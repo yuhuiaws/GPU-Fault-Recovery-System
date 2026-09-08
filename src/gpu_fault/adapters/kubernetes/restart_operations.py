@@ -448,6 +448,8 @@ class KubernetesRestartOperationsMixin:
             if expression not in expressions:
                 expressions.append(expression)
 
+    _HISTORICAL_RESTART_SCAN_LIMIT = 256
+
     def _observed_source_gpu_count(
         self, cluster_id: str, job_id: str, attempt_id: str
     ) -> int:
@@ -485,19 +487,26 @@ class KubernetesRestartOperationsMixin:
             }
             if gpu_uuids:
                 return len(gpu_uuids)
-        historical_counts = [
-            int(step.parameters["source_gpu_count"])
-            for workflow in self.store.list_workflows(limit=10000)
-            for step in workflow.official_steps
-            if (
-                step.operation is WorkflowOperation.RESTART_WORKLOAD
-                and step.parameters.get("cluster_id") == cluster_id
-                and step.parameters.get("job_id") == job_id
-                and step.parameters.get("source_attempt_id") == attempt_id
-                and int(step.parameters.get("source_gpu_count", 0)) > 0
-            )
-        ]
-        return max(historical_counts, default=0)
+        # Last resort: an earlier RESTART_WORKLOAD step for the same attempt
+        # already recorded the count. This used to list every workflow the
+        # store held (limit=10000) and walk every official step, inside the
+        # executor's restart path. A resubmitted restart is recent by
+        # construction, so a newest-first slice of a few hundred workflows
+        # is enough, and the newest matching step is the authoritative one
+        # (not the largest), so the scan stops at the first match.
+        for workflow in self.store.list_workflows(
+            limit=self._HISTORICAL_RESTART_SCAN_LIMIT, newest_first=True
+        ):
+            for step in workflow.official_steps:
+                if (
+                    step.operation is WorkflowOperation.RESTART_WORKLOAD
+                    and step.parameters.get("cluster_id") == cluster_id
+                    and step.parameters.get("job_id") == job_id
+                    and step.parameters.get("source_attempt_id") == attempt_id
+                    and int(step.parameters.get("source_gpu_count", 0)) > 0
+                ):
+                    return int(step.parameters["source_gpu_count"])
+        return 0
 
     def _restart_terminal_job(
         self,

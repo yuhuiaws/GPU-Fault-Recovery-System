@@ -462,15 +462,26 @@ def test_kmsg_records_for_identical_lines_share_the_boot_prefix() -> None:
     ), "records sharing an evidence_ref are named"
 
 
-def test_collect012_writes_the_same_line_twice_and_restores_through_the_registry(
+def test_collect012_judges_the_idle_node_monitor_only_without_a_workflow(
     tmp_path: Path,
 ) -> None:
+    """55272a0: RESTART_APP on an idle node is MONITOR_ONLY, not a quarantine.
+
+    The two XID 13 writes share one marker and earn distinct kmsg sequences;
+    neither opens a workflow, so there is no BLOCKED chain and no restore step
+    between the XIDs -- the node was never isolated."""
+
     calls: list[str] = []
     sequence = iter([100, 107, 300])
     records: dict[str, list[dict[str, Any]]] = {}
 
+    class Regional:
+        def node_snapshot(self, node: str) -> dict:
+            return {"ready": "True", "unschedulable": False, "taints": []}
+
     class Fixture:
         node = "node-a"
+        regional = Regional()
 
         def snapshot(self) -> dict:
             return {
@@ -491,32 +502,73 @@ def test_collect012_writes_the_same_line_twice_and_restores_through_the_registry
             )
             return {}
 
-        def wait_marker(self, marker: str, *, minimum_evidence: int = 1, **_: Any):
-            assert len(records[marker]) >= minimum_evidence
+        def store_snapshot(
+            self, marker: str, *, observed_after=None, scan_evidence: bool = True
+        ) -> dict:
             return {
-                "evidence": list(records[marker]),
-                "workflows": [{"status": "BLOCKED"}],
-                "incidents": [{"incident_id": f"inc-{marker}"}],
+                "evidence": list(records.get(marker, [])) if scan_evidence else [],
+                "evidence_scanned": scan_evidence,
+                "decisions": [
+                    {
+                        "official_action": "RESTART_APP",
+                        "disposition": "MONITOR_ONLY",
+                        "action": "NO_ACTION",
+                        "reasons": ["no managed application to restart"],
+                        "workflow_request_id": None,
+                        "incident_id": f"inc-{marker}",
+                    }
+                ],
+                "workflows": [],
+                "incidents": [
+                    {
+                        "incident_id": f"inc-{marker}",
+                        "state": "RECOVERED",
+                        "workflow_request_id": None,
+                    }
+                ],
             }
 
-        def restore_incidents(self, state: dict, **_: Any) -> list:
-            calls.append("restore")
-            return [{"status": "SUCCEEDED"}]
-
-    cleanup = acceptance.CaseCleanup()
-    result = acceptance.run_collect012(
-        Fixture(),
-        tmp_path,
-        1,
-        "hyperpod-v1",
-        cleanup=cleanup,  # type: ignore[arg-type]
-    )
+    result = acceptance.run_collect012(Fixture(), tmp_path, 1, "hyperpod-v1")
 
     assert result["verdict"] == "PASS", result
     assert result["markers"][0] == result["markers"][1], "samples 1 and 2 are one text"
-    assert calls == ["inject:13", "inject:13", "restore", "inject:31", "restore"]
-    assert cleanup.incident_states == [], "every registered state was restored"
+    assert calls == ["inject:13", "inject:13", "inject:31"], (
+        "no restore step: the node was never quarantined"
+    )
     assert len(result["record_ids"]) == 3
+    assert "restore_workflows" not in result, "there is nothing to restore"
+
+
+def test_restart_app_monitor_only_errors_names_every_regression() -> None:
+    good_decision = {
+        "official_action": "RESTART_APP",
+        "disposition": "MONITOR_ONLY",
+        "action": "NO_ACTION",
+        "reasons": ["no managed application to restart on an IDLE node"],
+        "workflow_request_id": None,
+    }
+    good_incident = {"state": "RECOVERED", "workflow_request_id": None}
+    assert (
+        acceptance.restart_app_monitor_only_errors([good_decision], [], [good_incident])
+        == []
+    )
+    # The old EXECUTABLE / BLOCKED shape must now fail every reading.
+    blocked = {
+        **good_decision,
+        "disposition": "EXECUTABLE",
+        "action": "RESTART_WORKLOAD",
+    }
+    errors = acceptance.restart_app_monitor_only_errors(
+        [blocked],
+        [{"status": "BLOCKED"}],
+        [{"state": "QUARANTINED", "workflow_request_id": "wf-1"}],
+    )
+    assert any("MONITOR_ONLY" in item for item in errors), errors
+    assert any("NO_ACTION" in item for item in errors), errors
+    assert any("opened a workflow" in item for item in errors), errors
+    assert any("RECOVERED" in item for item in errors), errors
+    missing = acceptance.restart_app_monitor_only_errors([], [], [])
+    assert any("no RESTART_APP decision" in item for item in missing), missing
 
 
 def test_case_cleanup_finish_releases_whatever_the_case_still_holds() -> None:

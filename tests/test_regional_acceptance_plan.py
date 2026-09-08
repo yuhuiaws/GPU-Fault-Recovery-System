@@ -59,8 +59,9 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    # 183 catalogued cases; 9 are DO_NOT_RUN (two retired earlier, seven folded
-    # into their supersets on 2026-09-07), so 174 run.
+    # 184 catalogued cases (COLLECT-021 added 2026-09-08); 9 are DO_NOT_RUN
+    # (two retired earlier, seven folded into their supersets on 2026-09-07),
+    # so 175 run.
     retired = (
         "GF-REGIONAL-DESTR-004",
         "GF-REGIONAL-AUTH-012",
@@ -72,8 +73,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 174
-    assert len(plan.cases) == 183
+    assert len(plan.execution_order) == 175
+    assert len(plan.cases) == 184
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
     assert plan.do_not_run_case_ids == retired

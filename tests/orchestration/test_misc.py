@@ -43,3 +43,16 @@ from ._misc_cases_2 import (
     test_unknown_workload_state_blocks_destructive_action,
     test_update_swfw_compiles_quiesced_version_pinned_workflow,
 )
+from ._misc_cases_3 import (
+    test_fault_action_generation_fence_age_limit_holds_without_boot_id,
+    test_fault_action_generation_fence_mismatched_boot_still_blocks,
+    test_fault_action_generation_fence_trusts_matching_boot_over_age,
+    test_ingest_of_different_nodes_is_not_serialised,
+    test_ingest_of_the_same_node_stays_serialised,
+    test_marker_correlation_does_not_read_incidents_for_scoped_markers,
+    test_marker_correlation_falls_back_to_the_incident_for_legacy_markers,
+    test_marker_correlation_reads_legacy_markers_of_other_clusters_out,
+    test_marker_correlation_skips_scoped_markers_of_other_clusters,
+    test_node_health_ingest_of_different_nodes_is_not_serialised,
+    test_simulate_waits_for_the_workflow_nodes_ingest,
+)

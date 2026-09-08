@@ -223,11 +223,16 @@ phases:
       - case: GF-REGIONAL-COLLECT-013
       - case: GF-REGIONAL-COLLECT-014
       - case: GF-REGIONAL-COLLECT-016
+      - case: GF-REGIONAL-COLLECT-021
+        predecessor: GF-REGIONAL-COLLECT-016
       - case: GF-REGIONAL-COLLECT-017
+        predecessor: GF-REGIONAL-COLLECT-016
       - range: {prefix: COLLECT, start: 18, end: 20}
       - case: GF-REGIONAL-COLLECT-015
         predecessor: GF-REGIONAL-COLLECT-017
     notes:
+      - COLLECT-021 以 COLLECT-016 PASS 为证据前置：它复用 COLLECT-016 的托管训练夹具与宿主探针，
+        验证 Pod 先死、RESTART_APP XID 后到的竞态被判为 MONITOR_ONLY 且被动路径仍重启，排在 COLLECT-016 之后。
       - COLLECT-015 以 COLLECT-017 PASS 为证据前置（run_collector_destructive.py 的链），
         COLLECT-018..020 排在它前面只是为了让 reboot 最后发生。
       - COLLECT-009 的正式前置是 COLLECT-005：COLLECT-006/007 是 pytest 用例，不产出 cases/<id>/<id>.json 证据。

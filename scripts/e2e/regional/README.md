@@ -108,6 +108,7 @@ them would turn every `--plan` into an execute against a real node.
 - `run_collector_acceptance.py`
 - `run_collector_destructive.py`
 - `run_collect016_training_recovery.py`
+- `run_collect021_late_xid_after_pod_death.py`
 - `run_collect017_efa_plugin.py`
 - `run_iso006_cluster_offline.py`
 - `run_e2e002_multicluster_fault.py`
@@ -591,7 +592,9 @@ Current classification:
 - COLLECT manual cases use two shared entry points:
   `run_collector_acceptance.py` for 001/002/003/005/009/010/011/012 and
   `run_collector_destructive.py` for 004/008/013/014/015. COLLECT-016 and
-  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers.
+  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers;
+  COLLECT-021 (`run_collect021_late_xid_after_pod_death.py`) reuses the
+  COLLECT-016 managed-training fixtures to drive the Pod-dies-before-XID race.
   Every driver is plan-only by default and requires the previous formal case
   evidence before mutation.
 - ISO-006 and E2E-002 have dedicated two-physical-cluster drivers.

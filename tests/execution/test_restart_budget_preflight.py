@@ -43,17 +43,26 @@ class RecordingAdapter:
         self,
         store: InMemoryStore,
         outcomes: dict[WorkflowOperation, WorkflowStepOutcome] | None = None,
+        *,
+        expected_reservations: list[str] | None = None,
     ) -> None:
         self.store = store
         self.outcomes = outcomes or {}
         self.calls: list[WorkflowOperation] = []
+        # The reservation every step must see while it runs: the preflight's
+        # own by default; an exhausted budget keeps the earlier one only.
+        self.expected_reservations = (
+            ["workflow-a/2/RESTART_WORKLOAD"]
+            if expected_reservations is None
+            else expected_reservations
+        )
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == "owner-a"
 
     def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         state = self.store.get_restart_budget("cluster-a", "training-a")
-        assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+        assert state.reservation_ids == self.expected_reservations
         self.calls.append(context.step.operation)
         return self.outcomes.get(
             context.step.operation, WorkflowStepOutcome.succeeded()
@@ -112,25 +121,40 @@ def _request() -> WorkflowExecutionRequest:
     return WorkflowExecutionRequest(expected_fencing_token=1)
 
 
-def test_exhausted_budget_fails_before_any_adapter_call() -> None:
+def test_exhausted_budget_withholds_the_restart_and_runs_the_rest() -> None:
+    # 逻辑 4: an exhausted budget used to fail the whole workflow before its
+    # first step. Now only the restart is withheld -- recorded FAILED up front,
+    # never reserved, never executed -- and the other steps still run; the
+    # workflow ends FAILED because the job was stopped and not restarted (see
+    # test_restart_budget_exhausted_preflight for the full chain).
     store = build_store()
     store.reserve_job_restart("cluster-a", "training-a", 1, "previous-restart")
     workflow = _state(store)
-    adapter = RecordingAdapter(store)
+    adapter = RecordingAdapter(store, expected_reservations=["previous-restart"])
 
     result = _executor(store, adapter).execute(workflow.request_id, _request())
 
     persisted = store.get_workflow(workflow.request_id)
     assert result.status is WorkflowStatus.FAILED
-    assert adapter.calls == []
-    assert persisted.completed_step_indexes == []
-    assert len(persisted.step_executions) == 1
-    execution = persisted.step_executions[0]
+    assert adapter.calls == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    assert persisted.completed_step_indexes == [0, 1]
+    restart = [
+        item
+        for item in persisted.step_executions
+        if item.operation is WorkflowOperation.RESTART_WORKLOAD
+    ]
+    assert len(restart) == 1
+    execution = restart[0]
     assert execution.step_index == 2
     assert execution.status is WorkflowStepStatus.FAILED
     assert execution.details["reason"] == ("RESTART_BUDGET_EXHAUSTED")
     assert "1/1" in execution.error
     assert store.list_remote_commands() == []
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.reservation_ids == ["previous-restart"]
 
 
 def test_missing_restart_context_fails_before_stop() -> None:

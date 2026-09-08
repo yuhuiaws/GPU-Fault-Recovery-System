@@ -179,6 +179,13 @@ class ProductionExecutorConfig:
     # here it caps the ``after_incident`` restart premise (a WAITING outcome
     # with ``reason=NODE_UNDER_REMEDIATION``) in ``bounded_waiting_outcome``,
     # since the dispatcher's hold only covers a workflow that has not started.
+    # It is the cap only while the premise names no remediation, or one that
+    # is terminal or unreadable: while the named remediation is still open the
+    # running restart is bounded by that remediation's ``lifetime_deadline_at``
+    # instead (``step_bounds._premise_hold_limit``), because a GPU reset chain
+    # (420 s maintenance window + VALIDATE_GPU + RESTORE_SCHEDULING) or a
+    # reboot chain (HyperPod, up to 2700 s) legitimately outlasts 240 s and
+    # cutting the wait there failed the restart just before the repair landed.
     node_busy_wait_seconds: float = 240.0
     workflow_preemption_enabled: bool = True
     remediation_budget: RemediationBudgetPolicy = RemediationBudgetPolicy()
@@ -436,7 +443,11 @@ def validate_timing_relationships(
       (``GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS``, rule A): the
       dispatcher holds a job workflow that has not started
       (dispatcher.py:467-478) and the executor caps the running restart
-      premise (``step_bounds.bounded_waiting_outcome``) for the same window.
+      premise (``step_bounds.bounded_waiting_outcome``) for the same window
+      whenever the premise's remediation is not an open workflow; while it
+      is open the executor defers to that remediation's lifetime instead
+      (``step_bounds._premise_hold_limit``), which is never shorter than the
+      window, so the equality here still means one deadline for one wait.
       Two values would give one job two different deadlines for one wait.
     * the node-busy wait < the VERIFY_NO_GPU_CLIENTS total wait. A job
       workflow whose node is under another remediation gives up at

@@ -26,6 +26,7 @@ from typing import Any
 from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import (
+    EXECUTABLE_WORKFLOW_STATUSES,
     StepPhase,
     WorkflowEvent,
     WorkflowEventCode,
@@ -39,6 +40,7 @@ from gpu_fault.models import (
     execution_phase,
     record_workflow_event,
 )
+from gpu_fault.store.shared.errors import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -173,10 +175,12 @@ def bounded_waiting_outcome(
     # Rule A: a restart held on its ``requires_incident_state`` premise is a
     # job waiting on a node another remediation is repairing, and that wait
     # has one window -- the same ``node_busy_wait_seconds`` the dispatcher
-    # applies before the workflow starts. Past it the job is not restarted.
+    # applies before the workflow starts. Past it the job is not restarted --
+    # unless the remediation it names is still open, in which case the
+    # remediation's own lifetime is the bound (``_premise_hold_limit``).
     premise_hold = details.get("reason") == WorkflowEventCode.NODE_UNDER_REMEDIATION
     if premise_hold:
-        limit = min(limit, int(executor.config.node_busy_wait_seconds))
+        limit = _premise_hold_limit(executor, details, limit, since)
     details["step_waiting_seconds"] = waited
     if waited >= limit:
         LOGGER.error(
@@ -223,6 +227,81 @@ def bounded_waiting_outcome(
                 limit,
             )
     return replace(outcome, details=details)
+
+
+def _premise_hold_limit(
+    executor: Any,
+    details: dict[str, Any],
+    step_limit: int,
+    since: datetime,
+) -> int:
+    """How long a restart may wait on its ``NODE_UNDER_REMEDIATION`` premise.
+
+    The node-busy window (240 s by default) is the right bound for a job
+    workflow that has not started: the dispatcher can still rewrite it into a
+    stop. It is the wrong bound once the ``after_incident`` restart is running
+    and the repair it waits for is real work in progress. A GPU reset chain
+    holds a maintenance window of up to seven minutes, then needs fresh
+    telemetry for VALIDATE_GPU and a RESTORE_SCHEDULING; a reboot chain waits
+    on HyperPod for up to forty-five minutes. Cut at 240 s, the restart failed
+    minutes before the repair landed and the job stayed down after a repair
+    that succeeded (逻辑 6).
+
+    So while the remediation the premise names is still open
+    (``EXECUTABLE_WORKFLOW_STATUSES``) the bound is that remediation's own
+    ``lifetime_deadline_at``, measured from when this step began waiting; a
+    remediation not yet claimed has no lifetime stamped and gets the restart's
+    per-operation cap as the fallback. Neither ever shortens the window the
+    dispatcher already granted. Once the remediation is terminal the adapter
+    settles the premise on its own (SUCCEEDED -> RECOVERED -> restart;
+    FAILED/BLOCKED -> INCIDENT_NOT_RECOVERABLE), so a WAITING that still
+    names it keeps today's window -- as does a hold with no
+    ``remediation_workflow_id``, or one whose record cannot be read. Failing
+    closed to the old cap is deliberate: a store outage must not turn a
+    bounded wait into an unbounded one.
+    """
+
+    window = int(executor.config.node_busy_wait_seconds)
+    remediation = _open_remediation(executor, details.get("remediation_workflow_id"))
+    if remediation is None:
+        return min(step_limit, window)
+    lifetime = remediation.lifetime_deadline_at
+    if lifetime is None:
+        return max(step_limit, window)
+    details["remediation_lifetime_deadline_at"] = lifetime.isoformat()
+    return max(window, int((lifetime - since).total_seconds()))
+
+
+def _open_remediation(executor: Any, request_id: Any) -> WorkflowRequest | None:
+    """The still-executable remediation workflow ``request_id`` names, or ``None``.
+
+    ``None`` covers every case the caller must treat as "keep today's cap": no
+    id on the hold, no store on this executor, a record the store does not
+    have (``NotFoundError`` -- the id was stamped from an incident whose
+    workflow has since been pruned), a store that cannot answer, or a record
+    that is already terminal.
+    """
+
+    if not request_id:
+        return None
+    store = getattr(executor, "store", None)
+    if store is None:
+        return None
+    try:
+        remediation: WorkflowRequest = store.get_workflow(str(request_id))
+    except NotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - the bound must still land on the old cap
+        LOGGER.warning(
+            "could not read the remediation workflow a restart premise waits on; "
+            "keeping the node-busy window: remediation_workflow=%s",
+            request_id,
+            exc_info=True,
+        )
+        return None
+    if remediation.status not in EXECUTABLE_WORKFLOW_STATUSES:
+        return None
+    return remediation
 
 
 def record_attempt(

@@ -6022,27 +6022,24 @@ test_cases:
   title: XID RESTART_APP 从 API 重放换成真 kmsg 注入
   category: regional-collector
   level: live
-  risk: live-isolation
+  risk: live-kernel-log-injection
   problem: >-
     RESTART_APP 这 48 条是占比最大的一类，此前只走过 API 重放， kmsg 采集器的正则、去重与权限从未被这一类驱动。
   injection: 通过真实 /dev/kmsg 注入 RESTART_APP 类 XID，并复核一条最常见的 MMU fault。
   expected:
   - kmsg 采集链走通，record_id、evidence_ref 与三元组齐全
   - 两次写入相同文本因kernel sequence不同形成两条不同record_id；相同原始sequence的去重由隔离重放夹具验证
-  - 判定结果与目录一致
-  - 空闲节点上有一道真实安全闸阻止执行段完成
+  - 空闲节点判定 official=RESTART_APP、disposition=MONITOR_ONLY、action=NO_ACTION，reasons 含空闲节点无可重启应用
+  - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault taint、boot_id 不变
   - 本用例只验采集层前半段与判定正确性，不验执行
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: bc5cc1b7ea56c0148c778579eda0e06951c83d7c084b1f2c3c20ea3ed38415e4
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-012
-  related_pytest: tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity
+  related_pytest: tests/orchestration/test_misc.py::test_restart_app_on_an_idle_node_does_not_open_a_workflow
+  # 55272a0 起空闲节点上的 RESTART_APP 不再 quarantine 而是 MONITOR_ONLY/NO_ACTION，
+  # runner 契约随之从"BLOCKED 安全链 + validated restore"改为"无 workflow、节点零改动"，
+  # 旧 PASS 证据不再覆盖当前代码，按 da62b12 重置 PASS 用例的先例复位为 NOT_RUN，owed 一次真机复验。
 - id: GF-REGIONAL-COLLECT-013
   title: XID RESET_GPU 真 kmsg 注入并真的执行单卡 reset
   category: regional-collector
@@ -6206,6 +6203,30 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
   related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow
+- id: GF-REGIONAL-COLLECT-021
+  title: Pod 先死、RESTART_APP XID 后到——空闲判定 MONITOR_ONLY，被动路径仍重启
+  category: regional-collector
+  level: live
+  risk: live-workload-restart
+  problem: >-
+    RESTART_APP 类 XID 杀掉训练进程后，Pod 终止先于内核行被采集，topology 解析为
+    IDLE。55272a0 之前该竞态会把空闲节点 quarantine（SAFETY_PENDING→BLOCKED），
+    且因 incident 被 QUARANTINED，attempt 自身的失败无法经被动 quick triage 重启。
+  injection: >-
+    提交托管 24-GPU 训练作业（restart_budget=1）并等 RUNNING 与 ACTIVE observation；
+    在任何 XID 之前用宿主 PID 命名空间 SIGKILL 目标 Pod cgroup 内的训练进程（不删 Pod/PyTorchJob），
+    使容器非零退出；待 store 显示该 attempt observation 终止、workload_phase=FAILED 后，
+    立即向 /dev/kmsg 写入迟到的 RESTART_APP 类 XID 13。
+  expected:
+  - 事件 workload_state=IDLE、affected_workload_ids 为空
+  - 判定 official=RESTART_APP、disposition=MONITOR_ONLY、action=NO_ACTION，reasons 含空闲节点无可重启应用
+  - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault.io taint、无 ownership 注解、boot_id 不变、无 remote command
+  - 被动路径经 quick triage 重启该 attempt：旧 Pod UID 全部消失、3 个新 Pod RUNNING、restart_count 由 0→1、新 attempt observation 出现
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-021
+  related_pytest: tests/completion/test_pod_dies_before_xid_ingest.py::test_pod_dies_before_xid_ingest_keeps_node_and_restarts_via_triage
 - id: GF-REGIONAL-COLLECT-015
   title: SXID ALWAYS_FATAL 经 provider 真机整机重启
   category: regional-collector

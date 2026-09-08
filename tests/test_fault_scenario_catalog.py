@@ -450,6 +450,7 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         "GF-REGIONAL-COLLECT-018": "run_collect018_rejected_event.py",
         "GF-REGIONAL-COLLECT-019": "run_collect019_nvidia_smi_hang.py",
         "GF-REGIONAL-COLLECT-020": "run_collect020_gpu_identity.py",
+        "GF-REGIONAL-COLLECT-021": ("run_collect021_late_xid_after_pod_death.py"),
         "GF-REGIONAL-COLLECT-015": "run_collector_destructive.py",
     }
     cases = {case["id"]: case for case in load_catalog(CATALOG)}
@@ -835,7 +836,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 183
+    assert len(regional) == 184
     assert all((case.get("evidence") or {}).get("verdict") for case in regional), (
         "every regional case must record a verdict"
     )

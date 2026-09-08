@@ -490,7 +490,9 @@ def test_incident_stop_marks_source_pods_before_suspend() -> None:
 
     outcome = adapter.execute(context)
 
-    assert outcome.status is WorkflowStepStatus.WAITING
+    # The fixture's PyTorchJob already reports Suspended, so the stop settles
+    # in this same call once the Pods are marked and deleted.
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED
     assert core.patches == [
         (
             "training-master-0",
@@ -512,6 +514,9 @@ def test_incident_stop_marks_source_pods_before_suspend() -> None:
 
 def test_incident_stop_poll_succeeds_after_source_pods_disappear() -> None:
     custom = PyTorchCustomApi()
+    # The operator has not reconciled the suspend yet when the step reads
+    # the PyTorchJob back, so the first call has to leave the step WAITING.
+    custom.workload["status"] = {"replicaStatuses": {"Master": {"active": 1}}}
     core = PodCoreApi()
     adapter = KubernetesWorkflowAdapter(
         core_api=core, batch_api=UnusedApi(), custom_api=custom, store=build_store()

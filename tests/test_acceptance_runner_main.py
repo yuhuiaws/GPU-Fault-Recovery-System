@@ -51,6 +51,7 @@ DEADLINE = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
 #: Every runner that delegates its ``main`` to the shared spine.
 STANDARD_RUNNERS = (
     "run_collect016_training_recovery",
+    "run_collect021_late_xid_after_pod_death",
     "run_collect017_efa_plugin",
     "run_destr001_gpu_reset",
     "run_destr002_hyperpod_reboot",

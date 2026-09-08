@@ -60,6 +60,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.notifications import (
     DiagnosticInconclusiveEmailBuilder,
+    RestartGuardEmailBuilder,
     WarmSpareReplacementEmailBuilder,
 )
 from gpu_fault.operation_registry import (
@@ -233,6 +234,10 @@ class ProductionWorkflowExecutor:
         self.diagnostic_inconclusive_email_builder = (
             DiagnosticInconclusiveEmailBuilder()
         )
+        # The same builder the restart adapters carry: the budget-exhausted
+        # notice the claim preflight files (逻辑 4) must be the adapter's
+        # template, not a second one.
+        self.restart_email_builder = RestartGuardEmailBuilder()
         # D-7: set by the dispatcher; the lease a WAITING row keeps until the
         # next tick. ``None`` keeps the full ``lease_duration_seconds``.
         self.waiting_lease_duration: timedelta | None = None
@@ -1058,15 +1063,33 @@ class ProductionWorkflowExecutor:
         incident: FaultIncident,
         execution_epoch: int,
     ) -> WorkflowExecutionResult:
-        """End FAILED / ESCALATED once the rewritten plan ran (F-N1 §8)."""
+        """End FAILED once the plan ran with a reason set ahead of time.
 
+        The rule A stop rewrite (F-N1 §8) and the restart withheld for an
+        exhausted budget (逻辑 4) both set ``terminal_failure_reason`` and let
+        the remaining steps run. The incident then follows the failure rule:
+        a node this workflow cordoned and never released stays QUARANTINED;
+        otherwise the job needs an operator, ESCALATED. The stop rewrite keeps
+        only STOP_WORKLOADS, so it lands on ESCALATED as before.
+        """
+
+        completed = set(workflow.completed_operations)
+        still_isolated = (
+            bool(
+                {WorkflowOperation.MARK_UNSCHEDULABLE, WorkflowOperation.QUARANTINE}
+                & completed
+            )
+            and WorkflowOperation.RESTORE_SCHEDULING not in completed
+        )
         return self._terminalize(
             workflow,
             incident,
             WorkflowStatus.FAILED,
             execution_epoch,
             reason=workflow.terminal_failure_reason,
-            incident_state=IncidentState.ESCALATED,
+            incident_state=(
+                IncidentState.QUARANTINED if still_isolated else IncidentState.ESCALATED
+            ),
         )
 
     @staticmethod

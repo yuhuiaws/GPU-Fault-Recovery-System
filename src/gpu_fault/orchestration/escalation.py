@@ -180,6 +180,12 @@ def _escalation_operations(
                 WorkflowOperation.QUARANTINE,
                 WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
                 WorkflowOperation.VALIDATE_GPU,
+                # Same exit as the node-health DRAIN chain: the node stays
+                # quarantined (RMA class, no RESTORE_SCHEDULING), and the
+                # explicit hand-off is what moves the incident to ESCALATED
+                # and tells an operator. Without it the drain parked in
+                # QUARANTINED with nobody notified.
+                WorkflowOperation.ESCALATE_SUPPORT,
             ]
         )
     else:
