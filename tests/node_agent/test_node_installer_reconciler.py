@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,13 +11,18 @@ import yaml
 
 from gpu_fault.node_installer_reconciler import (
     INSTALLER_ARTIFACT_ANNOTATION,
+    INSTALLER_ATTEMPTS_ANNOTATION,
     INSTALLER_BOOT_ID_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
     INSTALLER_DIGEST_ANNOTATION,
+    INSTALLER_JOB_LABEL,
     INSTALLER_NODE_UID_ANNOTATION,
+    INSTALLER_REASON_ANNOTATION,
     INSTALLER_STATE_ANNOTATION,
     INSTALLER_TEMPLATE_ANNOTATION,
     INSTALLER_VERSION_ANNOTATION,
+    RECONCILER_HEARTBEAT_PATH,
+    REQUEST_TIMEOUT,
     TEMPLATE_CONTENT_SHA256_ENV,
     NodeInstallerReconciler,
     load_job_template,
@@ -138,10 +145,18 @@ def node(
     )
 
 
-def job(*, condition: str | None = None, age_seconds: int = 0):
+def job(
+    *,
+    condition: str | None = None,
+    age_seconds: int = 0,
+    failed_at: datetime | None = None,
+):
     conditions = []
     if condition:
-        conditions.append(SimpleNamespace(type=condition, status="True"))
+        item = SimpleNamespace(type=condition, status="True")
+        if failed_at is not None:
+            item.last_transition_time = failed_at
+        conditions.append(item)
     return SimpleNamespace(
         metadata=SimpleNamespace(
             creation_timestamp=NOW - timedelta(seconds=age_seconds)
@@ -150,42 +165,106 @@ def job(*, condition: str | None = None, age_seconds: int = 0):
     )
 
 
+def installer_pod(*, reason: str | None = None, message: str = ""):
+    """A Job Pod whose container is stuck in ``reason`` and never started."""
+
+    waiting = (
+        None if reason is None else SimpleNamespace(reason=reason, message=message)
+    )
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name="installer-pod"),
+        status=SimpleNamespace(
+            phase="Pending",
+            container_statuses=[
+                SimpleNamespace(
+                    name="installer",
+                    state=SimpleNamespace(
+                        waiting=waiting, running=None, terminated=None
+                    ),
+                )
+            ],
+        ),
+    )
+
+
 class CoreApi:
-    def __init__(self, nodes, *, wave_data=None):
+    def __init__(self, nodes, *, wave_data=None, patch_failures=(), pods=None):
         self.nodes = nodes
         self.wave_data = wave_data
+        self.patch_failures = set(patch_failures)
+        self.pods = dict(pods or {})
         self.patches = []
+        self.calls = []
 
-    def list_node(self, *, label_selector):
+    def list_node(self, *, label_selector, _request_timeout=None):
         assert label_selector == "sagemaker.amazonaws.com/cluster-name=hp-cluster-a"
+        self.calls.append(("list_node", _request_timeout))
         return SimpleNamespace(items=self.nodes)
 
-    def patch_node(self, name, body):
+    def patch_node(self, name, body, _request_timeout=None):
+        self.calls.append(("patch_node", _request_timeout))
+        if name in self.patch_failures:
+            raise ApiError(500)
         self.patches.append((name, body))
 
-    def read_namespaced_config_map(self, name, namespace):
+    def read_namespaced_config_map(self, name, namespace, _request_timeout=None):
         assert name == "gpu-fault-node-installer-wave"
         assert namespace == "gpu-fault-system"
+        self.calls.append(("read_namespaced_config_map", _request_timeout))
         return SimpleNamespace(data=self.wave_data)
+
+    def list_namespaced_pod(self, namespace, *, label_selector, _request_timeout=None):
+        assert namespace == "gpu-fault-system"
+        self.calls.append(("list_namespaced_pod", _request_timeout))
+        items = [pod for key, pod in self.pods.items() if key in label_selector]
+        return SimpleNamespace(items=items)
 
 
 class BatchApi:
-    def __init__(self, existing=None):
+    """Fake Job API.
+
+    ``existing`` answers for every Job name (the historical behaviour); ``jobs``
+    maps a node name to the Job that node's installer Job lookup returns, which
+    is what a budget question about two different nodes needs.
+    """
+
+    def __init__(self, existing=None, *, jobs=None):
         self.existing = existing
+        self.jobs = dict(jobs or {})
         self.created = []
         self.deleted = []
         self.reads = 0
+        self.calls = []
 
-    def read_namespaced_job(self, name, namespace):
-        self.reads += 1
-        if self.existing is None:
-            raise ApiError(404)
+    def _for_name(self, name):
+        for node_name, value in self.jobs.items():
+            if node_name in name:
+                return value
         return self.existing
 
-    def create_namespaced_job(self, namespace, body):
+    def read_namespaced_job(self, name, namespace, _request_timeout=None):
+        self.reads += 1
+        self.calls.append(("read_namespaced_job", _request_timeout))
+        found = self._for_name(name)
+        if found is None:
+            raise ApiError(404)
+        return found
+
+    def list_namespaced_job(self, namespace, *, label_selector, _request_timeout=None):
+        assert namespace == "gpu-fault-system"
+        assert label_selector == f"{INSTALLER_JOB_LABEL}=true"
+        self.calls.append(("list_namespaced_job", _request_timeout))
+        items = list(self.jobs.values())
+        if self.existing is not None:
+            items.append(self.existing)
+        return SimpleNamespace(items=items)
+
+    def create_namespaced_job(self, namespace, body, _request_timeout=None):
+        self.calls.append(("create_namespaced_job", _request_timeout))
         self.created.append((namespace, body))
 
-    def delete_namespaced_job(self, name, namespace, **kwargs):
+    def delete_namespaced_job(self, name, namespace, _request_timeout=None, **kwargs):
+        self.calls.append(("delete_namespaced_job", _request_timeout))
         self.deleted.append((name, namespace, kwargs))
 
 
@@ -230,7 +309,7 @@ def template():
     }
 
 
-def reconciler(core, batch):
+def reconciler(core, batch, *, now=lambda: NOW, max_unavailable=1):
     return NodeInstallerReconciler(
         core,
         batch,
@@ -244,8 +323,28 @@ def reconciler(core, batch):
         job_template=template(),
         dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
         retry_seconds=300,
-        now=lambda: NOW,
+        max_unavailable=max_unavailable,
+        now=now,
     )
+
+
+def apply_patches(node_item, core):
+    """Fold the reconciler's annotation patches back onto the Node.
+
+    The apiserver does this between passes; a test that asks what the *next*
+    pass does has to do it too, because every backoff decision is read from the
+    annotations rather than from reconciler memory.
+    """
+
+    annotations = dict(node_item.metadata.annotations or {})
+    for _name, body in core.patches:
+        for key, value in body["metadata"]["annotations"].items():
+            if value is None:
+                annotations.pop(key, None)
+            else:
+                annotations[key] = value
+    node_item.metadata.annotations = annotations
+    return annotations
 
 
 def test_current_node_is_not_reinstalled():
@@ -637,3 +736,242 @@ def test_a_node_installed_before_boot_ids_adopts_its_current_boot():
     ((name, body),) = core.patches
     assert body["metadata"]["annotations"][INSTALLER_BOOT_ID_ANNOTATION] == "boot-now"
     assert body["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION] == "Succeeded"
+
+
+# -------------------------- liveness, budget, isolation, backoff (F3/F5/F6/F8/F14)
+
+
+def test_reconcile_pass_touches_the_heartbeat_file():
+    """Task 16's livenessProbe reads the age of this file.
+
+    Without it a half-open apiserver connection wedges the loop forever while
+    the Pod stays Running and Ready (F6). The heartbeat is written even when the
+    pass itself fails closed, because liveness answers "is the loop turning",
+    not "did reconciliation succeed".
+    """
+
+    core = CoreApi([node()])
+    batch = BatchApi()
+    started = time.time()
+
+    reconciler(core, batch).reconcile_once()
+
+    path = Path(RECONCILER_HEARTBEAT_PATH)
+    assert path.exists(), f"{RECONCILER_HEARTBEAT_PATH} was not written"
+    assert path.stat().st_mtime >= started - 1, (
+        "the heartbeat file was not refreshed by this reconcile pass"
+    )
+
+    failing = CoreApi(
+        [node()], wave_data={"allowed-nodes": "*", "max-unavailable": "invalid"}
+    )
+    active = reconciler(failing, BatchApi())
+    active.wave_config_map = "gpu-fault-node-installer-wave"
+    before_failed_pass = time.time()
+    with pytest.raises(RuntimeError, match="max-unavailable"):
+        active.reconcile_once()
+
+    assert path.stat().st_mtime >= before_failed_pass - 1, (
+        "a pass that fails closed must still prove the loop is alive"
+    )
+
+
+def test_running_job_on_a_later_node_blocks_creation_on_an_earlier_node():
+    """max_unavailable was overshot 2x because in_flight was counted in-loop (F3).
+
+    ``hyperpod-a`` sorts before ``hyperpod-b``, so with the old in-loop counter
+    it saw in_flight == 0 and created a second install while ``hyperpod-b`` was
+    still mid-install: two nodes lose their Agent at once under a budget of 1.
+    """
+
+    core = CoreApi(
+        [node(name="hyperpod-a", uid="node-a"), node(name="hyperpod-b", uid="node-b")]
+    )
+    batch = BatchApi(jobs={"hyperpod-b": job()})
+
+    result = reconciler(core, batch).reconcile_once()
+
+    assert batch.created == [], "an install slot already in use was handed out again"
+    assert result["created"] == 0, result
+    assert result["running"] == 1, result
+    assert result["deferred"] == 1, result
+
+
+def test_a_failing_node_does_not_block_later_nodes():
+    """One node's exception used to abort the whole pass, every 5 s, forever (F5)."""
+
+    core = CoreApi(
+        [node(name="hyperpod-a", uid="node-a"), node(name="hyperpod-b", uid="node-b")],
+        patch_failures={"hyperpod-a"},
+    )
+    batch = BatchApi()
+
+    result = reconciler(core, batch, max_unavailable=2).reconcile_once()
+
+    assert result["error"] == 1, result
+    assert result["created"] == 1, result
+    assert [name for name, _body in core.patches] == ["hyperpod-b"], core.patches
+    assert [
+        body["spec"]["template"]["spec"]["nodeName"] for _ns, body in batch.created
+    ] == ["hyperpod-a", "hyperpod-b"], (
+        "the node after the failing one must still be reconciled"
+    )
+
+
+def test_reconcile_passes_request_timeouts():
+    """Every apiserver call is bounded, so a half-open socket cannot wedge a pass."""
+
+    core = CoreApi(
+        [
+            node(name="hyperpod-i-001", uid="node-1"),
+            node(name="hyperpod-i-002", uid="node-2"),
+            node(name="hyperpod-i-003", uid="node-3"),
+        ],
+        wave_data={"allowed-nodes": "*", "max-unavailable": "1"},
+        pods={"hyperpod-i-003": installer_pod(reason="CreateContainerConfigError")},
+    )
+    batch = BatchApi(
+        jobs={
+            "hyperpod-i-002": job(condition="Failed", age_seconds=301),
+            "hyperpod-i-003": job(condition="Failed", age_seconds=900, failed_at=NOW),
+        }
+    )
+    active = reconciler(core, batch)
+    active.wave_config_map = "gpu-fault-node-installer-wave"
+
+    active.reconcile_once()
+
+    calls = core.calls + batch.calls
+    assert {name for name, _timeout in calls} >= {
+        "list_node",
+        "patch_node",
+        "read_namespaced_config_map",
+        "list_namespaced_pod",
+        "list_namespaced_job",
+        "read_namespaced_job",
+        "create_namespaced_job",
+        "delete_namespaced_job",
+    }, calls
+    assert all(timeout == REQUEST_TIMEOUT for _name, timeout in calls), calls
+    assert REQUEST_TIMEOUT == (5, 60), REQUEST_TIMEOUT
+
+
+def test_failed_node_is_not_repatched_every_pass():
+    """A node waiting out its retry delay was re-patched with identical
+    annotations every 5 s (F14): 17k pointless node writes a day per node."""
+
+    current = node()
+    core = CoreApi([current])
+    batch = BatchApi(job(condition="Failed", age_seconds=10, failed_at=NOW))
+    active = reconciler(core, batch)
+
+    first = active.reconcile_once()
+
+    assert first["failed"] == 1, first
+    assert len(core.patches) == 1, core.patches
+    marked = core.patches[-1][1]["metadata"]["annotations"]
+    assert marked[INSTALLER_STATE_ANNOTATION] == "Failed", marked
+    apply_patches(current, core)
+
+    second = active.reconcile_once()
+
+    assert second["failed"] == 1, second
+    assert len(core.patches) == 1, (
+        "a node already annotated Failed must not be patched again"
+    )
+    assert batch.deleted == [], "the retry delay had not elapsed"
+
+
+def test_node_without_action_key_is_reported_not_retried():
+    """A node with no key in gpu-fault-node-action-keys held the only install
+    slot for ~14 of every 14.5 minutes (F8): CreateContainerConfigError until
+    activeDeadlineSeconds, Failed, recreated on the next pass, forever.
+
+    The reconciler has no ``secrets`` RBAC, so it classifies on the Job Pod's
+    waiting reason and backs off on the same curve as any other failure.
+    """
+
+    current = node()
+    core = CoreApi(
+        [current],
+        pods={
+            "hyperpod-i-123": installer_pod(
+                reason="CreateContainerConfigError",
+                message='secret "gpu-fault-node-action-keys" key '
+                '"hyperpod-i-123" not found',
+            )
+        },
+    )
+    batch = BatchApi(job(condition="Failed", age_seconds=900, failed_at=NOW))
+    active = reconciler(core, batch)
+
+    result = active.reconcile_once()
+
+    assert result["unsupported"] == 1, result
+    assert result["failed"] == 0, result
+    assert batch.deleted == [], "a Pod that never started must not be retried at once"
+    assert batch.created == [], "no second install slot may be burned"
+    marked = core.patches[-1][1]["metadata"]["annotations"]
+    assert marked[INSTALLER_STATE_ANNOTATION] == "Unsupported", marked
+    assert "CreateContainerConfigError" in marked[INSTALLER_REASON_ANNOTATION], marked
+    assert "hyperpod-i-123" in marked[INSTALLER_REASON_ANNOTATION], marked
+    apply_patches(current, core)
+
+    again = active.reconcile_once()
+
+    assert again["unsupported"] == 1, again
+    assert len(core.patches) == 1, "the Unsupported annotation must not be rewritten"
+
+
+def test_repeated_failures_back_off_on_a_doubling_curve():
+    """300 s x 2^attempts, capped at 3600 s, measured from the failure and read
+    back out of the Node annotations so a reconciler restart cannot reset it."""
+
+    current = node()
+    core = CoreApi([current])
+    batch = BatchApi(job(condition="Failed", age_seconds=900, failed_at=NOW))
+    clock = [NOW]
+
+    def pass_now(seconds: int) -> dict[str, int]:
+        clock[0] = NOW + timedelta(seconds=seconds)
+        # A brand-new instance every pass: the backoff must survive a restart.
+        result = reconciler(core, batch, now=lambda: clock[0]).reconcile_once()
+        apply_patches(current, core)
+        return result
+
+    assert pass_now(299)["failed"] == 1, "the first retry waits 300 s"
+    assert batch.deleted == [], batch.deleted
+    assert INSTALLER_ATTEMPTS_ANNOTATION not in current.metadata.annotations, (
+        current.metadata.annotations
+    )
+
+    assert pass_now(301)["failed"] == 1, "at 300 s the failed Job is deleted"
+    assert len(batch.deleted) == 1, batch.deleted
+    assert current.metadata.annotations[INSTALLER_ATTEMPTS_ANNOTATION] == "1", (
+        current.metadata.annotations
+    )
+
+    # Second failure: 600 s, not 300 s.
+    batch.existing = job(
+        condition="Failed", age_seconds=0, failed_at=NOW + timedelta(seconds=400)
+    )
+    assert pass_now(400 + 599)["failed"] == 1, "the second retry waits 600 s"
+    assert len(batch.deleted) == 1, batch.deleted
+    assert pass_now(400 + 601)["failed"] == 1, "600 s later it retries"
+    assert len(batch.deleted) == 2, batch.deleted
+    assert current.metadata.annotations[INSTALLER_ATTEMPTS_ANNOTATION] == "2", (
+        current.metadata.annotations
+    )
+
+    # Cap: at eight attempts the curve would be 21 h; it must stop at one hour.
+    current.metadata.annotations[INSTALLER_ATTEMPTS_ANNOTATION] = "8"
+    batch.existing = job(
+        condition="Failed", age_seconds=0, failed_at=NOW + timedelta(seconds=5000)
+    )
+    assert pass_now(5000 + 3599)["failed"] == 1, "capped backoff has not elapsed"
+    assert len(batch.deleted) == 2, batch.deleted
+    assert pass_now(5000 + 3601)["failed"] == 1, "the cap is one hour, not 21 hours"
+    assert len(batch.deleted) == 3, batch.deleted
+    assert current.metadata.annotations[INSTALLER_ATTEMPTS_ANNOTATION] == "9", (
+        current.metadata.annotations
+    )

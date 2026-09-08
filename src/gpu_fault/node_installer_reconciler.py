@@ -31,9 +31,40 @@ INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
 # and an empty root where the Agent used to be. The UID check cannot see that;
 # a boot-id change followed by an Agent that does not answer can.
 INSTALLER_BOOT_ID_ANNOTATION = "gpu-fault.io/installer-boot-id"
+# How many installer Jobs this node has already burned, and why the last one
+# did not take. Both are read back off the Node on the next pass: the backoff
+# has to survive a reconciler restart, and a restart is a routine event here
+# (rollout, eviction, OOM), so it cannot live in process memory.
+INSTALLER_ATTEMPTS_ANNOTATION = "gpu-fault.io/installer-attempts"
+INSTALLER_REASON_ANNOTATION = "gpu-fault.io/installer-reason"
 DEFAULT_AGENT_PORT = 9099
 DEFAULT_REBOOT_GRACE_SECONDS = 600
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
+# (connect, read) seconds for every apiserver call. Without it a half-open
+# connection to the apiserver blocks the reconcile loop forever while the Pod
+# stays Running and Ready.
+REQUEST_TIMEOUT = (5, 60)
+# Touched at the end of every reconcile pass; the Deployment's livenessProbe
+# reads its age. A constant path, not an env var: the probe is a shell test in
+# the manifest and the two must agree without a second knob to keep in sync.
+RECONCILER_HEARTBEAT_PATH = "/tmp/reconciler-heartbeat"  # noqa: S108
+# The maximum retry delay for a node that keeps failing to install.
+MAX_RETRY_SECONDS = 3600
+# Container waiting reasons that mean the installer never ran a single line, so
+# there is nothing on the node to roll back and nothing a fast retry can fix.
+# The first one is what a node with no key in ``gpu-fault-node-action-keys``
+# produces: the reconciler has no ``secrets`` RBAC and cannot check the key
+# itself, so it reads the consequence off the Job's Pod instead.
+POD_NEVER_STARTED_REASONS = frozenset(
+    {
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "InvalidImageName",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "RunContainerError",
+    }
+)
 
 _INVENTORY = {
     "p5.4xlarge": (1, 1),
@@ -77,21 +108,101 @@ def _boot_id(node: Any) -> str | None:
     return str(value) if value else None
 
 
-def _ready_since(node: Any) -> datetime | None:
-    for condition in _conditions(node):
-        if _value(condition, "type") == "Ready":
-            value = _value(condition, "last_transition_time")
-            if value is None:
-                value = _value(condition, "lastTransitionTime")
-            if isinstance(value, datetime):
-                return value if value.tzinfo else value.replace(tzinfo=UTC)
-            if isinstance(value, str) and value:
-                try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                except ValueError:
-                    return None
-                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+def _as_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     return None
+
+
+def _transition_time(item: Any, condition_type: str) -> datetime | None:
+    for condition in _conditions(item):
+        if _value(condition, "type") != condition_type:
+            continue
+        value = _value(condition, "last_transition_time")
+        if value is None:
+            value = _value(condition, "lastTransitionTime")
+        return _as_datetime(value)
+    return None
+
+
+def _ready_since(node: Any) -> datetime | None:
+    return _transition_time(node, "Ready")
+
+
+def _failure_time(job: Any) -> datetime | None:
+    """When the Job actually failed, not when it was created.
+
+    Retry backoff measured from the creation timestamp is no backoff at all for
+    the failure that matters most: a Pod that never started burns the whole
+    ``activeDeadlineSeconds`` (840 s) before the Job goes Failed, so every
+    delay shorter than that has already elapsed by the time we look.
+    """
+
+    failed_at = _transition_time(job, "Failed")
+    if failed_at is not None:
+        return failed_at
+    status = _value(job, "status", {})
+    return _as_datetime(_value(status, "completion_time")) or _as_datetime(
+        _value(status, "completionTime")
+    )
+
+
+def _attempt_count(annotations: dict[str, str]) -> int:
+    try:
+        return max(int(annotations.get(INSTALLER_ATTEMPTS_ANNOTATION, "0")), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _annotations_match(current: dict[str, str], desired: dict[str, str | None]) -> bool:
+    return all(
+        (key not in current) if value is None else current.get(key) == value
+        for key, value in desired.items()
+    )
+
+
+def _touch_heartbeat() -> None:
+    """Prove the reconcile loop turned. Read by the Deployment's livenessProbe."""
+
+    try:
+        path = Path(RECONCILER_HEARTBEAT_PATH)
+        path.touch(exist_ok=True)
+        os.utime(path, None)
+    except OSError:
+        # Losing the heartbeat means liveness will restart this Pod, which is
+        # the right answer for a host that cannot write /tmp. It must not take
+        # the reconcile result down with it.
+        LOGGER.warning(
+            "could not write reconciler heartbeat %s",
+            RECONCILER_HEARTBEAT_PATH,
+            exc_info=True,
+        )
+
+
+class _InstallBudget:
+    """The ``max_unavailable`` slots left in this pass.
+
+    Consumed at the moment a Job is created rather than derived from the
+    outcome the node loop returns, so a node whose annotation patch fails
+    *after* its Job exists still spends the slot it took.
+    """
+
+    def __init__(self, used: int, limit: int) -> None:
+        self.used = used
+        self.limit = limit
+
+    @property
+    def allows_create(self) -> bool:
+        return self.used < self.limit
+
+    def consume(self) -> None:
+        self.used += 1
 
 
 def agent_answers(address: str, port: int, *, timeout_seconds: float = 2.0) -> bool:
@@ -220,6 +331,17 @@ class NodeInstallerReconciler:
         return f"sagemaker.amazonaws.com/cluster-name={self.cluster_name}"
 
     def reconcile_once(self) -> dict[str, int]:
+        try:
+            return self._reconcile_pass()
+        finally:
+            # In ``finally``, and not only on the happy path: liveness asks
+            # whether the loop is turning, not whether reconciliation
+            # succeeded. A pass that fails closed (an invalid wave ConfigMap)
+            # is a live process an operator can fix; a wedged apiserver call is
+            # not, and only the second one must trip the probe.
+            _touch_heartbeat()
+
+    def _reconcile_pass(self) -> dict[str, int]:
         result = {
             "current": 0,
             "created": 0,
@@ -231,10 +353,13 @@ class NodeInstallerReconciler:
             "unsupported": 0,
             "rebooted": 0,
             "recovering": 0,
+            "error": 0,
         }
         allowed_node_names, max_unavailable = self._wave_settings()
-        response = self.core.list_node(label_selector=self.node_selector)
-        in_flight = 0
+        response = self.core.list_node(
+            label_selector=self.node_selector,
+            _request_timeout=REQUEST_TIMEOUT,
+        )
         nodes = sorted(
             (
                 item
@@ -244,15 +369,41 @@ class NodeInstallerReconciler:
             ),
             key=lambda item: str(_value(_metadata(item), "name")),
         )
+        # Counted from the apiserver before the loop, never from the outcomes
+        # the loop produces: an in-loop counter lets a node that sorts *before*
+        # an already-running install see zero in flight and start a second one,
+        # so ``max_unavailable: 1`` took two nodes down at once.
+        budget = _InstallBudget(self._active_installer_jobs(), max_unavailable)
         for node in nodes:
-            outcome = self._reconcile_node(
-                node,
-                allow_create=in_flight < max_unavailable,
-            )
+            node_name = str(_value(_metadata(node), "name"))
+            try:
+                outcome = self._reconcile_node(node, budget=budget)
+            except Exception:
+                # Per node, because the pass is a fleet-wide loop over a sorted
+                # list: one node's 404 (deleted between LIST and patch), 5xx or
+                # missing InternalIP used to skip every node after it in sort
+                # order, every 5 s, for as long as the condition lasted.
+                LOGGER.exception(
+                    "node %s could not be reconciled; continuing with the rest",
+                    node_name,
+                )
+                result["error"] += 1
+                continue
             result[outcome] += 1
-            if outcome in {"created", "running"}:
-                in_flight += 1
         return result
+
+    def _active_installer_jobs(self) -> int:
+        response = self.batch.list_namespaced_job(
+            self.namespace,
+            label_selector=f"{INSTALLER_JOB_LABEL}=true",
+            _request_timeout=REQUEST_TIMEOUT,
+        )
+        active = 0
+        for item in _value(response, "items", []) or []:
+            if _job_condition(item, "Complete") or _job_condition(item, "Failed"):
+                continue
+            active += 1
+        return active
 
     def _wave_settings(self) -> tuple[frozenset[str] | None, int]:
         if self.wave_config_map is None:
@@ -260,6 +411,7 @@ class NodeInstallerReconciler:
         value = self.core.read_namespaced_config_map(
             self.wave_config_map,
             self.namespace,
+            _request_timeout=REQUEST_TIMEOUT,
         )
         data = dict(_value(value, "data", {}) or {})
         raw_nodes = str(data.get("allowed-nodes") or "").strip()
@@ -277,7 +429,7 @@ class NodeInstallerReconciler:
             raise RuntimeError("installer wave max-unavailable must be positive")
         return allowed_nodes, max_unavailable
 
-    def _reconcile_node(self, node: Any, *, allow_create: bool = True) -> str:
+    def _reconcile_node(self, node: Any, *, budget: _InstallBudget) -> str:
         metadata = _metadata(node)
         node_name = str(_value(metadata, "name"))
         node_uid = str(_value(metadata, "uid"))
@@ -301,7 +453,9 @@ class NodeInstallerReconciler:
                 return "current"
             if recorded_boot is None:
                 # Installed before boot ids were recorded: adopt this boot.
-                self._mark_node(node_name, node_uid, "Succeeded", boot_id)
+                self._mark_node(
+                    node_name, node_uid, "Succeeded", boot_id, annotations=annotations
+                )
                 return "current"
             # The node booted since the installation was recorded. A plain
             # reboot keeps the software and the Agent comes back on its own; a
@@ -309,7 +463,9 @@ class NodeInstallerReconciler:
             # and its annotations but not /opt/gpu-fault. Only the Agent can
             # tell the two apart.
             if self.agent_alive(_internal_ip(node), self.agent_port):
-                self._mark_node(node_name, node_uid, "Succeeded", boot_id)
+                self._mark_node(
+                    node_name, node_uid, "Succeeded", boot_id, annotations=annotations
+                )
                 return "rebooted"
             ready_since = _ready_since(node)
             if (
@@ -326,7 +482,9 @@ class NodeInstallerReconciler:
                 boot_id,
                 self.agent_port,
             )
-            self._mark_node(node_name, node_uid, "Retrying", boot_id)
+            self._mark_node(
+                node_name, node_uid, "Retrying", boot_id, annotations=annotations
+            )
             installer_state = "Retrying"
 
         name = _job_name(
@@ -338,11 +496,13 @@ class NodeInstallerReconciler:
             ),
         )
         try:
-            job = self.batch.read_namespaced_job(name, self.namespace)
+            job = self.batch.read_namespaced_job(
+                name, self.namespace, _request_timeout=REQUEST_TIMEOUT
+            )
         except Exception as error:
             if _api_status(error) != 404:
                 raise
-            if not allow_create:
+            if not budget.allows_create:
                 return "deferred"
             try:
                 body = self._build_job(node, name)
@@ -350,50 +510,151 @@ class NodeInstallerReconciler:
                 LOGGER.error("node %s cannot be installed: %s", node_name, build_error)
                 return "unsupported"
             try:
-                self.batch.create_namespaced_job(self.namespace, body)
+                self.batch.create_namespaced_job(
+                    self.namespace, body, _request_timeout=REQUEST_TIMEOUT
+                )
             except Exception as create_error:
                 if _api_status(create_error) != 409:
                     raise
-            self._mark_node(node_name, node_uid, "Installing", boot_id)
+            # Before the annotation patch: the slot is spent the moment the Job
+            # exists, whether or not this node's patch lands.
+            budget.consume()
+            self._mark_node(
+                node_name, node_uid, "Installing", boot_id, annotations=annotations
+            )
             LOGGER.info("created installer Job %s for node %s", name, node_name)
             return "created"
 
         if _job_condition(job, "Complete"):
             if not identity_matches or installer_state == "Retrying":
-                self.batch.delete_namespaced_job(
-                    name,
-                    self.namespace,
-                    propagation_policy="Background",
+                self._delete_job(name)
+                self._mark_node(
+                    node_name, node_uid, "Retrying", boot_id, annotations=annotations
                 )
-                self._mark_node(node_name, node_uid, "Retrying", boot_id)
                 LOGGER.warning(
                     "deleted stale completed installer Job %s for replay",
                     name,
                 )
                 return "running"
-            self._mark_node(node_name, node_uid, "Succeeded", boot_id)
+            self._mark_node(
+                node_name, node_uid, "Succeeded", boot_id, annotations=annotations
+            )
             return "succeeded"
         if _job_condition(job, "Failed"):
-            if self._retry_due(job):
-                self.batch.delete_namespaced_job(
-                    name,
-                    self.namespace,
-                    propagation_policy="Background",
+            attempts = _attempt_count(annotations)
+            if self._retry_due(job, attempts):
+                self._delete_job(name)
+                self._mark_node(
+                    node_name,
+                    node_uid,
+                    "Retrying",
+                    boot_id,
+                    annotations=annotations,
+                    attempts=attempts + 1,
                 )
-                self._mark_node(node_name, node_uid, "Retrying", boot_id)
-                LOGGER.warning("deleted failed installer Job %s for retry", name)
+                LOGGER.warning(
+                    "deleted failed installer Job %s for retry (attempt %s)",
+                    name,
+                    attempts + 1,
+                )
+                return "failed"
+            recorded_reason = annotations.get(INSTALLER_REASON_ANNOTATION)
+            if installer_state == "Unsupported" and recorded_reason:
+                # Already classified for this Job: reuse the recorded reason
+                # rather than listing its Pods again every 5 s. Any retry clears
+                # the annotation, so the next failure is classified afresh.
+                never_started = recorded_reason
             else:
-                self._mark_node(node_name, node_uid, "Failed", boot_id)
+                never_started = self._pod_never_started_reason(name)
+            if never_started is not None:
+                # Nothing ran on the node, so there is nothing to retry until
+                # whatever the Pod is waiting for changes -- most often a
+                # missing key in the node-action Secret, which this identity
+                # cannot read. Report it and let the backoff curve hold the
+                # install slot open for the rest of the fleet.
+                LOGGER.error(
+                    "node %s installer Pod never started (%s); next retry in %ss",
+                    node_name,
+                    never_started,
+                    self._retry_delay_seconds(attempts),
+                )
+                self._mark_node(
+                    node_name,
+                    node_uid,
+                    "Unsupported",
+                    boot_id,
+                    annotations=annotations,
+                    reason=never_started,
+                )
+                return "unsupported"
+            self._mark_node(
+                node_name, node_uid, "Failed", boot_id, annotations=annotations
+            )
             return "failed"
         return "running"
 
-    def _retry_due(self, job: Any) -> bool:
-        created = _value(_metadata(job), "creation_timestamp")
-        if created is None:
+    def _delete_job(self, name: str) -> None:
+        self.batch.delete_namespaced_job(
+            name,
+            self.namespace,
+            propagation_policy="Background",
+            _request_timeout=REQUEST_TIMEOUT,
+        )
+
+    def _retry_delay_seconds(self, attempts: int) -> int:
+        """``retry_seconds`` doubled per recorded attempt, capped at one hour."""
+
+        exponent: int = min(max(attempts, 0), 8)
+        delay: int = self.retry_seconds * int(2**exponent)
+        return min(delay, MAX_RETRY_SECONDS)
+
+    def _retry_due(self, job: Any, attempts: int = 0) -> bool:
+        reference = _failure_time(job)
+        if reference is None:
+            created = _value(_metadata(job), "creation_timestamp")
+            reference = _as_datetime(created)
+        if reference is None:
             return True
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        return (self.now() - created).total_seconds() >= self.retry_seconds
+        elapsed = (self.now() - reference).total_seconds()
+        return elapsed >= self._retry_delay_seconds(attempts)
+
+    def _pod_never_started_reason(self, job_name: str) -> str | None:
+        """The waiting reason of a Job Pod that never ran a container, if any.
+
+        Diagnostics: a reconciler without ``pods`` read access simply learns
+        nothing here and keeps the plain backoff, so this can never make a
+        failure look like a success.
+        """
+
+        try:
+            response = self.core.list_namespaced_pod(
+                self.namespace,
+                label_selector=f"job-name={job_name}",
+                _request_timeout=REQUEST_TIMEOUT,
+            )
+        except Exception:
+            LOGGER.warning(
+                "could not read the Pods of installer Job %s", job_name, exc_info=True
+            )
+            return None
+        for pod in _value(response, "items", []) or []:
+            status = _value(pod, "status", {})
+            for field in (
+                "init_container_statuses",
+                "initContainerStatuses",
+                "container_statuses",
+                "containerStatuses",
+            ):
+                for container in _value(status, field, []) or []:
+                    waiting = _value(_value(container, "state", {}), "waiting")
+                    if waiting is None:
+                        continue
+                    reason = str(_value(waiting, "reason") or "")
+                    if reason not in POD_NEVER_STARTED_REASONS:
+                        continue
+                    message = str(_value(waiting, "message") or "").strip()
+                    return f"{reason}: {message}"[:512] if message else reason
+        return None
 
     def _mark_node(
         self,
@@ -401,8 +662,25 @@ class NodeInstallerReconciler:
         node_uid: str,
         state: str,
         boot_id: str | None = None,
+        *,
+        annotations: dict[str, str],
+        attempts: int | None = None,
+        reason: str | None = None,
     ) -> None:
-        annotations = {
+        """Patch the Node's installer annotations unless they already say this.
+
+        ``annotations`` is this pass's view of the Node and is updated in place
+        on success, so a node parked in ``Failed`` waiting out its backoff is
+        not rewritten with identical content every 5 s.
+        """
+
+        if state == "Succeeded":
+            target_attempts = 0
+        elif attempts is None:
+            target_attempts = _attempt_count(annotations)
+        else:
+            target_attempts = max(attempts, 0)
+        desired: dict[str, str | None] = {
             INSTALLER_VERSION_ANNOTATION: self.version,
             INSTALLER_DIGEST_ANNOTATION: self.config_digest,
             INSTALLER_ARTIFACT_ANNOTATION: self.artifact_sha256,
@@ -412,11 +690,27 @@ class NodeInstallerReconciler:
             INSTALLER_STATE_ANNOTATION: state,
         }
         if boot_id is not None:
-            annotations[INSTALLER_BOOT_ID_ANNOTATION] = boot_id
+            desired[INSTALLER_BOOT_ID_ANNOTATION] = boot_id
+        if target_attempts > 0:
+            desired[INSTALLER_ATTEMPTS_ANNOTATION] = str(target_attempts)
+        elif INSTALLER_ATTEMPTS_ANNOTATION in annotations:
+            desired[INSTALLER_ATTEMPTS_ANNOTATION] = None
+        if reason:
+            desired[INSTALLER_REASON_ANNOTATION] = reason
+        elif INSTALLER_REASON_ANNOTATION in annotations:
+            desired[INSTALLER_REASON_ANNOTATION] = None
+        if _annotations_match(annotations, desired):
+            return
         self.core.patch_node(
             node_name,
-            {"metadata": {"annotations": annotations}},
+            {"metadata": {"annotations": desired}},
+            _request_timeout=REQUEST_TIMEOUT,
         )
+        for key, value in desired.items():
+            if value is None:
+                annotations.pop(key, None)
+            else:
+                annotations[key] = value
 
     def _build_job(self, node: Any, job_name: str) -> dict[str, Any]:
         body = copy.deepcopy(self.job_template)
@@ -580,7 +874,9 @@ def main() -> None:
         template_data = Path(template_path).read_bytes()
         origin = template_path
     else:
-        config_map = core.read_namespaced_config_map(template_name, namespace)
+        config_map = core.read_namespaced_config_map(
+            template_name, namespace, _request_timeout=REQUEST_TIMEOUT
+        )
         template_data = (config_map.data or {}).get("job.yaml", "")
         origin = f"{template_name}/job.yaml"
     job_template = load_job_template(
