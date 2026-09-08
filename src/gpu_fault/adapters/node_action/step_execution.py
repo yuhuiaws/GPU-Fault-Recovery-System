@@ -215,6 +215,7 @@ class NodeActionExecutionService:
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id}: {result.error}",
                 details={
+                    **self._partial_progress(state),
                     "node_action_interrupted": True,
                     "manual_confirmation_required": True,
                     "operation": context.step.operation.value,
@@ -230,6 +231,7 @@ class NodeActionExecutionService:
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
                 details={
+                    **self._partial_progress(state),
                     "waiting_node": node_id,
                     "reason": result.error or "retryable node action failure",
                     "retryable_node_action": True,
@@ -254,6 +256,7 @@ class NodeActionExecutionService:
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
                 details={
+                    **self._partial_progress(state),
                     "gpu_client_quiesce_attempt": state.verify_attempt,
                     "waiting_node": node_id,
                     "reason": result.error,
@@ -267,10 +270,35 @@ class NodeActionExecutionService:
             # re-submit bound; the attempt count and last error it recorded
             # are the operator's only view of what the agent tried.
             failure_details.update(result.details)
+        # Last, so this step's own accounting of what it finished cannot be
+        # overwritten by a same-named key the agent happened to report.
+        failure_details.update(self._partial_progress(state))
         return WorkflowStepOutcome.failed(
             f"node agent {node_id}: {result.error or 'action failed'}",
             details=failure_details,
         )
+
+    @staticmethod
+    def _partial_progress(state: NodeActionBatchState) -> dict[str, Any]:
+        """What this step already did, for an outcome that exits mid-batch.
+
+        A non-parallel multi-node step folds one node at a time, so every node
+        before the one that failed, was interrupted or has to be waited on was
+        really acted on: its GPUs were reset, its services quiesced, its
+        diagnostic run. Operators (and the follow-up steps that have to undo
+        that work) read ``result_details.node_results``, and only ``_finalize``
+        used to fill it -- so a terminal FAILED from the second node reported
+        the failure alone and never named the first, as if nothing had
+        happened on the cluster.
+
+        A copy, not the live dict: the outcome is the record of this instant,
+        and folding continues in the WAITING/diagnostic cases.
+        """
+
+        return {
+            "node_results": dict(state.node_results),
+            "completed_nodes": sorted(state.node_results),
+        }
 
     @staticmethod
     def _fold_step_outcome(

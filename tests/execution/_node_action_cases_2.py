@@ -955,3 +955,156 @@ def test_node_action_adapter_loads_node_secret_directory(monkeypatch, tmp_path) 
     adapter = NodeActionWorkflowAdapter.from_environment()
 
     assert adapter._secret_for_node("cluster-a", "node-a") == ("a" * 64)
+
+
+def _two_node_outcome(
+    operation: WorkflowOperation, answers: dict[str, dict]
+) -> WorkflowStepOutcome:
+    """One non-parallel step over node-a then node-b with canned answers.
+
+    ``answers`` maps a node id to the keyword arguments of the
+    ``NodeActionResult`` its agent returns, so a case only has to say how the
+    second node answered.
+    """
+
+    store = build_store()
+    incident, workflow = workflow_state(store, [operation])
+    registry = StubFleetRegistry(
+        {"node-a": "http://node-a:9099", "node-b": "http://node-b:9099"}
+    )
+
+    def sender(_endpoint, envelope):
+        answer = answers[envelope.command.node_id]
+        return node_action_result(
+            envelope.command.command_id, envelope.command.operation, **answer
+        )
+
+    adapter = NodeActionWorkflowAdapter({}, "s" * 32, sender=sender, registry=registry)
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        node_ids=["node-a", "node-b"],
+        gpu_uuids=["GPU-a"],
+    )
+    return adapter.execute(
+        WorkflowStepContext(
+            workflow=copy_model(workflow, official_steps=[step]),
+            incident=incident,
+            step=step,
+            step_index=0,
+            request=WorkflowExecutionRequest(
+                expected_fencing_token=workflow.fencing_token
+            ),
+            idempotency_key="workflow/two-nodes",
+        )
+    )
+
+
+def test_a_failed_second_node_still_reports_the_first_nodes_result() -> None:
+    """A terminal FAILED must still name the nodes the step already changed.
+
+    The step folds one node at a time, so node-a's action really ran on the
+    cluster before node-b refused. Reporting only ``node agent node-b: ...``
+    hides that from the operator reading ``result_details.node_results`` and
+    from any later step that has to undo what node-a already did.
+    """
+
+    outcome = _two_node_outcome(
+        WorkflowOperation.VALIDATE_GPU,
+        {
+            "node-a": {
+                "status": NodeActionStatus.SUCCEEDED,
+                "details": {"validated": True},
+            },
+            "node-b": {
+                "status": NodeActionStatus.FAILED,
+                "error": "GPU 0 is still faulted",
+            },
+        },
+    )
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert outcome.error == "node agent node-b: GPU 0 is still faulted", outcome.error
+    assert outcome.details["node_results"]["node-a"] == {"validated": True}, (
+        "the failed step dropped the node that already succeeded"
+    )
+    assert outcome.details["completed_nodes"] == ["node-a"], outcome.details
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (
+            {
+                "status": NodeActionStatus.FAILED,
+                "error": "OSError: temporary transport error",
+                "retryable": True,
+            },
+            WorkflowStepStatus.WAITING,
+        ),
+        (
+            {
+                "status": NodeActionStatus.INTERRUPTED,
+                "error": "the agent restarted mid-action",
+            },
+            WorkflowStepStatus.FAILED,
+        ),
+    ],
+    ids=["retryable", "interrupted"],
+)
+def test_an_early_held_or_interrupted_node_keeps_the_earlier_node_results(
+    answer: dict, expected: WorkflowStepStatus
+) -> None:
+    """A hold and a manual-confirmation exit report the same partial state.
+
+    The retryable hold is re-claimed and replays node-a from the agent ledger,
+    but the INTERRUPTED exit is terminal, and an operator asked to confirm by
+    hand needs to know node-a was already acted on.
+    """
+
+    outcome = _two_node_outcome(
+        WorkflowOperation.VALIDATE_GPU,
+        {
+            "node-a": {
+                "status": NodeActionStatus.SUCCEEDED,
+                "details": {"validated": True},
+            },
+            "node-b": answer,
+        },
+    )
+
+    assert outcome.status is expected, outcome
+    assert outcome.details["node_results"]["node-a"] == {"validated": True}, (
+        "the early exit dropped the node that already succeeded"
+    )
+    assert outcome.details["completed_nodes"] == ["node-a"], outcome.details
+
+
+def test_a_quiesce_wait_on_the_second_node_keeps_the_first_nodes_result() -> None:
+    """VERIFY_NO_GPU_CLIENTS waits per attempt and must not forget node-a.
+
+    The attempt counter rides on the step details across the wait, and the
+    per-node results have to ride along with it: the operator reads which
+    nodes are already clear while the step keeps waiting on the rest.
+    """
+
+    outcome = _two_node_outcome(
+        WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+        {
+            "node-a": {
+                "status": NodeActionStatus.SUCCEEDED,
+                "details": {"gpu_clients": []},
+            },
+            "node-b": {
+                "status": NodeActionStatus.FAILED,
+                "error": "GPU clients are still active: 2",
+            },
+        },
+    )
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert outcome.details["waiting_node"] == "node-b", outcome.details
+    assert outcome.details["node_results"]["node-a"] == {"gpu_clients": []}, (
+        "the quiesce wait dropped the node that already verified clean"
+    )
+    assert outcome.details["completed_nodes"] == ["node-a"], outcome.details

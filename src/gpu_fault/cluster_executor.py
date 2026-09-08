@@ -1467,10 +1467,13 @@ class ClusterActionExecutor:
                     return RemoteCommandResult(
                         lease_token=lease_token,
                         status=RemoteCommandStatus.WAITING,
-                        details={
-                            "fleet_preflight_blocked": True,
-                            "reason": preflight_error,
-                        },
+                        details=self._hold_details(
+                            command,
+                            {
+                                "fleet_preflight_blocked": True,
+                                "reason": preflight_error,
+                            },
+                        ),
                     )
             matches = [
                 adapter for adapter in self.adapters if adapter.supports(command.step)
@@ -1664,7 +1667,9 @@ class ClusterActionExecutor:
                 ",".join(command.step.node_ids),
                 retryable.details["reason"],
             )
-            return retryable
+            return retryable.model_copy(
+                update={"details": self._hold_details(command, retryable.details)}
+            )
         if not retryable_adapter_error(exc):
             return None
         self._increment("retryable_adapter_errors_total")
@@ -1683,14 +1688,45 @@ class ClusterActionExecutor:
             lease_token=lease_token,
             status=RemoteCommandStatus.WAITING,
             status_source="executor-retryable-adapter-error",
-            details={
-                "retryable_adapter_error": True,
-                "reason": "RETRYABLE_ADAPTER_ERROR",
-                "executor_id": self.executor_id,
-                "exception_type": type(exc).__name__,
-                "adapter_error": str(exc)[:200],
-            },
+            details=self._hold_details(
+                command,
+                {
+                    "retryable_adapter_error": True,
+                    "reason": "RETRYABLE_ADAPTER_ERROR",
+                    "executor_id": self.executor_id,
+                    "exception_type": type(exc).__name__,
+                    "adapter_error": str(exc)[:200],
+                },
+            ),
         )
+
+    def _hold_details(
+        self,
+        command: RemoteActionCommand,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        """This hold's own keys over whatever the previous cycle recorded.
+
+        ``complete_remote_command`` *replaces* ``result_details`` rather than
+        merging it, so a WAITING result the executor manufactures itself
+        becomes the entire record of the step. Everything an adapter needs to
+        resume its own asynchronous operation lives only there:
+        ``agent_baselines`` and ``spare_failover_pending`` for the HyperPod
+        lifecycle steps, ``gpu_client_quiesce_attempt`` for the 60-attempt
+        VERIFY_NO_GPU_CLIENTS bound. Posting only the hold's own keys made the
+        next cycle read a WAITING execution with no continuation state, so a
+        reboot that had already landed could never be auto-confirmed and the
+        quiesce bound reset on every transient failure.
+
+        Two rules keep this from widening anything. The hold's own keys win, so
+        ``reason``/``executor_id`` always describe *this* cycle. And only
+        executor-manufactured WAITING results merge: a terminal SUCCEEDED or
+        FAILED must never carry mid-flight state, and an adapter's own outcome
+        is its own -- it already sees the previous details as a replayed step
+        execution and carries forward only what it means to keep.
+        """
+
+        return {**(command.result_details or {}), **details}
 
     def _barrier_hold(
         self,
@@ -1736,13 +1772,16 @@ class ClusterActionExecutor:
             lease_token=lease_token,
             status=RemoteCommandStatus.WAITING,
             status_source="executor-barrier-unavailable",
-            details={
-                "multi_node_barrier_unavailable": True,
-                "operation": command.step.operation.value,
-                "node_ids": list(command.step.node_ids),
-                "reason": reason,
-                "executor_id": self.executor_id,
-            },
+            details=self._hold_details(
+                command,
+                {
+                    "multi_node_barrier_unavailable": True,
+                    "operation": command.step.operation.value,
+                    "node_ids": list(command.step.node_ids),
+                    "reason": reason,
+                    "executor_id": self.executor_id,
+                },
+            ),
         )
 
     def _retryable_control_plane_result(
@@ -1769,13 +1808,16 @@ class ClusterActionExecutor:
             lease_token=lease_token,
             status=RemoteCommandStatus.WAITING,
             status_source="executor-retryable-control-plane",
-            details={
-                "retryable_control_plane_error": True,
-                "status_code": exc.status_code,
-                "reason": str(exc),
-                "executor_id": self.executor_id,
-                "exception_type": type(exc).__name__,
-            },
+            details=self._hold_details(
+                command,
+                {
+                    "retryable_control_plane_error": True,
+                    "status_code": exc.status_code,
+                    "reason": str(exc),
+                    "executor_id": self.executor_id,
+                    "exception_type": type(exc).__name__,
+                },
+            ),
         )
 
     def _validate(self, command: RemoteActionCommand) -> None:

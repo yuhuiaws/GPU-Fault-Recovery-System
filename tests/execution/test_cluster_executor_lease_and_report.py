@@ -63,10 +63,17 @@ def remote_command(
     command_id: str,
     *,
     operation: WorkflowOperation = WorkflowOperation.VALIDATE_HOST,
+    node_ids: list[str] | None = None,
     result_details: dict[str, Any] | None = None,
+    workflow_steps: bool = False,
 ) -> RemoteActionCommand:
-    """A claimed command whose fencing tokens agree, so ``_validate`` passes."""
+    """A claimed command whose fencing tokens agree, so ``_validate`` passes.
 
+    ``workflow_steps`` puts this command's own step into the workflow's
+    ``official_steps``, which is what the destructive fleet preflight reads.
+    """
+
+    step = workflow_step(operation, node_ids=node_ids)
     return RemoteActionCommand(
         command_id=command_id,
         cluster_id=CLUSTER,
@@ -76,9 +83,12 @@ def remote_command(
         fencing_token=FENCING_TOKEN,
         idempotency_key=f"idem-{command_id}",
         lease_token=f"lease-{command_id}",
-        step=workflow_step(operation),
+        step=step,
         workflow=workflow_request(
-            "workflow-a", "incident-a", fencing_token=FENCING_TOKEN
+            "workflow-a",
+            "incident-a",
+            fencing_token=FENCING_TOKEN,
+            official_steps=[step] if workflow_steps else [],
         ),
         incident=fault_incident("incident-a", "event-a", fencing_token=FENCING_TOKEN),
         result_details=result_details or {},
@@ -589,3 +599,205 @@ def test_a_reclaimed_command_replays_its_recorded_details_to_the_adapter() -> No
     # The replay is a copy: the claimed command still carries the record the
     # control plane sent, so reporting cannot echo a fabricated execution back.
     assert command.workflow.step_executions == []
+
+
+def api_exception(status: int) -> Exception:
+    """A ``kubernetes.client`` ApiException as the classifier recognises it.
+
+    Built by name and module so the retryable-adapter-error classification is
+    exercised without importing the Kubernetes client extra.
+    """
+
+    exc = type(
+        "ApiException", (Exception,), {"__module__": "kubernetes.client.exceptions"}
+    )(f"({status}) Reason: HTTP {status}")
+    exc.status = status  # type: ignore[attr-defined]
+    return exc
+
+
+# The continuation state a multi-cycle adapter step keeps in its own details:
+# the HyperPod lifecycle adapter resumes RESTART_NODE/REPLACE_NODE from
+# ``agent_baselines``/``spare_failover_pending``, and VERIFY_NO_GPU_CLIENTS
+# bounds its wait with ``gpu_client_quiesce_attempt``.
+CONTINUATION_STATE: dict[str, Any] = {
+    "agent_baselines": {"node-a": {"boot_id": "boot-1", "generation": 7}},
+    "spare_failover_pending": True,
+    "gpu_client_quiesce_attempt": 12,
+    "reason": "waiting for the reboot to land",
+}
+
+
+def test_a_retryable_adapter_error_keeps_the_previous_cycles_details() -> None:
+    """A transient adapter failure may not erase what the last cycle recorded.
+
+    ``complete_remote_command`` *replaces* ``result_details``, so a WAITING
+    result the executor manufactured itself is the whole record of the step
+    from then on. Posting only ``retryable_adapter_error`` wiped the HyperPod
+    adapter's ``agent_baselines``: the next cycle saw a WAITING execution with
+    no baselines, could not auto-confirm the reboot it had already submitted,
+    and idled to the step bound. The executor's own keys still win, so
+    ``reason`` is this cycle's reason and not the stale one.
+    """
+
+    command = remote_command("command-a", result_details=dict(CONTINUATION_STATE))
+    client = FakeExecutorClient([command])
+    executor = build_executor(client, [RecordingAdapter(raises=api_exception(503))])
+
+    assert executor.run_once() == 1
+    result = client.reported("command-a")
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.status_source == "executor-retryable-adapter-error", result
+    assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
+        "the retryable hold dropped the adapter's continuation state"
+    )
+    assert result.details["spare_failover_pending"] is True, result.details
+    assert result.details["gpu_client_quiesce_attempt"] == 12, result.details
+    assert result.details["retryable_adapter_error"] is True, result.details
+    assert result.details["reason"] == "RETRYABLE_ADAPTER_ERROR", (
+        "the executor's own keys must win over the replayed ones"
+    )
+
+
+def test_a_retryable_control_plane_hold_keeps_the_previous_cycles_details() -> None:
+    """Same rule for a 503 from the control plane behind a regional proxy."""
+
+    command = remote_command("command-a", result_details=dict(CONTINUATION_STATE))
+    client = FakeExecutorClient([command])
+    executor = build_executor(
+        client,
+        [
+            RecordingAdapter(
+                raises=ClusterExecutorError(
+                    "regional control plane rejected request (503): store unavailable",
+                    status_code=503,
+                )
+            )
+        ],
+    )
+
+    assert executor.run_once() == 1
+    result = client.reported("command-a")
+    assert result.status_source == "executor-retryable-control-plane", result
+    assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
+        "a transient control-plane read dropped the adapter's continuation state"
+    )
+    assert result.details["retryable_control_plane_error"] is True, result.details
+    assert result.details["reason"] == (
+        "regional control plane rejected request (503): store unavailable"
+    ), "the executor's own keys must win over the replayed ones"
+
+
+class FenceRegistry:
+    """Fleet registry stand-in that answers the rollout fence remotely.
+
+    The regional proxy owns no store and answers the fence with a control-plane
+    round trip, which ``fleet_rollout_fence`` resolves by this method's
+    presence.
+    """
+
+    def fleet_rollout_fence_deployments(self, cluster_id: str) -> list[str]:
+        return ["deployment-1"]
+
+
+def test_a_fleet_preflight_hold_keeps_the_previous_cycles_details() -> None:
+    """A rollout that starts mid-step must not cost the step its memory.
+
+    The destructive preflight holds the command WAITING for as long as the
+    fleet rollout runs. That hold is the executor's, not the adapter's, so
+    without the merge a REPLACE_NODE already waiting on a warm spare loses
+    ``spare_failover_pending`` and restarts its failover from scratch.
+    """
+
+    command = remote_command(
+        "command-a",
+        operation=WorkflowOperation.MARK_UNSCHEDULABLE,
+        result_details=dict(CONTINUATION_STATE),
+        workflow_steps=True,
+    )
+    client = FakeExecutorClient([command])
+    adapter = RecordingAdapter()
+    adapter.registry = FenceRegistry()  # type: ignore[attr-defined]
+    executor = build_executor(client, [adapter])
+
+    assert executor.run_once() == 1
+    result = client.reported("command-a")
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.details["fleet_preflight_blocked"] is True, result.details
+    assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
+        "the preflight hold dropped the adapter's continuation state"
+    )
+    assert "fleet rollout fence blocked" in result.details["reason"], (
+        "the executor's own keys must win over the replayed ones"
+    )
+    assert adapter.contexts == [], "the adapter must not run behind a closed fence"
+
+
+def test_a_barrier_hold_keeps_the_previous_cycles_details() -> None:
+    """The barrier refusal is a hold too, and holds do not truncate history."""
+
+    command = remote_command(
+        "command-a",
+        operation=WorkflowOperation.RESET_GPU,
+        node_ids=["node-a", "node-b"],
+        result_details=dict(CONTINUATION_STATE),
+    )
+    client = FakeExecutorClient([command])
+    executor = build_executor(client, [RecordingAdapter()])
+
+    assert executor.run_once() == 1
+    result = client.reported("command-a")
+    assert result.status_source == "executor-barrier-unavailable", result
+    assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
+        "the barrier hold dropped the adapter's continuation state"
+    )
+    assert result.details["multi_node_barrier_unavailable"] is True, result.details
+
+
+@pytest.mark.parametrize(
+    ("adapter", "status_source"),
+    [
+        (
+            RecordingAdapter(raises=ValueError("adapter wiring is wrong")),
+            "executor-internal-error",
+        ),
+        (
+            RecordingAdapter(
+                raises=ClusterExecutorError("stale fencing token", status_code=409)
+            ),
+            "executor-rejected",
+        ),
+        (
+            RecordingAdapter(
+                status=WorkflowStepStatus.FAILED,
+                step_error="the GPU is still faulted",
+                details={"probe": "ran"},
+            ),
+            None,
+        ),
+    ],
+    ids=["defect", "rejected", "adapter-failed"],
+)
+def test_a_terminal_result_does_not_inherit_the_previous_cycles_details(
+    adapter: RecordingAdapter, status_source: str | None
+) -> None:
+    """Merging is for holds only: a verdict must not carry waiting state.
+
+    ``gpu_client_quiesce_attempt`` or ``spare_failover_pending`` surviving into
+    a FAILED result would tell the control plane and the operator that a step
+    that is over is still mid-flight, and the next reader of the details cannot
+    tell an inherited key from a fresh one.
+    """
+
+    command = remote_command("command-a", result_details=dict(CONTINUATION_STATE))
+    client = FakeExecutorClient([command])
+    executor = build_executor(client, [adapter])
+
+    assert executor.run_once() == 1
+    result = client.reported("command-a")
+    assert result.status is RemoteCommandStatus.FAILED, result
+    assert result.status_source == status_source, result
+    assert "agent_baselines" not in result.details, (
+        "a terminal result inherited the previous cycle's waiting state"
+    )
+    assert "spare_failover_pending" not in result.details, result.details
+    assert "gpu_client_quiesce_attempt" not in result.details, result.details
