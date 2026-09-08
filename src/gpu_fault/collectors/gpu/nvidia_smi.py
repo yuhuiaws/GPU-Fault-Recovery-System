@@ -34,6 +34,11 @@ from gpu_fault.collectors.sinks import (
 
 LOGGER = logging.getLogger(__name__)
 
+# A field the driver refuses is a property of the hardware, not of the round: it
+# repeats for the process's whole lifetime, so the split-fallback warning is
+# emitted once per this many refused rounds instead of on every one.
+MERGED_QUERY_REFUSAL_WARN_EVERY_ROUNDS = 10
+
 NVIDIA_SMI_CORE_FIELDS: dict[str, tuple[str, str | None]] = {
     "temperature.gpu": ("gpu_temperature_c", "celsius"),
     "power.draw": ("power_usage_w", "watts"),
@@ -144,6 +149,7 @@ class NvidiaSmiMetricsCollector:
         self._next_inventory_at: datetime | None = None
         self._temperature_limit_samples: list[GpuMetricSample] | None = None
         self._consecutive_failures = 0
+        self._merged_query_refusals = 0
 
     def collect_once(self) -> GpuMetricBatch:
         started_at = self.now()
@@ -337,11 +343,16 @@ class NvidiaSmiMetricsCollector:
         query_fields = [*self._IDENTITY_FIELDS, *merged]
         result = self._run_query(query_fields)
         if result.returncode == 0:
+            self._merged_query_refusals = 0
             return self.parse_csv(result.stdout, query_fields, merged)
-        LOGGER.warning(
-            "merged nvidia-smi query refused (%s); querying each field group",
-            result.stderr.strip() or "no error detail",
-        )
+        self._merged_query_refusals += 1
+        if self._merged_query_refusals % MERGED_QUERY_REFUSAL_WARN_EVERY_ROUNDS == 1:
+            LOGGER.warning(
+                "merged nvidia-smi query refused on %d consecutive round(s) (%s); "
+                "querying each field group",
+                self._merged_query_refusals,
+                result.stderr.strip() or "no error detail",
+            )
         samples = self._query(NVIDIA_SMI_CORE_FIELDS, required=True)
         for optional_fields in (
             NVIDIA_SMI_ECC_FIELDS,

@@ -324,19 +324,42 @@ def test_dcgm_metrics_survive_inventory_validation_error(
         lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
     )
     sink = RecordingSink()
-    times = iter([NOW, NOW + timedelta(seconds=15)])
+    ticks = iter(NOW + timedelta(seconds=15 * step) for step in range(7))
+    attempts: list[list[str]] = []
+    inventory_runner = _inventory_runner(8)
+
+    def runner(command, **kwargs) -> subprocess.CompletedProcess[str]:
+        if any(item.startswith("--query-gpu=index,uuid") for item in command):
+            attempts.append(list(command))
+        return inventory_runner(command, **kwargs)
+
     collector = DcgmMetricsCollector(
         sink,
         context(),
         node_id="worker-1",
-        now=lambda: next(times),
-        runner=_inventory_runner(8),
-        inventory_interval_seconds=3600,
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        inventory_interval_seconds=60,
+        now=lambda: next(ticks),
+        runner=runner,
+    )
+
+    for _ in range(3):
+        collector.collect_once()
+
+    assert len(attempts) == 3, "the first three ticks each retry the inventory"
+
+    for _ in range(3):
+        collector.collect_once()
+
+    assert len(attempts) == 3, (
+        "a permanently unusable inventory must back off to the inventory "
+        f"interval instead of paying a subprocess every tick: {len(attempts)}"
     )
 
     collector.collect_once()
-    collector.collect_once()
 
+    assert len(attempts) == 4, "the inventory retry resumes after the interval"
     paths = [path for path, _payload in sink.requests]
     assert paths.count(GPU_METRICS_PATH) == 1, (
         "an unusable expected GPU count blocked every metrics tick"
@@ -344,6 +367,64 @@ def test_dcgm_metrics_survive_inventory_validation_error(
     assert paths.count(GPU_INVENTORY_PATH) == 0, (
         "an invalid inventory snapshot must not be delivered"
     )
+
+
+def test_dcgm_temperature_limit_query_stops_probing_when_no_thresholds_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A driver that reports no temperature thresholds is not a success.
+
+    A vGPU or MIG device answers ``nvidia-smi -q -x`` with valid XML that
+    carries no threshold tags at all. An empty result left the samples unset
+    *and* cleared the failure counter, so the probe ran on every single tick
+    forever and no backoff could ever engage.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.urlopen",
+        lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
+    )
+    probes: list[list[str]] = []
+
+    def runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
+        if "-q" in command:
+            probes.append(list(command))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "<?xml version='1.0' ?><nvidia_smi_log><gpu>"
+                    "<minor_number>0</minor_number></gpu></nvidia_smi_log>"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            command, 0, stdout="0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n", stderr=""
+        )
+
+    ticks = iter(NOW + timedelta(seconds=15 * step) for step in range(7))
+    collector = DcgmMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        inventory_interval_seconds=60,
+        now=lambda: next(ticks),
+        runner=runner,
+    )
+
+    for _ in range(6):
+        collector.collect_once()
+
+    assert len(probes) == 3, (
+        "a limits query that reports no thresholds must count as a failure and "
+        f"back off, not run on every tick: {len(probes)} probes"
+    )
+
+    collector.collect_once()
+
+    assert len(probes) == 4, "the probe resumes once the inventory interval elapses"
 
 
 def test_dcgm_temperature_limit_query_backs_off_after_repeated_failures(

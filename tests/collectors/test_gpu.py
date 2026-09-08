@@ -249,13 +249,19 @@ def test_dcgm_edge_filter_ignores_micro_violation_creep() -> None:
 
 def test_dcgm_edge_filter_confirms_sustained_power_throttling() -> None:
     sink = RecordingSink()
-    times = iter([NOW + timedelta(seconds=15 * index) for index in range(6)])
+    times = iter(
+        [
+            *(NOW + timedelta(seconds=15 * index) for index in range(6)),
+            # One stale window (8 x the 15 s interval) past the last change.
+            NOW + timedelta(seconds=180),
+        ]
+    )
     collector = DcgmMetricsCollector(
         sink,
         context(),
         node_id="worker-1",
         now=lambda: next(times),
-        health_summary_seconds=300,
+        health_summary_seconds=3600,
         edge_confirmation_samples=3,
         violation_duty_cycle_threshold=0.05,
     )
@@ -274,13 +280,19 @@ def test_dcgm_edge_filter_confirms_sustained_power_throttling() -> None:
     collector.collect_text(text(9_000_000_000))
     collector.collect_text(text(9_000_000_000))
     collector.collect_text(text(9_000_000_000))
+    # A counter that stops advancing is only good news once it is certain the
+    # exporter is not simply lagging the scrape: an unrefreshed sample carries
+    # no information, so the recovery waits out the stale window
+    # (DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS x the 15 s interval) rather than
+    # firing on the next tick and flapping at every exporter cadence.
+    collector.collect_text(text(9_000_000_000))
 
     reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
     assert reasons == [
         ["initial-baseline"],
         ["candidate-confirmed"],
         ["candidate-recovered"],
-    ]
+    ], reasons
 
 
 def test_dcgm_edge_filter_ignores_a_violation_counter_that_outruns_the_clock() -> None:
@@ -333,6 +345,7 @@ def test_dcgm_edge_filter_ignores_a_violation_counter_that_outruns_the_clock() -
 
 
 DCGM_LOGGER = "gpu_fault.collectors.gpu.dcgm"
+NVIDIA_SMI_LOGGER = "gpu_fault.collectors.gpu.nvidia_smi"
 
 
 def _power_violation_text(nanoseconds: int) -> str:
@@ -436,6 +449,122 @@ def test_implausible_duty_cycle_blacklist_expires(
     reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
     assert reasons == [["initial-baseline"]], (
         "an implausible duty cycle must not become a candidate after expiry"
+    )
+
+
+def _lagging_exporter_texts(nanoseconds_per_change: int, ticks: int) -> list[str]:
+    """One exporter sample per two scrapes: the value changes on even ticks.
+
+    The DCGM exporter's factory default collect interval is 30 s while the
+    collector scrapes every 15 s, so every other tick reads back the identical
+    counter value and carries no new information at all.
+    """
+
+    return [
+        _power_violation_text(nanoseconds_per_change * (index // 2))
+        for index in range(ticks)
+    ]
+
+
+def test_duty_cycle_streak_survives_an_unrefreshed_exporter_tick() -> None:
+    """A sustained throttle must confirm even when the exporter lags the scrape.
+
+    An unrefreshed counter was graded 0.0 -- the same as a counter reset -- so
+    the key left the candidate set on every other tick and the confirmation
+    streak was rebuilt from scratch each time. At the production default of
+    three confirmations the streak could never reach three, and a real
+    sustained 60% power throttle produced no delivery edge at all.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    # 18 s of throttling per 30 s exporter window: a true 60% duty cycle.
+    for index, text in enumerate(_lagging_exporter_texts(18_000_000_000, 11)):
+        collector.collect_text(text, observed_at=NOW + timedelta(seconds=15 * index))
+
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    assert reasons == [["initial-baseline"], ["candidate-confirmed"]], (
+        "a sustained 60% throttle never confirmed because the streak reset on "
+        f"every unrefreshed tick: {reasons}"
+    )
+
+
+def test_duty_cycle_does_not_flap_when_the_exporter_lags_the_scrape() -> None:
+    """One confirmation sample turned the same lag into a flapping edge.
+
+    With ``edge_confirmation_samples=1`` the candidate was confirmed on every
+    refreshed tick and reported recovered on every unrefreshed one, so a single
+    throttling GPU produced a confirmed/recovered pair every 15 s.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=1,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    for index, text in enumerate(_lagging_exporter_texts(18_000_000_000, 11)):
+        collector.collect_text(text, observed_at=NOW + timedelta(seconds=15 * index))
+
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    recovered = [item for item in reasons if "candidate-recovered" in item]
+    assert recovered == [], (
+        f"an unrefreshed counter must not read as the throttle recovering: {reasons}"
+    )
+    assert reasons == [["initial-baseline"], ["candidate-confirmed"]], (
+        f"the throttle must be announced once, not on every refreshed tick: {reasons}"
+    )
+
+
+def test_implausible_duty_cycle_warning_is_not_re_armed_by_an_unrefreshed_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The expiry window must not be reset by a tick that carries no value.
+
+    An unrefreshed counter graded 0.0 fell below the threshold, which cleared
+    the write-off, so the next refreshed tick warned again: a permanently broken
+    counter warned on every exporter sample instead of once per expiry window.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=1,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    # 1.1x wall clock per 30 s exporter window: implausible at every spacing.
+    with caplog.at_level(logging.WARNING, logger=DCGM_LOGGER):
+        for index, text in enumerate(_lagging_exporter_texts(33_000_000_000, 21)):
+            collector.collect_text(
+                text, observed_at=NOW + timedelta(seconds=15 * index)
+            )
+
+    warnings = _duty_cycle_warnings(caplog)
+    assert len(warnings) == 2, (
+        "a broken counter read at a mismatched cadence must warn once per "
+        f"150 s expiry window over 300 s, not once per exporter sample: {warnings}"
+    )
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    assert reasons == [["initial-baseline"]], (
+        f"an implausible duty cycle must never become a candidate: {reasons}"
     )
 
 
@@ -1083,6 +1212,61 @@ def test_nvidia_smi_round_splits_the_query_only_when_a_field_is_refused(
     assert len([item for item in queries if "--query-gpu=" in item]) == 5, (
         f"the refused merged query must split into the four groups: {queries}"
     )
+
+
+def test_nvidia_smi_merged_query_refusal_warns_once_per_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A GPU model that lacks a field must not warn on every single round.
+
+    The refusal is a property of the hardware, not of the round: it repeats for
+    the process's whole lifetime, so warning every round buries the log the same
+    way the implausible-counter warning used to.
+    """
+
+    _nvidia_smi_environment(monkeypatch, tmp_path)
+
+    def runner(command, **kwargs) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(str(item) for item in command)
+        if "--query-gpu=index,uuid,pci.bus_id,name" in joined:
+            return _nvidia_smi_runner(command, **kwargs)
+        if "retired_pages.pending" in joined:
+            return completed_nvidia_smi(
+                "",
+                returncode=1,
+                stderr='Field "retired_pages.pending" is not a valid field to query.',
+            )
+        if "--query-gpu=" not in joined:
+            return completed_nvidia_smi("", returncode=1, stderr="no xml")
+        return completed_nvidia_smi(_nvidia_smi_csv(command))
+
+    times = iter(NOW + timedelta(seconds=step) for step in range(60))
+    collector = NvidiaSmiMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        inventory_interval_seconds=3600,
+        now=lambda: next(times),
+        runner=runner,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=NVIDIA_SMI_LOGGER):
+        for _ in range(11):
+            batch = collector.collect_once()
+
+    refusals = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == NVIDIA_SMI_LOGGER
+        and "merged nvidia-smi query" in record.getMessage()
+    ]
+    assert len(refusals) == 2, (
+        "a permanently refused field must warn once per window, not every round: "
+        f"{refusals}"
+    )
+    assert any(
+        sample.canonical_name == "gpu_temperature_c" for sample in batch.samples
+    ), "the split fallback must keep answering the core metrics every round"
 
 
 def test_nvidia_smi_inventory_the_outbox_took_is_not_re_sent_every_round(

@@ -46,6 +46,15 @@ DUTY_CYCLE_MAX_PLAUSIBLE = 1.05
 # counter cannot warn every tick, short enough that an operator who joined
 # later still learns why the counter is ignored.
 DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS = 10
+# A counter the exporter has not refreshed yet carries no information at all,
+# so its confirmation streak is carried over instead of reset. Not forever: past
+# this many collector intervals without a change the counter genuinely is not
+# advancing, and a confirmed candidate must be allowed to recover.
+DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS = 8
+# Consecutive inventory failures after which the delivery drops to the inventory
+# cadence: a permanent expected-count mismatch or a wedged driver otherwise
+# costs every tick one nvidia-smi subprocess and one traceback.
+INVENTORY_FAILURE_BACKOFF_THRESHOLD = 3
 # Consecutive temperature-limit failures after which the query drops to the
 # inventory cadence instead of costing every tick a 15 s subprocess timeout.
 TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD = 3
@@ -294,6 +303,8 @@ class DcgmMetricsCollector:
         self._last_inventory_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
         self._next_inventory_at: datetime | None = None
+        self._inventory_failures = 0
+        self._next_inventory_attempt_at: datetime | None = None
         self._temperature_limit_samples: list[GpuMetricSample] | None = None
         self._temperature_limit_failures = 0
         self._next_temperature_limit_attempt_at: datetime | None = None
@@ -452,10 +463,10 @@ class DcgmMetricsCollector:
         name = sample.canonical_name
         return name.endswith("_total") or name.endswith("_total_us")
 
-    def _duty_cycle(
+    def _grade_duty_cycle(
         self, sample: GpuMetricSample, observed_at: datetime
-    ) -> float | None:
-        """Fraction of the counter's own elapsed window spent in violation.
+    ) -> tuple[float | None, bool]:
+        """The counter's duty cycle, and whether this tick told us nothing new.
 
         The window is measured from the last observation that carried a
         *different* value, not from the previous tick. The exporter refreshes
@@ -464,26 +475,42 @@ class DcgmMetricsCollector:
         then attributes one full exporter window of accumulated violation time
         to a single 15 s tick: a real 60% throttle graded 1.20, was written off
         as an implausible counter, and never produced a delivery edge (F2).
-        Grading against the counter's own previous observation makes the result
-        independent of both cadences.
 
-        Returns ``None`` while no comparable previous sample exists, and
-        ``0`` for a counter reset, which is not itself a fault edge.
+        An unrefreshed read is not the same observation as a counter reset, and
+        conflating them cost the fix its point: grading the repeat 0.0 dropped
+        the key out of the candidate set, so the confirmation streak was rebuilt
+        from scratch on every other tick and at the default of three
+        confirmations a sustained throttle never confirmed at all. The second
+        element of the answer says "no new information": the caller carries the
+        streak over and leaves the implausible write-off alone.
+
+        Returns ``(None, False)`` when there is nothing to compare against,
+        ``(0.0, False)`` for a counter reset -- not itself a fault edge -- and
+        for a counter that has not moved for
+        ``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`` intervals, which is a real
+        observation of an idle GPU rather than a lagging exporter.
         """
 
         if not self._is_duty_cycle_counter(sample):
-            return None
+            return None, False
         previous = self._previous_values.get(self._sample_key(sample))
         if previous is None:
-            return None
+            return None, False
         previous_value, previous_observed_at = previous
         elapsed = (observed_at - previous_observed_at).total_seconds()
         if elapsed <= 0:
-            return None
+            return None, True
         delta = sample.value - previous_value
-        if delta <= 0:
-            return 0.0
-        return delta / (elapsed * 1_000_000)
+        if delta < 0:
+            return 0.0, False
+        if delta == 0:
+            stale_seconds = (
+                self.interval_seconds * DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS
+            )
+            if elapsed <= stale_seconds:
+                return None, True
+            return 0.0, False
+        return delta / (elapsed * 1_000_000), False
 
     def _duty_cycle_breached(
         self,
@@ -537,8 +564,16 @@ class DcgmMetricsCollector:
             )
         return False
 
-    def _candidate_keys(self, batch: GpuMetricBatch) -> set[str]:
+    def _candidate_keys(self, batch: GpuMetricBatch) -> tuple[set[str], set[str]]:
+        """The batch's candidate keys, and the keys it carries no news about.
+
+        The second set holds duty-cycle counters the exporter has not refreshed
+        since the previous scrape. They are neither candidates nor recoveries:
+        their streak is carried over untouched.
+        """
+
         candidates: set[str] = set()
+        carried_over: set[str] = set()
         values_by_device: dict[str, dict[str, float]] = {}
         for sample in batch.samples:
             device = sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
@@ -566,8 +601,10 @@ class DcgmMetricsCollector:
                 )
                 or (name == "xid_last_error" and sample.value > 0)
             )
-            duty_cycle = self._duty_cycle(sample, batch.observed_at)
-            if duty_cycle is not None and self._duty_cycle_breached(
+            duty_cycle, no_new_value = self._grade_duty_cycle(sample, batch.observed_at)
+            if no_new_value:
+                carried_over.add(self._sample_key(sample))
+            elif duty_cycle is not None and self._duty_cycle_breached(
                 sample, duty_cycle, batch.observed_at
             ):
                 breached = True
@@ -587,7 +624,7 @@ class DcgmMetricsCollector:
                 >= self.thresholds.power_correlation_min_utilization_percent
             ):
                 candidates.add(f"{device}/power_limit_correlation")
-        return candidates
+        return candidates, carried_over - candidates
 
     @staticmethod
     def _device_keys(batch: GpuMetricBatch) -> set[str]:
@@ -639,7 +676,7 @@ class DcgmMetricsCollector:
         ):
             reasons.append("health-summary")
 
-        candidates = self._candidate_keys(batch)
+        candidates, carried_over = self._candidate_keys(batch)
         confirmed_candidates = {
             key
             for key, streak in self._candidate_streaks.items()
@@ -647,7 +684,7 @@ class DcgmMetricsCollector:
         }
         recovered = {
             key
-            for key in confirmed_candidates - candidates
+            for key in confirmed_candidates - candidates - carried_over
             # A candidate whose device vanished has not recovered.
             if key.rsplit("/", 1)[0] not in lost_devices
         }
@@ -659,6 +696,14 @@ class DcgmMetricsCollector:
             next_streaks[key] = streak
             if streak == self.edge_confirmation_samples:
                 reasons.append("candidate-confirmed")
+        # A counter the exporter has not refreshed neither advances nor breaks a
+        # streak: rebuilding the streaks from this tick's candidates alone made
+        # a sustained throttle flap (confirm=1) or never confirm at all (the
+        # production confirm=3) whenever the exporter lagged the scrape.
+        for key in sorted(carried_over):
+            streak = self._candidate_streaks.get(key, 0)
+            if streak:
+                next_streaks[key] = streak
         self._candidate_streaks = dict(
             list(next_streaks.items())[-self.state_max_keys :]
         )
@@ -703,21 +748,33 @@ class DcgmMetricsCollector:
             self._previous_values.popitem(last=False)
         return None if previous is None else previous[0]
 
+    def _inventory_is_due(self, observed_at: datetime) -> bool:
+        """Whether this tick owes an inventory delivery.
+
+        A failing delivery used to be due again on the very next tick forever:
+        a permanent ``--expected-gpu-count`` mismatch or a wedged driver cost
+        every tick one nvidia-smi subprocess (up to its 15 s timeout) plus a
+        full traceback. After ``INVENTORY_FAILURE_BACKOFF_THRESHOLD`` failures
+        the retry drops to the inventory cadence, the way the temperature-limit
+        probe does.
+        """
+
+        if (
+            self._next_inventory_attempt_at is not None
+            and observed_at < self._next_inventory_attempt_at
+        ):
+            return False
+        if self._last_inventory_delivered_at is None:
+            return True
+        if self._next_inventory_at is not None:
+            return observed_at >= self._next_inventory_at
+        return (
+            observed_at - self._last_inventory_delivered_at
+        ).total_seconds() >= self.inventory_interval_seconds
+
     def collect_once(self) -> GpuMetricBatch:
         observed_at = self.now()
-        if (
-            self._last_inventory_delivered_at is None
-            or (
-                self._next_inventory_at is not None
-                and observed_at >= self._next_inventory_at
-            )
-            or (
-                self._next_inventory_at is None
-                and self._last_inventory_delivered_at is not None
-                and (observed_at - self._last_inventory_delivered_at).total_seconds()
-                >= self.inventory_interval_seconds
-            )
-        ):
+        if self._inventory_is_due(observed_at):
             try:
                 snapshot = deliver_gpu_inventory(
                     self.sink,
@@ -727,6 +784,8 @@ class DcgmMetricsCollector:
                     runner=self.runner,
                 )
                 self._last_inventory_delivered_at = observed_at
+                self._inventory_failures = 0
+                self._next_inventory_attempt_at = None
                 self._next_inventory_at = next_stable_phase(
                     observed_at,
                     cluster_id=self.context.cluster_id,
@@ -746,8 +805,21 @@ class DcgmMetricsCollector:
             # count used to silence GPU_METRICS on the node entirely (F3). The
             # subprocess exceptions are caught as well so a future runner cannot
             # reopen that path.
-            except (CollectorError, OSError, subprocess.TimeoutExpired):
-                LOGGER.exception("mandatory GPU inventory delivery failed")
+            except (CollectorError, OSError, subprocess.TimeoutExpired) as exc:
+                self._inventory_failures += 1
+                if self._inventory_failures >= INVENTORY_FAILURE_BACKOFF_THRESHOLD:
+                    self._next_inventory_attempt_at = observed_at + timedelta(
+                        seconds=self.inventory_interval_seconds
+                    )
+                if self._inventory_failures == 1:
+                    LOGGER.exception("mandatory GPU inventory delivery failed")
+                else:
+                    # One traceback is diagnosis; a traceback per tick is noise.
+                    LOGGER.warning(
+                        "mandatory GPU inventory delivery failed (%d consecutive): %s",
+                        self._inventory_failures,
+                        exc,
+                    )
         try:
             with urlopen(self.metrics_url, timeout=10) as response:
                 text = response.read().decode("utf-8", errors="replace")
@@ -784,25 +856,38 @@ class DcgmMetricsCollector:
         try:
             discovered = query_nvidia_temperature_limits(self.runner)
         except (CollectorError, OSError, subprocess.TimeoutExpired) as exc:
-            self._temperature_limit_failures += 1
-            if (
-                self._temperature_limit_failures
-                >= TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD
-            ):
-                self._next_temperature_limit_attempt_at = observed_at + timedelta(
-                    seconds=self.inventory_interval_seconds
-                )
-            LOGGER.warning(
-                "NVIDIA temperature limits unavailable (%d consecutive); "
-                "using configured fallback thresholds: %s",
-                self._temperature_limit_failures,
-                exc,
+            self._temperature_limit_unavailable(observed_at, str(exc))
+            return
+        if not discovered:
+            # Valid XML that carries no threshold tags -- a vGPU or MIG device --
+            # is not a success: treating it as one left the samples unset and
+            # cleared the failure counter, so the probe ran on every tick for the
+            # process's whole lifetime and no backoff could ever engage.
+            self._temperature_limit_unavailable(
+                observed_at, "nvidia-smi reported no temperature thresholds"
             )
             return
         self._temperature_limit_failures = 0
         self._next_temperature_limit_attempt_at = None
-        if discovered:
-            self._temperature_limit_samples = discovered
+        self._temperature_limit_samples = discovered
+
+    def _temperature_limit_unavailable(
+        self, observed_at: datetime, detail: str
+    ) -> None:
+        self._temperature_limit_failures += 1
+        if (
+            self._temperature_limit_failures
+            >= TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD
+        ):
+            self._next_temperature_limit_attempt_at = observed_at + timedelta(
+                seconds=self.inventory_interval_seconds
+            )
+        LOGGER.warning(
+            "NVIDIA temperature limits unavailable (%d consecutive); "
+            "using configured fallback thresholds: %s",
+            self._temperature_limit_failures,
+            detail,
+        )
 
     def _report_collection_error(self, exc: BaseException) -> None:
         """Deliver an erroring, sample-less batch so the node is not silent.
