@@ -51,6 +51,18 @@ DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS = 10
 # so its confirmation streak is carried over instead of reset. Not forever: past
 # this many collector intervals without a change the counter genuinely is not
 # advancing, and a confirmed candidate must be allowed to recover.
+#
+# Invariant: the exporter's refresh period must stay at or below
+# ``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS x interval_seconds`` (8 x 15 s = 120 s
+# at the defaults, against the exporter's ``-c 15000``). Past that bound the
+# carry-over expires between two refreshes, so an unchanged counter is graded as
+# an idle GPU, the streak resets, and the original F2 symptom -- a sustained
+# throttle that never confirms and never produces a delivery edge -- comes back
+# silently: nothing in the metrics text says the exporter is slow. The collector
+# checks the ratio at startup when the exporter's period is configured
+# (``exporter_interval_seconds`` /
+# ``GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS``), because DCGM does not publish
+# its own collect interval.
 DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS = 8
 # Consecutive inventory failures after which the delivery drops to the inventory
 # cadence: a permanent expected-count mismatch or a wedged driver otherwise
@@ -176,6 +188,109 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
 }
 
 
+def _configured_exporter_interval_seconds() -> float | None:
+    """The exporter's own collect period, if the deployment states it.
+
+    ``None`` means unknown, which is not a fault: the exporter does not publish
+    its collect interval, so an unset variable simply cannot be checked against
+    :data:`DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`.
+    """
+
+    configured = os.getenv("GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS")
+    if not configured or not configured.strip():
+        return None
+    return float(configured)
+
+
+def _check_exporter_interval(
+    exporter_interval_seconds: float | None, interval_seconds: float
+) -> None:
+    """Say once, at startup, when the carry-over cannot cover this exporter.
+
+    See :data:`DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`: past that bound the
+    carry-over expires between two refreshes, a sustained throttle stops
+    confirming, and the only symptom is silence -- nothing in the metrics text
+    says the exporter is slow. Startup rather than per tick because it is a
+    configuration fact, and a warning repeated every 15 s for months is
+    scrolled past. Unknown (no argument, no variable) is not a fault: DCGM does
+    not publish its own collect interval.
+    """
+
+    configured = (
+        exporter_interval_seconds
+        if exporter_interval_seconds is not None
+        else _configured_exporter_interval_seconds()
+    )
+    if configured is None:
+        return
+    if configured <= 0:
+        raise ValueError("DCGM exporter interval must be positive")
+    bound = interval_seconds * DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS
+    if configured <= bound:
+        return
+    LOGGER.warning(
+        "the DCGM exporter refreshes every %.0fs, past the %.0fs the stale "
+        "carry-over window covers (%d x the %.0fs collector interval): a "
+        "sustained throttle can stop confirming between two refreshes and "
+        "produce no delivery edge at all. Lower the exporter's -c, or raise "
+        "GPU_FAULT_METRICS_INTERVAL_SECONDS so 8 x it covers the exporter",
+        configured,
+        bound,
+        DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS,
+        interval_seconds,
+    )
+
+
+def _remember_bounded(
+    table: OrderedDict[str, datetime], key: str, value: datetime, max_keys: int
+) -> None:
+    """Write ``key`` as the newest entry and evict the oldest past ``max_keys``.
+
+    The write-off table is remembered only to rate-limit a warning, and it was
+    unbounded: a node whose GPU UUIDs change -- a replaced device, a driver
+    reload that renumbers -- added one permanent entry per broken counter in a
+    process that runs for months. Bounded like the value LRU, oldest first.
+    """
+
+    table[key] = value
+    table.move_to_end(key)
+    if len(table) > max_keys:
+        table.popitem(last=False)
+
+
+def _merged_candidate_streaks(
+    previous: dict[str, int],
+    candidates: set[str],
+    carried_over: set[str],
+    confirm_at: int,
+    max_keys: int,
+) -> tuple[dict[str, int], int]:
+    """Next tick's confirmation streaks, and how many keys just confirmed.
+
+    A counter the exporter has not refreshed neither advances nor breaks a
+    streak: rebuilding the streaks from this tick's candidates alone made a
+    sustained throttle flap (confirm=1) or never confirm at all (the production
+    confirm=3) whenever the exporter lagged the scrape. Carried-over keys are
+    merged *first* because the bound keeps the last ``max_keys`` entries: on a
+    node with more breaching keys than the bound, dropping a key this batch just
+    observed breaching in favour of one it learned nothing about would keep a
+    real fault from ever accumulating a streak.
+    """
+
+    merged: dict[str, int] = {}
+    for key in sorted(carried_over):
+        streak = previous.get(key, 0)
+        if streak:
+            merged[key] = streak
+    confirmed = 0
+    for key in sorted(candidates):
+        streak = previous.get(key, 0) + 1
+        merged[key] = streak
+        if streak == confirm_at:
+            confirmed += 1
+    return dict(list(merged.items())[-max_keys:]), confirmed
+
+
 class DcgmMetricsCollector:
     def __init__(
         self,
@@ -185,6 +300,7 @@ class DcgmMetricsCollector:
         node_id: str,
         metrics_url: str = "http://127.0.0.1:9400/metrics",
         interval_seconds: float = 15,
+        exporter_interval_seconds: float | None = None,
         now: Callable[[], datetime] | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
         edge_filter_enabled: bool | None = None,
@@ -289,6 +405,7 @@ class DcgmMetricsCollector:
             raise ValueError(
                 "DCGM violation duty cycle threshold must be within (0, 1]"
             )
+        _check_exporter_interval(exporter_interval_seconds, interval_seconds)
         self.failure_backoff_threshold = failure_backoff_threshold
         if self.failure_backoff_threshold <= 0:
             raise ValueError("DCGM failure backoff threshold must be positive")
@@ -299,7 +416,7 @@ class DcgmMetricsCollector:
         # duty cycle (F2).
         self._previous_values: OrderedDict[str, tuple[float, datetime]] = OrderedDict()
         self._candidate_streaks: dict[str, int] = {}
-        self._implausible_duty_cycle_keys: dict[str, datetime] = {}
+        self._implausible_duty_cycle_keys: OrderedDict[str, datetime] = OrderedDict()
         self._last_delivered_at: datetime | None = None
         self._last_inventory_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
@@ -484,6 +601,11 @@ class DcgmMetricsCollector:
         for a counter that has not moved for
         ``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`` intervals, which is a real
         observation of an idle GPU rather than a lagging exporter.
+
+        A window of zero or less -- two scrapes stamped alike, or a clock
+        stepped backwards -- answers ``(None, True)``, the same "no new
+        information" as an unrefreshed counter: calling it a reset would break a
+        confirmed candidate's streak on a time correction.
         """
 
         if not self._is_duty_cycle_counter(sample):
@@ -532,7 +654,8 @@ class DcgmMetricsCollector:
         it expires after ``DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS`` intervals:
         a counter that stays broken says so once per window rather than every
         tick, and a device whose counter becomes usable again is forgotten, so
-        the next implausible value is reported immediately.
+        the next implausible value is reported immediately, and it is bounded by
+        ``state_max_keys`` (see :func:`_remember_bounded`).
         """
 
         key = self._sample_key(sample)
@@ -548,7 +671,9 @@ class DcgmMetricsCollector:
             warned_at is None
             or (observed_at - warned_at).total_seconds() >= expiry_seconds
         ):
-            self._implausible_duty_cycle_keys[key] = observed_at
+            _remember_bounded(
+                self._implausible_duty_cycle_keys, key, observed_at, self.state_max_keys
+            )
             LOGGER.warning(
                 "ignoring %s for edge detection on %s: duty cycle %.2f exceeds "
                 "the elapsed interval, so the counter is not a duration in "
@@ -685,23 +810,14 @@ class DcgmMetricsCollector:
         }
         if recovered:
             reasons.append("candidate-recovered")
-        next_streaks: dict[str, int] = {}
-        for key in sorted(candidates):
-            streak = self._candidate_streaks.get(key, 0) + 1
-            next_streaks[key] = streak
-            if streak == self.edge_confirmation_samples:
-                reasons.append("candidate-confirmed")
-        # A counter the exporter has not refreshed neither advances nor breaks a
-        # streak: rebuilding the streaks from this tick's candidates alone made
-        # a sustained throttle flap (confirm=1) or never confirm at all (the
-        # production confirm=3) whenever the exporter lagged the scrape.
-        for key in sorted(carried_over):
-            streak = self._candidate_streaks.get(key, 0)
-            if streak:
-                next_streaks[key] = streak
-        self._candidate_streaks = dict(
-            list(next_streaks.items())[-self.state_max_keys :]
+        self._candidate_streaks, confirmed = _merged_candidate_streaks(
+            self._candidate_streaks,
+            candidates,
+            carried_over,
+            self.edge_confirmation_samples,
+            self.state_max_keys,
         )
+        reasons.extend("candidate-confirmed" for _ in range(confirmed))
 
         for sample in batch.samples:
             key = self._sample_key(sample)

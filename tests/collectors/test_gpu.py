@@ -1390,7 +1390,9 @@ def test_dcgm_collector_uses_shared_buffered_warning(caplog) -> None:
     assert "id=" in message, "warning must include the event id"
 
 
-def test_gpu_inventory_uses_shared_buffered_warning(monkeypatch, tmp_path, caplog) -> None:
+def test_gpu_inventory_uses_shared_buffered_warning(
+    monkeypatch, tmp_path, caplog
+) -> None:
     """GPU inventory delivery BUFFERED warning must use the shared text from deliver_or_raise."""
 
     boot_id = tmp_path / "boot_id"

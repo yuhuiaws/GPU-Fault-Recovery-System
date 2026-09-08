@@ -273,7 +273,9 @@ def test_training_progress_heartbeat_the_outbox_took_is_not_a_failure(tmp_path) 
     )
 
 
-def test_training_progress_collector_uses_shared_buffered_warning(tmp_path, caplog) -> None:
+def test_training_progress_collector_uses_shared_buffered_warning(
+    tmp_path, caplog
+) -> None:
     """Training progress collector BUFFERED warning must use the shared text from deliver_or_raise."""
 
     progress = tmp_path / "progress.json"

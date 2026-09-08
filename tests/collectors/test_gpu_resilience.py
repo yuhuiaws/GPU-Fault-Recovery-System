@@ -10,6 +10,7 @@ the device's confirmed candidate stopped appearing -- which reads as good news.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 
 import pytest
@@ -25,6 +26,8 @@ from ._support import (
     context,
     timedelta,
 )
+
+DCGM_LOGGER = "gpu_fault.collectors.gpu.dcgm"
 
 
 def _stop_after(monkeypatch: pytest.MonkeyPatch, count: int) -> list[float]:
@@ -596,4 +599,176 @@ def test_gpu_inventory_unknown_instance_type_leaves_expected_count_unset(
 
     assert snapshot.expected_gpu_count is None, (
         "an unknown instance type must not invent a count"
+    )
+
+
+def test_an_exporter_slower_than_the_carry_over_window_says_so_at_startup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The carry-over window is an invariant, not a cure for any exporter.
+
+    An unrefreshed counter keeps its streak for
+    ``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`` collector intervals -- 8 x 15 s at
+    the defaults. An exporter refreshing slower than that brings back the exact
+    F2 symptom the carry-over exists to remove (a sustained throttle whose
+    streak is dropped between two refreshes), and nothing in the metrics text
+    says the exporter is slow. So the one place the ratio is knowable -- a
+    configured exporter interval -- has to say it out loud.
+    """
+
+    with caplog.at_level(logging.WARNING, logger=DCGM_LOGGER):
+        DcgmMetricsCollector(
+            RecordingSink(),
+            context(),
+            node_id="worker-1",
+            interval_seconds=15,
+            exporter_interval_seconds=180,
+        )
+        violating = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == DCGM_LOGGER and "exporter" in record.getMessage()
+        ]
+        caplog.clear()
+        DcgmMetricsCollector(
+            RecordingSink(),
+            context(),
+            node_id="worker-1",
+            interval_seconds=15,
+            exporter_interval_seconds=120,
+        )
+        at_the_limit = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == DCGM_LOGGER and "exporter" in record.getMessage()
+        ]
+
+    assert len(violating) == 1, (
+        "an exporter refreshing slower than 8 x the collector interval must be "
+        f"reported once at startup: {violating}"
+    )
+    assert "180" in violating[0] and "120" in violating[0], (
+        f"the warning must name the configured period and the bound: {violating[0]}"
+    )
+    assert at_the_limit == [], (
+        "exactly 8 x the collector interval still satisfies the invariant and "
+        f"must stay quiet: {at_the_limit}"
+    )
+
+
+def test_a_carried_over_streak_is_dropped_before_a_real_candidate() -> None:
+    """The streak bound must evict what this tick told us nothing about.
+
+    The confirmation streaks are truncated to ``state_max_keys`` entries.
+    Carried-over keys -- duty-cycle counters the exporter has not refreshed --
+    were merged in last, so the truncation kept them and dropped the keys the
+    batch had just observed breaching: on a node with more breaching keys than
+    the bound, a real sustained fault could never accumulate the streak that
+    produces its delivery edge. Observed through the edge, not the table: the
+    fault has to be announced.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=3,
+        violation_duty_cycle_threshold=0.05,
+        state_max_keys=2,
+    )
+
+    def text(violation: int) -> str:
+        # The two hot temperatures are candidates without needing a previous
+        # value, so the LRU that keeps only the last two remembered values
+        # cannot starve them; the violation counter is last in the text, so it
+        # is one of the two that survives and can be graded.
+        return (
+            'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 95\n'
+            'DCGM_FI_DEV_GPU_TEMP{gpu="1",UUID="GPU-b"} 95\n'
+            "DCGM_FI_DEV_POWER_VIOLATION"
+            f'{{gpu="2",UUID="GPU-c"}} {violation}\n'
+        )
+
+    # Tick 1 advances the counter by 3 s in 15 s, so GPU-c breaches too and owns
+    # a streak; from tick 2 on the exporter never refreshes it again, so it
+    # carries no news and must not hold a slot against the two hot GPUs.
+    violations = (0, 3_000_000_000, 3_000_000_000, 3_000_000_000, 3_000_000_000)
+    for tick, violation in enumerate(violations):
+        collector.collect_text(
+            text(violation), observed_at=NOW + timedelta(seconds=15 * tick)
+        )
+
+    confirmations = [
+        index
+        for index, (_, payload) in enumerate(sink.requests)
+        if "candidate-confirmed" in payload["edge_filter_reasons"]
+    ]
+
+    assert len(confirmations) == 2, (
+        "both hot GPUs must reach the confirmation streak and be announced; a "
+        "carried-over counter that keeps its slot starves the second one for "
+        f"ever: {[payload['edge_filter_reasons'] for _, payload in sink.requests]}"
+    )
+
+
+def test_the_implausible_counter_write_off_is_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A per-key write-off must not grow without limit.
+
+    The keys are remembered only to rate-limit the warning, and they were never
+    evicted: a node whose GPU UUIDs change (a replaced device, a driver reload
+    that renumbers) added one entry per broken counter for the life of the
+    process, in a collector that is meant to run for months. Eviction is
+    observed through the warning it rate-limits -- a key that has been evicted
+    warns again -- because that is all the table is for.
+    """
+
+    collector = DcgmMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=1,
+        violation_duty_cycle_threshold=0.05,
+        state_max_keys=2,
+    )
+
+    def text(uuids: tuple[str, str], nanoseconds: int) -> str:
+        return "".join(
+            "DCGM_FI_DEV_POWER_VIOLATION"
+            f'{{gpu="{index}",UUID="{uuid}"}} {nanoseconds}\n'
+            for index, uuid in enumerate(uuids)
+        )
+
+    # 1.1e9 ns of claimed throttling per wall-clock second is implausible at
+    # every spacing, so both devices of each pair are written off. The first
+    # pair is seen again 60 s later, well inside the 150 s (10 x 15 s) the
+    # write-off suppresses a repeat warning for.
+    pairs = (("GPU-a", "GPU-b"), ("GPU-c", "GPU-d"), ("GPU-a", "GPU-b"))
+    with caplog.at_level(logging.WARNING, logger=DCGM_LOGGER):
+        for index, pair in enumerate(pairs):
+            collector.collect_text(
+                text(pair, 0), observed_at=NOW + timedelta(seconds=30 * index)
+            )
+            collector.collect_text(
+                text(pair, 16_500_000_000),
+                observed_at=NOW + timedelta(seconds=30 * index + 15),
+            )
+
+    written_off = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == DCGM_LOGGER and "duty cycle" in record.getMessage()
+    ]
+
+    assert len(written_off) == 6, (
+        "the write-off table is unbounded: the first pair's entries survived "
+        "the second pair and suppressed their own repeat warning, so a node "
+        "whose GPU UUIDs change grows one entry per broken counter for the "
+        f"life of the process: {written_off}"
     )
