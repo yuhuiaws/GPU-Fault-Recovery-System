@@ -29,6 +29,7 @@ import json
 import logging
 import socket
 import ssl
+from http.client import IncompleteRead
 from io import BytesIO
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -260,12 +261,15 @@ def test_a_report_failure_never_escapes_run_once(tmp_path) -> None:
     )
 
 
-def test_a_report_retry_stops_when_the_lease_is_lost(tmp_path) -> None:
-    """Retrying under a lost lease races the next holder's result.
+def test_a_lease_lost_during_the_report_backoff_withholds_the_retry(tmp_path) -> None:
+    """The lease can lapse *while* we back off, so re-check before re-posting.
 
-    The withheld-result rule already says a result posted after the lease is
-    gone must be dropped; the retry must obey the same rule rather than
-    hammering the route until its attempts run out.
+    Checking the hold only where the failure is caught is not enough: the sleep
+    is where a 120 s lease actually runs out, and a POST sent after that races
+    the result of whichever replica re-claimed the command -- exactly what the
+    withheld-result rule in ``_execute_under_lease`` exists to prevent. A
+    withheld retry is not a reporting failure either: nothing was refused and
+    nothing was lost that the next lease holder will not redo.
     """
 
     clock = FakeClock()
@@ -277,10 +281,40 @@ def test_a_report_retry_stops_when_the_lease_is_lost(tmp_path) -> None:
     executor = build(client, [RecordingAdapter()], tmp_path, clock=clock, sleep=sleeper)
 
     assert executor.run_once() == 1, "run_once must return, not raise"
-    assert [command_id for command_id, _ in client.completed] == ["command-a"] * 2, (
-        f"the retry must stop as soon as the lease is gone: {client.completed}"
+    assert [command_id for command_id, _ in client.completed] == ["command-a"], (
+        f"no result may be posted once the lease is gone: {client.completed}"
     )
-    assert executor.reported_failures == 1, "the abandoned report must be counted"
+    assert executor.results_withheld_total == 1, (
+        "abandoning the retry under a lost lease is a withheld result"
+    )
+    assert executor.reported_failures == 0, (
+        "a withheld retry is not the control plane refusing the result"
+    )
+
+
+def test_a_truncated_response_on_complete_is_retried(tmp_path) -> None:
+    """A half-read response carries no verdict either, so it must be retried.
+
+    ``http.client`` raises its own family (``IncompleteRead``,
+    ``BadStatusLine``) when the connection dies mid-response; it is not a
+    ``URLError`` and used to be neither wrapped nor retried, so it escaped the
+    worker exactly like F1's timeout did.
+    """
+
+    client = FlakyReportClient(
+        [remote_command("command-a")],
+        complete_failures={"command-a": [IncompleteRead(b"partial", 12)]},
+    )
+    sleeper = RecordingSleep()
+    executor = build(client, [RecordingAdapter()], tmp_path, sleep=sleeper)
+
+    assert executor.run_once() == 1, "run_once must return, not raise"
+    assert client.attempts.count("command-a") == 2, (
+        f"a truncated response must be retried: {client.attempts}"
+    )
+    assert executor.reported_failures == 0, (
+        "the retry landed, so nothing failed to report"
+    )
 
 
 def test_a_command_without_a_lease_token_never_sinks_its_batch(tmp_path) -> None:
@@ -374,8 +408,9 @@ def test_a_claim_response_of_the_wrong_shape_still_fails_the_cycle(monkeypatch) 
         (TimeoutError("timed out"), "timeout"),
         (ssl.SSLError("record layer failure"), "ssl"),
         (ConnectionResetError("reset by peer"), "connection-reset"),
+        (IncompleteRead(b"partial", 12), "incomplete-read"),
     ],
-    ids=["urlerror", "timeout", "ssl", "connection-reset"],
+    ids=["urlerror", "timeout", "ssl", "connection-reset", "incomplete-read"],
 )
 def test_a_transport_failure_to_the_control_plane_is_one_exception_type(
     monkeypatch, error: BaseException, label: str

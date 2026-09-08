@@ -9,6 +9,7 @@ import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from http.client import HTTPException
 from threading import Event, Lock, Thread
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -112,18 +113,25 @@ class ClusterExecutorClaimError(ClusterExecutorError):
 # Three attempts is enough for the baseline "Remote end closed connection"
 # (~1/min) and for a control-plane rollout's 503 window, and short enough that
 # the lease (>= 10 s, 120 s in production) is still ours while retrying.
+# Three attempts means two sleeps, so there are two delays and not three: the
+# worst case with jitter is 0.75 + 1.5 = 2.25s of extra latency on the command's
+# own worker thread.
 _RESULT_REPORT_ATTEMPTS = 3
-_RESULT_REPORT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+_RESULT_REPORT_BACKOFF_SECONDS = (0.5, 1.0)
 _RETRYABLE_REPORT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 # Transport failures reach the caller as several unrelated families, and only
 # HTTPError used to be converted. ``socket.timeout`` is an alias of
 # ``TimeoutError`` on 3.12 and is named here for readers, not for coverage.
+# ``HTTPException`` covers the connection that dies mid-response
+# (``IncompleteRead``, ``BadStatusLine``): no verdict was received, so it has to
+# be retryable rather than escaping raw.
 _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     URLError,
     TimeoutError,
     socket.timeout,
     ssl.SSLError,
     ConnectionError,
+    HTTPException,
 )
 
 
@@ -147,7 +155,7 @@ def _report_backoff_seconds(attempt: int) -> float:
     """Jittered delay before report attempt ``attempt + 1``.
 
     Jitter matters here because both replicas can be reporting into the same
-    control-plane rollout window; an un-jittered 0.5/1/2 retries in lockstep.
+    control-plane rollout window; an un-jittered 0.5/1 retries in lockstep.
     """
 
     base = _RESULT_REPORT_BACKOFF_SECONDS[
@@ -1286,7 +1294,36 @@ class ClusterActionExecutor:
                     exc,
                 )
                 self.sleep(delay)
-        return False
+                # The backoff is where a lease actually runs out: the local
+                # deadline can be crossed and the renewer can hit its failure
+                # limit while this thread sleeps. Re-check before re-posting,
+                # or the retry sends a result under a lease another replica may
+                # already own -- the very race the withhold rule prevents. This
+                # is a withheld result, not a reporting failure: nothing was
+                # refused, and the next lease holder will redo the step.
+                hold_reason = watch.hold_reason()
+                if hold_reason is not None:
+                    self._increment("results_withheld_total")
+                    LOGGER.warning(
+                        "regional cluster executor withheld an unreported "
+                        "result: the lease lapsed during the report backoff: "
+                        "command=%s cluster=%s operation=%s status=%s "
+                        "attempts=%d reason=%s",
+                        command.command_id,
+                        command.cluster_id,
+                        command.step.operation.value,
+                        result.status.value,
+                        attempt,
+                        hold_reason,
+                    )
+                    return False
+        # Unreachable: the final attempt always takes the terminal branch
+        # above, which is where ``reported_failures`` is counted. Fail loudly
+        # rather than returning an uncounted False if that ever changes -- the
+        # ``_execute_and_report`` boundary turns this into WAITING.
+        raise AssertionError(
+            "the result report loop must terminate inside its final attempt"
+        )
 
     def _renew_lease(
         self,
