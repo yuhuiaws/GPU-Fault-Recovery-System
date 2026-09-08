@@ -340,7 +340,12 @@ exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样
 
 DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，两条启动路径
 （`deploy/dataplane/hyperpod-dcgm-exporter.yaml` 与 `deploy/systemd/gpu-fault-dcgm-exporter.service`）
-都以 `-c 15000` 采样并只绑定 `127.0.0.1:9400`；GPU metrics collector 由节点 systemd 单元
+都以 `-c 15000` 采样并只绑定 `127.0.0.1:9400`；systemd 路径的 `-c` 值来自
+`/etc/gpu-fault/dcgm-exporter.env` 的 `GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS`（安装器
+参数，默认 15000，须为 ≥ 1000 的整数毫秒），`--dcgm-exporter docker` 时安装器还把换算成秒的
+`GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS` 写进 collector.env，采集器据此在启动时校验
+「exporter 刷新周期 ≤ 8 × 采集间隔」并在越界时 WARN 一次（`existing` 模式周期未知，不写、
+不校验）；GPU metrics collector 由节点 systemd 单元
 `gpu-fault-metrics-collector.service` 在本机访问 `http://127.0.0.1:9400/metrics`。历史的
 in-cluster DaemonSet 模板 `gpu-metrics-collector.yaml` 已删除，不得重新引入同类 DaemonSet，
 否则同一节点会出现双 producer。
