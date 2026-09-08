@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+from xml.etree import ElementTree as ET
 
 
 from gpu_fault.node_agent.protocol import (
@@ -20,6 +23,11 @@ class ClientOperationsMixin:
     device_client_sample_interval_seconds: Any
     proc_root: Any
     sleep: Callable[..., Any]
+
+    # Owned by ``_device_path_cache_window``.  Class defaults so the mixin
+    # needs nothing from the concrete executor's ``__init__``.
+    _device_path_cache: dict[str, str] | None = None
+    _device_path_cache_depth: int = 0
 
     def _compute_clients(self) -> list[dict[str, str]]:
         completed = self._run_checked(
@@ -43,7 +51,80 @@ class ClientOperationsMixin:
                 )
         return clients
 
+    @contextmanager
+    def _device_path_cache_window(self) -> Iterator[None]:
+        """Resolve the uuid -> device-node map at most once inside the block.
+
+        The map is a property of the driver's probe order and cannot change
+        while the node holds a GPU still, yet ``_persistent_device_clients``
+        rebuilt it for every sample: with three samples on an 8-GPU node, one
+        busy-retrying reset spent up to 96 ``nvidia-smi`` invocations learning
+        the same answer -- and each one is a driver round trip that competes
+        with the very reset it is waiting for.  The window is reference counted
+        so two actions running side by side cannot clear each other's cache,
+        and it is always dropped on the way out: nothing is cached across
+        commands, where a driver reload really can renumber the devices.
+        """
+
+        self._device_path_cache_depth += 1
+        try:
+            yield
+        finally:
+            self._device_path_cache_depth -= 1
+            if self._device_path_cache_depth <= 0:
+                self._device_path_cache_depth = 0
+                self._device_path_cache = None
+
     def _gpu_device_paths(self) -> dict[str, str]:
+        cached = self._device_path_cache
+        if cached is not None:
+            return cached
+        paths = self._minor_number_device_paths()
+        if paths is None:
+            paths = self._index_device_paths()
+        if self._device_path_cache_depth:
+            self._device_path_cache = paths
+        return paths
+
+    def _minor_number_device_paths(self) -> dict[str, str] | None:
+        """uuid -> ``/dev/nvidia<minor>`` from the driver's own minor numbers.
+
+        ``--query-gpu=index`` is ordered by PCI bus id; the device node's minor
+        number is the order the driver probed the GPUs in, which is why
+        nvidia-smi reports "Minor Number" separately at all.  Assuming they
+        match made ``VERIFY_NO_GPU_CLIENTS`` inspect a *different* GPU's device
+        node on any node where the two disagree: it passed with a live holder
+        on the target GPU, and blocked on a holder of a GPU nobody was
+        resetting.
+
+        Answers ``None`` -- never a partial map -- when the XML does not give a
+        usable minor number for every GPU, so the caller falls back to the
+        index map as a whole.  A half-and-half map is the one outcome that
+        could hide a holder.
+        """
+
+        try:
+            completed = self._run_checked(["nvidia-smi", "-q", "-x"], timeout=15)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return None
+        try:
+            root = ET.fromstring(completed.stdout or "")
+        except ET.ParseError:
+            return None
+        paths: dict[str, str] = {}
+        for gpu in root.findall(".//gpu"):
+            gpu_uuid = (gpu.findtext("uuid") or "").strip()
+            minor = (gpu.findtext("minor_number") or "").strip()
+            if not gpu_uuid or not minor.isdigit():
+                return None
+            paths[gpu_uuid] = f"/dev/nvidia{minor}"
+        if not paths or len(set(paths.values())) != len(paths):
+            return None
+        return paths
+
+    def _index_device_paths(self) -> dict[str, str]:
+        """The pre-minor-number mapping, kept for drivers that omit it."""
+
         completed = self._run_checked(
             [
                 "nvidia-smi",
@@ -226,9 +307,11 @@ class ClientOperationsMixin:
             )
         transient_device_clients: list[dict[str, str]] = []
         if include_device_clients:
-            device_clients, transient_device_clients = self._persistent_device_clients(
-                target
-            )
+            with self._device_path_cache_window():
+                (
+                    device_clients,
+                    transient_device_clients,
+                ) = self._persistent_device_clients(target)
             if device_clients:
                 raise RuntimeError(
                     "GPU device clients are still active: "

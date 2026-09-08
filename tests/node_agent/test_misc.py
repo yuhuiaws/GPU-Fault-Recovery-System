@@ -903,3 +903,143 @@ def test_a_lost_in_progress_write_reply_leaves_no_stuck_waiter(
     assert elapsed < 3.0, (
         f"the resubmit waited on a leaked in-flight Event: {elapsed:.1f}s"
     )
+
+
+MINOR_NUMBER_XML = """<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <gpu id="00000000:53:00.0">
+    <uuid>GPU-a</uuid>
+    <minor_number>3</minor_number>
+  </gpu>
+  <gpu id="00000000:64:00.0">
+    <uuid>GPU-b</uuid>
+    <minor_number>0</minor_number>
+  </gpu>
+</nvidia_smi_log>
+"""
+
+NO_MINOR_NUMBER_XML = """<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <gpu id="00000000:53:00.0">
+    <uuid>GPU-a</uuid>
+  </gpu>
+  <gpu id="00000000:64:00.0">
+    <uuid>GPU-b</uuid>
+  </gpu>
+</nvidia_smi_log>
+"""
+
+
+class DevicePathRunner:
+    """nvidia-smi on a node whose PCI order is not its device-minor order."""
+
+    def __init__(self, xml: str) -> None:
+        self.xml = xml
+        self.commands: list[list[str]] = []
+
+    def __call__(self, argv, **_):
+        self.commands.append(list(argv))
+        if argv[:3] == ["nvidia-smi", "-q", "-x"]:
+            return CompletedProcess(argv, 0, stdout=self.xml, stderr="")
+        if "--query-compute-apps=gpu_uuid,pid,process_name" in argv:
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+        if "--query-gpu=uuid,index" in argv:
+            return CompletedProcess(argv, 0, stdout="GPU-a, 0\nGPU-b, 1\n", stderr="")
+        if "--query-gpu=uuid" in argv:
+            return CompletedProcess(argv, 0, stdout="GPU-a\nGPU-b\n", stderr="")
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def xml_queries(self) -> int:
+        return len(
+            [item for item in self.commands if item[:3] == ["nvidia-smi", "-q", "-x"]]
+        )
+
+
+def _proc_root_holding(tmp_path: Path, device: str, *, pid: str = "222") -> Path:
+    proc = tmp_path / "host-proc"
+    fd_dir = proc / pid / "fd"
+    fd_dir.mkdir(parents=True)
+    (proc / pid / "comm").write_text("python\n")
+    (fd_dir / "7").symlink_to(device)
+    return proc
+
+
+def _verify_agent(tmp_path, ledger_name: str, runner, proc, **overrides):
+    return node_action_executor(
+        tmp_path,
+        ledger_name,
+        allowed_operations={WorkflowOperation.VERIFY_NO_GPU_CLIENTS},
+        runner=runner,
+        proc_root=str(proc),
+        sleep=lambda _seconds: None,
+        **overrides,
+    )
+
+
+def test_device_path_uses_minor_number_not_index(tmp_path) -> None:
+    """``/dev/nvidia{index}`` is a guess; the driver's minor number is the fact.
+
+    nvidia-smi's index is PCI-bus ordered and the device minor is probe
+    ordered, which is why NVIDIA reports "Minor Number" at all. With the two
+    swapped, ``VERIFY_NO_GPU_CLIENTS`` inspected a device node that belongs to
+    a different GPU: it passed while the target GPU had a holder, and the reset
+    that followed failed "in use" three times for nothing.
+    """
+
+    runner = DevicePathRunner(MINOR_NUMBER_XML)
+    proc = _proc_root_holding(tmp_path, "/dev/nvidia3")
+    agent = _verify_agent(tmp_path, "minor.db", runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "GPU-a:222:python" in (result.error or ""), result.error
+
+
+def test_device_path_never_maps_a_uuid_to_another_gpus_node(tmp_path) -> None:
+    """A holder of GPU-b's device node must not block a reset of GPU-a."""
+
+    runner = DevicePathRunner(MINOR_NUMBER_XML)
+    proc = _proc_root_holding(tmp_path, "/dev/nvidia0")
+    agent = _verify_agent(tmp_path, "other-gpu.db", runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["transient_device_clients"] == [], result.details
+
+
+def test_device_path_falls_back_to_the_index_without_a_minor_number(tmp_path) -> None:
+    """A driver whose XML omits the minor number must stay fail-closed."""
+
+    runner = DevicePathRunner(NO_MINOR_NUMBER_XML)
+    proc = _proc_root_holding(tmp_path, "/dev/nvidia0")
+    agent = _verify_agent(tmp_path, "fallback.db", runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "GPU-a:222:python" in (result.error or ""), result.error
+    assert [item for item in runner.commands if "--query-gpu=uuid,index" in item], (
+        f"the index query is the fallback and must have run: {runner.commands}"
+    )
+
+
+def test_verify_queries_the_device_map_once_per_verification(tmp_path) -> None:
+    """Three samples used to mean three nvidia-smi calls, per GPU, per attempt.
+
+    On an 8-GPU node with persistenced stopped, one busy-retrying reset ran up
+    to 96 nvidia-smi invocations just to learn a mapping that cannot change
+    while the GPU services are quiesced.
+    """
+
+    runner = DevicePathRunner(MINOR_NUMBER_XML)
+    proc = _proc_root_holding(tmp_path, "/dev/nvidia0")
+    agent = _verify_agent(
+        tmp_path, "cached-map.db", runner, proc, device_client_samples=3
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert runner.xml_queries() == 1, runner.commands
