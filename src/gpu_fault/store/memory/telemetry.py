@@ -26,7 +26,11 @@ from gpu_fault.store.shared.telemetry_models import (
     GpuMetricKey,
     GpuMetricsBatchKey,
 )
-from gpu_fault.telemetry import CollectorMetricsSnapshotRecord, CollectorStatus
+from gpu_fault.telemetry import (
+    CollectorMetricsSnapshotRecord,
+    CollectorStatus,
+    WorkloadCoverageHeartbeat,
+)
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest,
     WorkloadObservationState,
@@ -49,6 +53,7 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
     _gpu_metrics_batches: dict[GpuMetricsBatchKey, GpuMetricsIngestionResult]
     _telemetry_metric_latest: dict[tuple[str, str, str, str], TelemetryMetricLatest]
     _training_progress: dict[tuple[str, str, int], TrainingProgressState]
+    _workload_coverage_heartbeats: dict[str, WorkloadCoverageHeartbeat]
 
     _gpu_finding_history: dict[str, GpuHealthFinding]
     _lock: Any
@@ -386,6 +391,24 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
             limit=limit,
             newest_first=newest_first,
         )
+
+    def save_workload_coverage_heartbeat(
+        self, heartbeat: WorkloadCoverageHeartbeat
+    ) -> bool:
+        """Keep one heartbeat per cluster; ``False`` when an older one arrives."""
+
+        with self._lock:
+            previous = self._workload_coverage_heartbeats.get(heartbeat.cluster_id)
+            if previous is not None and heartbeat.observed_at <= previous.observed_at:
+                return False
+            self._workload_coverage_heartbeats[heartbeat.cluster_id] = heartbeat
+            return True
+
+    def get_workload_coverage_heartbeat(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None:
+        with self._lock:
+            return self._workload_coverage_heartbeats.get(cluster_id)
 
     def observe_training_progress(
         self, progress: TrainingProgressHeartbeat

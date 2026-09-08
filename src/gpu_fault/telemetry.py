@@ -136,6 +136,38 @@ class EvidenceService:
         return record
 
 
+#: Where the Completion Watcher posts :class:`WorkloadCoverageHeartbeat`. It is
+#: deliberately not a ``CHANNEL_REGISTRY`` channel: the heartbeat carries no
+#: attempt, needs no receipt and is superseded by the next pass.
+ATTEMPT_COVERAGE_PATH = "/v1/attempts/coverage"
+
+
+class WorkloadCoverageHeartbeat(StrictModel):
+    """One watcher's statement that it watched a whole cluster and is current.
+
+    An idle cluster produces no attempt observation, so "no observation" used
+    to mean both "nobody is watching" and "there is nothing to see", and the
+    resolver had to fail closed on UNKNOWN for both (completion-watcher F4).
+    This is the second statement made explicit: the watcher completed a full
+    pass at ``observed_at`` and found ``watched_attempts`` attempts across
+    ``watched_pods`` managed Pods -- zero being the interesting case.
+
+    ``resource_version`` is the Kubernetes list revision the pass started from
+    and ``watcher_instance`` names the process, so an operator can tell a
+    heartbeat from a watcher that has since been replaced from a current one.
+    Neither is read by the resolver: coverage is decided by ``observed_at``
+    alone, which is what keeps a rolled-back watcher from claiming coverage
+    with a stale clock.
+    """
+
+    cluster_id: str
+    observed_at: datetime
+    watched_pods: int = Field(default=0, ge=0)
+    watched_attempts: int = Field(default=0, ge=0)
+    resource_version: str | None = None
+    watcher_instance: str
+
+
 class WorkloadContext(StrictModel):
     workload_state: str
     workload_ids: list[str] = Field(default_factory=list)
@@ -154,6 +186,7 @@ class WorkloadTopologyService:
         *,
         max_age_seconds: int = 120,
         freshness_seconds: float = 600,
+        coverage_freshness_seconds: float | None = None,
     ) -> None:
         if freshness_seconds <= 0:
             raise ValueError("freshness_seconds must be positive")
@@ -163,14 +196,61 @@ class WorkloadTopologyService:
                 "observation young enough to match a node must also count as "
                 "coverage of its cluster"
             )
+        if coverage_freshness_seconds is None:
+            coverage_freshness_seconds = freshness_seconds
+        if coverage_freshness_seconds <= 0:
+            raise ValueError("coverage_freshness_seconds must be positive")
         self.store = store
         self.max_age_seconds = max_age_seconds
         # How recently the cluster must have produced any attempt observation
         # for "nothing matches this node" to mean IDLE rather than UNKNOWN.
         self.freshness_seconds = freshness_seconds
+        # The same question for the watcher's own coverage heartbeat, which is
+        # the only coverage an idle cluster produces. Defaults to the
+        # observation window so one setting moves both.
+        self.coverage_freshness_seconds = coverage_freshness_seconds
 
     def observe(self, observation: AttemptObservation) -> None:
         self.store.save_attempt_observation(observation)
+
+    def observe_coverage(self, heartbeat: WorkloadCoverageHeartbeat) -> bool:
+        """Record a watcher's full-pass heartbeat; ``False`` when it is stale.
+
+        One row per cluster: the store keeps the newest ``observed_at`` and
+        refuses an older one, so the last in-flight heartbeat of a watcher a
+        rollout has already replaced cannot move coverage backwards.
+        """
+
+        return bool(self.store.save_workload_coverage_heartbeat(heartbeat))
+
+    def _covered_by_heartbeat(self, cluster_id: str, observed_at: datetime) -> bool:
+        """Whether a watcher vouched for the whole cluster recently enough.
+
+        Read only when no observation covers the cluster -- on a busy cluster
+        this costs nothing, and on an idle one it is a single keyed row.
+
+        The answer is per *cluster*, exactly like observation coverage: the
+        watcher lists every managed Pod of the cluster in one pass, so "I found
+        no attempt" is a statement about every node at once. That is what the
+        planner needs, because the node it asks about is by definition one the
+        observations did not name.
+        """
+
+        # A store that does not carry heartbeats at all -- a narrow proxy, a
+        # double -- means "no coverage", the same answer it gave before the
+        # heartbeat existed. Resolving runs on the fault ingest path, so the
+        # missing method must not raise there, and the fallback is the closed
+        # direction: UNKNOWN blocks, it does not permit.
+        read = getattr(self.store, "get_workload_coverage_heartbeat", None)
+        heartbeat = read(cluster_id) if read is not None else None
+        if heartbeat is None:
+            return False
+        # The window is symmetric so ordinary clock skew between the watcher
+        # and this process cannot silently retire coverage, while a stamp from
+        # far in the future -- which the store's monotonic guard would then
+        # keep -- stops counting instead of vouching for the cluster for ever.
+        age = (observed_at - heartbeat.observed_at).total_seconds()
+        return abs(age) <= self.coverage_freshness_seconds
 
     def resolve(
         self,
@@ -192,12 +272,15 @@ class WorkloadTopologyService:
         instead of once per node; the age filter below is what bounds
         staleness either way.
 
-        ``workload_state`` fails closed: IDLE needs fresh observation
-        coverage of the cluster (any attempt, any phase, observed within
-        ``freshness_seconds``) that simply does not name this node. A cluster
-        with no coverage -- the watcher down, the cluster silent, a stale
-        feed -- is UNKNOWN, which the compilers treat as "someone may be
-        using it" (design: monitoring loss is Unknown; ARCH-E2E-1 finding 2).
+        ``workload_state`` fails closed: IDLE needs fresh coverage of the
+        cluster that simply does not name this node. Coverage is either a fresh
+        attempt observation (any attempt, any phase, within
+        ``freshness_seconds``) or -- for a cluster that is running nothing at
+        all, and therefore publishes no observation -- the watcher's own
+        full-pass heartbeat within ``coverage_freshness_seconds``. A cluster
+        with neither -- the watcher down, the feed stale -- is UNKNOWN, which
+        the compilers treat as "someone may be using it" (design: monitoring
+        loss is Unknown; ARCH-E2E-1 finding 2, completion-watcher F4).
         """
 
         if observations is None:
@@ -206,7 +289,7 @@ class WorkloadTopologyService:
             (observed_at - observation.observed_at).total_seconds()
             <= self.freshness_seconds
             for observation in observations
-        )
+        ) or self._covered_by_heartbeat(cluster_id, observed_at)
         workloads: list[str] = []
         jobs: list[str] = []
         attempts: list[str] = []

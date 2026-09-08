@@ -118,6 +118,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "get_regional_registry_revision",
         "get_restart_budget",
         "get_workflow",
+        "get_workload_coverage_heartbeat",
         "get_xid_correlation",
         "get_xid_event",
         "get_xid_events",
@@ -167,6 +168,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_triage_report",
+        "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
         "try_enqueue_processor_requests_batch",
     }
@@ -223,6 +225,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "get_regional_registry_revision",
         "get_restart_budget",
         "get_workflow",
+        "get_workload_coverage_heartbeat",
         "get_xid_correlation",
         "get_xid_event",
         "get_xid_policy_decision",
@@ -257,6 +260,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_triage_report",
+        "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
     }
 )

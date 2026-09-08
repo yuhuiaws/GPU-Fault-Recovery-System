@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         RegionalRegistryRevision,
         RemoteActionCommand,
     )
-    from gpu_fault.telemetry import CollectorStatus
+    from gpu_fault.telemetry import CollectorStatus, WorkloadCoverageHeartbeat
     from gpu_fault.telemetry_models import (
         WorkloadObservationState,
     )
@@ -834,6 +834,14 @@ class CompletionStore(Protocol):
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[WorkloadObservationState]: ...
+
+    def save_workload_coverage_heartbeat(
+        self, heartbeat: WorkloadCoverageHeartbeat
+    ) -> bool: ...
+
+    def get_workload_coverage_heartbeat(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None: ...
 
     def get_efa_traffic_state(self, state_key: str) -> EfaTrafficState: ...
 

@@ -39,7 +39,10 @@ from gpu_fault.store.shared.telemetry_models import (
     GpuMetricKey,
     GpuMetricsBatchKey,
 )
-from gpu_fault.telemetry import CollectorMetricsSnapshotRecord
+from gpu_fault.telemetry import (
+    CollectorMetricsSnapshotRecord,
+    WorkloadCoverageHeartbeat,
+)
 from gpu_fault.telemetry_models import WorkloadObservationState
 from gpu_fault.training_models import TrainingProgressHeartbeat, TrainingProgressState
 from gpu_fault.watcher import AttemptObservation
@@ -226,6 +229,38 @@ class SharedTelemetryRecordMixin:
             ],
             limit=limit,
             newest_first=newest_first,
+        )
+
+    def save_workload_coverage_heartbeat(
+        self, heartbeat: WorkloadCoverageHeartbeat
+    ) -> bool:
+        """Keep one heartbeat per cluster; ``False`` when an older one arrives.
+
+        The row is coverage evidence, so the newest ``observed_at`` has to win
+        outright: after a watcher rollout the replaced Pod's last in-flight
+        heartbeat can land behind the new Pod's first one, and letting it
+        overwrite the row would age coverage backwards.
+        """
+
+        storage_key = self._state_key((heartbeat.cluster_id,))
+        with self._state_transaction(f"workload_coverage_heartbeat/{storage_key}"):
+            previous = cast(
+                "WorkloadCoverageHeartbeat | None",
+                self._get_optional("workload_coverage_heartbeat", storage_key),
+            )
+            if previous is not None and heartbeat.observed_at <= previous.observed_at:
+                return False
+            self._put("workload_coverage_heartbeat", storage_key, heartbeat)
+            return True
+
+    def get_workload_coverage_heartbeat(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None:
+        return cast(
+            "WorkloadCoverageHeartbeat | None",
+            self._get_optional(
+                "workload_coverage_heartbeat", self._state_key((cluster_id,))
+            ),
         )
 
     def observe_training_progress(

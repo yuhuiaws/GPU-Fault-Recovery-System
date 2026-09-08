@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gpu_fault.telemetry import WorkloadTopologyService
+from gpu_fault.telemetry import WorkloadCoverageHeartbeat, WorkloadTopologyService
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 from tests._builders import attempt_observation, build_store, container_observation
 
@@ -57,6 +57,21 @@ def test_no_observations_for_the_cluster_is_unknown_not_idle() -> None:
         "a cluster nobody observes must not be reported as idle"
     )
     assert context.attempt_ids == [], context
+
+
+def test_a_store_without_coverage_heartbeats_resolves_unknown() -> None:
+    class ObservationOnlyStore:
+        """The narrowest store the resolver has ever been handed."""
+
+        def list_attempt_observations(self, _cluster_id: str) -> list:
+            return []
+
+    context = _topology(ObservationOnlyStore()).resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "a store that cannot answer the coverage question must fail closed, "
+        "not raise on the ingest path"
+    )
 
 
 def test_fresh_coverage_elsewhere_in_the_cluster_makes_the_node_idle() -> None:
@@ -140,3 +155,95 @@ def test_the_freshness_window_cannot_be_shorter_than_the_match_window() -> None:
         WorkloadTopologyService(
             build_store(), max_age_seconds=120, freshness_seconds=60
         )
+
+
+def _heartbeat(*, observed_at: datetime, cluster_id: str = CLUSTER):
+    return WorkloadCoverageHeartbeat(
+        cluster_id=cluster_id,
+        observed_at=observed_at,
+        watched_pods=0,
+        watched_attempts=0,
+        resource_version="4711",
+        watcher_instance="completion-watcher-0",
+    )
+
+
+def test_fresh_coverage_heartbeat_makes_an_empty_cluster_idle() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=30)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "IDLE", (
+        "a watcher that completed a full pass 30s ago and saw no attempt "
+        "proves the cluster is idle, not unobserved"
+    )
+    assert context.attempt_ids == [], context
+
+
+def test_stale_coverage_heartbeat_leaves_the_cluster_unknown() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=601)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "a heartbeat older than the freshness window proves nothing about now"
+    )
+
+
+def test_a_coverage_heartbeat_from_another_cluster_is_not_coverage() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(
+        _heartbeat(observed_at=NOW - timedelta(seconds=5), cluster_id="cluster-b")
+    )
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "another cluster's watcher says nothing about this one"
+    )
+
+
+def test_observations_win_over_a_fresh_coverage_heartbeat() -> None:
+    store = build_store()
+    store.save_attempt_observation(
+        _observation("node-1", observed_at=NOW - timedelta(seconds=30))
+    )
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=1)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "ACTIVE", (
+        "an attempt observed on the node outranks the coverage heartbeat"
+    )
+    assert context.attempt_ids == ["attempt-a"], context
+
+
+def test_the_coverage_heartbeat_window_is_configurable() -> None:
+    store = build_store()
+    strict = WorkloadTopologyService(
+        store, freshness_seconds=600, coverage_freshness_seconds=60
+    )
+    strict.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=90)))
+
+    relaxed = WorkloadTopologyService(
+        store, freshness_seconds=600, coverage_freshness_seconds=120
+    )
+
+    assert strict.resolve(CLUSTER, "node-1", NOW).workload_state == "UNKNOWN", (
+        "a 90s-old heartbeat is outside a 60s coverage window"
+    )
+    assert relaxed.resolve(CLUSTER, "node-1", NOW).workload_state == "IDLE", (
+        "a 90s-old heartbeat is inside a 120s coverage window"
+    )
+
+
+@pytest.mark.parametrize("seconds", [0, -1])
+def test_a_non_positive_coverage_window_is_refused(seconds: int) -> None:
+    with pytest.raises(ValueError, match="coverage_freshness_seconds"):
+        WorkloadTopologyService(build_store(), coverage_freshness_seconds=seconds)

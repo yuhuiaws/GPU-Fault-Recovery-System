@@ -106,6 +106,7 @@ class InMemoryStore(
         self._collector_statuses = {}
         self._telemetry_metric_latest = {}
         self._attempt_observations = {}
+        self._workload_coverage_heartbeats = {}
         self._training_progress = {}
         self._raw_evidence = {}
         self._hyperpod_node_identities = {}

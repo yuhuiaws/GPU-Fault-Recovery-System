@@ -73,6 +73,7 @@ def record_models() -> dict[str, type[BaseModel]]:
         CollectorStatus,
         RawEvidenceRecord,
         TelemetryMetricLatest,
+        WorkloadCoverageHeartbeat,
         WorkloadObservationState,
     )
     from gpu_fault.training_health import TrainingProgressState
@@ -108,6 +109,7 @@ def record_models() -> dict[str, type[BaseModel]]:
         "collector_metrics_snapshot": CollectorMetricsSnapshotRecord,
         "telemetry_metric_latest": TelemetryMetricLatest,
         "attempt_observation": WorkloadObservationState,
+        "workload_coverage_heartbeat": WorkloadCoverageHeartbeat,
         "training_progress": TrainingProgressState,
         "raw_evidence": RawEvidenceRecord,
         "hyperpod_node_identity": HyperPodNodeIdentity,

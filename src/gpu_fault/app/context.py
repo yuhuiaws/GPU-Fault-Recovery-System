@@ -201,9 +201,13 @@ class ApplicationContext:
             store=self.store,
         )
         self.node_health = NodeHealthPolicy(self.store)
-        # IDLE needs fresh attempt-observation coverage of the cluster; a
-        # cluster nobody has observed within this window resolves UNKNOWN and
+        # IDLE needs fresh coverage of the cluster within this window: either
+        # an attempt observation, or -- for a cluster running nothing at all,
+        # which publishes no observation -- the Completion Watcher's full-pass
+        # coverage heartbeat. A cluster with neither resolves UNKNOWN and
         # destructive node-health plans compile BLOCKED NEEDS_OPERATOR there.
+        # One setting moves both windows on purpose: the heartbeat interval is
+        # the watcher's pass, which is far shorter than either.
         self.topology = WorkloadTopologyService(
             self.store,
             freshness_seconds=float(
