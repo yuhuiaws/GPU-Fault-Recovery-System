@@ -163,7 +163,6 @@ def test_a_stuck_adapter_stops_being_renewed_after_the_execution_cap(
         assert result.status is RemoteCommandStatus.FAILED, result
         assert result.status_source == "executor-execution-timeout", result
         assert result.details["execution_timeout"] is True, result.details
-        assert result.details["outcome_unknown"] is True, result.details
         assert executor.execution_timeouts_total == 1, (
             "the abandoned command was not counted"
         )
@@ -215,6 +214,10 @@ def test_a_stuck_node_action_reports_an_unknown_outcome_not_a_plain_failure() ->
         )
         assert result.details["node_action_command_id"] == ("idem-command-a/node-a"), (
             "the operator needs the ledger row to confirm by hand"
+        )
+        assert result.details["outcome_unknown"] is True, (
+            "a reset the agent may still be running is the one case where the "
+            f"outcome really is unknown: {result.details}"
         )
         assert "unknown" in (result.error or ""), result.error
     finally:
@@ -269,7 +272,14 @@ def test_an_abandoned_mutation_keeps_its_lease_while_the_verdict_is_missing(
 
 
 def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
-    """VALIDATE_HOST changes nothing, so the flag would only cost attention."""
+    """VALIDATE_HOST changes nothing, so the flag would only cost attention.
+
+    Nor is its outcome unknown: a read-only probe that never answered simply
+    did not happen. ``outcome_unknown`` was written on every timeout, which
+    made the one key that means "somebody has to go look at the node" true for
+    every host validation that ran long -- and a signal that is always on is
+    the same as no signal at all.
+    """
 
     client = FakeExecutorClient([remote_command("command-a")])
     adapter = StuckAdapter()
@@ -279,6 +289,15 @@ def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
         executor.run_once()
         result = client.reported("command-a")
         assert "manual_confirmation_required" not in result.details, result.details
+        assert result.details.get("outcome_unknown") is not True, (
+            "an idempotent read-only operation that timed out has a known "
+            "outcome -- it did not happen -- so the unknown-outcome marker "
+            f"must follow the same rule as the status source: {result.details}"
+        )
+        assert "unknown" not in (result.error or ""), (
+            "the error text claims an unknown outcome for a read-only probe: "
+            f"{result.error}"
+        )
         assert result.status_source == "executor-execution-timeout", (
             "a read-only timeout is a plain timeout; reusing the unknown-outcome "
             f"source would ask an operator to confirm nothing: {result}"

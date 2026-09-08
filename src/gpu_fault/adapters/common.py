@@ -66,6 +66,32 @@ class NodeActionPending(RuntimeError):
         self.details = details or {}
 
 
+NODE_ACTION_ACCEPTED_NODES_KEY = "node_action_accepted_nodes"
+
+
+def node_action_accepted_nodes(details: Any) -> set[str]:
+    """The step's nodes whose mutation provably began, from its own details.
+
+    Written by the node-action layer only where the mutation cannot be called
+    back: the send whose acceptance the agent confirmed (PENDING in its ledger)
+    and the nodes this step already finished. The regional executor's
+    destructive fleet preflight reads it, so this is the writer's and the
+    reader's single definition of the key.
+
+    Anything else is "not accepted": a record from before the key existed, a
+    step-level marker with no node list, or a malformed value. The fence then
+    runs, which is the direction that cannot let a fleet rollout and a node
+    mutation overlap.
+    """
+
+    if not isinstance(details, dict):
+        return set()
+    raw = details.get(NODE_ACTION_ACCEPTED_NODES_KEY)
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str) and item}
+
+
 def quarantine_taint_value(incident_id: str) -> str:
     digest = hashlib.sha256(incident_id.encode("utf-8")).hexdigest()[:24]
     return f"incident-{digest}"

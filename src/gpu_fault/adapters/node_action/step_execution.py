@@ -6,7 +6,11 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from gpu_fault.adapters.common import dcgm_result_is_configuration_only
+from gpu_fault.adapters.common import (
+    NODE_ACTION_ACCEPTED_NODES_KEY,
+    dcgm_result_is_configuration_only,
+    node_action_accepted_nodes,
+)
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
@@ -340,9 +344,35 @@ class NodeActionExecutionService:
                 details={
                     **(result.details or {}),
                     **NodeActionExecutionService._partial_progress(state),
+                    **NodeActionExecutionService._accepted_nodes(state, result),
                 },
             )
         return result
+
+    @staticmethod
+    def _accepted_nodes(
+        state: NodeActionBatchState,
+        result: WorkflowStepOutcome,
+    ) -> dict[str, Any]:
+        """Which of this step's nodes are past the point of being fenced.
+
+        The regional executor skips the destructive fleet preflight only when
+        every node of the step is in this list, so it has to name each node that
+        cannot be called back: the one this outcome is about, when its agent
+        accepted the send (the transport stamps that), plus every node already
+        folded into ``node_results`` -- those were sent, accepted and finished,
+        and no fence can undo them.
+
+        Nodes the batch has not reached are deliberately absent, which keeps the
+        fence closed for them. The key is omitted entirely when nothing was
+        accepted rather than written empty: absent means "not accepted" to every
+        reader, including one holding a record from before this key existed.
+        """
+
+        accepted = node_action_accepted_nodes(result.details) | set(state.node_results)
+        if not accepted:
+            return {}
+        return {NODE_ACTION_ACCEPTED_NODES_KEY: sorted(accepted)}
 
     def _finalize(
         self,

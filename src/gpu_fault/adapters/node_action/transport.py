@@ -9,7 +9,10 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from gpu_fault.adapters.common import NodeActionPending
+from gpu_fault.adapters.common import (
+    NODE_ACTION_ACCEPTED_NODES_KEY,
+    NodeActionPending,
+)
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
 from gpu_fault.execution import (
     WorkflowStepContext,
@@ -209,13 +212,19 @@ class NodeActionTransportMixin:
             # below also carries ``node_action_command_id`` -- a refused
             # connection, a 503, an expired envelope -- so the pointer alone
             # cannot tell a caller that anything started. Callers that must know
-            # (the executor's destructive fleet preflight) read this key.
+            # (the executor's destructive fleet preflight) read these keys.
+            #
+            # Acceptance is per node, not per step: a multi-node step is folded
+            # one node at a time, so naming the node is the only way a reader
+            # can tell "this step began" from "this step began on this node and
+            # has not reached the others".
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
                 details={
                     "node_action_command_id": exc.command_id,
                     "node_action_state": "PENDING",
                     "node_action_accepted": True,
+                    NODE_ACTION_ACCEPTED_NODES_KEY: [node_id],
                     **exc.details,
                 },
             )

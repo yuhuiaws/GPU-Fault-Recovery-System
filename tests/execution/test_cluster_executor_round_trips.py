@@ -31,7 +31,12 @@ import pytest
 from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.cluster_executor import ClusterActionExecutor
 from gpu_fault.models import WorkflowOperation
-from gpu_fault.node_agent import NodeActionExecutionState, NodeActionSubmission
+from gpu_fault.node_agent import (
+    NodeActionExecutionState,
+    NodeActionResult,
+    NodeActionStatus,
+    NodeActionSubmission,
+)
 from gpu_fault.regional import RemoteCommandResult, RemoteCommandStatus
 from tests.execution.test_cluster_executor_lease_and_report import (
     EXECUTOR,
@@ -67,19 +72,22 @@ def build_executor(
 
 
 def destructive_command(
-    command_id: str, *, result_details: dict[str, Any] | None = None
+    command_id: str,
+    *,
+    result_details: dict[str, Any] | None = None,
+    node_ids: list[str] | None = None,
 ):
     return remote_command(
         command_id,
         operation=WorkflowOperation.REMEDIATE_DRIVER,
-        node_ids=["node-a"],
+        node_ids=node_ids or ["node-a"],
         result_details=result_details,
         workflow_steps=True,
     )
 
 
 def poll_a_destructive_command(
-    result_details: dict[str, Any],
+    result_details: dict[str, Any], *, node_ids: list[str] | None = None
 ) -> tuple[CountingFenceRegistry, RecordingAdapter, RemoteCommandResult]:
     """Run one executor cycle over a REMEDIATE_DRIVER carrying these details."""
 
@@ -87,7 +95,11 @@ def poll_a_destructive_command(
     adapter = RecordingAdapter()
     adapter.registry = registry  # type: ignore[attr-defined]
     client = FakeExecutorClient(
-        [destructive_command("command-a", result_details=result_details)]
+        [
+            destructive_command(
+                "command-a", result_details=result_details, node_ids=node_ids
+            )
+        ]
     )
     executor = build_executor(client, [adapter])
 
@@ -138,8 +150,53 @@ def accepting_agent(request: Any, *_args: Any, **_kwargs: Any) -> Any:
     return Response()
 
 
+def finished_on(node_id: str) -> Callable[..., Any]:
+    """An agent that already ran the action on ``node_id``, PENDING elsewhere.
+
+    The steady state of a multi-node destructive step: the batch folds one node
+    at a time, so the node before the one being waited on has really been
+    remediated. The command id carries the node (``<key>/<node_id>``), which is
+    how one wire can answer for a whole fleet.
+    """
+
+    def wire(request: Any, *_args: Any, **_kwargs: Any) -> Any:
+        command_id = request.full_url.split("command_id=")[1].split("&")[0]
+        if node_id in command_id:
+            submission = NodeActionSubmission(
+                command_id=command_id,
+                state=NodeActionExecutionState.SUCCEEDED,
+                result=NodeActionResult(
+                    command_id=command_id,
+                    operation=WorkflowOperation.REMEDIATE_DRIVER,
+                    status=NodeActionStatus.SUCCEEDED,
+                ),
+            )
+        else:
+            submission = NodeActionSubmission(
+                command_id=command_id, state=NodeActionExecutionState.PENDING
+            )
+        body = submission.model_dump_json().encode()
+
+        class Response:
+            def read(self) -> bytes:
+                return body
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+        return Response()
+
+    return wire
+
+
 def node_action_details(
-    monkeypatch: pytest.MonkeyPatch, wire: Callable[..., Any]
+    monkeypatch: pytest.MonkeyPatch,
+    wire: Callable[..., Any],
+    *,
+    node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """The details the real transport writes for one REMEDIATE_DRIVER send.
 
@@ -148,10 +205,15 @@ def node_action_details(
     """
 
     monkeypatch.setattr("gpu_fault.adapters.node_action.transport.urlopen", wire)
-    adapter = NodeActionWorkflowAdapter({"node-a": "http://node-a:9099"}, SECRET)
+    nodes = node_ids or ["node-a"]
+    adapter = NodeActionWorkflowAdapter(
+        {node_id: f"http://{node_id}:9099" for node_id in nodes}, SECRET
+    )
 
     outcome = adapter.execute(
-        step_context(adapter, operation=WorkflowOperation.REMEDIATE_DRIVER)
+        step_context(
+            adapter, operation=WorkflowOperation.REMEDIATE_DRIVER, node_ids=nodes
+        )
     )
 
     details = dict(outcome.details or {})
@@ -275,4 +337,77 @@ def test_an_unrelated_continuation_key_does_not_open_the_fence() -> None:
     assert result.status is RemoteCommandStatus.WAITING, result
     assert registry.fence_reads == 1, (
         "a replayed hold is not a started mutation; the fence must still run"
+    )
+
+
+def test_a_node_the_step_never_reached_keeps_the_fence_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance on one node of a two-node step opens nothing for the other.
+
+    A multi-node destructive step is folded one node at a time, so the outcome
+    that carries the acceptance belongs to the node currently being waited on --
+    the nodes behind it have not been sent anything at all. Reading that
+    step-level marker as "the mutation began" let a fleet rollout run
+    concurrently with a driver remediation on a node whose action had not even
+    been submitted, which is exactly the collision the fence exists to prevent.
+
+    The cost of the strict rule is bounded and accepted: the accepted node may
+    wait on the fence while a rollout is in progress, and the quiesce fail-safe
+    restores its services after 420s.
+    """
+
+    details = node_action_details(
+        monkeypatch, accepting_agent, node_ids=["node-a", "node-b"]
+    )
+    assert details["node_action_accepted"] is True, (
+        f"node-a's action was supposed to be accepted by the agent: {details}"
+    )
+
+    registry, adapter, result = poll_a_destructive_command(
+        details, node_ids=["node-a", "node-b"]
+    )
+
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.details["fleet_preflight_blocked"] is True, result.details
+    assert registry.fence_reads == 1, (
+        "node-b was never sent an action, so the rollout fence still decides "
+        f"for this step: {registry.fence_reads} read(s)"
+    )
+    assert adapter.contexts == [], "the adapter must not run behind a closed fence"
+
+
+def test_the_fence_is_skipped_once_every_node_of_the_step_is_accounted_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nodes already remediated plus the accepted one cover the whole step.
+
+    This is the shape that must keep skipping: node-a's driver remediation
+    finished (it is in ``node_results``, and no fence can recall it), node-b's
+    was accepted by its agent. Nothing in the step is still fenceable, so
+    re-reading the fence every two seconds only risks flipping the poll to
+    WAITING and stranding the one path to node-b's outcome.
+    """
+
+    details = node_action_details(
+        monkeypatch, finished_on("node-a"), node_ids=["node-a", "node-b"]
+    )
+    assert details["completed_nodes"] == ["node-a"], (
+        f"node-a's remediation was supposed to be folded as done: {details}"
+    )
+    assert details["node_action_accepted"] is True, (
+        f"node-b's action was supposed to be accepted by the agent: {details}"
+    )
+
+    registry, adapter, result = poll_a_destructive_command(
+        details, node_ids=["node-a", "node-b"]
+    )
+
+    assert result.status is RemoteCommandStatus.SUCCEEDED, result
+    assert registry.fence_reads == 0, (
+        "every node of the step is either finished or accepted, so the fence "
+        f"was re-read for a mutation nothing can call back: {registry.fence_reads}"
+    )
+    assert adapter.contexts != [], (
+        "the adapter must be reached so node-b's action can be polled"
     )

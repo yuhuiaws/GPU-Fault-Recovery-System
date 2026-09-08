@@ -25,6 +25,7 @@ from gpu_fault.adapters import (
     KubernetesWorkflowAdapter,
     NodeActionWorkflowAdapter,
 )
+from gpu_fault.adapters.common import node_action_accepted_nodes
 from gpu_fault.adapters.node_action.lease_guard import active_lease_guard
 from gpu_fault.aws_errors import (
     aws_configuration_error,
@@ -1541,9 +1542,9 @@ class ClusterActionExecutor:
         """
 
         operation = command.step.operation
+        unknown = self._timeout_outcome_is_unknown(command)
         details: dict[str, Any] = {
             "execution_timeout": True,
-            "outcome_unknown": True,
             "execution_timeout_seconds": (self.max_execution_seconds),
             "operation": operation.value,
         }
@@ -1552,8 +1553,12 @@ class ClusterActionExecutor:
             # The ledger row is the only way an operator can find out what the
             # agent actually did.
             details["node_action_command_id"] = pointer
-        unknown = self._timeout_outcome_is_unknown(command)
         if unknown:
+            # Both keys follow the same rule as ``status_source``: an
+            # idempotent read-only operation that timed out did not happen,
+            # and marking its outcome unknown would make the one key that
+            # means "go look at the node" true on every slow host validation.
+            details["outcome_unknown"] = True
             details["manual_confirmation_required"] = True
         return RemoteCommandResult(
             lease_token=str(command.lease_token),
@@ -1566,8 +1571,14 @@ class ClusterActionExecutor:
             details=details,
             error=(
                 f"executor abandoned {operation.value} after "
-                f"{self.max_execution_seconds:.0f}s; the outcome is unknown "
-                "and the operation may still be running on the node"
+                f"{self.max_execution_seconds:.0f}s"
+                + (
+                    "; the outcome is unknown and the operation may still be "
+                    "running on the node"
+                    if unknown
+                    else "; the operation changes nothing outside this process, "
+                    "so it did not happen"
+                )
             ),
         )
 
@@ -2151,25 +2162,33 @@ class ClusterActionExecutor:
         the gate has to see the acceptance the transport records only after it
         parsed a PENDING submission out of the agent.
 
-        For a multi-node destructive step, acceptance is read at step level: the
-        step's ``result_details`` carry the state of the node the step is
-        currently waiting on (``adapters/node_action/step_execution.py`` folds
-        the batch and keeps the waiting node's details, merging the nodes already
-        completed). One accepted node is enough, and deliberately so -- the step
-        as a whole is mid-mutation from that point on, and re-fencing it would
-        strand the accepted node's action exactly the way ``fleet_preflight``
-        already refuses to strand compensation after a completed destructive
-        step. The remaining nodes are still protected per send: the adapter
-        re-resolves each endpoint and agent generation, and the lease guard stops
-        new sends outright once the lease is lost.
+        Acceptance is counted per node, never per step. A multi-node step is
+        folded one node at a time, so its ``result_details`` describe the node it
+        is waiting on and the nodes it already finished -- the ones behind them
+        have not been sent anything at all. A step-level marker therefore let a
+        never-contacted node's reset run alongside a fleet rollout, which is the
+        one overlap this fence exists to prevent. So the skip requires the
+        accepted set to cover every node of the step
+        (``adapters/common.py::node_action_accepted_nodes``), and a record
+        without that list -- written before the key existed -- counts as not
+        accepted.
+
+        The cost is bounded and deliberate: while a rollout is in progress, a
+        node whose action *was* accepted can be made to wait behind the fence
+        together with its siblings. Its services are not left quiesced forever
+        either way, because the agent's own 420s fail-safe restores them.
         """
 
         details = command.result_details or {}
         if not details.get("node_action_command_id"):
             return False
-        return bool(details.get("node_action_accepted")) or (
-            details.get("node_action_state") == "PENDING"
-        )
+        if not (
+            bool(details.get("node_action_accepted"))
+            or details.get("node_action_state") == "PENDING"
+        ):
+            return False
+        node_ids = set(command.step.node_ids)
+        return bool(node_ids) and node_ids <= node_action_accepted_nodes(details)
 
     @staticmethod
     def _hold_details(
