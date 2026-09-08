@@ -20,6 +20,16 @@ whether the split works at all, neither of which shows up in pod status:
     on both Deployments is how it gets there.
 
 Exits non-zero with the reason so a deploy fails loudly.
+
+Every assertion above is the *current* release's contract. A verbatim
+rollback (``GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE`` set) restores the
+previous release's container env, which the previous release verified under
+its own contract; judging it by today's would fail a correct rollback the
+moment a release drops an env name or tightens a rule. In that mode the
+verifier instead proves the rollback did what it promised: the three role
+Deployments exist, every container's live ``env``/``envFrom`` equals the
+snapshot, the containers run ``GPU_FAULT_RUNTIME_IMAGE``, and every tier is
+fully ready with at least one replica. See ``verify_against_snapshot``.
 """
 
 from __future__ import annotations
@@ -28,8 +38,33 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from gpu_fault.container_env_snapshot import (  # noqa: E402
+    ROLE_DEPLOYMENTS,
+    ContainerEnvSnapshotError,
+    container_env_differences,
+    load_container_env_snapshot,
+    pod_container_env,
+)
 
 NAMESPACE = os.getenv("GPU_FAULT_NAMESPACE", "gpu-fault-system")
+# Set by the release engine on a verbatim rollback and read by the renderer
+# (see CONTAINER_ENV_FILE_VARIABLE in render_control_plane_role_split.py);
+# the apply script hands it on so this verifier judges the same snapshot.
+CONTAINER_ENV_FILE_VARIABLE = "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"
+MISSING_ROLE_CONSEQUENCE = {
+    "gpu-fault-api-ha": "",
+    "gpu-fault-control-worker": ": nothing claims from the processor queue",
+    "gpu-fault-telemetry-spool-worker": (
+        ": routine telemetry is admitted to the spool but nobody drains it"
+    ),
+}
 # name -> data, or None once kubectl has answered NotFound. Absence is
 # cached like presence so an optional ConfigMap referenced from several
 # places costs one lookup, and so a later required reference to the same
@@ -188,28 +223,114 @@ def reject_request_count_recycling(
         )
 
 
-def main() -> int:
-    problems: list[str] = []
-    expected_runtime_image = os.getenv("GPU_FAULT_RUNTIME_IMAGE")
+def report(problems: list[str]) -> int:
+    for problem in problems:
+        print(f"role-split check failed: {problem}")
+    return 1 if problems else 0
 
-    ingress = deployment("gpu-fault-api-ha")
-    worker = deployment("gpu-fault-control-worker")
-    spool = deployment("gpu-fault-telemetry-spool-worker")
-    if ingress is None:
-        problems.append("gpu-fault-api-ha is missing")
-    if worker is None:
-        problems.append(
-            "gpu-fault-control-worker is missing: nothing claims from the processor queue"
-        )
-    if spool is None:
-        problems.append(
-            "gpu-fault-telemetry-spool-worker is missing: routine "
-            "telemetry is admitted to the spool but nobody drains it"
-        )
+
+def role_deployments() -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The three role Deployments by name, and a problem for each missing one."""
+
+    found: dict[str, dict[str, Any]] = {}
+    problems: list[str] = []
+    for name in ROLE_DEPLOYMENTS:
+        item = deployment(name)
+        if item is None:
+            problems.append(f"{name} is missing{MISSING_ROLE_CONSEQUENCE[name]}")
+        else:
+            found[name] = item
+    return found, problems
+
+
+def spool_tier_disabled_in_snapshot(snapshot: dict[str, Any]) -> bool:
+    """Whether the previous release itself ran with telemetry-spool admission off.
+
+    Read from the snapshot's own ingress environment, not from the current
+    contract: when the previous ingress carried the literal
+    ``GPU_FAULT_TELEMETRY_SPOOL=false`` the spool tier was legitimately scaled
+    to zero (the apply script drains it on that transition), so a rollback that
+    restores that shape must not be failed for the zero.
+    """
+
+    api = (snapshot.get("gpu-fault-api-ha") or {}).get("api") or {}
+    return any(
+        item.get("name") == "GPU_FAULT_TELEMETRY_SPOOL"
+        and str(item.get("value", "")).strip().lower() == "false"
+        for item in api.get("env") or []
+    )
+
+
+def verify_against_snapshot(
+    found: dict[str, dict[str, Any]],
+    snapshot_path: str,
+    expected_runtime_image: str | None,
+) -> int:
+    """Snapshot mode: the rollback restored what it captured, and it is up.
+
+    The current-contract assertions in ``main`` (service roles, ports,
+    uvicorn worker counts, pool arithmetic, spool limits, inert pool sizing,
+    the spool/ingress admission pairing) are skipped: the previous release
+    verified its own environment under its own rules. What remains is
+    release-independent: live ``env``/``envFrom`` equal the snapshot
+    (``gpu_fault.container_env_snapshot`` normalisation), every container runs
+    the expected image, and every tier has all of its replicas ready.
+    """
+
+    print(
+        "role-split check running in container env snapshot mode: "
+        f"{CONTAINER_ENV_FILE_VARIABLE} is set, so the current release's "
+        "contract assertions are skipped and the live Deployments are judged "
+        "against the previous release's snapshot"
+    )
+    try:
+        snapshot = load_container_env_snapshot(snapshot_path)
+    except ContainerEnvSnapshotError as exc:
+        raise SystemExit(
+            f"{CONTAINER_ENV_FILE_VARIABLE}: previous container environment "
+            f"snapshot is invalid: {exc}"
+        ) from exc
+    live = {name: pod_container_env(item) for name, item in found.items()}
+    problems = container_env_differences(snapshot, live, actual_label="live")
+    spool_may_be_zero = spool_tier_disabled_in_snapshot(snapshot)
+    for name, item in found.items():
+        for member in item["spec"]["template"]["spec"]["containers"]:
+            if expected_runtime_image and member.get("image") != expected_runtime_image:
+                problems.append(
+                    f"{name} container {member['name']} runtime image does not "
+                    "match GPU_FAULT_RUNTIME_IMAGE"
+                )
+        replicas = item["spec"].get("replicas", 0)
+        ready = item.get("status", {}).get("readyReplicas", 0)
+        if not replicas:
+            if not (name == "gpu-fault-telemetry-spool-worker" and spool_may_be_zero):
+                problems.append(f"{name} is scaled to zero")
+        elif ready != replicas:
+            problems.append(f"{name} has {ready}/{replicas} ready")
     if problems:
-        for problem in problems:
-            print(f"role-split check failed: {problem}")
-        return 1
+        return report(problems)
+    print(
+        "role-split check passed (snapshot mode): live env/envFrom equal the "
+        "previous release's snapshot; "
+        + ", ".join(
+            f"{name} {found[name]['spec'].get('replicas')} replicas ready"
+            for name in ROLE_DEPLOYMENTS
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    expected_runtime_image = os.getenv("GPU_FAULT_RUNTIME_IMAGE")
+    snapshot_path = os.getenv(CONTAINER_ENV_FILE_VARIABLE, "").strip()
+    found, problems = role_deployments()
+    if problems:
+        return report(problems)
+    if snapshot_path:
+        return verify_against_snapshot(found, snapshot_path, expected_runtime_image)
+    ingress = found["gpu-fault-api-ha"]
+    worker = found["gpu-fault-control-worker"]
+    spool = found["gpu-fault-telemetry-spool-worker"]
 
     api = container(ingress, "api")
     if expected_runtime_image and api.get("image") != expected_runtime_image:

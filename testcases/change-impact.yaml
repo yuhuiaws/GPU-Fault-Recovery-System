@@ -185,6 +185,7 @@ rules:
       - tests/regional/test_release_supersede_failed_transaction.py
       - tests/deploy/test_rds_ca_bundle_wiring.py
       - tests/deploy/test_verify_control_plane_role_split_optional.py
+      - tests/deploy/test_verify_control_plane_role_split_snapshot.py
       - tests/regional/test_release_aurora_refresh_preflight.py
       - tests/test_artifact_consistency.py
     regional_cases:

@@ -6,10 +6,17 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 from urllib import request as urllib_request
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.container_env_snapshot import (
+    ROLE_DEPLOYMENTS,
+    container_env_differences,
+    load_container_env_snapshot,
+    pod_container_env,
+)
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import (
     environment_value_kinds,
@@ -33,6 +40,16 @@ PROCESSOR_POOL_ENV = {
     "GPU_FAULT_PROCESSOR_GPU_TELEMETRY_WORKERS",
     "GPU_FAULT_PROCESSOR_HOST_TELEMETRY_WORKERS",
 }
+# The validators that encode the *current* release's contract. A verbatim
+# rollback render carries the previous release's env, so these are the wrong
+# rules for it and snapshot mode skips them by name (see validate()).
+CURRENT_CONTRACT_VALIDATORS = (
+    "validate_environment_inventory",
+    "validate_role",
+    "validate_shutdown",
+    "validate_operation_allowlists",
+    "validate_connections",
+)
 
 
 def manifest_paths(values: list[str]) -> list[Path]:
@@ -356,10 +373,47 @@ def validate_environment_inventory(
     return errors
 
 
+def validate_against_container_env_snapshot(
+    deployments: list[dict[str, Any]],
+    snapshot_path: str,
+) -> list[str]:
+    """Judge a verbatim rollback render by the snapshot it was rendered from.
+
+    On rollback the renderer copies the previous release's container
+    ``env``/``envFrom`` into the rendered Deployments, so the current release's
+    inventory, role, shutdown, allowlist and connection rules would reject a
+    correct render (a name the current code dropped is "unknown" to it). The
+    previous release already ran those validators on exactly these lists when
+    it deployed; what can go wrong now is the copy, so that is what is checked:
+    the three role Deployments are rendered, the snapshot and the render name
+    the same Deployments and containers, and every container's lists equal the
+    snapshot's (env order-insensitive by name, envFrom in order -- see
+    ``gpu_fault.container_env_snapshot``). ``resolve_environment`` is skipped
+    too: it needs the previous release's ConfigMaps, which the engine restores
+    outside this render. A malformed or unreadable snapshot raises.
+    """
+
+    snapshot = load_container_env_snapshot(snapshot_path)
+    rendered = {
+        deployment["metadata"]["name"]: pod_container_env(deployment)
+        for deployment in deployments
+    }
+    errors = [
+        f"role Deployment {name} is not rendered"
+        for name in ROLE_DEPLOYMENTS
+        if name not in rendered
+    ]
+    errors.extend(
+        container_env_differences(snapshot, rendered, actual_label="rendered")
+    )
+    return errors
+
+
 def validate(
     paths: list[Path],
     *,
     node_operations: str | None = None,
+    container_env_snapshot: str | None = None,
 ) -> dict:
     items = documents(paths)
     config_maps = {
@@ -368,6 +422,18 @@ def validate(
         if item.get("kind") == "ConfigMap"
     }
     deployments = [item for item in items if item.get("kind") == "Deployment"]
+    if container_env_snapshot is not None:
+        snapshot_errors = validate_against_container_env_snapshot(
+            deployments, container_env_snapshot
+        )
+        return {
+            "valid": not snapshot_errors,
+            "deployments": len(deployments),
+            "config_maps": len(config_maps),
+            "errors": snapshot_errors,
+            "container_env_snapshot": container_env_snapshot,
+            "skipped": list(CURRENT_CONTRACT_VALIDATORS),
+        }
     environments = {}
     errors = []
     for deployment in deployments:
@@ -399,6 +465,15 @@ def main() -> int:
     command = subcommands.add_parser("validate")
     command.add_argument("manifest", nargs="*")
     command.add_argument("--node-operations")
+    command.add_argument(
+        "--container-env-snapshot",
+        metavar="FILE",
+        help=(
+            "rollback only: the previous release's container env snapshot the "
+            "render was substituted from; compare against it and skip the "
+            "current-release contract validators"
+        ),
+    )
     command.add_argument("--json", action="store_true")
     readiness = subcommands.add_parser("collector-readiness")
     readiness.add_argument("--url", required=True)
@@ -414,6 +489,7 @@ def main() -> int:
         report = validate(
             manifest_paths(args.manifest),
             node_operations=args.node_operations,
+            container_env_snapshot=args.container_env_snapshot,
         )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         report = {
@@ -424,7 +500,16 @@ def main() -> int:
         }
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
-    elif report["valid"]:
+        return 0 if report["valid"] else 1
+    if report.get("skipped"):
+        print(
+            "configuration validators skipped: "
+            + ", ".join(report["skipped"])
+            + " (container env snapshot mode: the render carries the previous "
+            "release's env/envFrom verbatim, which that release validated when "
+            "it deployed; the render is judged against the snapshot instead)"
+        )
+    if report["valid"]:
         print(
             "configuration valid: "
             f"{report['deployments']} deployment(s), "

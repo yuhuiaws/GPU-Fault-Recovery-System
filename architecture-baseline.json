@@ -37,7 +37,7 @@
   },
   "functions": {
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 660,
-    "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 252,
+    "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 241,
     "deploy/hyperpod/deploy.sh:build_artifacts": 270,
     "deploy/hyperpod/deploy.sh:deploy_control_plane": 368,
     "deploy/hyperpod/deploy.sh:ensure_aurora": 302,

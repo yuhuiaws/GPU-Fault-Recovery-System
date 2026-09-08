@@ -551,8 +551,18 @@ elif ! kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
     exit 1
 fi
 
+# A verbatim rollback renders the previous release's container env, which the
+# current release's validators would reject (names it dropped are "unknown" to
+# it). The engine sets GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE only then; the
+# lint switches to comparing the render against that snapshot.
+config_validate_args=("${GENERATED}")
+if [[ -n "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" ]]; then
+    config_validate_args+=(
+        --container-env-snapshot "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE}"
+    )
+fi
 PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}" python3 -m \
-    gpu_fault.config_cli validate "${GENERATED}"
+    gpu_fault.config_cli validate "${config_validate_args[@]}"
 
 render_manifest_for_apply() {
     local manifest="$1"
@@ -963,7 +973,10 @@ else
 fi
 stamp_admin_config_metadata
 
+# The snapshot variable is inherited from the engine's environment anyway; it
+# is passed on explicitly so the verifier's snapshot mode is visible here.
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
 GPU_FAULT_RELEASE_ID="${RELEASE_ID}" \
+GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE="${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" \
     "${SCRIPT_DIR}/verify-control-plane-role-split.sh"

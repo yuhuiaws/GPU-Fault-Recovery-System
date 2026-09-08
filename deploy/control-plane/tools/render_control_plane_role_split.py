@@ -35,6 +35,10 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from gpu_fault.admin.config import AdminConfig, default_admin_config  # noqa: E402
+from gpu_fault.container_env_snapshot import (  # noqa: E402
+    ContainerEnvSnapshotError,
+    load_container_env_snapshot,
+)
 
 CONTROL_PLANE_RUNTIME_PATH = (
     "/opt/gpu-fault/control-plane/bin:/opt/app-root/bin:"
@@ -186,57 +190,21 @@ def _invalid_container_env(detail: str) -> SystemExit:
 def load_previous_container_env() -> (
     dict[str, dict[str, dict[str, list[dict[str, Any]]]]] | None
 ):
-    """Read the rollback env snapshot, or None when there is none to apply."""
+    """Read the rollback env snapshot, or None when there is none to apply.
+
+    The shape rules live in ``gpu_fault.container_env_snapshot`` so that the
+    two verifications of a verbatim rollback (``config_cli validate`` on the
+    render, ``verify_control_plane_role_split`` on the live Deployments) judge
+    the same file by the same rules this render applied it under.
+    """
 
     path = os.getenv(CONTAINER_ENV_FILE_VARIABLE, "").strip()
     if not path:
         return None
     try:
-        snapshot = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise _invalid_container_env(f"cannot read {path}: {exc}") from exc
-    if not isinstance(snapshot, dict) or not snapshot:
-        raise _invalid_container_env("expected a non-empty Deployment mapping")
-    for deployment_name, containers in snapshot.items():
-        if not isinstance(deployment_name, str) or not isinstance(containers, dict):
-            raise _invalid_container_env("Deployment entries must map container names")
-        if not containers:
-            raise _invalid_container_env(f"{deployment_name} lists no containers")
-        for container_name, spec in containers.items():
-            if (
-                not isinstance(container_name, str)
-                or not isinstance(spec, dict)
-                or set(spec) != {"env", "envFrom"}
-                or not isinstance(spec["env"], list)
-                or not isinstance(spec["envFrom"], list)
-            ):
-                raise _invalid_container_env(
-                    f"{deployment_name}/{container_name} must carry exactly "
-                    "env and envFrom lists"
-                )
-            for item in spec["env"]:
-                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                    raise _invalid_container_env(
-                        f"{deployment_name}/{container_name} has an env entry "
-                        "without a name"
-                    )
-                if ("value" in item) == ("valueFrom" in item):
-                    raise _invalid_container_env(
-                        f"{deployment_name}/{container_name} env {item['name']} "
-                        "must define exactly one of value or valueFrom"
-                    )
-                if "value" in item and SENSITIVE_ENV.search(item["name"]):
-                    raise _invalid_container_env(
-                        f"{deployment_name}/{container_name} sensitive env "
-                        f"{item['name']} carries a literal value"
-                    )
-            for source in spec["envFrom"]:
-                if not isinstance(source, dict):
-                    raise _invalid_container_env(
-                        f"{deployment_name}/{container_name} has a malformed "
-                        "envFrom entry"
-                    )
-    return snapshot
+        return load_container_env_snapshot(path)
+    except ContainerEnvSnapshotError as exc:
+        raise _invalid_container_env(str(exc)) from exc
 
 
 def restore_previous_container_env(
