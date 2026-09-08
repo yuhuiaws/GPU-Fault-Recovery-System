@@ -150,6 +150,171 @@ def test_a_failed_host_validation_is_classified_like_the_other_validations():
     assert next_rung(VALIDATE_HOST, {REBOOT}) is WorkflowOperation.REPLACE_NODE
 
 
+def _failed_workflow(steps, failed_index, **failure):
+    return workflow_request(
+        "wf",
+        "inc",
+        status=WorkflowStatus.FAILED,
+        official_steps=steps,
+        completed_step_indexes=list(range(failed_index)),
+        completed_operations=[step.operation for step in steps[:failed_index]],
+        step_executions=[
+            *(
+                workflow_step_execution(index, step.operation)
+                for index, step in enumerate(steps[:failed_index])
+            ),
+            workflow_step_execution(
+                failed_index,
+                steps[failed_index].operation,
+                WorkflowStepStatus.FAILED,
+                **failure,
+            ),
+        ],
+    )
+
+
+def test_an_interrupted_reset_goes_to_an_operator_instead_of_the_reboot_rung():
+    """INTERRUPTED means "the agent may have reset the GPU; nobody knows".
+
+    The node-action fold turns it into FAILED with ``manual_confirmation_required``
+    and ``node_action_interrupted`` in the details. Climbing to REBOOT_NODE from
+    there rebooted a node whose reset may have finished a second ago, and the
+    recorded cost of every ledger-write failure ("the control plane treats the
+    step as manual confirmation") was simply false: nothing read the flags.
+    """
+
+    steps = [
+        workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
+        workflow_step(RESET, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
+    ]
+    workflow = _failed_workflow(
+        steps,
+        1,
+        error="node agent node-a: node action attempt closed without a result",
+        details={
+            "node_action_interrupted": True,
+            "manual_confirmation_required": True,
+            "operation": RESET.value,
+        },
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None
+    stage, action, operation, failures = classification
+    assert action is RecoveryAction.ESCALATE_OPERATOR, (
+        "an INTERRUPTED reset must reach an operator, not the reboot rung: "
+        f"{stage} -> {action}"
+    )
+    assert operation is WorkflowOperation.ESCALATE_SUPPORT, operation
+    assert stage == "manual_confirmation_required", stage
+    assert [item.step_index for item in failures] == [1]
+
+
+def test_an_unknown_outcome_reboot_timeout_goes_to_an_operator_not_to_replacement():
+    """The executor gave up on a RESTART_NODE whose thread may still be rebooting.
+
+    ``executor-execution-timeout-outcome-unknown`` is a FAILED result with
+    ``outcome_unknown`` and ``manual_confirmation_required`` in its details.
+    REPLACE_NODE on top of a reboot that is possibly still in flight is the
+    exact promotion the timeout result's own docstring said it existed to
+    prevent -- and nothing prevented it.
+    """
+
+    steps = [
+        workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
+        workflow_step(REBOOT, node_ids=["node-a"]),
+    ]
+    workflow = _failed_workflow(
+        steps,
+        1,
+        error="executor abandoned RESTART_NODE after 600s; the outcome is unknown",
+        details={
+            "execution_timeout": True,
+            "execution_timeout_seconds": 600,
+            "operation": REBOOT.value,
+            "outcome_unknown": True,
+            "manual_confirmation_required": True,
+        },
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None
+    stage, action, operation, failures = classification
+    assert action is RecoveryAction.ESCALATE_OPERATOR, (
+        "a reboot whose outcome is unknown must not be promoted to REPLACE_NODE: "
+        f"{stage} -> {action}"
+    )
+    assert operation is WorkflowOperation.ESCALATE_SUPPORT, operation
+    assert [item.step_index for item in failures] == [1]
+
+
+def test_a_timeout_status_source_alone_in_the_details_is_read_as_unknown():
+    """A record carrying only the executor's status source still stops the climb."""
+
+    steps = [workflow_step(REBOOT, node_ids=["node-a"])]
+    workflow = _failed_workflow(
+        steps,
+        0,
+        error="executor abandoned RESTART_NODE after 600s",
+        details={"status_source": "executor-execution-timeout-outcome-unknown"},
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None, "the failure must still be classified"
+    assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
+
+
+def test_a_plain_failed_reset_still_climbs_to_the_reboot_rung():
+    """The ladder is untouched for a reset that really failed."""
+
+    steps = [
+        workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
+        workflow_step(RESET, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
+    ]
+    workflow = _failed_workflow(
+        steps,
+        1,
+        error="node agent node-a: nvidia-smi --gpu-reset exited 1",
+        details={"operation": RESET.value, "reset_gpu_uuids": []},
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None
+    stage, action, operation, _failures = classification
+    assert stage == "reset", stage
+    assert action is RecoveryAction.REBOOT_NODE, action
+    assert operation is WorkflowOperation.RESTART_NODE, operation
+
+
+def test_a_bounded_read_only_timeout_still_climbs_as_a_plain_failure():
+    """``executor-execution-timeout`` without the unknown marker is a real verdict."""
+
+    steps = [
+        workflow_step(REBOOT, node_ids=["node-a"]),
+        workflow_step(VALIDATE_HOST, node_ids=["node-a"]),
+    ]
+    workflow = _failed_workflow(
+        steps,
+        1,
+        error="executor abandoned VALIDATE_HOST after 600s",
+        details={
+            "execution_timeout": True,
+            "operation": VALIDATE_HOST.value,
+            "status_source": "executor-execution-timeout",
+        },
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None
+    assert classification[0] == "reboot_validation", classification[:3]
+    assert classification[1] is RecoveryAction.REPLACE_NODE, classification[:3]
+
+
 # ---------------------------------------------------------------- emit
 
 

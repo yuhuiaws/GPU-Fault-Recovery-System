@@ -70,6 +70,22 @@ _CLASSIFIABLE_OPERATIONS = (
 # support workflow carries no isolation (ARCH-E2E-2A finding 1, DESTR-020).
 CONTAINMENT_STAGE = "containment_or_release"
 CONTAINMENT_REFUSED_STAGE = "containment_refused"
+# A failure whose outcome nobody knows. Two producers write it: the node-action
+# fold, when the agent's attempt closed INTERRUPTED (``node_action_interrupted``),
+# and the regional executor, when it abandoned a mutating command at its
+# execution cap (``outcome_unknown``; its ``status_source`` is
+# ``executor-execution-timeout-outcome-unknown``, read here too for a record
+# that carried the source but not the flags). Both set
+# ``manual_confirmation_required``. The reset may have run, the reboot may still
+# be in flight -- climbing the hardware ladder from there reboots a node whose
+# GPU was possibly just reset, or replaces one that is possibly still rebooting.
+MANUAL_CONFIRMATION_STAGE = "manual_confirmation_required"
+UNKNOWN_OUTCOME_STATUS_SOURCE = "executor-execution-timeout-outcome-unknown"
+_UNKNOWN_OUTCOME_FLAGS = (
+    "manual_confirmation_required",
+    "node_action_interrupted",
+    "outcome_unknown",
+)
 # Written by the Kubernetes node adapter on a step it refused rather than
 # failed: ``safety_rejection`` on every refusal, ``absent`` when the node
 # could not be read at all.
@@ -106,6 +122,22 @@ def escalation_origin(event_id: str) -> tuple[str, str] | None:
     if name not in ESCALATION_NAMES.values():
         return None
     return name, source_request_id
+
+
+def _unknown_outcome_failures(
+    executions: list[WorkflowStepExecution],
+) -> list[WorkflowStepExecution]:
+    """FAILED executions that demand an operator's confirmation, not a rung."""
+
+    return [
+        execution
+        for execution in executions
+        if execution.status is WorkflowStepStatus.FAILED
+        and (
+            any(execution.details.get(flag) is True for flag in _UNKNOWN_OUTCOME_FLAGS)
+            or execution.details.get("status_source") == UNKNOWN_OUTCOME_STATUS_SOURCE
+        )
+    ]
 
 
 def _refused_containment(
@@ -343,6 +375,16 @@ class HardwareEscalationService:
                 RecoveryAction.ESCALATE_OPERATOR,
                 WorkflowOperation.ESCALATE_SUPPORT,
                 lifetime_failures,
+            )
+        unknown_failures = _unknown_outcome_failures(workflow.step_executions)
+        if unknown_failures:
+            # The step may have run, or may still be running, on the node. An
+            # operator confirms what happened; no rung is climbed on a guess.
+            return (
+                MANUAL_CONFIRMATION_STAGE,
+                RecoveryAction.ESCALATE_OPERATOR,
+                WorkflowOperation.ESCALATE_SUPPORT,
+                unknown_failures,
             )
         failed_operation_set = {
             execution.operation
