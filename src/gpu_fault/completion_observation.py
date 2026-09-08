@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, cast
 
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
@@ -22,8 +24,11 @@ TERMINAL_ORIGIN_MISSING_TOMBSTONE = "missing-tombstone"
 # The kubernetes client leaves the read timeout unset by default, and a parked
 # API-server endpoint would then hold the whole reconcile forever (F3).
 WORKLOAD_READ_TIMEOUT = (5.0, 10.0)
-_SUCCESS_CONDITION_TYPES = frozenset({"complete", "completed", "succeeded"})
 _FAILURE_CONDITION_TYPES = frozenset({"failed"})
+# What a FAILED verdict recovered from a workload object can say about the
+# attempt: the Pods are gone, so there is no failed rank, no node and no exit
+# code to attribute, and containment must not be raised on a guess (C1).
+RECOVERED_VERDICT_REASON = "recovered from workload object; no per-rank evidence"
 
 
 def _parse_workload_id(value: str) -> tuple[str, str, str]:
@@ -35,21 +40,34 @@ def _parse_workload_id(value: str) -> tuple[str, str, str]:
     raise ValueError(f"invalid workload ID: {value}")
 
 
-def workload_termination_initiator(
+def read_workload_objects(
     controller: Any, workload_ids: list[str]
-) -> str | None:
+) -> list[dict[str, Any]]:
+    """Every readable workload object of an attempt, read exactly once.
+
+    Both questions the missing-Pod path asks -- "did we stop this ourselves?"
+    and "what does the object say happened?" -- have to be answered from the
+    *same* snapshot, and in that order (C1): deriving an outcome from a status
+    that our own stop produced turns a stop into an unattributed failure.
+    """
+
+    objects: list[dict[str, Any]] = []
+    for workload_id in workload_ids:
+        data = read_workload_object(controller, workload_id)
+        if data is not None:
+            objects.append(data)
+    return objects
+
+
+def workload_objects_initiator(objects: list[dict[str, Any]]) -> str | None:
     """The initiator incident recorded on the workload object itself.
 
     ``STOP_WORKLOADS`` writes ``gpu-fault.io/termination-initiator-incident-id``
     on the Job/PyTorchJob/JobSet when it suspends it, so the annotation
-    survives the Pods. Read-only through the stopper's API clients; any failure
-    means "unknown", never an exception on the observation path.
+    survives the Pods.
     """
 
-    for workload_id in workload_ids:
-        data = read_workload_object(controller, workload_id)
-        if data is None:
-            continue
+    for data in objects:
         metadata = data.get("metadata") or {}
         annotations = metadata.get("annotations") or {}
         initiator = annotations.get(TERMINATION_INCIDENT_ANNOTATION)
@@ -111,6 +129,11 @@ def pod_container_has_started(pod: dict[str, Any], container_name: str) -> bool:
     A Pod that exists is not a Pod that started: an unschedulable or
     image-pulling Pod has no ``containerStatuses`` at all, and publishing it as
     RUNNING misreported both the phase and ``started_at`` (F10).
+
+    A container that *has* run and is waiting to be restarted counts as
+    started: a CrashLoopBackOff window shows ``state.waiting`` with the exit in
+    ``lastState``, and reading that as PENDING would hide the attempt from hang
+    detection for as long as the backoff lasts.
     """
 
     status = pod.get("status") or {}
@@ -119,10 +142,18 @@ def pod_container_has_started(pod: dict[str, Any], container_name: str) -> bool:
         (item for item in statuses if item.get("name") == container_name),
         {},
     )
-    state = selected.get("state") or {}
+    if _as_count(selected.get("restartCount") or selected.get("restart_count")) > 0:
+        return True
+    states = [
+        selected.get("state") or {},
+        selected.get("lastState") or selected.get("last_state") or {},
+    ]
     # Presence, not truthiness: a freshly started container reports
     # ``state: {running: {}}`` -- an empty, falsy dict.
-    return state.get("running") is not None or state.get("terminated") is not None
+    return any(
+        state.get("running") is not None or state.get("terminated") is not None
+        for state in states
+    )
 
 
 def _as_count(value: Any) -> int:
@@ -131,68 +162,123 @@ def _as_count(value: Any) -> int:
     return int(value)
 
 
-def _completion_counts(status: dict[str, Any]) -> tuple[int, int]:
-    """Succeeded/failed replica counts across the kinds we manage.
+class WorkloadVerdict(Enum):
+    """What a workload object says about an attempt whose Pods are all gone.
 
-    ``Job`` reports them at the top level, ``PyTorchJob`` per replica type,
-    ``JobSet`` per replicated job, and all three also carry a terminal
+    ``ACTIVE`` is not an outcome: it means the object is still working (a
+    ``backoffLimit`` retry, an elastic replica set that lost members) and the
+    attempt has to stay in the missing state instead of being terminalized.
+    ``UNKNOWN`` is the fail-closed default and leaves the stop in place.
+    """
+
+    UNKNOWN = "unknown"
+    ACTIVE = "active"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _WorkloadStatusFacts:
+    succeeded: int = 0
+    failed: int = 0
+    active: int = 0
+    failure_condition: bool = False
+
+
+def _workload_status_facts(status: dict[str, Any]) -> _WorkloadStatusFacts:
+    """Replica counts and the terminal failure condition, across our kinds.
+
+    ``Job`` reports the counts at the top level, ``PyTorchJob`` per replica
+    type, ``JobSet`` per replicated job, and all three carry a ``Failed``
     condition. An unknown shape contributes nothing, which reads as "no
     verdict" and leaves the caller with its fail-closed default.
     """
 
     succeeded = _as_count(status.get("succeeded"))
     failed = _as_count(status.get("failed"))
+    active = _as_count(status.get("active"))
+    groups: list[dict[str, Any]] = []
     replica_statuses = status.get("replicaStatuses") or status.get("replica_statuses")
     if isinstance(replica_statuses, dict):
-        for group in replica_statuses.values():
-            if isinstance(group, dict):
-                succeeded += _as_count(group.get("succeeded"))
-                failed += _as_count(group.get("failed"))
+        groups.extend(
+            item for item in replica_statuses.values() if isinstance(item, dict)
+        )
     replicated = status.get("replicatedJobsStatus") or status.get(
         "replicated_jobs_status"
     )
     if isinstance(replicated, list):
-        for entry in replicated:
-            if isinstance(entry, dict):
-                succeeded += _as_count(entry.get("succeeded"))
-                failed += _as_count(entry.get("failed"))
+        groups.extend(item for item in replicated if isinstance(item, dict))
+    for group in groups:
+        succeeded += _as_count(group.get("succeeded"))
+        failed += _as_count(group.get("failed"))
+        active += _as_count(group.get("active"))
+    failure_condition = False
     for condition in status.get("conditions") or []:
         if not isinstance(condition, dict):
             continue
         if str(condition.get("status", "")).lower() != "true":
             continue
-        condition_type = str(condition.get("type", "")).lower()
-        if condition_type in _SUCCESS_CONDITION_TYPES:
-            succeeded += 1
-        elif condition_type in _FAILURE_CONDITION_TYPES:
-            failed += 1
-    return succeeded, failed
+        if str(condition.get("type", "")).lower() in _FAILURE_CONDITION_TYPES:
+            failure_condition = True
+    return _WorkloadStatusFacts(
+        succeeded=succeeded,
+        failed=failed,
+        active=active,
+        failure_condition=failure_condition,
+    )
 
 
-def workload_object_phase(controller: Any, workload_ids: list[str]) -> WorkloadPhase:
-    """What the workload object says happened, defaulting to STOPPED (F7).
+def _status_verdict(
+    status: dict[str, Any], expected_critical_ranks: int
+) -> WorkloadVerdict:
+    facts = _workload_status_facts(status)
+    # A true ``Failed`` condition is the object's own terminal verdict and
+    # outranks every count: ``{"succeeded": 3, "failed": 5}`` used to be read
+    # as a success because the success count was checked first (I1).
+    if facts.failure_condition:
+        return WorkloadVerdict.FAILED
+    if facts.active > 0:
+        # Still working: neither a success (ranks may yet fail) nor a failure
+        # (the retry may yet succeed) may be declared here (I2).
+        return WorkloadVerdict.ACTIVE
+    if facts.succeeded >= max(1, expected_critical_ranks):
+        return WorkloadVerdict.SUCCEEDED
+    if facts.failed > 0:
+        return WorkloadVerdict.FAILED
+    return WorkloadVerdict.UNKNOWN
+
+
+def workload_objects_verdict(
+    objects: list[dict[str, Any]], expected_critical_ranks: int
+) -> WorkloadVerdict:
+    """What the workload objects say happened, defaulting to UNKNOWN (F7).
 
     The Pods of an attempt that finished while the watcher was down are
     garbage-collected (``ttlSecondsAfterFinished``, ``cleanPodPolicy``), so
     their absence used to be recorded as a user stop and the job's workflows
     were withdrawn. The workload object outlives its Pods and still carries the
-    outcome. An unreadable or verdict-less object stays STOPPED: this path must
-    never invent a success.
+    outcome.
+
+    A success needs every critical rank accounted for; a partial count, an
+    unreadable object or a shape we do not recognise stays UNKNOWN, because
+    this path must never invent a success. ``ACTIVE`` from any object wins over
+    a sibling's outcome: the attempt is not over while one of its workloads
+    still is.
     """
 
-    for workload_id in workload_ids:
-        data = read_workload_object(controller, workload_id)
-        if data is None:
-            continue
-        status = data.get("status") or {}
-        if not isinstance(status, dict):
-            continue
-        succeeded, failed = _completion_counts(status)
-        if succeeded > 0:
-            return WorkloadPhase.SUCCEEDED
-        if failed > 0:
-            return WorkloadPhase.FAILED
-    return WorkloadPhase.STOPPED
+    verdicts = [
+        _status_verdict(status, expected_critical_ranks)
+        for status in (data.get("status") for data in objects)
+        if isinstance(status, dict)
+    ]
+    for candidate in (
+        WorkloadVerdict.ACTIVE,
+        WorkloadVerdict.FAILED,
+        WorkloadVerdict.SUCCEEDED,
+    ):
+        if candidate in verdicts:
+            return candidate
+    return WorkloadVerdict.UNKNOWN
 
 
 MANAGED_LABEL = "gpu-fault.io/managed"
@@ -235,6 +321,16 @@ class MissingAttemptTracker:
 
         return attempt_id in self.tombstoned
 
+    def defer_tombstone(self, attempt_id: str) -> None:
+        """Withdraw a tombstone the workload object contradicts (I2).
+
+        ``since`` is deliberately kept: the grace has already expired, so the
+        first pass on which the workload object goes quiet terminalizes the
+        attempt immediately instead of waiting out another whole grace.
+        """
+
+        self.tombstoned.discard(attempt_id)
+
     def observe_missing(
         self,
         attempt_id: str,
@@ -262,24 +358,24 @@ def restored_attempt_observation(
     attempt_id: str,
     previous: AttemptObservation,
     tombstone: AttemptObservation,
+    phase: WorkloadPhase,
     observed_at: datetime,
 ) -> AttemptObservation:
     """Replace a restored attempt's tombstone with the workload's own verdict.
 
     Only attempts rebuilt from persisted state reach here: this process never
     saw their Pods, so the absence of Pods says nothing about how they ended
-    (F7). The workload object is asked instead, and anything short of an
-    explicit succeeded/failed count leaves the tombstone in place.
+    (F7).
 
-    The exit codes are synthesized from that verdict -- the Pods are gone, so
-    no real code exists -- because the watcher core only derives
-    SUCCEEDED/FAILED once every critical rank is terminated. Every rank gets
-    the same code, so none of them is singled out as the first failure.
+    The ranks are marked terminated because the watcher core only derives
+    SUCCEEDED/FAILED once every critical rank is terminated, but they all keep
+    exit code 0: the Pods are gone, so no real code exists, and a synthesized
+    non-zero code would name a first failed rank and a node that nothing
+    observed (C1). A FAILED verdict rides on the phase alone, and the attempt
+    is marked as carrying a synthesized verdict so that the caller posts the
+    terminal without ever raising containment.
     """
 
-    phase = workload_object_phase(controller, previous.workload_ids)
-    if phase is WorkloadPhase.STOPPED:
-        return tombstone
     critical = [item for item in previous.containers if item.critical]
     if len(critical) < previous.expected_critical_ranks:
         LOGGER.warning(
@@ -300,19 +396,19 @@ def restored_attempt_observation(
             attempt_id,
         )
         return tombstone
-    exit_code = 0 if phase is WorkloadPhase.SUCCEEDED else 1
     containers = [
         item
         if item.terminated
         else item.model_copy(
             update={
                 "terminated": True,
-                "exit_code": exit_code,
+                "exit_code": 0,
                 "finished_at": observed_at,
             }
         )
         for item in critical
     ]
+    controller._synthesized_verdicts.add(attempt_id)
     LOGGER.warning(
         "restored attempt %s has no Pods left and its workload object reports "
         "%s; recording that instead of a stop",
@@ -351,6 +447,7 @@ def reconcile_attempt_observation(
     if attempt_pods:
         controller._missing_attempts.clear(attempt_id)
         controller._restored_attempts.discard(attempt_id)
+        controller._synthesized_verdicts.discard(attempt_id)
         return cast(
             AttemptObservation,
             controller._observation(attempt_id, attempt_pods, observed_at),
@@ -374,30 +471,63 @@ def reconcile_attempt_observation(
             observed_at,
         ),
     )
-    if (
-        result.workload_phase is WorkloadPhase.STOPPED
-        and attempt_id in controller._restored_attempts
-    ):
-        result = restored_attempt_observation(
-            controller, attempt_id, previous, result, observed_at
+    if result.workload_phase is not WorkloadPhase.STOPPED:
+        return result
+    return resolve_missing_attempt_tombstone(
+        controller, attempt_id, previous, result, observed_at
+    )
+
+
+def resolve_missing_attempt_tombstone(
+    controller: Any,
+    attempt_id: str,
+    previous: AttemptObservation,
+    tombstone: AttemptObservation,
+    observed_at: datetime,
+) -> AttemptObservation:
+    """Let the workload objects qualify a tombstone the Pods cannot explain.
+
+    Read once, and ask the questions in the order that keeps the path
+    fail-closed (C1): who stopped this first, an outcome only afterwards.
+    """
+
+    if tombstone.termination_initiator_incident_id is not None:
+        return tombstone
+    objects = read_workload_objects(controller, previous.workload_ids)
+    # STOP_WORKLOADS annotates the attempt Pods with the initiator incident
+    # and then suspends the workload; a Pod that exits within one poll of the
+    # patch is never observed annotated, so the tombstone would read as a user
+    # stop and the control plane would withdraw the workflow that is waiting
+    # to RESTART_WORKLOAD (DESTR-015, live). The stop step writes the same
+    # annotation on the workload object, which outlives the Pods.
+    initiator = workload_objects_initiator(objects)
+    if initiator:
+        # A stop we initiated also leaves ``status.failed`` behind -- it
+        # deleted the Pods -- so the outcome must not be derived from it.
+        return tombstone.model_copy(
+            update={"termination_initiator_incident_id": initiator}
         )
-    if (
-        result.workload_phase is WorkloadPhase.STOPPED
-        and result.termination_initiator_incident_id is None
-    ):
-        # STOP_WORKLOADS annotates the attempt Pods with the initiator incident
-        # and then suspends the workload; a Pod that exits within one poll of
-        # the patch is never observed annotated, so the tombstone would read
-        # as a user stop and the control plane would withdraw the workflow
-        # that is waiting to RESTART_WORKLOAD (DESTR-015, live). The stop step
-        # writes the same annotation on the workload object, which outlives
-        # the Pods, so read it from there before declaring the stop external.
-        initiator = workload_termination_initiator(controller, previous.workload_ids)
-        if initiator:
-            result = result.model_copy(
-                update={"termination_initiator_incident_id": initiator}
-            )
-    return result
+    if attempt_id not in controller._restored_attempts:
+        return tombstone
+    verdict = workload_objects_verdict(objects, previous.expected_critical_ranks)
+    if verdict is WorkloadVerdict.ACTIVE:
+        controller._missing_attempts.defer_tombstone(attempt_id)
+        LOGGER.info(
+            "restored attempt %s has no Pods left but its workload object is "
+            "still active; holding the stop",
+            attempt_id,
+        )
+        return previous.model_copy(update={"observed_at": observed_at})
+    if verdict is WorkloadVerdict.UNKNOWN:
+        return tombstone
+    phase = (
+        WorkloadPhase.SUCCEEDED
+        if verdict is WorkloadVerdict.SUCCEEDED
+        else WorkloadPhase.FAILED
+    )
+    return restored_attempt_observation(
+        controller, attempt_id, previous, tombstone, phase, observed_at
+    )
 
 
 class ObservationOnlyTracker:
@@ -606,9 +736,6 @@ class TerminalObservationCache:
     def __contains__(self, attempt_id: object) -> bool:
         return attempt_id in self._entries
 
-    def __len__(self) -> int:
-        return len(self._entries)
-
     def get(self, attempt_id: str) -> AttemptObservation | None:
         entry = self._entries.get(attempt_id)
         return None if entry is None else entry[0]
@@ -641,6 +768,7 @@ def _clear_attempt(controller, attempt_id: str) -> None:
     controller._terminal_observations.pop(attempt_id, None)
     controller._missing_attempts.clear(attempt_id)
     controller._restored_attempts.discard(attempt_id)
+    controller._synthesized_verdicts.discard(attempt_id)
     controller._failure_events.pop(attempt_id, None)
     controller._failure_sent.discard(attempt_id)
     controller._failure_delivery_started.pop(attempt_id, None)

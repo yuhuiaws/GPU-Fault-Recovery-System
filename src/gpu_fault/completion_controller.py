@@ -26,6 +26,7 @@ from gpu_fault.completion_attempt_state import (
 )
 from gpu_fault.completion_metrics_server import start_completion_metrics_server
 from gpu_fault.completion_observation import (
+    RECOVERED_VERDICT_REASON,
     TERMINATION_INCIDENT_ANNOTATION,
     MissingAttemptTracker,
     ObservationOnlyTracker,
@@ -692,6 +693,11 @@ class KubernetesCompletionController:
         # Attempts rebuilt from persisted state whose Pods this process has
         # never seen (F7); the restore fills it.
         self._restored_attempts: set[str] = set()
+        # Attempts whose SUCCEEDED/FAILED came from the workload object rather
+        # than from a Pod: the terminal is published, but the failure never
+        # reaches containment, because there is no rank, node or exit code to
+        # attribute and the workload IDs outlive the attempt (C1).
+        self._synthesized_verdicts: set[str] = set()
         try:
             self._missing_attempts = MissingAttemptTracker(
                 attempt_missing_grace_seconds
@@ -971,7 +977,8 @@ class KubernetesCompletionController:
                 }
             )
             return
-        if result.failure_detected is not None:
+        synthesized = attempt_id in self._synthesized_verdicts
+        if result.failure_detected is not None and not synthesized:
             failure_event = result.failure_detected
             if self.workload_stopper is not None and hasattr(
                 self.workload_stopper, "capture_logs"
@@ -1003,7 +1010,22 @@ class KubernetesCompletionController:
             )
             if initiator is None or initiator == passive_incident_id:
                 self._deliver_failure_containment(attempt_id)
-        if result.failure_detected is not None:
+        if result.failure_detected is not None and synthesized:
+            # No Pod of this attempt was ever seen by this process, so the
+            # event carries no rank, node or exit code -- and must not be
+            # published: ``handle_failure_detected`` would open an incident and
+            # STOP_WORKLOADS the workload IDs, which are stable across
+            # attempts, suspending whatever runs under them now (C1).
+            LOGGER.warning(
+                "restored attempt %s ended %s: %s; reporting the terminal "
+                "without containment",
+                attempt_id,
+                result.terminal_event.terminal_status.value
+                if result.terminal_event is not None
+                else "unresolved",
+                RECOVERED_VERDICT_REASON,
+            )
+        elif result.failure_detected is not None:
             LOGGER.warning(
                 "training failure detected: attempt=%s rank=%s node=%s exit_code=%s",
                 attempt_id,
@@ -1596,6 +1618,7 @@ class KubernetesCompletionController:
         self.watcher.reset_attempt(attempt_id)
         self._missing_attempts.clear(attempt_id)
         self._restored_attempts.discard(attempt_id)
+        self._synthesized_verdicts.discard(attempt_id)
         self._last_observations.pop(attempt_id, None)
         self._terminal_observations.pop(attempt_id, None)
         self._failure_events.pop(attempt_id, None)

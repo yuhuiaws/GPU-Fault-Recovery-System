@@ -4,8 +4,9 @@ The completion controller is a watch/poll loop with no HTTP server of its own,
 so the counters it keeps (``reconcile_failures_total``,
 ``evicted_attempts_total``, ``restore_skipped_total``,
 ``outbox_append_failures_total``, ``reconcile_runs_total``,
-``metadata_takeovers_total``), the outbox depth gauges (``outbox_depth``,
-``outbox_quarantined_depth``) and the timestamp of the last completed full
+``metadata_takeovers_total``, ``resumed_attempts_total``), the outbox depth
+gauges (``outbox_depth``, ``outbox_quarantined_depth``) and the timestamp of
+the last completed full
 reconcile pass were only reachable from a debugger. This module exposes them in
 Prometheus text exposition on a daemon thread so the Pod can carry the same
 ``prometheus.io/scrape`` annotations as every other GPU-fault workload.
@@ -87,6 +88,13 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
         "metadata_takeovers_total",
         "Attempts whose spec was re-derived because their Pods disagreed and "
         "then agreed again on a new generation.",
+    ),
+    (
+        "gpu_fault_completion_controller_resumed_attempts_total",
+        "resumed_attempts_total",
+        "Attempts whose missing-Pod tombstone was withdrawn because Pods of "
+        "that attempt-id were listed again. Anything above zero means a STOPPED "
+        "terminal was published for an attempt that was still alive.",
     ),
     (
         "gpu_fault_completion_outbox_append_failures_total",

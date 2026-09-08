@@ -37,6 +37,7 @@ class FakeController:
     outbox_quarantined_depth = 2
     reconcile_runs_total = 21
     metadata_takeovers_total = 6
+    resumed_attempts_total = 2
     watch_timeout_seconds = 30
     # The value the shipped Deployment derives (120 s receipt poll + 4 x 10 s
     # HTTP + 3 x 30 s Retry-After + 60 s margin).
@@ -278,6 +279,10 @@ def test_metrics_export_cycle_age_and_outbox_stats() -> None:
     for name, value in (
         ("gpu_fault_completion_controller_reconcile_runs_total", 21),
         ("gpu_fault_completion_controller_metadata_takeovers_total", 6),
+        # A withdrawn missing-Pod tombstone means a STOPPED terminal was
+        # published for an attempt that was still alive (F2), so it has to be
+        # scrapable, not just logged.
+        ("gpu_fault_completion_controller_resumed_attempts_total", 2),
     ):
         assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
         assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"

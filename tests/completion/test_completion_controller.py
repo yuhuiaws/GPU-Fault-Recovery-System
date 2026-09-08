@@ -476,27 +476,26 @@ def test_missing_grace_is_independent_of_cleanup_timeout() -> None:
     )
 
 
-def test_restored_attempt_with_gc_pods_and_succeeded_job_is_succeeded() -> None:
-    """F7: a finish during watcher downtime is not a user stop.
+class FakeJobApi:
+    """A ``BatchV1Api`` stand-in that serves one Job object."""
 
-    The Pods of an attempt that finished while the watcher was down are
-    garbage-collected (``ttlSecondsAfterFinished``), so the restored RUNNING
-    attempt sees no Pods at all. The workload object still records the
-    outcome and outlives its Pods.
-    """
+    def __init__(self, status, annotations=None) -> None:
+        self.status = status
+        self.annotations = annotations or {}
+        self.reads = []
 
-    class FakeBatch:
-        def __init__(self, status) -> None:
-            self.status = status
-            self.reads = []
+    def read_namespaced_job(self, name, namespace, **kwargs):
+        self.reads.append((name, namespace, kwargs.get("_request_timeout")))
+        return {
+            "metadata": {"name": name, "annotations": dict(self.annotations)},
+            "status": dict(self.status),
+        }
 
-        def read_namespaced_job(self, name, namespace, **kwargs):
-            self.reads.append((name, namespace, kwargs.get("_request_timeout")))
-            return {"metadata": {"name": name}, "status": dict(self.status)}
 
-    clock = Clock()
-    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
-    delivered = FakeSink()
+def restored_watcher(core, delivered, clock, batch):
+    """A second Watcher generation that restored one attempt from the
+    persisted state and can no longer see any of its Pods (F7)."""
+
     first = KubernetesCompletionController(
         core,
         KubernetesCompletionOutbox(core, delivered),
@@ -506,9 +505,7 @@ def test_restored_attempt_with_gc_pods_and_succeeded_job_is_succeeded() -> None:
         publish_observations=True,
     )
     first.run_once()
-
     core.pods = []
-    batch = FakeBatch({"succeeded": 1})
     stopper = FakeStopper()
     stopper.batch = batch
     stopper.custom = None
@@ -521,6 +518,24 @@ def test_restored_attempt_with_gc_pods_and_succeeded_job_is_succeeded() -> None:
         publish_observations=True,
         workload_stopper=stopper,
     )
+    return restarted, stopper
+
+
+def test_restored_attempt_with_gc_pods_and_succeeded_job_is_succeeded() -> None:
+    """F7: a finish during watcher downtime is not a user stop.
+
+    The Pods of an attempt that finished while the watcher was down are
+    garbage-collected (``ttlSecondsAfterFinished``), so the restored RUNNING
+    attempt sees no Pods at all. The workload object still records the
+    outcome and outlives its Pods.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    batch = FakeJobApi({"succeeded": 1, "active": 0})
+    restarted, _ = restored_watcher(core, delivered, clock, batch)
+
     restarted.run_once()
     clock.value += timedelta(seconds=31)
     restarted.run_once()
@@ -547,29 +562,8 @@ def test_unreadable_workload_object_keeps_the_restored_attempt_stopped() -> None
     clock = Clock()
     core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
     delivered = FakeSink()
-    first = KubernetesCompletionController(
-        core,
-        KubernetesCompletionOutbox(core, delivered),
-        cluster_id="hp-cluster",
-        attempt_missing_grace_seconds=30,
-        now=clock,
-        publish_observations=True,
-    )
-    first.run_once()
+    restarted, _ = restored_watcher(core, delivered, clock, BrokenBatch())
 
-    core.pods = []
-    stopper = FakeStopper()
-    stopper.batch = BrokenBatch()
-    stopper.custom = None
-    restarted = KubernetesCompletionController(
-        core,
-        KubernetesCompletionOutbox(core, delivered),
-        cluster_id="hp-cluster",
-        attempt_missing_grace_seconds=30,
-        now=clock,
-        publish_observations=True,
-        workload_stopper=stopper,
-    )
     restarted.run_once()
     clock.value += timedelta(seconds=31)
     restarted.run_once()
@@ -579,6 +573,166 @@ def test_unreadable_workload_object_keeps_the_restored_attempt_stopped() -> None
     )
     assert terminal["terminal_status"] == "STOPPED", (
         f"an unreadable workload object must not invent an outcome: {terminal}"
+    )
+
+
+def test_restored_attempt_stopped_by_us_keeps_its_initiator() -> None:
+    """C1: our own STOP_WORKLOADS leaves ``status.failed`` behind.
+
+    STOP_WORKLOADS annotates the workload object and deletes the Pods, so the
+    Job reports ``failed>=1`` afterwards. Deriving the outcome from that count
+    turned a stop we initiated into an unattributed FAILED, which the control
+    plane answers with a fresh incident and another STOP_WORKLOADS -- on
+    workload IDs that are stable across attempts, so a job that has since
+    restarted gets suspended. The annotation decides first.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    batch = FakeJobApi(
+        {"failed": 1, "active": 0},
+        annotations={"gpu-fault.io/termination-initiator-incident-id": "inc-stop"},
+    )
+    restarted, stopper = restored_watcher(core, delivered, clock, batch)
+
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "STOPPED", (
+        f"a stop we initiated was reported as a failure: {terminal}"
+    )
+    assert terminal["termination_initiator_incident_id"] == "inc-stop", (
+        f"the initiator recorded on the workload object was dropped: {terminal}"
+    )
+    failures = [
+        path for path, _ in delivered.posts if path.endswith("failure-detected")
+    ]
+    assert failures == [], f"a stop we initiated raised containment: {failures}"
+    assert stopper.calls == [], (
+        f"a stop we initiated was stopped again: {stopper.calls}"
+    )
+
+
+def test_restored_failed_attempt_posts_a_terminal_but_no_containment(caplog) -> None:
+    """C1: a verdict recovered from the workload object is not per-rank evidence.
+
+    There are no Pods left, so there is no failed rank, no node and no exit
+    code to attribute. Publishing a synthesized failure-detected would open an
+    incident and a STOP_WORKLOADS against workload IDs that outlive the
+    attempt. The terminal is still reported, so the job can be restarted.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    batch = FakeJobApi(
+        {"failed": 1, "active": 0, "conditions": [{"type": "Failed", "status": "True"}]}
+    )
+    restarted, stopper = restored_watcher(core, delivered, clock, batch)
+
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    with caplog.at_level(logging.WARNING):
+        restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "FAILED", (
+        f"a failure during downtime was recorded as a stop: {terminal}"
+    )
+    assert [item["exit_code"] for item in terminal["rank_exit_status"]] == [0], (
+        f"a per-rank exit code was invented: {terminal}"
+    )
+    failures = [
+        path for path, _ in delivered.posts if path.endswith("failure-detected")
+    ]
+    assert failures == [], f"a recovered verdict raised containment: {failures}"
+    assert stopper.calls == [], (
+        f"a recovered verdict stopped live workloads: {stopper.calls}"
+    )
+    assert "recovered from workload object; no per-rank evidence" in caplog.text, (
+        f"the recovered verdict was not reported as unattributed: {caplog.text}"
+    )
+
+
+def test_mixed_succeeded_and_failed_counts_are_a_failure() -> None:
+    """I1: a true ``Failed`` condition wins over any success count.
+
+    ``{"succeeded": 3, "failed": 5}`` used to read as SUCCEEDED because the
+    success count was checked first, so a failed run was recorded as a success
+    and never recovered.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    batch = FakeJobApi(
+        {
+            "succeeded": 3,
+            "failed": 5,
+            "active": 0,
+            "conditions": [{"type": "Failed", "status": "True"}],
+        }
+    )
+    restarted, _ = restored_watcher(core, delivered, clock, batch)
+
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "FAILED", (
+        f"a failed run was recorded as a success: {terminal}"
+    )
+
+
+def test_restored_attempt_with_a_retrying_job_is_not_tombstoned_yet() -> None:
+    """I2: ``failed>0`` on a Job that is still retrying is not a verdict.
+
+    ``backoffLimit`` retries take longer than the missing grace, and an
+    elastic PyTorchJob reports failed replicas while it is alive. Declaring
+    FAILED there ends an attempt that is about to heal itself; the attempt
+    stays in the missing state until the workload object goes quiet.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=["default/job/trainer"])])
+    delivered = FakeSink()
+    batch = FakeJobApi({"failed": 1, "active": 1})
+    restarted, _ = restored_watcher(core, delivered, clock, batch)
+
+    restarted.run_once()
+    clock.value += timedelta(seconds=31)
+    restarted.run_once()
+
+    terminals = [path for path, _ in delivered.posts if path == "/v1/attempts/terminal"]
+    assert terminals == [], f"a retrying job was terminalized: {terminals}"
+    published = [
+        payload
+        for path, payload in delivered.posts
+        if path == "/v1/workload-observations"
+    ][-1]
+    assert published["workload_phase"] == "RUNNING", (
+        f"a retrying job was taken off the active list: {published}"
+    )
+
+    batch.status = {"failed": 1, "active": 0}
+    clock.value += timedelta(seconds=1)
+    restarted.run_once()
+
+    terminal = next(
+        payload for path, payload in delivered.posts if path == "/v1/attempts/terminal"
+    )
+    assert terminal["terminal_status"] == "FAILED", (
+        f"the failure was not reported once the job went quiet: {terminal}"
     )
 
 
@@ -608,6 +762,41 @@ def test_pending_pod_without_statuses_is_pending() -> None:
     )
     assert published["containers"][0]["node_id"] is None, (
         f"an unscheduled Pod must not claim a node: {published}"
+    )
+
+
+def test_crashlooping_pod_is_running_not_pending() -> None:
+    """F10 must not swing the other way: a restarting container has started.
+
+    A Pod in CrashLoopBackOff reports ``state.waiting`` with the exit recorded
+    in ``lastState``; reading that as PENDING would hide the attempt from hang
+    detection for the whole backoff window.
+    """
+
+    crashlooping = pod(0)
+    crashlooping["status"]["containerStatuses"][0].update(
+        {
+            "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+            "lastState": {"terminated": {"exitCode": 1, "finishedAt": NOW.isoformat()}},
+            "restartCount": 2,
+        }
+    )
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        FakeCoreApi([crashlooping]),
+        sink,
+        cluster_id="hp-cluster",
+        now=lambda: NOW,
+        publish_observations=True,
+    )
+
+    subject.run_once()
+
+    published = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
+    assert published["workload_phase"] == "RUNNING", (
+        f"a restarting container reads as never started: {published}"
     )
 
 
