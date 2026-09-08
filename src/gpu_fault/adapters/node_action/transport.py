@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ssl
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any, Callable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -56,6 +57,24 @@ class NodeActionTransportMixin:
     secret: Any
     sender: Callable[..., Any]
     submit_timeout_seconds: Any
+
+    @property
+    def _ssl_context_cache(self) -> dict[tuple[str, str], ssl.SSLContext]:
+        """This adapter's pinned TLS contexts, created on first use.
+
+        Held per instance and reached through ``getattr``/``setattr`` because
+        the mixin owns no ``__init__`` (every concrete adapter would have to
+        remember to call it) and a class-level dict would be shared by every
+        adapter in the process, including ones built for another cluster.
+        """
+
+        cache: dict[tuple[str, str], ssl.SSLContext] | None = getattr(
+            self, "_node_action_ssl_contexts", None
+        )
+        if cache is None:
+            cache = {}
+            setattr(self, "_node_action_ssl_contexts", cache)
+        return cache
 
     def knows_node(self, cluster_id: str, node_id: str) -> bool:
         """Whether this adapter can address node_id at all.
@@ -129,7 +148,17 @@ class NodeActionTransportMixin:
                 agent_generation,
                 maintenance=maintenance,
             )
-            action_secret = self._secret_for_node(context.incident.cluster_id, node_id)
+            # One read for both the key version and the pinned certificate:
+            # they cannot disagree between two reads of the same record, and
+            # the second read was a control-plane round trip per node per poll.
+            record = (
+                self._agent_record(context.incident.cluster_id, node_id)
+                if self.registry is not None
+                else None
+            )
+            action_secret = self._secret_for_node(
+                context.incident.cluster_id, node_id, record=record
+            )
         except ValueError as exc:
             return WorkflowStepOutcome.failed(str(exc))
         if not endpoint:
@@ -140,6 +169,7 @@ class NodeActionTransportMixin:
                 context.incident.cluster_id,
                 node_id,
                 endpoint,
+                record=record,
             )
         except ValueError as exc:
             return WorkflowStepOutcome.failed(str(exc))
@@ -263,15 +293,38 @@ class NodeActionTransportMixin:
             details=common,
         )
 
-    def _secret_for_node(self, cluster_id: str, node_id: str) -> str:
+    def _agent_record(self, cluster_id: str, node_id: str) -> Any:
+        """Read one agent record for one send.
+
+        The key version and the pinned TLS certificate both live on this
+        record, and both are needed for every send. Read separately they cost
+        two control-plane round trips per node per cycle -- and a node action
+        that answers WAITING is re-dispatched every poll for as long as the
+        agent works, so this is the executor's steadiest avoidable load.
+
+        Fetch failures become ``ValueError``: the caller turns that into a
+        failed step, which is the fail-closed answer for "we cannot tell which
+        key or certificate this agent expects".
+        """
+
+        try:
+            return self.registry.store.get_agent(cluster_id, node_id)
+        except Exception as exc:
+            raise ValueError(
+                f"agent key metadata is unavailable for {node_id}"
+            ) from exc
+
+    def _secret_for_node(
+        self,
+        cluster_id: str,
+        node_id: str,
+        *,
+        record: Any = None,
+    ) -> str:
         key_version = self.node_action_key_version
         if self.registry is not None:
-            try:
-                record = self.registry.store.get_agent(cluster_id, node_id)
-            except Exception as exc:
-                raise ValueError(
-                    f"agent key metadata is unavailable for {node_id}"
-                ) from exc
+            if record is None:
+                record = self._agent_record(cluster_id, node_id)
             key_version = getattr(
                 record,
                 "node_action_key_version",
@@ -418,15 +471,46 @@ class NodeActionTransportMixin:
         cluster_id: str,
         node_id: str,
         endpoint: str,
+        *,
+        record: Any = None,
     ) -> ssl.SSLContext | None:
+        """The pinned TLS context for one node, reused across sends.
+
+        ``transport/http_client.py`` keys its connection pool on
+        ``id(ssl_context)``, so a context built per send means a full TLS
+        handshake per send and a pooled connection nothing can ever match
+        again. Cached per ``(node_id, sha256(certificate))``: keyed by node
+        alone the cache would keep trusting a retired certificate for the life
+        of the process, which no restart-free path could recover from.
+
+        Two threads racing the same cold key build two contexts and one wins;
+        that costs one extra handshake and nothing else, so the cache stays
+        lock-free.
+        """
+
         if not endpoint.startswith("https://"):
             return None
+        cache = self._ssl_context_cache
         if self.registry is None:
-            return ssl.create_default_context()
-        record = self.registry.store.get_agent(cluster_id, node_id)
+            key = ("", "system-trust")
+            context = cache.get(key)
+            if context is None:
+                context = ssl.create_default_context()
+                cache[key] = context
+            return context
+        if record is None:
+            record = self._agent_record(cluster_id, node_id)
         certificate = getattr(record, "tls_certificate_pem", None)
         if not certificate:
             raise ValueError(f"agent TLS certificate is unavailable for {node_id}")
-        context = ssl.create_default_context(cadata=certificate)
-        context.check_hostname = False
+        key = (node_id, sha256(certificate.encode()).hexdigest())
+        context = cache.get(key)
+        if context is None:
+            context = ssl.create_default_context(cadata=certificate)
+            context.check_hostname = False
+            # One live certificate per node: dropping the node's other entries
+            # keeps the cache bounded by fleet size across rotations.
+            for stale in [entry for entry in cache if entry[0] == node_id]:
+                cache.pop(stale, None)
+            cache[key] = context
         return context
