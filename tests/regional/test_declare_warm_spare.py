@@ -284,3 +284,19 @@ def test_helper_carries_no_site_topology() -> None:
     assert "/secure/gpu-fault-bootstrap" not in source
     assert "514385905925" not in source
     assert "hyperpod-i-" not in source
+
+
+def test_a_labeled_but_schedulable_spare_can_be_redeclared_to_complete_the_cordon(
+    tmp_path: Path,
+) -> None:
+    """A validated restore that released the spare's quarantine also uncordoned
+    it (DESTR-003 cleanup, 2026-09-08); the pool needs it cordoned again and
+    the declaration is the supported way to cordon."""
+    half = _node("node-spare", labels={SPARE_LABEL: "true"}, unschedulable=False)
+    assert _refusals(_settings(tmp_path), spare=half, declared=["node-spare"]) == []
+    whole = _node("node-spare", labels={SPARE_LABEL: "true"}, unschedulable=True)
+    refusals = _refusals(_settings(tmp_path), spare=whole, declared=["node-spare"])
+    assert refusals == [
+        "node is already declared as a spare and cordoned",
+        "node is already in the declared spare set",
+    ], refusals

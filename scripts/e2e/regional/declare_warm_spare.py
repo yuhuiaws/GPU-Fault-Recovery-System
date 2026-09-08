@@ -126,8 +126,13 @@ def declare_refusals(
     refusals = []
     if spare["ready"] != "True":
         refusals.append("node is not Ready")
-    if spare["labels"].get(SPARE_LABEL) == "true":
-        refusals.append("node is already declared as a spare")
+    if spare["labels"].get(SPARE_LABEL) == "true" and spare["unschedulable"]:
+        # Already labeled *and* cordoned: nothing to declare. Labeled but
+        # schedulable is a half-declared spare -- a validated restore that
+        # released a quarantine uncordons the node (DESTR-003 cleanup,
+        # 2026-09-08) -- and re-declaring completes the cordon the pool needs
+        # ("unreserved spare is schedulable" fails its health check otherwise).
+        refusals.append("node is already declared as a spare and cordoned")
     if spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
         refusals.append("HyperPod health label is not Schedulable")
     if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
@@ -148,7 +153,7 @@ def declare_refusals(
     agent = agent_by_node(state, settings.node)
     if agent is None or agent.get("lifecycle_state") != "ACTIVE":
         refusals.append("node does not have exactly one ACTIVE Agent")
-    if settings.node in declared:
+    if settings.node in declared and spare["unschedulable"]:
         refusals.append("node is already in the declared spare set")
     if fault is not None:
         if settings.node == settings.fault_node:
