@@ -47,7 +47,15 @@ def _load_verifier() -> ModuleType:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # A fresh module per test (the verifier caches lookups in module state), so
+    # the shared script loader's cache is not used -- but like it, never write a
+    # __pycache__ under deploy/: test_deploy_layout rejects the tree if we do.
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
