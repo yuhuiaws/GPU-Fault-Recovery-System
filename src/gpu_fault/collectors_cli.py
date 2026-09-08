@@ -19,7 +19,8 @@ from gpu_fault.collectors import (
     sink_from_environment,
 )
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import EventSink, OutboxFile, OutboxLockUnavailable
+from gpu_fault.collectors.outbox_file import OutboxFile, OutboxLockUnavailable
+from gpu_fault.collectors.sinks import EventSink
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 
@@ -39,13 +40,16 @@ def _add_outbox_parser(
     dead-letters again.
 
     ``requeue-dead`` runs its read-modify-write under the outbox's
-    ``fcntl.flock`` (``<outbox>.lock``), so it waits for a collector that is
-    buffering or replaying instead of racing it and losing one side's update
-    (F7). The lock is mandatory here -- unlike the collector, this process has
-    no in-process lock to fall back on -- so a lock it cannot take exits
-    non-zero and changes nothing; ``--force`` overrides that explicitly. It
-    leaves records whose payload was truncated to a digest dead: only a 4 KB
-    excerpt of those bodies exists, so they cannot be replayed.
+    ``fcntl.flock`` (``<outbox>.lock``) so it cannot race a collector that is
+    buffering or replaying and lose one side's update (F7). It does not wait
+    for the collector: the lock is polled non-blocking, ``OUTBOX_LOCK_ATTEMPTS``
+    times ``OUTBOX_LOCK_RETRY_SECONDS`` apart (10 x 0.5 s, so at most 4.5 s of
+    waiting), and a lock still held after that exits non-zero and changes
+    nothing -- unlike the collector, this process has no in-process lock to
+    fall back on. ``--force`` runs the same bounded poll and then rewrites
+    *without* the lock, for a collector that is stopped and left its lock
+    behind. It leaves records whose payload was truncated to a digest dead:
+    only a 4 KB excerpt of those bodies exists, so they cannot be replayed.
     """
 
     outbox = subcommands.add_parser(
