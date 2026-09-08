@@ -55,7 +55,7 @@ from gpu_fault.models import (
 from gpu_fault.notifications import (
     WarmSpareReplacementEmailBuilder,
 )
-from gpu_fault.orchestration import WorkflowFencingError
+from gpu_fault.orchestration import WorkflowFencingError, failure_takes_no_rung
 from gpu_fault.orchestration.preemption_boundary import preemption_boundary
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
@@ -647,9 +647,9 @@ class ProductionWorkflowExecutor:
     ) -> BranchEscalation | None:
         if self.branch_escalator is None or not workflow.dag_enabled:
             return None
-        if (outcome.details or {}).get("workflow_lifetime_exceeded"):
-            # The remediation's lifetime is over; no rung is planned for
-            # anyone, the whole workflow fails to an operator (F-N1).
+        if failure_takes_no_rung(outcome.details):
+            # Lifetime over (F-N1), or the step may have run / still be running
+            # on the node: the whole workflow fails to an operator, no rung.
             return None
         escalation = self.branch_escalator.escalate_branch(
             workflow, index, outcome.error

@@ -32,6 +32,7 @@ from ._support import (
     create_node_agent_app,
     envelope,
     executor,
+    quiesce_executor,
     quiesce_manager,
     result_params,
     submit_action,
@@ -161,4 +162,49 @@ def test_a_refused_resubmit_names_the_earlier_attempt_not_its_own_id(tmp_path) -
     assert "claimed by workflow/r1/node-a" in str(refused_other.value), (
         f"another command must still be told who holds the window: "
         f"{refused_other.value}"
+    )
+
+
+def test_a_ledger_read_failure_before_the_claim_does_not_fail_the_reset(
+    tmp_path, monkeypatch
+) -> None:
+    """The attempt number only feeds the refusal text; it must not gate the reset.
+
+    ``_claim_reset_window`` reads the attempt from the ledger inside the handler.
+    With ``sqlite3.OperationalError`` no longer a retryable handler error, a read
+    that failed there closed the attempt as a terminal FAILED -- and the ladder
+    rebooted a node whose GPU nobody had touched.
+    """
+
+    runner = ServiceRunner(active={"kubelet"})
+    agent = quiesce_executor(tmp_path, runner)
+    agent.execute(envelope(command(WorkflowOperation.QUIESCE_GPU_SERVICES)))
+    real_latest_row = agent.ledger.latest_row
+    real_mark_in_progress = agent.ledger.mark_in_progress
+    armed = Event()
+
+    def arm_after_dispatch(*args, **kwargs):
+        # The attempt is on disk: from here on every ledger read fails, which
+        # is the handler's read and nothing before it.
+        real_mark_in_progress(*args, **kwargs)
+        armed.set()
+
+    def failing_read(command_id: str):
+        if armed.is_set():
+            raise sqlite3.OperationalError("database is locked")
+        return real_latest_row(command_id)
+
+    monkeypatch.setattr(agent.ledger, "mark_in_progress", arm_after_dispatch)
+    monkeypatch.setattr(agent.ledger, "latest_row", failing_read)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.RESET_GPU, command_id="workflow/r1/node-a"))
+    )
+
+    assert result.status is NodeActionStatus.SUCCEEDED, (
+        "a ledger read that only feeds a refusal text failed the reset: "
+        f"{result.status.value} retryable={result.retryable} error={result.error}"
+    )
+    assert len([item for item in runner.commands if "--gpu-reset" in item]) == 1, (
+        runner.commands
     )

@@ -639,10 +639,23 @@ class NodeActionExecutor(
 
         The attempt number travels with the claim so that a refusal can name
         "an earlier attempt of this command" when the claimant is this very
-        command_id, instead of quoting the caller its own id.
+        command_id, instead of quoting the caller its own id. It only feeds
+        that text: a ledger read that fails here must not fail the reset --
+        ``sqlite3.OperationalError`` is not a retryable handler error, so it
+        would have closed the attempt as a terminal FAILED and sent the ladder
+        to reboot a node whose GPU nobody had touched.
         """
 
-        row = self.ledger.latest_row(command.command_id)
+        try:
+            row = self.ledger.latest_row(command.command_id)
+        except Exception:
+            LOGGER.warning(
+                "node action could not read its attempt number for the reset "
+                "claim; a refusal will not name it command_id=%s",
+                command.command_id,
+                exc_info=True,
+            )
+            row = None
         quiesce_manager.assert_quiesced(
             incident_id=command.incident_id,
             command_id=command.command_id,

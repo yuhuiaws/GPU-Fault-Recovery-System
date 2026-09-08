@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from typing import Any
 
 from gpu_fault.models import (
     BlockedKind,
@@ -70,17 +72,19 @@ _CLASSIFIABLE_OPERATIONS = (
 # support workflow carries no isolation (ARCH-E2E-2A finding 1, DESTR-020).
 CONTAINMENT_STAGE = "containment_or_release"
 CONTAINMENT_REFUSED_STAGE = "containment_refused"
-# A failure whose outcome nobody knows. Two producers write it: the node-action
-# fold, when the agent's attempt closed INTERRUPTED (``node_action_interrupted``),
-# and the regional executor, when it abandoned a mutating command at its
-# execution cap (``outcome_unknown``; its ``status_source`` is
-# ``executor-execution-timeout-outcome-unknown``, read here too for a record
-# that carried the source but not the flags). Both set
+# A failure whose outcome nobody knows. Three producers write it into the step
+# details (``status_source`` never crosses into a step record, so details are
+# the contract): the node-action fold, when the agent's attempt closed
+# INTERRUPTED (``node_action_interrupted``); the regional executor, when it
+# abandoned a mutating command at its execution cap (``outcome_unknown``); and
+# the node-action transport, when the agent refused a body change under an id
+# whose earlier attempt may already have run (COMMAND_ID_REUSED). All set
 # ``manual_confirmation_required``. The reset may have run, the reboot may still
 # be in flight -- climbing the hardware ladder from there reboots a node whose
 # GPU was possibly just reset, or replaces one that is possibly still rebooting.
+# Both ladders read this: ``_classify`` here and the DAG branch escalator's
+# guard in ``execution/executor.py``.
 MANUAL_CONFIRMATION_STAGE = "manual_confirmation_required"
-UNKNOWN_OUTCOME_STATUS_SOURCE = "executor-execution-timeout-outcome-unknown"
 _UNKNOWN_OUTCOME_FLAGS = (
     "manual_confirmation_required",
     "node_action_interrupted",
@@ -124,19 +128,52 @@ def escalation_origin(event_id: str) -> tuple[str, str] | None:
     return name, source_request_id
 
 
+def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED step's details say its outcome is not actually known.
+
+    Shared by both ladders: ``_classify`` (whole workflow) and the DAG branch
+    escalator's guard, which must stop where this stops -- a rung appended in
+    place is the same reboot over a possibly-reset GPU.
+    """
+
+    return details is not None and any(
+        details.get(flag) is True for flag in _UNKNOWN_OUTCOME_FLAGS
+    )
+
+
+def failure_takes_no_rung(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED branch step may take no in-place rung at all.
+
+    The DAG branch escalator's guard: the remediation's lifetime is over (F-N1,
+    no rung is planned for anyone) or the step's outcome is unknown. Either way
+    the whole workflow fails and ``_classify`` hands it to an operator, exactly
+    as on the non-DAG path.
+    """
+
+    return details is not None and (
+        details.get("workflow_lifetime_exceeded") is True
+        or unknown_outcome_failure(details)
+    )
+
+
 def _unknown_outcome_failures(
     executions: list[WorkflowStepExecution],
 ) -> list[WorkflowStepExecution]:
-    """FAILED executions that demand an operator's confirmation, not a rung."""
+    """FAILED classifiable executions that demand an operator, not a rung.
+
+    Restricted to ``_CLASSIFIABLE_OPERATIONS`` on purpose: an abandoned
+    ESCALATE_SUPPORT, FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS carries the same
+    flags, but a ``support-after-<wf>`` successor for a support escalation that
+    timed out is a second vendor ticket. Those keep the previous behaviour -- no
+    classification, the workflow stays FAILED with no successor.
+    """
 
     return [
         execution
         for execution in executions
         if execution.status is WorkflowStepStatus.FAILED
-        and (
-            any(execution.details.get(flag) is True for flag in _UNKNOWN_OUTCOME_FLAGS)
-            or execution.details.get("status_source") == UNKNOWN_OUTCOME_STATUS_SOURCE
-        )
+        and execution.operation in _CLASSIFIABLE_OPERATIONS
+        and unknown_outcome_failure(execution.details)
     ]
 
 

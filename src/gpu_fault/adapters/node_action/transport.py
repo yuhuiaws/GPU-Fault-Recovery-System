@@ -322,6 +322,13 @@ class NodeActionTransportMixin:
                     f"{code}: {message}",
                 },
             )
+        if code == "COMMAND_ID_REUSED":
+            # A workflow defect, not a failed GPU: the idempotency key excludes
+            # the body, so a rebind that changed this step's GPU set collides
+            # with an attempt 1 that may already have reset the old set. Both
+            # ladders read this flag and hand the step to an operator instead
+            # of rebooting on top of it.
+            common["manual_confirmation_required"] = True
         return WorkflowStepOutcome.failed(
             f"node agent {node_id} rejected request: HTTP {exc.code}: {message}",
             details=common,

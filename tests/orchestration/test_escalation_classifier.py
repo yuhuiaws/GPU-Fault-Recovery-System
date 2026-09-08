@@ -250,21 +250,64 @@ def test_an_unknown_outcome_reboot_timeout_goes_to_an_operator_not_to_replacemen
     assert [item.step_index for item in failures] == [1]
 
 
-def test_a_timeout_status_source_alone_in_the_details_is_read_as_unknown():
-    """A record carrying only the executor's status source still stops the climb."""
+def test_a_reused_command_id_goes_to_an_operator_not_up_the_ladder():
+    """COMMAND_ID_REUSED is a workflow defect, not a failed GPU.
 
-    steps = [workflow_step(REBOOT, node_ids=["node-a"])]
+    The idempotency key excludes the body, so a rebind that changes the GPU set
+    on the same step index collides with an attempt 1 that may already have
+    reset the old set. The transport marks the terminal fold
+    ``manual_confirmation_required``; the classifier must hand it over rather
+    than reboot on top of it.
+    """
+
+    steps = [
+        workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
+        workflow_step(RESET, node_ids=["node-a"], gpu_uuids=["GPU-b"]),
+    ]
     workflow = _failed_workflow(
         steps,
-        0,
-        error="executor abandoned RESTART_NODE after 600s",
-        details={"status_source": "executor-execution-timeout-outcome-unknown"},
+        1,
+        error="node agent node-a rejected request: HTTP 409: command_id reused",
+        details={
+            "node_action_error_code": "COMMAND_ID_REUSED",
+            "node_action_retryable": False,
+            "manual_confirmation_required": True,
+            "http_status": 409,
+        },
     )
 
     classification = HardwareEscalationService.classify(workflow)
 
-    assert classification is not None, "the failure must still be classified"
+    assert classification is not None
     assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
+
+
+def test_an_unknown_outcome_support_escalation_spawns_no_second_ticket():
+    """Outside the classifiable operations the short-circuit does not apply.
+
+    ESCALATE_SUPPORT, FREEZE_EVIDENCE and CHECKPOINT_WORKLOADS carry the
+    unknown-outcome flags when the executor abandons them, but a
+    ``support-after-<wf>`` successor for a support escalation that timed out
+    is a second vendor ticket. They keep the previous behaviour: no
+    classification, the workflow stays FAILED with no successor.
+    """
+
+    steps = [workflow_step(WorkflowOperation.ESCALATE_SUPPORT, node_ids=["node-a"])]
+    workflow = _failed_workflow(
+        steps,
+        0,
+        error="executor abandoned ESCALATE_SUPPORT after 600s; outcome unknown",
+        details={
+            "execution_timeout": True,
+            "operation": WorkflowOperation.ESCALATE_SUPPORT.value,
+            "outcome_unknown": True,
+            "manual_confirmation_required": True,
+        },
+    )
+
+    assert HardwareEscalationService.classify(workflow) is None, (
+        "an unknown-outcome ESCALATE_SUPPORT must not open a second support case"
+    )
 
 
 def test_a_plain_failed_reset_still_climbs_to_the_reboot_rung():

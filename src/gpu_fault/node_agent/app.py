@@ -186,7 +186,9 @@ def _closed_by_the_other_caller(result: NodeActionResult | None, error: str) -> 
     row over it asked for a destructive replay. A retryable row carrying this
     very error text is the failure the first closer saved a moment ago: a second
     row at attempt+1 spent one more ``node_action_retry_limit`` slot on a single
-    failure.
+    failure. The flip side is accepted: a pre-dispatch failure that repeats with
+    identical text keeps reusing attempt 1, so the transport's retry limit never
+    trips and the 600 s step waiting cap is the only bound on it.
     """
 
     return result is not None and (not result.retryable or result.error == error)

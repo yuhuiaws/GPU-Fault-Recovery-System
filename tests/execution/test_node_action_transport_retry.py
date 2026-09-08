@@ -364,6 +364,11 @@ def test_a_reused_command_id_fails_the_step_instead_of_waiting_for_a_new_one() -
     assert outcome.details.get("node_action_state") != "NEW_COMMAND_REQUIRED", (
         outcome.details
     )
+    # A workflow defect, not a failed GPU: attempt 1 under this id may already
+    # have reset the old GPU set, so both ladders must hand it to an operator.
+    assert outcome.details.get("manual_confirmation_required") is True, (
+        f"a reused command_id must not climb to REBOOT_NODE: {outcome.details}"
+    )
 
 
 def test_a_lost_lease_stops_new_node_actions_from_being_sent() -> None:

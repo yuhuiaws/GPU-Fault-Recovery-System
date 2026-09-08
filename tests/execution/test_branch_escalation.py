@@ -43,11 +43,14 @@ def test_model_defaults_and_the_escalation_ladder():
 
 # ---------------------------------------------------------------- executor
 
+import pytest  # noqa: E402
+
 from gpu_fault.execution.branch_escalation import BranchEscalator  # noqa: E402
 from gpu_fault.execution.models import WorkflowExecutionRequest  # noqa: E402
-from gpu_fault.models import IncidentState, WorkflowStatus  # noqa: E402
+from gpu_fault.models import IncidentState, RecoveryAction, WorkflowStatus  # noqa: E402
 from gpu_fault.orchestration.arbitration import RecoveryArbiter  # noqa: E402
 from gpu_fault.orchestration.dag_branching import DagBrancher  # noqa: E402
+from gpu_fault.orchestration.escalation import HardwareEscalationService  # noqa: E402
 from tests._builders import (  # noqa: E402
     active_workflow_executor,
     copy_model,
@@ -202,6 +205,63 @@ def test_an_exhausted_branch_fails_the_workflow_without_restarting_the_job():
         call.rsplit("/", 1)[1] for call in adapter.calls if "node" not in call
     ].count("REPLACE_NODE") == 1
     assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param(
+            {
+                "node_action_interrupted": True,
+                "manual_confirmation_required": True,
+                "operation": RESET.value,
+            },
+            id="interrupted-node-action",
+        ),
+        pytest.param(
+            {
+                "node_action_error_code": "COMMAND_ID_REUSED",
+                "node_action_retryable": False,
+                "manual_confirmation_required": True,
+                "http_status": 409,
+            },
+            id="command-id-reused",
+        ),
+    ],
+)
+def test_an_unknown_outcome_branch_failure_goes_to_an_operator_not_up_the_ladder(
+    details,
+):
+    """The in-place ladder must stop where the whole-workflow ladder stops.
+
+    An INTERRUPTED RESET_GPU (the agent may have reset the GPU) and a
+    COMMAND_ID_REUSED (the step's body changed under an id whose attempt 1 may
+    already have reset the old set) both carry ``manual_confirmation_required``.
+    The branch escalator appended RESTART_NODE without reading it -- a reboot
+    of a node whose GPU was possibly just reset, from the DAG path, while the
+    whole-workflow classifier had already learned to hand the step over.
+    """
+
+    store = build_store()
+    _, workflow = _job_dag(store, node_c_operation=BUNDLE)
+    outcomes = {
+        RESET: WorkflowStepOutcome.failed(
+            "node agent node-b: refused", details=details
+        ),
+        **_ok(BUNDLE, REBOOT, RESTART_JOB, *VALIDATIONS),
+    }
+
+    result, adapter, saved = _run(store, workflow, outcomes, escalator=_escalator())
+
+    assert all(not call.endswith("/RESTART_NODE") for call in adapter.calls), (
+        "a reboot rung was appended for a step whose outcome nobody knows: "
+        f"{adapter.calls}"
+    )
+    assert result.status is WorkflowStatus.FAILED, result.status
+    assert saved.branch_escalation_counts == {}, saved.branch_escalation_counts
+    classification = HardwareEscalationService.classify(saved)
+    assert classification is not None, "the whole-workflow classifier must take it"
+    assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
 
 
 def test_a_job_level_step_failure_still_fails_the_whole_workflow():
