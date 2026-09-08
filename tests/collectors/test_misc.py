@@ -271,3 +271,30 @@ def test_training_progress_heartbeat_the_outbox_took_is_not_a_failure(tmp_path) 
     assert [path for path, _payload in sink.requests] == ["/v1/training-progress"], (
         "the heartbeat was not handed to the sink"
     )
+
+
+def test_training_progress_collector_uses_shared_buffered_warning(tmp_path, caplog) -> None:
+    """Training progress collector BUFFERED warning must use the shared text from deliver_or_raise."""
+
+    progress = tmp_path / "progress.json"
+    progress.write_text(json.dumps({"step": 100, "loss": 0.5}), encoding="utf-8")
+    sink = BufferingSink()
+    collector = TrainingProgressCollector(
+        sink,
+        cluster_id="test-cluster",
+        attempt_id="attempt-1",
+        rank=0,
+        progress_path=str(progress),
+        now=lambda: NOW,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        collector.collect_once()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "buffered delivery must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert "persisted to the collector outbox" in message, (
+        "warning must use the shared text from deliver_or_raise"
+    )
+    assert "id=" in message, "warning must include the event id"

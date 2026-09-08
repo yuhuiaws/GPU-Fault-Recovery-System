@@ -32,6 +32,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_event,
+    deliver_or_raise,
 )
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
 
@@ -399,22 +400,16 @@ class DcgmMetricsCollector:
                     "edge_filter_reasons": reasons,
                 }
             )
-            result = deliver_event(
+            result = deliver_or_raise(
                 self.sink,
                 GPU_METRICS_PATH,
                 batch.model_dump(mode="json"),
+                logger=LOGGER,
+                what=f"DCGM batch {batch.batch_id}",
             )
             # The outbox replays what it took, so the edge filter advances for
             # BUFFERED exactly as for DELIVERED; only a batch that went nowhere
             # keeps the edge open (ARCH-G3).
-            result.raise_for_failure()
-            if result.buffered:
-                LOGGER.warning(
-                    "DCGM batch %s persisted to the collector outbox; "
-                    "advancing the edge filter: %s",
-                    batch.batch_id,
-                    result.error,
-                )
             self._last_delivered_at = timestamp
             if (
                 self._next_health_summary_at is None
@@ -919,9 +914,13 @@ class DcgmMetricsCollector:
             evidence_ref=f"prometheus://{self.metrics_url}",
         )
         try:
-            deliver_event(
-                self.sink, GPU_METRICS_PATH, batch.model_dump(mode="json")
-            ).raise_for_failure()
+            deliver_or_raise(
+                self.sink,
+                GPU_METRICS_PATH,
+                batch.model_dump(mode="json"),
+                logger=LOGGER,
+                what=f"DCGM error batch {batch.batch_id}",
+            )
         except Exception:
             LOGGER.exception("DCGM collection error report was not delivered")
 

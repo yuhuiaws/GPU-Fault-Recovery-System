@@ -30,6 +30,7 @@ from gpu_fault.collectors.sinks import (
     EventSink,
     SqsEventSink,
     deliver_event,
+    deliver_or_raise,
     is_retryable_collector_status,
 )
 
@@ -132,7 +133,7 @@ class CloudWatchHmaCollector:
             timestamp = datetime.fromtimestamp(
                 int(item["timestamp"]) / 1000, tz=timezone.utc
             )
-            result = deliver_event(
+            result = deliver_or_raise(
                 self.sink,
                 "/v1/provider-events/hyperpod-hma/cloudwatch",
                 {
@@ -148,18 +149,13 @@ class CloudWatchHmaCollector:
                         f"{log_stream}/{event_id}"
                     ),
                 },
+                logger=LOGGER,
+                what=f"HMA log event {event_id}",
             )
             # An event the outbox took is durable, so the rest of the
             # subscription batch is still forwarded; only an event that went
             # nowhere aborts the batch, which is what makes CloudWatch Logs
             # retry the whole delivery (ARCH-G3).
-            result.raise_for_failure()
-            if result.buffered:
-                LOGGER.warning(
-                    "HMA log event %s persisted to the collector outbox: %s",
-                    event_id,
-                    result.error,
-                )
             stats = stats.model_copy(update={"delivered": stats.delivered + 1})
         return stats
 
@@ -233,23 +229,21 @@ class SqsHmaConsumer:
                     "/v1/provider-events/hyperpod-hma/"
                 ) or not isinstance(payload, dict):
                     raise InvalidQueuedHmaEvent("invalid queued HMA event")
-                result = deliver_event(self.sink, path, payload)
-                result.raise_for_failure()
-                if result.buffered:
-                    # The queue is the stronger durability layer: it retains the
-                    # message for 14 days, while the collector outbox is an
-                    # emptyDir the optional HMA manifests do not even configure.
-                    # So a buffered forward keeps the message and lets SQS
-                    # redeliver it after the visibility timeout; the control
-                    # plane dedupes by CloudWatch log event id, so the outbox
-                    # replay and the redelivery collapse into one record.
-                    LOGGER.warning(
-                        "queued HMA event %s persisted to the collector outbox; "
-                        "leaving it on the queue for redelivery: %s",
-                        message.get("MessageId", "<unknown>"),
-                        result.error,
-                    )
-                else:
+                result = deliver_or_raise(
+                    self.sink,
+                    path,
+                    payload,
+                    logger=LOGGER,
+                    what=f"queued HMA event {message.get('MessageId', '<unknown>')}",
+                )
+                # The queue is the stronger durability layer: it retains the
+                # message for 14 days, while the collector outbox is an
+                # emptyDir the optional HMA manifests do not even configure.
+                # So a buffered forward keeps the message and lets SQS
+                # redeliver it after the visibility timeout; the control
+                # plane dedupes by CloudWatch log event id, so the outbox
+                # replay and the redelivery collapse into one record.
+                if not result.buffered:
                     self.client.delete_message(
                         QueueUrl=self.queue_url,
                         ReceiptHandle=message["ReceiptHandle"],

@@ -1265,3 +1265,31 @@ def test_node_resource_collector_refreshes_its_liveness_heartbeat(
         assert heartbeat.exists(), (
             f"the cycle using {type(core).__name__} left no liveness heartbeat"
         )
+
+
+def test_kubernetes_hma_collector_uses_shared_buffered_warning(caplog) -> None:
+    """Kubernetes HMA collector BUFFERED warning must use the shared text from deliver_or_raise."""
+
+    sink = BufferingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    node = {
+        "metadata": {
+            "name": "worker-1",
+            "resourceVersion": "12345",
+            "labels": {HMA_HEALTH_STATUS: "Schedulable"},
+        },
+        "status": {},
+    }
+
+    with caplog.at_level(logging.WARNING):
+        collector.collect_node(node)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "buffered delivery must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert "persisted to the collector outbox" in message, (
+        "warning must use the shared text from deliver_or_raise"
+    )
+    assert "id=" in message or "node/" in message, (
+        "warning must include the event id or node identifier"
+    )

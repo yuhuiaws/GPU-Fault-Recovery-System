@@ -9,6 +9,7 @@ from ._support import (
     RejectingSink,
     context,
     json,
+    logging,
     pytest,
     rank_liveness_collector,
     rank_liveness_cycle,
@@ -1041,3 +1042,27 @@ def test_a_drive_without_smart_status_is_not_a_failed_query(
     assert len(_health_checks(calls)) == 1, (
         f"a clean verdict-less answer must stay cacheable: {calls}"
     )
+
+
+def test_host_collector_uses_shared_buffered_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """Host collector BUFFERED warning must use the shared text from deliver_or_raise."""
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ())
+    sink = BufferingSink()
+    collector = HostTelemetryCollector(
+        sink, context(), node_id="worker-1", now=lambda: NOW
+    )
+
+    with caplog.at_level(logging.WARNING):
+        collector.collect_once()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "buffered delivery must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert "persisted to the collector outbox" in message, (
+        "warning must use the shared text from deliver_or_raise"
+    )
+    assert "id=" in message, "warning must include the event id"
+    assert "network unavailable" in message, "warning must include the transport error"

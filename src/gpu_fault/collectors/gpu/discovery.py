@@ -28,6 +28,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_event,
+    deliver_or_raise,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -418,22 +419,16 @@ def deliver_gpu_inventory(
         raise CollectorError(f"GPU inventory snapshot is not valid: {exc}") from exc
     except ValueError as exc:
         raise CollectorError(f"GPU inventory snapshot is not usable: {exc}") from exc
-    result = deliver_event(
+    result = deliver_or_raise(
         sink,
         GPU_INVENTORY_PATH,
         snapshot.model_dump(mode="json"),
+        logger=LOGGER,
+        what=f"GPU inventory {snapshot.snapshot_id}",
     )
     # A snapshot the outbox took is replayed from there, so the caller may
     # advance its inventory schedule; only a snapshot that went nowhere raises
     # (ARCH-G3).
-    result.raise_for_failure()
-    if result.buffered:
-        LOGGER.warning(
-            "GPU inventory %s persisted to the collector outbox; "
-            "advancing the inventory schedule: %s",
-            snapshot.snapshot_id,
-            result.error,
-        )
     return snapshot
 
 

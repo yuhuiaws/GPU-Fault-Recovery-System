@@ -30,6 +30,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_event,
+    deliver_or_raise,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -217,22 +218,17 @@ class NvidiaSmiMetricsCollector:
             checkpoint_manifest_ref=(self.context.checkpoint_manifest_ref),
             evidence_ref=f"nvidia-smi://{self.node_id}",
         )
-        result = deliver_event(
+        result = deliver_or_raise(
             self.sink,
             GPU_METRICS_PATH,
             batch.model_dump(mode="json"),
+            logger=LOGGER,
+            what=f"nvidia-smi batch {batch.batch_id}",
         )
         # A batch the outbox took is not a failed round: raising here made the
         # run loop count a consecutive failure, back off, and post a second
         # sample-less error batch for records that were already durable
         # (ARCH-G3).
-        result.raise_for_failure()
-        if result.buffered:
-            LOGGER.warning(
-                "nvidia-smi batch %s persisted to the collector outbox: %s",
-                batch.batch_id,
-                result.error,
-            )
         return batch
 
     def run(self) -> None:
@@ -316,9 +312,13 @@ class NvidiaSmiMetricsCollector:
             evidence_ref=f"nvidia-smi://{self.node_id}",
         )
         try:
-            deliver_event(
-                self.sink, GPU_METRICS_PATH, batch.model_dump(mode="json")
-            ).raise_for_failure()
+            deliver_or_raise(
+                self.sink,
+                GPU_METRICS_PATH,
+                batch.model_dump(mode="json"),
+                logger=LOGGER,
+                what=f"nvidia-smi error batch {batch.batch_id}",
+            )
         except Exception:
             LOGGER.exception("nvidia-smi collection error report was not delivered")
 

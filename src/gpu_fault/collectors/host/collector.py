@@ -29,6 +29,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_event,
+    deliver_or_raise,
 )
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
@@ -554,10 +555,12 @@ class HostTelemetryCollector(
                     "edge_filter_reasons": sorted(delivery_reasons),
                 }
             )
-            result = deliver_event(
+            result = deliver_or_raise(
                 self.sink,
                 HOST_TELEMETRY_PATH,
                 batch.model_dump(mode="json"),
+                logger=LOGGER,
+                what=f"host telemetry batch {batch.batch_id}",
             )
             # A batch the durable outbox took is delivered as far as this
             # collector is concerned (ARCH-G3): skipping the bookkeeping made
@@ -565,14 +568,6 @@ class HostTelemetryCollector(
             # the retry ladder and buffer another 100-200 KB batch with a fresh
             # batch_id until the outbox evicted. Only a batch that went nowhere
             # keeps the edge open.
-            result.raise_for_failure()
-            if result.buffered:
-                LOGGER.warning(
-                    "host telemetry batch %s persisted to the collector outbox; "
-                    "advancing the edge filter: %s",
-                    batch.batch_id,
-                    result.error,
-                )
             self._last_delivered_at = observed_at
             if (
                 self._next_health_summary_at is None

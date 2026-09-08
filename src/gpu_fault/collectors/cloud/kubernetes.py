@@ -26,7 +26,7 @@ from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
-    deliver_event,
+    deliver_or_raise,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -203,7 +203,7 @@ class KubernetesHmaNodeCollector:
             return CollectorStats(observed=1, duplicates=1)
 
         collected_at = self.now()
-        result = deliver_event(
+        result = deliver_or_raise(
             self.sink,
             "/v1/provider-events/hyperpod-hma/kubernetes-node",
             {
@@ -215,18 +215,14 @@ class KubernetesHmaNodeCollector:
                     f"k8s://nodes/{node_id}?resourceVersion={resource_version}"
                 ),
             },
+            logger=LOGGER,
+            what=f"HMA node record for {node_id}",
         )
         # Only a record that went nowhere leaves the digest unrecorded: one the
         # outbox took is replayed from there, and re-posting it on the next
         # relist would buffer a duplicate for the whole outage (ARCH-G3).
-        result.raise_for_failure()
         self._content_digests[node_id] = digest
         if result.buffered:
-            LOGGER.warning(
-                "HMA node record for %s persisted to the collector outbox: %s",
-                node_id,
-                result.error,
-            )
             return CollectorStats(observed=1)
         return CollectorStats(observed=1, delivered=1)
 
@@ -654,24 +650,18 @@ class KubernetesNodeResourceCollector:
             # match the control plane's steady-state test on the reason set.
             edge_filter_reasons=list(dict.fromkeys(edge_reasons)),
         )
-        result = deliver_event(
+        result = deliver_or_raise(
             self.sink,
             HOST_TELEMETRY_PATH,
             batch.model_dump(mode="json"),
+            logger=LOGGER,
+            what=f"Kubernetes node resource batch {batch.batch_id}",
         )
         # A batch the outbox took is replayed from there, so this node's edge
         # state and summary schedule advance exactly as for a live delivery;
         # only a batch that went nowhere raises, and the caller logs it and
         # moves to the next node.
-        result.raise_for_failure()
         self._last_state.update(pending_state)
-        if result.buffered:
-            LOGGER.warning(
-                "Kubernetes node resource batch %s persisted to the collector "
-                "outbox; advancing the edge filter: %s",
-                batch.batch_id,
-                result.error,
-            )
         for state_key in delivered_state_keys:
             self._last_delivered_at[state_key] = observed_at
             resource = state_key.rsplit("/", 1)[-1]

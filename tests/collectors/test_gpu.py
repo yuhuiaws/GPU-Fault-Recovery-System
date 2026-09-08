@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from gpu_fault.collectors.gpu.discovery import deliver_gpu_inventory
+
 from ._support import (
     NOW,
     NVIDIA_SMI_CORE_FIELDS,
@@ -1365,3 +1367,55 @@ def test_dcgm_batches_the_outbox_took_advance_both_schedules(
     assert paths.count(GPU_METRICS_CHANNEL) == 1, (
         "an unchanged healthy batch was re-buffered after the outbox took it"
     )
+
+
+def test_dcgm_collector_uses_shared_buffered_warning(caplog) -> None:
+    """DCGM collector BUFFERED warning must use the shared text from deliver_or_raise."""
+
+    sink = BufferingSink()
+    collector = DcgmMetricsCollector(
+        sink, context(), node_id="worker-1", now=lambda: NOW
+    )
+    text = 'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
+
+    with caplog.at_level(logging.WARNING):
+        collector.collect_text(text, observed_at=NOW)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "buffered delivery must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert "persisted to the collector outbox" in message, (
+        "warning must use the shared text from deliver_or_raise"
+    )
+    assert "id=" in message, "warning must include the event id"
+
+
+def test_gpu_inventory_uses_shared_buffered_warning(monkeypatch, tmp_path, caplog) -> None:
+    """GPU inventory delivery BUFFERED warning must use the shared text from deliver_or_raise."""
+
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("boot-a\n", encoding="ascii")
+    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
+
+    def runner(command, **_kwargs):
+        joined = " ".join(str(item) for item in command)
+        if "--query-gpu=index,uuid,pci.bus_id,name" in joined:
+            return completed_nvidia_smi("0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n")
+        return completed_nvidia_smi("")
+
+    sink = BufferingSink()
+
+    with caplog.at_level(logging.WARNING):
+        deliver_gpu_inventory(
+            sink, context(), node_id="worker-1", observed_at=NOW, runner=runner
+        )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "buffered delivery must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert "persisted to the collector outbox" in message, (
+        "warning must use the shared text from deliver_or_raise"
+    )
+    assert "id=" in message, "warning must include the event id"

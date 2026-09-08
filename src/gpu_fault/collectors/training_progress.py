@@ -18,6 +18,7 @@ from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
     EventSink,
     deliver_event,
+    deliver_or_raise,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -56,21 +57,15 @@ class TrainingProgressCollector:
 
     def collect_once(self) -> TrainingProgressHeartbeat:
         heartbeat = self._heartbeat()
-        result = deliver_event(
+        result = deliver_or_raise(
             self.sink,
             TRAINING_PROGRESS_PATH,
             heartbeat.model_dump(mode="json"),
+            logger=LOGGER,
+            what=f"training progress heartbeat for rank {self.rank}",
         )
         # A heartbeat the outbox took is durable and will be replayed, so the
         # round succeeded; only one that went nowhere is an error (ARCH-G3).
-        result.raise_for_failure()
-        if result.buffered:
-            LOGGER.warning(
-                "training progress heartbeat for rank %s persisted to the "
-                "collector outbox: %s",
-                self.rank,
-                result.error,
-            )
         return heartbeat
 
     def _heartbeat(self) -> TrainingProgressHeartbeat:
