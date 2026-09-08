@@ -17,6 +17,7 @@ from gpu_fault.admin.artifact_configmaps import (
     COMPRESSED_ARTIFACT_SUFFIX,
     compress_artifact,
 )
+from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -1349,6 +1350,12 @@ def install_aurora_refresh(
             master_secret_arn=str(aurora["master_secret_arn"]),
         )
     else:
+        ensure_rds_ca_bundle(
+            runner,
+            repository_root=repository_root,
+            cpu_kubeconfig=cpu_kubeconfig,
+            namespace=namespace,
+        )
         kubectl_apply(runner, cpu_kubeconfig, rendered)
     role_name = safe_name(f"gpu-fault-{site_id}-aurora-refresh", maximum=64)
     statements: list[dict[str, Any]] = [

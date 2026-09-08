@@ -1177,3 +1177,38 @@ def test_ensure_role_reads_each_role_once(monkeypatch: pytest.MonkeyPatch) -> No
     assert len([argv for argv in calls if "get-role-policy" in argv]) == 1, (
         "the inline policy was read twice to answer one question"
     )
+
+
+def test_ensure_rds_ca_bundle_runs_the_pinned_script_against_the_cpu_cluster(
+    tmp_path: Path,
+) -> None:
+    """The refresh CronJob mounts gpu-fault-rds-ca-bundle non-optionally; the
+    bootstrap task must ship it before applying the CronJob (live 2026-09-08:
+    the verify Job hung on the missing volume until the deploy timed out)."""
+    from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
+
+    calls: list[tuple[list[str], dict]] = []
+
+    class Runner:
+        dry_run = False
+
+        def run(self, arguments, **kwargs):
+            calls.append((list(arguments), kwargs))
+            return ""
+
+    ensure_rds_ca_bundle(
+        Runner(),
+        repository_root=tmp_path,
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+    )
+
+    assert len(calls) == 1, calls
+    arguments, kwargs = calls[0]
+    assert arguments == [
+        "bash",
+        str(tmp_path / "deploy/control-plane/tools/apply-rds-ca-bundle.sh"),
+    ], arguments
+    assert kwargs["mutate"] is True, kwargs
+    assert kwargs["env"]["KUBECONFIG"] == str(tmp_path / "cpu.kubeconfig"), kwargs
+    assert kwargs["env"]["GPU_FAULT_NAMESPACE"] == "gpu-fault-system", kwargs
