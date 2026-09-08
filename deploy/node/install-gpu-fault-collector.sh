@@ -19,6 +19,10 @@ DRIVER_BRANCH=""
 CUDA_VERSION=""
 METRICS_MODE="auto"
 METRICS_INTERVAL="15"
+# The dedicated exporter's own collect period, in MILLISECONDS (DCGM's ``-c``).
+# Kept at the collector's scrape period: on DCGM's 30 s default every second
+# sample repeats the previous one, so a throttling episode cannot be graded.
+DCGM_EXPORTER_COLLECT_INTERVAL_MS="${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS:-15000}"
 GPU_INVENTORY_INTERVAL_SECONDS="${GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS:-60}"
 DCGM_EDGE_FILTER_ENABLED="${GPU_FAULT_DCGM_EDGE_FILTER_ENABLED:-true}"
 DCGM_HEALTH_SUMMARY_SECONDS="${GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS:-300}"
@@ -1514,6 +1518,14 @@ install -m 0600 /dev/null /etc/gpu-fault/collector.env
     write_env GPU_FAULT_DRIVER_BRANCH "${DRIVER_BRANCH}"
     write_env GPU_FAULT_CUDA_VERSION "${CUDA_VERSION}"
     write_env GPU_FAULT_METRICS_INTERVAL_SECONDS "${METRICS_INTERVAL}"
+    if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
+        # Only this mode knows the exporter's period, so only it can state the
+        # seconds the collector checks its stale carry-over window against.
+        # With an 'existing' exporter the period belongs to somebody else and
+        # stays unset, which the collector reads as unknown rather than wrong.
+        write_env GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS \
+            "$((DCGM_EXPORTER_COLLECT_INTERVAL_MS / 1000))"
+    fi
     write_env GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS \
         "${GPU_INVENTORY_INTERVAL_SECONDS}"
     write_env GPU_FAULT_NODE_INSTANCE_ID "${NODE_INSTANCE_ID}"
@@ -1745,6 +1757,8 @@ if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
     install -m 0600 /dev/null /etc/gpu-fault/dcgm-exporter.env
     {
         write_env GPU_FAULT_DCGM_EXPORTER_IMAGE "${DCGM_EXPORTER_IMAGE}"
+        write_env GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS \
+            "${DCGM_EXPORTER_COLLECT_INTERVAL_MS}"
     } > /etc/gpu-fault/dcgm-exporter.env
     chmod 0600 /etc/gpu-fault/dcgm-exporter.env
 fi

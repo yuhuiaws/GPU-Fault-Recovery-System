@@ -8,11 +8,14 @@ Requires=docker.service
 Type=simple
 EnvironmentFile=/etc/gpu-fault/dcgm-exporter.env
 ExecStartPre=-@CONTAINER_RUNTIME@ rm -f gpu-fault-dcgm-exporter
-ExecStart=@CONTAINER_RUNTIME@ run --rm --name gpu-fault-dcgm-exporter --gpus all --network host --cap-add SYS_ADMIN --security-opt no-new-privileges --cpus 2 --cpu-shares 128 --memory 2g --memory-reservation 1g --pids-limit 512 -e DCGM_EXPORTER_COLLECTORS=/etc/dcgm-exporter/gpu-fault-counters.csv -v /etc/gpu-fault/dcgm-counters.csv:/etc/dcgm-exporter/gpu-fault-counters.csv:ro ${GPU_FAULT_DCGM_EXPORTER_IMAGE} -a 127.0.0.1:9400 -c 15000
-# -c 15000 keeps the container's collection interval at the collector's
-# 15 s scrape cadence. On DCGM's 30 s default every second sample repeats
-# the previous one, so a real power-throttling episode cannot be graded.
-# Kept in step with the args in deploy/dataplane/hyperpod-dcgm-exporter.yaml.
+ExecStart=@CONTAINER_RUNTIME@ run --rm --name gpu-fault-dcgm-exporter --gpus all --network host --cap-add SYS_ADMIN --security-opt no-new-privileges --cpus 2 --cpu-shares 128 --memory 2g --memory-reservation 1g --pids-limit 512 -e DCGM_EXPORTER_COLLECTORS=/etc/dcgm-exporter/gpu-fault-counters.csv -v /etc/gpu-fault/dcgm-counters.csv:/etc/dcgm-exporter/gpu-fault-counters.csv:ro ${GPU_FAULT_DCGM_EXPORTER_IMAGE} -a 127.0.0.1:9400 -c ${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS}
+# The collect interval comes from /etc/gpu-fault/dcgm-exporter.env, which the
+# installer always writes in docker mode (default 15000 ms): the collector's
+# own scrape cadence. On DCGM's 30 s default every second sample repeats the
+# previous one, so a real power-throttling episode cannot be graded, and the
+# collector's carry-over window is derived from the same number
+# (GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS). Kept in step with the args in
+# deploy/dataplane/hyperpod-dcgm-exporter.yaml.
 ExecStop=-@CONTAINER_RUNTIME@ stop -t 15 gpu-fault-dcgm-exporter
 Restart=always
 RestartSec=10

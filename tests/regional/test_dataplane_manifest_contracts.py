@@ -52,6 +52,7 @@ from tests.regional._release_orchestrator_support import config_file
 ROOT = Path(__file__).resolve().parents[2]
 DATAPLANE = ROOT / "deploy" / "dataplane"
 SYSTEMD = ROOT / "deploy" / "systemd"
+INSTALLER = ROOT / "deploy" / "node" / "install-gpu-fault-collector.sh"
 #: Liveness must never fire on a component that is merely idle: the heartbeat
 #: threshold is the review's floor, and the probe period the review's cadence.
 MINIMUM_HEARTBEAT_SECONDS = 300
@@ -225,9 +226,35 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
     assert arguments[arguments.index("-c") + 1] == "15000", (
         f"the DaemonSet must collect every 15 000 ms, got {arguments}"
     )
-    assert "-c 15000" in unit, (
-        "the systemd launch path must collect on the same cadence as the "
-        "DaemonSet, or a node's grading depends on how its exporter started"
+    assert "-c ${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS}" in unit, (
+        "the systemd launch path must take its collect interval from the "
+        f"installer's environment file rather than a second literal: {unit!r}"
+    )
+    installer = INSTALLER.read_text(encoding="utf-8")
+    default = re.search(
+        r"DCGM_EXPORTER_COLLECT_INTERVAL_MS=\"\$\{"
+        r"GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS:-(\d+)\}\"",
+        installer,
+    )
+    assert default is not None, (
+        "the installer no longer defaults the exporter collect interval, so the "
+        "unit's -c would expand to an empty argument"
+    )
+    assert default.group(1) == arguments[arguments.index("-c") + 1], (
+        "the two launch paths collect on different cadences, so a node's "
+        f"grading depends on how its exporter started: {default.group(1)}ms "
+        "from systemd"
+    )
+    assert (
+        "write_env GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS" in installer
+        and "write_env GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS" in installer
+    ), (
+        "the exporter's period must reach both the unit (milliseconds) and the "
+        "collector's carry-over check (seconds), or one of them guesses"
+    )
+    assert "(DCGM_EXPORTER_COLLECT_INTERVAL_MS / 1000)" in installer, (
+        "the collector's seconds must be derived from the exporter's "
+        "milliseconds, not written twice"
     )
 
 
