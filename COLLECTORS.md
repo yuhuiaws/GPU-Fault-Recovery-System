@@ -37,7 +37,9 @@ HTTP 2xx 但 body 不是 JSON object 的响应按**结果未知**处理，走与
 `NodeLogCollector` 当前默认禁用，不进入生产必需集合。安装器只在隔离验证环境显式
 传入 `--enable-node-log-collector` 时启用。
 
-`nvidia-smi`保留为DCGM Exporter不可用时的fallback。Kubernetes HMA和
+`nvidia-smi`保留为DCGM Exporter不可用时的fallback；两种模式共用同一套 inventory 节拍：inventory
+校验失败（如 `GPU_FAULT_EXPECTED_GPU_COUNT` 配错）连续 3 次后按 inventory 间隔退避，不再让整轮
+失败，节点照常发出带样本的 GPU_METRICS 批次；vGPU/MIG 上查不到温度阈值也同样退避而不是每轮重跑。Kubernetes HMA和
 CloudWatch HMA属于optional验证链路，不在默认拓扑中。
 
 ### 新增 Collector
