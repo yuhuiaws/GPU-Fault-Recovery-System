@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import subprocess
 from typing import Any, Callable
-
 
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
@@ -33,6 +33,17 @@ class ResetOperationsMixin:
             try:
                 self._run_checked(command, timeout=timeout)
                 return attempt
+            except subprocess.TimeoutExpired as exc:
+                # subprocess.run SIGKILLs nvidia-smi, but the reset it asked
+                # the driver for keeps going: the outcome is unknown. A
+                # TimeoutExpired would be classified retryable and the control
+                # plane would resubmit, so convert it to a RuntimeError that
+                # nothing retries. Recovery is a human decision (re-quiesce,
+                # or reboot the node).
+                raise RuntimeError(
+                    f"gpu reset outcome unknown after {timeout}s; "
+                    "refusing to retry automatically"
+                ) from exc
             except RuntimeError as exc:
                 if (
                     "In use by another client" not in str(exc)

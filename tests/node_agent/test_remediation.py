@@ -112,6 +112,28 @@ def test_gpu_reset_is_idempotent_and_rechecks_clients(tmp_path) -> None:
     assert reset_commands == [["nvidia-smi", "--gpu-reset", "-i", "GPU-a"]]
 
 
+def test_gpu_reset_timeout_is_not_retryable_and_runs_once(tmp_path) -> None:
+    # nvidia-smi --gpu-reset that blows its 120 s deadline leaves the
+    # in-kernel reset running: the outcome is unknown, so the node must
+    # never let the control plane resubmit and reset a second time.
+    runner = FakeRunner(reset_timeout_seconds=120)
+    agent = executor(tmp_path, runner)
+    signed = envelope(command(WorkflowOperation.RESET_GPU))
+
+    first = agent.execute(signed)
+    second = agent.execute(signed)
+
+    assert first.status is NodeActionStatus.FAILED, "a timed-out reset is a failure"
+    assert first.retryable is False, (
+        "a reset whose outcome is unknown must never be retried automatically"
+    )
+    assert "gpu reset outcome unknown after 120s" in first.error, first.error
+    assert second == first, "the resubmit must replay the stored result"
+    assert len([item for item in runner.commands if "--gpu-reset" in item]) == 1, (
+        "exactly one nvidia-smi --gpu-reset may run for one command"
+    )
+
+
 def test_gpu_reset_remains_disabled_without_node_opt_in(tmp_path) -> None:
     runner = FakeRunner()
     agent = node_action_executor(
@@ -270,8 +292,8 @@ def test_driver_remediation_is_pinned_and_target_verified(tmp_path) -> None:
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
 
     class Quiesced:
-        def assert_quiesced(self, *, incident_id):
-            assert incident_id == "incident-a"
+        def assert_quiesced(self, *, incident_id, command_id=None, for_reset=True):
+            assert incident_id == "incident-a", incident_id
 
     class DriverRunner:
         def __init__(self):
@@ -540,8 +562,8 @@ def test_firmware_update_requires_exact_verified_version(tmp_path) -> None:
     verifier_digest = hashlib.sha256(verifier.read_bytes()).hexdigest()
 
     class Quiesced:
-        def assert_quiesced(self, *, incident_id):
-            assert incident_id == "incident-a"
+        def assert_quiesced(self, *, incident_id, command_id=None, for_reset=True):
+            assert incident_id == "incident-a", incident_id
 
     def runner(argv, **_):
         stdout = "92.10.14\n" if argv[0] == str(verifier) else ""

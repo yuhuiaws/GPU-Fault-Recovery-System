@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from subprocess import CalledProcessError, CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess, TimeoutExpired
 from threading import Event
 from typing import Any, Callable
 from unittest import mock
@@ -53,13 +53,23 @@ SECRET = "node-action-secret-" + "x" * 32
 
 
 class FakeRunner:
-    def __init__(self, clients: str = "", reset_error: str | None = None) -> None:
+    def __init__(
+        self,
+        clients: str = "",
+        reset_error: str | None = None,
+        reset_timeout_seconds: int | None = None,
+    ) -> None:
         self.clients = clients
         self.reset_error = reset_error
+        # A reset that never returns: subprocess.run SIGKILLs nvidia-smi while
+        # the in-kernel reset keeps going, so the outcome is unknown.
+        self.reset_timeout_seconds = reset_timeout_seconds
         self.commands: list[list[str]] = []
 
     def __call__(self, command, **_):
         self.commands.append(command)
+        if "--gpu-reset" in command and self.reset_timeout_seconds is not None:
+            raise TimeoutExpired(command, self.reset_timeout_seconds)
         if "--gpu-reset" in command and self.reset_error:
             raise CalledProcessError(255, command, stderr=self.reset_error)
         stdout = (
@@ -183,8 +193,12 @@ def wait_for_result(client: TestClient, command_id: str, *, tries: int = 200) ->
 
 
 class Quiesced:
-    def assert_quiesced(self, *, incident_id: str) -> None:
-        assert incident_id == "incident-a"
+    """A quiesce manager stub mirroring the real fencing signature."""
+
+    def assert_quiesced(
+        self, *, incident_id: str, command_id: str | None = None, for_reset: bool = True
+    ) -> None:
+        assert incident_id == "incident-a", incident_id
 
 
 class ServiceRunner:
