@@ -36,7 +36,7 @@
 
 ### Task 1: ledger exactly-once for destructive node actions; delete the sync route
 
-**Files:** Modify `src/gpu_fault/node_agent/executor.py`, `ledger.py`, `app.py`; Test `tests/node_agent/test_service.py`, `test_ledger_audit.py`, `test_agent_observability.py`, `test_protocol.py`, `test_misc.py`, `tests/fleet/_fleet_cases_1.py:197`.
+**Files:** Modify `src/gpu_fault/node_agent/executor.py`, `ledger.py`, `app.py`; Test `tests/node_agent/test_service.py`, `test_ledger_audit.py`, `test_agent_observability.py`, `test_protocol.py`, `test_misc.py`, `tests/fleet/_fleet_cases_1.py` (the node-action URL string).
 **Evidence:** `node-agent-core §F1 (P0), §F2, §F3, §F4, §F5`.
 
 Behaviour today:
@@ -52,7 +52,7 @@ Target:
 - `finalize_action` reuses the in-progress attempt number; a `ValueError` from the pooled execute is a rejection: do not persist, drop the future, log once; the next `/result` 404s and the transport resubmits. Count `rejected` once (validation runs twice today).
 - `/submit`: an existing `FAILED retryable=True` row falls through to the pool (execute already increments the attempt).
 - Replay: on an existing row compare operation, `parameters_digest` and sorted `gpu_uuids`; mismatch → `ValueError("node action command_id reused for a different command")` → 409 `COMMAND_ID_REUSED`, `requires_new_command=True` in `_node_action_rejection`. Delete dead lines 312-314.
-- Remove the `POST /v1/node-actions` route. Rewrite the 4 tests that use it to submit + poll; delete the `test_misc.py:180-189` assertion that the route is synchronous; change the fleet URL string to `/v1/node-actions/submit`. Check `tests/test_documentation_contracts.py:349` still passes.
+- Remove the `POST /v1/node-actions` route. Rewrite the 4 tests that use it to submit + poll; delete the `test_misc.py:180-189` assertion that the route is synchronous; change the fleet URL string to `/v1/node-actions/submit`. Check the route inventory in `tests/test_documentation_contracts.py` still passes.
 
 - [ ] Tests (red): `test_ledger_save_failure_after_reset_never_reexecutes` (flaky save raising once; resubmit twice; exactly one `--gpu-reset`; poll answers INTERRUPTED, not 404, not PENDING); `test_submit_reruns_a_retryable_failure_as_attempt_two` (HTTP surface); `test_expiry_while_queued_is_a_rejection_not_a_ledger_result`; `test_same_command_id_with_different_body_is_rejected_not_replayed` (409 COMMAND_ID_REUSED); `test_sync_node_action_route_is_gone`.
 - [ ] Run, expect FAIL for each with the assertion text recorded.
@@ -192,7 +192,7 @@ Target:
 
 ### Task 8: coverage heartbeat — an idle, fully watched cluster is IDLE, not UNKNOWN
 
-**Files:** Modify `src/gpu_fault/completion_controller.py`, `completion_metrics_server.py`; **control plane:** the topology resolver (`grep -rn "class WorkloadTopologyService" src/gpu_fault` — expected under `src/gpu_fault/app/` or `src/gpu_fault/telemetry.py:203-271`), the ingest route that receives attempt observations (`grep -rn "attempts/observation\|workload-observation" src/gpu_fault/app/routes`), the store method that persists observations (`src/gpu_fault/store/**`), and `src/gpu_fault/telemetry.py`; Test `tests/completion/**`, the topology tests (`grep -rl "is_unknown_not_idle\|WorkloadTopology" tests`), and the store contract tests for the new column/table.
+**Files:** Modify `src/gpu_fault/completion_controller.py`, `completion_metrics_server.py`; **control plane:** the topology resolver (`grep -rn "class WorkloadTopologyService" src/gpu_fault` — expected under `src/gpu_fault/app/` or `src/gpu_fault/telemetry.py` (the UNKNOWN/covered resolution around lines 203-271)), the ingest route that receives attempt observations (`grep -rn "attempts/observation\|workload-observation" src/gpu_fault/app/routes`), the store method that persists observations (`src/gpu_fault/store/**`), and `src/gpu_fault/telemetry.py`; Test `tests/completion/**`, the topology tests (`grep -rl "is_unknown_not_idle\|WorkloadTopology" tests`), and the store contract tests for the new column/table.
 **Evidence:** `completion-watcher §F4 (P1)`; memory `idle-cluster-workload-state-unknown` (live: DESTR-016 attempt 4 was BLOCKED on an idle cluster).
 
 Behaviour today: the watcher posts observations only for `attempt_ids` it sees (`completion_controller.py:633-650`); with no managed job for 10 min `covered=False` → `UNKNOWN` → every node-mutating plan is QUARANTINE + BLOCKED (`telemetry.py:203-207`, `:266-271`; `test_no_observations_for_the_cluster_is_unknown_not_idle`).
@@ -222,7 +222,7 @@ Target: persist per attempt only the spec plus `pod uid/rank/node` (rebuild the 
 
 ### Task 9: finish ARCH-G3 — every collector treats BUFFERED as delivered
 
-**Files:** Modify `src/gpu_fault/collectors/host/collector.py:425-441`, `gpu/dcgm.py:372`, `gpu/nvidia_smi.py:212,299`, `gpu/discovery.py:383` (`deliver_gpu_inventory`), `training_progress.py:78`, `cloud/kubernetes.py:59,95-116,402`, `cloud/cloudwatch.py:91,179`, `logs/fabric_manager.py:166` (health summary), `logs/kernel.py:303` (stats); Test `tests/collectors/test_host.py`, `test_gpu.py`, `test_cloud.py`, `test_logs.py`, `test_delivery_result.py`.
+**Files:** Modify `src/gpu_fault/collectors/host/collector.py` (the post at lines 425-441), `gpu/dcgm.py:372`, `gpu/nvidia_smi.py:212,299`, `gpu/discovery.py:383` (`deliver_gpu_inventory`), `training_progress.py:78`, `cloud/kubernetes.py:59,95-116,402`, `cloud/cloudwatch.py:91,179`, `logs/fabric_manager.py:166` (health summary), `logs/kernel.py:303` (stats); Test `tests/collectors/test_host.py`, `test_gpu.py`, `test_cloud.py`, `test_logs.py`, `test_delivery_result.py`.
 **Evidence:** `collector-shared-layer §F1 (P1), §F3 (P1)`; `host-collector §F5`; `log-collectors §F13`; `hma-installer-deploy §F2`.
 
 Behaviour today: `HttpEventSink.post` raises `CollectorError(buffered=True)` after the outbox took the record; the 13 raw `sink.post` callers treat it as failure: bookkeeping (`_last_delivered_at`, edge state, next-summary time) is skipped so the host collector re-blocks ~47 s and re-buffers a full batch every tick; the node-resources collector aborts its whole node loop on the first buffered post and commits `_last_state`/`_mismatch_counts` before delivery; the HMA watcher's initial LIST + posts are outside its `try` so a buffered post crash-loops the process.
