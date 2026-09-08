@@ -328,6 +328,9 @@ def build_cpu_apply_environment(
     return {
         **os.environ,
         **admin_config_renderer_environment(config.admin_config),
+        # Present only when site.yaml spec.retention turns archive-first
+        # deletion on; the renderer forwards these to the control-worker.
+        **config.retention.environment(),
         "KUBECONFIG": config.cpu_kubeconfig,
         "GPU_FAULT_AWS_REGION": config.aws_region,
         "GPU_FAULT_NAMESPACE": config.namespace,

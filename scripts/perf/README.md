@@ -108,8 +108,10 @@ remove serving capacity even though Kubernetes reports no container restart.
 The result is written to `ingress-process-model-preflight.json` before Aurora
 scaling or synthetic registry registration.
 Apply the matching `32-disabled`, `32-enabled`, `50-disabled`, or `50-enabled`
-AdminConfig preset through `gpu-fault-admin config` before each run. The current
-command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
+AdminConfig preset before each run: set `spec.capacity.preset` in
+`<state-dir>/admin-config.yaml` and run `gpu-fault-admin config --state-dir
+<state-dir>` (there are no capacity flags; the YAML is the only input). The
+current command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
 
 Before the start gate and every 30 seconds during workflow drain, the integrated
 runner refreshes synthetic Agent leases, required collector success, healthy

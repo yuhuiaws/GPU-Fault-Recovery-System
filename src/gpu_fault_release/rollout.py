@@ -20,11 +20,13 @@ from gpu_fault_release.regional_admin_checks import (
 )
 from gpu_fault_release.regional_admin_commands import (
     bootstrap_cpu_is_current,
-    build_full_status,
     build_release_diff,
+    build_status,
     apply_rds_ca_bundle,
     build_release_summary,
+    compact_report,
     ensure_schema,
+    full_report_requested,
     run_deploy,
     run_resume,
     stage_noop_release,
@@ -54,6 +56,7 @@ from gpu_fault_release.regional_observability_rollback import (
     restore_observability_snapshot,
 )
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
+from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release.regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
@@ -69,6 +72,10 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseDiff,
     classify_release,
     control_plane_role_targets,
+)
+from gpu_fault_release.regional_release_failure_domains import (
+    FAILURE_DOMAIN_MAP_SHA256_ENV,
+    apply_failure_domain_map,
 )
 from gpu_fault_release.regional_release_fleet_rollout import (
     agent_heartbeats_converged,
@@ -321,11 +328,21 @@ class Runner:
             # silent: their output is what they were marked sensitive for.
             # Both go to stderr: stdout carries the machine-readable release
             # report, and a failed command's chatter must not land in it.
-            if capture and not sensitive:
+            quoted = capture and not sensitive
+            if quoted:
                 for text in (completed.stdout, completed.stderr):
                     if text:
                         print(text, file=sys.stderr)
-            raise ReleaseError(f"command failed ({completed.returncode}): {args[0]}")
+            # Our own scripts have just reported themselves (above, or on the
+            # inherited descriptors); a foreign command gets one line naming
+            # the step and its last words.
+            raise child_failure(
+                ReleaseError,
+                args,
+                completed.returncode,
+                detail=last_output_line(completed.stderr) if quoted else "",
+                sensitive=sensitive,
+            )
         return completed.stdout.strip() if capture else ""
 
     def probe(self, args: list[str], *, timeout_seconds: float | None = None) -> bool:
@@ -437,6 +454,9 @@ def render_and_apply_cpu_roles(
             },
         )
         environment["GPU_FAULT_ROLE_SPLIT_GENERATED_DIR"] = str(generated)
+        # The failure-domain ConfigMap ships in the same apply; its digest rides
+        # the pod-template annotation so the worker rolls only when it changed.
+        environment[FAILURE_DOMAIN_MAP_SHA256_ENV] = apply_failure_domain_map(release)
         release.runner.run(
             [
                 "bash",
@@ -788,12 +808,10 @@ class RegionalRelease:
             *execution,
         ]
 
-    def status(self) -> dict[str, Any]:
-        self._apply_health_baseline()
-        return build_full_status(self)
+    def status(self, *, full: bool = False) -> dict[str, Any]:
+        return build_status(self, full=full)
 
-    def _apply_health_baseline(self) -> None:
-        state = self._load_state()
+    def _apply_health_baseline(self, state: dict[str, Any]) -> None:
         previous = state.get("previous")
         rollback_result = state.get("rollback_result")
         if (
@@ -1358,6 +1376,10 @@ def parser() -> argparse.ArgumentParser:
         default="upgrade",
     )
     value.add_argument("--dry-run", action="store_true")
+    # `status`: every health check instead of the cheap two. `preflight`: the
+    # passing checks' details instead of their names. GPU_FAULT_FULL_REPORT=1
+    # does the same for a wrapper that cannot add the flag.
+    value.add_argument("--full", action="store_true")
     return value
 
 
@@ -1375,10 +1397,19 @@ def _run_mode(arguments: argparse.Namespace) -> int:
         )
     elif arguments.mode == "preflight":
         report = build_preflight_report(release)
-        print(json.dumps(report, indent=2, sort_keys=True))
+        full = bool(getattr(arguments, "full", False)) or full_report_requested()
+        print(
+            json.dumps(
+                report if full else compact_report(report),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         exit_code = report_exit_code(report)
     elif arguments.mode == "status":
-        report = release.status()
+        report = release.status(
+            full=bool(getattr(arguments, "full", False)) or full_report_requested()
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
         exit_code = 0 if report.get("healthy") else 1
     elif arguments.mode == "release-summary":
@@ -1428,7 +1459,7 @@ def _run_mode(arguments: argparse.Namespace) -> int:
     elif arguments.mode == "sync-state":
         sync_release_state(release)
     elif arguments.mode == "verify":
-        release._apply_health_baseline()
+        release._apply_health_baseline(release._load_state())
         report = build_health_report(release, mode="verify")
         print(json.dumps(report, indent=2, sort_keys=True))
         exit_code = report_exit_code(report)
@@ -1450,7 +1481,9 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        # A child that was our own script has already said why; only a foreign
+        # command's failure needs this line, and the child's status passes up.
+        exit_code = report_failure("ERROR", exc)
     finally:
         # `finally` rather than the success path, so an invocation that died --
         # the case where an operator most needs to know it is over and how long

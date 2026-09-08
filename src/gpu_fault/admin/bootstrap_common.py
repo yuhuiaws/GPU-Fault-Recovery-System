@@ -14,6 +14,8 @@ from typing import Any, Callable, Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.command_log import child_failure
+
 ARN_PATTERN = re.compile(
     r"^arn:(?P<partition>[^:]+):(?P<service>[^:]+):"
     r"(?P<region>[^:]*):(?P<account>[^:]*):(?P<resource>.+)$"
@@ -94,22 +96,17 @@ class BootstrapRequest:
     gpu_cluster_arns: tuple[str, ...]
     repository_root: Path
     state_dir: Path
+    # SES sends from this address to this address; there is no separate sender,
+    # recipient list or subject prefix (the site.yaml fields the release engine
+    # reads are filled from it).
     alert_email: str | None = None
-    email_sender: str | None = None
-    email_recipients: tuple[str, ...] = ()
-    email_subject_prefix: str = ""
-    cosign_signing_key: Path | None = None
-    cosign_public_key: Path | None = None
-    cosign_password_file: Path | None = None
     staging_only_release: bool = False
     impact_base: str = "origin/main"
-    dry_run: bool = False
-    # Amazon Managed Grafana dashboards (``gpu_fault.admin.grafana``): on by
-    # default, an explicit workspace id is operator input, ``grafana_create``
-    # opts into creating a workspace when the region has none.
-    grafana_enabled: bool = True
+    # Amazon Managed Grafana dashboards (``gpu_fault.admin.grafana``): an
+    # explicit workspace id is operator input; ``grafana_viewer`` is the IAM
+    # Identity Center user granted VIEWER on the workspace after the import.
     grafana_workspace_id: str | None = None
-    grafana_create: bool = False
+    grafana_viewer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,8 +117,7 @@ class BootstrapResult:
 
 
 class CommandRunner:
-    def __init__(self, *, dry_run: bool = False) -> None:
-        self.dry_run = dry_run
+    def __init__(self) -> None:
         self._print_lock = threading.Lock()
 
     def run(
@@ -138,8 +134,6 @@ class CommandRunner:
         shown = "<sensitive command>" if sensitive else " ".join(arguments)
         with self._print_lock:
             print(f"+ {shown}", file=sys.stderr, flush=True)
-        if self.dry_run and mutate:
-            return ""
         completed = subprocess.run(
             list(arguments),
             input=input_text,
@@ -150,10 +144,14 @@ class CommandRunner:
             cwd=cwd,
         )
         if completed.returncode:
-            message = completed.stderr.strip() if capture else ""
-            raise BootstrapError(
-                f"command failed ({completed.returncode}): {arguments[0]}"
-                + (f": {message}" if message else "")
+            # The whole captured stderr stays in the message: callers match
+            # ``NoSuchEntity``/``NotFound`` in it to tell "absent" from "broken".
+            raise child_failure(
+                BootstrapError,
+                arguments,
+                completed.returncode,
+                detail=completed.stderr.strip() if capture else "",
+                sensitive=sensitive,
             )
         return completed.stdout.strip() if capture else ""
 
@@ -176,8 +174,6 @@ class CommandRunner:
             mutate=mutate,
             sensitive=sensitive,
         )
-        if self.dry_run and mutate and not raw:
-            return {}
         return cast(dict[str, Any], json.loads(raw))
 
     def aws_text(
@@ -203,7 +199,7 @@ class CommandRunner:
 
 class ReadOnlyProbeRunner(CommandRunner):
     def __init__(self, delegate: CommandRunner) -> None:
-        super().__init__(dry_run=delegate.dry_run)
+        super().__init__()
         self._delegate = delegate
 
     def run(
@@ -465,6 +461,30 @@ def run_parallel(
         )
         raise first_error
     return results
+
+
+def describe_or_absent(
+    runner: CommandRunner,
+    region: str,
+    *arguments: str,
+    not_found: Sequence[str],
+) -> dict[str, Any] | None:
+    """One ``aws`` describe that answers both "is it there?" and "what is it?".
+
+    Only an error naming one of the ``not_found`` codes means absent; anything
+    else (AccessDenied, a throttled call, a broken CLI) is re-raised. Reading a
+    failed describe as "absent" -- the ``subprocess.run(...).returncode == 0``
+    pattern this replaces -- sends the run into a ``create-*`` call that then
+    fails on the resource that was there all along, or worse, succeeds twice.
+    """
+
+    try:
+        return runner.aws_json(region, *arguments)
+    except BootstrapError as exc:
+        message = str(exc)
+        if any(code in message for code in not_found):
+            return None
+        raise
 
 
 def write_secret(path: Path, value: str) -> None:

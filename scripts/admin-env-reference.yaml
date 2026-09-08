@@ -454,8 +454,8 @@ categories:
       - name: GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE
         description: "每节点 raw evidence 数量上限。"
       - name: GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS
-        description: "incident/workflow archive-first 保留天数；0 表示不自动归档删除。"
+        description: "incident/workflow archive-first 保留天数；默认 0 = 关闭，永不归档删除。不直接设置：在 site.yaml 声明 spec.retention.controlRecordRetentionDays 后重跑 deploy --state-dir，只渲染进 control-worker。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI
-        description: "archive-first 目标 S3 URI；配置后先写归档并校验 SHA，再删 live rows。"
+        description: "archive-first 目标 S3 URI（保留天数 >0 时必填）；先写归档并校验 SHA，再删 live rows。来自 site.yaml spec.retention.archiveS3Uri；deploy 同时给控制面角色加该前缀的 s3:PutObject。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS
-        description: "控制记录归档扫描周期。"
+        description: "控制记录归档扫描周期；来自 site.yaml spec.retention.archiveIntervalSeconds，缺省 3600。"

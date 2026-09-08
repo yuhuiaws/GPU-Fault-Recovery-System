@@ -382,7 +382,7 @@ def test_apply_script_passes_the_snapshot_to_both_verifications() -> None:
     assert guard < flag < end_of_guard < lint, "flag must be added inside the guard"
     assert script.count("--container-env-snapshot") == 1
 
-    verify = script.index('"${SCRIPT_DIR}/verify-control-plane-role-split.sh"')
+    verify = script.index('python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"')
     handoff = script.rindex(
         'GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE="${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}"',
         0,

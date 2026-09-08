@@ -4,12 +4,12 @@ import argparse
 import inspect
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+from gpu_fault.admin.notification_precheck import EmailConfirmation
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
 from scripts import (
     staging_deploy,
@@ -61,6 +61,39 @@ def _live_evidence() -> dict[str, object]:
     }
 
 
+def _status_report() -> dict[str, object]:
+    """The quick ``status`` report the pre-deploy reading returns."""
+
+    return {
+        "mode": "status",
+        "healthy": True,
+        "health_scope": "quick",
+        "live_release": {
+            "release_id": "release-a",
+            "phase": "complete",
+            "transaction_committed": True,
+            "state_sha256": "e" * 64,
+        },
+        "configured_release": {
+            "release_id": "release-a",
+            "database_schema_version": 12,
+        },
+        "next_deploy": {"kind": "NOOP", "changed": []},
+    }
+
+
+def _confirmed_email() -> EmailConfirmation:
+    return EmailConfirmation(
+        sender="operations@example.com",
+        admin_email="operations@example.com",
+        ses_verified=True,
+        ses_identity_created=False,
+        sns_topic_arn="arn:aws:sns:us-east-1:123456789012:gpu-fault-alerts",
+        sns_status="CONFIRMED",
+        sns_subscription_arn="arn:aws:sns:us-east-1:123456789012:gpu-fault-alerts:1",
+    )
+
+
 def test_pending_profile_change_runs_the_release_on_unchanged_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -108,8 +141,11 @@ def test_pending_profile_change_runs_the_release_on_unchanged_source(
     assert DEPLOY_EVENT in events, (
         "a pending Runtime Profile change on unchanged source deployed nothing"
     )
-    assert readings == ["read", "read"], "the success record must be re-read"
-    assert events.index(DEPLOY_EVENT) < events.index("success")
+    # The success record comes from the release driver's own files, not from a
+    # second reading of the site.
+    assert readings == ["read"], "the pre-apply reading is the only status call"
+    assert events.index(DEPLOY_EVENT) < events.index(RECORD_EVIDENCE_EVENT)
+    assert events.index(RECORD_EVIDENCE_EVENT) < events.index("success")
 
 
 def test_signing_material_is_generated_once(
@@ -587,6 +623,12 @@ def test_deploy_uses_same_orchestration_for_first_and_later_runs(
         "collect_live_deploy_evidence",
         lambda **_kwargs: _live_evidence(),
     )
+    monkeypatch.setattr(
+        staging_deploy, "read_live_status", lambda **_k: _status_report()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "precheck_email_confirmations", lambda **_k: _confirmed_email()
+    )
     arguments = argparse.Namespace(
         repo_root=repository,
         state_dir=state,
@@ -698,6 +740,12 @@ def test_unchanged_successful_source_does_not_query_ci_or_deploy(
         staging_deploy,
         "collect_live_deploy_evidence",
         lambda **_kwargs: _live_evidence(),
+    )
+    monkeypatch.setattr(
+        staging_deploy, "read_live_status", lambda **_k: _status_report()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "precheck_email_confirmations", lambda **_k: _confirmed_email()
     )
 
     result = staging_deploy.deploy(
@@ -825,6 +873,12 @@ def test_source_scan_runs_before_snapshot_and_bundle(
         "collect_live_deploy_evidence",
         lambda **_kwargs: _live_evidence(),
     )
+    monkeypatch.setattr(
+        staging_deploy, "read_live_status", lambda **_k: _status_report()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "precheck_email_confirmations", lambda **_k: _confirmed_email()
+    )
 
     staging_deploy.deploy(
         argparse.Namespace(
@@ -885,159 +939,6 @@ def test_makefile_keeps_staging_release_build_internal() -> None:
     assert '--impact-base "$(BASE)"' in staging_build
 
 
-def _git(repository: Path, *arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", *arguments], cwd=repository, check=True, capture_output=True, text=True
-    )
-    return completed.stdout.strip()
-
-
-def test_clean_source_is_isolated_without_staging_tier(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    (repository / ".gitignore").write_text("dist/\n", encoding="utf-8")
-    tracked = repository / "tracked.txt"
-    tracked.write_text("release\n", encoding="utf-8")
-    tracked.chmod(0o664)
-    _git(repository, "add", ".gitignore", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    state = tmp_path / "state"
-
-    first = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    first.repository_root.joinpath("dist").mkdir()
-    first.repository_root.joinpath("dist/current-release.json").write_text(
-        "signed-release\n", encoding="utf-8"
-    )
-    repository.joinpath("dist").mkdir()
-    repository.joinpath("dist/current-release.json").write_text(
-        "later-local-build\n", encoding="utf-8"
-    )
-    second = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-
-    assert first == second
-    assert first.repository_root != repository
-    assert first.snapshot is False
-    assert first.isolated is True
-    assert first.git_commit == _git(repository, "rev-parse", "HEAD")
-    assert first.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o664
-    assert (
-        first.repository_root.joinpath("dist/current-release.json").read_text(
-            encoding="utf-8"
-        )
-        == "signed-release\n"
-    )
-
-
-def test_dirty_source_is_snapshotted_without_changing_original(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    tracked = repository / "tracked.txt"
-    tracked.write_text("before\n", encoding="utf-8")
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    tracked.write_text("after\n", encoding="utf-8")
-    (repository / "new.txt").write_text("new\n", encoding="utf-8")
-
-    first = staging_deploy.prepare_source_checkout(
-        repository, state_dir=tmp_path / "state"
-    )
-    second = staging_deploy.prepare_source_checkout(
-        repository, state_dir=tmp_path / "state"
-    )
-
-    assert first.snapshot is True
-    assert first.isolated is True
-    assert first == second
-    assert (first.repository_root / "tracked.txt").read_text() == "after\n"
-    assert (first.repository_root / "new.txt").read_text() == "new\n"
-    assert _git(first.repository_root, "status", "--porcelain") == ""
-    assert "tracked.txt" in _git(repository, "status", "--short")
-    assert "new.txt" in _git(repository, "status", "--short")
-
-
-def test_dirty_snapshot_preserves_tracked_modes_across_umasks(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    tracked = repository / "tracked.txt"
-    tracked.write_text("before\n", encoding="utf-8")
-    tracked.chmod(0o664)
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    tracked.write_text("after\n", encoding="utf-8")
-    state = tmp_path / "state"
-
-    previous_umask = os.umask(0o077)
-    try:
-        first = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    finally:
-        os.umask(previous_umask)
-
-    assert first.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o664
-
-    tracked.chmod(0o644)
-    second = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-
-    assert second.fingerprint != first.fingerprint
-    assert (
-        second.repository_root.joinpath("tracked.txt").stat().st_mode & 0o777 == 0o644
-    )
-
-
-def test_snapshot_metadata_must_match_current_fingerprint(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    tracked = repository / "tracked.txt"
-    tracked.write_text("before\n", encoding="utf-8")
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    tracked.write_text("after\n", encoding="utf-8")
-    state = tmp_path / "state"
-    checkout = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    snapshot_dir = state / "source-snapshots" / checkout.fingerprint
-    metadata = snapshot_dir / "snapshot.json"
-    value = json.loads(metadata.read_text(encoding="utf-8"))
-    value["fingerprint"] = "c" * 64
-    metadata.write_text(json.dumps(value), encoding="utf-8")
-
-    with pytest.raises(
-        staging_deploy.StagingDeployError, match="snapshot identity does not match"
-    ):
-        staging_deploy.prepare_source_checkout(repository, state_dir=state)
-
-
-def test_snapshot_prepared_tree_must_remain_unchanged(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    tracked = repository / "tracked.txt"
-    tracked.write_text("release\n", encoding="utf-8")
-    tracked.chmod(0o644)
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    state = tmp_path / "state"
-    checkout = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    checkout.repository_root.joinpath("tracked.txt").chmod(0o600)
-
-    with pytest.raises(
-        staging_deploy.StagingDeployError, match="prepared tree does not match"
-    ):
-        staging_deploy.prepare_source_checkout(repository, state_dir=state)
-
-
 def _deploy_arguments(repository: Path, state: Path) -> argparse.Namespace:
     return argparse.Namespace(
         repo_root=repository,
@@ -1070,6 +971,7 @@ def _install_admin_stub(state: Path) -> None:
 STUB_LOCK_FD = 17
 EVIDENCE_EVENT = f"evidence(lock_fd={STUB_LOCK_FD})"
 DEPLOY_EVENT = f"deploy(lock_fd={STUB_LOCK_FD})"
+RECORD_EVIDENCE_EVENT = "evidence(release-record)"
 
 
 def _stub_deploy_orchestration(
@@ -1103,6 +1005,10 @@ def _stub_deploy_orchestration(
 
     def evidence(**kwargs: object) -> dict[str, object]:
         events.append(f"evidence(lock_fd={kwargs.get('lock_fd')})")
+        return _live_evidence()
+
+    def record_evidence(**_kwargs: object) -> dict[str, object]:
+        events.append(RECORD_EVIDENCE_EVENT)
         return _live_evidence()
 
     def admin_deploy(**kwargs: object) -> None:
@@ -1146,6 +1052,15 @@ def _stub_deploy_orchestration(
     monkeypatch.setattr(staging_deploy, "run_admin_deploy", admin_deploy)
     monkeypatch.setattr(staging_deploy, "collect_live_deploy_evidence", evidence)
     monkeypatch.setattr(
+        staging_deploy, "read_live_status", lambda **_k: _status_report()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "precheck_email_confirmations", lambda **_k: _confirmed_email()
+    )
+    monkeypatch.setattr(
+        staging_deploy, "live_evidence_from_release_record", record_evidence
+    )
+    monkeypatch.setattr(
         staging_deploy,
         "prune_source_snapshots",
         lambda *_a, **_k: events.append("prune") or (),
@@ -1181,11 +1096,14 @@ def test_apply_source_deploy_has_no_lockless_path() -> None:
 def test_deploy_collects_live_evidence_once_under_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One pre-apply ``status``, taken under the lock, plus the success one.
+    """One pre-apply ``status`` under the lock; the success comes from the record.
 
-    ``gpu-fault-admin status`` costs about 45 seconds. The classification it
-    feeds is only trustworthy while nothing else can change the site, so the
-    lock comes first and the answer is reused instead of re-derived.
+    The classification the pre-apply reading feeds is only trustworthy while
+    nothing else can change the site, so the lock comes first and the answer is
+    reused instead of re-derived. After an application release the success
+    record is built from the release driver's own ``state.json`` and
+    ``release-summary.json`` -- not from a second ``status`` (about 45 seconds)
+    that would read the same release back.
     """
 
     monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
@@ -1228,11 +1146,25 @@ def test_deploy_collects_live_evidence_once_under_lock(
         "lock-enter",
         EVIDENCE_EVENT,
         DEPLOY_EVENT,
-        EVIDENCE_EVENT,
+        RECORD_EVIDENCE_EVENT,
         "success",
         "prune",
         "lock-exit",
     ]
+
+
+def test_release_record_that_is_not_evidence_falls_back_to_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A driver that completed without a usable summary still gets a success record."""
+
+    def unusable(**_kwargs: object) -> dict[str, object]:
+        raise staging_deploy.LiveEvidenceError("release summary unavailable")
+
+    monkeypatch.setattr(staging_deploy, "live_evidence_from_release_record", unusable)
+
+    assert staging_deploy.release_record_evidence(tmp_path) is None
+    assert "release summary unavailable" in capsys.readouterr().err
 
 
 def test_unchanged_deploy_reuses_its_single_live_evidence(
@@ -1387,104 +1319,3 @@ def test_missing_venv_promotes_prepared_mode_and_deploys(
     )
     assert "gate" not in events
     assert events.index(DEPLOY_EVENT) < events.index("success")
-
-
-def _snapshot_tree(root: Path, index: int) -> Path:
-    """One ``source-snapshots/<fingerprint>/repository-*`` pair, mtime by index."""
-
-    fingerprint = f"{index:064d}"
-    worktree = root / fingerprint / f"repository-{index}"
-    worktree.mkdir(parents=True)
-    (worktree / "tracked.txt").write_text("release\n", encoding="utf-8")
-    (root / fingerprint / "snapshot.json").write_text("{}", encoding="utf-8")
-    stamp = 1_700_000_000 + index
-    os.utime(root / fingerprint, (stamp, stamp))
-    return worktree
-
-
-def test_prune_source_snapshots_keeps_referenced_and_newest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The snapshots a deploy can still be asked to reproduce always survive.
-
-    Production had 59 snapshots and 3.5 GB in this directory because nothing
-    removed them. What may not be removed is what the recorded state points at:
-    the pending deploy, the last success, and the tree running right now.
-    """
-
-    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
-    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "3")
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    state = tmp_path / "state"
-    snapshots = state / "source-snapshots"
-    trees = [_snapshot_tree(snapshots, index) for index in range(8)]
-    (state / staging_state_hygiene.SOURCE_DEPLOY_STATE).write_text(
-        json.dumps({"prepared_repository_root": str(trees[0])}), encoding="utf-8"
-    )
-    (state / staging_state_hygiene.SOURCE_DEPLOY_SUCCESS_STATE).write_text(
-        json.dumps({"prepared_repository_root": str(trees[1])}), encoding="utf-8"
-    )
-
-    removed = staging_deploy.prune_source_snapshots(
-        state, source_repository_root=repository, current=trees[2]
-    )
-
-    assert set(removed) == {trees[3].parent, trees[4].parent}
-    for index in (0, 1, 2, 5, 6, 7):
-        assert trees[index].is_dir(), index
-    for index in (3, 4):
-        assert not trees[index].parent.exists(), index
-
-    monkeypatch.delenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED")
-
-    assert (
-        staging_deploy.prune_source_snapshots(
-            state, source_repository_root=repository, current=trees[2]
-        )
-        == ()
-    ), "the default retention removed a snapshot it should have kept"
-
-    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "0")
-
-    with pytest.raises(staging_deploy.StagingDeployError, match="positive integer"):
-        staging_deploy.prune_source_snapshots(
-            state, source_repository_root=repository, current=trees[2]
-        )
-
-
-def test_prune_source_snapshots_unregisters_git_worktrees(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A snapshot is a worktree of the source repository, so Git has to be told.
-
-    ``shutil.rmtree`` alone leaves the registration behind in the source
-    repository, and the next ``git worktree add`` for the same path fails.
-    """
-
-    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
-    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "1")
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    _git(repository, "init")
-    _git(repository, "config", "user.name", "Test")
-    _git(repository, "config", "user.email", "test@example.com")
-    (repository / "tracked.txt").write_text("release\n", encoding="utf-8")
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "initial")
-    state = tmp_path / "state"
-    stale = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    (repository / "tracked.txt").write_text("changed\n", encoding="utf-8")
-    _git(repository, "add", "tracked.txt")
-    _git(repository, "commit", "-m", "second")
-    current = staging_deploy.prepare_source_checkout(repository, state_dir=state)
-    assert current.repository_root != stale.repository_root
-
-    removed = staging_deploy.prune_source_snapshots(
-        state, source_repository_root=repository, current=current.repository_root
-    )
-
-    assert removed == (stale.repository_root.parent,)
-    assert not stale.repository_root.exists(), "the stale snapshot must be pruned"
-    assert current.repository_root.is_dir(), "the current snapshot must survive pruning"
-    assert str(stale.repository_root) not in _git(repository, "worktree", "list")

@@ -4407,7 +4407,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-020
-  related_pytest: tests/regional/test_regional_acceptance_fixtures.py::test_boot020_runner_covers_diff_resume_and_rollback
+  related_pytest: tests/regional/test_boot020_runner.py::test_boot020_runner_covers_diff_resume_and_rollback
 - id: GF-REGIONAL-BOOT-021
   title: Executor认证readiness负向矩阵
   category: regional-deployability
@@ -5564,37 +5564,35 @@ test_cases:
   - tests/orchestration/test_placement_hold.py
   related_pytest: tests/execution/test_placement_hold_dispatch.py::test_preempt035_a_hold_waits_then_dissolves_when_the_node_is_freed
 - id: GF-REGIONAL-PREEMPT-036
-  title: 卡死工作流由运维审计关闭：compile-blocked、orphaned-commands、retired-generation 三种 workflow-reconcile 模式各自 plan→apply，绑定摘要，拒绝在飞工作流与漂移计划
+  title: 卡死工作流由 dispatcher 自动关闭：compile-blocked、orphaned-commands、retired-generation 三种形态在每轮清扫中各自收敛，孪生的活记录逐字段不动，再跑一轮幂等
   category: regional-preemption
   level: integration
   risk: non-destructive
   problem: >-
     三类工作流会卡在没人能关闭的状态，各自堵过一次发布：compile 阶段就 BLOCKED（没有可执行负责人，例如
     efaDriverRemediation）的记录被升级前置当成在飞的破坏性作业；FAILED 工作流留下的远程命令 WAITING 了 13 小时；
-    被改判掉的旧代仍在派发。修复以 gpu-fault-admin workflow-reconcile 三种模式发货，但目录里没有任何用例覆盖这条运维路径。
+    被改判掉的旧代仍在派发。第一版修复是 gpu-fault-admin workflow-reconcile 的三个模式，每次实际使用都只是为了让
+    发布前置放行；三者的判定全部只读 Store，于是改由 dispatcher 每轮清扫自动关闭，目录里需要一条用例证明这条自动路径。
   injection: >-
-    每种模式一套隔离存储（优先 docker 一次性 PostgreSQL 16，退化到临时 SqliteStore），只经 Store 公共 API 造出
-    「一条合格记录 + 一条不合格孪生记录」，然后在本地子进程里执行 admin 真实发货的模块源码与驱动，先 --plan 再 --apply，
-    并用发货的 workflow_safety、remote_command_stats 探针源码在 apply 前后各测一次。
+    每种形态一套隔离存储（优先 docker 一次性 PostgreSQL 16，退化到临时 SqliteStore），只经 Store 公共 API 造出
+    「一条该被关闭的记录 + 一条必须原样留下的孪生记录」，然后用公开构造器建一个没有 adapter 的 WorkflowDispatcher，
+    对该存储调用 sweep_stuck_records 按形态所需轮数执行（retired-generation 两轮），之后再多跑一轮，
+    并用发货的 workflow_safety、remote_command_stats 探针源码在清扫前后各测一次。
   expected:
-  - plan 恰好覆盖被点名的记录，合格项按 eligible or cancellable 判定，不合格孪生被点名并带自己的理由
-  - 含不合格项的 plan 执行 apply 被拒，拒绝语点名 contains ineligible records
-  - 篡改 plan_sha256 被拒为 plan 漂移；apply 绑定运维批准的摘要（retired-generation 绑 plan_sha256，其 settled_plan_sha256 是取消远程命令后的二次摘要）
-  - records_deleted 恒为 0
-  - compile-blocked 记录变 SUPERSEDED，preemption_reason 带 reference、never changed a node 与原 blocked_reasons
-  - 孤儿远程命令变 FAILED、status_source=workflow-timeout、error 带 reference、租约清空；不写 workflow 与 incident
-  - retired-generation 旧代 SUPERSEDED、preempted_by_workflow_id 指向后继、执行者与租约清空
-  - RUNNING 孪生的在飞命令逐字段不变
-  - workflow_safety 阻塞列表精确匹配：compile-blocked 1→0，orphaned-commands 1→1，retired-generation 3→2，只有计划内记录离开列表
+  - compile-blocked 记录变 SUPERSEDED，preemption_reason 带 dispatcher reconciliation、closed compile-time BLOCKED workflow 与原 blocked_reasons；不写 incident
+  - 孤儿远程命令变 FAILED、status_source=workflow-timeout、error 带 dispatcher 归属、租约清空；FAILED 工作流与其 incident 原样不动
+  - retired-generation 旧代第一轮被取消远程命令、第二轮 SUPERSEDED，preempted_by_workflow_id 指向后继，执行者与租约清空，preemption_reason 与 incident reasons 带 revoked retired generation
+  - 每条孪生记录与不写审计的 incident 在清扫前后逐字段相同；RUNNING 孪生的在飞命令逐字段不变
+  - compile-blocked 与 orphaned-commands 各在被写记录上恰有一条 OPERATOR_RECONCILED 事件，actor=dispatcher，previous_status/new_status 与记录一致，details 带各自的关闭/取消明细；retired-generation 无 operator 事件；孪生无事件
+  - 最后一轮仍 withhold 的集合精确等于留给人工的那条（已完成 RESET_GPU 的旧代），其它形态为空
+  - workflow_safety 列表精确匹配：compile-blocked 在 compile_blocked 列表 1→0、blockers 前后为空、孪生在 resolved_blocked；orphaned-commands blockers 1→1；retired-generation 3→2；各 *_count 与列表长度一致
   - remote_command_stats.by_status 的 PENDING+LEASED+WAITING 恰好减少被取消的条数
-  - 重跑：compile-blocked/retired-generation 得到 already_closed/already_revoked 且 apply 空操作，orphaned-commands 的 apply 被拒且记录不变
-  - 证据记录 store_backend（postgres 或 sqlite）与执行文本以模块源码为前缀，且只含摘要、不含 URL 与口令
-  - 每个被写的记录恰带一条归属事件（compile-blocked/orphaned-commands 为 OPERATOR_RECONCILED，retired-generation 为 OPERATOR_RETIRED_GENERATION）：actor 为 STS ARN 或 user@host、reference、admin_plan_sha256、运行时 plan_sha256、previous_status/new_status；被拒孪生无事件，重跑不新增事件
-  - apply 包在 command_log(kind=mutating) 内，日志落在 state-dir/logs/mutating/ 下
+  - 再多跑一轮：workflow、incident、remote command 快照逐字段不变，事件不新增
+  - 证据记录 store_backend（postgres 或 sqlite）、每轮 withhold 集合、前后状态与审计事件，且只含摘要、不含 URL 与口令
   evidence:
     verdict: NOT_RUN
   automation: command
-  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-036卡死工作流由运维审计关闭
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-036卡死工作流由dispatcher自动关闭
   execution:
     parallel_safe: true
     environment: isolated
@@ -5607,7 +5605,7 @@ test_cases:
   - scripts/e2e/regional/run_preempt036_stuck_workflow_reconcile.py
   - --run-dir
   - artifacts/regional-acceptance/preempt036
-  related_pytest: tests/regional/test_preempt036_stuck_workflow_reconcile.py::test_apply_closes_the_record_and_leaves_live_work_alone
+  related_pytest: tests/regional/test_preempt036_stuck_workflow_reconcile.py::test_the_sweep_closes_the_record_and_leaves_live_work_alone
 - id: GF-REGIONAL-PREEMPT-037
   title: 调度循环判活：关闭 workflow dispatcher 后 last-cycle 时间戳老化，GpuFaultWorkflowDispatcherStalled 表达式在其 for 内成立，恢复后归零
   category: regional-preemption

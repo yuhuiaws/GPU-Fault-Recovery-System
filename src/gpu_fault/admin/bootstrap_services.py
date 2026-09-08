@@ -26,6 +26,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     ReadOnlyProbeRunner,
     assert_site_tag,
+    describe_or_absent,
     kubectl_apply,
     safe_name,
     tag_map,
@@ -39,6 +40,7 @@ from gpu_fault.admin.grafana import GrafanaSettings, ensure_grafana_dashboards
 from gpu_fault.admin.monitoring_subscriptions import (
     ensure_monitoring_subscriptions,
 )
+from gpu_fault.admin.site import archive_s3_prefix_arn
 
 SNS_TOPIC_GENERATION_TAG = "gpu-fault:topic-generation"
 # One Pod Identity add-on result per deploy run, keyed by the runner the run was
@@ -136,25 +138,21 @@ def _ensure_pod_identity_agent(
     if cached is not None:
         return dict(cached)
     # One describe answers both questions the ensure has: whether the add-on is
-    # there at all, and which site owns it. A separate silent existence probe
-    # asked the same thing a second time. Only a not-found error means absent;
-    # anything else (AccessDenied, a throttled call) stays fail-closed, because
-    # reading it as absent would send the run into `create-addon`, which fails on
-    # an add-on that already exists.
-    addon: dict[str, Any] | None = None
-    try:
-        addon = runner.aws_json(
-            cluster.region,
-            "eks",
-            "describe-addon",
-            "--cluster-name",
-            cluster.eks_name,
-            "--addon-name",
-            "eks-pod-identity-agent",
-        )["addon"]
-    except BootstrapError as exc:
-        if "notfound" not in str(exc).lower():
-            raise
+    # there at all, and which site owns it (`describe_or_absent` keeps anything
+    # but a not-found fail-closed: reading AccessDenied as absent would send the
+    # run into `create-addon`, which fails on an add-on that already exists).
+    described = describe_or_absent(
+        runner,
+        cluster.region,
+        "eks",
+        "describe-addon",
+        "--cluster-name",
+        cluster.eks_name,
+        "--addon-name",
+        "eks-pod-identity-agent",
+        not_found=("ResourceNotFoundException",),
+    )
+    addon = described["addon"] if described is not None else None
     ownership = "CREATED"
     if addon is not None:
         tags = runner.aws_json(
@@ -506,14 +504,18 @@ def control_plane_policy_document(
     region: str,
     account_id: str,
     email_sender: str | None = None,
+    archive_s3_uri: str | None = None,
 ) -> dict[str, Any]:
     """Every AWS permission the regional control plane is allowed to hold.
 
     This is a value rather than a literal buried in ``ensure_control_plane_role``
     because it is the whole blast-radius argument for the CPU side: SageMaker
-    read-only, no node mutation of any kind, and email only from the verified
-    sender. Stated as a document it can be checked against the same validator
-    the release path applies to the executor role, without an AWS account.
+    read-only, no node mutation of any kind, email only from the verified
+    sender, and -- only when ``site.yaml`` ``spec.retention`` names an archive
+    bucket -- ``PutObject`` under that one prefix, because the archiver writes
+    bundles and never reads or deletes them. Stated as a document it can be
+    checked against the same validator the release path applies to the
+    executor role, without an AWS account.
     """
 
     statements: list[dict[str, Any]] = [
@@ -541,6 +543,15 @@ def control_plane_policy_document(
                         "ses:FromAddress": email_sender,
                     }
                 },
+            }
+        )
+    if archive_s3_uri:
+        statements.append(
+            {
+                "Sid": "ControlRecordArchive",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": archive_s3_prefix_arn(archive_s3_uri),
             }
         )
     return {"Version": "2012-10-17", "Statement": statements}
@@ -579,6 +590,7 @@ def ensure_control_plane_role(
     namespace: str,
     site_id: str,
     email_sender: str | None = None,
+    archive_s3_uri: str | None = None,
 ) -> dict[str, str]:
     _ensure_pod_identity_agent(runner, cpu, site_id)
     _ensure_service_account(
@@ -598,6 +610,7 @@ def ensure_control_plane_role(
             region=cpu.region,
             account_id=cpu.account_id,
             email_sender=email_sender,
+            archive_s3_uri=archive_s3_uri,
         ),
         site_id=site_id,
     )
@@ -676,36 +689,20 @@ def _ensure_oidc_provider(
         raise BootstrapError(f"EKS cluster {cluster.eks_name} has no OIDC issuer")
     issuer_host = issuer.removeprefix("https://")
     provider_arn = f"arn:aws:iam::{cluster.account_id}:oidc-provider/{issuer_host}"
-    exists = (
-        subprocess.run(
-            [
-                "aws",
-                "iam",
-                "get-open-id-connect-provider",
-                "--open-id-connect-provider-arn",
-                provider_arn,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    # `get-open-id-connect-provider` returns the provider's tags, so the one read
+    # settles both existence and ownership.
+    provider = describe_or_absent(
+        runner,
+        cluster.region,
+        "iam",
+        "get-open-id-connect-provider",
+        "--open-id-connect-provider-arn",
+        provider_arn,
+        not_found=("NoSuchEntity",),
     )
     ownership = "EXTERNAL"
-    if exists:
-        tags = json.loads(
-            runner.run(
-                [
-                    "aws",
-                    "iam",
-                    "list-open-id-connect-provider-tags",
-                    "--open-id-connect-provider-arn",
-                    provider_arn,
-                    "--output",
-                    "json",
-                ]
-            )
-        ).get("Tags", [])
-        if tag_map(tags).get(SITE_TAG_KEY) == site_id:
+    if provider is not None:
+        if tag_map(provider.get("Tags", [])).get(SITE_TAG_KEY) == site_id:
             ownership = "CREATED"
     else:
         runner.run(
@@ -815,7 +812,7 @@ def _ensure_amp_workspace(
             description=f"AMP workspace {workspace_id}",
             allow_missing=True,
         )
-        if not tagged and not runner.dry_run:
+        if not tagged:
             runner.run(
                 [
                     "aws",
@@ -831,8 +828,6 @@ def _ensure_amp_workspace(
                 mutate=True,
                 capture=False,
             )
-    elif runner.dry_run:
-        workspace_id = "ws-dryrun"
     else:
         workspace_id = str(
             runner.aws_json(
@@ -846,28 +841,27 @@ def _ensure_amp_workspace(
                 mutate=True,
             )["workspaceId"]
         )
-    if not runner.dry_run:
-        deadline = time.monotonic() + 600
-        while time.monotonic() < deadline:
-            workspace = runner.aws_json(
-                cpu.region,
-                "amp",
-                "describe-workspace",
-                "--workspace-id",
-                workspace_id,
-            )["workspace"]
-            status = (workspace.get("status") or {}).get("statusCode")
-            if status == "ACTIVE":
-                break
-            if status in {"CREATION_FAILED", "DELETING"}:
-                raise BootstrapError(f"AMP workspace entered {status}")
-            time.sleep(5)
-        else:
-            raise BootstrapError("AMP workspace did not become ACTIVE")
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        workspace = runner.aws_json(
+            cpu.region,
+            "amp",
+            "describe-workspace",
+            "--workspace-id",
+            workspace_id,
+        )["workspace"]
+        status = (workspace.get("status") or {}).get("statusCode")
+        if status == "ACTIVE":
+            break
+        if status in {"CREATION_FAILED", "DELETING"}:
+            raise BootstrapError(f"AMP workspace entered {status}")
+        time.sleep(5)
+    else:
+        raise BootstrapError("AMP workspace did not become ACTIVE")
     return workspace_id, False
 
 
-def _ensure_sns_topic(
+def ensure_sns_topic(
     runner: CommandRunner,
     *,
     cpu: ClusterIdentity,
@@ -876,20 +870,16 @@ def _ensure_sns_topic(
     topic_name = safe_name(f"gpu-fault-{site_id}-alerts", maximum=256)
     expected_topic_arn = f"arn:aws:sns:{cpu.region}:{cpu.account_id}:{topic_name}"
     topic_reused = (
-        subprocess.run(
-            [
-                "aws",
-                "sns",
-                "get-topic-attributes",
-                "--region",
-                cpu.region,
-                "--topic-arn",
-                expected_topic_arn,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+        describe_or_absent(
+            runner,
+            cpu.region,
+            "sns",
+            "get-topic-attributes",
+            "--topic-arn",
+            expected_topic_arn,
+            not_found=("NotFound",),
+        )
+        is not None
     )
     if topic_reused:
         topic_arn = expected_topic_arn
@@ -916,7 +906,7 @@ def _ensure_sns_topic(
         if not generation:
             generation = uuid4().hex
             tag_values.append(f"Key={SNS_TOPIC_GENERATION_TAG},Value={generation}")
-        if tag_values and not runner.dry_run:
+        if tag_values:
             runner.run(
                 [
                     "aws",
@@ -991,7 +981,7 @@ def _ensure_sqs_queue(
             description=f"SQS queue {queue_url}",
             allow_missing=True,
         )
-        if not tagged and not runner.dry_run:
+        if not tagged:
             runner.run(
                 [
                     "aws",
@@ -1096,7 +1086,7 @@ def ensure_monitoring_resources(
         cpu=cpu,
         site_id=site_id,
     )
-    topic_arn, topic_reused, topic_generation = _ensure_sns_topic(
+    topic_arn, topic_reused, topic_generation = ensure_sns_topic(
         runner,
         cpu=cpu,
         site_id=site_id,
@@ -1261,8 +1251,8 @@ def _upload_wheel_configmap(
 ) -> str:
     sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
     name = f"gpu-fault-control-plane-wheel-0100-{sha[:12]}"
-    exists = (
-        subprocess.run(
+    try:
+        runner.run(
             [
                 "kubectl",
                 "--kubeconfig",
@@ -1272,12 +1262,17 @@ def _upload_wheel_configmap(
                 "get",
                 "configmap",
                 name,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
+                "-o",
+                "name",
+            ]
+        )
+        exists = True
+    except BootstrapError as exc:
+        # Only NotFound means absent: an unreachable API server must not be
+        # answered with a `create configmap` that then fails on the existing one.
+        if "NotFound" not in str(exc):
+            raise
+        exists = False
     if not exists:
         # xz-compressed: the control-plane wheel outgrew the 1 MiB ConfigMap
         # ceiling, and nothing installs it from the mount at runtime.

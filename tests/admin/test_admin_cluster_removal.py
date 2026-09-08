@@ -336,6 +336,13 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
         "_sync_release_state",
         lambda *_args: calls.append("release-state"),
     )
+    monkeypatch.setattr(
+        admin_cluster_removal,
+        "refresh_failure_domain_map",
+        lambda site: calls.append(
+            f"failure-domain-map:{len(site.release_config['clusters'])}"
+        ),
+    )
 
     request = RemoveClusterRequest(
         site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
@@ -354,6 +361,10 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     assert calls.count("registry") == 1
     assert calls.count("release-state") == 1
     assert calls.count("site-verified") == 1
+    # The failure-domain map is re-rendered once, for the remaining (empty)
+    # cluster set, before the release state moves on.
+    assert calls.count("failure-domain-map:0") == 1
+    assert calls.index("failure-domain-map:0") < calls.index("release-state")
 
 
 def test_remove_network_discovery_is_bounded_parallel(monkeypatch) -> None:

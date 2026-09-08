@@ -88,14 +88,13 @@ Runtime Profile策略变化时，首次deploy生成
 `<state-dir>/release-deploy/profile-plan.json`并停止。审核后运行：
 
 ```bash
-gpu-fault-admin approve-profile \
+gpu-fault-admin deploy \
   --state-dir /secure/gpu-fault-staging \
-  --plan-sha256 "$(jq -er '.plan_sha256' \
-    /secure/gpu-fault-staging/release-deploy/profile-plan.json)" \
+  --approve-profile-plan <停止信息里打印的 plan_sha256> \
   --reference CHG-12345
 ```
 
-随后重跑原四参数deploy。不得通过隐藏参数或环境变量注入审批引用。
+审批与发布在同一条命令里完成；只有 `profile-plan.json` 已存在且摘要一致时该参数才被接受。不得通过隐藏参数或环境变量注入审批引用。
 完整管理员流程见[Runtime Profile变更审批](docs/管理员Profile变更审批.md)。
 
 GitHub Actions从触发、OIDC/ECR、质量门禁、制品签名到`gpu-fault-release` artifact

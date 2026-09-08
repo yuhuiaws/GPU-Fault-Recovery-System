@@ -130,6 +130,79 @@ def test_the_probe_and_the_product_agree_on_what_makes_a_generation_abandoned() 
     )
 
 
+def test_workflow_safety_sets_aside_a_workflow_blocked_at_compile_time() -> None:
+    """A compiler refusal that never ran is the dispatcher's to close, not a blocker.
+
+    The record observed live -- ``REMEDIATE_EFA_DRIVER`` BLOCKED with ``no
+    executable owner for efaDriverRemediation`` -- held the release that would
+    have added the owner. The sweep that closes it ships in that release, so the
+    gate has to roll past it while still reporting what it set aside.
+    """
+
+    result = SAFETY.workflow_safety_snapshot(
+        release(
+            '{"blocker_count":0,"blockers":[],'
+            '"resolved_blocked_count":0,"resolved_blocked":[],'
+            '"abandoned_generation_count":0,"abandoned_generation":[],'
+            '"compile_blocked_count":1,"compile_blocked":["workflow-efa"]}'
+        )
+    )
+
+    assert result["compile_blocked_count"] == 1
+    assert result["compile_blocked"] == ["workflow-efa"]
+
+
+# The guard fields that make a compile-time BLOCKED record provably a no-op.
+# Both copies of the predicate have to read every one of them: dropping any
+# single field turns the test into "BLOCKED with a reason", which would set
+# aside -- and let the dispatcher close -- a record an operator is meant to act
+# on (the dispatcher's own INTERNAL_ERROR BLOCKED, which a claim has stamped).
+COMPILE_BLOCKED_GUARDS = (
+    "blocked_reasons",
+    "execution_epoch",
+    "step_executions",
+    "completed_step_indexes",
+    "completed_operations",
+    "execution_owner_id",
+    "source_plan_id",
+    "remediation_budget_claims",
+    "IncidentState.RECOVERED",
+    "IncidentState.ESCALATED",
+    "RemoteCommandStatus.PENDING",
+    "RemoteCommandStatus.LEASED",
+    "RemoteCommandStatus.WAITING",
+)
+COMPILE_BLOCKED = ROOT / "src/gpu_fault/compile_blocked.py"
+
+
+def test_the_probe_and_the_product_agree_on_what_makes_a_record_compile_blocked() -> (
+    None
+):
+    """The probe inlines the predicate; this holds the two copies together.
+
+    Same arrangement as ``abandoned_generation`` above and for the same reason:
+    the probe runs against the *already deployed* ``gpu_fault``, which for the
+    release that first carries the sweep has no ``gpu_fault.compile_blocked``.
+    """
+
+    preflight = PROBES.probe_source("workflow_safety")
+    product = COMPILE_BLOCKED.read_text(encoding="utf-8")
+
+    for source, label in ((preflight, "probe"), (product, "product")):
+        assert "compile_blocked" in source, label
+        for guard in COMPILE_BLOCKED_GUARDS:
+            assert guard in source, f"{label} copy stopped reading {guard}"
+        assert "WorkflowStatus.BLOCKED" in source, label
+
+    assert "gpu_fault.compile_blocked" not in preflight.replace(
+        "``gpu_fault.compile_blocked", ""
+    ), (
+        "importing the product module would make the probe fail on exactly the "
+        "deployment that needs it -- the one that has not shipped the sweep yet"
+    )
+    assert "compile_blocked_count" in preflight
+
+
 def test_preflight_and_fleet_gate_require_verified_restore_evidence() -> None:
     # Both gates ship their program to the Pod as source, so the evidence they
     # demand is a property of the probe body, not of the engine module that

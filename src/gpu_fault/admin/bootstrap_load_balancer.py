@@ -13,6 +13,7 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
     assert_site_tag,
+    describe_or_absent,
     safe_name,
 )
 from gpu_fault.admin.bootstrap_services import (
@@ -201,29 +202,20 @@ def ensure_load_balancer_controller(
     _ensure_pod_identity_agent(runner, cpu, site_id)
     policy_name = safe_name(f"gpu-fault-{site_id}-lbc-policy", maximum=128)
     policy_arn = f"arn:aws:iam::{cpu.account_id}:policy/{policy_name}"
-    policy_exists = (
-        subprocess.run(
-            ["aws", "iam", "get-policy", "--policy-arn", policy_arn],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    # `get-policy` carries the policy's tags: one read decides both existence
+    # and ownership, and only NoSuchEntity reads as absent.
+    policy = describe_or_absent(
+        runner,
+        cpu.region,
+        "iam",
+        "get-policy",
+        "--policy-arn",
+        policy_arn,
+        not_found=("NoSuchEntity",),
     )
     policy_file = state_dir / "aws-load-balancer-controller-policy.json"
-    if policy_exists:
-        policy_tags = json.loads(
-            runner.run(
-                [
-                    "aws",
-                    "iam",
-                    "list-policy-tags",
-                    "--policy-arn",
-                    policy_arn,
-                    "--output",
-                    "json",
-                ]
-            )
-        ).get("Tags", [])
+    if policy is not None:
+        policy_tags = (policy.get("Policy") or {}).get("Tags", [])
         if not assert_site_tag(
             policy_tags,
             site_id=site_id,

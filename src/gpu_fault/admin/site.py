@@ -18,6 +18,7 @@ from gpu_fault.admin.config import (
 )
 from gpu_fault.admin.config_parser import boolean_field
 from gpu_fault.digests import SHA256_PATTERN
+from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
 SITE_API_VERSION = "gpu-fault.aws/v1alpha1"
 SITE_KIND = "RegionalSite"
@@ -132,6 +133,141 @@ def _text_list(
     if len(normalized) < minimum:
         raise SiteConfigError(f"{path} requires at least {minimum} value(s)")
     return normalized
+
+
+def _failure_domain_labels(value: object, path: str) -> tuple[str, ...]:
+    """Ordered node label keys, finest domain first; the default priority when absent.
+
+    Order is meaning here (the first label a node carries wins), so unlike the
+    other list fields this one is not sorted.
+    """
+
+    if value is None:
+        return FAILURE_DOMAIN_LABELS
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise SiteConfigError(f"{path} must be a list")
+    labels = tuple(
+        _required_text(item, f"{path}[]") for item in cast(Sequence[object], value)
+    )
+    if not labels:
+        raise SiteConfigError(f"{path} requires at least 1 value(s)")
+    if len(set(labels)) != len(labels):
+        raise SiteConfigError(f"{path} values must be unique")
+    for label in labels:
+        if not IDENTIFIER_PATTERN.fullmatch(label):
+            raise SiteConfigError(f"{path} contains an invalid label key: {label}")
+    return labels
+
+
+RETENTION_DAYS_ENV = "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS"
+RETENTION_ARCHIVE_URI_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI"
+RETENTION_INTERVAL_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS"
+S3_URI_PATTERN = re.compile(
+    r"^s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?P<prefix>/.*)?$"
+)
+
+
+def archive_s3_prefix_arn(uri: str) -> str:
+    """The object ARN pattern one ``s3://bucket/prefix`` archive URI covers."""
+
+    match = S3_URI_PATTERN.fullmatch(uri.strip())
+    if match is None:
+        raise SiteConfigError("archiveS3Uri must be an s3://bucket[/prefix] URI")
+    prefix = (match.group("prefix") or "").strip("/")
+    return f"arn:aws:s3:::{match.group('bucket')}/{prefix + '/' if prefix else ''}*"
+
+
+@dataclass(frozen=True)
+class RetentionSiteConfig:
+    """``spec.retention``: archive-first deletion of closed control records.
+
+    Absent means off: the runtime default for the retention days is ``0`` and
+    nothing is ever deleted. Turning it on is a site declaration followed by a
+    ``deploy --state-dir`` rerun, never a release change, so the operator
+    decision and the S3 destination sit in one reviewed file.
+    """
+
+    control_record_retention_days: int = 0
+    archive_s3_uri: str | None = None
+    archive_interval_seconds: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.control_record_retention_days > 0
+
+    @classmethod
+    def from_value(cls, value: object) -> RetentionSiteConfig:
+        if value is None:
+            return cls()
+        data = _mapping(
+            value,
+            "spec.retention",
+            allowed={
+                "controlRecordRetentionDays",
+                "archiveS3Uri",
+                "archiveIntervalSeconds",
+            },
+        )
+        days = _integer(
+            data.get("controlRecordRetentionDays"),
+            "spec.retention.controlRecordRetentionDays",
+            default=0,
+            minimum=0,
+            maximum=3650,
+        )
+        uri = _optional_text(data.get("archiveS3Uri"), "spec.retention.archiveS3Uri")
+        if uri is not None:
+            archive_s3_prefix_arn(uri)
+        elif days > 0:
+            raise SiteConfigError(
+                "spec.retention.archiveS3Uri is required when "
+                "controlRecordRetentionDays > 0: rows are archived before deletion"
+            )
+        interval = data.get("archiveIntervalSeconds")
+        return cls(
+            control_record_retention_days=days,
+            archive_s3_uri=uri,
+            archive_interval_seconds=(
+                None
+                if interval is None
+                else _integer(
+                    interval,
+                    "spec.retention.archiveIntervalSeconds",
+                    default=3600,
+                    minimum=60,
+                    maximum=86400 * 7,
+                )
+            ),
+        )
+
+    def as_release_config(self) -> dict[str, Any]:
+        return {
+            "control_record_retention_days": self.control_record_retention_days,
+            "archive_s3_uri": self.archive_s3_uri,
+            "archive_interval_seconds": self.archive_interval_seconds,
+        }
+
+    def environment(self) -> dict[str, str]:
+        """The worker variables, empty unless retention is on."""
+
+        if not self.enabled or self.archive_s3_uri is None:
+            return {}
+        values = {
+            RETENTION_DAYS_ENV: str(self.control_record_retention_days),
+            RETENTION_ARCHIVE_URI_ENV: self.archive_s3_uri,
+        }
+        if self.archive_interval_seconds is not None:
+            values[RETENTION_INTERVAL_ENV] = str(self.archive_interval_seconds)
+        return values
+
+
+def site_retention(site: Mapping[str, Any] | None) -> RetentionSiteConfig:
+    """``spec.retention`` of a raw site document, off when absent or unreadable."""
+
+    spec = site.get("spec") if isinstance(site, Mapping) else None
+    if not isinstance(spec, Mapping):
+        return RetentionSiteConfig()
+    return RetentionSiteConfig.from_value(spec.get("retention"))
 
 
 @dataclass(frozen=True)
@@ -620,6 +756,8 @@ class SiteSpec:
     health: HealthSiteConfig
     notifications: NotificationSiteConfig
     clusters: tuple[GpuClusterSiteConfig, ...]
+    failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
+    retention: RetentionSiteConfig = RetentionSiteConfig()
 
     @classmethod
     def from_value(cls, value: object) -> SiteSpec:
@@ -641,6 +779,8 @@ class SiteSpec:
                 "health",
                 "notifications",
                 "clusters",
+                "failureDomainLabels",
+                "retention",
             },
         )
         region = _required_text(data.get("awsRegion"), "spec.awsRegion")
@@ -705,6 +845,10 @@ class SiteSpec:
             health=health,
             notifications=NotificationSiteConfig.from_value(data.get("notifications")),
             clusters=clusters,
+            failure_domain_labels=_failure_domain_labels(
+                data.get("failureDomainLabels"), "spec.failureDomainLabels"
+            ),
+            retention=RetentionSiteConfig.from_value(data.get("retention")),
         )
 
 
@@ -907,6 +1051,8 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "role_sha256": admin_config.role_sha256(),
         },
         "clusters": clusters,
+        "failure_domain_labels": list(site.spec.failure_domain_labels),
+        "retention": site.spec.retention.as_release_config(),
     }
     image_values = {
         "GPU_FAULT_RUNTIME_IMAGE": site.spec.images.runtime,

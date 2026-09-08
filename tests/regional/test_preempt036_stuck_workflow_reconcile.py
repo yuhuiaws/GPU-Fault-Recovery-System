@@ -1,234 +1,134 @@
 """Unit tests for the GF-REGIONAL-PREEMPT-036 seeding and verdict module.
 
-The runner owns the throwaway database, the shipped-source subprocess and the
-evidence file. Everything decidable without those lives in
+The runner owns the throwaway database, the probe subprocesses and the evidence
+file. Everything decidable without those lives in
 ``scripts.e2e.regional.preempt036_verdicts`` and is tested here: the three stuck
-shapes are seeded against a real SqliteStore and driven through the real
-``workflow-reconcile`` plan/apply entry points, and every verdict function is
-also shown to fail on the drift it exists to catch.
+shapes are seeded against a real SqliteStore and swept by the product's own
+dispatcher, and every verdict function is also shown to fail on the drift it
+exists to catch.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import pytest
 
-from gpu_fault.admin.compile_blocked import (
-    apply_compile_blocked_plan,
-    build_compile_blocked_plan,
-)
-from gpu_fault.admin.orphaned_commands import (
-    apply_orphaned_commands_plan,
-    build_orphaned_commands_plan,
-)
-from gpu_fault.retired_generation import (
-    apply_retired_generation_plan,
-    build_retired_generation_plan,
-)
 from gpu_fault.store import SqliteStore
 from scripts.e2e.regional.preempt036_verdicts import (
-    CANCELLED_STATUS_SOURCE,
     CASE_ID,
-    CLUSTER_ID,
-    COMPILE_BLOCKED_MODE,
-    DRIFT_REFUSALS,
-    INELIGIBLE_REFUSALS,
-    MODES,
-    ORPHANED_COMMANDS_MODE,
-    REFERENCE,
-    RERUN_NO_OP,
-    RERUN_REFUSED,
-    RETIRED_GENERATION_MODE,
-    ModeSeed,
+    COMPILE_BLOCKED_SHAPE,
+    DISPATCHER_ACTOR,
+    ORPHANED_COMMANDS_SHAPE,
+    RETIRED_GENERATION_SHAPE,
+    SHAPES,
+    ShapeSeed,
     all_errors,
-    apply_errors,
     case_verdict,
     command_errors,
-    command_log_errors,
     command_snapshot,
     event_errors,
+    held_errors,
+    incident_errors,
+    incident_snapshot,
     open_command_errors,
-    plan_errors,
     record_errors,
-    refusal_errors,
     rerun_errors,
-    rerun_event_errors,
     safety_errors,
-    seed_mode,
-    shipped_source_errors,
+    seed_shape,
+    sweep,
     workflow_snapshot,
 )
 
-BUILDERS: Mapping[str, Callable[..., dict[str, Any]]] = {
-    COMPILE_BLOCKED_MODE: build_compile_blocked_plan,
-    ORPHANED_COMMANDS_MODE: build_orphaned_commands_plan,
-    RETIRED_GENERATION_MODE: build_retired_generation_plan,
-}
-APPLIERS: Mapping[str, Callable[..., dict[str, Any]]] = {
-    COMPILE_BLOCKED_MODE: apply_compile_blocked_plan,
-    ORPHANED_COMMANDS_MODE: apply_orphaned_commands_plan,
-    RETIRED_GENERATION_MODE: apply_retired_generation_plan,
-}
-TAMPERED_DIGEST = "0" * 64
+
+def _store(tmp_path: Any, shape: str) -> SqliteStore:
+    return SqliteStore(str(tmp_path / f"{shape}.db"))
 
 
-def _store(tmp_path: Any, mode: str) -> SqliteStore:
-    return SqliteStore(str(tmp_path / f"{mode}.db"))
+def _snapshots(store: Any, seed: ShapeSeed) -> dict[str, Any]:
+    return {
+        "workflows": workflow_snapshot(store, seed.workflow_ids),
+        "incidents": incident_snapshot(store, seed.incident_ids),
+        "commands": command_snapshot(store, seed.workflow_ids),
+    }
 
 
-ACTOR = "arn:aws:sts::123456789012:assumed-role/acceptance/operator"
-ADMIN_DIGEST = "a" * 64
+def _swept(tmp_path: Any, shape: str) -> tuple[Any, ShapeSeed, dict, dict, list]:
+    store = _store(tmp_path, shape)
+    seed = seed_shape(shape, store)
+    before = _snapshots(store, seed)
+    held = sweep(store, passes=seed.passes)
+    return store, seed, before, _snapshots(store, seed), held
 
 
-def _apply(mode: str, store: Any, seed: ModeSeed, digest: str) -> dict[str, Any]:
-    return APPLIERS[mode](
-        store,
-        workflow_ids=list(seed.actionable_ids),
-        expected_plan_sha256=digest,
-        reference=REFERENCE,
-        actor=ACTOR,
-        admin_plan_sha256=ADMIN_DIGEST,
-    )
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_seeded_plan_names_the_actionable_record_and_refuses_the_twin(
-    tmp_path: Any, mode: str
+@pytest.mark.parametrize("shape", SHAPES)
+def test_the_sweep_closes_the_record_and_leaves_live_work_alone(
+    tmp_path: Any, shape: str
 ) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
+    _store_, seed, before, after, held = _swept(tmp_path, shape)
 
-    plan = BUILDERS[mode](store, list(seed.workflow_ids))
-
-    assert plan_errors(plan, seed) == [], (
-        f"{mode}: the seeded store does not produce the plan the case asserts"
+    assert held_errors(held, seed) == [], f"{shape}: the held set is wrong"
+    assert record_errors(before["workflows"], after["workflows"], seed) == [], (
+        f"{shape}: the workflow records did not reach the promised state"
     )
-    assert set(seed.actionable_ids) & set(seed.refused_ids) == set(), (
-        f"{mode}: a record cannot be both actionable and refused"
+    assert incident_errors(before["incidents"], after["incidents"], seed) == [], (
+        f"{shape}: the incidents did not end as promised"
     )
-    assert set(seed.actionable_ids) | set(seed.refused_ids) == set(seed.workflow_ids), (
-        f"{mode}: the seed leaves a workflow neither actionable nor refused"
+    assert command_errors(before["commands"], after["commands"], seed) == [], (
+        f"{shape}: the remote commands did not reach the promised state"
     )
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_apply_over_the_ineligible_twin_is_refused_by_name(
-    tmp_path: Any, mode: str
+@pytest.mark.parametrize("shape", SHAPES)
+def test_every_written_record_is_attributed_to_the_dispatcher(
+    tmp_path: Any, shape: str
 ) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    plan = BUILDERS[mode](store, list(seed.workflow_ids))
+    _store_, seed, _before, after, _held = _swept(tmp_path, shape)
 
-    with pytest.raises(ValueError) as raised:
-        APPLIERS[mode](
-            store,
-            workflow_ids=list(seed.workflow_ids),
-            expected_plan_sha256=str(plan["plan_sha256"]),
-            reference=REFERENCE,
-        )
-
-    message = str(raised.value)
-    assert refusal_errors("ineligible", message, INELIGIBLE_REFUSALS[mode]) == [], (
-        f"{mode}: the refusal does not say the plan holds ineligible records"
+    assert event_errors(after["workflows"], seed) == [], (
+        f"{shape}: the audit trail is not what the shape promises"
     )
-    for request_id in seed.refused_ids:
-        assert (
-            refusal_errors(request_id, message, seed.refusal_substrings[request_id])
-            == []
-        ), f"{mode}: the refusal does not give {request_id} its own reason"
 
 
-@pytest.mark.parametrize("mode", MODES)
-def test_apply_bound_to_a_tampered_plan_digest_is_refused(
-    tmp_path: Any, mode: str
+@pytest.mark.parametrize("shape", SHAPES)
+def test_one_more_pass_changes_nothing(tmp_path: Any, shape: str) -> None:
+    store, seed, _before, settled, _held = _swept(tmp_path, shape)
+
+    sweep(store, passes=1)
+
+    assert rerun_errors(settled, _snapshots(store, seed)) == [], (
+        f"{shape}: the sweep is not idempotent on this shape"
+    )
+
+
+def test_only_the_retired_generation_needs_two_passes_and_holds_one_for_a_human(
+    tmp_path: Any,
 ) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    BUILDERS[mode](store, list(seed.actionable_ids))
+    seeds = {shape: seed_shape(shape, _store(tmp_path, shape)) for shape in SHAPES}
 
-    with pytest.raises(ValueError) as raised:
-        _apply(mode, store, seed, TAMPERED_DIGEST)
-
-    assert (
-        refusal_errors("tampered plan", str(raised.value), DRIFT_REFUSALS[mode]) == []
-    ), f"{mode}: a tampered plan digest was not refused as plan drift"
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_apply_closes_the_record_and_leaves_live_work_alone(
-    tmp_path: Any, mode: str
-) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    plan = BUILDERS[mode](store, list(seed.actionable_ids))
-    digest = str(plan["plan_sha256"])
-    commands_before = command_snapshot(store, seed.workflow_ids)
-
-    result = _apply(mode, store, seed, digest)
-
-    assert apply_errors(result, seed, approved_plan_sha256=digest) == [], (
-        f"{mode}: the apply result does not match the approved plan"
-    )
-    assert record_errors(workflow_snapshot(store, seed.statuses_after), seed) == [], (
-        f"{mode}: the workflow records did not reach the promised state"
-    )
-    assert (
-        command_errors(
-            commands_before, command_snapshot(store, seed.workflow_ids), seed
-        )
-        == []
-    ), f"{mode}: the remote commands did not reach the promised state"
-
-
-@pytest.mark.parametrize("mode", MODES)
-def test_rerunning_the_same_reconcile_changes_nothing(tmp_path: Any, mode: str) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    digest = str(BUILDERS[mode](store, list(seed.actionable_ids))["plan_sha256"])
-    _apply(mode, store, seed, digest)
-
-    rerun_plan = BUILDERS[mode](store, list(seed.actionable_ids))
-    rerun_result: dict[str, Any] | None = None
-    output = ""
-    if seed.rerun_contract == RERUN_REFUSED:
-        with pytest.raises(ValueError) as raised:
-            _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
-        output = str(raised.value)
-    else:
-        rerun_result = _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
-
-    assert (
-        rerun_errors(seed, plan=rerun_plan, result=rerun_result, output=output) == []
-    ), f"{mode}: the second reconcile pass did not honour this mode's contract"
-    assert record_errors(workflow_snapshot(store, seed.statuses_after), seed) == [], (
-        f"{mode}: the second pass moved a record that was already settled"
+    assert {shape: seed.passes for shape, seed in seeds.items()} == {
+        COMPILE_BLOCKED_SHAPE: 1,
+        ORPHANED_COMMANDS_SHAPE: 1,
+        RETIRED_GENERATION_SHAPE: 2,
+    }
+    assert seeds[RETIRED_GENERATION_SHAPE].held_after == ("p036rg-mutated",), (
+        "the generation that already reset a GPU must stay held for an operator"
     )
 
 
-def test_only_orphaned_commands_refuses_its_own_rerun() -> None:
-    contracts = {mode: seed_contract(mode) for mode in MODES}
+def test_the_retired_generation_writes_no_operator_event(tmp_path: Any) -> None:
+    seeds = {shape: seed_shape(shape, _store(tmp_path, shape)) for shape in SHAPES}
 
-    assert contracts == {
-        COMPILE_BLOCKED_MODE: RERUN_NO_OP,
-        ORPHANED_COMMANDS_MODE: RERUN_REFUSED,
-        RETIRED_GENERATION_MODE: RERUN_NO_OP,
-    }, "the per-mode rerun contracts drifted from what the reconcile code does"
-
-
-def seed_contract(mode: str) -> str:
-    """The rerun contract a mode declares, read without touching a store."""
-
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as directory:
-        store = SqliteStore(f"{directory}/{mode}.db")
-        return seed_mode(mode, store).rerun_contract
+    assert {shape: seed.event_kind for shape, seed in seeds.items()} == {
+        COMPILE_BLOCKED_SHAPE: "OPERATOR_RECONCILED",
+        ORPHANED_COMMANDS_SHAPE: "OPERATOR_RECONCILED",
+        RETIRED_GENERATION_SHAPE: None,
+    }, "the per-shape audit contracts drifted from what the sweeps do"
 
 
-def test_seed_mode_refuses_an_unknown_mode(tmp_path: Any) -> None:
-    with pytest.raises(ValueError, match="unsupported workflow-reconcile mode"):
-        seed_mode("restore", SqliteStore(str(tmp_path / "unknown.db")))
+def test_seed_shape_refuses_an_unknown_shape(tmp_path: Any) -> None:
+    with pytest.raises(ValueError, match="unsupported stuck-workflow shape"):
+        seed_shape("restore", SqliteStore(str(tmp_path / "unknown.db")))
 
 
 def test_case_id_matches_the_catalog_entry() -> None:
@@ -237,522 +137,248 @@ def test_case_id_matches_the_catalog_entry() -> None:
     )
 
 
-def _seed(tmp_path: Any, mode: str) -> ModeSeed:
-    return seed_mode(mode, _store(tmp_path, mode))
+def test_seed_identifiers_carry_the_case_number(tmp_path: Any) -> None:
+    for shape in SHAPES:
+        seed = seed_shape(shape, _store(tmp_path, shape))
+        for request_id in (*seed.workflow_ids, *seed.incident_ids):
+            assert request_id.startswith("p036"), request_id
 
 
-def test_plan_errors_reports_a_missing_digest_and_an_unplanned_record(
+# --------------------------------------------------------------------------- #
+# Each verdict fails on the drift it exists to catch
+# --------------------------------------------------------------------------- #
+def test_record_errors_reports_a_status_a_missing_audit_and_a_moved_twin(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-
-    errors = plan_errors({"mode": seed.plan_mode, "items": []}, seed)
-
-    assert any("sha256" in error for error in errors), (
-        "a plan without a digest must be reported"
-    )
-    assert any("plan covers" in error for error in errors), (
-        "a plan that skips the seeded records must be reported"
-    )
-
-
-def test_plan_errors_reports_an_eligibility_flag_that_flipped(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    refused = seed.refused_ids[0]
-    plan = {
-        "mode": seed.plan_mode,
-        "plan_sha256": "a" * 64,
-        "items": [
-            {"request_id": request_id, "eligible": True, "reasons": []}
-            for request_id in seed.workflow_ids
-        ],
+    _store_, seed, before, after, _held = _swept(tmp_path, COMPILE_BLOCKED_SHAPE)
+    drifted = {
+        key: dict(value, status="BLOCKED", preemption_reason="")
+        if key == "p036cb-blocked"
+        else dict(value, fencing_token=99)
+        for key, value in after["workflows"].items()
     }
 
-    errors = plan_errors(plan, seed)
+    errors = record_errors(before["workflows"], drifted, seed)
 
-    assert any(error.startswith(f"{refused}: plan eligible") for error in errors), (
-        "a plan that calls the ineligible twin eligible must be reported"
-    )
-    assert any(
-        error.startswith(f"{refused}: reasons do not name") for error in errors
-    ), "a plan that drops the twin's refusal reason must be reported"
-
-
-def test_plan_errors_reports_reasons_on_a_record_that_must_have_none(
-    tmp_path: Any,
-) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    actionable = seed.actionable_ids[0]
-    plan = {
-        "mode": seed.plan_mode,
-        "plan_sha256": "a" * 64,
-        "items": [
-            {
-                "request_id": request_id,
-                **dict(seed.plan_flags.get(request_id) or {}),
-                "reasons": ["unexpected"],
-            }
-            for request_id in seed.workflow_ids
-        ],
-    }
-
-    errors = plan_errors(plan, seed)
-
-    assert any(
-        error.startswith(f"{actionable}: item was expected to carry no reasons")
-        for error in errors
-    ), "reasons on a record the plan must apply cleanly have to be reported"
-
-
-def test_refusal_errors_needs_a_configured_substring() -> None:
-    assert refusal_errors("rerun", "anything", "") == [
-        "rerun: no refusal substring was configured"
-    ], "an unconfigured refusal must not silently pass"
-    assert refusal_errors("rerun", "boom", "boom") == [], (
-        "a refusal that names the expected reason must pass"
-    )
-
-
-def test_apply_errors_reports_an_unbound_digest_and_a_deletion(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    result = {
-        "mode": seed.apply_mode,
-        "reference": REFERENCE,
-        "applied_workflow_ids": list(seed.actionable_ids),
-        "records_deleted": 1,
-        seed.approved_digest_field: TAMPERED_DIGEST,
-        "settled_plan_sha256": TAMPERED_DIGEST,
-    }
-
-    errors = apply_errors(result, seed, approved_plan_sha256="b" * 64)
-
-    assert any("records" in error for error in errors), (
-        "an apply that deleted a record must be reported; reconcile never deletes"
-    )
-    assert any(seed.approved_digest_field in error for error in errors), (
-        "an apply bound to a digest the operator never approved must be reported"
-    )
-
-
-def test_apply_errors_reports_a_wider_change_than_the_plan(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    digest = "c" * 64
-    result = {
-        "mode": seed.apply_mode,
-        "reference": REFERENCE,
-        "applied_workflow_ids": [*seed.actionable_ids, *seed.refused_ids],
-        "records_deleted": 0,
-        seed.approved_digest_field: digest,
-        "settled_plan_sha256": digest,
-    }
-
-    errors = apply_errors(result, seed, approved_plan_sha256=digest)
-
-    assert any("apply changed" in error for error in errors), (
-        "an apply that touched the refused twin must be reported"
-    )
-
-
-@pytest.mark.parametrize("mode", [ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE])
-def test_apply_errors_reports_a_cancelling_mode_that_omits_its_cancel_counters(
-    tmp_path: Any, mode: str
-) -> None:
-    seed = _seed(tmp_path, mode)
-    digest = "e" * 64
-    result = {
-        "mode": seed.apply_mode,
-        "reference": REFERENCE,
-        "applied_workflow_ids": list(seed.actionable_ids),
-        "records_deleted": 0,
-        seed.approved_digest_field: digest,
-        "settled_plan_sha256": digest if not seed.settled_digest_differs else "f" * 64,
-    }
-
-    errors = apply_errors(result, seed, approved_plan_sha256=digest)
-
-    assert any("no cancelled_remote_commands" in error for error in errors), (
-        f"{mode}: an apply that reports no cancel counters used to pass unjudged"
-    )
-    counted = {
-        **result,
-        "cancelled_remote_commands": {
-            request_id: {"cancelled": 1} for request_id in seed.actionable_ids
-        },
-    }
-    assert not any(
-        "cancelled_remote_commands" in error
-        for error in apply_errors(counted, seed, approved_plan_sha256=digest)
-    ), f"{mode}: an apply that reports its cancel counters must not be faulted"
-
-
-def test_compile_blocked_apply_needs_no_cancel_counters(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    digest = "e" * 64
-    result = {
-        "mode": seed.apply_mode,
-        "reference": REFERENCE,
-        "applied_workflow_ids": list(seed.actionable_ids),
-        "records_deleted": 0,
-        seed.approved_digest_field: digest,
-        "settled_plan_sha256": digest,
-    }
-
-    assert apply_errors(result, seed, approved_plan_sha256=digest) == []
-
-
-def test_shipped_source_is_judged_not_merely_recorded() -> None:
-    good = {
-        "starts_with_module_source": True,
-        "script_sha256": "a" * 64,
-        "module_sha256": "b" * 64,
-        "driver_sha256": "c" * 64,
-    }
-    assert shipped_source_errors(good) == []
-
-    drifted = {**good, "starts_with_module_source": False}
-    assert shipped_source_errors(drifted) == [
-        "the executed script does not start with the shipped module source"
-    ]
-    assert any(
-        "driver_sha256" in error
-        for error in shipped_source_errors({**good, "driver_sha256": ""})
-    ), "a missing driver digest must be reported"
-    assert case_verdict({"shipped_source": shipped_source_errors(drifted)}) == "FAIL"
-
-
-def test_seed_identifiers_carry_the_case_number() -> None:
-    assert "p036" in CLUSTER_ID and "p035" not in CLUSTER_ID, (
-        "the seeds still carried the pre-renumbering p035 identifiers"
-    )
-
-
-def test_apply_errors_reports_a_second_pass_digest_that_did_not_move(
-    tmp_path: Any,
-) -> None:
-    seed = _seed(tmp_path, RETIRED_GENERATION_MODE)
-    digest = "d" * 64
-    result = {
-        "mode": seed.apply_mode,
-        "reference": REFERENCE,
-        "applied_workflow_ids": list(seed.actionable_ids),
-        "records_deleted": 0,
-        seed.approved_digest_field: digest,
-        "settled_plan_sha256": digest,
-    }
-
-    errors = apply_errors(result, seed, approved_plan_sha256=digest)
-
-    assert seed.settled_digest_differs is True, (
-        "retired-generation settles a second-pass digest, so it must differ"
-    )
-    assert any("cancel pass" in error for error in errors), (
-        "a retired-generation apply whose cancel pass changed nothing must be reported"
-    )
-
-
-def test_record_errors_reports_a_status_and_a_missing_audit_reference(
-    tmp_path: Any,
-) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    closed = seed.actionable_ids[0]
-    snapshot = {
-        request_id: {
-            "status": "RUNNING",
-            "preemption_reason": "",
-            "preempted_by_workflow_id": None,
-            "execution_owner_id": None,
-        }
-        for request_id in seed.statuses_after
-    }
-
-    errors = record_errors(snapshot, seed)
-
-    assert any(error.startswith(f"{closed}: status is") for error in errors), (
-        "a record that never left RUNNING must be reported"
-    )
-    assert any(error.startswith(f"{closed}: preemption_reason") for error in errors), (
-        "a closed record with no audit prose must be reported"
-    )
+    assert any("status is 'BLOCKED'" in error for error in errors), errors
+    assert any("preemption_reason does not carry" in error for error in errors), errors
+    assert any("untouched record changed" in error for error in errors), errors
 
 
 def test_record_errors_reports_a_revoked_record_that_kept_its_owner(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, RETIRED_GENERATION_MODE)
-    revoked = next(iter(seed.preempted_by))
-    snapshot = {
-        request_id: {
-            "status": seed.statuses_after[request_id],
-            "preemption_reason": " ".join(seed.reason_substrings.get(request_id) or ()),
-            "preempted_by_workflow_id": seed.preempted_by.get(request_id),
-            "execution_owner_id": "p036-executor-a",
-        }
-        for request_id in seed.statuses_after
+    _store_, seed, before, after, _held = _swept(tmp_path, RETIRED_GENERATION_SHAPE)
+    drifted = dict(after["workflows"])
+    drifted["p036rg-retired"] = dict(
+        drifted["p036rg-retired"],
+        execution_owner_id="p036-executor-a",
+        preempted_by_workflow_id=None,
+    )
+
+    errors = record_errors(before["workflows"], drifted, seed)
+
+    assert any("still holds an owner" in error for error in errors), errors
+    assert any("preempted_by_workflow_id is None" in error for error in errors), errors
+
+
+def test_incident_errors_reports_a_moved_incident_and_a_missing_audit_line(
+    tmp_path: Any,
+) -> None:
+    _store_, seed, before, after, _held = _swept(tmp_path, RETIRED_GENERATION_SHAPE)
+    drifted = {
+        key: dict(value, reasons=[], workflow_request_id="somebody-else")
+        for key, value in after["incidents"].items()
     }
 
-    errors = record_errors(snapshot, seed)
+    errors = incident_errors(before["incidents"], drifted, seed)
 
-    assert [f"{revoked}: revoked record still holds an owner"] == errors, (
-        "a revoked generation that kept its execution owner can still dispatch"
+    assert any("do not carry" in error for error in errors), errors
+    assert any("moved incident workflow_request_id" in error for error in errors), (
+        errors
     )
+
+    _store2, seed2, before2, after2, _held2 = _swept(tmp_path, COMPILE_BLOCKED_SHAPE)
+    touched = {
+        key: dict(value, reasons=[*value["reasons"], "x"])
+        for key, value in after2["incidents"].items()
+    }
+    assert any(
+        "incident changed" in error
+        for error in incident_errors(before2["incidents"], touched, seed2)
+    ), "a shape that does not write the incident must notice when one moved"
+
+
+def test_event_errors_reports_a_wrong_actor_a_missing_detail_and_a_stray_event(
+    tmp_path: Any,
+) -> None:
+    _store_, seed, _before, after, _held = _swept(tmp_path, ORPHANED_COMMANDS_SHAPE)
+    drifted = dict(after["workflows"])
+    (event,) = drifted["p036oc-failed"]["events"]
+    drifted["p036oc-failed"] = dict(
+        drifted["p036oc-failed"],
+        events=[
+            dict(
+                event,
+                actor="arn:aws:sts::1:assumed-role/x",
+                details={**event["details"], "command_ids": []},
+            )
+        ],
+    )
+    drifted["p036oc-running"] = dict(
+        drifted["p036oc-running"], events=[dict(event, actor=DISPATCHER_ACTOR)]
+    )
+
+    errors = event_errors(drifted, seed)
+
+    assert any("event actor is" in error for error in errors), errors
+    assert any("event command_ids is []" in error for error in errors), errors
+    assert any("untouched record carries 1" in error for error in errors), errors
+
+
+def test_event_errors_reports_a_closed_record_with_no_event(tmp_path: Any) -> None:
+    _store_, seed, _before, after, _held = _swept(tmp_path, COMPILE_BLOCKED_SHAPE)
+    silent = {key: dict(value, events=[]) for key, value in after["workflows"].items()}
+
+    assert event_errors(silent, seed) == [
+        "p036cb-blocked: 0 OPERATOR_RECONCILED event(s), expected exactly 1"
+    ]
 
 
 def test_command_errors_reports_a_wrong_status_source_and_a_live_command(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, ORPHANED_COMMANDS_MODE)
-    orphan = seed.cancelled_command_ids[0]
-    live = seed.untouched_command_ids[0]
-    before = {live: {"status": "WAITING", "lease_owner": None}}
-    after = {
-        orphan: {
-            "status": "FAILED",
-            "status_source": "node-agent",
-            "error": f"operator reconciliation {REFERENCE}",
-            "lease_owner": None,
-        },
-        live: {"status": "FAILED", "lease_owner": None},
-    }
-
-    errors = command_errors(before, after, seed)
-
-    assert any(error.startswith(f"{orphan}: status_source") for error in errors), (
-        "an orphan failed by something other than "
-        f"{CANCELLED_STATUS_SOURCE!r} must be reported"
+    _store_, seed, before, after, _held = _swept(tmp_path, ORPHANED_COMMANDS_SHAPE)
+    drifted = dict(after["commands"])
+    drifted["p036oc-command-orphan"] = dict(
+        drifted["p036oc-command-orphan"],
+        status_source="agent",
+        error="",
+        lease_owner="still-here",
     )
-    assert any(error.startswith(f"{live}: live command changed") for error in errors), (
-        "cancelling the live workflow's command must be reported"
+    drifted["p036oc-command-live"] = dict(
+        drifted["p036oc-command-live"], status="FAILED"
     )
 
+    errors = command_errors(before["commands"], drifted, seed)
 
-def test_command_errors_reports_a_cancelled_command_that_kept_its_lease(
+    assert any("status_source is 'agent'" in error for error in errors), errors
+    assert any("error does not carry" in error for error in errors), errors
+    assert any("still holds a lease" in error for error in errors), errors
+    assert any("live command changed" in error for error in errors), errors
+
+
+def test_held_errors_reports_a_wrong_pass_count_and_a_released_operator_record(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, ORPHANED_COMMANDS_MODE)
-    orphan = seed.cancelled_command_ids[0]
-    after = {
-        orphan: {
-            "status": "FAILED",
-            "status_source": CANCELLED_STATUS_SOURCE,
-            "error": f"operator reconciliation {REFERENCE}: cancelled",
-            "lease_owner": "p036-node-agent",
-        }
-    }
+    seed = seed_shape(RETIRED_GENERATION_SHAPE, _store(tmp_path, "rg"))
 
-    errors = command_errors({}, after, seed)
-
-    assert errors == [f"{orphan}: cancelled command still holds a lease"], (
-        "a cancelled command that kept its lease can still be executed"
-    )
+    assert held_errors([[]], seed) == ["sweep ran 1 pass(es), expected 2"]
+    assert held_errors([["p036rg-retired", "p036rg-mutated"], []], seed) == [
+        "the last pass still holds [], expected ['p036rg-mutated']"
+    ]
 
 
 def test_safety_errors_reports_a_blocker_that_did_not_clear(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
+    seed = seed_shape(RETIRED_GENERATION_SHAPE, _store(tmp_path, "rg"))
     before = {
-        "blockers": list(seed.blockers_before),
-        "blocker_count": len(seed.blockers_before),
-        "resolved_blocked": list(seed.resolved_blocked),
+        "blockers": ["p036rg-current", "p036rg-mutated", "p036rg-retired"],
+        "blocker_count": 3,
+        "resolved_blocked": [],
+        "resolved_blocked_count": 0,
+        "compile_blocked": [],
+        "compile_blocked_count": 0,
     }
+    after = dict(before)
 
-    errors = safety_errors(before, before, seed)
+    errors = safety_errors(before, after, seed)
 
-    assert any("blockers after the apply" in error for error in errors), (
-        "a release preflight that still names the closed record must be reported"
-    )
-
-
-def test_safety_errors_accepts_blockers_that_must_survive(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, RETIRED_GENERATION_MODE)
-    before = {
-        "blockers": list(seed.blockers_before),
-        "blocker_count": len(seed.blockers_before),
-        "resolved_blocked": list(seed.resolved_blocked),
-    }
-    after = {
-        "blockers": list(seed.blockers_after),
-        "blocker_count": len(seed.blockers_after),
-        "resolved_blocked": list(seed.resolved_blocked),
-    }
-
-    assert safety_errors(before, after, seed) == [], (
-        "the live successor and the human-owned record are blockers before and after"
-    )
-    assert seed.blockers_after, (
-        "retired-generation must not claim it cleared the running successor"
-    )
+    assert errors == [
+        "blockers after are ['p036rg-current', 'p036rg-mutated', 'p036rg-retired'], "
+        "expected ['p036rg-current', 'p036rg-mutated']"
+    ]
 
 
-def test_safety_errors_reports_a_count_that_disagrees_with_the_list(
+def test_safety_errors_accepts_blockers_that_must_survive_and_counts_that_agree(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
+    seed = seed_shape(ORPHANED_COMMANDS_SHAPE, _store(tmp_path, "oc"))
+    snapshot = {
+        "blockers": ["p036oc-running"],
+        "blocker_count": 1,
+        "resolved_blocked": [],
+        "resolved_blocked_count": 0,
+        "compile_blocked": [],
+        "compile_blocked_count": 0,
+    }
+
+    assert safety_errors(snapshot, snapshot, seed) == []
+
+
+def test_safety_errors_reports_a_compile_blocked_record_the_probe_still_counts(
+    tmp_path: Any,
+) -> None:
+    seed = seed_shape(COMPILE_BLOCKED_SHAPE, _store(tmp_path, "cb"))
     before = {
-        "blockers": list(seed.blockers_before),
-        "blocker_count": 99,
-        "resolved_blocked": list(seed.resolved_blocked),
+        "blockers": ["p036cb-blocked"],
+        "blocker_count": 1,
+        "resolved_blocked": ["p036cb-restore-twin"],
+        "resolved_blocked_count": 1,
+        "compile_blocked": [],
+        "compile_blocked_count": 1,
     }
     after = {
-        "blockers": list(seed.blockers_after),
-        "blocker_count": len(seed.blockers_after),
-        "resolved_blocked": list(seed.resolved_blocked),
+        "blockers": [],
+        "blocker_count": 0,
+        "resolved_blocked": ["p036cb-restore-twin"],
+        "resolved_blocked_count": 1,
+        "compile_blocked": [],
+        "compile_blocked_count": 0,
     }
 
     errors = safety_errors(before, after, seed)
 
-    assert any("blocker_count before" in error for error in errors), (
-        "a probe whose count disagrees with its own list must be reported"
+    assert any("blockers before are ['p036cb-blocked']" in error for error in errors), (
+        errors
     )
+    assert any("compile_blocked before are []" in error for error in errors), errors
+    assert any(
+        "compile_blocked_count before is 1 for 0" in error for error in errors
+    ), errors
 
 
 def test_open_command_errors_reports_a_counter_that_did_not_drop(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, ORPHANED_COMMANDS_MODE)
-    stats = {"by_status": {"WAITING": 2, "PENDING": 0, "LEASED": 0}}
+    seed = seed_shape(ORPHANED_COMMANDS_SHAPE, _store(tmp_path, "oc"))
+    stats = {"by_status": {"PENDING": 0, "LEASED": 0, "WAITING": 2}}
 
-    assert open_command_errors(stats, stats, seed) != [], (
-        "a release gate counter that never dropped must be reported"
-    )
-    assert (
-        open_command_errors(
-            stats, {"by_status": {"WAITING": 1, "PENDING": 0, "LEASED": 0}}, seed
-        )
-        == []
-    ), "one orphan cancelled must drop the open-command counter by exactly one"
-
-
-def test_open_command_errors_refuses_stats_without_by_status(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, ORPHANED_COMMANDS_MODE)
-
+    assert open_command_errors(stats, stats, seed) == [
+        "open remote commands dropped by 0, expected 1"
+    ]
     with pytest.raises(ValueError, match="by_status"):
-        open_command_errors({"total": 2}, {"total": 1}, seed)
+        open_command_errors({}, stats, seed)
 
 
-def test_rerun_errors_reports_a_second_apply_that_changed_a_record(
+def test_rerun_errors_reports_a_second_pass_that_changed_a_record(
     tmp_path: Any,
 ) -> None:
-    seed = _seed(tmp_path, COMPILE_BLOCKED_MODE)
-    plan = {
-        "items": [
-            {"request_id": request_id, "already_closed": True}
-            for request_id in seed.actionable_ids
-        ]
-    }
-    result = {
-        "applied_workflow_ids": list(seed.actionable_ids),
-        "already_closed_workflow_ids": list(seed.actionable_ids),
+    _store_, _seed, _before, settled, _held = _swept(tmp_path, COMPILE_BLOCKED_SHAPE)
+    rerun = {
+        **settled,
+        "workflows": {
+            key: dict(value, events=[*value["events"], {"kind": "OPERATOR_RECONCILED"}])
+            for key, value in settled["workflows"].items()
+        },
     }
 
-    errors = rerun_errors(seed, plan=plan, result=result, output="")
+    errors = rerun_errors(settled, rerun)
 
-    assert any("a second time" in error for error in errors), (
-        "a rerun that wrote the record again must be reported"
-    )
-
-
-def test_rerun_errors_reports_a_missing_refusal(tmp_path: Any) -> None:
-    seed = _seed(tmp_path, ORPHANED_COMMANDS_MODE)
-
-    errors = rerun_errors(seed, plan=None, result=None, output="something else")
-
-    assert errors == [
-        f"rerun: refusal does not name {seed.rerun_refusal!r}, got 'something else'"
-    ], "orphaned-commands must refuse its own rerun by name"
+    assert len(errors) == len(settled["workflows"])
+    assert all("workflows: the rerun changed" in error for error in errors), errors
 
 
 def test_verdict_and_error_aggregation_are_stage_ordered() -> None:
-    stages = {"plan": [], "apply": ["b", "a"], "records": ["c"]}
+    stages = {"records": ["b"], "audit_events": [], "commands": ["a"]}
 
-    assert case_verdict(stages) == "FAIL", "any stage error must fail the case"
-    assert case_verdict({"plan": [], "apply": []}) == "PASS", (
-        "an empty stage set must pass"
-    )
-    assert all_errors(stages) == ["apply: b", "apply: a", "records: c"], (
-        "aggregated errors must name their stage in stage order"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# ARCH-I1: the operator write is attributed
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("mode", MODES)
-def test_apply_attributes_every_written_record_to_the_operator(
-    tmp_path: Any, mode: str
-) -> None:
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    digest = str(BUILDERS[mode](store, list(seed.actionable_ids))["plan_sha256"])
-
-    _apply(mode, store, seed, digest)
-    after = workflow_snapshot(store, seed.workflow_ids)
-
-    assert (
-        event_errors(
-            after,
-            seed,
-            actor=ACTOR,
-            admin_plan_sha256=ADMIN_DIGEST,
-            approved_plan_sha256=digest,
-        )
-        == []
-    ), f"{mode}: the written records do not carry the attributed operator event"
-    rerun_plan = BUILDERS[mode](store, list(seed.actionable_ids))
-    if seed.rerun_contract == RERUN_REFUSED:
-        with pytest.raises(ValueError):
-            _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
-    else:
-        _apply(mode, store, seed, str(rerun_plan["plan_sha256"]))
-    assert (
-        rerun_event_errors(after, workflow_snapshot(store, seed.workflow_ids), seed)
-        == []
-    ), f"{mode}: a no-op or refused rerun appended an operator event"
-
-
-def test_event_errors_reports_an_unknown_actor_a_wrong_digest_and_a_stray_event(
-    tmp_path: Any,
-) -> None:
-    mode = COMPILE_BLOCKED_MODE
-    store = _store(tmp_path, mode)
-    seed = seed_mode(mode, store)
-    digest = str(BUILDERS[mode](store, list(seed.actionable_ids))["plan_sha256"])
-    result = APPLIERS[mode](
-        store,
-        workflow_ids=list(seed.actionable_ids),
-        expected_plan_sha256=digest,
-        reference=REFERENCE,
-    )
-    assert result["applied_workflow_ids"], result
-    after = workflow_snapshot(store, seed.workflow_ids)
-
-    errors = event_errors(
-        after,
-        seed,
-        actor="unknown-identity",
-        admin_plan_sha256=ADMIN_DIGEST,
-        approved_plan_sha256=digest,
-    )
-    joined = "\n".join(errors)
-    assert "event actor is" in joined, errors
-    assert "admin_plan_sha256" in joined, errors
-
-    stray = dict(after)
-    stray[seed.refused_ids[0]] = {
-        **after[seed.refused_ids[0]],
-        "events": [{"kind": "x"}],
-    }
-    assert "a refused record carries 1 operator event" in "\n".join(
-        event_errors(
-            stray,
-            seed,
-            actor=ACTOR,
-            admin_plan_sha256=ADMIN_DIGEST,
-            approved_plan_sha256=digest,
-        )
-    )
-
-
-def test_command_log_errors_requires_the_mutating_directory(tmp_path: Any) -> None:
-    state_dir = tmp_path / "state"
-    good = state_dir / "logs" / "mutating" / "20300101T000000Z-workflow-reconcile.log"
-    assert command_log_errors(good, state_dir=state_dir) == []
-    flat = state_dir / "logs" / "workflow-reconcile.log"
-    assert "is not under" in "\n".join(command_log_errors(flat, state_dir=state_dir))
-    assert "was not opened" in "\n".join(command_log_errors(None, state_dir=state_dir))
+    assert case_verdict(stages) == "FAIL"
+    assert case_verdict({"records": [], "commands": []}) == "PASS"
+    assert all_errors(stages) == ["commands: a", "records: b"]

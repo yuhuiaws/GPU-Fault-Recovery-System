@@ -1,35 +1,49 @@
+"""``gpu-fault-admin workflow-reconcile``: close BLOCKED records a later workflow restored.
+
+One shape, one command. A workflow that is BLOCKED and never changed a node --
+or whose incident a *later* workflow already recovered and whose node a
+``RESTORE_SCHEDULING`` already put back -- is paperwork the runtime cannot
+close on its own, because the proof needs node evidence the control plane does
+not hold: the GPU node carries no cordon, no quarantine taint and no gpu-fault
+isolation annotation. This module reads that evidence through the site's own
+GPU kubeconfig and hands the verdict to ``gpu_fault.workflow_reconcile`` in the
+CPU ingress Pod.
+
+The other three shapes the command used to take modes for are closed by the
+dispatcher's periodic sweep now (``WorkflowDispatcher.sweep_stuck_records``):
+retired generations, compile-time BLOCKED no-ops (``gpu_fault.compile_blocked``)
+and remote commands a terminal workflow left open
+(``gpu_fault.orphaned_commands``). Every live use of those modes had been to
+unblock a release preflight, and every condition they checked was a Store
+predicate.
+
+One invocation plans and applies. The plan is built in the Pod, extended here
+with the site identity and the node evidence, re-built immediately before the
+apply and compared field by field (``_plan_drift``); the apply carries the
+runtime digest, the admin digest and the operator's STS identity, and the Pod
+puts all three on the workflow's ``OPERATOR_RECONCILED`` event. ``--dry-run``
+prints the plan and writes nothing, on the Pod or on disk. Without it the plan
+and the result are archived under ``workflow-reconcile/history/<digest>/``.
+Nothing is ever deleted: ``records_deleted`` is always 0.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
 from gpu_fault import retired_generation
-from gpu_fault.admin import compile_blocked, operator_identity, orphaned_commands
+from gpu_fault.admin import operator_identity
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
-from gpu_fault.digests import SHA256_PATTERN
 
 REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
-RECONCILE_MODES = (
-    "restore",
-    "retired-generation",
-    "compile-blocked",
-    "orphaned-commands",
-)
-PLAN_PATH = Path("workflow-reconcile/plan.json")
 HISTORY_PATH = Path("workflow-reconcile/history")
-RETIRED_GENERATION_PLAN_PATH = Path("workflow-reconcile/retired-generation/plan.json")
-RETIRED_GENERATION_HISTORY_PATH = Path("workflow-reconcile/retired-generation/history")
-COMPILE_BLOCKED_PLAN_PATH = Path("workflow-reconcile/compile-blocked/plan.json")
-COMPILE_BLOCKED_HISTORY_PATH = Path("workflow-reconcile/compile-blocked/history")
-ORPHANED_COMMANDS_PLAN_PATH = Path("workflow-reconcile/orphaned-commands/plan.json")
-ORPHANED_COMMANDS_HISTORY_PATH = Path("workflow-reconcile/orphaned-commands/history")
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 ISOLATION_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
@@ -57,7 +71,7 @@ if payload["mode"] == "plan":
     # against a deployed image whose planner predates them.
     options = {
         key: payload[key]
-        for key in ("incident_ids", "blocked_kinds", "max_items")
+        for key in ("incident_ids", "max_items")
         if payload.get(key) is not None
     }
     result = build_workflow_reconcile_plan(
@@ -96,128 +110,6 @@ else:
     raise ValueError("unsupported workflow reconcile mode")
 print(json.dumps(result, sort_keys=True))
 """
-RETIRED_GENERATION_DRIVER = """
-
-import json as _json
-import sys as _sys
-
-from gpu_fault.app import ApplicationContext
-
-_payload = _json.load(_sys.stdin)
-_store = ApplicationContext.from_environment().store
-if _payload["mode"] == "plan":
-    _result = build_retired_generation_plan(_store, _payload.get("workflow_ids"))
-elif _payload["mode"] == "apply":
-    _result = apply_retired_generation_plan(
-        _store,
-        workflow_ids=_payload["workflow_ids"],
-        expected_plan_sha256=_payload["plan_sha256"],
-        reference=_payload["reference"],
-        actor=_payload.get("actor"),
-        admin_plan_sha256=_payload.get("admin_plan_sha256"),
-    )
-else:
-    raise ValueError("unsupported retired generation reconcile mode")
-print(_json.dumps(_result, sort_keys=True))
-"""
-
-
-def retired_generation_script() -> str:
-    """``gpu_fault.retired_generation``'s own source, plus a stdin/stdout driver.
-
-    The other mode above imports its logic from the Pod's ``gpu_fault``. This one
-    cannot. A retired generation is precisely the record the release preflight
-    refuses to roll past, so the operator has to close it *before* the release
-    that carries the code for closing it -- against an image whose
-    ``gpu_fault.retired_generation`` does not exist yet. The engine has the same
-    problem with its control-plane probes and solves it the same way: ship the
-    decision as source and run it against the deployed runtime.
-
-    Shipping the module's own file, rather than a hand-copied excerpt of it, is
-    what keeps the two from drifting: there is no second copy to update.
-    ``tests/admin/test_retired_generation_reconcile.py`` pins that this script
-    still compiles, still calls the two entry points the driver names, and still
-    imports nothing the previously deployed image may lack.
-    """
-
-    source = Path(retired_generation.__file__).read_text(encoding="utf-8")
-    return source + RETIRED_GENERATION_DRIVER
-
-
-COMPILE_BLOCKED_DRIVER = """
-
-import json as _json
-import sys as _sys
-
-from gpu_fault.app import ApplicationContext
-
-_payload = _json.load(_sys.stdin)
-_store = ApplicationContext.from_environment().store
-if _payload["mode"] == "plan":
-    _result = build_compile_blocked_plan(_store, _payload["workflow_ids"])
-elif _payload["mode"] == "apply":
-    _result = apply_compile_blocked_plan(
-        _store,
-        workflow_ids=_payload["workflow_ids"],
-        expected_plan_sha256=_payload["plan_sha256"],
-        reference=_payload["reference"],
-        actor=_payload.get("actor"),
-        admin_plan_sha256=_payload.get("admin_plan_sha256"),
-    )
-else:
-    raise ValueError("unsupported compile-blocked reconcile mode")
-print(_json.dumps(_result, sort_keys=True))
-"""
-
-
-def compile_blocked_script() -> str:
-    """``gpu_fault.admin.compile_blocked``'s own source, plus a stdin/stdout driver.
-
-    Same arrangement as ``retired_generation_script`` and for the same reason:
-    a compile-time BLOCKED destructive workflow is what the release preflight
-    refuses to roll past, so it has to be closed against the image that is
-    already deployed, which does not have this module.
-    ``tests/admin/test_compile_blocked_reconcile.py`` pins that the shipped
-    source still compiles, calls both entry points and imports nothing the
-    deployed image may lack.
-    """
-
-    source = Path(compile_blocked.__file__).read_text(encoding="utf-8")
-    return source + COMPILE_BLOCKED_DRIVER
-
-
-ORPHANED_COMMANDS_DRIVER = """
-
-import json as _json
-import sys as _sys
-
-from gpu_fault.app import ApplicationContext
-
-_payload = _json.load(_sys.stdin)
-_store = ApplicationContext.from_environment().store
-if _payload["mode"] == "plan":
-    _result = build_orphaned_commands_plan(_store, _payload["workflow_ids"])
-elif _payload["mode"] == "apply":
-    _result = apply_orphaned_commands_plan(
-        _store,
-        workflow_ids=_payload["workflow_ids"],
-        expected_plan_sha256=_payload["plan_sha256"],
-        reference=_payload["reference"],
-        actor=_payload.get("actor"),
-        admin_plan_sha256=_payload.get("admin_plan_sha256"),
-    )
-else:
-    raise ValueError("unsupported orphaned-commands reconcile mode")
-print(_json.dumps(_result, sort_keys=True))
-"""
-
-
-def orphaned_commands_script() -> str:
-    """``gpu_fault.admin.orphaned_commands``'s source plus a stdin/stdout driver,
-    shipped to the Pod for the same reason as the other two pre-deploy modes."""
-
-    source = Path(orphaned_commands.__file__).read_text(encoding="utf-8")
-    return source + ORPHANED_COMMANDS_DRIVER
 
 
 def _canonical_sha256(value: object) -> str:
@@ -234,13 +126,13 @@ def _apply_payload(
     reference: str,
     actor: str,
 ) -> dict[str, Any]:
-    """The apply request every mode sends to the Pod.
+    """The apply request sent to the Pod.
 
     Besides the ids, the runtime digest and the reference, it names the operator
-    (the STS caller ARN, or ``unknown-identity`` when it could not be read --
-    resolving it never blocks the apply) and the admin-side plan digest, so the
-    Pod can put both on the workflow's audit event (I1). The archived
-    ``applied.json`` carries the same identity.
+    (the STS caller ARN, else ``user@host`` -- resolving it never blocks the
+    apply) and the admin-side plan digest, so the Pod can put both on the
+    workflow's audit event (I1). The archived ``applied.json`` carries the same
+    identity.
     """
 
     return {
@@ -253,12 +145,19 @@ def _apply_payload(
     }
 
 
-def _run_reconcile(
+def run_control_plane_script(
     site: RenderedSite,
     payload: dict[str, Any],
     *,
     script: str = RECONCILE_SCRIPT,
 ) -> dict[str, Any]:
+    """Exec ``script`` in a Running CPU ingress Pod with ``payload`` on stdin.
+
+    The exec channel is how every administrator command reaches the Store
+    without holding a control-plane token on the deploy host; ``submit-
+    remediation`` reuses it with its own script.
+    """
+
     kubectl = [
         "kubectl",
         "--kubeconfig",
@@ -304,6 +203,10 @@ def _run_reconcile(
     return value
 
 
+# The historical name; the reconcile paths and their tests still bind it.
+_run_reconcile = run_control_plane_script
+
+
 def _site_identity(site: RenderedSite) -> dict[str, Any]:
     return {
         "site_name": site.release_config["site_name"],
@@ -323,23 +226,35 @@ def _site_identity(site: RenderedSite) -> dict[str, Any]:
     }
 
 
-def _gpu_kubectl(site: RenderedSite, target: dict[str, Any]) -> list[str]:
-    command = ["kubectl"]
-    kubeconfig = (
-        site.release_config.get("gpu_kubeconfig")
-        or site.environment.get("KUBECONFIG")
-        or os.environ.get("KUBECONFIG")
-        or str(Path.home() / ".kube/config")
+def gpu_kubectl_command(site: RenderedSite, target: dict[str, Any]) -> list[str]:
+    """``kubectl`` bound to the site's GPU kubeconfig, or a refusal.
+
+    The evidence this reads decides whether a record is closed, so it has to
+    come from the cluster the site manages. The shell's ``KUBECONFIG`` and
+    ``~/.kube/config`` are whatever the operator last pointed at -- possibly a
+    different site -- so a site without a rendered GPU kubeconfig is refused
+    instead of silently read through the default.
+    """
+
+    kubeconfig = site.release_config.get("gpu_kubeconfig") or site.environment.get(
+        "KUBECONFIG"
     )
-    command.extend(
-        [
-            "--kubeconfig",
-            str(kubeconfig),
-            "--context",
-            str(target["context"]),
-        ]
-    )
-    return command
+    if not kubeconfig:
+        raise BootstrapError(
+            "workflow reconcile has no GPU kubeconfig for cluster "
+            f"{target['cluster_id']}: the managed site renders none, and the "
+            "default kubeconfig is never used for node evidence"
+        )
+    return [
+        "kubectl",
+        "--kubeconfig",
+        str(kubeconfig),
+        "--context",
+        str(target["context"]),
+    ]
+
+
+_gpu_kubectl = gpu_kubectl_command
 
 
 def cluster_nodes(
@@ -479,11 +394,23 @@ def _scheduling_evidence(
     return result
 
 
+def plan_digest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The items reduced to the fields the digest binds.
+
+    The admin layer re-hashes the runtime items with the site identity and the
+    node evidence, so it needs the same trimming the runtime uses: hashing
+    ``workflow_updated_at`` left the apply unwinnable no matter what the runtime
+    digest did (P0-72A). See ``retired_generation.DIGEST_EXCLUDED_ITEM_FIELDS``.
+    """
+
+    return retired_generation.plan_digest_items(items)
+
+
 def _plan_drift(
     saved_items: list[dict[str, Any]],
     current_items: list[dict[str, Any]],
 ) -> list[str]:
-    """Which item fields moved between the approved plan and the re-plan.
+    """Which item fields moved between the plan and the re-plan before apply.
 
     "plan changed before apply" on its own told the operator nothing: the record
     is live, so the plan changing is the expected case, and the useful question
@@ -512,35 +439,6 @@ def _plan_drift(
                     f"{after.get(field)!r}"
                 )
     return drift
-
-
-def _changed_before_apply(
-    what: str,
-    saved: dict[str, Any],
-    current: dict[str, Any],
-) -> BootstrapError:
-    drift = _plan_drift(
-        list(saved.get("items") or []), list(current.get("items") or [])
-    )
-    if saved.get("runtime_plan_sha256") != current.get("runtime_plan_sha256") and (
-        not drift
-    ):
-        drift.append("the runtime plan digest changed outside the item fields")
-    return BootstrapError(
-        f"{what} plan changed before apply: " + (" | ".join(drift) or "plan differs")
-    )
-
-
-def plan_digest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Both modes hash their items under the retired-generation rule.
-
-    The admin layer re-hashes the runtime items with the site identity and the
-    node evidence, so it needed the same trimming: hashing ``workflow_updated_at``
-    here left the apply unwinnable no matter what the runtime digest did
-    (P0-72A). See ``retired_generation.DIGEST_EXCLUDED_ITEM_FIELDS``.
-    """
-
-    return retired_generation.plan_digest_items(items)
 
 
 def _finalize_plan(
@@ -584,541 +482,171 @@ def _finalize_plan(
     return plan
 
 
-def plan_workflow_reconcile(
+def _plan(
     site: RenderedSite,
-    state_dir: Path,
     *,
     workflow_ids: Sequence[str],
     incident_ids: Sequence[str] = (),
-    blocked_kinds: Sequence[str] = (),
     max_items: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"mode": "plan", "workflow_ids": list(workflow_ids)}
     if incident_ids:
         payload["incident_ids"] = list(incident_ids)
-    if blocked_kinds:
-        payload["blocked_kinds"] = list(blocked_kinds)
     if max_items is not None:
         payload["max_items"] = int(max_items)
-    runtime_plan = _run_reconcile(site, payload)
-    plan = _finalize_plan(site, runtime_plan)
-    write_json_atomic(state_dir / PLAN_PATH, plan)
-    return plan
+    return _finalize_plan(site, _run_reconcile(site, payload))
 
 
-def _finalize_retired_generation_plan(
-    site: RenderedSite,
-    runtime_plan: dict[str, Any],
-) -> dict[str, Any]:
-    raw_items = runtime_plan.get("items")
-    if not isinstance(raw_items, list) or not all(
-        isinstance(item, dict) for item in raw_items
-    ):
-        raise BootstrapError("retired generation reconcile runtime plan is invalid")
-    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
-    plan = {
-        "schema_version": 1,
-        "mode": "retired-generation-plan",
-        "evaluated_at": runtime_plan.get("evaluated_at"),
-        "site_identity": _site_identity(site),
-        "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
-        "discovery": runtime_plan.get("discovery"),
-        "items": items,
-    }
-    plan["plan_sha256"] = _canonical_sha256(
-        {
-            "schema_version": plan["schema_version"],
-            "mode": plan["mode"],
-            "site_identity": plan["site_identity"],
-            "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            # Same exclusion as the runtime digest, and for the same reason: a
-            # record still being dispatched restamps ``updated_at`` every tick,
-            # and hashing it here would leave the apply unwinnable no matter what
-            # the runtime digest did. See DIGEST_EXCLUDED_ITEM_FIELDS.
-            "items": plan_digest_items(items),
-        }
-    )
-    return plan
-
-
-def plan_retired_generation_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    workflow_ids: Sequence[str],
-) -> dict[str, Any]:
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": list(workflow_ids)},
-        script=retired_generation_script(),
-    )
-    plan = _finalize_retired_generation_plan(site, runtime_plan)
-    write_json_atomic(state_dir / RETIRED_GENERATION_PLAN_PATH, plan)
-    return plan
-
-
-def apply_retired_generation_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    expected_plan_sha256: str,
-    reference: str,
-) -> dict[str, Any]:
-    digest = expected_plan_sha256.strip()
-    normalized_reference = reference.strip()
-    if not SHA256_PATTERN.fullmatch(digest):
-        raise BootstrapError("retired generation reconcile plan SHA-256 is invalid")
-    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
-        raise BootstrapError("retired generation reconcile reference is invalid")
-    plan_path = state_dir / RETIRED_GENERATION_PLAN_PATH
-    if not plan_path.is_file():
-        raise BootstrapError("retired generation reconcile has no saved plan")
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise BootstrapError(
-            "retired generation reconcile saved plan is invalid"
-        ) from exc
-    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
-        raise BootstrapError(
-            "retired generation reconcile saved plan SHA-256 does not match"
-        )
-    if plan.get("mode") != "retired-generation-plan":
-        raise BootstrapError("saved plan is not a retired generation plan")
-    if plan.get("site_identity") != _site_identity(site):
-        raise BootstrapError(
-            "retired generation reconcile managed site identity changed"
-        )
-    items = plan.get("items")
-    if not isinstance(items, list) or not items:
-        raise BootstrapError("retired generation reconcile saved plan has no workflows")
-    workflow_ids = [str(item["request_id"]) for item in items]
-    script = retired_generation_script()
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": workflow_ids},
-        script=script,
-    )
-    current = _finalize_retired_generation_plan(site, runtime_plan)
-    if current["plan_sha256"] != digest:
-        raise _changed_before_apply("retired generation reconcile", plan, current)
-    # Refused here as well as in the runtime, so the operator reads the reasons
-    # from the plan they approved instead of from a Pod's stderr. An item whose
-    # only blocker is an open remote command is *not* refused: cancelling those
-    # is the first half of the apply. Nor is one an earlier, partial apply
-    # already revoked: the runtime skips it and names it in the result.
-    blocked = [
-        f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
-        for item in current["items"]
+def _ineligible(items: list[dict[str, Any]]) -> dict[str, list[str]]:
+    return {
+        str(item.get("request_id")): [
+            str(reason) for reason in item.get("reasons") or []
+        ]
+        for item in items
         if not item.get("eligible")
-        and not item.get("cancellable")
-        and not item.get("already_revoked")
-    ]
-    if blocked:
-        raise BootstrapError(
-            "retired generation reconcile plan contains ineligible records: "
-            + " | ".join(blocked)
-        )
-    actor = operator_identity.resolve_operator_identity()
-    result = _run_reconcile(
-        site,
-        _apply_payload(
-            workflow_ids=workflow_ids,
-            runtime_plan_sha256=current["runtime_plan_sha256"],
-            admin_plan_sha256=digest,
-            reference=normalized_reference,
-            actor=actor,
-        ),
-        script=script,
-    )
-    result["admin_plan_sha256"] = digest
-    result["actor"] = actor
-    archive = state_dir / RETIRED_GENERATION_HISTORY_PATH / digest
-    write_json_atomic(archive / "plan.json", plan)
-    write_json_atomic(archive / "applied.json", result)
-    plan_path.unlink(missing_ok=True)
-    return result
-
-
-def apply_workflow_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    expected_plan_sha256: str,
-    reference: str,
-) -> dict[str, Any]:
-    digest = expected_plan_sha256.strip()
-    normalized_reference = reference.strip()
-    if not SHA256_PATTERN.fullmatch(digest):
-        raise BootstrapError("workflow reconcile plan SHA-256 is invalid")
-    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
-        raise BootstrapError("workflow reconcile reference is invalid")
-    plan_path = state_dir / PLAN_PATH
-    if not plan_path.is_file():
-        raise BootstrapError("workflow reconcile has no saved plan")
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise BootstrapError("workflow reconcile saved plan is invalid") from exc
-    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
-        raise BootstrapError("workflow reconcile saved plan SHA-256 does not match")
-    if plan.get("site_identity") != _site_identity(site):
-        raise BootstrapError("workflow reconcile managed site identity changed")
-    items = plan.get("items")
-    if not isinstance(items, list) or not items:
-        raise BootstrapError("workflow reconcile saved plan has no workflows")
-    workflow_ids = [str(item["request_id"]) for item in items]
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": workflow_ids},
-    )
-    current = _finalize_plan(site, runtime_plan)
-    if current["plan_sha256"] != digest:
-        raise _changed_before_apply("workflow reconcile", plan, current)
-    rejected = [item for item in current["items"] if not item.get("eligible")]
-    if rejected:
-        raise BootstrapError("workflow reconcile plan contains ineligible records")
-    actor = operator_identity.resolve_operator_identity()
-    result = _run_reconcile(
-        site,
-        _apply_payload(
-            workflow_ids=workflow_ids,
-            runtime_plan_sha256=current["runtime_plan_sha256"],
-            admin_plan_sha256=digest,
-            reference=normalized_reference,
-            actor=actor,
-        ),
-    )
-    result["admin_plan_sha256"] = digest
-    result["actor"] = actor
-    archive = state_dir / HISTORY_PATH / digest
-    write_json_atomic(archive / "plan.json", plan)
-    write_json_atomic(archive / "applied.json", result)
-    plan_path.unlink(missing_ok=True)
-    return result
-
-
-def _finalize_compile_blocked_plan(
-    site: RenderedSite,
-    runtime_plan: dict[str, Any],
-) -> dict[str, Any]:
-    raw_items = runtime_plan.get("items")
-    if not isinstance(raw_items, list) or not all(
-        isinstance(item, dict) for item in raw_items
-    ):
-        raise BootstrapError("compile-blocked reconcile runtime plan is invalid")
-    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
-    # The one condition the runtime cannot see: the node carries no gpu-fault
-    # isolation at all. A record that blocked at compile time never isolated
-    # anything, so any isolation present belongs to someone else and closing
-    # the record would leave it unexplained.
-    scheduling = _scheduling_evidence(site, items)
-    for item in items:
-        evidence = scheduling[str(item.get("request_id") or "")]
-        item["scheduling_evidence"] = evidence
-        if not evidence["restored"] and not item.get("already_closed"):
-            item["eligible"] = False
-            item["reasons"] = [
-                *list(item.get("reasons") or []),
-                "GPU node scheduling state has not been restored",
-            ]
-    plan = {
-        "schema_version": 1,
-        "mode": compile_blocked.PLAN_MODE,
-        "evaluated_at": runtime_plan.get("evaluated_at"),
-        "site_identity": _site_identity(site),
-        "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
-        "items": items,
     }
-    plan["plan_sha256"] = _canonical_sha256(
-        {
-            "schema_version": plan["schema_version"],
-            "mode": plan["mode"],
-            "site_identity": plan["site_identity"],
-            "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            "items": compile_blocked.plan_digest_items(items),
-        }
-    )
-    return plan
 
 
-def plan_compile_blocked_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
+def _validate_request(
     *,
     workflow_ids: Sequence[str],
-) -> dict[str, Any]:
-    if not [item for item in workflow_ids if str(item).strip()]:
-        raise BootstrapError(
-            "--mode compile-blocked --plan requires at least one --workflow-id"
-        )
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": list(workflow_ids)},
-        script=compile_blocked_script(),
-    )
-    plan = _finalize_compile_blocked_plan(site, runtime_plan)
-    write_json_atomic(state_dir / COMPILE_BLOCKED_PLAN_PATH, plan)
-    return plan
+    incident_ids: Sequence[str],
+    max_items: int | None,
+    reference: str | None,
+    dry_run: bool,
+) -> str | None:
+    """Refuse a request whose flags would otherwise be silently ignored.
 
-
-def apply_compile_blocked_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    expected_plan_sha256: str,
-    reference: str,
-) -> dict[str, Any]:
-    digest = expected_plan_sha256.strip()
-    normalized_reference = reference.strip()
-    if not SHA256_PATTERN.fullmatch(digest):
-        raise BootstrapError("compile-blocked reconcile plan SHA-256 is invalid")
-    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
-        raise BootstrapError("compile-blocked reconcile reference is invalid")
-    plan_path = state_dir / COMPILE_BLOCKED_PLAN_PATH
-    if not plan_path.is_file():
-        raise BootstrapError("compile-blocked reconcile has no saved plan")
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise BootstrapError("compile-blocked reconcile saved plan is invalid") from exc
-    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
-        raise BootstrapError(
-            "compile-blocked reconcile saved plan SHA-256 does not match"
-        )
-    if plan.get("mode") != compile_blocked.PLAN_MODE:
-        raise BootstrapError("saved plan is not a compile-blocked plan")
-    if plan.get("site_identity") != _site_identity(site):
-        raise BootstrapError("compile-blocked reconcile managed site identity changed")
-    items = plan.get("items")
-    if not isinstance(items, list) or not items:
-        raise BootstrapError("compile-blocked reconcile saved plan has no workflows")
-    workflow_ids = [str(item["request_id"]) for item in items]
-    script = compile_blocked_script()
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": workflow_ids},
-        script=script,
-    )
-    current = _finalize_compile_blocked_plan(site, runtime_plan)
-    if current["plan_sha256"] != digest:
-        raise _changed_before_apply("compile-blocked reconcile", plan, current)
-    blocked = [
-        f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
-        for item in current["items"]
-        if not item.get("eligible") and not item.get("already_closed")
-    ]
-    if blocked:
-        raise BootstrapError(
-            "compile-blocked reconcile plan contains ineligible records: "
-            + " | ".join(blocked)
-        )
-    actor = operator_identity.resolve_operator_identity()
-    result = _run_reconcile(
-        site,
-        _apply_payload(
-            workflow_ids=workflow_ids,
-            runtime_plan_sha256=current["runtime_plan_sha256"],
-            admin_plan_sha256=digest,
-            reference=normalized_reference,
-            actor=actor,
-        ),
-        script=script,
-    )
-    result["admin_plan_sha256"] = digest
-    result["actor"] = actor
-    archive = state_dir / COMPILE_BLOCKED_HISTORY_PATH / digest
-    write_json_atomic(archive / "plan.json", plan)
-    write_json_atomic(archive / "applied.json", result)
-    plan_path.unlink(missing_ok=True)
-    return result
-
-
-def _finalize_orphaned_commands_plan(
-    site: RenderedSite,
-    runtime_plan: dict[str, Any],
-) -> dict[str, Any]:
-    raw_items = runtime_plan.get("items")
-    if not isinstance(raw_items, list) or not all(
-        isinstance(item, dict) for item in raw_items
-    ):
-        raise BootstrapError("orphaned-commands reconcile runtime plan is invalid")
-    items: list[dict[str, Any]] = [dict(item) for item in raw_items]
-    plan = {
-        "schema_version": 1,
-        "mode": orphaned_commands.PLAN_MODE,
-        "evaluated_at": runtime_plan.get("evaluated_at"),
-        "site_identity": _site_identity(site),
-        "runtime_plan_sha256": runtime_plan.get("plan_sha256"),
-        "items": items,
-    }
-    plan["plan_sha256"] = _canonical_sha256(
-        {
-            "schema_version": plan["schema_version"],
-            "mode": plan["mode"],
-            "site_identity": plan["site_identity"],
-            "runtime_plan_sha256": plan["runtime_plan_sha256"],
-            "items": orphaned_commands.plan_digest_items(items),
-        }
-    )
-    return plan
-
-
-def plan_orphaned_commands_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    workflow_ids: Sequence[str],
-) -> dict[str, Any]:
-    if not [item for item in workflow_ids if str(item).strip()]:
-        raise BootstrapError(
-            "--mode orphaned-commands --plan requires at least one --workflow-id"
-        )
-    runtime_plan = _run_reconcile(
-        site,
-        {"mode": "plan", "workflow_ids": list(workflow_ids)},
-        script=orphaned_commands_script(),
-    )
-    plan = _finalize_orphaned_commands_plan(site, runtime_plan)
-    write_json_atomic(state_dir / ORPHANED_COMMANDS_PLAN_PATH, plan)
-    return plan
-
-
-def apply_orphaned_commands_reconcile(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    expected_plan_sha256: str,
-    reference: str,
-) -> dict[str, Any]:
-    digest = expected_plan_sha256.strip()
-    normalized_reference = reference.strip()
-    if not SHA256_PATTERN.fullmatch(digest):
-        raise BootstrapError("orphaned-commands reconcile plan SHA-256 is invalid")
-    if not REFERENCE_PATTERN.fullmatch(normalized_reference):
-        raise BootstrapError("orphaned-commands reconcile reference is invalid")
-    plan_path = state_dir / ORPHANED_COMMANDS_PLAN_PATH
-    if not plan_path.is_file():
-        raise BootstrapError("orphaned-commands reconcile has no saved plan")
-    try:
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise BootstrapError(
-            "orphaned-commands reconcile saved plan is invalid"
-        ) from exc
-    if not isinstance(plan, dict) or plan.get("plan_sha256") != digest:
-        raise BootstrapError(
-            "orphaned-commands reconcile saved plan SHA-256 does not match"
-        )
-    if plan.get("mode") != orphaned_commands.PLAN_MODE:
-        raise BootstrapError("saved plan is not an orphaned-commands plan")
-    if plan.get("site_identity") != _site_identity(site):
-        raise BootstrapError(
-            "orphaned-commands reconcile managed site identity changed"
-        )
-    items = plan.get("items")
-    if not isinstance(items, list) or not items:
-        raise BootstrapError("orphaned-commands reconcile saved plan has no workflows")
-    workflow_ids = [str(item["request_id"]) for item in items]
-    script = orphaned_commands_script()
-    runtime_plan = _run_reconcile(
-        site, {"mode": "plan", "workflow_ids": workflow_ids}, script=script
-    )
-    current = _finalize_orphaned_commands_plan(site, runtime_plan)
-    if current["plan_sha256"] != digest:
-        raise _changed_before_apply("orphaned-commands reconcile", plan, current)
-    blocked = [
-        f"{item.get('request_id')}: " + "; ".join(item.get("reasons") or [])
-        for item in current["items"]
-        if not item.get("eligible")
-    ]
-    if blocked:
-        raise BootstrapError(
-            "orphaned-commands reconcile plan contains ineligible records: "
-            + " | ".join(blocked)
-        )
-    actor = operator_identity.resolve_operator_identity()
-    result = _run_reconcile(
-        site,
-        _apply_payload(
-            workflow_ids=workflow_ids,
-            runtime_plan_sha256=current["runtime_plan_sha256"],
-            admin_plan_sha256=digest,
-            reference=normalized_reference,
-            actor=actor,
-        ),
-        script=script,
-    )
-    result["admin_plan_sha256"] = digest
-    result["actor"] = actor
-    archive = state_dir / ORPHANED_COMMANDS_HISTORY_PATH / digest
-    write_json_atomic(archive / "plan.json", plan)
-    write_json_atomic(archive / "applied.json", result)
-    plan_path.unlink(missing_ok=True)
-    return result
-
-
-def run_workflow_reconcile_mode(
-    site: RenderedSite,
-    state_dir: Path,
-    *,
-    mode: str,
-    plan: bool,
-    workflow_ids: Sequence[str],
-    incident_ids: Sequence[str] = (),
-    blocked_kinds: Sequence[str] = (),
-    max_items: int | None = None,
-    plan_sha256: str | None = None,
-    reference: str | None = None,
-) -> dict[str, Any]:
-    """Dispatch one ``workflow-reconcile`` invocation to its mode.
-
-    The batch selectors (``--incident-id``, ``--blocked-kind``, ``--max-items``)
-    only mean something to ``--mode restore --plan`` discovery; the other two
-    modes take explicit workflow ids, so passing a selector with them is refused
-    rather than silently ignored.
+    Explicit ``--workflow-id``s bypass discovery, so a selector given with them
+    (``--incident-id``, ``--max-items``) would do nothing; the reference is what
+    the audit trail keys on, so an apply without one is refused before any read.
+    Returns the normalised reference, or ``None`` on a dry run without one.
     """
 
-    if mode not in RECONCILE_MODES:
-        raise BootstrapError(f"unsupported workflow-reconcile mode {mode!r}")
-    if mode != "restore" and (incident_ids or blocked_kinds or max_items is not None):
+    if workflow_ids and (incident_ids or max_items is not None):
         raise BootstrapError(
-            "--incident-id, --blocked-kind and --max-items select BLOCKED records "
-            "for --mode restore --plan only"
+            "--incident-id and --max-items select BLOCKED records for discovery; "
+            "do not combine them with --workflow-id"
         )
     if max_items is not None and max_items < 1:
         raise BootstrapError("--max-items must be at least 1")
-    if plan:
-        if mode == "orphaned-commands":
-            return plan_orphaned_commands_reconcile(
-                site, state_dir, workflow_ids=tuple(workflow_ids)
-            )
-        if mode == "compile-blocked":
-            return plan_compile_blocked_reconcile(
-                site, state_dir, workflow_ids=tuple(workflow_ids)
-            )
-        if mode == "retired-generation":
-            return plan_retired_generation_reconcile(
-                site, state_dir, workflow_ids=tuple(workflow_ids)
-            )
-        return plan_workflow_reconcile(
-            site,
-            state_dir,
-            workflow_ids=tuple(workflow_ids),
-            incident_ids=tuple(incident_ids),
-            blocked_kinds=tuple(blocked_kinds),
-            max_items=max_items,
-        )
-    if not plan_sha256 or not reference:
+    normalized = (reference or "").strip()
+    if not normalized:
+        if dry_run:
+            return None
         raise BootstrapError(
-            "workflow-reconcile --apply requires --plan-sha256 and --reference"
+            "workflow-reconcile requires --reference (an approved change or "
+            "maintenance-window reference) unless --dry-run is given"
         )
-    applier = {
-        "orphaned-commands": apply_orphaned_commands_reconcile,
-        "compile-blocked": apply_compile_blocked_reconcile,
-        "retired-generation": apply_retired_generation_reconcile,
-        "restore": apply_workflow_reconcile,
-    }[mode]
-    return applier(
-        site, state_dir, expected_plan_sha256=plan_sha256, reference=reference
+    if not REFERENCE_PATTERN.fullmatch(normalized):
+        raise BootstrapError("workflow reconcile reference is invalid")
+    return normalized
+
+
+def run_workflow_reconcile(
+    site: RenderedSite,
+    state_dir: Path,
+    *,
+    workflow_ids: Sequence[str] = (),
+    incident_ids: Sequence[str] = (),
+    max_items: int | None = None,
+    reference: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Plan, and unless ``dry_run``, apply, in one invocation.
+
+    Discovery (no ``--workflow-id``) may name records that are not eligible;
+    those are reported under ``ineligible`` and skipped. A record the operator
+    named explicitly that is not eligible refuses the whole apply before any
+    write, with its reasons: the operator asked for something the evidence does
+    not support, and ``--dry-run`` shows why. Eligible records are re-planned
+    immediately before the apply and any field that moved refuses the apply by
+    name. Each record is written on its own inside the Pod; ``failed_workflow_ids``
+    and ``failures`` say which did not land, and the CLI exits 1 on any.
+    """
+
+    requested = [str(item).strip() for item in workflow_ids if str(item).strip()]
+    normalized_reference = _validate_request(
+        workflow_ids=requested,
+        incident_ids=incident_ids,
+        max_items=max_items,
+        reference=reference,
+        dry_run=dry_run,
     )
+    plan = _plan(
+        site,
+        workflow_ids=requested,
+        incident_ids=incident_ids,
+        max_items=max_items,
+    )
+    if dry_run:
+        return {**plan, "dry_run": True}
+    assert normalized_reference is not None
+    ineligible = _ineligible(plan["items"])
+    if requested and ineligible:
+        raise BootstrapError(
+            "workflow reconcile refuses ineligible records: "
+            + " | ".join(
+                f"{request_id}: " + "; ".join(reasons)
+                for request_id, reasons in sorted(ineligible.items())
+            )
+        )
+    eligible_ids = [
+        str(item["request_id"]) for item in plan["items"] if item.get("eligible")
+    ]
+    result: dict[str, Any]
+    if not eligible_ids:
+        result = {
+            "mode": "workflow-reconcile-apply",
+            "applied_workflow_ids": [],
+            "failed_workflow_ids": [],
+            "failures": {},
+            "records_deleted": 0,
+        }
+    else:
+        # Re-planned for exactly the records about to be written: the runtime
+        # digest binds the item set, and a discovery plan may hold ineligible
+        # items beside them. Compared field by field with the plan just made.
+        current = _plan(site, workflow_ids=eligible_ids)
+        drift = _plan_drift(
+            [item for item in plan["items"] if item["request_id"] in eligible_ids],
+            list(current["items"]),
+        )
+        if drift:
+            raise BootstrapError(
+                "workflow reconcile plan changed before apply: " + " | ".join(drift)
+            )
+        still_ineligible = _ineligible(current["items"])
+        if still_ineligible:
+            raise BootstrapError(
+                "workflow reconcile plan contains ineligible records: "
+                + " | ".join(
+                    f"{request_id}: " + "; ".join(reasons)
+                    for request_id, reasons in sorted(still_ineligible.items())
+                )
+            )
+        actor = operator_identity.resolve_operator_identity(
+            fallback=operator_identity.local_operator_identity()
+        )
+        result = _run_reconcile(
+            site,
+            _apply_payload(
+                workflow_ids=eligible_ids,
+                runtime_plan_sha256=current["runtime_plan_sha256"],
+                admin_plan_sha256=current["plan_sha256"],
+                reference=normalized_reference,
+                actor=actor,
+            ),
+        )
+        result["actor"] = actor
+        result["admin_plan_sha256"] = current["plan_sha256"]
+        plan = current
+    result.setdefault("records_deleted", 0)
+    result["reference"] = normalized_reference
+    result["plan_sha256"] = plan["plan_sha256"]
+    result["ineligible"] = ineligible
+    result["dry_run"] = False
+    archive = state_dir / HISTORY_PATH / str(plan["plan_sha256"])
+    write_json_atomic(archive / "plan.json", plan)
+    write_json_atomic(archive / "applied.json", result)
+    return result

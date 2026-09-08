@@ -50,6 +50,88 @@ def test_health_report_exit_code_tracks_failures() -> None:
     assert CHECKS.report_exit_code(unhealthy) == 1
 
 
+def test_unconfirmed_sns_subscription_is_a_warning_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirmation gate moved to the first minute of ``deploy``; ``verify``
+    still names the topic nobody listens to, but as WARN: the report stays
+    healthy and exits 0."""
+
+    module = _checks_module()
+    for name in (
+        "_check_contexts",
+        "check_cpu_secrets",
+        "_check_cpu_workloads",
+        "check_email_notifications",
+        "check_aurora_refresh",
+        "_verify_profile",
+        "run_read_only_verifiers",
+        "_check_runtime_component_identity",
+        "_check_control_api",
+        "_check_gpu_cluster",
+        "_check_nlb_runtime",
+        "_check_aurora",
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *_args, name=name, **_kwargs: module.CheckValue(name)
+        )
+
+    def aws_json(_release, arguments):
+        if arguments[:2] == ["amp", "describe-workspace"]:
+            return {"workspace": {"status": {"statusCode": "ACTIVE"}}}
+        if arguments[:2] == ["sns", "list-subscriptions-by-topic"]:
+            return {
+                "Subscriptions": [
+                    {
+                        "Protocol": "email",
+                        "Endpoint": "ops@example.com",
+                        "SubscriptionArn": "PendingConfirmation",
+                    }
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr(module, "_aws_json", aws_json)
+    monkeypatch.setattr(
+        MONITORING,
+        "decode_monitoring_configuration",
+        lambda *_a, **_k: ("groups: []\n", "route: {}\n"),
+    )
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="test-site",
+            clusters=[],
+            health=SimpleNamespace(
+                amp_workspace_id="ws-1",
+                sns_topic_arn="arn:aws:sns:us-east-1:123456789012:alerts",
+                amp_rule_namespace="gpu-fault",
+                require_confirmed_sns_subscription=True,
+            ),
+            notifications=SimpleNamespace(admin_email="ops@example.com"),
+        ),
+        runner=SimpleNamespace(run=lambda *_a, **_k: "verified"),
+    )
+
+    report = module.build_health_report(release, mode="verify")
+    finding = next(item for item in report["checks"] if item["name"] == "monitoring")
+
+    assert finding["status"] == "WARN"
+    assert "no confirmed subscription" in finding["summary"]
+    assert finding["details"]["confirmed_subscriptions"] == 0
+    assert report["healthy"] is True, "a warning does not fail verify"
+    assert report["summary"]["WARN"] == 1
+    assert module.report_exit_code(report) == 0
+
+    release.config.health.require_confirmed_sns_subscription = False
+    relaxed = module.build_health_report(release, mode="verify")
+    assert (
+        next(item for item in relaxed["checks"] if item["name"] == "monitoring")[
+            "status"
+        ]
+        == "PASS"
+    )
+
+
 def test_monitoring_rejects_duplicate_email_subscription_states() -> None:
     confirmed = {
         "Protocol": "email",
@@ -992,3 +1074,119 @@ def test_state_changing_aws_calls_are_never_cached() -> None:
     assert state.aws_read_only(["acm", "describe-certificate"]), "describe- is read"
     assert state.aws_read_only(["sesv2", "get-account"]), "get- is read"
     assert state.aws_read_only(["sns", "list-subscriptions-by-topic"]), "list- is read"
+
+
+def test_aurora_check_lists_only_the_site_cluster_instances(monkeypatch) -> None:
+    """``describe-db-instances`` is filtered to the site's cluster server-side.
+
+    Unfiltered, it returned every RDS instance in the region -- other systems'
+    databases included -- for this check to discard all but two.
+    """
+
+    module = CHECKS
+    calls: list[list[str]] = []
+
+    def aws_json(_release, arguments):
+        calls.append(list(arguments))
+        if arguments[1] == "describe-db-clusters":
+            return {"DBClusters": [{"Status": "available", "Endpoint": "w"}]}
+        return {
+            "DBInstances": [
+                {
+                    "DBInstanceIdentifier": f"gpu-fault-{index}",
+                    "DBClusterIdentifier": "gpu-fault-aurora",
+                    "DBInstanceStatus": "available",
+                }
+                for index in range(2)
+            ]
+        }
+
+    monkeypatch.setattr(module, "_aws_json", aws_json)
+    for name in (
+        "_check_tools",
+        "_check_local_inputs",
+        "_check_aws_identity",
+        "_check_contexts",
+        "_check_cpu_capacity",
+        "check_cpu_secrets",
+        "_check_load_balancer_controller",
+        "_check_nlb_inputs",
+        "check_aurora_refresh",
+        "check_email_notifications",
+        "_check_monitoring",
+        "workflow_safety_snapshot",
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *args, name=name: module.CheckValue(name)
+        )
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="test-site",
+            health=SimpleNamespace(aurora_cluster_id="gpu-fault-aurora"),
+        )
+    )
+
+    report = module.build_preflight_report(release)
+
+    (aurora,) = [item for item in report["checks"] if item["name"] == "aurora"]
+    assert aurora["status"] == "PASS", aurora
+    assert [item["id"] for item in aurora["details"]["instances"]] == [
+        "gpu-fault-0",
+        "gpu-fault-1",
+    ]
+    instances_call = [call for call in calls if call[1] == "describe-db-instances"]
+    assert instances_call == [
+        [
+            "rds",
+            "describe-db-instances",
+            "--filters",
+            "Name=db-cluster-id,Values=gpu-fault-aurora",
+        ]
+    ]
+
+
+def test_quick_health_report_runs_only_the_cheap_checks(monkeypatch) -> None:
+    """The default ``status`` health: control-plane workloads and the API.
+
+    No GPU cluster, role split, NLB, Aurora or monitoring probe runs -- that is
+    the 44-call, 15-exec report ``status --full`` still produces. The document
+    keeps the health-report shape so every reader of ``status`` JSON works on
+    either, and says which one it is.
+    """
+
+    module = CHECKS
+    ran: list[str] = []
+
+    def check(name):
+        def run(*_args, **_kwargs):
+            ran.append(name)
+            return module.CheckValue(name)
+
+        return run
+
+    for name in (
+        "_check_cpu_workloads",
+        "_check_control_api",
+        "_check_contexts",
+        "check_cpu_secrets",
+        "_check_gpu_cluster",
+        "run_read_only_verifiers",
+        "_check_nlb_runtime",
+        "_check_aurora",
+        "_check_monitoring",
+    ):
+        monkeypatch.setattr(module, name, check(name))
+
+    report = module.build_quick_health_report(Release())
+
+    assert sorted(ran) == ["_check_control_api", "_check_cpu_workloads"]
+    assert report["mode"] == "status"
+    assert report["healthy"] is True
+    assert report["scope"] == "quick"
+    assert report["reused_validation_checks"] == []
+    assert [item["name"] for item in report["checks"]] == list(
+        module.QUICK_HEALTH_CHECKS
+    )
+    assert set(report) >= {"mode", "site_name", "healthy", "summary", "checks"}, (
+        "quick health must keep the health-report shape"
+    )

@@ -87,30 +87,25 @@ def test_configured_alert_email_is_recorded_as_the_routing_source(
     assert runner.commands == [], "a configured address must not be looked up in AWS"
 
 
-def test_discovered_alert_email_keeps_a_distinct_sender_and_recipients(
-    tmp_path: Path,
-) -> None:
+def test_discovered_alert_email_is_both_sender_and_recipient(tmp_path: Path) -> None:
+    """There is no separate sender/recipient/prefix input any more: the
+    discovered administrator address is the whole routing."""
+
     state = _state(tmp_path)
     runner = Runner([{"Account": {"Email": "root@example.com"}}])
 
     admin_email, routing = notification_routing(
-        runner,
-        _cpu(),
-        _request(
-            tmp_path,
-            alert_email=None,
-            email_sender="sender@example.com",
-            email_recipients=("oncall@example.com", "oncall@example.com"),
-            email_subject_prefix="  [PROD]  ",
-        ),
-        state,
+        runner, _cpu(), _request(tmp_path, alert_email=None), state
     )
 
     assert admin_email == "root@example.com"
-    assert routing.sender == "sender@example.com"
-    assert routing.recipients == ("oncall@example.com",)
-    assert routing.subject_prefix == "[PROD]"
+    assert routing == NotificationRouting(
+        sender="root@example.com", recipients=("root@example.com",), subject_prefix=""
+    ), "the discovered address is sender and recipient, with no prefix"
     assert state.value["resources"]["admin_email_source"] == "organizations"
+    assert not hasattr(_request(tmp_path), "email_sender"), (
+        "the sender/recipient/prefix overrides left BootstrapRequest"
+    )
 
 
 def test_undiscoverable_admin_email_stops_the_bootstrap(tmp_path: Path) -> None:
@@ -176,9 +171,9 @@ def test_notification_tasks_send_as_the_routing_sender_and_alert_the_admin(
         task()
 
     assert calls["ensure_control_plane_role"]["email_sender"] == "sender@example.com"
-    assert calls["ensure_email_notifications"]["sender_email"] == "sender@example.com"
-    assert calls["ensure_email_notifications"]["recipients"] == ("oncall@example.com",)
-    assert calls["ensure_email_notifications"]["subject_prefix"] == "[PROD]"
+    assert calls["ensure_email_notifications"]["routing"] == routing, (
+        "the SES task receives the resolved routing whole"
+    )
     assert calls["ensure_email_notifications"]["admin_email"] == "ops@example.com"
     # The alert address is the administrator's, not the sender identity: SES mail
     # comes from the sender, but a monitoring alarm has to reach a human.

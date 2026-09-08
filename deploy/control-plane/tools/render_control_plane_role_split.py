@@ -627,6 +627,28 @@ def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
         set_env(container, name, environment_text(value))
 
 
+# site.yaml spec.retention, forwarded by the release engine's apply
+# environment. Worker only: the archiver runs in the periodic services of
+# that tier, and the runtime refuses a positive retention without an S3 URI,
+# so a tier that cannot honour it must not be asked to validate it.
+CONTROL_RECORD_RETENTION_ENV = (
+    "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS",
+)
+
+
+def configure_control_record_retention(container: dict[str, Any]) -> None:
+    """Carry the retention variables when declared; leave none behind otherwise."""
+
+    for name in CONTROL_RECORD_RETENTION_ENV:
+        declared = os.getenv(name)
+        if declared is None or not declared.strip():
+            unset_env(container, name)
+        else:
+            set_env(container, name, declared.strip())
+
+
 def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
     processor = config.processor
     workflow = config.workflow
@@ -975,6 +997,7 @@ def main() -> None:
     # pools exist on, so the value has to be visible next to the four
     # pools it sizes the defaults for.
     configure_worker_capacity(worker, admin_config)
+    configure_control_record_retention(worker)
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_WORKERS", "4")
     set_env(
         worker,

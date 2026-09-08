@@ -33,16 +33,17 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 from gpu_fault_release.regional_release_timing import record_rollback_wave_event
 
+# One definition of "failure domain" for the whole system: the remediation
+# budget's per-domain tier reads the same label priority through the same
+# function, so a rollout wave and a repair cap cannot disagree about which
+# nodes share a fate.
 from gpu_fault.failure_domains import (
-    FAILURE_DOMAIN_LABELS as SHARED_FAILURE_DOMAIN_LABELS,
+    FAILURE_DOMAIN_LABELS,
+    UNKNOWN_FAILURE_DOMAIN,
+    node_failure_domain,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-# One definition of "failure domain" for the whole system: the remediation
-# budget's per-domain tier reads the same priority, so a rollout wave and a
-# repair cap cannot disagree about which nodes share a fate. Instance group
-# leads because every node of a HyperPod cluster shares one zone.
-FAILURE_DOMAIN_LABELS = SHARED_FAILURE_DOMAIN_LABELS
 CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS = 75.0
 ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS = 60.0
 ROLLOUT_AGENT_POLL_SECONDS = 5.0
@@ -52,6 +53,9 @@ MAX_UPGRADE_UNAVAILABLE = 32
 INSTALLER_WAVE_CONFIG_MAP_ENV = "GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP"
 INSTALLER_BUNDLE_ENV = "GPU_FAULT_INSTALLER_BUNDLE_SHA256"
 INSTALLER_TEMPLATE_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_SHA256"
+# Every release Secret backup carries this label; the commit-time sweep lists
+# by it so nothing but our own backups can ever be deleted.
+RELEASE_SECRET_BACKUP_LABEL = "gpu-fault.io/release-secret-backup"
 
 
 @dataclass(frozen=True)
@@ -123,7 +127,7 @@ def backup_secret(
             "name": backup,
             "namespace": release.config.namespace,
             "labels": {
-                "gpu-fault.io/release-secret-backup": "true",
+                RELEASE_SECRET_BACKUP_LABEL: "true",
             },
             "annotations": {
                 "gpu-fault.io/source-secret": source,
@@ -237,6 +241,12 @@ def delete_release_secret_backups(
     release: Any,
     previous: dict[str, Any],
 ) -> None:
+    """Delete the backups ``previous`` references (after a verified rollback).
+
+    Only the clusters still in the site are contacted, so a cluster removed
+    since the backup was taken cannot fail the cleanup.
+    """
+
     backups = previous.get("secret_backups") or {}
     entries: list[tuple[list[str], str]] = []
     cpu = backups.get("cpu") or {}
@@ -260,6 +270,88 @@ def delete_release_secret_backups(
             ],
             sensitive=True,
         )
+
+
+def referenced_secret_backups(previous: dict[str, Any]) -> set[str] | None:
+    """Backup Secret names the ``previous`` snapshot still needs.
+
+    ``None`` when the snapshot recorded no backups at all: without a reference
+    there is no way to tell a needed backup from a stale one.
+    """
+
+    backups = previous.get("secret_backups")
+    if not isinstance(backups, dict):
+        return None
+    names: set[str] = set()
+    cpu = backups.get("cpu")
+    if isinstance(cpu, dict) and cpu.get("backup"):
+        names.add(str(cpu["backup"]))
+    clusters = backups.get("clusters")
+    for item in (clusters or {}).values() if isinstance(clusters, dict) else ():
+        if isinstance(item, dict) and item.get("backup"):
+            names.add(str(item["backup"]))
+    return names
+
+
+def delete_stale_release_secret_backups(
+    release: Any,
+    previous: dict[str, Any],
+) -> list[str]:
+    """Commit-time sweep: keep what ``previous`` references, delete the rest.
+
+    A committed release keeps its own backups so that ``deploy --rollback``
+    can still restore the CPU email and GPU connection Secrets after the
+    commit; what goes is every *other* labelled backup -- the release before
+    it, or a transaction that never committed. The referenced names are kept
+    in every context (a CPU and a GPU context may be one cluster), and only
+    the clusters currently in the site are contacted. Returns the names
+    deleted, in the order they were removed.
+    """
+
+    keep = referenced_secret_backups(previous)
+    if keep is None:
+        return []
+    contexts = [release._cpu()] + [
+        release._gpu(target) for target in release.config.clusters
+    ]
+    deleted: list[str] = []
+    for kubectl in contexts:
+        listing = release._get_json(
+            kubectl
+            + [
+                "-n",
+                release.config.namespace,
+                "get",
+                "secret",
+                "-l",
+                f"{RELEASE_SECRET_BACKUP_LABEL}=true",
+            ]
+        )
+        stale = sorted(
+            {
+                name
+                for item in listing.get("items") or []
+                if isinstance(item, dict)
+                and (name := str((item.get("metadata") or {}).get("name") or ""))
+                and name not in keep
+            }
+        )
+        if not stale:
+            continue
+        release.runner.run(
+            kubectl
+            + [
+                "-n",
+                release.config.namespace,
+                "delete",
+                "secret",
+                *stale,
+                "--ignore-not-found",
+            ],
+            sensitive=True,
+        )
+        deleted.extend(stale)
+    return deleted
 
 
 def target_node_names(
@@ -291,6 +383,14 @@ def target_node_failure_domains(
     target: ClusterTarget,
     node_names: tuple[str, ...],
 ) -> dict[str, str]:
+    """One domain per target node, ``UNKNOWN_FAILURE_DOMAIN`` for unlabelled ones.
+
+    The same ``node_failure_domain`` reading (and the same site-configured
+    label keys) the remediation map is rendered from; the only difference is
+    the sentinel, which the wave policy turns into a one-node wave because the
+    fleet request model must name a domain for every node it rolls.
+    """
+
     expected = set(node_names)
     result = {}
     for item in gpu_node_items(release, target):
@@ -298,15 +398,15 @@ def target_node_failure_domains(
         node_id = str(metadata.get("name") or "")
         if node_id not in expected:
             continue
-        labels = metadata.get("labels") or {}
-        result[node_id] = next(
-            (
-                str(labels[label])
-                for label in FAILURE_DOMAIN_LABELS
-                if str(labels.get(label) or "").strip()
+        domain = node_failure_domain(
+            metadata.get("labels") or {},
+            # A release config predating the site field (or a legacy rollback
+            # snapshot) uses the shared default priority.
+            label_keys=getattr(
+                release.config, "failure_domain_labels", FAILURE_DOMAIN_LABELS
             ),
-            "UNKNOWN",
         )
+        result[node_id] = UNKNOWN_FAILURE_DOMAIN if domain is None else domain
     if set(result) != expected:
         raise ReleaseError(
             f"{target.cluster_id} failure-domain inventory is incomplete"
@@ -474,7 +574,7 @@ def node_rollout_policy(
     domains = set(failure_domains.values())
     if not node_count:
         raise ReleaseError("upgrade rollout policy has no nodes")
-    if "UNKNOWN" in domains:
+    if UNKNOWN_FAILURE_DOMAIN in domains:
         effective = 1
         per_domain = 1
     else:
@@ -515,7 +615,7 @@ def rollback_node_rollout_policy(
     domains = set(failure_domains.values())
     if not node_count:
         raise ReleaseError("rollback rollout policy has no nodes")
-    if "UNKNOWN" in domains:
+    if UNKNOWN_FAILURE_DOMAIN in domains:
         effective = 1
         per_domain = 1
     else:

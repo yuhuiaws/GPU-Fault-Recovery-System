@@ -1123,22 +1123,22 @@ print(json.dumps({"Version": "2012-10-17", "Statement": statements}))
 }
 
 # What this script creates is not in the installation resource registry
-# (S12). `gpu-fault-admin uninstall --cpu-cluster-arn <eks-arn>
-# --gpu-cluster-arn <eks-arn>` rebuilds ownership of the Aurora cluster,
-# its instances, subnet group, security group and the IRSA roles from the
-# live namespace -- but only while Secret ${NAMESPACE}/gpu-fault-aurora
-# exists; the cluster parameter group only while the cluster still runs on it.
+# (S12), and `gpu-fault-admin uninstall` only works from a managed state
+# directory (`site.yaml`), so nothing rebuilds ownership of the Aurora
+# cluster, its instances, subnet group, security group and the IRSA roles:
+# they are removed by hand, and the Secret ${NAMESPACE}/gpu-fault-aurora is
+# the record of which cluster that is.
 registry_warning() {
     cat >&2 <<EOF
 
 WARNING: the legacy deploy writes no installation resource registry. The
 deletion-protected Aurora cluster ${AURORA_CLUSTER_ID}, its writer/reader,
 DB subnet group and security group ${AURORA_CLUSTER_ID}, and the IRSA roles
-are only reachable by \`gpu-fault-admin uninstall --cpu-cluster-arn ... \
---gpu-cluster-arn ...\`, which discovers them through Secret
-${NAMESPACE}/gpu-fault-aurora -- do not delete that Secret first. The cluster
-parameter group ${AURORA_CLUSTER_ID}-pg is picked up only while it is the group
-the cluster runs on.
+are not reachable by \`gpu-fault-admin uninstall\`, which only uninstalls a
+site deployed by \`gpu-fault-admin deploy\`; they are deleted by hand. Secret
+${NAMESPACE}/gpu-fault-aurora names the cluster: do not delete that Secret first.
+The cluster parameter group ${AURORA_CLUSTER_ID}-pg belongs to the stack
+only while it is the group the cluster runs on.
 EOF
 }
 
@@ -2129,7 +2129,7 @@ EOF
     # ingress capacity budget and made the ingress replicas export
     # gpu_fault_processor_workers for pools they never create. They are
     # also absent from generated/gpu-fault-api-ha-ingress.yaml, and
-    # verify-control-plane-role-split.sh fails the deploy if a stale
+    # verify_control_plane_role_split.py fails the deploy if a stale
     # `set env` value puts them back.
     kubectl -n "${NAMESPACE}" set env \
         deployment/gpu-fault-api-ha \
@@ -2180,10 +2180,27 @@ EOF
     kubectl -n "${NAMESPACE}" rollout status \
         deployment/gpu-fault-api-ha --timeout=10m
     if [[ "${AGENT_PIN_MIGRATION_PAUSED}" != "true" ]]; then
-        GPU_FAULT_NAMESPACE="${NAMESPACE}" \
-            GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
-            "${REPO_DIR}/deploy/control-plane/tools/verify-control-plane-role-split.sh"
+        verify_control_plane_role_split
     fi
+}
+
+# The role-split verifier, then the CPU-plane registry sync that used to trail
+# it (this legacy path has no engine to refresh the registry for it).
+verify_control_plane_role_split() {
+    GPU_FAULT_NAMESPACE="${NAMESPACE}" \
+        GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
+        python3 "${REPO_DIR}/deploy/control-plane/tools/verify_control_plane_role_split.py"
+    local registry_args=(
+        --plane cpu
+        --namespace "${NAMESPACE}"
+        --release-id "${GPU_FAULT_RELEASE_ID:-verified}"
+    )
+    if [[ -n "${KUBECONFIG:-}" ]]; then
+        registry_args+=(--kubeconfig "${KUBECONFIG}")
+    fi
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${REPO_DIR}/deploy/control-plane/tools/sync_installed_resource_registry.py" \
+        "${registry_args[@]}"
 }
 
 pause_control_workers_for_agent_pin_migration() {
@@ -2204,9 +2221,7 @@ resume_control_workers_after_agent_pin_migration() {
     kubectl -n "${NAMESPACE}" rollout status \
         deployment/gpu-fault-control-worker --timeout=10m
     AGENT_PIN_MIGRATION_PAUSED=false
-    GPU_FAULT_NAMESPACE="${NAMESPACE}" \
-        GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
-        "${REPO_DIR}/deploy/control-plane/tools/verify-control-plane-role-split.sh"
+    verify_control_plane_role_split
 }
 
 finalize_agent_pin_migration() {

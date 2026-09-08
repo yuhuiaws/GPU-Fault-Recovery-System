@@ -440,7 +440,7 @@ def test_regional_restart_covers_every_running_role_in_order() -> None:
     ingress = script.index("gpu-fault-api-ha")
     assert spool < worker < ingress
     assert "replicas == 0" in script
-    assert "verify-control-plane-role-split.sh" in script
+    assert "verify_control_plane_role_split.py" in script
     assert "set KUBECONFIG" in script
 
 

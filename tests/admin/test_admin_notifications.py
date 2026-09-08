@@ -8,8 +8,17 @@ import pytest
 
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.notifications import (
+    NotificationRouting,
     ensure_email_notifications,
+    ensure_ses_identity,
     resolve_admin_email,
+    ses_identity_verified,
+)
+
+ROUTING = NotificationRouting(
+    sender="sender@example.com",
+    recipients=("ops@example.com", "oncall@example.com"),
+    subject_prefix="[PROD]",
 )
 
 
@@ -105,9 +114,7 @@ def test_email_notifications_require_verified_ses_and_apply_secret(
         namespace="gpu-fault-system",
         site_id="site-a",
         admin_email="ops@example.com",
-        sender_email="sender@example.com",
-        recipients=("ops@example.com", "oncall@example.com"),
-        subject_prefix="[PROD]",
+        routing=ROUTING,
     )
 
     assert result["sender_email"] == "sender@example.com"
@@ -138,20 +145,77 @@ def test_email_notifications_require_verified_ses_and_apply_secret(
     assert "--from-literal=aws-account-id=123456789012" in secret_command
 
 
-def test_unverified_ses_identity_blocks_deploy(tmp_path: Path) -> None:
+def test_unverified_ses_identity_is_recorded_not_fatal(tmp_path: Path) -> None:
+    """The verification gate moved to the deploy's first minute.
+
+    ``gpu-fault-admin deploy`` checks the sender identity before any gate or
+    build (``notification_precheck``); by the time this bootstrap task runs the
+    identity is verified, and if an internal hop bypassed the check the task
+    records the pending status instead of failing a bootstrap minutes in.
+    """
+
     runner = Runner(
-        [{"VerifiedForSendingStatus": False, "VerificationStatus": "PENDING"}]
+        [
+            {"VerifiedForSendingStatus": False, "VerificationStatus": "PENDING"},
+            {"SendingEnabled": True, "ProductionAccessEnabled": False},
+        ]
     )
 
-    with pytest.raises(BootstrapError, match="complete verification"):
-        ensure_email_notifications(
-            runner,
-            cpu=_cpu(),
-            cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
-            namespace="gpu-fault-system",
-            site_id="site-a",
-            admin_email="ops@example.com",
-        )
+    result = ensure_email_notifications(
+        runner,
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        routing=ROUTING,
+    )
+
+    assert result["verified"] is False
+    assert result["verification_status"] == "PENDING"
+    assert any(
+        command[0] == "run"
+        and "create" in command[1]
+        and "gpu-fault-email" in command[1]
+        for command in runner.commands
+    ), "the email Secret is applied whatever the verification status"
+
+
+def test_ensure_ses_identity_sends_the_verification_once(tmp_path: Path) -> None:
+    """An absent identity is created (SES mails the link); a present one is read."""
+
+    runner = Runner(
+        [
+            BootstrapError("NotFoundException"),
+            {"VerifiedForSendingStatus": False, "VerificationStatus": "PENDING"},
+        ]
+    )
+
+    identity, created = ensure_ses_identity(
+        runner, region="us-west-2", sender="sender@example.com", site_id="site-a"
+    )
+
+    assert created is True
+    assert ses_identity_verified(identity) is False
+    creates = [
+        command
+        for command in runner.commands
+        if command[0] == "run" and "create-email-identity" in command[1]
+    ]
+    assert len(creates) == 1
+    assert "Key=gpu-fault:site-id,Value=site-a" in creates[0][1]
+
+    existing = Runner(
+        [{"VerifiedForSendingStatus": True, "VerificationStatus": "SUCCESS"}]
+    )
+    identity, created = ensure_ses_identity(
+        existing, region="us-west-2", sender="sender@example.com", site_id="site-a"
+    )
+    assert created is False
+    assert ses_identity_verified(identity) is True
+    assert not any(command[0] == "run" for command in existing.commands), (
+        "a present identity is only read; no second verification mail"
+    )
 
 
 def test_verified_email_probe_reuses_matching_secret(tmp_path: Path) -> None:
@@ -180,9 +244,7 @@ def test_verified_email_probe_reuses_matching_secret(tmp_path: Path) -> None:
         namespace="gpu-fault-system",
         site_id="site-a",
         admin_email="ops@example.com",
-        sender_email="sender@example.com",
-        recipients=("ops@example.com", "oncall@example.com"),
-        subject_prefix="[PROD]",
+        routing=ROUTING,
     )
 
     mutating = [

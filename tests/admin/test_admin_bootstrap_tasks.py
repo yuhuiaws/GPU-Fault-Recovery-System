@@ -78,7 +78,7 @@ def test_pod_identity_agent_is_reproved_on_every_run(tmp_path: Path) -> None:
 
     log: list[tuple[str, bool, bool]] = []
     ensure = Recorder("pod_identity_agent", log)
-    runner = CommandRunner(dry_run=True)
+    runner = CommandRunner()
 
     bootstrap_tasks.revalidate_pod_identity_agent(
         runner, _state(tmp_path), _cluster(), "site-a", ensure
@@ -116,7 +116,7 @@ def test_a_probe_that_needs_a_mutation_falls_back_to_ensure(tmp_path: Path) -> N
         return {"agent": "reinstalled"}
 
     bootstrap_tasks.revalidate_pod_identity_agent(
-        CommandRunner(dry_run=True),
+        CommandRunner(),
         _state(tmp_path, completed={"pod_identity_agent": {"agent": "present"}}),
         _cluster(),
         "site-a",
@@ -128,7 +128,7 @@ def test_a_probe_that_needs_a_mutation_falls_back_to_ensure(tmp_path: Path) -> N
 
 def _run_prerequisites(tmp_path: Path, state: BootstrapState) -> None:
     bootstrap_tasks.run_platform_prerequisite_tasks(
-        runner=CommandRunner(dry_run=True),
+        runner=CommandRunner(),
         state=state,
         repository_root=tmp_path,
         cpu=_cluster(),
@@ -211,7 +211,7 @@ def _run_foundation(
     tmp_path: Path, state: BootstrapState, log: list[tuple[str, bool, bool]]
 ) -> dict[str, Any]:
     return bootstrap_tasks.run_foundation_tasks(
-        runner=CommandRunner(dry_run=True),
+        runner=CommandRunner(),
         state=state,
         cpu=_cluster(),
         gpu_clusters=[_gpu("gpu-a")],

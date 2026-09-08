@@ -10,6 +10,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -661,6 +662,76 @@ def load_release_artifacts(
     )
 
 
+RETENTION_ENVIRONMENT = (
+    "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS",
+)
+
+
+@dataclass(frozen=True)
+class RegionalRetentionConfig:
+    """``retention`` from the release config: ``site.yaml`` ``spec.retention``.
+
+    Off unless the days are positive; the runtime default is ``0`` and the
+    worker then never archives or deletes a control record. Rendered into the
+    control-worker environment only when on, so a site that never declared it
+    keeps exactly the environment it had.
+    """
+
+    control_record_retention_days: int = 0
+    archive_s3_uri: str | None = None
+    archive_interval_seconds: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.control_record_retention_days > 0
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> RegionalRetentionConfig:
+        if not value:
+            return cls()
+        days = value.get("control_record_retention_days", 0)
+        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+            raise ReleaseError(
+                "retention.control_record_retention_days must be an integer >= 0"
+            )
+        uri = value.get("archive_s3_uri")
+        uri = required_text(uri, "retention.archive_s3_uri") if uri else None
+        if uri is not None and not uri.startswith("s3://"):
+            raise ReleaseError("retention.archive_s3_uri must be an s3:// URI")
+        if days > 0 and uri is None:
+            raise ReleaseError(
+                "retention.archive_s3_uri is required when "
+                "control_record_retention_days > 0"
+            )
+        interval = value.get("archive_interval_seconds")
+        if interval is not None and (
+            isinstance(interval, bool) or not isinstance(interval, int) or interval < 1
+        ):
+            raise ReleaseError(
+                "retention.archive_interval_seconds must be a positive integer"
+            )
+        return cls(
+            control_record_retention_days=days,
+            archive_s3_uri=uri,
+            archive_interval_seconds=interval,
+        )
+
+    def environment(self) -> dict[str, str]:
+        """The control-worker variables; empty while retention is off."""
+
+        if not self.enabled or self.archive_s3_uri is None:
+            return {}
+        values = {
+            RETENTION_ENVIRONMENT[0]: str(self.control_record_retention_days),
+            RETENTION_ENVIRONMENT[1]: self.archive_s3_uri,
+        }
+        if self.archive_interval_seconds is not None:
+            values[RETENTION_ENVIRONMENT[2]] = str(self.archive_interval_seconds)
+        return values
+
+
 @dataclass(frozen=True)
 class ReleaseConfig:
     site_name: str
@@ -699,6 +770,10 @@ class ReleaseConfig:
     notifications: RegionalNotificationConfig
     admin_config: AdminConfig
     auto_rollback: bool = True
+    # Node label keys that name a failure domain, finest first. Read by the
+    # failure-domain ConfigMap render and by the fleet rollout's per-domain cap.
+    failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
+    retention: RegionalRetentionConfig = RegionalRetentionConfig()
 
     def for_rollback(
         self,
@@ -886,7 +961,26 @@ class ReleaseConfig:
             notifications=notifications,
             admin_config=admin_config,
             auto_rollback=bool(value.get("auto_rollback", True)),
+            failure_domain_labels=failure_domain_labels(
+                value.get("failure_domain_labels")
+            ),
+            retention=RegionalRetentionConfig.from_mapping(
+                dict(value.get("retention") or {})
+            ),
         )
+
+
+def failure_domain_labels(value: object) -> tuple[str, ...]:
+    """``failure_domain_labels`` from the release config, or the built-in priority."""
+
+    if value is None:
+        return FAILURE_DOMAIN_LABELS
+    if not isinstance(value, list) or not value:
+        raise ReleaseError("failure_domain_labels must be a non-empty list")
+    labels = tuple(required_text(item, "failure_domain_labels[]") for item in value)
+    if len(set(labels)) != len(labels):
+        raise ReleaseError("failure_domain_labels values must be unique")
+    return labels
 
 
 def render_nlb_manifest(config: ReleaseConfig, text: str) -> str:

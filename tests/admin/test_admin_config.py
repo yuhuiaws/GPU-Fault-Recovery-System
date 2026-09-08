@@ -2,37 +2,47 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
 
 from gpu_fault.admin.config import (
+    MAX_ACTIVE_PER_FAILURE_DOMAIN,
+    MAX_ACTIVE_PER_NODE,
     AdminConfig,
     AdminConfigError,
     AuroraCapacityConfig,
     CapacityConfig,
     ProcessorConfig,
-    admin_config_approval_path,
+    RemediationCapacity,
     admin_config_desired_path,
     admin_config_history_path,
-    admin_config_plan_path,
+    admin_config_pending_path,
+    admin_config_spec,
     aurora_min_acu_floor,
+    begin_admin_config_apply,
     canonical_sha256,
     complete_admin_config_apply,
-    create_admin_config_plan,
     default_admin_config,
+    default_admin_config_reference,
     load_desired_admin_config,
-    prepare_admin_config_apply,
+    load_pending_admin_config_apply,
+    matching_pending_admin_config_apply,
+    upgrade_legacy_record,
 )
 from gpu_fault.admin.config_file import (
     admin_config_file_path,
     initialize_desired_admin_config,
     load_admin_config_file,
 )
-from gpu_fault.admin.config_parser import AdminConfigParseError, boolean_field
-from gpu_fault.admin.config_patch import apply_capacity_patch, preset_admin_config
+from gpu_fault.admin.config_parser import (
+    AdminConfigParseError,
+    boolean_field,
+    camel_case,
+)
+from gpu_fault.admin.config_patch import apply_patch, preset_admin_config
 from gpu_fault.admin.site import SiteConfigError
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +56,8 @@ RELEASE_IDENTITY = {
     "manifest_sha256": "a" * 64,
     "staging_only": False,
 }
+APPROVER = "arn:aws:sts::123456789012:assumed-role/Admin/alice"
+STARTED = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
 
 
 def _config_file(tmp_path: Path, capacity: dict[str, object]) -> Path:
@@ -63,6 +75,123 @@ def _config_file(tmp_path: Path, capacity: dict[str, object]) -> Path:
     )
     path.chmod(0o600)
     return path
+
+
+def _begin(tmp_path: Path, desired: AdminConfig, **overrides):
+    arguments = {
+        "site_identity": SITE_IDENTITY,
+        "release_identity": RELEASE_IDENTITY,
+        "desired": desired,
+        "source": "file:/secure/admin-config.yaml",
+        "approver_identity": APPROVER,
+        "reference": "CHG-12345",
+        "started_at": STARTED,
+    }
+    arguments.update(overrides)
+    return begin_admin_config_apply(tmp_path, **arguments)
+
+
+# ---------------------------------------------------------------------------
+# The schema: one set of dataclasses, two spellings.
+# ---------------------------------------------------------------------------
+
+
+def test_default_as_dict_is_the_persisted_digest_contract() -> None:
+    """Every live desired.json digests exactly this tree; a key change here
+    would refuse every site on its next read. The two safety constants stay
+    in the record although they are no longer fields."""
+
+    expected = {
+        "schema_version": 1,
+        "capacity": {
+            "control_worker_replicas": 6,
+            "largest_cluster_node_count": 512,
+            "managed_node_count": 512,
+            "telemetry_spool": {"enabled": False, "replicas": 0},
+            "remediation": {
+                "max_active_region": 20,
+                "max_active_per_cluster": 5,
+                "max_active_per_resource_class": 2,
+                "max_active_per_node": 1,
+                "max_active_per_failure_domain": 1,
+            },
+        },
+        "aurora": {"min_acu": 8.0, "max_acu": 32.0},
+        "processor": {
+            "max_queue_depth": 65536,
+            "max_cluster_queue_depth": 4096,
+            "retry_after_seconds": 2,
+            "retry_backoff_seconds": 1,
+            "retry_backoff_max_seconds": 30,
+            "completed_retention_seconds": 600,
+        },
+        "workflow": {"poll_interval_seconds": 5.0, "dispatcher_workers": 8},
+        "notification_delivery": {"batch_size": 25, "max_attempts": 8},
+        "evidence": {"retention_hours": 24, "max_records_per_node": 10000},
+    }
+
+    config = default_admin_config()
+
+    assert config.as_dict() == expected
+    assert config.sha256() == canonical_sha256(expected)
+    assert AdminConfig.from_mapping(expected) == config
+
+
+def test_constant_budgets_are_readable_but_not_fields() -> None:
+    remediation = RemediationCapacity()
+
+    assert remediation.max_active_per_node == MAX_ACTIVE_PER_NODE == 1
+    assert remediation.max_active_per_failure_domain == MAX_ACTIVE_PER_FAILURE_DOMAIN
+    with pytest.raises(TypeError):
+        RemediationCapacity(max_active_per_node=1)  # type: ignore[call-arg]
+    # Old YAML may still spell them, at the constant value only.
+    accepted = apply_patch(
+        default_admin_config(), {"capacity": {"remediation": {"maxActivePerNode": 1}}}
+    )
+    assert accepted == default_admin_config()
+    with pytest.raises(
+        AdminConfigError, match="maxActivePerFailureDomain is fixed at 1"
+    ):
+        apply_patch(
+            default_admin_config(),
+            {"capacity": {"remediation": {"maxActivePerFailureDomain": 2}}},
+        )
+    # The persisted spelling behaves the same way.
+    raw = default_admin_config().as_dict()
+    raw["capacity"]["remediation"]["max_active_per_node"] = 2
+    with pytest.raises(AdminConfigError, match="max_active_per_node is fixed at 1"):
+        AdminConfig.from_mapping(raw)
+
+
+def test_yaml_spec_is_the_record_in_camel_case_without_constants() -> None:
+    def leaves(value: object, prefix: str = "") -> set[str]:
+        if not isinstance(value, dict):
+            return {prefix}
+        return set().union(
+            *(
+                leaves(item, f"{prefix}.{key}" if prefix else key)
+                for key, item in value.items()
+            )
+        )
+
+    config = preset_admin_config("32-enabled")
+    record = {k: v for k, v in config.as_dict().items() if k != "schema_version"}
+    spec = admin_config_spec(config)
+
+    camel_record = {
+        ".".join(camel_case(part) for part in leaf.split("."))
+        for leaf in leaves(record)
+    }
+    constants = {
+        "capacity.remediation.maxActivePerNode",
+        "capacity.remediation.maxActivePerFailureDomain",
+    }
+    assert leaves(spec) == camel_record - constants
+    assert len(leaves(spec)) == 22
+    assert camel_case("notification_delivery") == "notificationDelivery"
+    assert camel_case("min_acu") == "minAcu"
+    # Round trip: the spec read back on top of the defaults is the config.
+    assert apply_patch(default_admin_config(), spec) == config
 
 
 def test_capacity_presets_are_coherent_and_bounded() -> None:
@@ -176,6 +305,11 @@ def test_fault_reserved_depths_derive_from_node_count_and_queue_depth() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Legacy records: read as what the site really ran, digested as they were.
+# ---------------------------------------------------------------------------
+
+
 def test_legacy_persisted_config_without_node_counts_derives_them_from_depth() -> None:
     # A desired.json written before node counts existed carries depth 1024 and
     # no node counts; it must load as a 256-node cluster, not as the new 512
@@ -197,6 +331,24 @@ def test_legacy_persisted_config_without_node_counts_derives_them_from_depth() -
     assert AdminConfig.from_mapping({}).capacity == CapacityConfig()
 
 
+def test_upgrade_legacy_record_fills_only_what_the_record_predates() -> None:
+    upgraded = upgrade_legacy_record(
+        {"capacity": {"largest_cluster_node_count": 300}, "processor": {}}
+    )
+    assert upgraded["aurora"] == {"min_acu": 0.5, "max_acu": 8.0}
+    assert upgraded["capacity"] == {
+        "largest_cluster_node_count": 300,
+        "managed_node_count": 300,
+    }
+    complete = default_admin_config().as_dict()
+    assert upgrade_legacy_record(complete) == complete
+    # A malformed section is left alone for the reader to reject by name.
+    with pytest.raises(
+        AdminConfigError, match="admin config.capacity must be a mapping"
+    ):
+        AdminConfig.from_mapping({"capacity": ["x"]})
+
+
 def test_recorded_state_below_the_aurora_floor_loads_but_cannot_be_planned() -> None:
     # A site that predates the floor really runs 0.5/8 ACU (the hidden legacy
     # baseline). Reading that fact must not fail, or the administrator could
@@ -211,10 +363,10 @@ def test_recorded_state_below_the_aurora_floor_loads_but_cannot_be_planned() -> 
     with pytest.raises(AdminConfigError, match="spec.aurora.minAcu"):
         recorded.validate()
     with pytest.raises(AdminConfigError, match="spec.aurora.minAcu"):
-        apply_capacity_patch(recorded, {"controlWorkerReplicas": 5})
+        apply_patch(recorded, {"capacity": {"controlWorkerReplicas": 5}})
 
 
-def test_capacity_patch_accepts_node_counts_and_preset_adopts_its_aurora_floor(
+def test_patch_accepts_node_counts_and_a_preset_adopts_its_aurora_floor(
     tmp_path: Path,
 ) -> None:
     # 4000 nodes need 40 ACU (section 13.3 ratio), so the base has to carry it
@@ -223,28 +375,41 @@ def test_capacity_patch_accepts_node_counts_and_preset_adopts_its_aurora_floor(
         default_admin_config(),
         aurora=AuroraCapacityConfig(min_acu=100.0, max_acu=200.0),
     )
-    patched = apply_capacity_patch(
-        generous, {"largestClusterNodeCount": 1000, "managedNodeCount": 4000}
+    patched = apply_patch(
+        generous,
+        {"capacity": {"largestClusterNodeCount": 1000, "managedNodeCount": 4000}},
     )
     assert patched.capacity.largest_cluster_node_count == 1000
     assert patched.capacity.managed_node_count == 4000
     with pytest.raises(AdminConfigError, match="spec.aurora.minAcu"):
-        apply_capacity_patch(default_admin_config(), {"managedNodeCount": 8192})
+        apply_patch(default_admin_config(), {"capacity": {"managedNodeCount": 8192}})
     with pytest.raises(AdminConfigError, match="managedNodeCount"):
-        apply_capacity_patch(default_admin_config(), {"largestClusterNodeCount": 1024})
+        apply_patch(
+            default_admin_config(), {"capacity": {"largestClusterNodeCount": 1024}}
+        )
 
     # A preset names a topology; choosing it raises Aurora to that topology's
     # floor when the current value is below it, and never lowers it.
-    from_default = apply_capacity_patch(
-        default_admin_config(), {"preset": "32-disabled"}
+    from_default = apply_patch(
+        default_admin_config(), {"capacity": {"preset": "32-disabled"}}
     )
     assert from_default.aurora == AuroraCapacityConfig(min_acu=82.0, max_acu=128.0)
-    assert apply_capacity_patch(generous, {"preset": "32-disabled"}).aurora == (
+    assert apply_patch(generous, {"capacity": {"preset": "32-disabled"}}).aurora == (
         generous.aurora
     )
-    assert apply_capacity_patch(from_default, {"preset": "default"}).aurora == (
+    assert apply_patch(from_default, {"capacity": {"preset": "default"}}).aurora == (
         from_default.aurora
     )
+    # Explicit fields in the same document override the preset's values.
+    tuned = apply_patch(
+        default_admin_config(),
+        {"capacity": {"preset": "32-disabled", "controlWorkerReplicas": 5}},
+    )
+    assert tuned.capacity.control_worker_replicas == 5
+    assert tuned.capacity.remediation.max_active_region == 128
+    with pytest.raises(AdminConfigError, match="unknown capacity preset"):
+        apply_patch(default_admin_config(), {"capacity": {"preset": "64-enabled"}})
+
     path = _config_file(
         tmp_path, {"largestClusterNodeCount": 600, "managedNodeCount": 1200}
     )
@@ -278,8 +443,8 @@ def test_node_counts_change_every_role_digest() -> None:
     # The derived fault reserve is rendered into every role's environment, so
     # a node count change that leaves all digests alone would never roll.
     current = default_admin_config()
-    desired = apply_capacity_patch(
-        current, {"largestClusterNodeCount": 600, "managedNodeCount": 600}
+    desired = apply_patch(
+        current, {"capacity": {"largestClusterNodeCount": 600, "managedNodeCount": 600}}
     )
     for role, digest in desired.role_sha256().items():
         assert digest != current.role_sha256()[role], (
@@ -379,12 +544,18 @@ def test_admin_config_rejects_unsafe_or_incoherent_values(tmp_path: Path) -> Non
     with pytest.raises(AdminConfigError, match="disabled telemetry spool"):
         load_admin_config_file(path)
 
-    path = _config_file(tmp_path, {"remediation": {"maxActivePerNode": 1}})
-    with pytest.raises(AdminConfigError, match="unknown fields"):
+    path = _config_file(tmp_path, {"remediation": {"maxActivePerNode": 2}})
+    with pytest.raises(AdminConfigError, match="maxActivePerNode is fixed at 1"):
         load_admin_config_file(path)
 
     path = _config_file(tmp_path, {"controlWorkerReplicas": 8})
     with pytest.raises(AdminConfigError, match="connection ceiling"):
+        load_admin_config_file(path)
+
+    path = _config_file(tmp_path, {"controlWorkerReplicas": "6"})
+    with pytest.raises(
+        AdminConfigError, match="spec.capacity.controlWorkerReplicas must be an integer"
+    ):
         load_admin_config_file(path)
 
     config = default_admin_config()
@@ -408,160 +579,284 @@ def test_admin_config_file_must_be_private_and_rejects_unknown_fields(
         load_admin_config_file(path)
 
 
-def test_plan_apply_persists_audited_desired_config(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# The apply record: pending.json and history/<started>-<sha>/.
+# ---------------------------------------------------------------------------
+
+
+def test_begin_records_the_attempt_and_complete_closes_it(tmp_path: Path) -> None:
     initialize_desired_admin_config(tmp_path)
+    before_record = json.loads(admin_config_desired_path(tmp_path).read_text())
     desired = preset_admin_config("32-disabled")
-    plan = create_admin_config_plan(
-        tmp_path,
-        site_identity=SITE_IDENTITY,
-        release_identity=RELEASE_IDENTITY,
-        desired=desired,
-        source="preset:32-disabled",
-    )
-    approved_at = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
 
-    prepared = prepare_admin_config_apply(
-        tmp_path,
-        expected_plan_sha256=str(plan["plan_sha256"]),
-        reference="CHG-12345",
-        current_release_identity=RELEASE_IDENTITY,
-        approved_at=approved_at,
-    )
+    apply = _begin(tmp_path, desired)
 
-    assert prepared.no_op is False
+    assert apply.no_op is False
+    assert apply.resumed is False
+    assert apply.affected_roles == ["ingress", "spool", "worker"]
+    assert apply.aurora_changed is True
+    assert apply.history == f"20260901T010000Z-{desired.sha256()}"
+    pending = json.loads(admin_config_pending_path(tmp_path).read_text())
+    assert pending == apply.record
+    assert set(pending) == {
+        "schema_version",
+        "history",
+        "started_at",
+        "source",
+        "reference",
+        "approver_identity",
+        "site_identity",
+        "release_identity",
+        "before_config",
+        "before_config_sha256",
+        "desired_config",
+        "desired_config_sha256",
+        "affected_roles",
+        "aurora_changed",
+        "changes",
+    }
+    assert pending["approver_identity"] == APPROVER
+    assert pending["reference"] == "CHG-12345"
+    assert pending["before_config_sha256"] == default_admin_config().sha256()
+    assert pending["desired_config_sha256"] == desired.sha256()
+    history = admin_config_history_path(tmp_path, apply.history)
+    assert json.loads((history / "before.json").read_text()) == before_record
+    assert not (history / "result.json").exists(), "begin already wrote a result"
+    live = json.loads(admin_config_desired_path(tmp_path).read_text())
     assert load_desired_admin_config(tmp_path) == desired
+    assert live["source"] == f"pending-apply:{apply.history}"
+    assert live["approver_identity"] == APPROVER
+    assert live["reference"] == "CHG-12345"
     assert tmp_path.stat().st_mode & 0o777 == 0o700
     assert admin_config_desired_path(tmp_path).stat().st_mode & 0o777 == 0o600
-    assert admin_config_approval_path(tmp_path).is_file(), (
-        "admin config approval was not persisted"
-    )
-    history = admin_config_history_path(tmp_path, str(plan["plan_sha256"]))
-    assert json.loads((history / "plan.json").read_text()) == plan
 
-    result = complete_admin_config_apply(
+    result_path = complete_admin_config_apply(
         tmp_path,
-        expected_plan_sha256=str(plan["plan_sha256"]),
+        config_sha256=desired.sha256(),
         release_id="release-a",
         success=True,
-        completed_at=datetime(2026, 9, 1, 1, 5, tzinfo=UTC),
+        details={"aurora": {"modified": True}},
+        completed_at=STARTED + timedelta(minutes=5),
     )
 
-    assert json.loads(result.read_text())["status"] == "APPLIED"
-    assert not admin_config_plan_path(tmp_path).exists(), (
-        "successful apply left the active plan behind"
+    assert result_path == history / "result.json"
+    result = json.loads(result_path.read_text())
+    assert result["status"] == "APPLIED"
+    assert result["approver_identity"] == APPROVER
+    assert result["release_id"] == "release-a"
+    assert result["config_sha256"] == desired.sha256()
+    assert result["details"] == {"aurora": {"modified": True}}
+    assert json.loads((history / "after.json").read_text()) == live
+    assert not admin_config_pending_path(tmp_path).exists(), (
+        "successful apply left pending.json behind"
     )
-    assert not admin_config_approval_path(tmp_path).exists(), (
-        "successful apply left the active approval behind"
-    )
+    assert load_desired_admin_config(tmp_path) == desired
 
 
-def test_failed_apply_keeps_plan_and_supports_idempotent_resume(tmp_path: Path) -> None:
+def test_failed_apply_restores_before_and_the_rerun_is_a_new_attempt(
+    tmp_path: Path,
+) -> None:
     initialize_desired_admin_config(tmp_path)
     desired = preset_admin_config("50-disabled")
-    plan = create_admin_config_plan(
-        tmp_path,
-        site_identity=SITE_IDENTITY,
-        release_identity=RELEASE_IDENTITY,
-        desired=desired,
-        source="preset:50-disabled",
-    )
-    first = prepare_admin_config_apply(
-        tmp_path,
-        expected_plan_sha256=str(plan["plan_sha256"]),
-        reference="MW-2026-09-01",
-        current_release_identity=RELEASE_IDENTITY,
-    )
-    repeated = prepare_admin_config_apply(
-        tmp_path,
-        expected_plan_sha256=str(plan["plan_sha256"]),
-        reference="MW-2026-09-01",
-        current_release_identity=RELEASE_IDENTITY,
-    )
-    assert repeated.config == first.config
+    first = _begin(tmp_path, desired)
 
     complete_admin_config_apply(
         tmp_path,
-        expected_plan_sha256=str(plan["plan_sha256"]),
+        config_sha256=desired.sha256(),
         release_id="release-a",
         success=False,
         error="verification failed",
     )
 
-    assert admin_config_plan_path(tmp_path).is_file(), (
-        "failed apply did not retain its retryable plan"
-    )
-    assert admin_config_approval_path(tmp_path).is_file(), (
-        "failed apply did not retain its approval"
-    )
     assert load_desired_admin_config(tmp_path) == default_admin_config()
-    assert (
-        prepare_admin_config_apply(
-            tmp_path,
-            expected_plan_sha256=str(plan["plan_sha256"]),
-            reference="MW-2026-09-01",
-            current_release_identity=RELEASE_IDENTITY,
-        ).config
-        == desired
+    restored = json.loads(admin_config_desired_path(tmp_path).read_text())
+    assert restored["source"] == f"rollback-after-failed-apply:{first.history}"
+    first_result = json.loads(
+        (admin_config_history_path(tmp_path, first.history) / "result.json").read_text()
+    )
+    assert first_result["status"] == "FAILED"
+    assert first_result["error"] == "verification failed"
+    assert admin_config_pending_path(tmp_path).is_file(), (
+        "failed apply did not keep pending.json for the resume"
     )
 
+    second = _begin(
+        tmp_path,
+        desired,
+        started_at=STARTED + timedelta(hours=1),
+        reference="CHG-12345-RETRY",
+        approver_identity="arn:aws:sts::123456789012:assumed-role/Admin/bob",
+    )
 
-def test_apply_rejects_release_drift_before_persisting_desired_config(
+    assert second.resumed is True
+    assert second.history == f"20260901T020000Z-{desired.sha256()}"
+    assert second.reference == "CHG-12345-RETRY"
+    assert load_desired_admin_config(tmp_path) == desired
+    second_before = json.loads(
+        (
+            admin_config_history_path(tmp_path, second.history) / "before.json"
+        ).read_text()
+    )
+    assert second_before == restored
+    complete_admin_config_apply(
+        tmp_path, config_sha256=desired.sha256(), release_id="release-a", success=True
+    )
+    assert not admin_config_pending_path(tmp_path).exists(), (
+        "successful retry left pending.json behind"
+    )
+    assert (
+        admin_config_history_path(tmp_path, first.history) / "result.json"
+    ).is_file(), "the retry erased the failed attempt's record"
+
+
+def test_interrupted_apply_resumes_in_the_same_attempt(tmp_path: Path) -> None:
+    """A crash between begin and complete: desired.json already names the
+    target, no result was written, and the rerun continues that attempt."""
+
+    initialize_desired_admin_config(tmp_path)
+    desired = preset_admin_config("32-enabled")
+    first = _begin(tmp_path, desired)
+    pending_before = admin_config_pending_path(tmp_path).read_bytes()
+
+    resumed = _begin(tmp_path, desired, started_at=STARTED + timedelta(hours=1))
+
+    assert resumed.resumed is True
+    assert resumed.history == first.history
+    assert resumed.record == first.record
+    assert admin_config_pending_path(tmp_path).read_bytes() == pending_before
+    assert (
+        matching_pending_admin_config_apply(
+            tmp_path,
+            site_identity=SITE_IDENTITY,
+            release_identity=RELEASE_IDENTITY,
+            desired=desired,
+        )
+        == first.record
+    )
+    assert (
+        matching_pending_admin_config_apply(
+            tmp_path,
+            site_identity=SITE_IDENTITY,
+            release_identity={**RELEASE_IDENTITY, "manifest_sha256": "b" * 64},
+            desired=desired,
+        )
+        is None
+    ), "a different signed release matched the pending apply"
+    assert (
+        matching_pending_admin_config_apply(
+            tmp_path,
+            site_identity=SITE_IDENTITY,
+            release_identity=RELEASE_IDENTITY,
+            desired=preset_admin_config("50-enabled"),
+        )
+        is None
+    ), "a different target matched the pending apply"
+
+
+def test_a_different_target_supersedes_an_unfinished_pending_apply(
+    tmp_path: Path,
+) -> None:
+    initialize_desired_admin_config(tmp_path)
+    first = _begin(tmp_path, preset_admin_config("32-disabled"))
+    # The crashed attempt was never completed, so desired.json still names
+    # its target; the new apply starts from there.
+    replacement = preset_admin_config("50-disabled")
+
+    second = _begin(tmp_path, replacement, started_at=STARTED + timedelta(hours=1))
+
+    first_result = json.loads(
+        (admin_config_history_path(tmp_path, first.history) / "result.json").read_text()
+    )
+    assert first_result["status"] == "SUPERSEDED"
+    assert first_result["release_id"] is None
+    assert second.resumed is False
+    assert second.before == preset_admin_config("32-disabled")
+    assert load_pending_admin_config_apply(tmp_path) == second.record
+
+
+def test_resume_refuses_a_desired_json_that_moved_underneath(tmp_path: Path) -> None:
+    initialize_desired_admin_config(tmp_path)
+    desired = preset_admin_config("32-disabled")
+    _begin(tmp_path, desired)
+    path = admin_config_desired_path(tmp_path)
+    foreign = preset_admin_config("50-enabled")
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config": foreign.as_dict(),
+                "config_sha256": foreign.sha256(),
+                "role_sha256": foreign.role_sha256(),
+                "source": "by-hand",
+                "updated_at": "2026-09-01T02:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AdminConfigError, match="changed after the interrupted apply"):
+        _begin(tmp_path, desired)
+
+
+def test_no_op_apply_writes_nothing(tmp_path: Path) -> None:
+    initialize_desired_admin_config(tmp_path)
+    before = admin_config_desired_path(tmp_path).read_bytes()
+
+    apply = _begin(tmp_path, default_admin_config())
+
+    assert apply.no_op is True
+    assert apply.record["changes"] == []
+    assert apply.affected_roles == []
+    assert not admin_config_pending_path(tmp_path).exists(), (
+        "a no-op wrote pending.json"
+    )
+    assert not (tmp_path / "admin-config/history").exists(), "a no-op wrote history"
+    assert admin_config_desired_path(tmp_path).read_bytes() == before
+
+
+def test_reference_defaults_to_approver_and_time_and_approver_is_required(
     tmp_path: Path,
 ) -> None:
     initialize_desired_admin_config(tmp_path)
     desired = preset_admin_config("32-disabled")
-    plan = create_admin_config_plan(
-        tmp_path,
-        site_identity=SITE_IDENTITY,
-        release_identity=RELEASE_IDENTITY,
-        desired=desired,
-        source="preset:32-disabled",
+
+    apply = _begin(tmp_path, desired, reference=None)
+
+    assert apply.reference == f"{APPROVER}:20260901T010000Z"
+    assert apply.reference == default_admin_config_reference(APPROVER, STARTED)
+    # A user@host fallback identity still yields a well-formed reference.
+    assert default_admin_config_reference("alice@deploy-host", STARTED) == (
+        "alice-deploy-host:20260901T010000Z"
     )
-
-    with pytest.raises(AdminConfigError, match="signed release differs"):
-        prepare_admin_config_apply(
-            tmp_path,
-            expected_plan_sha256=str(plan["plan_sha256"]),
-            reference="CHG-12345",
-            current_release_identity={**RELEASE_IDENTITY, "manifest_sha256": "b" * 64},
-        )
-
-    assert load_desired_admin_config(tmp_path) == default_admin_config()
-    assert not admin_config_approval_path(tmp_path).exists(), (
-        "release drift persisted an approval before applying desired config"
-    )
+    assert len(default_admin_config_reference("x" * 300, STARTED)) == 128
+    with pytest.raises(AdminConfigError, match="--reference must be"):
+        _begin(tmp_path, desired, reference="bad reference with spaces")
+    with pytest.raises(AdminConfigError, match="approver identity must be non-empty"):
+        _begin(tmp_path, desired, approver_identity="  ")
 
 
-def test_new_plan_supersedes_an_active_approval(tmp_path: Path) -> None:
+def test_tampered_pending_record_fails_closed_and_names_the_next_command(
+    tmp_path: Path,
+) -> None:
     initialize_desired_admin_config(tmp_path)
-    first_plan = create_admin_config_plan(
-        tmp_path,
-        site_identity=SITE_IDENTITY,
-        release_identity=RELEASE_IDENTITY,
-        desired=preset_admin_config("32-disabled"),
-        source="preset:32-disabled",
-    )
-    prepare_admin_config_apply(
-        tmp_path,
-        expected_plan_sha256=str(first_plan["plan_sha256"]),
-        reference="CHG-12345",
-        current_release_identity=RELEASE_IDENTITY,
-    )
+    desired = preset_admin_config("32-disabled")
+    _begin(tmp_path, desired)
+    path = admin_config_pending_path(tmp_path)
+    record = json.loads(path.read_text())
+    record["affected_roles"] = ["worker"]
+    path.write_text(json.dumps(record), encoding="utf-8")
 
-    replacement = create_admin_config_plan(
-        tmp_path,
-        site_identity=SITE_IDENTITY,
-        release_identity=RELEASE_IDENTITY,
-        desired=preset_admin_config("50-disabled"),
-        source="preset:50-disabled",
-    )
+    with pytest.raises(AdminConfigError) as error:
+        load_pending_admin_config_apply(tmp_path)
 
-    history = admin_config_history_path(tmp_path, str(first_plan["plan_sha256"]))
-    superseded = json.loads((history / "superseded.json").read_text())
-    assert superseded["replacement_plan_sha256"] == replacement["plan_sha256"]
-    assert not admin_config_approval_path(tmp_path).exists(), (
-        "replacement plan left the superseded approval active"
-    )
+    message = str(error.value)
+    assert "affected_roles does not match" in message
+    assert f"gpu-fault-admin config --state-dir {tmp_path}" in message
+    assert "plan" not in message.replace("pending admin config apply", "")
+    with pytest.raises(AdminConfigError, match="rerun gpu-fault-admin config"):
+        complete_admin_config_apply(
+            tmp_path, config_sha256="c" * 64, release_id="release-a", success=True
+        )
 
 
 def test_tampered_desired_config_fails_closed(tmp_path: Path) -> None:
@@ -575,7 +870,9 @@ def test_tampered_desired_config_fails_closed(tmp_path: Path) -> None:
         load_desired_admin_config(tmp_path)
 
 
-def _legacy_capacity_record(config) -> dict[str, object]:
+def legacy_capacity_record(config: AdminConfig) -> dict[str, object]:
+    """The first release's desired.json: capacity only, capacity-only role digests."""
+
     capacity = config.capacity
     content = {"schema_version": 1, "capacity": capacity.as_dict()}
     return {
@@ -610,7 +907,7 @@ def test_legacy_capacity_only_desired_config_is_verified_and_migrated(
     )
     path = admin_config_desired_path(tmp_path)
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(_legacy_capacity_record(desired)), encoding="utf-8")
+    path.write_text(json.dumps(legacy_capacity_record(desired)), encoding="utf-8")
 
     assert load_desired_admin_config(tmp_path) == desired
     initialize_desired_admin_config(tmp_path)
@@ -656,7 +953,7 @@ def test_legacy_full_admin_config_preserves_hidden_aurora_baseline(
 def test_tampered_legacy_capacity_only_desired_config_fails_closed(
     tmp_path: Path,
 ) -> None:
-    record = _legacy_capacity_record(preset_admin_config("32-disabled"))
+    record = legacy_capacity_record(preset_admin_config("32-disabled"))
     record["config"]["capacity"]["control_worker_replicas"] = 7
     path = admin_config_desired_path(tmp_path)
     path.parent.mkdir(parents=True)
@@ -786,6 +1083,8 @@ def test_initialization_materializes_private_editable_config(tmp_path: Path) -> 
     assert editable.is_file(), "initialization did not create admin-config.yaml"
     assert editable.stat().st_mode & 0o777 == 0o600
     assert load_admin_config_file(editable) == initialized
+    document = yaml.safe_load(editable.read_text(encoding="utf-8"))
+    assert document["spec"] == admin_config_spec(initialized)
 
 
 @pytest.mark.parametrize(

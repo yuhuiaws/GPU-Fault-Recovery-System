@@ -244,7 +244,7 @@ def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
         site=site,
         cpu_disposition="keep",
         confirmation="UNINSTALL_GPU_FAULT",
-        final_snapshot_policy="skip",
+        reset_database=True,
     )
     _delete_aurora_last(cleaner, snapshot, request, state)
 
@@ -474,3 +474,141 @@ def test_legacy_online_registry_is_backfilled_without_manual_cleanup(
     assert direct_syncs[0].resources[0].status is (
         admin_uninstall.InstallationResourceStatus.DELETE_PENDING
     )
+
+
+def _aurora_stack() -> list[InstallationResource]:
+    return [
+        _resource("aws/aurora/cluster", "aurora_cluster", "test-aurora"),
+        _resource(
+            "aws/aurora/instance/writer", "aurora_instance", "test-aurora-writer"
+        ),
+        _resource("aws/aurora/secret", "rds_managed_secret", "test-aurora-secret"),
+        _resource(
+            "aws/aurora/subnet-group", "rds_db_subnet_group", "test-aurora-subnets"
+        ),
+        _resource("aws/aurora/security-group", "security_group", "sg-aurora"),
+        _resource(
+            "aws/aurora/parameter-group", "rds_cluster_parameter_group", "test-pg"
+        ),
+    ]
+
+
+def test_keep_mode_is_a_reinstall_and_preserves_the_aurora_stack() -> None:
+    """``--cpu-cluster keep`` keeps the site's incident, workflow and registry
+    records: every Aurora-phase resource stays, whatever the registry's own
+    delete policy says, and even for a legacy REUSED record."""
+
+    for resource in _aurora_stack():
+        for ownership in (
+            InstallationResourceOwnership.CREATED,
+            InstallationResourceOwnership.REUSED,
+        ):
+            candidate = resource.model_copy(update={"ownership": ownership})
+            assert (
+                _effective_policy(candidate, cpu_disposition="keep")
+                is InstallationResourceDeletePolicy.PRESERVE
+            ), f"{candidate.resource_key} ({ownership.value}) must be preserved"
+
+
+def test_reset_database_deletes_the_aurora_stack_in_keep_mode() -> None:
+    for resource in _aurora_stack():
+        assert (
+            _effective_policy(resource, cpu_disposition="keep", reset_database=True)
+            is InstallationResourceDeletePolicy.DELETE
+        ), f"{resource.resource_key} must be deleted by --reset-database"
+
+
+def test_delete_mode_still_deletes_the_aurora_stack() -> None:
+    for resource in _aurora_stack():
+        assert (
+            _effective_policy(resource, cpu_disposition="delete")
+            is InstallationResourceDeletePolicy.DELETE
+        ), f"{resource.resource_key} must be deleted on retirement"
+
+
+def test_keep_mode_never_calls_delete_db_cluster(tmp_path) -> None:
+    site = load_site(site_file(tmp_path))
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site",
+        resources=[_resource("aws/nlb", "nlb", "x"), *_aurora_stack()],
+    )
+    calls: list[str] = []
+
+    class Cleaner:
+        def delete(self, resource):
+            calls.append(f"delete:{resource.resource_key}")
+
+        def delete_aurora(self, cluster, **_kwargs):
+            calls.append(f"delete-db-cluster:{cluster.resource_id}")
+            return None
+
+        def wait_absent(self, resource, *, timeout_seconds=900):
+            del resource, timeout_seconds
+
+    request = UninstallRequest(
+        site=site, cpu_disposition="keep", confirmation="UNINSTALL_GPU_FAULT"
+    )
+    state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
+
+    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
+
+    assert retained is None, "no final snapshot exists when nothing was deleted"
+    assert calls == [], "a reinstall must not touch the Aurora stack"
+
+
+def test_reset_database_runs_the_aurora_phase(tmp_path) -> None:
+    site = load_site(site_file(tmp_path))
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site", resources=_aurora_stack()
+    )
+    calls: list[str] = []
+
+    class Cleaner:
+        def delete(self, resource):
+            calls.append(f"delete:{resource.resource_key}")
+
+        def delete_aurora(self, cluster, *, final_snapshot_policy, **_kwargs):
+            calls.append(
+                f"delete-db-cluster:{cluster.resource_id}:{final_snapshot_policy}"
+            )
+            return "test-final"
+
+        def wait_absent(self, resource, *, timeout_seconds=900):
+            del resource, timeout_seconds
+
+    request = UninstallRequest(
+        site=site,
+        cpu_disposition="keep",
+        confirmation="UNINSTALL_GPU_FAULT",
+        reset_database=True,
+    )
+    state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
+
+    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
+
+    assert retained is not None, "the retained final snapshot must be reported"
+    assert retained.resource_id == "test-final", "snapshot id comes from the cleaner"
+    assert calls[0] == "delete-db-cluster:test-aurora:retain", (
+        "the cluster goes first, with the default retain policy"
+    )
+    assert "delete:aws/aurora/parameter-group" in calls, (
+        "the parameter group is deleted after the cluster"
+    )
+
+
+@pytest.mark.parametrize(
+    ("disposition", "overrides", "message"),
+    (
+        ("keep", {"final_snapshot_policy": "skip"}, "--cpu-cluster delete"),
+        ("delete", {"reset_database": True}, "--cpu-cluster keep"),
+    ),
+)
+def test_uninstall_request_refuses_contradictory_flags(
+    tmp_path, disposition, overrides, message
+) -> None:
+    site = load_site(site_file(tmp_path))
+
+    with pytest.raises(BootstrapError, match=message):
+        UninstallRequest(
+            site=site, cpu_disposition=disposition, confirmation="x", **overrides
+        )

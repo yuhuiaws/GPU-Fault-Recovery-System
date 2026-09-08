@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -8,32 +7,55 @@ from typing import Any, Sequence
 import pytest
 
 from gpu_fault.admin import bootstrap_aurora as aurora
+from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.config_file import initialize_desired_admin_config
+
+# The error code RDS answers a describe of something that is not there with.
+NOT_FOUND = {
+    "describe-db-instances": "DBInstanceNotFound",
+    "describe-db-cluster-parameter-groups": "DBParameterGroupNotFound",
+}
 
 
 class Runner:
     """Records the AWS calls instead of making them, and plays a two-instance
-    Serverless v2 cluster whose window only changes after ``modify-db-cluster``."""
+    Serverless v2 cluster whose window only changes after ``modify-db-cluster``.
 
-    dry_run = False
+    ``missing`` names the describes that answer "not there" the way RDS does:
+    a failed read carrying the not-found code. The ensure paths decide from
+    that one read, so the fake has no separate existence switch to get wrong.
+    """
 
     def __init__(
-        self, statuses: Sequence[str] = (), *, window: tuple[float, float] = (0.5, 8.0)
+        self,
+        statuses: Sequence[str] = (),
+        *,
+        window: tuple[float, float] = (0.5, 8.0),
+        missing: Sequence[str] = (),
     ) -> None:
         self.calls: list[tuple[str, ...]] = []
         # Each entry is the cluster status one settle poll observes; the list is
         # consumed in order and the last value repeats forever.
         self.statuses = list(statuses) or ["available"]
         self.window = window
+        self.missing = frozenset(missing)
 
     def run(self, arguments: Sequence[str], **_keywords: Any) -> str:
         self.calls.append(tuple(arguments))
         return ""
 
+    def _absent(self, operation: str) -> None:
+        if operation in self.missing:
+            raise BootstrapError(
+                f"command failed (254): aws: An error occurred "
+                f"({NOT_FOUND[operation]}) when calling the operation"
+            )
+
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
         self.calls.append(("aws", *arguments))
         operation = arguments[1]
+        self._absent(operation)
         if operation == "describe-db-clusters":
             status = self.statuses[0]
             if len(self.statuses) > 1:
@@ -234,28 +256,6 @@ def test_settle_gives_up_rather_than_polling_a_stuck_cluster_forever(
         )
 
 
-def test_a_dry_run_never_polls_for_a_change_it_did_not_make(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--dry-run`` skips the modify, so waiting for it would wait forever."""
-
-    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
-    runner = Runner(["modifying"])
-    runner.dry_run = True
-
-    aurora.reconcile_existing_capacity(
-        runner,
-        aws_region="us-east-1",
-        cluster_id="aurora-a",
-        cluster={},
-        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
-    )
-
-    operations = _operations(runner)
-    assert operations.count("modify-db-cluster") == 1
-    assert operations[operations.index("modify-db-cluster") + 1 :] == []
-
-
 def test_missing_instances_are_created_in_their_own_availability_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,12 +265,7 @@ def test_missing_instances_are_created_in_their_own_availability_zone(
     depends on a no-op, and the zone is only pinned at create time.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = Runner()
+    runner = Runner(missing=["describe-db-instances"])
 
     instance_ids = aurora.ensure_serverless_instances(
         runner,
@@ -282,7 +277,9 @@ def test_missing_instances_are_created_in_their_own_availability_zone(
 
     assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
     assert _operations(runner) == [
+        "describe-db-instances",
         "create-db-instance",
+        "describe-db-instances",
         "create-db-instance",
         "wait",
         "wait",
@@ -305,11 +302,6 @@ def test_existing_instances_are_waited_for_but_not_recreated(
     in ``creating``.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = Runner()
 
     aurora.ensure_serverless_instances(
@@ -320,24 +312,48 @@ def test_existing_instances_are_waited_for_but_not_recreated(
         safe_name=lambda value, maximum: value[:maximum],
     )
 
-    assert _operations(runner) == ["wait", "wait"]
+    assert _operations(runner) == [
+        "describe-db-instances",
+        "describe-db-instances",
+        "wait",
+        "wait",
+    ]
 
 
-def test_a_missing_availability_zone_is_refused_rather_than_defaulted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_throttled_instance_read_is_not_read_as_a_missing_instance() -> None:
+    """``create-db-instance`` on an identifier that exists fails the bootstrap,
+    so a describe that failed for any reason but not-found must stop here."""
+
+    class Throttled(Runner):
+        def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
+            self.calls.append(("aws", *arguments))
+            raise BootstrapError(
+                "command failed (254): aws: An error occurred (Throttling) "
+                "when calling the DescribeDBInstances operation: Rate exceeded"
+            )
+
+    runner = Throttled()
+
+    with pytest.raises(BootstrapError, match="Throttling"):
+        aurora.ensure_serverless_instances(
+            runner,
+            aws_region="us-east-1",
+            cluster_id="aurora-a",
+            availability_zones=["us-east-1a", "us-east-1b"],
+            safe_name=lambda value, maximum: value[:maximum],
+        )
+
+    assert "create-db-instance" not in _operations(runner)
+
+
+def test_a_missing_availability_zone_is_refused_rather_than_defaulted() -> None:
     """One zone for two instances is a configuration error, not a placement.
 
     ``zip`` without ``strict`` would silently create only the writer, leaving a
     single-instance cluster that reads as a successful bootstrap.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = Runner()
+    runner = Runner(missing=["describe-db-instances"])
 
     with pytest.raises(ValueError, match="argument 2 is shorter"):
         aurora.ensure_serverless_instances(
@@ -353,12 +369,15 @@ class DiagnosticsRunner(Runner):
     """Plays the parameter-group side of RDS: the group's current values and
     the engine family, plus a quiet cluster for the settle wait."""
 
-    def __init__(self, parameters: dict[str, str] | None = None) -> None:
-        super().__init__()
+    def __init__(
+        self, parameters: dict[str, str] | None = None, *, missing: Sequence[str] = ()
+    ) -> None:
+        super().__init__(missing=missing)
         self.parameters = dict(parameters or {})
 
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
         self.calls.append(("aws", *arguments))
+        self._absent(arguments[1])
         if arguments[1] == "describe-db-engine-versions":
             return {
                 "DBEngineVersions": [{"DBParameterGroupFamily": "aurora-postgresql16"}]
@@ -382,19 +401,14 @@ def _settled(parameters: dict[str, str]) -> dict[str, str]:
     }
 
 
-def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled() -> (
+    None
+):
     """The default group cannot be modified, so a fresh cluster gets its own
     group, in the family of its engine version, with the four diagnostic
     parameters set in one call."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = DiagnosticsRunner()
+    runner = DiagnosticsRunner(missing=["describe-db-cluster-parameter-groups"])
 
     group = aurora.ensure_cluster_parameter_group(
         runner,
@@ -406,15 +420,16 @@ def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
 
     assert group == "aurora-a-pg"
     assert _operations(runner) == [
+        "describe-db-cluster-parameter-groups",
         "describe-db-engine-versions",
         "create-db-cluster-parameter-group",
         "modify-db-cluster-parameter-group",
     ]
-    create = runner.calls[1]
+    create = runner.calls[2]
     assert (
         create[create.index("--db-parameter-group-family") + 1] == "aurora-postgresql16"
     )
-    modify = runner.calls[2]
+    modify = runner.calls[3]
     parameters = modify[modify.index("--parameters") + 1 :]
     assert (
         "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate"
@@ -426,17 +441,10 @@ def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
     ) in parameters
 
 
-def test_a_settled_parameter_group_is_left_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_settled_parameter_group_is_left_alone() -> None:
     """A routine deploy must not modify a group whose values already match:
     the modify is a live mutation even when nothing changes."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = DiagnosticsRunner(_settled({"work_mem": "65536"}))
 
     aurora.ensure_cluster_parameter_group(
@@ -447,20 +455,16 @@ def test_a_settled_parameter_group_is_left_alone(
         safe_name=lambda value, maximum: value[:maximum],
     )
 
-    assert _operations(runner) == ["describe-db-cluster-parameters"]
+    assert _operations(runner) == [
+        "describe-db-cluster-parameter-groups",
+        "describe-db-cluster-parameters",
+    ]
 
 
-def test_only_the_drifted_parameters_are_rewritten(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_only_the_drifted_parameters_are_rewritten() -> None:
     """An operator's other parameters and the already-correct ones stay out of
     the modify call."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = DiagnosticsRunner(_settled({"log_lock_waits": "0"}))
 
     aurora.ensure_cluster_parameter_group(
@@ -537,11 +541,10 @@ def test_an_existing_group_is_read_from_the_projected_parameter_list(
     with the bare list, not ``{"Parameters": [...]}``. The first live deploy
     created the group and never listed it; the second one did and crashed."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
+    # The group's existence is now probed through the runner
+    # (``describe_or_absent``); ``DiagnosticsRunner`` answers that describe with
+    # a document, so the group reads as existing without patching subprocess.
+    del monkeypatch
 
     class ProjectedRunner(DiagnosticsRunner):
         def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:

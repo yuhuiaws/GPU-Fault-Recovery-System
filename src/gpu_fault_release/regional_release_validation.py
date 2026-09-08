@@ -192,10 +192,10 @@ def validate_release_components(
     if cpu:
         release.runner.run(
             [
-                "bash",
+                "python3",
                 str(
                     ROOT
-                    / "deploy/control-plane/tools/verify-control-plane-role-split.sh"
+                    / "deploy/control-plane/tools/verify_control_plane_role_split.py"
                 ),
             ],
             env={
@@ -203,7 +203,6 @@ def validate_release_components(
                 "KUBECONFIG": release.config.cpu_kubeconfig,
                 "GPU_FAULT_NAMESPACE": release.config.namespace,
                 "GPU_FAULT_RUNTIME_IMAGE": release.runtime_image,
-                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
             },
         )
         checks.append("control_plane_role_split")
@@ -212,8 +211,8 @@ def validate_release_components(
         def verify_data_plane(target: Any) -> None:
             release.runner.run(
                 [
-                    "bash",
-                    str(ROOT / "deploy/dataplane/tools/verify-dataplane-executor.sh"),
+                    "python3",
+                    str(ROOT / "deploy/dataplane/tools/verify_dataplane_executor.py"),
                 ],
                 env={
                     **os.environ,
@@ -223,7 +222,6 @@ def validate_release_components(
                         release.config.cpu_kubeconfig
                     ),
                     "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": (release.executor_wheel_cm),
-                    "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
                 },
             )
 
@@ -1040,8 +1038,8 @@ def validate_gpu_rollback_target(
     ):
         release.runner.run(
             [
-                "bash",
-                str(ROOT / "deploy/dataplane/tools/verify-dataplane-executor.sh"),
+                "python3",
+                str(ROOT / "deploy/dataplane/tools/verify_dataplane_executor.py"),
             ],
             env={
                 **os.environ,
@@ -1049,7 +1047,6 @@ def validate_gpu_rollback_target(
                 "GPU_FAULT_KUBE_CONTEXT": target.context,
                 "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": (release.config.cpu_kubeconfig),
                 "GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP": expected_wheel or "",
-                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
             },
         )
 
@@ -1132,10 +1129,10 @@ def validate_rollback(
             raise ReleaseError("rollback Runtime Profile did not converge")
         release.runner.run(
             [
-                "bash",
+                "python3",
                 str(
                     ROOT / "deploy/control-plane/tools/"
-                    "verify-control-plane-role-split.sh"
+                    "verify_control_plane_role_split.py"
                 ),
             ],
             env={
@@ -1143,7 +1140,6 @@ def validate_rollback(
                 "KUBECONFIG": release.config.cpu_kubeconfig,
                 "GPU_FAULT_NAMESPACE": release.config.namespace,
                 "GPU_FAULT_RUNTIME_IMAGE": expected_runtime_image,
-                "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
             },
         )
     if cluster_components is None:

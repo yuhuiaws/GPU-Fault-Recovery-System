@@ -362,13 +362,6 @@ def test_deployment_entrypoints_refresh_runtime_registry() -> None:
         / "tools"
         / "apply-control-plane-role-split.sh"
     ).read_text(encoding="utf-8")
-    control_verify = (
-        ROOT
-        / "deploy"
-        / "control-plane"
-        / "tools"
-        / "verify-control-plane-role-split.sh"
-    ).read_text(encoding="utf-8")
     gpu = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text(
         encoding="utf-8"
     )
@@ -376,8 +369,15 @@ def test_deployment_entrypoints_refresh_runtime_registry() -> None:
         encoding="utf-8"
     )
 
-    assert "verify-control-plane-role-split.sh" in control
-    for text in (control_verify, gpu, bundle):
+    # The apply script runs the verifier itself and then syncs the CPU-plane
+    # registry; there is no shell wrapper in between any more.
+    assert "verify_control_plane_role_split.py" in control, (
+        "the apply script must run the verifier directly"
+    )
+    assert "verify-control-plane-role-split.sh" not in control, (
+        "the shell wrapper was deleted"
+    )
+    for text in (control, gpu, bundle):
         assert "sync_installed_resource_registry.py" in text
 
     hma = (ROOT / "deploy/hyperpod/deploy-cloudwatch-hma.sh").read_text(

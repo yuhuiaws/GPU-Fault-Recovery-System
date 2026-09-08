@@ -41,7 +41,10 @@ def test_the_warning_names_every_unregistered_resource_and_the_way_out() -> None
     assert "no installation resource registry" in banner
     assert "Aurora cluster gpu-fault-canary" in banner
     assert "security group gpu-fault-canary" in banner
-    assert "gpu-fault-admin uninstall --cpu-cluster-arn" in banner
+    # The ARN discovery branch of ``gpu-fault-admin uninstall`` is gone, so the
+    # banner must not send the operator to a command that will not run.
+    assert "--cpu-cluster-arn" not in banner, "legacy uninstall discovery is gone"
+    assert "deleted by hand" in banner, "the banner must say what the way out is"
     assert "gpu-fault-canary-ns/gpu-fault-aurora" in banner
     assert "do not delete that Secret first" in banner
     assert "parameter group gpu-fault-canary-pg" in banner

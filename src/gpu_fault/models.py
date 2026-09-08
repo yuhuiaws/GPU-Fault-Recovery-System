@@ -789,11 +789,13 @@ class WorkflowEventKind(StrEnum):
     PREEMPTION = "PREEMPTION"
     HOLD = "HOLD"
     TERMINAL = "TERMINAL"
-    # Operator writes (``gpu-fault-admin workflow-reconcile``): who closed the
-    # record, under which approval, from which status (I1). ``kind`` is
-    # enum-typed, so a row carrying one of these does not load on a release
-    # that predates them; they are only written by an operator action taken
-    # after this release is live, never by the runtime on its own.
+    # Reconciliation writes: who closed the record, under which approval, from
+    # which status (I1). ``OPERATOR_RECONCILED`` is written both by the
+    # administrator's ``workflow-reconcile`` and by the dispatcher's own sweep
+    # (actor ``dispatcher``) for compile-time BLOCKED no-ops and orphaned
+    # remote commands; ``OPERATOR_RETIRED_GENERATION`` by the dispatcher's
+    # retired-generation revocation. ``kind`` is enum-typed, so a row carrying
+    # one of these does not load on a release that predates them.
     OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
     OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
     # One marker at the seam of a bounded history saying how much was dropped

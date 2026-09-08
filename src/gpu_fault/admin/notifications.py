@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
@@ -32,33 +32,16 @@ def validate_admin_email(value: str) -> str:
     return normalized
 
 
-def resolve_notification_routing(
-    *,
-    admin_email: str,
-    sender_email: str | None = None,
-    recipients: Sequence[str] = (),
-    subject_prefix: str = "",
-) -> NotificationRouting:
-    sender = validate_admin_email(sender_email or admin_email)
-    normalized_recipients = tuple(
-        dict.fromkeys(
-            validate_admin_email(item) for item in (recipients or (admin_email,))
-        )
-    )
-    normalized_prefix = subject_prefix.strip()
-    if (
-        len(normalized_prefix) > 64
-        or "\n" in normalized_prefix
-        or "\r" in normalized_prefix
-    ):
-        raise BootstrapError(
-            "email subject prefix must be a single line of at most 64 characters"
-        )
-    return NotificationRouting(
-        sender=sender,
-        recipients=normalized_recipients,
-        subject_prefix=normalized_prefix,
-    )
+def resolve_notification_routing(*, admin_email: str) -> NotificationRouting:
+    """SES mail goes from the administrator address to the administrator address.
+
+    There is no separate sender, recipient list or subject prefix on the
+    command; the ``site.yaml`` fields the release engine reads are filled from
+    this routing.
+    """
+
+    sender = validate_admin_email(admin_email)
+    return NotificationRouting(sender=sender, recipients=(sender,), subject_prefix="")
 
 
 def _optional_aws_json(
@@ -223,29 +206,26 @@ def _apply_email_secret(
     )
 
 
-def ensure_email_notifications(
+def ses_identity_verified(identity: Mapping[str, Any]) -> bool:
+    return bool(identity.get("VerifiedForSendingStatus")) or (
+        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
+    )
+
+
+def ensure_ses_identity(
     runner: CommandRunner,
     *,
-    cpu: ClusterIdentity,
-    cpu_kubeconfig: Path,
-    namespace: str,
+    region: str,
+    sender: str,
     site_id: str,
-    admin_email: str,
-    sender_email: str | None = None,
-    recipients: Sequence[str] = (),
-    subject_prefix: str = "",
-) -> dict[str, Any]:
-    routing = resolve_notification_routing(
-        admin_email=admin_email,
-        sender_email=sender_email,
-        recipients=recipients,
-        subject_prefix=subject_prefix,
-    )
-    identity = _ses_identity(
-        runner,
-        region=cpu.region,
-        email=routing.sender,
-    )
+) -> tuple[dict[str, Any], bool]:
+    """The SES identity for ``sender``, created (verification mail sent) if absent.
+
+    Returns ``(identity, created)``. Idempotent: an identity that exists is only
+    read, so a rerun neither re-sends the verification nor re-tags it.
+    """
+
+    identity = _ses_identity(runner, region=region, email=sender)
     created = identity is None
     if created:
         runner.run(
@@ -254,9 +234,9 @@ def ensure_email_notifications(
                 "sesv2",
                 "create-email-identity",
                 "--region",
-                cpu.region,
+                region,
                 "--email-identity",
-                routing.sender,
+                sender,
                 "--tags",
                 f"Key={SITE_TAG_KEY},Value={site_id}",
             ],
@@ -264,21 +244,36 @@ def ensure_email_notifications(
             sensitive=True,
             capture=False,
         )
-        identity = _ses_identity(
-            runner,
-            region=cpu.region,
-            email=routing.sender,
-        )
+        identity = _ses_identity(runner, region=region, email=sender)
     if identity is None:
         raise BootstrapError("SES email identity could not be inspected")
-    verified = bool(identity.get("VerifiedForSendingStatus")) or (
-        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
+    return identity, created
+
+
+def ensure_email_notifications(
+    runner: CommandRunner,
+    *,
+    cpu: ClusterIdentity,
+    cpu_kubeconfig: Path,
+    namespace: str,
+    site_id: str,
+    admin_email: str,
+    routing: NotificationRouting,
+) -> dict[str, Any]:
+    """The bootstrap task: SES identity, sending account, email Secret.
+
+    Verification is no longer gated here. ``gpu-fault-admin deploy`` checks the
+    sender identity and the SNS subscription in its first minute
+    (``notification_precheck``) and stops with both addresses named; by the time
+    this task runs the identity is verified, and if it is not (the check was
+    bypassed by an internal hop) the status is recorded for ``status`` and the
+    verifier rather than failing a bootstrap that is minutes in.
+    """
+
+    identity, created = ensure_ses_identity(
+        runner, region=cpu.region, sender=routing.sender, site_id=site_id
     )
-    if not verified:
-        raise BootstrapError(
-            "SES sent a verification request to the configured sender email; "
-            "complete verification and rerun the same deploy command"
-        )
+    verified = ses_identity_verified(identity)
     account = runner.aws_json(cpu.region, "sesv2", "get-account")
     if not bool(account.get("SendingEnabled")):
         raise BootstrapError("SES sending is disabled for the AWS account")
@@ -303,7 +298,8 @@ def ensure_email_notifications(
             f"arn:aws:ses:{cpu.region}:{cpu.account_id}:identity/{routing.sender}"
         ),
         "identity_ownership": "CREATED" if created else "EXTERNAL",
-        "verified": True,
+        "verified": verified,
+        "verification_status": "VERIFIED" if verified else "PENDING",
         "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
         "secret_name": EMAIL_SECRET_NAME,
     }

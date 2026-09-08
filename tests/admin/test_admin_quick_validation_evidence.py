@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault_release import regional_validation_evidence as evidence_module
 from scripts import release_deploy
 from tests.admin.test_release_deploy import (
     _pending_commit_diff,
@@ -78,6 +79,47 @@ def test_status_reuses_a_present_evidence_file_and_invents_nothing(
     assert admin_cli.quick_validation_evidence_environment(arguments) == {
         admin_cli.QUICK_VALIDATION_EVIDENCE_ENV: str(evidence.resolve())
     }
+
+
+def test_the_driver_and_status_name_the_same_evidence_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One canonical evidence path, shared by the writer and the reader.
+
+    The release driver used to finalize the evidence under its per-release
+    directory (`release-deploy/<release_id>/quick-validation.json`) while `status`
+    looked for `<state-dir>/quick-validation.json`; on the live state directory
+    the root file never existed, so every `status` re-ran all fifteen probes the
+    deploy had just proved. Both sides now derive the path from one helper, and
+    this pins them equal without a cluster or a subprocess.
+    """
+
+    monkeypatch.delenv(admin_cli.QUICK_VALIDATION_EVIDENCE_ENV, raising=False)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    site_file = state_dir / "site.yaml"
+
+    canonical = evidence_module.quick_validation_evidence_path(state_dir)
+    assert (
+        canonical
+        == state_dir.resolve() / evidence_module.QUICK_VALIDATION_EVIDENCE_FILE
+    )
+    assert release_deploy.quick_validation_evidence_path(site_file.parent) == (
+        canonical
+    ), "the release driver must finalize evidence where status reads it"
+    assert admin_cli.QUICK_VALIDATION_EVIDENCE_FILE == (
+        evidence_module.QUICK_VALIDATION_EVIDENCE_FILE
+    )
+
+    canonical.write_text("{}", encoding="utf-8")
+    status = argparse.Namespace(command="status", state_dir=state_dir)
+    assert admin_cli.quick_validation_evidence_environment(status) == {
+        admin_cli.QUICK_VALIDATION_EVIDENCE_ENV: str(canonical)
+    }
+    by_file = argparse.Namespace(command="status", state_dir=None, file=site_file)
+    assert admin_cli.quick_validation_evidence_environment(by_file) == {
+        admin_cli.QUICK_VALIDATION_EVIDENCE_ENV: str(canonical)
+    }, "status -f <site> lives in the same state directory as the deploy"
 
 
 def test_verify_and_explicit_settings_keep_running_the_verifiers(
@@ -177,14 +219,24 @@ def test_evidence_finalizes_when_deploy_completed_but_not_committed(
         },
     )
 
-    evidence = prepared.state_dir / admin_cli.QUICK_VALIDATION_EVIDENCE_FILE
+    evidence = evidence_module.quick_validation_evidence_path(site.parent)
+    assert not (
+        prepared.state_dir / admin_cli.QUICK_VALIDATION_EVIDENCE_FILE
+    ).exists(), "the per-release copy is the location status never read"
     finalized = json.loads(evidence.read_text(encoding="utf-8"))
     assert finalized["release_state_sha256"] == "b" * 64
     assert finalized["finalized_at"]
+    assert evidence.stat().st_mode & 0o777 == 0o600, (
+        "the evidence reader refuses a file other users can read"
+    )
     assert len(verify_environments) == 1
     assert verify_environments[0][release_deploy.QUICK_VALIDATION_EVIDENCE_ENV] == str(
         evidence
     ), "verify was not handed the evidence the deploy had just proved"
+    status = argparse.Namespace(command="status", state_dir=site.parent)
+    assert admin_cli.quick_validation_evidence_environment(status) == {
+        admin_cli.QUICK_VALIDATION_EVIDENCE_ENV: str(evidence)
+    }, "the next status must find the evidence the driver finalized"
 
 
 def test_evidence_is_dropped_when_the_post_deploy_state_is_not_ours(
@@ -251,3 +303,6 @@ def test_evidence_is_dropped_when_the_post_deploy_state_is_not_ours(
 
     assert len(verify_environments) == 1
     assert release_deploy.QUICK_VALIDATION_EVIDENCE_ENV not in verify_environments[0]
+    assert not evidence_module.quick_validation_evidence_path(site.parent).exists(), (
+        "evidence the driver declined must not be left for the next status to find"
+    )

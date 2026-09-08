@@ -32,12 +32,7 @@ def notification_routing(
         account_id=cpu.account_id,
         configured=request.alert_email,
     )
-    routing = resolve_notification_routing(
-        admin_email=admin_email,
-        sender_email=request.email_sender,
-        recipients=request.email_recipients,
-        subject_prefix=request.email_subject_prefix,
-    )
+    routing = resolve_notification_routing(admin_email=admin_email)
     state.record("admin_email_source", source)
     return admin_email, routing
 
@@ -52,6 +47,7 @@ def notification_bootstrap_tasks(
     site_id: str,
     admin_email: str,
     routing: NotificationRouting,
+    archive_s3_uri: str | None = None,
 ) -> dict[str, Callable[[], Any]]:
     return {
         "control_plane_role": lambda: ensure_control_plane_role(
@@ -61,6 +57,7 @@ def notification_bootstrap_tasks(
             namespace=namespace,
             site_id=site_id,
             email_sender=routing.sender,
+            archive_s3_uri=archive_s3_uri,
         ),
         "email_notifications": lambda: ensure_email_notifications(
             runner,
@@ -69,9 +66,7 @@ def notification_bootstrap_tasks(
             namespace=namespace,
             site_id=site_id,
             admin_email=admin_email,
-            sender_email=routing.sender,
-            recipients=routing.recipients,
-            subject_prefix=routing.subject_prefix,
+            routing=routing,
         ),
         "monitoring_resources": lambda: ensure_monitoring_resources(
             runner,

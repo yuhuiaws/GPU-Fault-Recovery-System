@@ -11,7 +11,6 @@ without an AWS call.
 from __future__ import annotations
 
 import json
-import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -136,8 +135,6 @@ class Account:
                     }
                 }
             )
-        if "list-open-id-connect-provider-tags" in argv:
-            return json.dumps({"Tags": self.provider_tags})
         if argv[0] == "openssl" and "s_client" in argv:
             return self.chain
         if argv[0] == "openssl":
@@ -167,6 +164,15 @@ class Account:
             return {"association": {"roleArn": self.association_role}}
         if operation == "create-pod-identity-association":
             return {"association": {"associationId": "assoc-new"}}
+        if operation == "get-open-id-connect-provider":
+            if not self.provider_exists:
+                raise BootstrapError(
+                    "command failed (254): aws: An error occurred (NoSuchEntity) "
+                    "when calling the GetOpenIDConnectProvider operation: "
+                    "OpenIDConnect Provider not found"
+                )
+            # The provider read carries its tags, so ownership needs no second call.
+            return {"Url": self.issuer, "Tags": list(self.provider_tags)}
         raise AssertionError(f"unexpected aws call: {arguments}")
 
     def aws_text(self, _region: str, *arguments: str, **_keywords: Any) -> str:
@@ -175,18 +181,14 @@ class Account:
 
     # -- process boundary --------------------------------------------------
     def process(self, arguments: Sequence[Any], **_keywords: Any) -> Any:
-        """The one existence probe left that does not go through the runner.
+        """No existence probe bypasses the runner any more.
 
-        IAM roles, inline policies and the Pod Identity add-on are read through
-        ``run``/``aws_json`` above, once each. Only the account-wide OIDC provider
-        is still probed with a bare process, so anything else arriving here is a
-        read that was meant to be deduplicated.
+        IAM roles, inline policies, the Pod Identity add-on and the account-wide
+        OIDC provider are all read through ``run``/``aws_json`` above, once each,
+        so anything arriving here is a read that was meant to be deduplicated.
         """
 
-        argv = [str(item) for item in arguments]
-        if "get-open-id-connect-provider" in " ".join(argv):
-            return subprocess.CompletedProcess(argv, 0 if self.provider_exists else 254)
-        raise AssertionError(f"unexpected process: {argv}")
+        raise AssertionError(f"unexpected process: {[str(item) for item in arguments]}")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(services.subprocess, "run", self.process)

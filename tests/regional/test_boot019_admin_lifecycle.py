@@ -35,7 +35,10 @@ class FakeBackend:
         self.uninstall_result = uninstall or {
             "cpu_cluster": "keep",
             "registry_entries_preserved": 2,
-            "final_registry_statuses": {"cluster/cluster-a/eks": "PRESERVED"},
+            "final_registry_statuses": {
+                "cluster/cluster-a/eks": "PRESERVED",
+                boot019.AURORA_CLUSTER_RESOURCE_KEY: "PRESERVED",
+            },
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -119,9 +122,23 @@ def test_uninstall_assertions_read_live_values_not_literals() -> None:
         {
             "cpu_cluster": "keep",
             "registry_entries_preserved": 3,
-            "final_registry_statuses": {"a": "PRESERVED", "b": "DELETED"},
+            "final_registry_statuses": {
+                "a": "PRESERVED",
+                "b": "DELETED",
+                boot019.AURORA_CLUSTER_RESOURCE_KEY: "PRESERVED",
+            },
         }
     )
+    with pytest.raises(boot019.AcceptanceCheckError, match="preserve the Aurora"):
+        boot019.assert_uninstall_result(
+            {
+                "registry_entries_preserved": 2,
+                "final_registry_statuses": {
+                    "a": "PRESERVED",
+                    boot019.AURORA_CLUSTER_RESOURCE_KEY: "DELETED",
+                },
+            }
+        )
     with pytest.raises(boot019.AcceptanceCheckError, match="fewer than 2"):
         boot019.assert_uninstall_result(
             {"registry_entries_preserved": 1, "final_registry_statuses": {"a": "X"}}
@@ -130,7 +147,11 @@ def test_uninstall_assertions_read_live_values_not_literals() -> None:
         boot019.assert_uninstall_result(
             {
                 "registry_entries_preserved": 2,
-                "final_registry_statuses": {"a": "PRESERVED", "b": "DELETE_PENDING"},
+                "final_registry_statuses": {
+                    "a": "PRESERVED",
+                    "b": "DELETE_PENDING",
+                    boot019.AURORA_CLUSTER_RESOURCE_KEY: "PRESERVED",
+                },
             }
         )
     with pytest.raises(
@@ -178,7 +199,6 @@ def _live_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         allowed_namespaces=("default",),
         join_state_dir=tmp_path / "join",
         run_dir=tmp_path / "run",
-        final_snapshot_policy="retain",
     )
     site = SimpleNamespace(
         release_config={

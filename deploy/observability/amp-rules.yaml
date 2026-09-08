@@ -797,7 +797,7 @@ groups:
             aggregation window have an incident that is gone or points
             elsewhere and no successor. Each may still hold a node claim.
             List them with the orphan inspection in gpu-fault-admin
-            workflow-reconcile --plan and terminalize through it; do not
+            workflow-reconcile --dry-run and terminalize through it; do not
             delete rows.
       - alert: GpuFaultIncidentDanglingWorkflowPointers
         expr: >-
@@ -814,7 +814,7 @@ groups:
             answers to. A later event on the same node follows that pointer,
             finds nothing, and the duplicate-event fast path has to rebuild the
             chain (gpu_fault_ingest_stale_event_link_repairs_total). Read the
-            incidents with workflow-reconcile --plan; a pointer is repaired
+            incidents with workflow-reconcile --dry-run; a pointer is repaired
             through it, never by editing the incident row.
       # An ACTIVE agent whose heartbeat lease has lapsed is a node the control
       # plane still counts as a remediation target and cannot reach. Minutes of

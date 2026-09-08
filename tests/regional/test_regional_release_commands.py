@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from gpu_fault.admin.command_log import report_failure
 from gpu_fault_release import regional_admin_commands as ADMIN_COMMANDS_MODULE
 from gpu_fault_release import regional_release_iam as IAM_MODULE
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
@@ -807,7 +808,7 @@ def test_a_failed_captured_command_reports_what_it_printed(capsys) -> None:
         "sys.exit(1)"
     )
 
-    with pytest.raises(MODULE.ReleaseError, match=r"command failed \(1\)"):
+    with pytest.raises(MODULE.ReleaseError, match=r"exited with status 1") as caught:
         runner.run([sys.executable, "-c", script], capture=True)
     reported = capsys.readouterr()
 
@@ -816,6 +817,31 @@ def test_a_failed_captured_command_reports_what_it_printed(capsys) -> None:
     # stdout carries the machine-readable release report, so a failing command's
     # output must not be mixed into it.
     assert reported.out == ""
+    # The verifier is our own script and has just been quoted in full, so the
+    # rollout's own exit adds no ``command failed (1): python3`` on top of it and
+    # exits with the verifier's status.
+    assert "command failed" not in str(caught.value)
+    assert report_failure("ERROR", caught.value) == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_a_failed_foreign_command_names_the_step_and_its_last_words(capsys) -> None:
+    """``command failed (1): kubectl`` named a binary; the step is in the argv."""
+
+    runner = MODULE.Runner()
+
+    with pytest.raises(MODULE.ReleaseError) as caught:
+        runner.run(
+            ["bash", "-c", "echo 'error: timed out waiting' >&2; exit 1"], capture=True
+        )
+
+    assert str(caught.value) == (
+        "command failed (1): bash -c echo 'error: timed out waiting' >&2; exit 1: "
+        "error: timed out waiting"
+    )
+    assert report_failure("ERROR", caught.value) == 2
+    reported = capsys.readouterr().err
+    assert reported.endswith("ERROR: " + str(caught.value) + "\n"), reported
 
 
 def test_a_failed_sensitive_command_stays_silent(capsys) -> None:
@@ -829,7 +855,7 @@ def test_a_failed_sensitive_command_stays_silent(capsys) -> None:
     runner = MODULE.Runner()
     script = "import sys; print('token-value-abc'); sys.exit(1)"
 
-    with pytest.raises(MODULE.ReleaseError, match=r"command failed \(1\)"):
+    with pytest.raises(MODULE.ReleaseError, match=r"exited with status 1"):
         runner.run([sys.executable, "-c", script], capture=True, sensitive=True)
     reported = capsys.readouterr()
 

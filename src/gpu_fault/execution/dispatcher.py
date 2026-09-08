@@ -15,10 +15,9 @@ from typing import Callable, Literal
 
 from pydantic import ValidationError
 
+from gpu_fault.compile_blocked import close_compile_blocked_workflows
 from gpu_fault.execution import restart_budget_preflight
-from gpu_fault.execution.config import (
-    WorkflowDispatcherConfig,
-)
+from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
     DISPATCHER_INTERNAL_ERROR_ACTOR,
@@ -57,6 +56,7 @@ from gpu_fault.models import (
     workflow_is_open,
 )
 from gpu_fault.orchestration import WorkflowFencingError
+from gpu_fault.orphaned_commands import cancel_orphaned_commands
 from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,
@@ -184,8 +184,7 @@ class WorkflowDispatcher:
             )
         self._reconcile_failed_workflows()
         now = datetime.now(timezone.utc)
-        self._supersede_abandoned_generations(now)
-        retired = self._revoke_retired_generations(now)
+        retired = self.sweep_stuck_records(now)
         timed_out = self._expire_stuck_workflows(now)
         workflows, filtered, horizon_exhausted = self._scan_dispatchable(now, retired)
         executed = 0
@@ -1147,6 +1146,20 @@ class WorkflowDispatcher:
             incident.cluster_id, scope_keys
         )
 
+    def sweep_stuck_records(self, now: datetime) -> set[str]:
+        """Close the records nothing else will -- by Store predicate, never age.
+
+        Abandoned and retired generations, compile-time BLOCKED no-ops and remote
+        commands a terminal workflow left open; not counted into the dispatch
+        report. Returns the still-settling retired generations the scan withholds.
+        """
+
+        self._supersede_abandoned_generations(now)
+        retired = self._revoke_retired_generations(now)
+        close_compile_blocked_workflows(self.store, now=now)
+        cancel_orphaned_commands(self.store, now=now)
+        return retired
+
     def _supersede_abandoned_generations(self, now: datetime) -> list[WorkflowRequest]:
         """Terminalize workflows their incident re-planned away from.
 
@@ -1258,40 +1271,27 @@ class WorkflowDispatcher:
         """Revoke a retired generation that had already started.
 
         ``_supersede_abandoned_generations`` above only clears the record that
-        never ran. That is the cheap case. The one that actually cost a fleet was
-        the opposite: on 2026-09-04 the retired generation was ``RUNNING``, held
-        an execution owner, a renewing lease, six remediation budget claims and
-        an unsettled ``STOP_WORKLOADS`` remote command against three nodes, and
-        the fleet rollout fence was the only thing still standing between that
-        command and a running 24-GPU job. Its incident had recovered at a higher
-        generation four hours earlier.
+        never ran. The one that actually cost a fleet was the opposite: on
+        2026-09-04 the retired generation was ``RUNNING``, held an owner, a
+        renewing lease, six budget claims and an unsettled ``STOP_WORKLOADS``
+        remote command against three nodes of a running 24-GPU job, four hours
+        after its incident had recovered at a higher generation.
 
-        The order below is the whole point, and it is why this can take two
-        ticks. A remote command outlives the workflow row, so revoking the
-        workflow first would leave a destructive command behind whose next fence
-        evaluation releases it. So: cancel the commands first -- ``PENDING`` and
-        ``WAITING`` go terminal in the store immediately, and a ``LEASED`` one
-        gets a cancellation request that both bars it from ever being claimed
-        again and turns whatever the executor reports into a ``FAILED`` -- and
-        revoke the workflow only once the store shows every one of them settled.
+        The order below is the whole point, and why this can take two ticks. A
+        remote command outlives the workflow row, so revoking the workflow first
+        would leave a destructive command behind whose next fence evaluation
+        releases it. So: cancel the commands first -- ``PENDING`` and ``WAITING``
+        go terminal at once, a ``LEASED`` one gets a cancellation request that
+        bars it from being claimed again and turns whatever the executor reports
+        into a ``FAILED`` -- and revoke only once the store shows them settled.
 
-        No lease is taken. ``claim_workflow`` cannot help here: the lease holder
-        is this very dispatch loop, which renews on every tick, so a
-        lease-respecting revocation would wait forever on a record it is itself
-        keeping alive. Safety comes from
+        No lease is taken: the lease holder is this very dispatch loop, which
+        renews on every tick, so a lease-respecting revocation would wait
+        forever on a record it is itself keeping alive. Safety comes from
         ``retired_generation_records`` re-deriving every condition inside the
-        store transaction. In particular a record that has already *completed* a
-        destructive operation is never revoked -- there is something real to
-        compensate for, and the release gate goes on reporting it until an
-        operator resolves it.
-
-        Not counted into the dispatch report, for the same reason a supersession
-        is not: cleanup is neither an execution nor a failure.
-
-        Returns the ids of the retired generations that are still open, which
-        ``run_once`` withholds from dispatch: a record waiting for its commands
-        to settle is one ``_validate_fencing`` would reject, and blocking it on a
-        fencing error would bury the revocation under a dispatch failure.
+        store transaction; a record that has already *completed* a destructive
+        operation is never revoked -- there is something real to compensate
+        for, and the release gate goes on reporting it until an operator acts.
         """
 
         held: set[str] = set()

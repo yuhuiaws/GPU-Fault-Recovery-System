@@ -11,9 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import (
-    DEFAULT_DCGM_IMAGE,
-    DEFAULT_NODE_INSTALLER_IMAGE,
-    DEFAULT_RUNTIME_IMAGE,
     BootstrapError,
     CommandRunner,
     compute_agent_config_digest,
@@ -159,9 +156,6 @@ def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
     if configured:
         yield configured
         return
-    if runner.dry_run:
-        yield "postgresql://postgres@127.0.0.1:5432/postgres"
-        return
     name = f"gpu-fault-release-postgres-{os.getpid()}"
     runner.run(
         [
@@ -217,8 +211,6 @@ def verify_prebuilt_release(
     cosign_public_key: Path | None = None,
     staging_only: bool = False,
 ) -> None:
-    if runner.dry_run:
-        return
     attestation = repository_root / "dist/current-attestation.json"
     bundle = repository_root / "dist/current-attestation.bundle.json"
     public_key = (
@@ -386,13 +378,6 @@ def build_signed_release(
 ) -> dict[str, Any]:
     if staging_only and not impact_base.strip():
         raise BootstrapError("staging release requires a non-empty impact base")
-    if runner.dry_run:
-        return load_prebuilt_release(
-            runner,
-            repository_root=repository_root,
-            runtime_profile=runtime_profile,
-            allow_staging=staging_only,
-        )
     if _git_output(
         repository_root,
         "status",
@@ -426,6 +411,25 @@ def build_signed_release(
                 runner,
                 repository_root=repository_root,
             )
+    release_source = (
+        "staging_impact"
+        if staging_only
+        else "main_ci_candidate"
+        if promoted_candidate is not None
+        else "local_full_gate"
+    )
+    # Said up front, because it decides whether the next four minutes are spent
+    # re-running gates that CI already passed on main.
+    print(
+        f"release-build: release_source={release_source}"
+        + (
+            " (no verified CI candidate for this tree; running the full gates locally)"
+            if release_source == "local_full_gate"
+            else ""
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
     impact_plan_path: Path | None = None
     postgres_required = promoted_candidate is None
     if staging_only:
@@ -545,13 +549,7 @@ def build_signed_release(
     return {
         **release,
         "release_reused": False,
-        "release_source": (
-            "staging_impact"
-            if staging_only
-            else "main_ci_candidate"
-            if promoted_candidate is not None
-            else "local_full_gate"
-        ),
+        "release_source": release_source,
     }
 
 
@@ -563,19 +561,6 @@ def load_prebuilt_release(
     allow_staging: bool = False,
 ) -> dict[str, Any]:
     manifest = repository_root / "dist/current-release.json"
-    if runner.dry_run:
-        return {
-            "manifest": str(manifest),
-            "release_id": "dry-run",
-            "images": {
-                "runtime": DEFAULT_RUNTIME_IMAGE,
-                "node_installer": DEFAULT_NODE_INSTALLER_IMAGE,
-                "dcgm_exporter": DEFAULT_DCGM_IMAGE,
-                "adot": DEFAULT_ADOT_IMAGE_AMD64,
-            },
-            "agent_config_digest": "0" * 64,
-            "staging_only": allow_staging,
-        }
     if not manifest.is_file():
         raise BootstrapError(
             "dist/current-release.json is missing; build and sign the release in CI"

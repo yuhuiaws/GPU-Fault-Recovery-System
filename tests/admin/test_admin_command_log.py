@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -7,12 +8,18 @@ from pathlib import Path
 
 import pytest
 
+from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import command_log as command_log_module
+from gpu_fault.admin.bootstrap_common import CommandRunner
 from gpu_fault.admin.command_log import (
     ADMIN_LOG_ENVIRONMENT,
+    child_failure,
     command_log,
+    last_output_line,
     prune_admin_logs,
+    report_failure,
 )
+from scripts import staging_deploy
 
 
 @pytest.fixture(autouse=True)
@@ -111,8 +118,135 @@ def test_a_nested_invocation_appends_to_the_outer_log(
     with command_log(tmp_path, command="release-deploy") as path:
         pass
 
-    assert path == outer
+    assert path is None, (
+        "a nested invocation owns no log; handing it the outer path is what made "
+        "it announce the file a second time"
+    )
     assert list(outer.parent.iterdir()) == [outer]
+
+
+def test_a_failure_announces_the_log_once_across_nested_invocations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failed deploy, one ``full output in`` line.
+
+    ``gpu-fault-admin deploy`` re-enters itself from the deploy-host venv, and
+    each level used to name the log on its way out: the operator read three
+    identical lines under four nested ``command failed`` lines. Only the process
+    that opened the log knows the path now, so only it speaks.
+    """
+
+    class Parser:
+        @staticmethod
+        def parse_args() -> argparse.Namespace:
+            return argparse.Namespace(command="deploy", state_dir=tmp_path)
+
+    def run(_arguments: argparse.Namespace) -> int:
+        if os.environ.get(ADMIN_LOG_ENVIRONMENT):
+            return 2  # the innermost level: the failure itself
+        return admin_cli.main()  # the re-entered CLI, inheriting the log
+
+    monkeypatch.setattr(admin_cli, "parser", Parser)
+    monkeypatch.setattr(admin_cli, "enforce_deploy_host_state_dir", lambda _a: None)
+    monkeypatch.setattr(admin_cli, "run", run)
+
+    assert admin_cli.main() == 2
+
+    logs = list((tmp_path / "logs" / "mutating").glob("*.log"))
+    assert len(logs) == 1, "the nested invocation opened a log of its own"
+    recorded = logs[0].read_text(encoding="utf-8")
+    assert recorded.count("full output in") == 1, recorded
+    assert recorded.count("logging to") == 1, recorded
+
+
+def test_a_child_that_is_our_own_driver_is_not_wrapped_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The deploy is five wrappers deep; only the innermost knows the cause.
+
+    Each layer used to add ``command failed (N): <interpreter path>``, so the
+    tail of a failed deploy was four lines naming a venv python while the cause
+    sat hundreds of lines above. A Python module, ``gpu-fault-admin`` or ``make``
+    has already said why it stopped; the wrapper passes its status through and
+    prints nothing.
+    """
+
+    error = child_failure(
+        RuntimeError,
+        ["/x/bundle-abc/bin/python", "-m", "gpu_fault_release.rollout", "deploy"],
+        3,
+    )
+
+    assert "command failed" not in str(error)
+    assert "gpu_fault_release.rollout" in str(error), (
+        "the message that survives a re-wrap should name the module, not python"
+    )
+    assert report_failure("release-deploy", error) == 3
+    assert capsys.readouterr().err == ""
+    assert report_failure("x", child_failure(RuntimeError, ["make", "check"], 2)) == 2
+    assert "make check" in str(child_failure(RuntimeError, ["make", "check"], 2))
+
+
+def test_a_foreign_command_gets_one_line_naming_the_step_and_its_last_words(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``kubectl`` and ``aws`` do not always say what they were doing.
+
+    ``command failed (1): kubectl`` named the binary and nothing else; the step
+    -- which Job, which namespace -- was in the ``+`` echo far above, and the
+    reason was in a stderr the wrapper had swallowed.
+    """
+
+    error = child_failure(
+        RuntimeError,
+        [
+            "kubectl",
+            "--kubeconfig",
+            "/s/cpu.kubeconfig",
+            "-n",
+            "gpu-fault-system",
+            "wait",
+            "--for=condition=complete",
+            "jobs/gpu-fault-aurora-credential-refresh-verify",
+        ],
+        1,
+        detail=last_output_line("warning: x\nerror: timed out waiting\n\n"),
+    )
+
+    assert str(error) == (
+        "command failed (1): kubectl --kubeconfig /s/cpu.kubeconfig -n "
+        "gpu-fault-system wait ...: error: timed out waiting"
+    )
+    assert report_failure("gpu-fault-admin", error) == 2
+    assert capsys.readouterr().err == "gpu-fault-admin: " + str(error) + "\n"
+    # A sensitive command shows its program only; its argv is why it is sensitive.
+    secret = child_failure(RuntimeError, ["aws", "sts", "x"], 254, sensitive=True)
+    assert str(secret) == "command failed (254): aws"
+
+
+def test_a_failure_propagates_the_first_cause_through_the_admin_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End to end through ``main``: a real child, a real exit status, one line."""
+
+    class Parser:
+        @staticmethod
+        def parse_args() -> argparse.Namespace:
+            return argparse.Namespace(command="deploy", state_dir=None)
+
+    def run(_arguments: argparse.Namespace) -> int:
+        CommandRunner().run(
+            [sys.executable, "-c", "import sys; print('the cause'); sys.exit(4)"],
+            capture=False,
+        )
+        return 0
+
+    monkeypatch.setattr(admin_cli, "parser", Parser)
+    monkeypatch.setattr(admin_cli, "enforce_deploy_host_state_dir", lambda _a: None)
+    monkeypatch.setattr(admin_cli, "run", run)
+
+    assert admin_cli.main() == 4, "the child's exit status must pass through"
+    assert "command failed" not in capsys.readouterr().err
 
 
 def test_a_command_without_managed_state_logs_nowhere(tmp_path: Path) -> None:
@@ -281,4 +415,45 @@ def test_an_unknown_kind_is_refused_before_anything_is_written(tmp_path: Path) -
 
     assert not (tmp_path / "logs").exists(), (
         "a refused kind still created a log directory"
+    )
+
+
+def test_a_failed_nested_admin_passes_its_status_through_unwrapped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The nested ``gpu-fault-admin`` has already said why; this layer adds nothing.
+
+    ``staging-deploy: command failed (2): /…/deployer-venv/bin/gpu-fault-admin``
+    was the second of four such lines under one failure. A foreign command still
+    gets its one line, with the step and its last stderr line, and exits 2.
+    """
+
+    monkeypatch.setattr(
+        staging_deploy, "parser", lambda: argparse.ArgumentParser(add_help=False)
+    )
+
+    def nested_admin_failed(_parsed: argparse.Namespace) -> dict[str, object]:
+        raise child_failure(
+            staging_deploy.StagingDeployError,
+            ["/s/deployer-venv/bin/gpu-fault-admin", "deploy", "--state-dir", "/s"],
+            3,
+        )
+
+    monkeypatch.setattr(staging_deploy, "deploy", nested_admin_failed)
+    assert staging_deploy.main([]) == 3
+    assert capsys.readouterr().err == ""
+
+    def foreign_failed(_parsed: argparse.Namespace) -> dict[str, object]:
+        raise child_failure(
+            staging_deploy.StagingDeployError,
+            ["git", "fetch", "origin"],
+            128,
+            detail=last_output_line("fatal: could not read from remote\n"),
+        )
+
+    monkeypatch.setattr(staging_deploy, "deploy", foreign_failed)
+    assert staging_deploy.main([]) == 2
+    assert capsys.readouterr().err == (
+        "staging-deploy: command failed (128): git fetch origin: "
+        "fatal: could not read from remote\n"
     )

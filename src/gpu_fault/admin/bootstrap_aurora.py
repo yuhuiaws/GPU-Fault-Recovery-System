@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -9,7 +8,11 @@ from gpu_fault.admin.aurora_capacity import (
     CAPACITY_SETTLE_STABLE_POLLS,
     reconcile_aurora_capacity,
 )
-from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
+from gpu_fault.admin.bootstrap_common import (
+    BootstrapError,
+    CommandRunner,
+    describe_or_absent,
+)
 from gpu_fault.admin.config import (
     AdminConfigError,
     AuroraCapacityConfig,
@@ -76,7 +79,6 @@ def reconcile_existing_capacity(
             timeout_seconds=int(CAPACITY_SETTLE_TIMEOUT_SECONDS),
             poll_seconds=CAPACITY_SETTLE_POLL_SECONDS,
             aws_json=runner.aws_json,
-            wait_for_settle=not runner.dry_run,
         )
     except AdminConfigError as exc:
         raise BootstrapError(f"Aurora cluster {cluster_id}: {exc}") from exc
@@ -168,23 +170,16 @@ def ensure_serverless_instances(
         availability_zones,
         strict=True,
     ):
-        exists = (
-            subprocess.run(
-                [
-                    "aws",
-                    "rds",
-                    "describe-db-instances",
-                    "--region",
-                    aws_region,
-                    "--db-instance-identifier",
-                    instance_id,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
+        existing = describe_or_absent(
+            runner,
+            aws_region,
+            "rds",
+            "describe-db-instances",
+            "--db-instance-identifier",
+            instance_id,
+            not_found=("DBInstanceNotFound",),
         )
-        if exists:
+        if existing is not None:
             continue
         runner.run(
             [
@@ -254,20 +249,16 @@ def ensure_cluster_parameter_group(
 
     group = cluster_parameter_group_name(cluster_id, safe_name=safe_name)
     exists = (
-        subprocess.run(
-            [
-                "aws",
-                "rds",
-                "describe-db-cluster-parameter-groups",
-                "--region",
-                aws_region,
-                "--db-cluster-parameter-group-name",
-                group,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+        describe_or_absent(
+            runner,
+            aws_region,
+            "rds",
+            "describe-db-cluster-parameter-groups",
+            "--db-cluster-parameter-group-name",
+            group,
+            not_found=("DBParameterGroupNotFound",),
+        )
+        is not None
     )
     if not exists:
         versions = (
@@ -330,8 +321,6 @@ def ensure_cluster_parameter_group(
             str(item.get("ParameterName")): str(item.get("ParameterValue") or "")
             for item in items
         }
-    if runner.dry_run and not exists:
-        return group
     drifted = [
         f"ParameterName={name},ParameterValue={value},ApplyMethod={method}"
         for name, value, method in DIAGNOSTIC_PARAMETERS
@@ -400,10 +389,7 @@ def reconcile_cluster_diagnostics(
         mutate=True,
         capture=False,
     )
-    if not runner.dry_run:
-        # The modify answers before the cluster flips to ``modifying``; the
-        # same settle wait the capacity change needs (see above).
-        wait_for_capacity_to_settle(
-            runner, aws_region=aws_region, cluster_id=cluster_id
-        )
+    # The modify answers before the cluster flips to ``modifying``; the same
+    # settle wait the capacity change needs (see above).
+    wait_for_capacity_to_settle(runner, aws_region=aws_region, cluster_id=cluster_id)
     return True

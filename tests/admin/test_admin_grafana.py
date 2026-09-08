@@ -1,10 +1,11 @@
 """Amazon Managed Grafana provisioning on the administrator deploy path.
 
 The workspace is resolved in the CPU cluster's region and never guessed between
-candidates; the dashboards are pushed through the Grafana HTTP API with a
-service-account token that lives for one run and never reaches state, logs or
-the summary. Every AWS call goes through a recorded fake runner and every HTTP
-call through a recorded fake transport -- nothing here reaches the network.
+candidates -- and created for the site when the region has none; the dashboards
+are pushed through the Grafana HTTP API with a service-account token that lives
+for one run and never reaches state, logs or the summary. Every AWS call goes
+through a recorded fake runner and every HTTP call through a recorded fake
+transport -- nothing here reaches the network.
 """
 
 from __future__ import annotations
@@ -28,11 +29,14 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.grafana import (
     DASHBOARD_FOLDER_UID,
     DATASOURCE_UID,
+    GRAFANA_VIEWER_ENV,
+    GRAFANA_WORKSPACE_ID_ENV,
     GrafanaSettings,
     HttpResponse,
     dashboard_asset_digests,
     ensure_grafana_dashboards,
     ensure_grafana_workspace,
+    grafana_access_lines,
     grafana_environment,
     grafana_installation_resources,
     grafana_request_fields,
@@ -66,13 +70,16 @@ class Runner:
         workspaces: Sequence[Mapping[str, Any]] = (),
         *,
         service_accounts: Sequence[Mapping[str, Any]] = (),
-        dry_run: bool = False,
+        create_refused: str | None = None,
+        permission_errors: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         # Deep copies: the fake tags workspaces in place, and the fixtures are
         # module constants shared by every test.
         self.workspaces = [json.loads(json.dumps(item)) for item in workspaces]
         self.service_accounts = [dict(item) for item in service_accounts]
-        self.dry_run = dry_run
+        # The region's answer to create-workspace when it will not create one.
+        self.create_refused = create_refused
+        self.permission_errors = [dict(item) for item in permission_errors]
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self.token_key = "glsa_secret_token_value"
 
@@ -84,8 +91,6 @@ class Runner:
     def run(self, arguments: Sequence[str], **keywords: Any) -> str:
         argv = list(arguments)
         self.calls.append((argv, keywords))
-        if self.dry_run and keywords.get("mutate"):
-            return ""
         operation = argv[2] if argv[0] == "aws" else argv[0]
         if argv[1] == "grafana":
             return self._grafana(operation, argv, keywords)
@@ -114,6 +119,12 @@ class Runner:
             return ""
         if operation == "create-workspace":
             assert keywords.get("mutate") is True, "creation is a write"
+            if self.create_refused:
+                raise BootstrapError(
+                    f"command failed (254): aws: An error occurred "
+                    f"(ValidationException) when calling CreateWorkspace: "
+                    f"{self.create_refused}"
+                )
             tags = json.loads(argv[argv.index("--tags") + 1])
             created = {
                 "id": "g-created01",
@@ -155,6 +166,9 @@ class Runner:
         if operation == "delete-workspace-service-account-token":
             assert keywords.get("mutate") is True, "token deletion writes"
             return ""
+        if operation == "update-permissions":
+            assert keywords.get("mutate") is True, "granting a role writes"
+            return json.dumps({"errors": self.permission_errors})
         raise AssertionError(argv)
 
     def _iam(self, operation: str, argv: list[str]) -> str:
@@ -173,10 +187,7 @@ class Runner:
 
     def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:
         assert region == REGION, f"Grafana followed region {region}, not {REGION}"
-        raw = self.run(["aws", *arguments, "--region", region], **keywords)
-        if self.dry_run and keywords.get("mutate") and not raw:
-            return {}
-        return json.loads(raw)
+        return json.loads(self.run(["aws", *arguments, "--region", region], **keywords))
 
     def operations(self) -> list[str]:
         return [argv[2] for argv, _keywords in self.calls if argv[0] == "aws"]
@@ -359,25 +370,44 @@ def test_two_untagged_active_workspaces_are_never_guessed_between() -> None:
     assert "tag-resource" not in runner.operations()
 
 
-def test_no_workspace_and_no_creation_is_the_documented_error() -> None:
+def test_resolution_order_is_operator_id_then_site_tag_then_single_active_then_create() -> (
+    None
+):
+    """Each step of the order wins over the ones below it, and no step guesses."""
+
+    ours = _tagged(
+        {**HYPERPOD_WORKSPACE, "id": "g-ours000001", "name": "ours"},
+        **{"gpu-fault:site-id": SITE},
+    )
+    # 1. The operator's id wins even when a tagged workspace exists.
+    runner = Runner([HYPERPOD_WORKSPACE, ours])
+    chosen = ensure_grafana_workspace(
+        runner, cpu=_cluster(), site_id=SITE, requested_id="g-5b81a13d97"
+    )
+    assert chosen["workspace_id"] == "g-5b81a13d97"
+    # 2. The site tag wins over an untagged ACTIVE workspace.
+    chosen = ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
+    assert chosen["workspace_id"] == "g-ours000001"
+    # 3. The region's single ACTIVE workspace is adopted.
+    runner = Runner([HYPERPOD_WORKSPACE])
+    chosen = ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
+    assert chosen["workspace_id"] == "g-5b81a13d97"
+    assert "create-workspace" not in runner.operations(), (
+        "a workspace was created although the region had one to adopt"
+    )
+    # 4. An empty region gets a workspace created for the site.
+    runner = Runner([])
+    chosen = ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
+    assert chosen["workspace_id"] == "g-created01"
+    assert chosen["ownership"] == "CREATED"
+
+
+def test_an_empty_region_gets_a_workspace_with_sso_customer_managed_and_our_role() -> (
+    None
+):
     runner = Runner([])
 
-    with pytest.raises(BootstrapError) as failure:
-        ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
-
-    assert str(failure.value) == (
-        "no Amazon Managed Grafana workspace in us-east-1; "
-        "pass --grafana-workspace-id, or --grafana disabled"
-    )
-    assert "create-workspace" not in runner.operations()
-
-
-def test_creation_when_allowed_uses_sso_customer_managed_and_our_role() -> None:
-    runner = Runner([])
-
-    workspace = ensure_grafana_workspace(
-        runner, cpu=_cluster(), site_id=SITE, create_allowed=True
-    )
+    workspace = ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
 
     assert workspace["ownership"] == "CREATED"
     assert workspace["workspace_id"] == "g-created01"
@@ -414,13 +444,16 @@ def test_creation_when_allowed_uses_sso_customer_managed_and_our_role() -> None:
     assert trust["Statement"][0]["Principal"] == {"Service": "grafana.amazonaws.com"}
 
 
-def test_a_dry_run_without_a_workspace_reports_the_dry_run_id() -> None:
-    runner = Runner([], dry_run=True)
+def test_a_region_that_refuses_the_creation_names_the_manual_fallback() -> None:
+    runner = Runner([], create_refused="No IAM Identity Center instance in region")
 
-    workspace = ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
+    with pytest.raises(BootstrapError) as failure:
+        ensure_grafana_workspace(runner, cpu=_cluster(), site_id=SITE)
 
-    assert workspace["workspace_id"] == "g-dryrun"
-    assert "create-workspace" not in runner.operations()
+    message = str(failure.value)
+    assert "No IAM Identity Center instance" in message
+    assert "--grafana-workspace-id" in message, "the fallback flag is not named"
+    assert "console" in message.lower(), "the manual creation path is not named"
 
 
 def test_a_read_only_probe_of_an_untagged_workspace_reports_the_write() -> None:
@@ -697,27 +730,6 @@ def test_a_dashboard_without_a_stable_uid_is_rejected_before_any_call(
     )
 
 
-def test_dry_run_provisioning_mints_no_token_and_plans_the_imports(
-    tmp_path: Path,
-) -> None:
-    runner = Runner([HYPERPOD_WORKSPACE], dry_run=True)
-    http = Http()
-
-    summary = provision_grafana(
-        runner,
-        workspace=_workspace(workspace_id="g-dryrun"),
-        amp_workspace_id=AMP,
-        region=REGION,
-        dashboards_dir=_dashboards(tmp_path, "gpu-fault-overview"),
-        http=http,
-    )
-
-    assert summary["status"] == "DRY_RUN"
-    assert [item["uid"] for item in summary["dashboards"]] == ["gpu-fault-overview"]
-    assert http.requests == []
-    assert "create-workspace-service-account-token" not in runner.operations()
-
-
 # --- the monitoring task step ----------------------------------------------------
 
 
@@ -745,12 +757,124 @@ def _ensure(
     )
 
 
-def test_disabled_grafana_calls_nothing(tmp_path: Path) -> None:
+def test_a_caller_without_a_grafana_decision_skips_the_step(tmp_path: Path) -> None:
     runner = Runner([HYPERPOD_WORKSPACE])
 
-    assert _ensure(runner, _settings(enabled=False), tmp_path) == {"status": "DISABLED"}
-    assert _ensure(runner, None, tmp_path) == {"status": "DISABLED"}
+    assert _ensure(runner, None, tmp_path) == {"status": "SKIPPED"}
     assert runner.calls == []
+
+
+def test_the_default_settings_create_and_provision_when_the_region_is_empty(
+    tmp_path: Path,
+) -> None:
+    """First deploy for the customer: no flag, no workspace, and the dashboards
+    still land -- in a workspace recorded as ours."""
+
+    runner = Runner([])
+    _dashboards(tmp_path, "gpu-fault-overview")
+
+    result = _ensure(runner, _settings(), tmp_path)
+
+    assert result["status"] == "PROVISIONED"
+    assert result["workspace_id"] == "g-created01"
+    assert result["ownership"] == "CREATED"
+    assert [item["uid"] for item in result["dashboards"]] == ["gpu-fault-overview"]
+
+
+def test_a_refused_creation_degrades_to_a_warning_and_the_deploy_continues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = Runner([], create_refused="No IAM Identity Center instance in region")
+
+    result = _ensure(runner, _settings(), tmp_path)
+
+    assert result["status"] == "FAILED"
+    assert "No IAM Identity Center instance" in result["reason"]
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "deploy continues" in err
+    assert "--grafana-workspace-id" in err, "the warning does not name the fallback"
+    assert "create-workspace-service-account-token" not in runner.operations()
+
+
+def test_the_viewer_flag_grants_the_identity_center_user_after_the_import(
+    tmp_path: Path,
+) -> None:
+    runner = Runner([HYPERPOD_WORKSPACE])
+
+    result = _ensure(runner, _settings(viewer_sso_user_id="u-42"), tmp_path)
+
+    assert result["status"] == "PROVISIONED"
+    assert result["viewer_sso_user_id"] == "u-42"
+    operations = runner.operations()
+    assert operations.index("update-permissions") > operations.index(
+        "delete-workspace-service-account-token"
+    ), "the grant ran before the import finished"
+    grant = next(argv for argv, _k in runner.calls if argv[2] == "update-permissions")
+    assert grant[grant.index("--workspace-id") + 1] == "g-5b81a13d97"
+    batch = json.loads(grant[grant.index("--update-instruction-batch") + 1])
+    assert batch == [
+        {
+            "action": "ADD",
+            "role": "VIEWER",
+            "users": [{"id": "u-42", "type": "SSO_USER"}],
+        }
+    ]
+
+
+def test_a_refused_viewer_is_operator_input_and_fails_the_deploy(
+    tmp_path: Path,
+) -> None:
+    runner = Runner(
+        [HYPERPOD_WORKSPACE],
+        permission_errors=[{"code": 1, "message": "user u-typo not found"}],
+    )
+
+    with pytest.raises(BootstrapError, match="u-typo"):
+        _ensure(runner, _settings(viewer_sso_user_id="u-typo"), tmp_path)
+
+
+def test_the_access_lines_name_the_real_workspace_and_the_exact_permission_command(
+    tmp_path: Path,
+) -> None:
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
+    assert grafana_access_lines(state) == [], "nothing provisioned, nothing to say"
+    state.record(
+        "monitoring_install",
+        {
+            "grafana": {
+                "status": "PROVISIONED",
+                "workspace_id": "g-5b81a13d97",
+                "region": REGION,
+                "dashboards_url": "https://g-5b81a13d97.grafana-workspace/x",
+            }
+        },
+    )
+
+    lines = grafana_access_lines(state)
+
+    assert lines[0] == "Grafana dashboards: https://g-5b81a13d97.grafana-workspace/x"
+    assert (
+        "aws grafana update-permissions --region us-east-1 "
+        "--workspace-id g-5b81a13d97 --update-instruction-batch "
+        '\'[{"action":"ADD","role":"VIEWER","users":'
+        '[{"id":"<sso-user-id>","type":"SSO_USER"}]}]\''
+    ) in lines[1]
+    assert "--grafana-viewer" in lines[1]
+
+    state.record(
+        "monitoring_install",
+        {
+            "grafana": {
+                "status": "PROVISIONED",
+                "workspace_id": "g-5b81a13d97",
+                "region": REGION,
+                "dashboards_url": "https://g-5b81a13d97.grafana-workspace/x",
+                "viewer_sso_user_id": "u-42",
+            }
+        },
+    )
+    granted = grafana_access_lines(state)
+    assert "u-42" in granted[1] and "update-permissions" not in granted[1]
 
 
 def test_a_provisioned_step_records_the_workspace_and_the_imports_not_the_token(
@@ -810,7 +934,7 @@ def test_a_refused_http_call_fails_soft_but_keeps_the_created_workspace(
     runner = Runner([])
     http = Http({("GET", "/api/org"): HttpResponse(401, "Unauthorized")})
 
-    result = _ensure(runner, _settings(create=True), tmp_path, http=http)
+    result = _ensure(runner, _settings(), tmp_path, http=http)
 
     assert result["status"] == "FAILED"
     assert result["workspace_id"] == "g-created01"
@@ -881,11 +1005,13 @@ def _request(**overrides: Any) -> BootstrapRequest:
     return BootstrapRequest(**values)
 
 
-def test_request_defaults_enable_grafana_without_a_workspace_id() -> None:
+def test_request_defaults_leave_the_workspace_and_the_viewer_unset() -> None:
     request = _request()
 
-    assert request.grafana_enabled is True
     assert request.grafana_workspace_id is None
+    assert request.grafana_viewer is None
+    assert not hasattr(request, "grafana_enabled"), "the --grafana mode is gone"
+    assert not hasattr(request, "grafana_create"), "the --grafana mode is gone"
 
 
 def test_settings_take_the_operator_id_over_the_persisted_site_id(
@@ -918,9 +1044,9 @@ def test_settings_take_the_operator_id_over_the_persisted_site_id(
     assert fresh.previous == {"status": "PROVISIONED", "workspace_id": "g-5b81a13d97"}
     assert (
         grafana_settings(
-            _request(grafana_enabled=False), existing_site=None, state=state
-        ).enabled
-        is False
+            _request(grafana_viewer="u-42"), existing_site=None, state=state
+        ).viewer_sso_user_id
+        == "u-42"
     )
 
 
@@ -929,37 +1055,30 @@ def test_cli_options_are_parsed_and_carried_to_the_next_hop_as_environment(
 ) -> None:
     parser = argparse.ArgumentParser()
     admin_grafana.add_grafana_arguments(parser)
-    monkeypatch.delenv("GPU_FAULT_ADMIN_GRAFANA", raising=False)
-    monkeypatch.delenv("GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv(GRAFANA_WORKSPACE_ID_ENV, raising=False)
+    monkeypatch.delenv(GRAFANA_VIEWER_ENV, raising=False)
 
     default = parser.parse_args([])
     explicit = parser.parse_args(
-        ["--grafana", "disabled", "--grafana-workspace-id", "g-5b81a13d97"]
+        ["--grafana-workspace-id", "g-5b81a13d97", "--grafana-viewer", "u-42"]
     )
-    create = parser.parse_args(["--grafana", "create"])
 
     assert grafana_environment(default) == {}, "no option, no variable"
     assert grafana_request_fields(default) == {
-        "grafana_enabled": True,
         "grafana_workspace_id": None,
-        "grafana_create": False,
+        "grafana_viewer": None,
     }
     assert grafana_environment(explicit) == {
-        "GPU_FAULT_ADMIN_GRAFANA": "disabled",
-        "GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID": "g-5b81a13d97",
+        GRAFANA_WORKSPACE_ID_ENV: "g-5b81a13d97",
+        GRAFANA_VIEWER_ENV: "u-42",
     }
     assert grafana_request_fields(explicit) == {
-        "grafana_enabled": False,
         "grafana_workspace_id": "g-5b81a13d97",
-        "grafana_create": False,
+        "grafana_viewer": "u-42",
     }
-    assert grafana_request_fields(create) == {
-        "grafana_enabled": True,
-        "grafana_workspace_id": None,
-        "grafana_create": True,
-    }
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--grafana", "maybe"])
+    for retired in (["--grafana", "disabled"], ["--grafana", "create"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(retired)
 
 
 def test_the_inner_hop_reads_the_variables_the_public_command_set(
@@ -967,21 +1086,17 @@ def test_the_inner_hop_reads_the_variables_the_public_command_set(
 ) -> None:
     parser = argparse.ArgumentParser()
     admin_grafana.add_grafana_arguments(parser)
-    monkeypatch.setenv("GPU_FAULT_ADMIN_GRAFANA", "disabled")
-    monkeypatch.setenv("GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID", "g-5b81a13d97")
+    monkeypatch.setenv(GRAFANA_WORKSPACE_ID_ENV, "g-5b81a13d97")
+    monkeypatch.setenv(GRAFANA_VIEWER_ENV, "u-42")
 
     fields = grafana_request_fields(parser.parse_args([]))
-    option_wins = grafana_request_fields(parser.parse_args(["--grafana", "enabled"]))
+    option_wins = grafana_request_fields(
+        parser.parse_args(["--grafana-workspace-id", "g-other0001"])
+    )
 
-    assert fields == {
-        "grafana_enabled": False,
-        "grafana_workspace_id": "g-5b81a13d97",
-        "grafana_create": False,
-    }
-    assert option_wins["grafana_enabled"] is True
-    monkeypatch.setenv("GPU_FAULT_ADMIN_GRAFANA", "sometimes")
-    with pytest.raises(BootstrapError, match="GPU_FAULT_ADMIN_GRAFANA"):
-        grafana_request_fields(parser.parse_args([]))
+    assert fields == {"grafana_workspace_id": "g-5b81a13d97", "grafana_viewer": "u-42"}
+    assert option_wins["grafana_workspace_id"] == "g-other0001"
+    assert option_wins["grafana_viewer"] == "u-42"
 
 
 def test_site_health_document_persists_the_resolved_workspace(tmp_path: Path) -> None:
@@ -996,11 +1111,11 @@ def test_site_health_document_persists_the_resolved_workspace(tmp_path: Path) ->
     failed = admin_grafana.grafana_site_health(
         state, _settings(workspace_id="g-persisted")
     )
-    disabled = admin_grafana.grafana_site_health(state, _settings(enabled=False))
+    unresolved = admin_grafana.grafana_site_health(state, _settings())
 
-    assert provisioned == {"grafanaEnabled": True, "grafanaWorkspaceId": "g-5b81a13d97"}
-    assert failed == {"grafanaEnabled": True, "grafanaWorkspaceId": "g-persisted"}
-    assert disabled == {"grafanaEnabled": False}
+    assert provisioned == {"grafanaWorkspaceId": "g-5b81a13d97"}
+    assert failed == {"grafanaWorkspaceId": "g-persisted"}
+    assert unresolved == {}, "no workspace yet, nothing to persist"
 
 
 # --- registry records and checkpoint assets ----------------------------------------
@@ -1087,8 +1202,8 @@ def test_a_created_workspace_and_its_role_are_deleted_role_last() -> None:
 
 @pytest.mark.parametrize(
     "grafana",
-    [{"status": "DISABLED"}, {"status": "FAILED", "reason": "ambiguous"}],
-    ids=["disabled", "failed-before-resolution"],
+    [{"status": "SKIPPED"}, {"status": "FAILED", "reason": "ambiguous"}],
+    ids=["skipped", "failed-before-resolution"],
 )
 def test_no_workspace_means_no_record(grafana: dict[str, Any]) -> None:
     assert _records(grafana) == {}

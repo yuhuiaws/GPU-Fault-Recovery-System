@@ -236,15 +236,19 @@ def test_healthy_lbc_probe_skips_helm_and_iam_mutation(
 
         def run(self, arguments, **kwargs):
             calls.append((list(arguments), kwargs))
-            if "list-policy-tags" in arguments:
+            if "get-policy" in arguments:
+                # One read carries the tags; there is no list-policy-tags call.
                 return json.dumps(
                     {
-                        "Tags": [
-                            {
-                                "Key": admin_bootstrap_services.SITE_TAG_KEY,
-                                "Value": "site-a",
-                            }
-                        ]
+                        "Policy": {
+                            "Arn": policy_arn,
+                            "Tags": [
+                                {
+                                    "Key": admin_bootstrap_services.SITE_TAG_KEY,
+                                    "Value": "site-a",
+                                }
+                            ],
+                        }
                     }
                 )
             if "list-attached-role-policies" in arguments:

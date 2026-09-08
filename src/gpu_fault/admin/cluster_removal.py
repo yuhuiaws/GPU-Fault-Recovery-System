@@ -21,6 +21,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     safe_name,
 )
+from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
@@ -1070,6 +1071,12 @@ def _sync_release_state(site: RenderedSite) -> None:
         raise BootstrapError("regional release state synchronization failed")
 
 
+def refresh_failure_domain_map(site: RenderedSite) -> None:
+    """Re-render the control-worker's failure-domain map for the remaining clusters."""
+
+    apply_failure_domain_map(site)
+
+
 def remove_cluster(
     request: RemoveClusterRequest,
     *,
@@ -1223,6 +1230,9 @@ def _remove_cluster_locked(
         repository_root=request.site.repository_root,
     )
     if not _done(state, "RELEASE_STATE_UPDATED"):
+        # Membership is final: drop the removed cluster from the failure-domain
+        # map the control-worker mounts before the release state moves on.
+        refresh_failure_domain_map(updated_site)
         _sync_release_state(updated_site)
         _complete(
             state_path,

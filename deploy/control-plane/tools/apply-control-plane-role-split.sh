@@ -44,6 +44,11 @@ NOTIFICATION_CONFIG_SHA256="$(
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
 FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
+# Content digest of the failure-domain ConfigMap the release engine applied
+# just before this script; stamped on the control-worker pod template so the
+# worker rolls exactly when the map it mounts changed. Empty means "not
+# rendered" (dry run) and leaves the existing stamp alone.
+FAILURE_DOMAIN_MAP_SHA256="${GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256:-}"
 ROLE_TARGETS="$(
     printf '%s' \
         "${GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS:-spool,worker,ingress}"
@@ -99,6 +104,11 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
     "${PRESERVE_ROLE_CONFIG_MAPS}" == "false" ]] || {
     echo "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS must be true or false" >&2
     exit 2
+}
+[[ -z "${FAILURE_DOMAIN_MAP_SHA256}" ||
+    "${FAILURE_DOMAIN_MAP_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256 must be a lowercase SHA-256" >&2
+    exit 1
 }
 [[ "${FORCE_ROLE_RESTART}" == "true" ||
     "${FORCE_ROLE_RESTART}" == "false" ]] || {
@@ -637,6 +647,24 @@ stamp_release() {
         )"
 }
 
+stamp_failure_domain_map() {
+    [[ -n "${FAILURE_DOMAIN_MAP_SHA256}" ]] || return 0
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
+        gpu-fault-control-worker --type=merge -p "$(
+            jq -nc --arg sha "${FAILURE_DOMAIN_MAP_SHA256}" '{
+                spec: {
+                    template: {
+                        metadata: {
+                            annotations: {
+                                "gpu-fault.io/failure-domain-map-sha256": $sha
+                            }
+                        }
+                    }
+                }
+            }'
+        )"
+}
+
 stamp_admin_config_metadata() {
     local deployment
     for deployment in \
@@ -898,6 +926,7 @@ apply_worker_role() {
     stamp_release \
         gpu-fault-control-worker \
         "${ADMIN_CONFIG_WORKER_SHA256}"
+    stamp_failure_domain_map
     if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
         "${FORCE_ROLE_RESTART}" == "true" ]]; then
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
@@ -979,4 +1008,26 @@ GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
 GPU_FAULT_RELEASE_ID="${RELEASE_ID}" \
 GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE="${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" \
-    "${SCRIPT_DIR}/verify-control-plane-role-split.sh"
+    python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"
+
+# Record the CPU-plane resources this apply produced. The regional engine sets
+# GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY=false on the rollouts that refresh
+# the registry themselves; every other caller syncs here.
+SYNC_REGISTRY="${GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY:-true}"
+[[ "${SYNC_REGISTRY}" == "true" || "${SYNC_REGISTRY}" == "false" ]] || {
+    echo "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY must be true or false" >&2
+    exit 2
+}
+if [[ "${SYNC_REGISTRY}" == "true" ]]; then
+    registry_args=(
+        --plane cpu
+        --namespace "${NAMESPACE}"
+        --release-id "${RELEASE_ID}"
+    )
+    if [[ -n "${KUBECONFIG_PATH}" ]]; then
+        registry_args+=(--kubeconfig "${KUBECONFIG_PATH}")
+    fi
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/sync_installed_resource_registry.py" \
+        "${registry_args[@]}"
+fi

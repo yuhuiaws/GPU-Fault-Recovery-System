@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import ipaddress
 import json
 import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Callable, Mapping, Sequence, cast
 from urllib.parse import quote
 
 from gpu_fault.admin.aurora_capacity import (
@@ -36,6 +38,7 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
     assert_site_tag,
+    describe_or_absent,
     ensure_namespace as _ensure_namespace,
     kubectl_apply as _kubectl_apply,
     safe_name as _safe_name,
@@ -43,7 +46,13 @@ from gpu_fault.admin.bootstrap_common import (
     write_secret as _write_secret,
     write_yaml as _write_yaml,
 )
+from gpu_fault.admin.bootstrap_checkpoint import HYPERPOD_HINTS, load_hyperpod_hints
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
+from gpu_fault.admin.bootstrap_network import (
+    RouteTableIndex,
+    describe_subnets as _describe_subnets,
+    private_subnets as _private_subnets,
+)
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
     cluster_alias as _cluster_alias,
@@ -60,9 +69,15 @@ from gpu_fault.admin.bootstrap_tasks import (
     run_platform_prerequisite_tasks,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
-from gpu_fault.admin.grafana import grafana_settings, grafana_site_health
+from gpu_fault.admin.deploy_consent import refuse_unconsented_release
+from gpu_fault.admin.grafana import (
+    grafana_access_lines,
+    grafana_settings,
+    grafana_site_health,
+)
 from gpu_fault.admin.notifications import NotificationRouting
 from gpu_fault.admin.release_repositories import prepare_signed_release
+from gpu_fault.admin.site import site_retention
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
     "public.ecr.aws/aws-observability/aws-otel-collector@"
@@ -134,16 +149,43 @@ def _cluster_name_from_eks_arn(value: str) -> str:
     return arn.resource_name
 
 
+def _orchestrator_eks_arn(hyperpod: Mapping[str, Any]) -> str:
+    return str(
+        ((hyperpod.get("Orchestrator") or {}).get("Eks") or {}).get("ClusterArn", "")
+    )
+
+
 def _find_hyperpod_for_eks(
     runner: CommandRunner,
     *,
     eks_arn: str,
     region: str,
+    hint: str | None = None,
 ) -> dict[str, Any]:
+    """The HyperPod cluster orchestrated by ``eks_arn``.
+
+    With a ``hint`` (the HyperPod ARN a previous run resolved) one describe
+    answers; it is trusted only if the described cluster still names this EKS
+    cluster as its orchestrator, otherwise the region inventory decides as on a
+    first run.
+    """
+
+    if hint:
+        described = describe_or_absent(
+            runner,
+            region,
+            "sagemaker",
+            "describe-cluster",
+            "--cluster-name",
+            hint,
+            not_found=("ResourceNotFound",),
+        )
+        if described is not None and _orchestrator_eks_arn(described) == eks_arn:
+            return described
     matches = [
         value
         for value in hyperpod_inventory(runner, region=region)
-        if (value.get("Orchestrator") or {}).get("Eks", {}).get("ClusterArn") == eks_arn
+        if _orchestrator_eks_arn(value) == eks_arn
     ]
     if len(matches) != 1:
         raise BootstrapError(
@@ -159,6 +201,7 @@ def discover_cluster(
     cluster_arn: str,
     role: str,
     context: str,
+    hyperpod_hints: Mapping[str, str] | None = None,
 ) -> ClusterIdentity:
     arn = Arn.parse(cluster_arn)
     if arn.service == "sagemaker":
@@ -174,17 +217,13 @@ def discover_cluster(
             runner,
             eks_arn=cluster_arn,
             region=arn.region,
+            hint=(hyperpod_hints or {}).get(cluster_arn),
         )
     else:
         raise BootstrapError("cluster ARN must use the eks or sagemaker service")
     hyperpod_arn = str(hyperpod.get("ClusterArn") or "")
     hyperpod_name = str(hyperpod.get("ClusterName") or "")
-    eks_arn = str(
-        ((hyperpod.get("Orchestrator") or {}).get("Eks") or {}).get(
-            "ClusterArn",
-            "",
-        )
-    )
+    eks_arn = _orchestrator_eks_arn(hyperpod)
     if not all((hyperpod_arn, hyperpod_name, eks_arn)):
         raise BootstrapError(
             f"HyperPod cluster {cluster_arn} does not expose an EKS orchestrator"
@@ -243,54 +282,28 @@ def _require_same_scope(
             )
 
 
-def _ensure_kubeconfigs(
-    runner: CommandRunner,
-    *,
-    cpu: ClusterIdentity,
-    gpu_clusters: Sequence[ClusterIdentity],
-    state_dir: Path,
-) -> tuple[Path, Path]:
-    cpu_config = state_dir / "cpu.kubeconfig"
-    gpu_config = state_dir / "gpu.kubeconfig"
+def _update_kubeconfig(
+    runner: CommandRunner, *, cluster: ClusterIdentity, path: Path
+) -> None:
     runner.run(
         [
             "aws",
             "eks",
             "update-kubeconfig",
             "--region",
-            cpu.region,
+            cluster.region,
             "--name",
-            cpu.eks_name,
+            cluster.eks_name,
             "--kubeconfig",
-            str(cpu_config),
+            str(path),
             "--alias",
-            cpu.context,
+            cluster.context,
         ],
         mutate=True,
         capture=False,
     )
-    for cluster in gpu_clusters:
-        runner.run(
-            [
-                "aws",
-                "eks",
-                "update-kubeconfig",
-                "--region",
-                cluster.region,
-                "--name",
-                cluster.eks_name,
-                "--kubeconfig",
-                str(gpu_config),
-                "--alias",
-                cluster.context,
-            ],
-            mutate=True,
-            capture=False,
-        )
-    if not runner.dry_run:
-        cpu_config.chmod(0o600)
-        gpu_config.chmod(0o600)
-    return cpu_config, gpu_config
+    if path.exists():
+        path.chmod(0o600)
 
 
 def _ensure_base_secrets(
@@ -301,37 +314,10 @@ def _ensure_base_secrets(
     secure_dir: Path,
 ) -> Path:
     secret_name = "gpu-fault-control-plane-active"
-    exists = (
-        subprocess.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(cpu_kubeconfig),
-                "-n",
-                namespace,
-                "get",
-                "secret",
-                secret_name,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    )
-    if not exists:
-        values = {
-            "execution-token": secrets.token_hex(32),
-            "processor-replay-secret": secrets.token_hex(32),
-            "node-action-secret": secrets.token_hex(32),
-        }
-        manifest = _secret_manifest(
-            name=secret_name,
-            namespace=namespace,
-            string_data=values,
-        )
-        _kubectl_apply(runner, cpu_kubeconfig, manifest)
-        master = values["node-action-secret"]
-    else:
+    # One read answers both "is it there?" and "what is the master?"; only a
+    # NotFound means absent -- an unreachable API server must not mint a second
+    # fleet master over the one the nodes already hold.
+    try:
         encoded = runner.run(
             [
                 "kubectl",
@@ -347,6 +333,22 @@ def _ensure_base_secrets(
             ],
             sensitive=True,
         )
+    except BootstrapError as exc:
+        if "NotFound" not in str(exc):
+            raise
+        values = {
+            "execution-token": secrets.token_hex(32),
+            "processor-replay-secret": secrets.token_hex(32),
+            "node-action-secret": secrets.token_hex(32),
+        }
+        manifest = _secret_manifest(
+            name=secret_name,
+            namespace=namespace,
+            string_data=values,
+        )
+        _kubectl_apply(runner, cpu_kubeconfig, manifest)
+        master = values["node-action-secret"]
+    else:
         master = base64.b64decode(encoded).decode()
     master_file = secure_dir / "fleet-master"
     _write_secret(master_file, master)
@@ -414,77 +416,6 @@ def _discover_adot_image(
     return sorted(candidates)[0]
 
 
-def _describe_subnets(
-    runner: CommandRunner,
-    *,
-    region: str,
-    subnet_ids: Sequence[str],
-) -> list[dict[str, Any]]:
-    if not subnet_ids:
-        return []
-    return cast(
-        list[dict[str, Any]],
-        runner.aws_json(
-            region,
-            "ec2",
-            "describe-subnets",
-            "--subnet-ids",
-            *subnet_ids,
-        ).get("Subnets", []),
-    )
-
-
-def _route_tables_for_subnet(
-    runner: CommandRunner,
-    *,
-    region: str,
-    subnet_id: str,
-    vpc_id: str,
-) -> list[dict[str, Any]]:
-    tables = cast(
-        list[dict[str, Any]],
-        runner.aws_json(
-            region,
-            "ec2",
-            "describe-route-tables",
-            "--filters",
-            f"Name=association.subnet-id,Values={subnet_id}",
-        ).get("RouteTables", []),
-    )
-    if tables:
-        return tables
-    return cast(
-        list[dict[str, Any]],
-        runner.aws_json(
-            region,
-            "ec2",
-            "describe-route-tables",
-            "--filters",
-            f"Name=vpc-id,Values={vpc_id}",
-            "Name=association.main,Values=true",
-        ).get("RouteTables", []),
-    )
-
-
-def _public_subnet(
-    runner: CommandRunner,
-    *,
-    region: str,
-    subnet: dict[str, Any],
-) -> bool:
-    return any(
-        route.get("DestinationCidrBlock") == "0.0.0.0/0"
-        and str(route.get("GatewayId", "")).startswith("igw-")
-        for table in _route_tables_for_subnet(
-            runner,
-            region=region,
-            subnet_id=subnet["SubnetId"],
-            vpc_id=subnet["VpcId"],
-        )
-        for route in table.get("Routes", [])
-    )
-
-
 def _ensure_internet_gateway(
     runner: CommandRunner,
     *,
@@ -509,12 +440,6 @@ def _ensure_internet_gateway(
             "ownership": (
                 "CREATED" if tags.get(SITE_TAG_KEY) == site_id else "EXTERNAL"
             ),
-            "vpc_id": vpc_id,
-        }
-    if runner.dry_run:
-        return {
-            "internet_gateway_id": f"igw-dryrun-{site_id[:8]}",
-            "ownership": "CREATED",
             "vpc_id": vpc_id,
         }
     created = runner.aws_json(
@@ -576,34 +501,19 @@ def _owned_public_subnets(
     cluster: ClusterIdentity,
     site_id: str,
     all_subnets: Sequence[dict[str, Any]],
+    routes: RouteTableIndex,
 ) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     owned = [
         item
         for item in all_subnets
         if tag_map(item.get("Tags")).get(SITE_TAG_KEY) == site_id
         and tag_map(item.get("Tags")).get("gpu-fault:purpose") == "public-nlb"
-        if _public_subnet(runner, region=cluster.region, subnet=item)
+        if routes.is_public(item)
     ]
     resources: list[dict[str, str]] = []
     by_az: dict[str, dict[str, str]] = {}
     for subnet in owned:
-        route_tables = _route_tables_for_subnet(
-            runner,
-            region=cluster.region,
-            subnet_id=str(subnet["SubnetId"]),
-            vpc_id=cluster.vpc_id,
-        )
-        route_table = next(
-            (
-                table
-                for table in route_tables
-                if any(
-                    item.get("SubnetId") == subnet["SubnetId"]
-                    for item in table.get("Associations", [])
-                )
-            ),
-            None,
-        )
+        route_table = routes.explicit_for(str(subnet["SubnetId"]))
         if route_table is None:
             raise BootstrapError(
                 f"owned public subnet {subnet['SubnetId']} has no route table"
@@ -619,7 +529,7 @@ def _owned_public_subnets(
             raise BootstrapError(
                 f"route table {route_table_id} belongs to site {route_owner!r}"
             )
-        if route_owner is None and not runner.dry_run:
+        if route_owner is None:
             runner.run(
                 [
                     "aws",
@@ -665,18 +575,20 @@ def _ensure_public_subnets(
             f"Name=vpc-id,Values={cluster.vpc_id}",
         ).get("Subnets", []),
     )
+    # One route-table read for the VPC serves every subnet decision below.
+    routes = RouteTableIndex.load(runner, region=cluster.region, vpc_id=cluster.vpc_id)
     subnet_resources, public_by_az = _owned_public_subnets(
         runner,
         cluster=cluster,
         site_id=site_id,
         all_subnets=all_subnets,
+        routes=routes,
     )
-
-    eks_subnets = _describe_subnets(
-        runner,
-        region=cluster.region,
-        subnet_ids=cluster.subnet_ids,
-    )
+    # The EKS subnets are a subset of the VPC's; the earlier describe answers.
+    eks_subnet_ids = set(cluster.subnet_ids)
+    eks_subnets = [
+        item for item in all_subnets if str(item.get("SubnetId")) in eks_subnet_ids
+    ] or _describe_subnets(runner, region=cluster.region, subnet_ids=cluster.subnet_ids)
     availability_zones = sorted({item["AvailabilityZone"] for item in eks_subnets})
     if len(availability_zones) < 2:
         raise BootstrapError("CPU EKS must span at least two availability zones")
@@ -714,85 +626,80 @@ def _ensure_public_subnets(
         zip(target_azs, cidrs, strict=True),
         len(subnet_resources) + 1,
     ):
-        if runner.dry_run:
-            subnet_id = f"subnet-dryrun-public-{index}"
-            route_table_id = f"rtb-dryrun-public-{index}"
-            association_id = f"rtbassoc-dryrun-public-{index}"
-        else:
-            created = runner.aws_json(
-                cluster.region,
+        created = runner.aws_json(
+            cluster.region,
+            "ec2",
+            "create-subnet",
+            "--vpc-id",
+            cluster.vpc_id,
+            "--availability-zone",
+            az,
+            "--cidr-block",
+            cidr,
+            "--tag-specifications",
+            "ResourceType=subnet,Tags="
+            f"[{{Key=gpu-fault:site-id,Value={site_id}}},"
+            "{Key=gpu-fault:purpose,Value=public-nlb}]",
+            mutate=True,
+        )
+        subnet_id = str(created["Subnet"]["SubnetId"])
+        runner.run(
+            [
+                "aws",
                 "ec2",
-                "create-subnet",
-                "--vpc-id",
-                cluster.vpc_id,
-                "--availability-zone",
-                az,
-                "--cidr-block",
-                cidr,
-                "--tag-specifications",
-                "ResourceType=subnet,Tags="
-                f"[{{Key=gpu-fault:site-id,Value={site_id}}},"
-                "{Key=gpu-fault:purpose,Value=public-nlb}]",
-                mutate=True,
-            )
-            subnet_id = str(created["Subnet"]["SubnetId"])
-            runner.run(
-                [
-                    "aws",
-                    "ec2",
-                    "modify-subnet-attribute",
-                    "--region",
-                    cluster.region,
-                    "--subnet-id",
-                    subnet_id,
-                    "--map-public-ip-on-launch",
-                ],
-                mutate=True,
-                capture=False,
-            )
-            route_table_id = runner.aws_text(
+                "modify-subnet-attribute",
+                "--region",
                 cluster.region,
-                "ec2",
-                "create-route-table",
-                "--vpc-id",
-                cluster.vpc_id,
-                "--tag-specifications",
-                "ResourceType=route-table,Tags="
-                f"[{{Key=gpu-fault:site-id,Value={site_id}}},"
-                "{Key=gpu-fault:purpose,Value=public-nlb}]",
-                "--query",
-                "RouteTable.RouteTableId",
-                mutate=True,
-            )
-            runner.run(
-                [
-                    "aws",
-                    "ec2",
-                    "create-route",
-                    "--region",
-                    cluster.region,
-                    "--route-table-id",
-                    route_table_id,
-                    "--destination-cidr-block",
-                    "0.0.0.0/0",
-                    "--gateway-id",
-                    gateway["internet_gateway_id"],
-                ],
-                mutate=True,
-                capture=False,
-            )
-            association_id = runner.aws_text(
-                cluster.region,
-                "ec2",
-                "associate-route-table",
-                "--route-table-id",
-                route_table_id,
                 "--subnet-id",
                 subnet_id,
-                "--query",
-                "AssociationId",
-                mutate=True,
-            )
+                "--map-public-ip-on-launch",
+            ],
+            mutate=True,
+            capture=False,
+        )
+        route_table_id = runner.aws_text(
+            cluster.region,
+            "ec2",
+            "create-route-table",
+            "--vpc-id",
+            cluster.vpc_id,
+            "--tag-specifications",
+            "ResourceType=route-table,Tags="
+            f"[{{Key=gpu-fault:site-id,Value={site_id}}},"
+            "{Key=gpu-fault:purpose,Value=public-nlb}]",
+            "--query",
+            "RouteTable.RouteTableId",
+            mutate=True,
+        )
+        runner.run(
+            [
+                "aws",
+                "ec2",
+                "create-route",
+                "--region",
+                cluster.region,
+                "--route-table-id",
+                route_table_id,
+                "--destination-cidr-block",
+                "0.0.0.0/0",
+                "--gateway-id",
+                gateway["internet_gateway_id"],
+            ],
+            mutate=True,
+            capture=False,
+        )
+        association_id = runner.aws_text(
+            cluster.region,
+            "ec2",
+            "associate-route-table",
+            "--route-table-id",
+            route_table_id,
+            "--subnet-id",
+            subnet_id,
+            "--query",
+            "AssociationId",
+            mutate=True,
+        )
         resource = {
             "subnet_id": subnet_id,
             "availability_zone": az,
@@ -840,14 +747,6 @@ def _ensure_security_group(
         )
         return {
             "group_id": str(groups[0]["GroupId"]),
-            "ownership": "CREATED",
-            "vpc_id": cluster.vpc_id,
-        }
-    if runner.dry_run:
-        return {
-            "group_id": (
-                "sg-dryrun-" + hashlib.sha256(group_name.encode()).hexdigest()[:8]
-            ),
             "ownership": "CREATED",
             "vpc_id": cluster.vpc_id,
         }
@@ -973,13 +872,12 @@ def _ensure_nlb_network(
     eips = sorted(
         {eip for cluster in gpu_clusters for eip in _gpu_nat_eips(runner, cluster)}
     )
-    if not runner.dry_run:
-        _authorize_nlb_sources(
-            runner,
-            region=cpu.region,
-            security_group=security_group["group_id"],
-            eips=eips,
-        )
+    _authorize_nlb_sources(
+        runner,
+        region=cpu.region,
+        security_group=security_group["group_id"],
+        eips=eips,
+    )
     return {
         "name": nlb_name,
         "ownership": "CREATED",
@@ -1041,7 +939,7 @@ def _ensure_private_zone(
             description=f"Route53 hosted zone {zone_id}",
             allow_missing=True,
         )
-        if not tagged and not runner.dry_run:
+        if not tagged:
             runner.run(
                 [
                     "aws",
@@ -1057,9 +955,6 @@ def _ensure_private_zone(
                 mutate=True,
                 capture=False,
             )
-        zone_ownership = "CREATED"
-    elif runner.dry_run:
-        zone_id = "ZDRYRUN" + hashlib.sha256(site_id.encode()).hexdigest()[:8]
         zone_ownership = "CREATED"
     else:
         created = runner.aws_json(
@@ -1094,7 +989,7 @@ def _ensure_private_zone(
             capture=False,
         )
     associated_vpcs: set[tuple[str, str]] = set()
-    if zone is not None and not runner.dry_run:
+    if zone is not None:
         details = runner.aws_json(
             cpu.region,
             "route53",
@@ -1283,31 +1178,17 @@ def _ensure_pki(
         site_id=site_id,
     )
     secret_name = f"gpu-fault/{site_id}/regional-pki"
-    existing = (
-        subprocess.run(
-            [
-                "aws",
-                "secretsmanager",
-                "describe-secret",
-                "--region",
-                cpu.region,
-                "--secret-id",
-                secret_name,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    secret_description = describe_or_absent(
+        runner,
+        cpu.region,
+        "secretsmanager",
+        "describe-secret",
+        "--secret-id",
+        secret_name,
+        not_found=("ResourceNotFoundException",),
     )
     ca_output = state_dir / "control-plane-ca.crt"
-    if existing:
-        secret_description = runner.aws_json(
-            cpu.region,
-            "secretsmanager",
-            "describe-secret",
-            "--secret-id",
-            secret_name,
-        )
+    if secret_description is not None:
         secret = json.loads(
             runner.aws_text(
                 cpu.region,
@@ -1328,7 +1209,7 @@ def _ensure_pki(
             description=f"Secrets Manager secret {secret_name}",
             allow_missing=True,
         )
-        if not tagged and not runner.dry_run:
+        if not tagged:
             runner.run(
                 [
                     "aws",
@@ -1358,7 +1239,7 @@ def _ensure_pki(
             description=f"ACM certificate {certificate_arn}",
             allow_missing=True,
         )
-        if not certificate_tagged and not runner.dry_run:
+        if not certificate_tagged:
             runner.run(
                 [
                     "aws",
@@ -1379,18 +1260,6 @@ def _ensure_pki(
         return {
             **dns,
             "certificate_arn": certificate_arn,
-            "certificate_ownership": "CREATED",
-            "ca_file": str(ca_output),
-            "pki_secret_id": secret_name,
-            "pki_secret_ownership": "CREATED",
-        }
-    if runner.dry_run:
-        ca_output.write_text("DRY-RUN CA\n", encoding="utf-8")
-        return {
-            **dns,
-            "certificate_arn": (
-                f"arn:aws:acm:{cpu.region}:{cpu.account_id}:certificate/dry-run"
-            ),
             "certificate_ownership": "CREATED",
             "ca_file": str(ca_output),
             "pki_secret_id": secret_name,
@@ -1465,28 +1334,6 @@ def _ensure_pki(
     }
 
 
-def _private_subnets(
-    runner: CommandRunner,
-    cluster: ClusterIdentity,
-) -> list[dict[str, Any]]:
-    all_subnets = _describe_subnets(
-        runner,
-        region=cluster.region,
-        subnet_ids=cluster.subnet_ids,
-    )
-    private = [
-        item
-        for item in all_subnets
-        if not _public_subnet(runner, region=cluster.region, subnet=item)
-    ]
-    selected: dict[str, dict[str, Any]] = {}
-    for item in private:
-        selected.setdefault(item["AvailabilityZone"], item)
-    if len(selected) < 2:
-        raise BootstrapError("CPU EKS requires private subnets in at least two AZs")
-    return list(selected.values())[:2]
-
-
 def _ensure_rds_site_tag(
     runner: CommandRunner,
     *,
@@ -1502,7 +1349,7 @@ def _ensure_rds_site_tag(
         description=description,
         allow_missing=True,
     )
-    if tagged or runner.dry_run:
+    if tagged:
         return
     runner.run(
         [
@@ -1588,30 +1435,17 @@ def _ensure_aurora(
     subnet_ids = [item["SubnetId"] for item in subnets]
     availability_zones = [item["AvailabilityZone"] for item in subnets]
     subnet_group = cluster_id
-    subnet_group_exists = (
-        subprocess.run(
-            [
-                "aws",
-                "rds",
-                "describe-db-subnet-groups",
-                "--region",
-                cpu.region,
-                "--db-subnet-group-name",
-                subnet_group,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    subnet_groups = describe_or_absent(
+        runner,
+        cpu.region,
+        "rds",
+        "describe-db-subnet-groups",
+        "--db-subnet-group-name",
+        subnet_group,
+        not_found=("DBSubnetGroupNotFoundFault",),
     )
-    if subnet_group_exists:
-        subnet_group_details = runner.aws_json(
-            cpu.region,
-            "rds",
-            "describe-db-subnet-groups",
-            "--db-subnet-group-name",
-            subnet_group,
-        )["DBSubnetGroups"][0]
+    if subnet_groups is not None:
+        subnet_group_details = subnet_groups["DBSubnetGroups"][0]
         _ensure_rds_site_tag(
             runner,
             region=cpu.region,
@@ -1626,21 +1460,28 @@ def _ensure_aurora(
             site_id=site_id,
             description=f"RDS subnet group {subnet_group}",
         )
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "modify-db-subnet-group",
-                "--region",
-                cpu.region,
-                "--db-subnet-group-name",
-                subnet_group,
-                "--subnet-ids",
-                *subnet_ids,
-            ],
-            mutate=True,
-            capture=False,
+        # The modify is a mutation even when nothing changes (and RDS answers it
+        # slowly); a group that already holds these subnets is left alone.
+        current_subnet_ids = sorted(
+            str(item.get("SubnetIdentifier") or "")
+            for item in subnet_group_details.get("Subnets") or []
         )
+        if current_subnet_ids != sorted(subnet_ids):
+            runner.run(
+                [
+                    "aws",
+                    "rds",
+                    "modify-db-subnet-group",
+                    "--region",
+                    cpu.region,
+                    "--db-subnet-group-name",
+                    subnet_group,
+                    "--subnet-ids",
+                    *subnet_ids,
+                ],
+                mutate=True,
+                capture=False,
+            )
     else:
         runner.run(
             [
@@ -1695,30 +1536,18 @@ def _ensure_aurora(
         )
         if result.returncode and "InvalidPermission.Duplicate" not in result.stderr:
             raise BootstrapError(result.stderr.strip())
-    cluster_exists = (
-        subprocess.run(
-            [
-                "aws",
-                "rds",
-                "describe-db-clusters",
-                "--region",
-                cpu.region,
-                "--db-cluster-identifier",
-                cluster_id,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
+    clusters = describe_or_absent(
+        runner,
+        cpu.region,
+        "rds",
+        "describe-db-clusters",
+        "--db-cluster-identifier",
+        cluster_id,
+        not_found=("DBClusterNotFoundFault",),
     )
-    if cluster_exists:
-        existing_cluster = runner.aws_json(
-            cpu.region,
-            "rds",
-            "describe-db-clusters",
-            "--db-cluster-identifier",
-            cluster_id,
-        )["DBClusters"][0]
+    cluster_exists = clusters is not None
+    if clusters is not None:
+        existing_cluster = clusters["DBClusters"][0]
         _ensure_rds_site_tag(
             runner,
             region=cpu.region,
@@ -1795,22 +1624,6 @@ def _ensure_aurora(
             cluster=existing_cluster,
             capacity=capacity,
         )
-    if runner.dry_run:
-        return {
-            "cluster_id": cluster_id,
-            "cluster_ownership": "CREATED",
-            "instance_ids": [
-                *instance_ids,
-            ],
-            "subnet_group": subnet_group,
-            "subnet_group_ownership": "CREATED",
-            "security_group": security_group["group_id"],
-            "security_group_ownership": security_group["ownership"],
-            "parameter_group": parameter_group,
-            "parameter_group_ownership": "CREATED",
-            "master_secret_arn": "arn:aws:secretsmanager:dry-run",
-            "master_secret_kms_key_arn": "",
-        }
     database = runner.aws_json(
         cpu.region,
         "rds",
@@ -1992,6 +1805,92 @@ def _site_document(
     }
 
 
+def _remember_hyperpod_hints(
+    state: BootstrapState,
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+) -> None:
+    """Persist what discovery learned so the next deploy skips the inventory."""
+
+    hints = {cluster.eks_arn: cluster.hyperpod_arn for cluster in (cpu, *gpu_clusters)}
+    if state.value["resources"].get(HYPERPOD_HINTS) != hints:
+        state.record(HYPERPOD_HINTS, hints)
+
+
+def prepare_cluster_access(
+    runner: CommandRunner,
+    *,
+    state: BootstrapState,
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+    state_dir: Path,
+    namespace: str,
+    secure_dir: Path,
+    site_id: str,
+    ensure_pod_identity_agent: Callable[[CommandRunner, ClusterIdentity, str], Any],
+) -> tuple[Path, Path, Path]:
+    """Kubeconfigs, namespaces, the base Secret and the Pod Identity add-on.
+
+    Three independent chains that used to run one after another: the CPU
+    kubeconfig, its namespace and the fleet master Secret depend on each other
+    and nothing else; the GPU kubeconfig contexts and their namespaces are their
+    own chain (one file holds every GPU context and ``update-kubeconfig``
+    rewrites it, so the GPU writes stay serial among themselves); the add-on
+    revalidation is an AWS read that needs no kubeconfig at all. Each chain
+    keeps its order and its checkpoint semantics; only the waiting is shared.
+    """
+
+    cpu_kubeconfig = state_dir / "cpu.kubeconfig"
+    gpu_kubeconfig = state_dir / "gpu.kubeconfig"
+
+    def control_plane() -> Path:
+        _update_kubeconfig(runner, cluster=cpu, path=cpu_kubeconfig)
+        _ensure_namespace(runner, kubeconfig=cpu_kubeconfig, namespace=namespace)
+        return _ensure_base_secrets(
+            runner,
+            cpu_kubeconfig=cpu_kubeconfig,
+            namespace=namespace,
+            secure_dir=secure_dir,
+        )
+
+    def data_plane() -> None:
+        for cluster in gpu_clusters:
+            _update_kubeconfig(runner, cluster=cluster, path=gpu_kubeconfig)
+        for cluster in gpu_clusters:
+            _ensure_namespace(
+                runner,
+                kubeconfig=gpu_kubeconfig,
+                namespace=namespace,
+                context=cluster.context,
+            )
+
+    def pod_identity() -> None:
+        # Completed exclusive resources are re-probed without mutation.
+        # A healthy probe reuses its checkpoint; detected drift enters ensure.
+        # Probe failures other than mutation-required drift remain fail-closed.
+        revalidate_pod_identity_agent(
+            runner, state, cpu, site_id, ensure_pod_identity_agent
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        master = pool.submit(control_plane)
+        chains: list[Future[Any]] = [
+            master,
+            pool.submit(data_plane),
+            pool.submit(pod_identity),
+        ]
+        # Every chain is awaited so a failure in one never leaves another
+        # half-written; the first failure is the one that propagates.
+        failures = [
+            failure
+            for failure in (future.exception() for future in chains)
+            if failure is not None
+        ]
+    if failures:
+        raise failures[0]
+    return cpu_kubeconfig, gpu_kubeconfig, master.result()
+
+
 def bootstrap_from_arns(
     request: BootstrapRequest,
     *,
@@ -2001,11 +1900,13 @@ def bootstrap_from_arns(
     from gpu_fault.admin.notification_bootstrap import notification_routing
 
     validate_bootstrap_dependencies()
-    active_runner = runner or CommandRunner(dry_run=request.dry_run)
+    active_runner = runner or CommandRunner()
     existing_site, cpu, gpu_clusters = discover_bootstrap_scope(
         request=request,
         runner=active_runner,
-        discover=discover_cluster,
+        discover=partial(
+            discover_cluster, hyperpod_hints=load_hyperpod_hints(request.state_dir)
+        ),
         alias=_cluster_alias,
     )
     _require_same_scope(cpu, gpu_clusters)
@@ -2014,6 +1915,7 @@ def bootstrap_from_arns(
     request.state_dir.chmod(0o700)
     state = BootstrapState(request.state_dir / "bootstrap-state.json", site_id=site_id)
     managed_gpu_clusters = bootstrap_gpu_scope(state, existing_site, cpu, gpu_clusters)
+    _remember_hyperpod_hints(state, cpu, gpu_clusters)
     state.phase("discovered")
     release = prepare_signed_release(
         active_runner,
@@ -2023,41 +1925,30 @@ def bootstrap_from_arns(
         site_id=site_id,
         state=state,
     )
-    admin_email, routing = notification_routing(active_runner, cpu, request, state)
-    cpu_kubeconfig, gpu_kubeconfig = _ensure_kubeconfigs(
-        active_runner,
-        cpu=cpu,
-        gpu_clusters=managed_gpu_clusters,
+    # The candidate is known now; a candidate the operator has not consented to
+    # (superseding a failed transaction, crossing a schema version) is refused
+    # here, before the AWS re-validation and the rollout, in the engine's words.
+    refuse_unconsented_release(
         state_dir=request.state_dir,
+        manifest_path=Path(str(release["manifest"])),
+        existing_site=existing_site,
     )
+    admin_email, routing = notification_routing(active_runner, cpu, request, state)
     namespace = "gpu-fault-system"
-    _ensure_namespace(active_runner, kubeconfig=cpu_kubeconfig, namespace=namespace)
-    for cluster in managed_gpu_clusters:
-        _ensure_namespace(
-            active_runner,
-            kubeconfig=gpu_kubeconfig,
-            namespace=namespace,
-            context=cluster.context,
-        )
     token_files, secure_dir = _initial_secure_files(
         state_dir=request.state_dir,
         gpu_clusters=managed_gpu_clusters,
     )
-    fleet_master_file = _ensure_base_secrets(
+    cpu_kubeconfig, gpu_kubeconfig, fleet_master_file = prepare_cluster_access(
         active_runner,
-        cpu_kubeconfig=cpu_kubeconfig,
+        state=state,
+        cpu=cpu,
+        gpu_clusters=managed_gpu_clusters,
+        state_dir=request.state_dir,
         namespace=namespace,
         secure_dir=secure_dir,
-    )
-    # Completed exclusive resources are re-probed without mutation.
-    # A healthy probe reuses its checkpoint; detected drift enters ensure.
-    # Probe failures other than mutation-required drift remain fail-closed.
-    revalidate_pod_identity_agent(
-        active_runner,
-        state,
-        cpu,
-        site_id,
-        _ensure_pod_identity_agent,
+        site_id=site_id,
+        ensure_pod_identity_agent=_ensure_pod_identity_agent,
     )
     adot_image = str(release["images"]["adot"])
 
@@ -2076,6 +1967,9 @@ def bootstrap_from_arns(
         ensure_nlb_network=_ensure_nlb_network,
         ensure_pki=_ensure_pki,
         ensure_aurora=_ensure_aurora,
+        # spec.retention is operator-declared in the existing site; a rerun of
+        # deploy is what widens the control-plane role to the archive prefix.
+        archive_s3_uri=site_retention(existing_site).archive_s3_uri,
     )
     state.phase("aws-infrastructure-ready")
     executor_roles = {
@@ -2106,6 +2000,8 @@ def bootstrap_from_arns(
         grafana=grafana,
     )
     state.phase("platform-prerequisites-ready")
+    for line in grafana_access_lines(state):
+        print(line, file=sys.stderr, flush=True)
     site_file = request.state_dir / "site.yaml"
     generated_site = _site_document(
         request=request,

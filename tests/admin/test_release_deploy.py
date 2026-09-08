@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import profile_approval as admin_profile_approval
-from scripts import release_deploy, release_failure_recovery
+from scripts import release_deploy, release_deploy_evidence, release_failure_recovery
 
 REGION = "us-east-1"
 READ_LIVE_RELEASE_STATE = release_deploy.read_live_release_state
@@ -192,6 +192,14 @@ def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         release_deploy,
         "compute_agent_config_digest",
         lambda *_args, **_kwargs: "b" * 64,
+    )
+    # The completion step records the installed resources; that discovery talks
+    # to AWS and the control plane, so every test here starts with it stubbed to
+    # a success and `test_release_deploy_registry_sync.py` re-patches it.
+    monkeypatch.setattr(
+        release_deploy_evidence,
+        "sync_installation_resource_registry",
+        lambda _site: tmp_path / "installation-resources.json",
     )
     return site
 
@@ -894,7 +902,7 @@ def test_profile_change_requires_approval_and_generates_version(
     assert plan.desired_version.startswith("regional-hyperpod-"), (
         "Profile version was not derived from the normalized policy digest"
     )
-    with pytest.raises(release_deploy.ReleaseDeployError, match="approve-profile"):
+    with pytest.raises(release_deploy.ReleaseDeployError) as stopped:
         release_deploy.execute_release(
             site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
         )
@@ -905,6 +913,24 @@ def test_profile_change_requires_approval_and_generates_version(
         )
     )
     assert pending["plan_sha256"] == release_deploy.profile_plan_sha256(pending)
+    stop_message = str(stopped.value)
+    assert (
+        f"gpu-fault-admin deploy --state-dir {site.parent} "
+        f"--approve-profile-plan {pending['plan_sha256']} --reference CHG-<id>"
+    ) in stop_message, "the stop must print the rerun line with the real digest"
+    assert "<plan_sha256>" not in stop_message, "the stop printed a placeholder digest"
+    assert "gpu-fault-admin approve-profile" not in stop_message, (
+        "the stop still names the removed approve-profile verb"
+    )
+    for value in (
+        "site_name: test-site",
+        "cpu_eks_arn: arn:aws:eks:us-east-1:123456789012:cluster/control",
+        "version: profile-v1 -> " + plan.desired_version,
+        "change_kind: EXPANSIVE",
+        *(f"- {change}" for change in plan.changes),
+        f"plan_sha256: {pending['plan_sha256']}",
+    ):
+        assert value in stop_message, f"the stop omitted the review field {value!r}"
     assert pending["site_identity"] == {
         "site_name": "test-site",
         "aws_region": REGION,
@@ -1288,3 +1314,72 @@ def test_execute_release_runs_an_accepted_schema_change_fail_forward(
     )
     assert state["rollback"]["status"] == "SKIPPED_POLICY"
     assert "accept-schema-change" in state["rollback"]["reason"]
+
+
+def test_profile_drift_after_inline_approval_stops_with_the_new_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan that drifts between approval and rerun is superseded, not applied.
+
+    The rerun archives the stale approval and stops again; the stop message
+    must carry the *new* digest so the next rerun line is copy-pasteable.
+    """
+
+    site = _site(tmp_path, monkeypatch)
+    profile = tmp_path / "repo/config/profile.yaml"
+    initial = release_deploy.plan_runtime_profile(
+        site, live_profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest()
+    )
+    release_deploy.prepare_site_release(site, profile_plan=initial)
+    active_profile = Path(
+        yaml.safe_load(site.read_text(encoding="utf-8"))["spec"]["runtimeProfile"][
+            "source"
+        ]
+    )
+    live_sha = hashlib.sha256(active_profile.read_bytes()).hexdigest()
+    value = yaml.safe_load(profile.read_text(encoding="utf-8"))
+    value["claims"] = [
+        {"capability": "gpuReset", "mode": "OBSERVE", "owner": "gpu-fault-node-agent"}
+    ]
+    profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    with pytest.raises(release_deploy.ReleaseDeployError, match="approve-profile-plan"):
+        release_deploy.execute_release(
+            site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+        )
+    reviewed = json.loads(
+        admin_profile_approval.profile_plan_path(site.parent).read_text()
+    )
+    admin_profile_approval.approve_profile_plan_inline(
+        site.parent, plan_sha256=str(reviewed["plan_sha256"]), reference="CHG-1"
+    )
+
+    value["claims"][0]["mode"] = "DISABLED"
+    profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    with pytest.raises(release_deploy.ReleaseDeployError) as stopped:
+        release_deploy.execute_release(
+            site, run_checks=False, live_state={"runtime_profile_sha256": live_sha}
+        )
+
+    replacement = json.loads(
+        admin_profile_approval.profile_plan_path(site.parent).read_text()
+    )
+    assert replacement["plan_sha256"] != reviewed["plan_sha256"], (
+        "the drifted template did not produce a new pending plan"
+    )
+    message = str(stopped.value)
+    assert "SUPERSEDED" in message
+    assert f"--approve-profile-plan {replacement['plan_sha256']}" in message, (
+        "the drift stop must print the rerun line with the new digest"
+    )
+    assert reviewed["plan_sha256"] not in message.split("Record plan_sha256")[1], (
+        "the rerun line still carries the superseded digest"
+    )
+    assert not admin_profile_approval.profile_approval_path(site.parent).exists(), (
+        "the stale approval stayed active after the plan drifted"
+    )
+    stale = admin_profile_approval.profile_approval_archive_path(
+        site.parent, str(reviewed["plan_sha256"])
+    )
+    superseded = json.loads((stale / "superseded.json").read_text())
+    assert superseded["status"] == "SUPERSEDED"
+    assert superseded["replacement_plan_sha256"] == replacement["plan_sha256"]

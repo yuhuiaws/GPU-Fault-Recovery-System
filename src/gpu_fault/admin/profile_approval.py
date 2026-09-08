@@ -309,8 +309,11 @@ def approve_profile(
     given, falling back to ``user@host`` so an approval is never anonymous. It
     lives on the record and in the archive but *outside* ``plan_sha256``: that
     digest binds the reviewed plan, is computed before anyone approves, and is
-    what the operator types back on ``--plan-sha256``; folding the approver in
-    would change it under them and make an approved plan unwinnable.
+    what the operator types back on the rerun; folding the approver in would
+    change it under them and make an approved plan unwinnable.
+
+    Refusals name the pending plan's digest so the operator can see whether
+    the plan they reviewed is still the one on disk.
     """
 
     normalized = reference.strip()
@@ -328,12 +331,15 @@ def approve_profile(
         plan_path = profile_plan_path(state_dir)
         if not plan_path.is_file():
             raise ProfileApprovalError(
-                "no pending Profile plan; run gpu-fault-admin deploy first"
+                "no pending Profile plan; run gpu-fault-admin deploy first and "
+                "review the release-deploy/profile-plan.json it writes"
             )
         plan, digest = _validated_plan(_read_json(plan_path, "Profile plan"))
         if digest != normalized_plan_sha256:
             raise ProfileApprovalError(
-                "pending Profile plan does not match the reviewed --plan-sha256"
+                f"pending Profile plan {digest} does not match the reviewed "
+                f"plan SHA-256 {normalized_plan_sha256}; review "
+                "release-deploy/profile-plan.json again and pass its plan_sha256"
             )
         if plan.get("approval_required") is not True:
             raise ProfileApprovalError("Profile plan does not require approval")
@@ -379,6 +385,49 @@ def approve_profile(
         )
         write_json_atomic(approval_path, record)
         return record
+
+
+def approve_profile_plan_inline(
+    state_dir: Path,
+    *,
+    plan_sha256: str,
+    reference: str,
+) -> dict[str, Any]:
+    """Approve the pending plan from the deploy rerun's own flags.
+
+    Contract for ``gpu-fault-admin deploy --approve-profile-plan SHA
+    --reference REF``: the CLI calls this *before* ``run_source_deploy``, with
+    nothing but the ``--state-dir`` it was given -- no site load, no release
+    preparation, no AWS lookups beyond the STS caller identity that names the
+    approver. It performs exactly what the former ``approve-profile`` verb did
+    (same operation lock, same approver identity, same
+    ``profile-approvals/<plan_sha256>/`` archive, same SUPERSEDED handling of
+    an earlier approval for a different plan), then returns the approval
+    record. The deploy that follows resolves that record as ``EXACT`` and
+    marks it ``CONSUMED`` on success; a plan that drifted in between is
+    archived as ``SUPERSEDED`` and the deploy stops again with a new digest.
+
+    The flag cannot be passed blind: with no ``release-deploy/profile-plan.json``
+    under ``state_dir`` there is nothing to approve, and a ``plan_sha256`` that
+    differs from the pending plan's digest is refused with a message naming
+    the pending digest. Both checks happen under the lock inside
+    :func:`approve_profile`, so the digest compared is the one on disk at
+    approval time.
+
+    Raises :class:`ProfileApprovalError` on every refusal.
+    """
+
+    normalized_plan_sha256 = plan_sha256.strip()
+    if not SHA256_PATTERN.fullmatch(normalized_plan_sha256):
+        raise ProfileApprovalError(
+            "--approve-profile-plan must be the 64-hex plan_sha256 printed when "
+            "the deploy stopped for Runtime Profile review"
+        )
+    return approve_profile(
+        state_dir,
+        reference=reference,
+        expected_plan_sha256=normalized_plan_sha256,
+    )
 
 
 def _target_matches(

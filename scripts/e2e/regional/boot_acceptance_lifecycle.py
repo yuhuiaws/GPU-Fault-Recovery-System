@@ -24,9 +24,10 @@ from scripts.e2e.regional.boot_acceptance_common import (
 )
 
 UNINSTALL_CONFIRMATION = "UNINSTALL_GPU_FAULT"
-# `gpu-fault-admin verify` reuses the quick gate's runtime-identity evidence when
-# this variable names it, and the reused check carries no per-replica digests.
-# BOOT-018 needs the digests, so the variable is withheld from its verify run.
+# `gpu-fault-admin status` reuses a fresh deploy's quick-gate runtime-identity
+# evidence, and the reused check carries no per-replica digests. An explicit
+# setting of this variable wins over the path the CLI derives, so BOOT-018
+# names a file that does not exist and the engine runs the probes instead.
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 RUNTIME_IDENTITY_CHECK = "runtime_component_identity"
 RELEASE_METADATA_CONFIGMAP = "gpu-fault-release-metadata"
@@ -56,11 +57,13 @@ print(json.dumps({"agents": agents}, sort_keys=True))
 def admin_command(
     *arguments: str,
     timeout: int = 21600,
-    drop_environment: tuple[str, ...] = (),
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    environment = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
-    for name in drop_environment:
-        environment.pop(name, None)
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT / "src"),
+        **(environment_overrides or {}),
+    }
     return run(
         [sys.executable, "-m", "gpu_fault.admin.cli", *arguments],
         check=False,
@@ -212,11 +215,13 @@ def _boot016_verified_site(
         timeout=600,
     )
     write_log(case_dir / "empty-bootstrap-guard.log", empty_guard)
-    verify = admin_command("verify", "--state-dir", str(state_dir), timeout=1800)
-    status = admin_command("status", "--state-dir", str(state_dir), timeout=1800)
+    # `status --full` is the whole health report acceptance evidence records;
+    # the public CLI has no separate verify verb.
+    status = admin_command(
+        "status", "--state-dir", str(state_dir), "--full", timeout=1800
+    )
     second = admin_command(*command)
-    write_log(case_dir / "verify.log", verify)
-    write_log(case_dir / "status.log", status)
+    write_log(case_dir / "status-full.log", status)
     write_log(case_dir / "second-deploy.log", second)
     after = deployment_generations(site_file)
     live_fixture = SiteFixture(site_file, clusters[0])
@@ -290,7 +295,6 @@ def _boot016_verified_site(
         and all(registry_created <= item for item in workload_created),
         "release_state_completed": str(state.get("phase", "")).lower()
         in {"complete", "completed"},
-        "verify_passed": verify.returncode == 0,
         "status_passed": status.returncode == 0,
         "rerun_passed": second.returncode == 0,
         "rerun_no_rollout_generation_change": before == after,
@@ -571,8 +575,8 @@ def build_release_under_umask(
     return {"checkout": checkout, "manifest": manifest}
 
 
-def parse_verify_report(stdout: str) -> dict[str, Any]:
-    """The health report ``gpu-fault-admin verify`` printed.
+def parse_status_report(stdout: str) -> dict[str, Any]:
+    """The health report ``gpu-fault-admin status --full`` printed.
 
     The report is an indented JSON document; the rollout wrapper may print
     plain lines ahead of it, so the parse starts at the first line that is
@@ -586,10 +590,10 @@ def parse_verify_report(stdout: str) -> dict[str, Any]:
         lines = text.splitlines()
         starts = [index for index, line in enumerate(lines) if line.strip() == "{"]
         if not starts:
-            raise BootAcceptanceError("verify printed no JSON report") from None
+            raise BootAcceptanceError("status printed no JSON report") from None
         value = json.loads("\n".join(lines[starts[0] :]))
     if not isinstance(value, dict):
-        raise BootAcceptanceError("verify report is not a JSON object")
+        raise BootAcceptanceError("status report is not a JSON object")
     return value
 
 
@@ -600,9 +604,9 @@ def runtime_identity_matches_release(
     metadata: dict[str, Any],
     agents: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Compare what verify saw against the release metadata itself.
+    """Compare what ``status --full`` saw against the release metadata itself.
 
-    ``verify.returncode == 0`` only says verify's own expectations held. This
+    ``status.returncode == 0`` only says the report's own expectations held. This
     reads the per-replica module digests from the report's
     ``runtime_component_identity`` check, the required pins from the release
     metadata ConfigMap and every ACTIVE Agent's artifact pin, and compares each
@@ -635,7 +639,7 @@ def runtime_identity_matches_release(
     )
     replicas: dict[str, str] = {}
     if check is None or check.get("status") != "PASS":
-        reasons.append("verify report has no passing runtime_component_identity check")
+        reasons.append("status report has no passing runtime_component_identity check")
     else:
         details = check.get("details") or {}
         control = (details.get("control_plane") or {}).get("deployments")
@@ -784,17 +788,20 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
             timeout=1200,
         )
         write_log(case_dir / "tamper-negative.log", tamper)
-    verify = admin_command(
-        "verify",
+    status = admin_command(
+        "status",
         "--state-dir",
         str(state_dir),
+        "--full",
         timeout=1800,
-        drop_environment=(QUICK_VALIDATION_EVIDENCE_ENV,),
+        environment_overrides={
+            QUICK_VALIDATION_EVIDENCE_ENV: str(case_dir / "no-quick-evidence-reuse")
+        },
     )
-    write_log(case_dir / "live-verify.log", verify)
+    write_log(case_dir / "live-status-full.log", status)
     live = _live_release_identity(state_dir)
     identity = runtime_identity_matches_release(
-        parse_verify_report(verify.stdout),
+        parse_status_report(status.stdout),
         manifest=live["manifest"],
         metadata=live["metadata"],
         agents=live["agents"],
@@ -802,8 +809,8 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
     checks = {
         "wheel_and_bundle_hashes_identical": identical,
         "tamper_negative_failed": tamper.returncode != 0,
-        "live_verify_passed": verify.returncode == 0,
-        "live_runtime_identity_verify": identity["passed"],
+        "live_status_passed": status.returncode == 0,
+        "live_runtime_identity_matches_release": identity["passed"],
     }
     return {
         "verdict": "PASS" if all(checks.values()) else "FAIL",
@@ -812,8 +819,9 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
         "runtime_identity": identity,
         **live["identity"],
         "limitations": [
-            "Runtime identity is read from the administrator verify report and "
-            "compared with the release manifest, metadata ConfigMap and ACTIVE "
+            "Runtime identity is read from the administrator status --full "
+            "report and compared with the release manifest, metadata ConfigMap "
+            "and ACTIVE "
             "Agent pins; version strings and annotations are not trusted."
         ],
     }

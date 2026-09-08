@@ -451,7 +451,7 @@ spec:
                   key: compatible-regional-executor-compatibility-digests
                   optional: true
             # Optional on purpose, in both places at once: the ConfigMap is
-            # rendered by `gpu-fault-admin failure-domain-map` and carries the
+            # rendered by the release engine during the CPU apply and carries the
             # file path in its own `map-path` key, so a site without the map
             # runs without the per-failure-domain remediation tier, while a
             # site that ships one gets a worker that refuses to start on a

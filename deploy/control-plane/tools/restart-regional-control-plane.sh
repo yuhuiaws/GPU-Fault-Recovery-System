@@ -40,4 +40,15 @@ if (( found == 0 )); then
 fi
 
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
-    "${SCRIPT_DIR}/verify-control-plane-role-split.sh"
+    python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"
+
+# A restart changes no resource, but the registry sync is what the verifier
+# used to trail with; keep the record fresh unless the caller says otherwise.
+if [[ "${GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY:-true}" == "true" ]]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/sync_installed_resource_registry.py" \
+        --plane cpu \
+        --namespace "${NAMESPACE}" \
+        --release-id "${GPU_FAULT_RELEASE_ID:-verified}" \
+        --kubeconfig "${KUBECONFIG}"
+fi

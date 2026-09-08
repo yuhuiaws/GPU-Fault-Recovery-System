@@ -144,6 +144,7 @@ def run_foundation_tasks(
     ensure_nlb_network: Callable[..., Any],
     ensure_pki: Callable[..., Any],
     ensure_aurora: Callable[..., Any],
+    archive_s3_uri: str | None = None,
 ) -> dict[str, Any]:
     from gpu_fault.admin.bootstrap_load_balancer import (
         ensure_load_balancer_controller,
@@ -206,6 +207,7 @@ def run_foundation_tasks(
                 site_id=site_id,
                 admin_email=admin_email,
                 routing=routing,
+                archive_s3_uri=archive_s3_uri,
             ),
             **executor_tasks,
         }

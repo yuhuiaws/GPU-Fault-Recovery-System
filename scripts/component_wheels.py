@@ -137,8 +137,8 @@ COMPONENTS = {
             },
         },
         # `workflow_reconcile` has no importer inside the control plane: the
-        # administrator's `workflow-reconcile --plan/--apply` runs it in the Pod
-        # through a program the deploy host execs, so the module has to be in
+        # administrator's `workflow-reconcile` runs it in the Pod through a
+        # program the deploy host execs, so the module has to be in
         # this wheel even though nothing here reaches it by import. The deploy
         # host ships only the wrapper, which is what keeps the Store mutation on
         # the control plane.

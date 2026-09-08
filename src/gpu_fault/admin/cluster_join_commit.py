@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import copy
-import fcntl
-import os
 import tempfile
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -31,22 +27,6 @@ from gpu_fault.installation_resources import (
 
 if TYPE_CHECKING:
     from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution
-
-
-_MEMBERSHIP_THREAD_LOCK = Lock()
-
-
-@contextmanager
-def _membership_lock(site: RenderedSite) -> Iterator[None]:
-    path = site.source.parent / ".gpu-fault-membership.lock"
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with _MEMBERSHIP_THREAD_LOCK, path.open("a+", encoding="utf-8") as descriptor:
-        os.chmod(path, 0o600)
-        fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
 
 
 def _resource(
@@ -333,124 +313,122 @@ def activate_and_commit(
     state: dict[str, Any],
 ) -> None:
     cluster_id = execution.cluster_id
-    with _membership_lock(request.site):
-        activation_started = step_done(state, "ACTIVATION_STARTED")
-        verified = (state.get("evidence") or {}).get("VERIFIED")
-        if not isinstance(verified, dict):
-            raise BootstrapError("join candidate has no verification evidence")
-        if not activation_started:
-            validate_verified_membership(
-                evidence=verified,
-                state=state,
-                current_site=request.site,
-                candidate_site=execution.candidate,
-                cluster_id=cluster_id,
-            )
-        if not step_done(state, "SITE_UPDATED"):
-            _commit_site(
-                request,
-                state_dir=state_dir,
-                state=state,
-                candidate=execution.candidate.source,
-                cluster_id=cluster_id,
-            )
-            join._update_bootstrap_state(
-                request.site,
-                cluster_id=cluster_id,
-                role=dict(execution.prerequisites["executor_role"]),
-                network=dict(execution.prerequisites["network"]),
-            )
-            complete_step(state_path, state, "SITE_UPDATED")
-        updated_site = load_site(
-            request.site.source,
-            repository_root=request.site.repository_root,
+    activation_started = step_done(state, "ACTIVATION_STARTED")
+    verified = (state.get("evidence") or {}).get("VERIFIED")
+    if not isinstance(verified, dict):
+        raise BootstrapError("join candidate has no verification evidence")
+    if not activation_started:
+        validate_verified_membership(
+            evidence=verified,
+            state=state,
+            current_site=request.site,
+            candidate_site=execution.candidate,
+            cluster_id=cluster_id,
         )
-        if not step_done(state, "RELEASE_STATE_UPDATED"):
-            join._sync_join_release_state(updated_site)
-            complete_step(
-                state_path,
-                state,
-                "RELEASE_STATE_UPDATED",
-                {
-                    "cluster_ids": [
-                        item["cluster_id"]
-                        for item in updated_site.release_config["clusters"]
-                    ]
-                },
+    if not step_done(state, "SITE_UPDATED"):
+        _commit_site(
+            request,
+            state_dir=state_dir,
+            state=state,
+            candidate=execution.candidate.source,
+            cluster_id=cluster_id,
+        )
+        join._update_bootstrap_state(
+            request.site,
+            cluster_id=cluster_id,
+            role=dict(execution.prerequisites["executor_role"]),
+            network=dict(execution.prerequisites["network"]),
+        )
+        complete_step(state_path, state, "SITE_UPDATED")
+    updated_site = load_site(
+        request.site.source,
+        repository_root=request.site.repository_root,
+    )
+    if not step_done(state, "RELEASE_STATE_UPDATED"):
+        join._sync_join_release_state(updated_site)
+        complete_step(
+            state_path,
+            state,
+            "RELEASE_STATE_UPDATED",
+            {
+                "cluster_ids": [
+                    item["cluster_id"]
+                    for item in updated_site.release_config["clusters"]
+                ]
+            },
+        )
+    if not step_done(state, "REGISTRY_UPDATED"):
+        snapshot = _sync_registry(
+            updated_site,
+            before_path=Path(execution.discovery["registry_snapshot"]),
+            state_dir=state_dir,
+            resources=_joined_resources(updated_site, execution=execution),
+        )
+        complete_step(
+            state_path,
+            state,
+            "REGISTRY_UPDATED",
+            {"snapshot_digest": snapshot.source_sha256},
+        )
+    if not activation_started:
+        validate_verified_membership(
+            evidence=verified,
+            state=state,
+            current_site=updated_site,
+            candidate_site=execution.candidate,
+            cluster_id=cluster_id,
+        )
+        complete_step(
+            state_path,
+            state,
+            "ACTIVATION_STARTED",
+            {"cluster_id": cluster_id},
+        )
+    if not step_done(state, "ACTIVATED"):
+        join._run_rollout(
+            execution.candidate,
+            "activate-cluster",
+            cluster_id=cluster_id,
+        )
+        complete_step(state_path, state, "ACTIVATED")
+    if not step_done(state, "FINAL_VERIFIED"):
+        live = join._fetch_installation_registry(updated_site)
+        required = {
+            f"cluster/{cluster_id}/eks",
+            f"cluster/{cluster_id}/hyperpod",
+            f"aws/iam/executor/{cluster_id}/role",
+        }
+        active = {
+            item.resource_key
+            for item in live.resources
+            if item.status is InstallationResourceStatus.ACTIVE
+        }
+        missing = sorted(required - active)
+        if missing:
+            raise BootstrapError(
+                "joined resources are absent from Aurora registry: "
+                + ", ".join(missing)
             )
-        if not step_done(state, "REGISTRY_UPDATED"):
-            snapshot = _sync_registry(
-                updated_site,
-                before_path=Path(execution.discovery["registry_snapshot"]),
-                state_dir=state_dir,
-                resources=_joined_resources(updated_site, execution=execution),
-            )
-            complete_step(
-                state_path,
-                state,
-                "REGISTRY_UPDATED",
-                {"snapshot_digest": snapshot.source_sha256},
-            )
-        if not activation_started:
-            validate_verified_membership(
-                evidence=verified,
-                state=state,
-                current_site=updated_site,
-                candidate_site=execution.candidate,
-                cluster_id=cluster_id,
-            )
-            complete_step(
-                state_path,
-                state,
-                "ACTIVATION_STARTED",
-                {"cluster_id": cluster_id},
-            )
-        if not step_done(state, "ACTIVATED"):
-            join._run_rollout(
-                execution.candidate,
-                "activate-cluster",
-                cluster_id=cluster_id,
-            )
-            complete_step(state_path, state, "ACTIVATED")
-        if not step_done(state, "FINAL_VERIFIED"):
-            live = join._fetch_installation_registry(updated_site)
-            required = {
-                f"cluster/{cluster_id}/eks",
-                f"cluster/{cluster_id}/hyperpod",
-                f"aws/iam/executor/{cluster_id}/role",
-            }
-            active = {
-                item.resource_key
-                for item in live.resources
-                if item.status is InstallationResourceStatus.ACTIVE
-            }
-            missing = sorted(required - active)
-            if missing:
-                raise BootstrapError(
-                    "joined resources are absent from Aurora registry: "
-                    + ", ".join(missing)
-                )
-            identity = final_membership_identity(
-                updated_site,
-                candidate_site_sha256=str(
-                    verified.get("candidate_site_sha256")
-                    or execution.candidate.source_sha256
-                ),
-                cluster_id=cluster_id,
-                verified_at=str(
-                    verified.get("verified_at")
-                    or datetime.now(timezone.utc).isoformat()
-                ),
-            )
-            complete_step(
-                state_path,
-                state,
-                "FINAL_VERIFIED",
-                {
-                    "snapshot_digest": live.source_sha256,
-                    **identity,
-                },
-            )
+        identity = final_membership_identity(
+            updated_site,
+            candidate_site_sha256=str(
+                verified.get("candidate_site_sha256")
+                or execution.candidate.source_sha256
+            ),
+            cluster_id=cluster_id,
+            verified_at=str(
+                verified.get("verified_at") or datetime.now(timezone.utc).isoformat()
+            ),
+        )
+        complete_step(
+            state_path,
+            state,
+            "FINAL_VERIFIED",
+            {
+                "snapshot_digest": live.source_sha256,
+                **identity,
+            },
+        )
 
 
 def rollback_membership(
@@ -459,25 +437,24 @@ def rollback_membership(
     execution: JoinExecution,
     joined: bool,
 ) -> None:
-    with _membership_lock(request.site):
-        cluster_was_committed = join._site_contains_cluster(
+    cluster_was_committed = join._site_contains_cluster(
+        request.site.source,
+        execution.cluster_id,
+    )
+    restored_site = (
+        _remove_joined_cluster_from_site(request, execution.cluster_id)
+        if cluster_was_committed
+        else load_site(
             request.site.source,
-            execution.cluster_id,
+            repository_root=request.site.repository_root,
         )
-        restored_site = (
-            _remove_joined_cluster_from_site(request, execution.cluster_id)
-            if cluster_was_committed
-            else load_site(
-                request.site.source,
-                repository_root=request.site.repository_root,
-            )
+    )
+    if cluster_was_committed:
+        join._sync_join_release_state(restored_site)
+    _remove_joined_resources(restored_site, execution=execution)
+    if joined:
+        join._run_rollout(
+            execution.candidate,
+            "rollback-cluster",
+            cluster_id=execution.cluster_id,
         )
-        if cluster_was_committed:
-            join._sync_join_release_state(restored_site)
-        _remove_joined_resources(restored_site, execution=execution)
-        if joined:
-            join._run_rollout(
-                execution.candidate,
-                "rollback-cluster",
-                cluster_id=execution.cluster_id,
-            )

@@ -50,6 +50,9 @@ class CheckSkipped(RuntimeError):
 class CheckValue:
     summary: str
     details: Any = None
+    # ``WARN`` is a finding that does not fail the report: something the
+    # operator should read, not something the deploy should stop on.
+    status: str = "PASS"
 
 
 def _check(
@@ -62,7 +65,7 @@ def _check(
         value = function()
         return {
             "name": name,
-            "status": "PASS",
+            "status": value.status,
             "summary": value.summary,
             "details": value.details,
         }
@@ -664,10 +667,17 @@ def _check_aurora(release: Any) -> CheckValue:
     cluster = clusters[0]
     if cluster.get("Status") != "available":
         raise ReleaseError(f"Aurora cluster {cluster_id} is {cluster.get('Status')}")
+    # Filtered server-side: without it every RDS instance in the region came
+    # back, most of them belonging to other systems, to be discarded here.
     instances = (
         _aws_json(
             release,
-            ["rds", "describe-db-instances"],
+            [
+                "rds",
+                "describe-db-instances",
+                "--filters",
+                f"Name=db-cluster-id,Values={cluster_id}",
+            ],
         ).get("DBInstances")
         or []
     )
@@ -755,8 +765,11 @@ def _check_monitoring(release: Any) -> CheckValue:
         for item in subscriptions
         if item.get("SubscriptionArn") not in {None, "PendingConfirmation"}
     ]
-    if health.require_confirmed_sns_subscription and not confirmed:
-        raise ReleaseError("SNS topic has no confirmed subscription")
+    # The confirmation gate moved to the first minute of ``gpu-fault-admin
+    # deploy`` (``notification_precheck``), where the operator can act on it.
+    # Here it is a warning: the report still names the topic nobody listens to,
+    # but a subscription that lapsed after the deploy does not fail ``verify``.
+    unconfirmed = health.require_confirmed_sns_subscription and not confirmed
     email_summary = monitoring_safety.email_subscription_summary(
         subscriptions,
         release.config.notifications.admin_email,
@@ -784,7 +797,12 @@ def _check_monitoring(release: Any) -> CheckValue:
             capture=True,
         )
     return CheckValue(
-        "AMP rules, Alertmanager and SNS destination are configured",
+        (
+            "AMP rules and Alertmanager are configured; SNS topic has no "
+            "confirmed subscription"
+            if unconfirmed
+            else "AMP rules, Alertmanager and SNS destination are configured"
+        ),
         {
             "workspace_id": health.amp_workspace_id,
             "workspace_status": status,
@@ -794,6 +812,7 @@ def _check_monitoring(release: Any) -> CheckValue:
             "email_subscription": email_summary,
             "verifier": verifier,
         },
+        status="WARN" if unconfirmed else "PASS",
     )
 
 
@@ -1017,6 +1036,35 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
         raise ReleaseError("CPU external alert acknowledgement does not match site")
     details["email_enabled"] = release.config.notifications.allow_email
     return CheckValue("CPU control-plane workloads are at desired readiness", details)
+
+
+# The checks a default ``status`` runs. Together they answer "is the control
+# plane up and serving this release" from a handful of ``kubectl get`` calls and
+# one exec into the ingress Pod, where the full report also probes every GPU
+# cluster, the role split, the NLB, Aurora and AMP -- 44 kubectl calls including
+# 15 execs, about 44 seconds on production. The full report stays one flag away
+# (``status --full``) and is still what acceptance evidence records.
+QUICK_HEALTH_CHECKS = ("cpu_workloads", "control_api")
+
+
+def build_quick_health_report(release: Any) -> dict[str, Any]:
+    specifications = [
+        ("cpu_workloads", lambda: _check_cpu_workloads(release)),
+        ("control_api", lambda: _check_control_api(release)),
+    ]
+    assert tuple(name for name, _ in specifications) == QUICK_HEALTH_CHECKS
+    with _read_snapshot(release):
+        _prime_deployment_snapshot(release)
+        with ThreadPoolExecutor(max_workers=len(specifications)) as executor:
+            futures = [
+                executor.submit(_check, name, function)
+                for name, function in specifications
+            ]
+            checks = [future.result() for future in futures]
+    report = _report("status", release, checks)
+    report["scope"] = "quick"
+    report["reused_validation_checks"] = []
+    return report
 
 
 def run_read_only_verifiers(

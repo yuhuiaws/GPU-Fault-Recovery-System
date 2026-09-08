@@ -407,14 +407,6 @@ def test_admin_deploy_runs_preflight_before_bootstrap(
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
-    )
-    monkeypatch.setattr(
-        admin_cli,
-        "sync_installation_resource_registry",
-        lambda _site: tmp_path / "installation-resources.json",
-    )
     arguments = argparse.Namespace(
         command="deploy", file=path, repo_root=None, show_effective_config=False
     )
@@ -433,14 +425,6 @@ def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) ->
         return subprocess.CompletedProcess(command, 1)
 
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
-    )
-    monkeypatch.setattr(
-        admin_cli,
-        "sync_installation_resource_registry",
-        lambda _site: tmp_path / "installation-resources.json",
-    )
     arguments = argparse.Namespace(
         command="deploy", file=path, repo_root=None, show_effective_config=False
     )
@@ -449,6 +433,8 @@ def test_admin_deploy_stops_when_preflight_fails(tmp_path: Path, monkeypatch) ->
     assert [call[1] for call in calls] == ["preflight"]
 
 
+# `status` is the public verb; `preflight` and `verify` are the driver-only
+# passthroughs `scripts/staging_deploy.py` and `scripts/release_deploy.py` use.
 @pytest.mark.parametrize("command", ["preflight", "verify", "status"])
 def test_admin_read_only_commands_map_to_regional_modes(
     tmp_path: Path, monkeypatch, command: str
@@ -464,9 +450,6 @@ def test_admin_read_only_commands_map_to_regional_modes(
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
     if command == "status":
         monkeypatch.setattr(admin_cli, "_live_release_state", lambda _site: {})
-    monkeypatch.setattr(
-        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
-    )
     arguments = argparse.Namespace(
         command=command,
         file=None,
@@ -591,26 +574,84 @@ def test_admin_main_enforces_binding_before_dispatch(
     assert "installed deploy-host is bound" in capsys.readouterr().err
 
 
-def test_legacy_uninstall_accepts_cluster_arns_without_site_file() -> None:
-    arguments = admin_cli.parser().parse_args(
-        [
-            "uninstall",
-            "--cpu-cluster-arn",
-            "arn:aws:sagemaker:us-west-2:123456789012:cluster/cpu",
-            "--gpu-cluster-arn",
-            "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu",
-            "--cpu-cluster",
-            "keep",
-            "--confirm",
-            "UNINSTALL_GPU_FAULT",
-        ]
+def test_uninstall_no_longer_discovers_a_site_from_cluster_arns(
+    tmp_path: Path, capsys
+) -> None:
+    """Every production state directory carries ``site.yaml``; the ARN discovery
+    branch (and ``legacy_site``) is gone, so the flags are unknown."""
+
+    with pytest.raises(SystemExit):
+        admin_cli.parser().parse_args(
+            [
+                "uninstall",
+                "--cpu-cluster-arn",
+                "arn:aws:sagemaker:us-west-2:123456789012:cluster/cpu",
+                "--gpu-cluster-arn",
+                "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu",
+                "--confirm",
+                "UNINSTALL_GPU_FAULT",
+            ]
+        )
+    assert "--cpu-cluster-arn" in capsys.readouterr().err, (
+        "argparse must name the unknown flag"
     )
 
-    assert arguments.file is None, "ARN uninstall unexpectedly requires a site file"
-    assert arguments.cpu_cluster_arn.endswith("cluster/cpu"), "CPU ARN was not parsed"
-    assert arguments.gpu_cluster_arn == [
-        "arn:aws:sagemaker:us-west-2:123456789012:cluster/gpu"
-    ], "GPU ARN was not parsed"
+    arguments = admin_cli.parser().parse_args(
+        ["uninstall", "--state-dir", str(tmp_path), "--confirm", "UNINSTALL_GPU_FAULT"]
+    )
+    with pytest.raises(SiteConfigError, match="found no managed site"):
+        admin_cli.run(arguments)
+
+
+def test_uninstall_keeps_aurora_unless_the_database_reset_is_explicit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    site_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        admin_cli,
+        "uninstall",
+        lambda request: calls.append(request) or {"phase": "COMPLETED"},
+    )
+    common = ["uninstall", "--state-dir", str(tmp_path), "--cpu-cluster", "keep"]
+
+    admin_cli.run(
+        admin_cli.parser().parse_args([*common, "--confirm", "UNINSTALL_GPU_FAULT"])
+    )
+    admin_cli.run(
+        admin_cli.parser().parse_args(
+            [*common, "--reset-database", "--confirm", "UNINSTALL_GPU_FAULT"]
+        )
+    )
+
+    assert [request.reset_database for request in calls] == [False, True], (
+        "only the explicit flag asks for the database wipe"
+    )
+    assert {request.final_snapshot_policy for request in calls} == {"retain"}, (
+        "keep mode always retains the final snapshot"
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (["--cpu-cluster", "keep", "--aurora-final-snapshot", "skip"], "delete"),
+        (["--cpu-cluster", "delete", "--reset-database"], "keep"),
+    ),
+)
+def test_uninstall_refuses_contradictory_aurora_flags(
+    tmp_path: Path, monkeypatch, extra: list[str], message: str
+) -> None:
+    site_file(tmp_path)
+    monkeypatch.setattr(
+        admin_cli, "uninstall", lambda request: pytest.fail("must not run")
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["uninstall", "--state-dir", str(tmp_path), *extra, "--confirm", "x"]
+    )
+
+    with pytest.raises(SiteConfigError, match=f"--cpu-cluster {message}"):
+        admin_cli.run(arguments)
 
 
 def test_uninstall_resolves_site_from_state_dir(tmp_path: Path, monkeypatch) -> None:
@@ -665,14 +706,6 @@ def test_arn_only_deploy_bootstraps_site_then_deploys_and_verifies(
         return subprocess.CompletedProcess(arguments, 0)
 
     monkeypatch.setattr(admin_cli.subprocess, "run", fake_run)
-    monkeypatch.setattr(
-        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
-    )
-    monkeypatch.setattr(
-        admin_cli,
-        "sync_installation_resource_registry",
-        lambda _site: tmp_path / "installation-resources.json",
-    )
     monkeypatch.setattr(
         admin_cli,
         "join_clusters",
@@ -758,6 +791,10 @@ def test_public_deploy_help_exposes_optional_admin_config(capsys) -> None:
         "--state-dir",
         "--admin-email",
         "--config",
+        "--rollback",
+        "--approve-profile-plan",
+        "--reference",
+        "--wait-for-email-confirmation",
     ):
         assert value in help_text
     for value in (
@@ -773,36 +810,283 @@ def test_public_deploy_help_exposes_optional_admin_config(capsys) -> None:
         assert value not in help_text
 
 
-def test_approve_profile_command_records_pending_plan(
+def test_public_verbs_are_the_six_plus_two_and_approve_profile_is_gone() -> None:
+    """The verb table: no ``approve-profile`` (folded into ``deploy``), and the
+    two wave-1 verbs ``rotate-token``/``submit-remediation`` registered."""
+
+    choices = sorted(admin_cli.parser()._subparsers._group_actions[0].choices)
+
+    assert "approve-profile" not in choices
+    assert "rotate-token" in choices
+    assert "submit-remediation" in choices
+    assert "preflight" not in choices and "verify" not in choices, (
+        "the driver passthroughs stay off the public table"
+    )
+    assert not hasattr(admin_cli, "_run_profile_approval"), (
+        "the verb's runner went with it"
+    )
+    with pytest.raises(SystemExit):
+        admin_cli.parser().parse_args(
+            ["approve-profile", "--state-dir", "/tmp/x", "--plan-sha256", "a" * 64]
+        )
+
+
+def _managed_state(tmp_path: Path, *, gpu_names: tuple[str, ...] = ("gpu-a",)) -> Path:
+    """A state directory holding a loadable ``site.yaml`` with an admin email."""
+
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    first = document["spec"]["clusters"][0]
+    document["spec"]["clusters"] = [
+        {
+            **first,
+            "clusterId": name,
+            "context": name,
+            "hyperpodClusterName": f"hp-{name}",
+            "eksClusterArn": f"arn:aws:eks:us-east-1:123456789012:cluster/{name}",
+        }
+        for name in gpu_names
+    ]
+    document["spec"]["notifications"] = {"adminEmail": "operations@example.com"}
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return tmp_path
+
+
+def test_deploy_with_state_dir_alone_upgrades_the_managed_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``deploy --state-dir X`` is the whole upgrade command on a managed site."""
+
+    state_dir = _managed_state(tmp_path)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    arguments = admin_cli.parser().parse_args(["deploy", "--state-dir", str(state_dir)])
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0]["cpu_cluster_arn"] == (
+        "arn:aws:eks:us-east-1:123456789012:cluster/control"
+    )
+    assert calls[0]["gpu_cluster_arns"] == (
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+    )
+    assert calls[0]["admin_email"] == "operations@example.com"
+
+
+def test_deploy_superset_joins_the_delta_without_a_rollout_when_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The managed ARNs plus a new one: the new one is joined; when the source
+    deploy applied no release (the site would NOOP) the join is the whole cost."""
+
+    state_dir = _managed_state(tmp_path)
+    new_arn = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
+    calls: list[dict] = []
+    joined: list[str] = []
+
+    def source_deploy(**kwargs):
+        calls.append(kwargs)
+        (state_dir / "source-deploy-success.json").write_text(
+            json.dumps({"schema_version": 1, "status": "PASSED", "mode": "UNCHANGED"}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(admin_cli, "run_source_deploy", source_deploy)
+    monkeypatch.setattr(admin_cli, "load_site", lambda *_a, **_k: "site")
+    monkeypatch.setattr(
+        admin_cli,
+        "join_clusters",
+        lambda requests: joined.extend(r.gpu_cluster_arn for r in requests) or {},
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--state-dir",
+            str(state_dir),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+            "--gpu-cluster-arn",
+            new_arn,
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0]["gpu_cluster_arns"] == (
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        new_arn,
+    )
+    assert joined == [new_arn]
+
+
+def test_deploy_superset_after_an_application_release_leaves_the_join_to_the_inner_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An application release joins the delta itself (``pending_gpu_cluster_arns``
+    right after the release); the outer hop must not join it a second time."""
+
+    state_dir = _managed_state(tmp_path)
+
+    def source_deploy(**_kwargs):
+        (state_dir / "source-deploy-success.json").write_text(
+            json.dumps({"schema_version": 1, "mode": "APPLICATION_RELEASE"}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(admin_cli, "run_source_deploy", source_deploy)
+    monkeypatch.setattr(
+        admin_cli,
+        "join_clusters",
+        lambda requests: pytest.fail("the outer hop joined after a release"),
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--state-dir",
+            str(state_dir),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+
+
+def test_deploy_subset_is_refused_naming_remove_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _managed_state(tmp_path, gpu_names=("gpu-a", "gpu-b"))
+    monkeypatch.setattr(
+        admin_cli,
+        "run_source_deploy",
+        lambda **_kwargs: pytest.fail("a subset reached the source preparer"),
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--state-dir",
+            str(state_dir),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="remove-cluster") as failure:
+        admin_cli.run(arguments)
+    assert "cluster/gpu-b" in str(failure.value), "the omitted cluster is named"
+
+
+def test_deploy_with_a_different_cpu_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _managed_state(tmp_path)
+    monkeypatch.setattr(
+        admin_cli,
+        "run_source_deploy",
+        lambda **_kwargs: pytest.fail("a foreign CPU reached the source preparer"),
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--state-dir",
+            str(state_dir),
+            "--cpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/other",
+        ]
+    )
+
+    with pytest.raises(SiteConfigError, match="CPU cluster identity differs"):
+        admin_cli.run(arguments)
+
+
+def test_deploy_rollback_dispatches_to_the_rollback_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _managed_state(tmp_path)
+    seen: list[tuple[object, Path]] = []
+    monkeypatch.setattr(admin_cli, "load_site", lambda *_a, **_k: "site")
+    monkeypatch.setattr(
+        admin_cli,
+        "run_rollback",
+        lambda site, *, state_dir: seen.append((site, state_dir)) or 2,
+    )
+    monkeypatch.setattr(
+        admin_cli,
+        "run_source_deploy",
+        lambda **_kwargs: pytest.fail("--rollback ran a source deploy"),
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(state_dir), "--rollback"]
+    )
+
+    assert admin_cli.run(arguments) == 2, "the rollback command's exit code is returned"
+    assert seen == [("site", state_dir.resolve())]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        ["--gpu-cluster-arn", "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"],
+        ["--approve-profile-plan", "a" * 64, "--reference", "CHG-1"],
+        ["--accept-schema-change"],
+        ["--supersede-failed-transaction"],
+    ),
+)
+def test_deploy_rollback_takes_no_other_deploy_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
+) -> None:
+    state_dir = _managed_state(tmp_path)
+    monkeypatch.setattr(
+        admin_cli, "run_rollback", lambda *_a, **_k: pytest.fail("rollback ran")
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(state_dir), "--rollback", *extra]
+    )
+
+    with pytest.raises(SiteConfigError, match="takes no other deploy option"):
+        admin_cli.run(arguments)
+
+
+def test_deploy_rollback_requires_a_managed_site(tmp_path: Path) -> None:
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(tmp_path / "empty"), "--rollback"]
+    )
+
+    with pytest.raises(SiteConfigError, match="requires a managed site"):
+        admin_cli.run(arguments)
+
+
+def test_deploy_approve_profile_plan_approves_inline_before_the_source_deploy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    calls: list[tuple[Path, str, str]] = []
+    state_dir = _managed_state(tmp_path)
+    events: list[str] = []
 
-    def approve(state_dir: Path, *, reference: str, expected_plan_sha256: str):
-        calls.append((state_dir, reference, expected_plan_sha256))
+    def approve(path: Path, *, plan_sha256: str, reference: str):
+        events.append(f"approve:{path}:{plan_sha256}:{reference}")
         return {
-            "site_identity": {
-                "site_name": "test-site",
-                "aws_region": REGION,
-                "cpu_eks_arn": ("arn:aws:eks:us-east-1:123456789012:cluster/control"),
-            },
-            "site_identity_sha256": "b" * 64,
-            "desired_version": "profile-v2",
-            "change_kind": "EXPANSIVE",
-            "plan_sha256": "a" * 64,
+            "plan_sha256": plan_sha256,
             "reference": reference,
-            "approved_at": "2026-08-30T12:00:00+00:00",
+            "approved_at": "2026-09-08T12:00:00+00:00",
             "approver_identity": "arn:aws:sts::123456789012:assumed-role/Admin/alice",
         }
 
-    monkeypatch.setattr(admin_cli, "approve_profile", approve)
-    state_dir = tmp_path / "state"
+    monkeypatch.setattr(admin_cli, "approve_profile_plan_inline", approve)
+    monkeypatch.setattr(
+        admin_cli,
+        "run_source_deploy",
+        lambda **kwargs: events.append("source-deploy") or 0,
+    )
     arguments = admin_cli.parser().parse_args(
         [
-            "approve-profile",
+            "deploy",
             "--state-dir",
             str(state_dir),
-            "--plan-sha256",
+            "--approve-profile-plan",
             "a" * 64,
             "--reference",
             "CHG-12345",
@@ -810,36 +1094,46 @@ def test_approve_profile_command_records_pending_plan(
     )
 
     assert admin_cli.run(arguments) == 0
-    assert calls == [(state_dir, "CHG-12345", "a" * 64)]
-    output = json.loads(capsys.readouterr().out)
-    assert output["status"] == "APPROVED"
-    assert output["plan_sha256"] == "a" * 64
-    assert output["site_identity"]["cpu_eks_arn"].endswith("/control"), (
-        "approve-profile output omitted the readable CPU control-plane identity"
-    )
-    assert output["approver_identity"].endswith("/Admin/alice"), (
-        "approve-profile output must name who approved (I2)"
+    assert events == [
+        f"approve:{state_dir.resolve()}:{'a' * 64}:CHG-12345",
+        "source-deploy",
+    ], "the approval happens first, then the same deploy continues"
+    err = capsys.readouterr().err
+    assert "2026-09-08T12:00:00+00:00" in err and "/Admin/alice" in err, (
+        "the approval record's time and approver are printed (I2)"
     )
 
 
-def test_approve_profile_help_exposes_reviewed_plan_sha(capsys) -> None:
-    with pytest.raises(SystemExit, match="0"):
-        admin_cli.parser().parse_args(["approve-profile", "--help"])
+def test_deploy_approve_profile_plan_requires_a_reference(tmp_path: Path) -> None:
+    state_dir = _managed_state(tmp_path)
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(state_dir), "--approve-profile-plan", "a" * 64]
+    )
 
-    help_text = capsys.readouterr().out
-    assert "--state-dir" in help_text
-    assert "--plan-sha256" in help_text
-    assert "--reference" in help_text
-    assert "--file" not in help_text
-    assert "--repo-root" not in help_text
+    with pytest.raises(SiteConfigError, match="requires --reference"):
+        admin_cli.run(arguments)
+
+
+def test_wait_for_email_confirmation_travels_to_the_source_preparer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _managed_state(tmp_path)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(state_dir), "--wait-for-email-confirmation", "15"]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[0]["wait_for_email_confirmation"] == 15
 
 
 @pytest.mark.parametrize(
     ("command", "expected"),
     (
-        ("preflight", ()),
-        ("verify", ()),
-        ("status", ()),
+        ("status", ("--full",)),
         ("join-cluster", ("--gpu-cluster-arn",)),
         ("remove-cluster", ("--gpu-cluster-arn", "--confirm")),
         ("uninstall", ("--cpu-cluster", "--confirm")),
@@ -900,35 +1194,7 @@ def test_arn_only_deploy_requires_admin_email(tmp_path: Path) -> None:
         admin_cli.run(arguments)
 
 
-def test_admin_email_option_keeps_alert_email_compatibility() -> None:
-    preferred = admin_cli.parser().parse_args(
-        [
-            "deploy",
-            "--cpu-cluster-arn",
-            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
-            "--gpu-cluster-arn",
-            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
-            "--admin-email",
-            "ops@example.com",
-        ]
-    )
-    legacy = admin_cli.parser().parse_args(
-        [
-            "deploy",
-            "--cpu-cluster-arn",
-            "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
-            "--gpu-cluster-arn",
-            "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
-            "--alert-email",
-            "ops@example.com",
-        ]
-    )
-
-    assert preferred.alert_email == "ops@example.com"
-    assert legacy.alert_email == preferred.alert_email
-
-
-def test_admin_cli_accepts_independent_email_routing() -> None:
+def test_admin_email_option_is_the_alert_email() -> None:
     arguments = admin_cli.parser().parse_args(
         [
             "deploy",
@@ -937,21 +1203,54 @@ def test_admin_cli_accepts_independent_email_routing() -> None:
             "--gpu-cluster-arn",
             "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
             "--admin-email",
-            "owner@example.com",
-            "--email-sender",
-            "sender@example.com",
-            "--email-recipient",
             "ops@example.com",
-            "--email-recipient",
-            "oncall@example.com",
-            "--email-subject-prefix",
-            "[PROD]",
         ]
     )
 
-    assert arguments.email_sender == "sender@example.com"
-    assert arguments.email_recipient == ["ops@example.com", "oncall@example.com"]
-    assert arguments.email_subject_prefix == "[PROD]"
+    assert arguments.alert_email == "ops@example.com", (
+        "--admin-email is the only notification address input"
+    )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    (
+        "--email-sender=sender@example.com",
+        "--email-recipient=ops@example.com",
+        "--email-subject-prefix=[PROD]",
+        "--alert-email=ops@example.com",
+        "--allow-legacy-python-foundation",
+        "--show-effective-config",
+    ),
+)
+def test_deploy_dropped_its_hidden_notification_and_debug_flags(
+    flag: str, capsys
+) -> None:
+    """The routing overrides were never forwarded by the source preparer and the
+    other two had no reader; sender = recipient = ``--admin-email``."""
+
+    with pytest.raises(SystemExit):
+        admin_cli.parser().parse_args(
+            [
+                "deploy",
+                "--cpu-cluster-arn",
+                "arn:aws:eks:us-east-1:123456789012:cluster/cpu",
+                "--gpu-cluster-arn",
+                "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
+                "--admin-email",
+                "owner@example.com",
+                flag,
+            ]
+        )
+    assert flag.split("=", 1)[0] in capsys.readouterr().err, (
+        "argparse must name the unknown flag"
+    )
+    assert not hasattr(admin_cli, "_configure_site_notifications"), (
+        "the zero-caller notification rewriter went with its flags"
+    )
+    assert not hasattr(admin_cli, "_redacted_config"), (
+        "nothing prints the effective config any more"
+    )
 
 
 def test_accept_schema_change_travels_to_the_source_preparer_as_environment(
@@ -1004,10 +1303,18 @@ def test_accept_schema_change_travels_to_the_source_preparer_as_environment(
     }
 
 
-def test_an_explicit_schema_change_variable_wins_over_the_flag(monkeypatch) -> None:
+def test_the_flag_wins_over_a_stale_schema_change_variable(monkeypatch) -> None:
+    """A leftover ``export`` from an earlier session must not override the
+    consent the operator typed; without a flag nothing is added and the
+    inherited environment travels unchanged."""
+
     monkeypatch.setenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, "no-snapshot")
-    arguments = admin_cli.parser().parse_args(
+    with_flag = admin_cli.parser().parse_args(
         ["deploy", "--accept-schema-change", "--state-dir", "/tmp/x"]
     )
+    without = admin_cli.parser().parse_args(["deploy", "--state-dir", "/tmp/x"])
 
-    assert admin_cli.schema_change_environment(arguments) == {}
+    assert admin_cli.schema_change_environment(with_flag) == {
+        admin_cli.ACCEPT_SCHEMA_CHANGE_ENV: "snapshot"
+    }
+    assert admin_cli.schema_change_environment(without) == {}

@@ -10,30 +10,29 @@ link them leave a record that nothing will ever close, and because the
 dispatcher admits one workflow per incident, that record also starves the
 successor its incident is now waiting on.
 
-This module is the single copy of that decision, for three callers that cannot
-share an import:
+This module is the single copy of that decision, for callers that cannot share
+an import:
 
-* ``WorkflowDispatcher._revoke_retired_generations`` -- the self-healing sweep.
+* ``WorkflowDispatcher._revoke_retired_generations`` -- the self-healing sweep,
+  which is the only path that revokes a retired generation now.
 * ``TransactionalWorkflowMixin.reconcile_retired_generation_workflow`` -- the
-  audited operator write.
-* ``gpu_fault.admin.workflow_reconcile`` -- which ships *this file's source* into
-  the running Pod, because an operator has to be able to close such a record
-  using the image that is already deployed, including the release that carries
-  this module for the first time.
+  audited Store write the sweep goes through.
+* ``build_retired_generation_plan`` -- the read-only report the DESTR-017
+  acceptance runner records, and the digest rule (``plan_digest_items``) the
+  administrator's ``workflow-reconcile`` shares.
 
-That third caller is why the imports below are deliberately narrow and
-long-standing: ``models``, ``operation_registry``, ``remote_command_models`` and
-``store`` only. Nothing here may import ``gpu_fault.workflow_resolution``,
-``gpu_fault.execution`` or anything else that has changed in the same release,
-or the shipped copy stops running against the deployed image.
+The administrator's retired-generation mode, which shipped this file's source
+into the running Pod, was folded into the dispatcher sweep; the imports below
+stay narrow (``models``, ``operation_registry``, ``remote_command_models`` and
+``store`` only) so nothing here pulls ``gpu_fault.execution`` back into the
+store layer through ``workflow_resolution``.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, NamedTuple
 
 import gpu_fault.models as _models
@@ -653,8 +652,9 @@ def _canonical_sha256(value: object) -> str:
 # successor's identity and generation, completed and pending destructive
 # operations, unsettled local steps, budget claims, open commands -- stays in the
 # digest, so any material change still refuses. And the write itself is guarded
-# where a timestamp could not guard it anyway: ``_revoke_planned_item`` compares
-# the fencing token inside the transaction. ``updated_at`` is still printed,
+# where a timestamp could not guard it anyway: the Store's retired-generation
+# reconcile compares the fencing token inside the transaction. ``updated_at`` is
+# still printed,
 # because "this record was touched seconds ago" is exactly what tells an operator
 # the wedge is live rather than historical.
 DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"workflow_updated_at"})
@@ -701,330 +701,3 @@ def build_retired_generation_plan(
         }
     )
     return plan
-
-
-def _revoke_planned_item(
-    store: Any,
-    item: dict[str, Any],
-    *,
-    reference: str,
-    applied_at: datetime,
-    waiting_ttl: timedelta | None = None,
-    actor: str | None = None,
-    approval: Mapping[str, Any] | None = None,
-) -> tuple[str, str | None]:
-    transactional = getattr(store, "reconcile_retired_generation_workflow", None)
-    if transactional is not None:
-        # The Store this runs against may be the previously deployed one, whose
-        # transactional write predates the attributed event; only hand it what
-        # its signature takes, or the apply fails with a TypeError at the one
-        # moment it is needed.
-        parameters = inspect.signature(transactional).parameters
-        attribution: dict[str, Any] = {}
-        if "actor" in parameters:
-            attribution["actor"] = actor
-        if "approval" in parameters:
-            attribution["approval"] = approval
-        revoked, _ = transactional(
-            item["request_id"],
-            item["successor_workflow_id"],
-            expected_fencing_token=int(item["fencing_token"]),
-            reference=reference,
-            reconciled_at=applied_at,
-            **attribution,
-        )
-    else:
-        # The release that first carries this module has to be able to close a
-        # retired generation *before* it deploys -- that record is exactly what
-        # the release preflight refuses to roll past -- and the Store it talks to
-        # is the previously deployed one, which has no transactional form of this
-        # write. Resolved as a capability rather than by catching an
-        # ``AttributeError``: a missing Store method is a static property of the
-        # deployment, not a transient failure. The window this opens is one
-        # re-read: ``retired_generation_records`` re-derives every condition from
-        # rows read here, and the only concurrent writer is the dispatcher
-        # renewing a lease whose fields this write clears anyway.
-        workflow = store.get_workflow(item["request_id"])
-        incident = store.get_incident(workflow.incident_id)
-        successor = store.get_workflow(item["successor_workflow_id"])
-        revoked, updated_incident = retired_generation_records(
-            workflow,
-            incident,
-            successor,
-            store.list_remote_commands(workflow_request_ids=[workflow.request_id]),
-            expected_fencing_token=int(item["fencing_token"]),
-            reference=reference,
-            reconciled_at=applied_at,
-            actor=actor,
-            approval=approval,
-        )
-        # Compare-and-set on the copy read above: the lease renewal named
-        # there now surfaces as ``StaleWriteError`` (reported per item by the
-        # caller) instead of being overwritten (store review 2026-09-07, item B).
-        store.save_workflow(revoked, expected=workflow)
-        store.save_incident(updated_incident, expected=incident)
-    return revoked.request_id, _release_restart_reservations(
-        store, revoked, waiting_ttl=waiting_ttl
-    )
-
-
-def _release_restart_reservations(
-    store: Any,
-    workflow: WorkflowRequest,
-    *,
-    waiting_ttl: timedelta | None = None,
-) -> str | None:
-    """Release restart reservations the revoked workflow will never attempt.
-
-    Imported here rather than at module scope: ``gpu_fault.execution`` reaches
-    this module through ``workflow_resolution``, so a top-level import would
-    close an import cycle, and the shipped copy of this file must not depend on
-    the execution package having the shape it has in this release.
-
-    Which is also why a shortfall is returned rather than raised. This runs
-    *after* the workflow row is already terminalized, so letting an import or
-    attribute error out of here would hand the operator a traceback for a write
-    that in fact succeeded -- at the one moment they have no other way to clear
-    the release blocker, and with no way to tell from the output whether to run
-    the command again. The cost of the degraded path is bounded and nameable: a
-    restart reservation stays held, so a later legitimate restart of that job can
-    be refused for budget. Reported, so the operator can release it deliberately
-    rather than discover it as an unexplained refusal weeks later.
-    """
-
-    try:
-        from gpu_fault.execution import restart_budget_preflight
-
-        release = restart_budget_preflight.release_unattempted_restart_reservations
-    except (ImportError, AttributeError) as exc:
-        return (
-            f"{workflow.request_id}: revoked, but restart reservations were not "
-            f"released -- the deployed image cannot do it ({exc}). Release them "
-            "with the release that carries this fix."
-        )
-    try:
-        # Inside the same guard as the import, for the same reason: the release
-        # reads and writes the Store, and a transient storage error here would
-        # otherwise turn a committed revocation into a traceback (P1-72F).
-        # ``waiting_ttl`` is passed only when given: the previously deployed
-        # image's release may not know the keyword, and the default call has
-        # to stay the one it accepts.
-        if waiting_ttl is None:
-            release(store, workflow)
-        else:
-            release(store, workflow, waiting_ttl=waiting_ttl)
-    except Exception as exc:  # noqa: BLE001 -- reported to the operator, not raised
-        return (
-            f"{workflow.request_id}: revoked, but releasing its restart "
-            f"reservations failed ({type(exc).__name__}: {exc}). Release them "
-            "deliberately, or run the command again for this workflow."
-        )
-    return None
-
-
-# Item fields the cancel pass is allowed to change between the approved plan and
-# the settled re-plan. Everything else must read back identical, or the second
-# pass is describing a record the operator never approved (P1-72D).
-SECOND_PASS_MUTABLE_FIELDS = frozenset(
-    {
-        "open_remote_commands",
-        "cancellable",
-        "eligible",
-        "reasons",
-        "blocker_codes",
-        "workflow_updated_at",
-    }
-)
-
-
-def second_pass_drift(
-    approved: dict[str, Any],
-    settled: dict[str, Any],
-) -> list[str]:
-    """Field-level differences the cancel pass cannot account for.
-
-    Cancelling commands may only empty ``open_remote_commands`` and drop the one
-    blocker that named them; a change to any other field -- the generation, the
-    step list's destructive content, the successor, the incident's state -- names
-    the field and both values so the operator can tell a re-plan from a tick.
-    """
-
-    request_id = str(approved.get("request_id"))
-    drift: list[str] = []
-    for field in sorted(set(approved) | set(settled)):
-        if field in SECOND_PASS_MUTABLE_FIELDS:
-            continue
-        before, after = approved.get(field), settled.get(field)
-        if before != after:
-            drift.append(f"{request_id}: {field} {before!r} -> {after!r}")
-    still_open = set(settled.get("open_remote_commands") or [])
-    if not still_open <= set(approved.get("open_remote_commands") or []):
-        drift.append(
-            f"{request_id}: open_remote_commands gained "
-            f"{sorted(still_open - set(approved.get('open_remote_commands') or []))}"
-        )
-    remaining = [
-        code
-        for code in settled.get("blocker_codes") or []
-        if code != OPEN_REMOTE_COMMANDS_CODE
-    ]
-    approved_codes = [
-        code
-        for code in approved.get("blocker_codes") or []
-        if code != OPEN_REMOTE_COMMANDS_CODE
-    ]
-    if remaining != approved_codes:
-        drift.append(f"{request_id}: blocker_codes {approved_codes!r} -> {remaining!r}")
-    return drift
-
-
-def apply_retired_generation_plan(
-    store: Any,
-    *,
-    workflow_ids: Iterable[str],
-    expected_plan_sha256: str,
-    reference: str,
-    now: datetime | None = None,
-    waiting_ttl: timedelta | None = None,
-    actor: str | None = None,
-    admin_plan_sha256: str | None = None,
-) -> dict[str, Any]:
-    """Cancel the open commands of a retired generation, then terminalize it.
-
-    ``actor`` is the operator's resolved STS identity and ``admin_plan_sha256``
-    the digest of the plan the operator approved on the admin side; with the
-    runtime digest they go on each revoked workflow's audit event (I1).
-
-    Both passes happen here rather than asking the operator to run the command
-    twice, because cancelling a ``PENDING`` or ``WAITING`` command settles it in
-    the same Store call: the second plan below usually finds nothing left to
-    wait for. A ``LEASED`` command does not settle -- only the executor holding
-    the lease can report it -- so that case stops with the reasons printed
-    instead of revoking a workflow whose effect is still in flight.
-
-    The approval binds the write. The compare-and-set value and the successor
-    handed to the Store come from the plan whose digest the operator approved,
-    and the settled re-plan is compared with it field by field: the cancel pass
-    may only have emptied ``open_remote_commands``. Each revocation is isolated,
-    so one failing row leaves a result naming what was applied, what failed and
-    why; a rerun finds the applied rows as ``already_revoked`` and skips them.
-
-    ``waiting_ttl`` is how long a ``RESTART_WORKLOAD`` may have been WAITING
-    before its restart reservation counts as never used (F-C9). This module has
-    no executor config to read the cap from, so the caller supplies it; without
-    it a WAITING record keeps its reservation, as before.
-    """
-
-    applied_at = now or datetime.now(timezone.utc)
-    requested = requested_workflow_ids(workflow_ids)
-    plan = build_retired_generation_plan(store, requested, now=applied_at)
-    if plan["plan_sha256"] != expected_plan_sha256:
-        raise ValueError("retired generation reconcile plan changed before apply")
-    if not plan["items"]:
-        raise ValueError("retired generation reconcile plan has no workflows")
-    skipped = [item for item in plan["items"] if item["already_revoked"]]
-    blocked = [
-        f"{item['request_id']}: " + "; ".join(item["reasons"])
-        for item in plan["items"]
-        if not item["eligible"]
-        and not item["cancellable"]
-        and not item["already_revoked"]
-    ]
-    if blocked:
-        raise ValueError(
-            "retired generation reconcile plan contains ineligible records: "
-            + " | ".join(blocked)
-        )
-    cancelled: dict[str, dict[str, int]] = {}
-    for item in plan["items"]:
-        if not item["cancellable"]:
-            continue
-        cancelled[item["request_id"]] = store.cancel_remote_commands_for_workflow(
-            item["request_id"],
-            reason=(
-                f"operator reconciliation {reference}: cancelled before revoking "
-                f"retired generation {item['request_id']} at generation "
-                f"{item['fencing_token']}"
-            ),
-        )
-    settled = build_retired_generation_plan(store, requested, now=applied_at)
-    settled_by_id = {str(item["request_id"]): item for item in settled["items"]}
-    drift = [
-        line
-        for item in plan["items"]
-        if not item["already_revoked"]
-        for line in second_pass_drift(item, settled_by_id.get(item["request_id"], {}))
-    ]
-    if drift:
-        raise ValueError(
-            "retired generation reconcile plan changed between cancelling remote "
-            "commands and revoking, nothing was revoked: " + " | ".join(drift)
-        )
-    unsettled = [
-        f"{item['request_id']}: " + "; ".join(item["reasons"])
-        for item in settled["items"]
-        if not item["eligible"] and not item["already_revoked"]
-    ]
-    if unsettled:
-        raise ValueError(
-            "retired generation reconcile stopped after cancelling remote "
-            "commands, records are not settled yet: " + " | ".join(unsettled)
-        )
-    applied: list[str] = []
-    failures: dict[str, str] = {}
-    warnings: list[str] = []
-    approval: dict[str, Any] = {"plan_sha256": expected_plan_sha256}
-    if admin_plan_sha256:
-        approval["admin_plan_sha256"] = admin_plan_sha256
-    for item in plan["items"]:
-        if item["already_revoked"]:
-            continue
-        try:
-            request_id, warning = _revoke_planned_item(
-                store,
-                item,
-                reference=reference,
-                applied_at=applied_at,
-                waiting_ttl=waiting_ttl,
-                actor=actor,
-                approval=approval,
-            )
-        except Exception as exc:  # noqa: BLE001 -- per-item isolation, reported
-            # The rows already revoked above are committed; the operator has to
-            # see them in the result, not lose them to a traceback (P1-60F).
-            failures[str(item["request_id"])] = f"{type(exc).__name__}: {exc}"
-            continue
-        applied.append(request_id)
-        if warning is not None:
-            warnings.append(warning)
-    return {
-        "schema_version": 1,
-        "mode": "retired-generation-apply",
-        "plan_sha256": expected_plan_sha256,
-        "settled_plan_sha256": settled["plan_sha256"],
-        "reference": reference,
-        "actor": actor,
-        "applied_at": applied_at.isoformat(),
-        "applied_workflow_ids": sorted(applied),
-        "already_revoked_workflow_ids": sorted(
-            str(item["request_id"]) for item in skipped
-        ),
-        "failed_workflow_ids": sorted(failures),
-        "failures": dict(sorted(failures.items())),
-        "restart_reservation_warnings": sorted(warnings),
-        "cancelled_remote_commands": {
-            request_id: {
-                "cancelled": int(counts.get("cancelled", 0)),
-                "cancellation_requested": int(counts.get("cancellation_requested", 0)),
-            }
-            for request_id, counts in sorted(cancelled.items())
-        },
-        "archive_eligible_incident_ids": sorted(
-            {
-                str(item["incident_id"])
-                for item in settled["items"]
-                if item.get("incident_id")
-            }
-        ),
-        "records_deleted": 0,
-    }
