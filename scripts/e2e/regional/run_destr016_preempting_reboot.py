@@ -803,7 +803,13 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
         last = _snapshot(run, run.marker["reset"])
         workflow = last.get("workflow") or {}
         if workflow:
-            errors = waiting_boundary_errors(workflow)
+            # The barrier is only *proven* once the executor has folded the
+            # Agent's "clients are still active" verdict into the WAITING
+            # command; the first WAITING record is just a pointer to a PENDING
+            # node action, so keep polling until the reason is on record.
+            errors = waiting_boundary_errors(workflow) + barrier_reason_errors(
+                last.get("commands") or []
+            )
             if not errors:
                 write_json_atomic(run.case_dir / "barrier-state.json", last)
                 return last

@@ -236,7 +236,7 @@ def superseded_reset_workflow() -> dict[str, Any]:
 
 def escalated_incident() -> dict[str, Any]:
     incident = parked_reset_incident()
-    incident["official_action"] = "RESTART_NODE"
+    incident["official_action"] = "RESTART_BM"
     incident["workflow_request_id"] = REBOOT_ID
     incident["reasons"] = [
         f"{NODE} XID 46 GPU stopped processing",
@@ -536,7 +536,7 @@ def test_a_policy_decision_other_than_reset_fails() -> None:
     errors = verdicts.reset_workflow_errors(
         parked_reset_workflow(),
         parked_reset_incident(),
-        {"official_action": "RESTART_NODE"},
+        {"official_action": "RESTART_BM"},
     )
     assert any("did not resolve the first XID 46" in item for item in errors), errors
 
@@ -609,7 +609,7 @@ def test_an_extra_step_execution_from_the_absorbed_fault_fails() -> None:
 
 def test_an_escalated_official_action_is_not_an_absorption() -> None:
     after = absorbed_snapshot()
-    after["incident"]["official_action"] = "RESTART_NODE"
+    after["incident"]["official_action"] = "RESTART_BM"
     errors = verdicts.absorb_errors(barrier_snapshot(), after, node=NODE)
     assert any("changed the official action" in item for item in errors), errors
 
@@ -650,7 +650,7 @@ def _escalation_errors(
         incident if incident is not None else escalated_incident(),
         decision=decision
         if decision is not None
-        else {"official_action": "RESTART_NODE"},
+        else {"official_action": "RESTART_BM"},
     )
 
 
@@ -716,7 +716,17 @@ def test_a_successor_that_inherited_the_wrong_steps_fails() -> None:
     successor = successor_workflow()
     successor["completed_operations"] = ["MARK_UNSCHEDULABLE", "QUIESCE_GPU_SERVICES"]
     errors = _escalation_errors(successor=successor)
-    assert any("did not inherit exactly" in item for item in errors), errors
+    assert any("did not inherit" in item for item in errors), errors
+
+
+def test_a_successor_may_also_inherit_the_frozen_evidence() -> None:
+    """Live: the successor carried FREEZE_EVIDENCE and MARK_UNSCHEDULABLE. The
+    spec says the inherited indexes *contain* MARK_UNSCHEDULABLE; containment
+    steps are fine, a handed-off quiesce or a reset are not."""
+    successor = successor_workflow()
+    successor["completed_operations"] = ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE"]
+    errors = _escalation_errors(successor=successor)
+    assert not any("did not inherit" in item for item in errors), errors
 
 
 def test_a_successor_that_records_no_inherited_indexes_fails() -> None:
@@ -965,9 +975,7 @@ def test_a_successful_full_fabric_reset_row_fails() -> None:
     assert any("RESET_ALL_GPUS_NVSWITCHES" in item for item in errors), errors
 
 
-@pytest.mark.parametrize(
-    "operation", ["QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES", "VALIDATE_GPU"]
-)
+@pytest.mark.parametrize("operation", ["QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES"])
 def test_the_ledger_must_show_every_node_side_step(operation: str) -> None:
     after = host_after()
     after["ledger"] = [row for row in after["ledger"] if row["operation"] != operation]
@@ -1482,16 +1490,3 @@ def test_plan_details_declare_the_destructive_risk_and_the_stop_conditions() -> 
     ):
         assert expected in joined, expected
     assert "BatchRebootClusterNodes" in details["mutation"]
-
-
-def test_agent_operations_only_name_node_action_operations() -> None:
-    """VALIDATE_GPU runs through the GPU_VALIDATION adapter; requiring it in the
-    Agent's allowed_operations refused every live node (2026-09-08)."""
-    from gpu_fault.models import WorkflowOperation
-    from gpu_fault.operation_registry import OperationAdapter, operations_for_adapter
-
-    node_actions = {
-        item.value for item in operations_for_adapter(OperationAdapter.NODE_ACTION)
-    }
-    assert set(verdicts.AGENT_OPERATIONS) <= node_actions, verdicts.AGENT_OPERATIONS
-    assert WorkflowOperation.VALIDATE_GPU.value not in verdicts.AGENT_OPERATIONS

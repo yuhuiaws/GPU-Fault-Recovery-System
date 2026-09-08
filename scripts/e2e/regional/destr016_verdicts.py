@@ -83,6 +83,13 @@ AGENT_OPERATIONS = (
 VALIDATION_OPERATION = "VALIDATE_GPU"
 RESET_ACTION = "RESET_GPU"
 REBOOT_ACTION = "RESTART_NODE"
+# The policy and the incident speak in RecoveryAction terms: XID 79 resolves to
+# RESTART_BM, which the planner realises as the RESTART_NODE operation.
+REBOOT_RECOVERY_ACTION = "RESTART_BM"
+# Containment the successor may carry over as already done. MARK_UNSCHEDULABLE
+# is required (the cordon is inherited, not redone); FREEZE_EVIDENCE is fine;
+# anything else -- a quiesce, a reset -- would mean the handoff was skipped.
+ALLOWED_INHERITED_OPERATIONS = ("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE")
 FIRST_XID = 46
 ESCALATION_XID = 79
 CANCELLED_STATUS_SOURCE = "workflow-preempted"
@@ -256,6 +263,7 @@ def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
         item
         for item in commands
         if (item.get("step") or {}).get("operation") == BARRIER_OPERATION
+        or item.get("operation") == BARRIER_OPERATION
     ]
     if len(barrier) != 1:
         return [f"there is not exactly one barrier remote command: {len(barrier)}"]
@@ -375,9 +383,12 @@ def escalation_errors(
     """The preemption itself: one incident, two workflows, one direction."""
 
     errors: list[str] = []
-    if decision.get("official_action", decision.get("action")) != REBOOT_ACTION:
+    if decision.get("official_action", decision.get("action")) not in {
+        REBOOT_RECOVERY_ACTION,
+        REBOOT_ACTION,
+    }:
         errors.append(
-            "policy did not resolve XID 79 to RESTART_NODE: "
+            f"policy did not resolve XID 79 to {REBOOT_RECOVERY_ACTION}: "
             f"{decision.get('official_action', decision.get('action'))}"
         )
     predecessor_id = str(predecessor.get("request_id") or "")
@@ -407,9 +418,10 @@ def escalation_errors(
             "the incident still points at the superseded workflow: "
             f"{incident.get('workflow_request_id')}"
         )
-    if incident.get("official_action") != REBOOT_ACTION:
+    if incident.get("official_action") not in {REBOOT_RECOVERY_ACTION, REBOOT_ACTION}:
         errors.append(
-            f"the incident action is not RESTART_NODE: {incident.get('official_action')}"
+            f"the incident action is not {REBOOT_RECOVERY_ACTION}: "
+            f"{incident.get('official_action')}"
         )
     reason = str(successor.get("preemption_reason") or "")
     if PREEMPTION_REASON_SUBSTRING not in reason:
@@ -417,9 +429,12 @@ def escalation_errors(
             f"the successor does not record {PREEMPTION_REASON_SUBSTRING!r}: {reason!r}"
         )
     inherited = sorted(successor.get("completed_operations") or [])
-    if inherited != sorted(INHERITED_OPERATIONS):
+    if not set(INHERITED_OPERATIONS) <= set(inherited) or not set(inherited) <= set(
+        ALLOWED_INHERITED_OPERATIONS
+    ):
         errors.append(
-            f"the successor did not inherit exactly {list(INHERITED_OPERATIONS)}: {inherited}"
+            f"the successor did not inherit {list(INHERITED_OPERATIONS)} (and only "
+            f"containment from {list(ALLOWED_INHERITED_OPERATIONS)}): {inherited}"
         )
     if not successor.get("inherited_step_indexes"):
         errors.append("the successor records no inherited step indexes")
@@ -665,7 +680,9 @@ def host_errors(
                 f"the Node Agent ledger shows a successful {operation}: "
                 f"{[row.get('command_id') for row in succeeded]}"
             )
-    for operation in ("QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES", "VALIDATE_GPU"):
+    # VALIDATE_GPU runs through the GPU_VALIDATION adapter, not the Node Agent,
+    # so it never appears in the ledger; its success is a workflow step check.
+    for operation in ("QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES"):
         succeeded = [
             row
             for row in added
