@@ -793,6 +793,12 @@ wait_for_rollout() {
 }
 
 wait_for_spool_drain() {
+    # E-1: this runs after ingress has already rolled to spool=false, and an
+    # ingress with spool admission off reports depth/leased as 0 whatever the
+    # table holds -- the old gate passed on its first poll and the spool tier
+    # was scaled away with rows still queued. Read the tier whose spool is
+    # still enabled (the spool-worker), and when none of its Pods is Running
+    # count the table directly from a control-worker Pod.
     local timeout="${GPU_FAULT_TELEMETRY_SPOOL_DRAIN_TIMEOUT_SECONDS:-300}"
     local deadline
     local pod
@@ -807,29 +813,50 @@ wait_for_spool_drain() {
     while ((SECONDS < deadline)); do
         pod="$(
             kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
-                -l app=gpu-fault-api-ha \
+                -l app=gpu-fault-telemetry-spool-worker \
                 --field-selector=status.phase=Running \
-                -o jsonpath='{.items[0].metadata.name}'
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
         )"
-        [[ -n "${pod}" ]] || {
-            echo "cannot inspect telemetry spool drain without a Running ingress Pod" >&2
-            return 1
-        }
-        metrics="$(
-            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
-                /opt/gpu-fault/control-plane/bin/python -c \
-                'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
-        )"
-        depth="$(
-            awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
-                <<<"${metrics}" |
-                tail -n 1
-        )"
-        leased="$(
-            awk '$1=="gpu_fault_telemetry_spool_leased"{print int($2)}' \
-                <<<"${metrics}" |
-                tail -n 1
-        )"
+        if [[ -n "${pod}" ]]; then
+            metrics="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
+                    /opt/gpu-fault/control-plane/bin/python -c \
+                    'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
+            )"
+            depth="$(
+                awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
+                    <<<"${metrics}" |
+                    tail -n 1
+            )"
+            leased="$(
+                awk '$1=="gpu_fault_telemetry_spool_leased"{print int($2)}' \
+                    <<<"${metrics}" |
+                    tail -n 1
+            )"
+        else
+            # No consumer Pod to ask: count the rows themselves. A leased row
+            # is still a row, so a zero here covers depth and leased at once.
+            pod="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
+                    -l app=gpu-fault-control-worker \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath='{.items[0].metadata.name}'
+            )"
+            [[ -n "${pod}" ]] || {
+                echo "cannot inspect telemetry spool drain without a Running spool-worker or control-worker Pod" >&2
+                return 1
+            }
+            depth="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
+                    /opt/gpu-fault/control-plane/bin/python -c \
+                    'import os, pathlib, psycopg
+dsn_file = os.environ.get("GPU_FAULT_STORE_URL_FILE", "")
+dsn = pathlib.Path(dsn_file).read_text().strip() if dsn_file and os.path.exists(dsn_file) else os.environ["GPU_FAULT_STORE_URL"]
+with psycopg.connect(dsn, connect_timeout=10) as connection:
+    print(connection.execute("SELECT count(*) FROM gpu_fault_telemetry_spool").fetchone()[0])'
+            )"
+            leased="0"
+        fi
         if [[ "${depth:-}" == "0" && "${leased:-}" == "0" ]]; then
             return 0
         fi

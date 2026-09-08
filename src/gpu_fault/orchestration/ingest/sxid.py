@@ -6,7 +6,6 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from gpu_fault.models import (
-    bounded_reasons,
     BlockedKind,
     FaultIncident,
     IncidentState,
@@ -14,18 +13,20 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkloadState,
+    bounded_reasons,
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher
+from gpu_fault.orchestration.disposition import MERGING_DISPOSITIONS, Disposition
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
+from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
     SxidEvent,
 )
 from gpu_fault.store.shared.errors import NotFoundError
-from gpu_fault.orchestration.disposition import MERGING_DISPOSITIONS
 
 
 @dataclass(frozen=True)
@@ -316,9 +317,8 @@ class SxidIngestionService:
         has_existing = existing_incident is not None and existing_workflow is not None
         mutable = bool(
             has_existing
-            and existing_workflow.status is WorkflowStatus.PENDING
-            and existing_workflow.execution_owner_id is None
-            and not existing_workflow.completed_step_indexes
+            and existing_workflow is not None
+            and workflow_is_mutable(existing_workflow)
         )
         candidate = self.callbacks.candidate_recovery_workflow(
             context.event, context.decision
@@ -346,6 +346,12 @@ class SxidIngestionService:
             if has_existing
             else None
         )
+        if disposition == Disposition.REPLACE_IN_PLACE:
+            # ``disposition`` says so for a mutable row, and (C-03) for a
+            # BLOCKED(NEEDS_OPERATOR) row that never ran a step. In this
+            # family "mutable" is what selects the in-place rewrite -- same
+            # ``request_id``, ``fencing_token + 1`` -- in ``_scope``/``_emit``.
+            mutable = True
         return _SxidBuildState(
             now=now,
             existing_incident=existing_incident,

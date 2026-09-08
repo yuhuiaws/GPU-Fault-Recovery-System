@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from copy import deepcopy
 from typing import Any, Callable, Protocol
 
+from gpu_fault.adapters.common import (
+    ANNOTATION_APPROVE_GPU_COUNT_CHANGE,
+    ANNOTATION_RESTART_BUDGET,
+    ANNOTATION_RESTART_COUNT,
+    ANNOTATION_TARGET_GPU_COUNT,
+    LABEL_ATTEMPT_ID,
+    LABEL_JOB_ID,
+)
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -14,16 +22,6 @@ from gpu_fault.models import (
     WorkflowEventCode,
     WorkflowOperation,
     WorkflowStepStatus,
-)
-
-
-from gpu_fault.adapters.common import (
-    ANNOTATION_APPROVE_GPU_COUNT_CHANGE,
-    ANNOTATION_RESTART_BUDGET,
-    ANNOTATION_RESTART_COUNT,
-    ANNOTATION_TARGET_GPU_COUNT,
-    LABEL_ATTEMPT_ID,
-    LABEL_JOB_ID,
 )
 
 

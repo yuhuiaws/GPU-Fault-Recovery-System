@@ -1,9 +1,9 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
     GPU_MECHANICAL_EMAIL_TEMPLATE,
     GPU_MECHANICAL_TEMPLATE_VERSION,
     NVLINK74_MECHANICAL_EMAIL_TEMPLATE,
     NVLINK74_MECHANICAL_TEMPLATE_VERSION,
+    AdvisoryNotification,
 )
 
 

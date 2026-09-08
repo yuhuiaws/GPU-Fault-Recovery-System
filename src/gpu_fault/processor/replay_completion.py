@@ -1,15 +1,91 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timedelta, timezone
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from gpu_fault.processor.rejected_events import record_replay_completion
 
-
 LOGGER = logging.getLogger(__name__)
+
+
+def retryable_status(status: int) -> bool:
+    """A handler answer the queue retries rather than commits."""
+
+    return status in {408, 425, 429} or status >= 500
+
+
+def retry_disposition(coordinator: Any, item: Any, *, status: int) -> str | None:
+    """How a retryable handler response is booked for this row.
+
+    ``"retry"`` while the row is inside its retry horizon; ``"horizon"``
+    once it is past it (counted in ``retry_horizon_failures_total`` and
+    logged here, the caller commits the response as the row's final
+    answer); ``None`` for a response that is not retryable at all. Shared
+    by the single-request replay and the batch paths so a 500 on one item
+    of a telemetry batch is booked exactly like a 500 on a replayed request
+    (B-4).
+    """
+
+    if not retryable_status(status):
+        return None
+    response_age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - item.created_at).total_seconds(),
+    )
+    # An observation's horizon is its own stale limit, not the generic
+    # retry age (F-D3): while it retries it holds correlated faults back.
+    retry_horizon_seconds = coordinator._retry_horizon_seconds(item)
+    if response_age_seconds <= retry_horizon_seconds:
+        return "retry"
+    # Retryable, but past the horizon: the response is committed as the
+    # row's final answer. Booked like the release path's horizon failures
+    # so the two exits of the same bound share a count.
+    with coordinator._state_lock:
+        coordinator._retry_horizon_failures_total += 1
+    LOGGER.error(
+        "processor replay returned a retryable response past the retry "
+        "horizon; completing as failed request_id=%s path=%s status=%s "
+        "age_seconds=%.3f horizon_seconds=%.3f",
+        item.request_id,
+        item.path,
+        status,
+        response_age_seconds,
+        retry_horizon_seconds,
+    )
+    return "horizon"
+
+
+def reschedule_retryable_response(coordinator: Any, item: Any, *, status: int) -> None:
+    """Release the row as a booked retry with an exponential backoff (F-D4)."""
+
+    retry_count = item.retry_count + 1
+    delay_seconds = min(
+        coordinator.retry_backoff_max_seconds,
+        coordinator.retry_backoff_seconds * (2 ** min(item.retry_count, 16)),
+    )
+    not_before = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+    LOGGER.warning(
+        "processor replay returned a retryable response; "
+        "rescheduling request request_id=%s path=%s status=%s "
+        "age_seconds=%.3f retry_count=%s not_before=%s "
+        "retry_max_age_seconds=%.3f",
+        item.request_id,
+        item.path,
+        status,
+        max(0.0, (datetime.now(timezone.utc) - item.created_at).total_seconds()),
+        retry_count,
+        not_before.isoformat(),
+        coordinator._retry_horizon_seconds(item),
+    )
+    coordinator._release(
+        item,
+        not_before=not_before,
+        retry_count=retry_count,
+    )
+    coordinator._observe_retry_schedule(item.path, delay_seconds)
 
 
 def finalize_replay_response(
@@ -32,59 +108,10 @@ def finalize_replay_response(
         coordinator._release(item, failure="lane lease changed")
         coordinator._observe_processing(outcome, time.monotonic() - started)
         return
-    response_age_seconds = max(
-        0.0,
-        (datetime.now(timezone.utc) - item.created_at).total_seconds(),
-    )
-    # An observation's horizon is its own stale limit, not the generic
-    # retry age (F-D3): while it retries it holds correlated faults back.
-    retry_horizon_seconds = coordinator._retry_horizon_seconds(item)
-    if (status in {408, 425, 429} or status >= 500) and (
-        response_age_seconds <= retry_horizon_seconds
-    ):
-        retry_count = item.retry_count + 1
-        delay_seconds = min(
-            coordinator.retry_backoff_max_seconds,
-            coordinator.retry_backoff_seconds * (2 ** min(item.retry_count, 16)),
-        )
-        not_before = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
-        LOGGER.warning(
-            "processor replay returned a retryable response; "
-            "rescheduling request request_id=%s path=%s status=%s "
-            "age_seconds=%.3f retry_count=%s not_before=%s "
-            "retry_max_age_seconds=%.3f",
-            item.request_id,
-            item.path,
-            status,
-            response_age_seconds,
-            retry_count,
-            not_before.isoformat(),
-            retry_horizon_seconds,
-        )
-        coordinator._release(
-            item,
-            not_before=not_before,
-            retry_count=retry_count,
-        )
-        coordinator._observe_retry_schedule(item.path, delay_seconds)
+    if retry_disposition(coordinator, item, status=status) == "retry":
+        reschedule_retryable_response(coordinator, item, status=status)
         coordinator._observe_processing(outcome, time.monotonic() - started)
         return
-    if status in {408, 425, 429} or status >= 500:
-        # Retryable, but past the horizon: the response below is committed
-        # as the row's final answer. Booked like the release path's
-        # horizon failures so the two exits of the same bound share a count.
-        with coordinator._state_lock:
-            coordinator._retry_horizon_failures_total += 1
-        LOGGER.error(
-            "processor replay returned a retryable response past the retry "
-            "horizon; completing as failed request_id=%s path=%s status=%s "
-            "age_seconds=%.3f horizon_seconds=%.3f",
-            item.request_id,
-            item.path,
-            status,
-            response_age_seconds,
-            retry_horizon_seconds,
-        )
 
     coordinator._set_request_phase(item.request_id, "completion")
     try:

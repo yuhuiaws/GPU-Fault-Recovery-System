@@ -65,6 +65,17 @@ PROCESSOR_POOL_ENV = (
 SENSITIVE_ENV = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DEFAULT_ADMIN_CONFIG = default_admin_config()
 
+# Four uvicorn processes per Pod on the ingress and control-worker tiers
+# (the telemetry spool runs one). ADOT scrapes a Pod, not a process, so
+# the application aggregates /metrics over the Pod's live processes
+# through a shared /dev/shm directory (``gpu_fault.app.process_metrics``,
+# strategies in ``gpu_fault.app.metric_aggregation``); a scrape answered
+# by any process reads the whole Pod. The consumer-process invariant is
+# ``replicas x UVICORN_WORKERS_PER_POD`` and the verifier fails the deploy
+# if a tier's command says otherwise.
+UVICORN_WORKERS_PER_POD = 4
+SPOOL_UVICORN_WORKERS_PER_POD = 1
+
 
 def config_domain(name: str) -> str:
     domains = (
@@ -278,13 +289,21 @@ def configure_processor_retry(container: dict) -> None:
 def configure_worker_queue_coordination(
     worker: dict,
     *,
-    notification_shards: int,
+    consumer_processes: int,
 ) -> None:
+    # Both the process count and the shard count are replicas x uvicorn
+    # workers per Pod; the runtime refuses a shard count below the process
+    # count (a consumer without a shard never hears a notification).
     set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS", "5")
     set_env(
         worker,
+        "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES",
+        str(consumer_processes),
+    )
+    set_env(
+        worker,
         "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS",
-        str(notification_shards),
+        str(consumer_processes),
     )
     set_env(worker, "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", "1")
     set_env(worker, "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS", "30")
@@ -920,7 +939,7 @@ def main() -> None:
     replace_uvicorn_args(
         ingress,
         port=8080,
-        workers=4,
+        workers=UVICORN_WORKERS_PER_POD,
         backlog=8192,
         ingress=True,
     )
@@ -1033,7 +1052,9 @@ def main() -> None:
     )
     configure_worker_queue_coordination(
         worker,
-        notification_shards=(admin_config.capacity.control_worker_replicas * 4),
+        consumer_processes=(
+            admin_config.capacity.control_worker_replicas * UVICORN_WORKERS_PER_POD
+        ),
     )
     set_env(
         worker,
@@ -1077,7 +1098,7 @@ def main() -> None:
     replace_uvicorn_args(
         worker,
         port=8081,
-        workers=4,
+        workers=UVICORN_WORKERS_PER_POD,
         backlog=1024,
         ingress=False,
     )
@@ -1249,7 +1270,7 @@ def main() -> None:
     replace_uvicorn_args(
         spool_worker,
         port=8082,
-        workers=1,
+        workers=SPOOL_UVICORN_WORKERS_PER_POD,
         backlog=1024,
         ingress=False,
     )

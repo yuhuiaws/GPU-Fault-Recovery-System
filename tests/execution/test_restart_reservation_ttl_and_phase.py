@@ -205,6 +205,9 @@ def test_the_waiting_cap_on_a_restart_frees_the_budget_end_to_end() -> None:
         execution_deadline=now + timedelta(minutes=10),
     )
     store.save_workflow(workflow)
+    # A WAITING restart record means its adapter already reserved (D-10: the
+    # claim no longer re-reserves an attempted restart).
+    _reserve(store, workflow)
     adapter = _KeyRecordingAdapter(
         WorkflowStepOutcome.waiting(
             operation_id="approval", details={"approval_required": True}

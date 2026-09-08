@@ -10,8 +10,8 @@ from threading import RLock
 from typing import Any, Sequence
 
 from gpu_fault.env import env_bool
+from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    bounded_reasons,
     BlockedKind,
     Environment,
     FaultIncident,
@@ -23,6 +23,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
     WorkloadState,
+    bounded_reasons,
     resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
@@ -30,24 +31,15 @@ from gpu_fault.operation_registry import (
     NODE_ACTION_SCOPE_OPERATIONS,
     NODE_EXCLUSIVE_OPERATIONS,
     NODE_WIDE_RECOVERY_OPERATIONS,
-    OPERATION_CAPABILITY as REGISTERED_OPERATION_CAPABILITY,
     RECOVERY_OPERATION_DOMINANCE,
     RECOVERY_OPERATION_RANK,
     TRANSIENT_GPU_INVENTORY_OPERATIONS,
     WORKLOAD_SCOPED_OPERATIONS,
     ZERO_RANK_ACTION_OPERATIONS,
 )
-from gpu_fault.policy import (
-    ActionDisposition,
-    DistributedXidBatch,
-    FaultPolicyDecision,
-    SxidEvent,
-    XidEvent,
+from gpu_fault.operation_registry import (
+    OPERATION_CAPABILITY as REGISTERED_OPERATION_CAPABILITY,
 )
-from gpu_fault.store import NotFoundError
-from gpu_fault.store.contracts import ControlPlaneStore
-from gpu_fault.host_health import NodeHealthFinding
-from gpu_fault.watcher import AttemptObservation
 from gpu_fault.orchestration import (
     DagBrancher,
     HardwareEscalationService,
@@ -75,10 +67,21 @@ from gpu_fault.orchestration.families import (
     ResetOperationService,
     ValidationOperationService,
 )
+from gpu_fault.orchestration.families.identity import note_stale_event_link
 from gpu_fault.orchestration.placement_hold import PlacementHoldService
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
+from gpu_fault.policy import (
+    ActionDisposition,
+    DistributedXidBatch,
+    FaultPolicyDecision,
+    SxidEvent,
+    XidEvent,
+)
+from gpu_fault.store import NotFoundError
+from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.watcher import AttemptObservation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -316,17 +319,21 @@ class IncidentOrchestrator:
     def _drain_operations(self) -> DrainOperationService:
         callbacks = DrainOperationCallbacks(
             active_node_exclusive_workflow=(self._active_node_exclusive_workflow),
+            aggregation_deadlines=self._aggregation_deadlines,
             attempt_group_key=self._attempt_group_key,
             merge_disposition=self._merge_disposition,
             node_group_key=self._node_group_key,
             ingest_node_health=self.ingest_node_health,
             incident_state_for_workflow=(self._incident_state_for_workflow),
+            preempt_parallel_job_branch=(self._preempt_parallel_job_branch),
             prepare_preempting_successor=(self._prepare_preempting_successor),
         )
         return DrainOperationService(
             self.store,
+            self._arbiter,
             self._brancher,
             callbacks,
+            workflow_preemption_enabled=(self.workflow_preemption_enabled),
         )
 
     @cached_property
@@ -676,22 +683,27 @@ class IncidentOrchestrator:
         with self._lock:
             existing = self.store.get_incident_by_event(event.event_id)
             if existing is not None:
-                workflow = (
-                    self.store.get_workflow(existing.workflow_request_id)
-                    if existing.workflow_request_id
-                    else None
-                )
-                return existing, workflow
+                linked = self._linked_workflow(existing, event.event_id)
+                if linked is not None:
+                    return existing, linked[0]
+                # C-04: the link says handled but its workflow is gone; the
+                # build path below rebuilds and re-links (the store's own
+                # duplicate check treats the link as dirty the same way).
             try:
                 correlated = self.store.get_incident(decision.marker.incident_id)
             except NotFoundError:
                 correlated = None
+            linked = None
             if correlated is not None:
-                workflow = (
-                    self.store.get_workflow(correlated.workflow_request_id)
-                    if correlated.workflow_request_id
-                    else None
-                )
+                linked = self._linked_workflow(correlated, event.event_id)
+                if linked is None:
+                    # C-04: the correlation target's own workflow is gone.
+                    # Returning it would hand back a pair with no workflow
+                    # for an event that needs one; the build path below
+                    # rebuilds under the same incident id instead.
+                    correlated = None
+            if correlated is not None and linked is not None:
+                workflow = linked[0]
                 observation = self._attempt_observation(event)
                 previous_generation = (
                     workflow is not None
@@ -730,10 +742,10 @@ class IncidentOrchestrator:
                         # ``WorkflowFencingError`` this handler already
                         # raises, and ingest retries the whole event with a
                         # fresh read of the correlated incident.
-                        self.store.save_incident(correlated, expected=read_correlated)
-                        self.store.link_event_to_incident(
-                            event.event_id,
-                            correlated.incident_id,
+                        self.store.save_incident(
+                            correlated,
+                            expected=read_correlated,
+                            extra_event_ids=[event.event_id],
                         )
                         return correlated, workflow
                 else:
@@ -898,9 +910,32 @@ class IncidentOrchestrator:
         incident = self._independent_incident(
             event, decision, extra_reasons=[reason]
         ).model_copy(update={"state": IncidentState.RECOVERED})
+        # ``incident.event_id`` is this event's id and ``save_incident`` links
+        # it inside the same transaction on all three backends; the separate
+        # ``link_event_to_incident`` was a second autocommit for nothing, and a
+        # crash between the two left the fenced incident unlinked (C-09).
         self.store.save_incident(incident)
-        self.store.link_event_to_incident(event.event_id, incident.incident_id)
         return incident
+
+    def _linked_workflow(
+        self, incident: FaultIncident, event_id: str
+    ) -> tuple[WorkflowRequest | None] | None:
+        """The workflow an event's incident points at, wrapped, or None when
+        the pointer dangles (C-04). ``(None,)`` is an incident that has no
+        workflow on purpose (fenced, NO_ACTION)."""
+
+        if not incident.workflow_request_id:
+            return (None,)
+        try:
+            return (self.store.get_workflow(incident.workflow_request_id),)
+        except NotFoundError:
+            note_stale_event_link(
+                self.store,
+                event_id=event_id,
+                incident_id=incident.incident_id,
+                pointer=incident.workflow_request_id,
+            )
+            return None
 
     @staticmethod
     def _sample_hung_triage_nodes(

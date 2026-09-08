@@ -4,7 +4,6 @@ from typing import Any
 
 from gpu_fault_release.regional_release_config import ReleaseError
 
-
 AGENT_IDENTITY_FIELDS = (
     "agent_protocol_version",
     "agent_version",

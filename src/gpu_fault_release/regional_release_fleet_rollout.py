@@ -9,6 +9,15 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 
+# One definition of "failure domain" for the whole system: the remediation
+# budget's per-domain tier reads the same label priority through the same
+# function, so a rollout wave and a repair cap cannot disagree about which
+# nodes share a fate.
+from gpu_fault.failure_domains import (
+    FAILURE_DOMAIN_LABELS,
+    UNKNOWN_FAILURE_DOMAIN,
+    node_failure_domain,
+)
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_agent_convergence import (
     agent_heartbeats_converged as agent_heartbeats_converged,
@@ -32,16 +41,6 @@ from gpu_fault_release.regional_release_runtime_identity import (
     exec_cpu_ingress_probe,
 )
 from gpu_fault_release.regional_release_timing import record_rollback_wave_event
-
-# One definition of "failure domain" for the whole system: the remediation
-# budget's per-domain tier reads the same label priority through the same
-# function, so a rollout wave and a repair cap cannot disagree about which
-# nodes share a fate.
-from gpu_fault.failure_domains import (
-    FAILURE_DOMAIN_LABELS,
-    UNKNOWN_FAILURE_DOMAIN,
-    node_failure_domain,
-)
 
 ROOT = Path(__file__).resolve().parents[2]
 CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS = 75.0

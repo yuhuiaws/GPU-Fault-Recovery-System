@@ -32,7 +32,7 @@ CLUSTER_VARIABLE_QUERY = (
     "label_values(gpu_fault_processor_cluster_queue_depth, cluster_id)"
 )
 CLUSTER_SELECTOR = 'cluster_id=~"$cluster_id"'
-SEVERITY_COLOR = {"critical": "red", "warning": "orange"}
+SEVERITY_COLOR = {"critical": "red", "warning": "orange", "info": "blue"}
 # The test's own reading of a rule, kept independent of the generator's parser
 # so a bug there cannot be mirrored here.
 RULE_METRIC = re.compile(r"\b(?:gpu_fault|otelcol)_[a-z0-9_]+|\bup(?=\{)")

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 import secrets
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
     StoreIoCapacityExceeded,

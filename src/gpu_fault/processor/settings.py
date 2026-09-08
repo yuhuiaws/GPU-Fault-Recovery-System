@@ -392,9 +392,51 @@ class ProcessorSpoolSettings:
                 "telemetry spool replay batch byte limit must be "
                 "positive and not exceed the in-flight byte limit"
             )
+        # Every replay slot must be able to hold a full batch at once. With
+        # ``workers x batch_max > max_in_flight`` the last free slot's byte
+        # budget is smaller than the head row, and the claim -- which always
+        # takes the head row -- is abandoned and retaken in a loop (E-6 /
+        # F-D8). Production runs 8 x 8 MiB = 64 MiB exactly; only checked
+        # when the spool is on, because the worker role derives 12 workers
+        # from its processor budget and never starts the consumer.
+        if (
+            self.telemetry_spool_enabled
+            and self.telemetry_spool_workers
+            * self.telemetry_spool_replay_batch_max_bytes
+            > self.telemetry_spool_max_in_flight_bytes
+        ):
+            raise ValueError(
+                "telemetry spool workers x replay batch byte limit "
+                f"({self.telemetry_spool_workers} x "
+                f"{self.telemetry_spool_replay_batch_max_bytes}) must fit "
+                "within the in-flight byte limit "
+                f"({self.telemetry_spool_max_in_flight_bytes})"
+            )
 
     @classmethod
     def from_environment(cls, *, default_pool: int) -> ProcessorSpoolSettings:
+        max_in_flight_bytes = int(
+            os.getenv(
+                "GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES",
+                str(64 * 1024 * 1024),
+            )
+        )
+        replay_batch_max_bytes = int(
+            os.getenv(
+                "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES",
+                str(8 * 1024 * 1024),
+            )
+        )
+        # The derived worker count must respect the in-flight budget (E-6):
+        # a worker role derives 12 from its processor budget while shipping
+        # the spool-worker's 64 MiB / 8 MiB limits, and must not fail to
+        # start for a consumer it never runs.
+        default_workers = max(
+            1,
+            min(
+                default_pool * 2, max_in_flight_bytes // max(1, replay_batch_max_bytes)
+            ),
+        )
         return cls(
             telemetry_spool_enabled=os.getenv("GPU_FAULT_TELEMETRY_SPOOL", "0")
             .strip()
@@ -403,7 +445,7 @@ class ProcessorSpoolSettings:
             telemetry_spool_workers=int(
                 os.getenv(
                     "GPU_FAULT_TELEMETRY_SPOOL_WORKERS",
-                    str(default_pool * 2),
+                    str(default_workers),
                 )
             ),
             telemetry_spool_lease_seconds=float(
@@ -433,22 +475,12 @@ class ProcessorSpoolSettings:
                     "0.5",
                 )
             ),
-            telemetry_spool_max_in_flight_bytes=int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES",
-                    str(64 * 1024 * 1024),
-                )
-            ),
+            telemetry_spool_max_in_flight_bytes=max_in_flight_bytes,
             telemetry_spool_replay_batch_max_items=int(
                 os.getenv(
                     "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS",
                     "64",
                 )
             ),
-            telemetry_spool_replay_batch_max_bytes=int(
-                os.getenv(
-                    "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES",
-                    str(8 * 1024 * 1024),
-                )
-            ),
+            telemetry_spool_replay_batch_max_bytes=replay_batch_max_bytes,
         )

@@ -341,8 +341,9 @@ class _ExplodingExecutor:
 
 
 def test_dispatch_internal_errors_carry_a_last_seen_stamp_for_sampled_pods() -> None:
-    """control-worker runs four processes and a scrape samples one, so the
-    counter interleaves; the stamp is what an alert can max() across them."""
+    """control-worker runs four processes; /metrics sums the counter over the
+    Pod, but a process restart still resets it, so the stamp is what an alert
+    can max() across Pods without reading a reset as an event."""
     store = build_store()
     created_at = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
     store.save_incident_and_workflow(

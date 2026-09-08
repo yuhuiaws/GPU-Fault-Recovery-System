@@ -5,19 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from gpu_fault.execution import (
-    WorkflowStepContext,
-    WorkflowStepOutcome,
-)
-from gpu_fault.models import (
-    IncidentState,
-    WorkflowOperation,
-    WorkflowRequest,
-    WorkflowStatus,
-)
-from gpu_fault.store import NotFoundError
-
-
 from gpu_fault.adapters.common import (
     ANNOTATION_EFA_PLUGIN_RESTART_OPERATION,
     ANNOTATION_EFA_PLUGIN_RESTART_POD_UID,
@@ -29,8 +16,8 @@ from gpu_fault.adapters.common import (
     ANNOTATION_INCIDENT,
     ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
     ANNOTATION_PREVIOUS_UNSCHEDULABLE,
-    NodeIsolationRejected,
     QUARANTINE_TAINT,
+    NodeIsolationRejected,
     quarantine_taint_value,
 )
 from gpu_fault.adapters.kubernetes.primitives import (
@@ -38,6 +25,17 @@ from gpu_fault.adapters.kubernetes.primitives import (
     node_scheduling_snapshot,
     patch_node_with_retry,
 )
+from gpu_fault.execution import (
+    WorkflowStepContext,
+    WorkflowStepOutcome,
+)
+from gpu_fault.models import (
+    IncidentState,
+    WorkflowOperation,
+    WorkflowRequest,
+    WorkflowStatus,
+)
+from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
 

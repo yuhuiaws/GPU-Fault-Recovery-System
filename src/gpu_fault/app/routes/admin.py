@@ -114,6 +114,13 @@ async def livez(
         and not processor.spool_consumer_running
     ):
         dead_threads.append("telemetry-spool-consumer")
+    if (
+        dependencies.service_role in {"worker", "all"}
+        and processor is not None
+        and getattr(processor, "active_consumers", False)
+        and _processor_consumer_dead(processor)
+    ):
+        dead_threads.append("processor-consumer")
     payload = {
         "status": "alive" if not dead_threads else "dead",
         "service_role": (
@@ -124,6 +131,29 @@ async def livez(
     if dead_threads:
         return JSONResponse(status_code=503, content=payload)
     return payload
+
+
+def _processor_consumer_dead(processor: Any) -> bool:
+    """Whether the ``gpu-fault-processor-inbox`` loop has died or wedged (B-6).
+
+    The signal is the coordinator's ``processor_consumer_running`` flag and
+    the age of its last cycle. Before the first cycle the age is ``None``:
+    the thread has not started yet, and a probe that restarted the Pod for
+    that would never let it start, so that reads as alive. A coordinator
+    that predates the signal has neither attribute and is left alone.
+    """
+
+    running = getattr(processor, "processor_consumer_running", None)
+    age = getattr(processor, "consumer_last_cycle_age_seconds", None)
+    if running is None or age is None:
+        return False
+    if not running:
+        # It cycled once and is no longer running: the thread exited.
+        return True
+    # The loop's longest voluntary wait is the notification fallback (or the
+    # idle backoff); several multiples of it separate "idle" from "wedged".
+    fallback = float(getattr(processor, "processor_notification_fallback_seconds", 5.0))
+    return not processor.consumer_is_live(max_cycle_age_seconds=max(30.0, 6 * fallback))
 
 
 @router.get("/v1/version")

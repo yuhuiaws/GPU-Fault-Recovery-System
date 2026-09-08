@@ -14,9 +14,9 @@ from gpu_fault.models import (
 )
 from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
 from gpu_fault.policy import (
+    NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
     ActionDisposition,
     FaultPolicyDecision,
-    NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
     SxidClassification,
     SxidEvent,
     XidEvent,

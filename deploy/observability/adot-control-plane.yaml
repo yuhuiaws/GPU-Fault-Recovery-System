@@ -60,7 +60,13 @@ data:
           scrape_configs:
             - job_name: gpu-fault-control-plane
               scrape_interval: 15s
-              scrape_timeout: 5s
+              # 10s, not 5s: a render is bounded by the store pool timeout
+              # (10s) rather than by the store_io admission budget it no
+              # longer queues behind, and a 5s cutoff equal to that budget
+              # dropped the whole sample exactly when the process was
+              # saturated -- the moment GpuFaultStoreIoSaturated needed it
+              # (control-plane review 2026-09-08, H2-2).
+              scrape_timeout: 10s
               # /metrics is no longer anonymous: it names every cluster
               # and node and costs a query per cluster, so on the
               # internet-facing NLB it requires the operator token.
@@ -88,16 +94,17 @@ data:
                   regex: http
                 # The app label IS the tier. Keep it as an explicit
                 # label so a query can tell an ingress sample from a
-                # worker sample: gpu-fault-api-ha AND
-                # gpu-fault-control-worker both run uvicorn
-                # --workers 4 behind one port, so the process-local
-                # families (gpu_fault_store_io_*,
-                # gpu_fault_event_loop_lag_*,
-                # gpu_fault_processor_admission_rejections_*) are a
-                # sample of ONE of four processes per scrape and must
-                # not be fed to rate(). Only
-                # gpu-fault-telemetry-spool-worker runs --workers 1,
-                # so its series are whole.
+                # worker sample. gpu-fault-api-ha AND
+                # gpu-fault-control-worker run uvicorn --workers 4
+                # behind one port; the application aggregates /metrics
+                # over the Pod's live processes (sum for counters and
+                # additive gauges, max for timestamps, min for health
+                # flags -- gpu_fault.app.metric_aggregation), so a
+                # scrape of a Pod is the whole Pod and the families may
+                # be summed or rate()d per pod like any other counter.
+                # gpu_fault_metrics_aggregation_degraded 1 marks a Pod
+                # whose processes could not share, i.e. a sample of one
+                # process.
                 - action: replace
                   source_labels:
                     - __meta_kubernetes_pod_label_app
@@ -148,9 +155,16 @@ data:
                 # match gpu_fault_incidents_by_state -- the plural is one letter
                 # away from the dangling-pointer family and the keep regex has
                 # no tolerance for that -- so the family is named separately.
+                #
+                # gpu_fault_metrics_.+ is the per-contributor error counter of
+                # the /metrics render itself (a contributor that raises is now
+                # skipped and counted instead of failing the scrape), and
+                # gpu_fault_aurora_.+ is the credential refresher's last
+                # verdict read from the mounted Secret (control-plane review
+                # 2026-09-08, G-8 / H1-2).
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+
+                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+
                 # Dropped because they describe the collector, not the fleet.
                 # The receiver stamps every metric with the instrumentation
                 # scope it arrived under, and those labels then take part in
@@ -202,9 +216,18 @@ data:
                 # one before AMP either. Verified by running the pinned image and
                 # reading the endpoint -- the names cannot be guessed from the
                 # upstream documentation, which describes a suffixed form.
+                #
+                # The two process gauges are the collector's own memory: the
+                # container is capped at 256Mi with GOMEMLIMIT 220MiB, and a
+                # cardinality growth that drove it into an OOMKill loop was
+                # invisible -- each restart landed a batch before dying, so
+                # neither absent(up) nor the drop counter fired (H2-4). Names
+                # follow the same unsuffixed convention as the exporter
+                # counters; verify on the live :8889 endpoint after an image
+                # bump.
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|otelcol_exporter_send_failed_metric_points|otelcol_exporter_sent_metric_points|otelcol_exporter_queue_size|otelcol_exporter_queue_capacity
+                  regex: up|otelcol_exporter_send_failed_metric_points|otelcol_exporter_sent_metric_points|otelcol_exporter_queue_size|otelcol_exporter_queue_capacity|otelcol_process_memory_rss|otelcol_process_runtime_heap_alloc_bytes
                 # Same argument as the job above, with two labels that are worse:
                 # service_instance_id is a UUID the collector regenerates on
                 # every start and service_version moves with the image, so a

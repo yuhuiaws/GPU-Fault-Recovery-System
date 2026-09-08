@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Collection
 
@@ -25,10 +26,13 @@ from gpu_fault.store.shared.remediation_budgets import (
 )
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
+    incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
 )
 from gpu_fault.store.shared.workflow_scan import dispatch_order_key
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PostgresWorkflowMixin:
@@ -352,7 +356,7 @@ class PostgresWorkflowMixin:
                 SELECT i.payload
                 FROM gpu_fault_objects i
                 WHERE i.kind='incident'
-                  AND COALESCE(i.payload->>'workflow_request_id', '') <> ''
+                  AND i.payload->>'workflow_request_id' > ''
                   AND NOT EXISTS (
                       SELECT 1 FROM gpu_fault_objects w
                       WHERE w.kind='workflow'
@@ -362,6 +366,36 @@ class PostgresWorkflowMixin:
                 LIMIT %s
                 """,
                 (limit,),
+            )
+            rows = cursor.fetchall()
+        return [self._decode("incident", row[0]) for row in rows]
+
+    def list_incidents_by_state(
+        self,
+        cluster_id: str,
+        states: Collection[IncidentState],
+        *,
+        node_ids: set[str] | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
+    ) -> list[FaultIncident]:
+        wanted = sorted({IncidentState(state).value for state in states})
+        if not wanted or (node_ids is not None and not node_ids):
+            return []
+        clauses = [
+            "i.kind='incident'",
+            "i.payload->>'cluster_id'=%s",
+            "i.payload->>'state' = ANY(%s)",
+        ]
+        parameters: list[object] = [cluster_id, wanted]
+        if node_ids is not None:
+            clauses.append("i.payload->'node_ids' ?| %s")
+            parameters.append(sorted(node_ids))
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                "SELECT i.payload FROM gpu_fault_objects i WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY i.payload->>'updated_at' DESC, i.key DESC LIMIT %s",
+                [*parameters, limit],
             )
             rows = cursor.fetchall()
         return [self._decode("incident", row[0]) for row in rows]
@@ -835,9 +869,11 @@ class PostgresWorkflowMixin:
             # review 2026-09-07, item C). A missing incident is tolerated: the
             # write below creates it.
             try:
-                self._get_for_update("incident", incident.incident_id)
+                current_incident = self._get_for_update(
+                    "incident", incident.incident_id
+                )
             except NotFoundError:
-                pass
+                current_incident = None
             current = self._get_for_update("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
             if (
@@ -850,6 +886,18 @@ class PostgresWorkflowMixin:
             if current.merge_revision != workflow.merge_revision:
                 raise WorkflowMergedError("workflow was merged since it was read")
             self._put("workflow", workflow.request_id, workflow)
+            if incident_pointer_moved(current_incident, incident):
+                # Inside the row lock (C-02): the caller's incident snapshot
+                # predates a merge that re-parented the incident. Only the
+                # workflow is written; see ``incident_pointer_moved``.
+                LOGGER.warning(
+                    "incident %s moved its workflow pointer to %s since %s read "
+                    "it; keeping the merged incident and writing only the workflow",
+                    incident.incident_id,
+                    current_incident.workflow_request_id,
+                    workflow.request_id,
+                )
+                return
             self._put("incident", incident.incident_id, incident)
             self._link(
                 "incident_by_event",

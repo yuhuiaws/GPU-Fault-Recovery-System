@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 import json
 import time
 from datetime import datetime, timedelta, timezone
 from threading import Event as ThreadEvent
-from typing import Callable
+from typing import Any, Callable
 
 from gpu_fault.store.shared.telemetry_models import (
     TELEMETRY_SPOOL_MAX_ATTEMPTS,
@@ -21,7 +19,13 @@ class PostgresTelemetrySpoolMixin:
 
     TELEMETRY_SPOOL_MAX_ATTEMPTS = TELEMETRY_SPOOL_MAX_ATTEMPTS
 
-    _TELEMETRY_SPOOL_DEPTH_TTL_SECONDS = 0.25
+    # How long one process trusts its last depth reading. Twelve ingress
+    # processes at 0.25 s each read the table 48 times a second, and the
+    # reading was ``telemetry_spool_stats`` -- a ``payload::text`` of every
+    # row -- so the cost peaked exactly when the spool was backed up (E-2).
+    # The projection only needs counts, and admitting a few rows past the
+    # cap during one second is the trade the cache already makes.
+    _TELEMETRY_SPOOL_DEPTH_TTL_SECONDS = 1.0
 
     _telemetry_spool_depth_cache: dict | None = None
 
@@ -32,10 +36,18 @@ class PostgresTelemetrySpoolMixin:
         on_state: Callable[[bool], None],
         *,
         timeout_seconds: float = 1.0,
+        writer_check_seconds: float = 5.0,
     ) -> None:
-        """Wake spool consumers without polling the processor channel."""
+        """Wake spool consumers without polling the processor channel.
+
+        Once per ``writer_check_seconds`` the loop asks the server whether it
+        is still the writer (G-11): after a failover a LISTEN connection left
+        on the demoted instance stays open but never receives a NOTIFY.
+        """
 
         import psycopg
+
+        from gpu_fault.store.postgres.pool import _reject_reader
 
         while not stop_event.is_set():
             try:
@@ -46,7 +58,16 @@ class PostgresTelemetrySpoolMixin:
                 ) as connection:
                     connection.execute("LISTEN gpu_fault_telemetry_spool")
                     on_state(True)
+                    last_writer_check = time.monotonic()
                     while not stop_event.is_set():
+                        monotonic = time.monotonic()
+                        if monotonic - last_writer_check >= writer_check_seconds:
+                            last_writer_check = monotonic
+                            _reject_reader(
+                                connection,
+                                "telemetry spool LISTEN connection is on a "
+                                "read-only replica; NOTIFY is not forwarded there",
+                            )
                         payloads = set()
                         for notification in connection.notifies(
                             timeout=timeout_seconds,
@@ -70,11 +91,11 @@ class PostgresTelemetrySpoolMixin:
             cache is None
             or monotonic - cache["read_at"] >= self._TELEMETRY_SPOOL_DEPTH_TTL_SECONDS
         ):
-            stats = self.telemetry_spool_stats(now=now)
+            depths = self.telemetry_spool_depths()
             cache = {
                 "read_at": monotonic,
-                "depth": stats["depth"],
-                "by_cluster": dict(stats["by_cluster"]),
+                "depth": depths["depth"],
+                "by_cluster": dict(depths["by_cluster"]),
                 "admitted": 0,
                 "admitted_by_cluster": {},
             }
@@ -177,11 +198,15 @@ class PostgresTelemetrySpoolMixin:
                         request_id=excluded.request_id,
                         revision=
                             gpu_fault_telemetry_spool.revision + 1,
-                        -- The failure budget belongs to the payload, and
-                        -- this is a new one. Without the reset a stream
-                        -- that hit a transient outage would arrive at the
-                        -- drop threshold and stay there.
-                        attempts=0,
+                        -- ``attempts`` is deliberately kept (E-4): the
+                        -- budget belongs to the lane, not the payload. A
+                        -- node whose sample the endpoint cannot execute
+                        -- re-sends every cycle, and resetting here let it
+                        -- retry forever on Postgres while the in-memory
+                        -- store -- and the test pinning the intent --
+                        -- dropped it after TELEMETRY_SPOOL_MAX_ATTEMPTS.
+                        -- A drop deletes the row, so the next sample
+                        -- starts from zero anyway.
                         lease_owner=NULL,
                         -- Pull a leased row back into the claim window.
                         -- Whoever holds it is carrying the payload this
@@ -417,6 +442,28 @@ class PostgresTelemetrySpoolMixin:
                 )
                 released = cursor.rowcount
         return released, dropped
+
+    def telemetry_spool_depths(self) -> dict[str, Any]:
+        """Row counts by cluster, for the admission projection (E-2).
+
+        Index-only on ``gpu_fault_telemetry_spool_cluster``; never touches
+        ``payload``. Byte totals stay in :meth:`telemetry_spool_stats` for
+        ``/metrics``.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT coalesce(cluster_id, '__unscoped__'), count(*)
+                FROM gpu_fault_telemetry_spool
+                GROUP BY 1
+                """
+            )
+            rows = cursor.fetchall()
+        return {
+            "depth": sum(row[1] for row in rows),
+            "by_cluster": {row[0]: row[1] for row in rows},
+        }
 
     def telemetry_spool_stats(self, *, now: datetime | None = None) -> dict:
         observed_at = now or datetime.now(timezone.utc)

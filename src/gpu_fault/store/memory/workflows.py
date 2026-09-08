@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 from gpu_fault.models import (
     FaultIncident,
@@ -36,6 +37,7 @@ from gpu_fault.store.shared.remediation_budgets import (
     extend_remediation_budget,
 )
 from gpu_fault.store.shared.transactional_workflows import (
+    incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
     workflow_matches_expected,
@@ -48,6 +50,8 @@ from gpu_fault.workflow_resolution import (
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
+
+LOGGER = logging.getLogger(__name__)
 
 
 # The two statuses in which an aggregated-but-unnamed workflow waits forever
@@ -71,11 +75,88 @@ class MemoryWorkflowMixin:
     _replacement_fault_groups: Any
     _sxid_fault_groups: Any
 
+    # Same counter and meaning as ``TransactionalWorkflowMixin`` (F-B7): read
+    # by ``gpu_fault_ingest_stale_event_link_repairs_total``.
+    stale_event_link_repairs = 0
+
+    def _duplicate_event_records(
+        self, event_id: str
+    ) -> tuple[FaultIncident, WorkflowRequest] | None:
+        """The pair an already-ingested event resolves to, or None to rebuild.
+
+        The memory copy of ``TransactionalWorkflowMixin._duplicate_event_records``
+        (C-05): ``tests/store/test_merge_duplicate_event_contract.py`` pins the
+        three backends to the same answer. The three fast paths here used to
+        raise (``RuntimeError`` / ``NotFoundError``) on a dangling pointer, so
+        every family test on the in-memory store -- and the ``--dry-run``
+        adapter path -- saw a poison message where PostgreSQL rebuilt.
+        """
+
+        incident_id = self._incident_by_event.get(event_id)
+        if incident_id is None:
+            return None
+        incident = self._incidents.get(incident_id)
+        workflow = (
+            self._workflows.get(incident.workflow_request_id)
+            if incident is not None and incident.workflow_request_id
+            else None
+        )
+        if incident is not None and workflow is not None:
+            return incident, workflow
+        self.stale_event_link_repairs += 1
+        LOGGER.warning(
+            "incident_by_event link for %s points at incident %s whose %s is "
+            "missing; rebuilding the event instead of failing the re-post",
+            event_id,
+            incident_id,
+            (
+                "record"
+                if incident is None
+                else "workflow pointer"
+                if not incident.workflow_request_id
+                else f"workflow {incident.workflow_request_id}"
+            ),
+        )
+        return None
+
+    def _stamped(
+        self,
+        existing_incident: FaultIncident | None,
+        existing_workflow: WorkflowRequest | None,
+        incident: FaultIncident,
+        workflow: WorkflowRequest,
+    ) -> WorkflowRequest:
+        """See ``TransactionalWorkflowMixin._stamped`` (C-01): an adopted row
+        is bumped from its *stored* revision and its incident goes through the
+        generation guard; the process lock stands in for the row lock."""
+
+        if (
+            existing_incident is None
+            or existing_incident.incident_id != incident.incident_id
+        ):
+            stored_incident = self._incidents.get(incident.incident_id)
+            if stored_incident is not None:
+                stale = stale_incident_versions(stored_incident, incident)
+                if stale is not None:
+                    raise stale
+        stored_workflow = (
+            existing_workflow
+            if existing_workflow is not None
+            and existing_workflow.request_id == workflow.request_id
+            else self._workflows.get(workflow.request_id)
+        )
+        if stored_workflow is None:
+            return workflow
+        return workflow.model_copy(
+            update={"merge_revision": stored_workflow.merge_revision + 1}
+        )
+
     def save_incident(
         self,
         incident: FaultIncident,
         *,
         expected: FaultIncident | None = None,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         """See ``WorkflowStore.save_incident`` (architecture review, item D1)."""
 
@@ -92,11 +173,15 @@ class MemoryWorkflowMixin:
                     raise stale
             self._incidents[incident.incident_id] = incident
             self._incident_by_event[incident.event_id] = incident.incident_id
+            for event_id in extra_event_ids:
+                self._incident_by_event[event_id] = incident.incident_id
 
     def save_incident_and_workflow(
         self,
         incident: FaultIncident,
         workflow: WorkflowRequest,
+        *,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         if incident.workflow_request_id != workflow.request_id:
             raise ValueError("incident workflow pointer does not match workflow")
@@ -112,6 +197,8 @@ class MemoryWorkflowMixin:
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
             self._incident_by_event[incident.event_id] = incident.incident_id
+            for event_id in extra_event_ids:
+                self._incident_by_event[event_id] = incident.incident_id
 
     def reconcile_restored_workflow(
         self,
@@ -234,16 +321,11 @@ class MemoryWorkflowMixin:
     ) -> tuple[FaultIncident, WorkflowRequest, bool]:
         """Atomically create an event's incident and workflow."""
         with self._lock:
-            existing = self.get_incident_by_event(event_id)
-            if existing is not None:
-                if not existing.workflow_request_id:
-                    raise RuntimeError("event incident has no workflow request")
-                return (
-                    existing,
-                    self.get_workflow(existing.workflow_request_id),
-                    False,
-                )
+            duplicate = self._duplicate_event_records(event_id)
+            if duplicate is not None:
+                return duplicate[0], duplicate[1], False
             incident, workflow = builder()
+            workflow = self._stamped(None, None, incident, workflow)
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
@@ -271,12 +353,9 @@ class MemoryWorkflowMixin:
     ) -> tuple[FaultIncident, WorkflowRequest]:
         """Atomically merge one node fault into a workload replacement."""
         with self._lock:
-            duplicate = self.get_incident_by_event(event_id)
+            duplicate = self._duplicate_event_records(event_id)
             if duplicate is not None:
-                return (
-                    duplicate,
-                    self.get_workflow(duplicate.workflow_request_id),
-                )
+                return duplicate
             incident_id = self._replacement_fault_groups.get(group_key)
             existing_incident = (
                 self._incidents.get(incident_id) if incident_id is not None else None
@@ -288,13 +367,9 @@ class MemoryWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
-            if (
-                existing_workflow is not None
-                and existing_workflow.request_id == workflow.request_id
-            ):
-                workflow = workflow.model_copy(
-                    update={"merge_revision": existing_workflow.merge_revision + 1}
-                )
+            workflow = self._stamped(
+                existing_incident, existing_workflow, incident, workflow
+            )
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
@@ -314,12 +389,9 @@ class MemoryWorkflowMixin:
     ) -> tuple[FaultIncident, WorkflowRequest]:
         """Atomically merge one fault into an attempt-scoped workflow."""
         with self._lock:
-            duplicate = self.get_incident_by_event(event_id)
+            duplicate = self._duplicate_event_records(event_id)
             if duplicate is not None:
-                return (
-                    duplicate,
-                    self.get_workflow(duplicate.workflow_request_id),
-                )
+                return duplicate
             incident_id = self._sxid_fault_groups.get(group_key)
             existing_incident = (
                 self._incidents.get(incident_id) if incident_id is not None else None
@@ -331,13 +403,9 @@ class MemoryWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
-            if (
-                existing_workflow is not None
-                and existing_workflow.request_id == workflow.request_id
-            ):
-                workflow = workflow.model_copy(
-                    update={"merge_revision": existing_workflow.merge_revision + 1}
-                )
+            workflow = self._stamped(
+                existing_incident, existing_workflow, incident, workflow
+            )
             self._incidents[incident.incident_id] = incident
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
@@ -410,6 +478,28 @@ class MemoryWorkflowMixin:
             ]
         dangling.sort(key=lambda item: (item.created_at, item.incident_id))
         return dangling[:limit]
+
+    def list_incidents_by_state(
+        self,
+        cluster_id: str,
+        states: Collection[IncidentState],
+        *,
+        node_ids: set[str] | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
+    ) -> list[FaultIncident]:
+        if node_ids is not None and not node_ids:
+            return []
+        wanted = {IncidentState(state) for state in states}
+        with self._lock:
+            matches = [
+                incident
+                for incident in self._incidents.values()
+                if incident.cluster_id == cluster_id
+                and incident.state in wanted
+                and (node_ids is None or set(incident.node_ids) & node_ids)
+            ]
+        matches.sort(key=lambda item: (item.updated_at, item.incident_id), reverse=True)
+        return matches[:limit]
 
     def save_workflow(
         self,
@@ -863,5 +953,16 @@ class MemoryWorkflowMixin:
                 raise WorkflowMergedError("workflow was merged since it was read")
             self._workflows[workflow.request_id] = workflow
             self._stamp_preemption_pending(workflow)
+            current_incident = self._incidents.get(incident.incident_id)
+            if incident_pointer_moved(current_incident, incident):
+                # Same rule as PostgreSQL (C-02).
+                LOGGER.warning(
+                    "incident %s moved its workflow pointer to %s since %s read "
+                    "it; keeping the merged incident and writing only the workflow",
+                    incident.incident_id,
+                    current_incident.workflow_request_id,
+                    workflow.request_id,
+                )
+                return
             self._incidents[incident.incident_id] = incident
             self._incident_by_event[incident.event_id] = incident.incident_id

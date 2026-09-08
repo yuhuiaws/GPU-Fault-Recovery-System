@@ -279,3 +279,72 @@ def test_postgres_paged_dispatch_scan_walks_the_dispatch_order_index_without_a_s
         assert "::timestamptz" not in sql
     finally:
         store.close()
+
+
+# Control-plane review 2026-09-08, G-6: presence by name was the whole check.
+# A CREATE INDEX CONCURRENTLY that failed leaves an INVALID index the planner
+# never uses, and an index recreated by hand with another definition keeps its
+# name; both passed the startup check and degraded the hot queries silently.
+
+
+def _set_index_validity(name: str, valid: bool) -> None:
+    import psycopg
+
+    assert POSTGRES_URL is not None
+    with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE pg_index SET indisvalid=%s WHERE indexrelid=to_regclass(%s)",
+                (valid, name),
+            )
+
+
+def test_postgres_schema_validation_fails_closed_when_a_declared_index_is_invalid():
+    _store().close()
+    _set_index_validity("gpu_fault_executable_workflow_order", False)
+    try:
+        with pytest.raises(
+            RuntimeError, match="invalid.*gpu_fault_executable_workflow_order"
+        ):
+            PostgresStore(POSTGRES_URL, initialize_schema=False)
+    finally:
+        _set_index_validity("gpu_fault_executable_workflow_order", True)
+        _store(initialize_schema=True).close()
+
+
+def test_postgres_schema_validation_fails_closed_when_an_index_definition_drifted():
+    import psycopg
+
+    _store().close()
+    assert POSTGRES_URL is not None
+    with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP INDEX IF EXISTS gpu_fault_executable_workflow_order")
+            cursor.execute(
+                """
+                CREATE INDEX gpu_fault_executable_workflow_order
+                ON gpu_fault_objects (key)
+                WHERE kind='workflow'
+                """
+            )
+    try:
+        with pytest.raises(
+            RuntimeError, match="definition.*gpu_fault_executable_workflow_order"
+        ):
+            PostgresStore(POSTGRES_URL, initialize_schema=False)
+        # The idempotent DDL sees the name present and leaves the drifted
+        # definition alone; the preflight names it and the online builder is
+        # the sanctioned repair (drop, then --build-indexes-concurrently).
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+            from gpu_fault.store.postgres.index_builder import schema_preflight
+
+            report = schema_preflight(connection)
+        assert report["indexes"]["drifted"] == ["gpu_fault_executable_workflow_order"]
+        assert report["ok"] is False
+    finally:
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DROP INDEX IF EXISTS gpu_fault_executable_workflow_order"
+                )
+        _store(initialize_schema=True).close()

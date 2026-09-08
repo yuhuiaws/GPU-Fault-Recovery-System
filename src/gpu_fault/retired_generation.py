@@ -37,11 +37,11 @@ from typing import Any, Iterable, Mapping, NamedTuple
 
 import gpu_fault.models as _models
 from gpu_fault.models import (
-    resolved_step_indexes,
     FaultIncident,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     CONTAINMENT_ONLY_OPERATIONS,

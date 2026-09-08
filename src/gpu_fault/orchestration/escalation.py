@@ -20,8 +20,8 @@ from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
 )
+from gpu_fault.orchestration.families.identity import note_stale_event_link
 from gpu_fault.store.shared.errors import NotFoundError
-
 
 RESTART_SAFETY_PARAMETERS = (
     "cluster_id",
@@ -970,10 +970,22 @@ class HardwareEscalationService:
         if existing is not None:
             if not existing.workflow_request_id:
                 return None
-            return (
-                existing,
-                self.store.get_workflow(existing.workflow_request_id),
-            )
+            try:
+                return (
+                    existing,
+                    self.store.get_workflow(existing.workflow_request_id),
+                )
+            except NotFoundError:
+                # C-04: the escalation was recorded but its workflow row is
+                # gone; ``emit`` rebuilds through
+                # ``create_incident_workflow_if_absent``, which treats the
+                # dirty link the same way and re-links this event id.
+                note_stale_event_link(
+                    self.store,
+                    event_id=event_id,
+                    incident_id=existing.incident_id,
+                    pointer=existing.workflow_request_id,
+                )
         scope = self.collect_scope(workflow, source, failed_executions)
         return self.emit(
             workflow,

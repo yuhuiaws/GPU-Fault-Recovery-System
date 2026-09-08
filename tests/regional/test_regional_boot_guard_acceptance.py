@@ -354,10 +354,15 @@ def test_boot013_the_ses_client_region_comes_only_from_the_declared_environment(
     assert unset.region_name is None
     assert primary.execution_enabled is True
     assert disabled.execution_enabled is False
-    assert calls == [
-        ("sesv2", {"region_name": "us-east-2"}),
-        ("sesv2", {"region_name": None}),
-    ]
+    # The client carries the declared region plus the botocore timeout/retry
+    # Config (control-plane review 2026-09-08, F-4) and nothing else.
+    assert [
+        (service, {key: value for key, value in kwargs.items() if key != "config"})
+        for service, kwargs in calls
+    ] == [("sesv2", {"region_name": "us-east-2"}), ("sesv2", {"region_name": None})]
+    assert all("config" in kwargs for _service, kwargs in calls), (
+        "every SES client must carry the botocore timeout/retry Config (F-4)"
+    )
     assert declared["AWS_REGION"]["value"], declared["AWS_REGION"]
     assert declared["AWS_DEFAULT_REGION"]["value"], declared["AWS_DEFAULT_REGION"]
 

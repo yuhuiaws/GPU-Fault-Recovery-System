@@ -5,20 +5,22 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from gpu_fault.models import (
-    bounded_reasons,
     FaultIncident,
     IncidentState,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    bounded_reasons,
+    resolved_step_indexes,
 )
+from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
     SxidEvent,
     XidEvent,
 )
-from gpu_fault.orchestration.disposition import DispositionApplier
 
 
 @dataclass(frozen=True)
@@ -362,11 +364,7 @@ class GroupedFaultService:
                 existing_incident.attempt_id == context.observation.attempt_id
             ),
         )
-        mutable = (
-            existing_workflow.status is WorkflowStatus.PENDING
-            and existing_workflow.execution_owner_id is None
-            and not existing_workflow.completed_step_indexes
-        )
+        mutable = workflow_is_mutable(existing_workflow)  # D-9 companion
         workflow, winner = self._apply_disposition(
             disposition,
             context,
@@ -464,8 +462,19 @@ class GroupedFaultService:
             WorkflowOperation.STOP_WORKLOADS,
             WorkflowOperation.RESTART_WORKLOAD,
         }
+        # Finished, superseded and in-flight steps are history or a command an
+        # agent already holds (F-B6 rule, C-08): a completed STOP_WORKLOADS
+        # keeps the nodes it stopped and a WAITING RESTART_WORKLOAD keeps the
+        # budget it was issued with. Only steps still to run take this
+        # event's observation.
+        untouchable = set(resolved_step_indexes(workflow)) | {
+            execution.step_index for execution in workflow.step_executions
+        }
         steps = []
-        for step in workflow.official_steps:
+        for index, step in enumerate(workflow.official_steps):
+            if index in untouchable:
+                steps.append(step)
+                continue
             parameters = step.parameters
             if step.operation is WorkflowOperation.STOP_WORKLOADS:
                 parameters = {

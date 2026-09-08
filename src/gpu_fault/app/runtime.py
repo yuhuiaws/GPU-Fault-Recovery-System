@@ -63,3 +63,6 @@ class AppRuntime:
     # a plugin contributor or a test that builds this runtime directly still
     # renders; the accessor falls back to an unshared read.
     metric_scan_cache: Any = None
+    # ``{"nul": n}`` from AdmissionRuntime (E-3); rendered as
+    # gpu_fault_ingress_decode_rejections_total{reason}.
+    decode_rejections: Any = None

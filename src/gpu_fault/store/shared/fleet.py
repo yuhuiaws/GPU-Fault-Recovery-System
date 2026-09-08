@@ -4,8 +4,10 @@ deployments and barriers, each a single row keyed by its own id."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, cast
 
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.primitives import (
     DeleteRecord,
     GetOptionalRecord,
@@ -136,6 +138,28 @@ class SharedFleetMixin:
                 member,
             )
             return member
+
+    def cleanup_stale_regional_registry_members(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        """Drop heartbeat rows of processes not seen since ``older_than``
+        (F-5 / F-8). PostgreSQL overrides this with one set-based statement."""
+
+        with self._state_transaction("regional_registry_member/cleanup"):
+            member_ids = [
+                item.member_id
+                for item in sorted(
+                    cast(
+                        "list[RegionalRegistryMember]",
+                        self._list("regional_registry_member"),
+                    ),
+                    key=lambda item: (item.last_seen_at, item.member_id),
+                )
+                if item.last_seen_at <= older_than
+            ][:limit]
+            for member_id in member_ids:
+                self._delete("regional_registry_member", member_id)
+            return log_cleanup("regional_registry_member", member_ids)
 
     def list_regional_registry_members(self) -> list[RegionalRegistryMember]:
         members = cast(

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-
 COLLECTOR_EVENT_PREFIX = "/v1/collector-events/"
 
 
@@ -104,6 +103,7 @@ NODE_LOG_PATH = "/v1/collector-events/node-logs"
 COLLECTOR_HEALTH_PATH = "/v1/collector-events/collector-health"
 WORKLOAD_OBSERVATIONS_PATH = "/v1/workload-observations"
 TRAINING_PROGRESS_PATH = "/v1/training-progress"
+WORKLOAD_COVERAGE_PATH = "/v1/workload-coverage"
 
 
 CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
@@ -208,6 +208,17 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
         priority_mode=ChannelPriorityMode.ROUTINE,
         pool=ChannelPool.OBSERVATION,
         lane=ChannelLane.ATTEMPT,
+        receipt=True,
+    ),
+    # One heartbeat per cluster per scan; the payload names no attempt or
+    # node, so its ordering key is the cluster and latest-wins keeps a single
+    # pending row per cluster however often the watcher scans.
+    WORKLOAD_COVERAGE_PATH: ProcessorChannel(
+        path=WORKLOAD_COVERAGE_PATH,
+        priority_mode=ChannelPriorityMode.ROUTINE,
+        pool=ChannelPool.OBSERVATION,
+        lane=ChannelLane.ATTEMPT,
+        latest_wins=True,
         receipt=True,
     ),
 }

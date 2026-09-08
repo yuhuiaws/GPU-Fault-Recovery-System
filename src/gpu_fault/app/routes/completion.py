@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from gpu_fault.channel_registry import (
-    WORKLOAD_OBSERVATIONS_PATH,
+from gpu_fault.app.authorization import authorization_bucket
+from gpu_fault.app.ingest.workload_observations import (
+    ingest_workload_coverage,
+    ingest_workload_observation,
 )
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
     StoreIoCapacityExceeded,
+)
+from gpu_fault.channel_registry import (
+    WORKLOAD_COVERAGE_PATH,
+    WORKLOAD_OBSERVATIONS_PATH,
 )
 from gpu_fault.models import (
     CompletionDecision,
@@ -22,14 +26,12 @@ from gpu_fault.models import (
     TerminalEvent,
     TriageReport,
 )
-from gpu_fault.app.ingest.workload_observations import (
-    ingest_workload_observation,
-)
 from gpu_fault.service import CompletionPendingError
 from gpu_fault.watcher import (
     AttemptObservation,
     FailureContainmentDecision,
     FailureDetectedEvent,
+    WorkloadCoverageHeartbeat,
 )
 
 
@@ -79,6 +81,24 @@ async def observe_workload(
         observation,
     )
     return observation
+
+
+@router.post(
+    WORKLOAD_COVERAGE_PATH,
+    response_model=WorkloadCoverageHeartbeat,
+)
+@authorization_bucket("cluster-token")
+async def observe_workload_coverage(
+    heartbeat: WorkloadCoverageHeartbeat,
+    dependencies: CompletionRouterDependencies = Depends(get_completion_dependencies),
+) -> WorkloadCoverageHeartbeat:
+    await _store_call(
+        dependencies,
+        ingest_workload_coverage,
+        dependencies.context,
+        heartbeat,
+    )
+    return heartbeat
 
 
 @router.post(

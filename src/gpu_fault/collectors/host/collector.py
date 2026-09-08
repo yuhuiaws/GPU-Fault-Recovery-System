@@ -12,24 +12,22 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
+from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
+from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
+from gpu_fault.collectors.host.inventory import HostInventoryMixin
+from gpu_fault.collectors.host.network import HostNetworkMixin
+from gpu_fault.collectors.host.system_metrics import HostSystemMetricsMixin
+from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.sinks import CollectorError, EventSink
 from gpu_fault.env import env_bool
-from gpu_fault.models import WorkloadState
 from gpu_fault.host_health import (
     HostMetricSample,
     HostTelemetryBatch,
     HostTelemetryHistoryPoint,
     NodeHealthPolicy,
 )
-
-
-from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
-from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import CollectorError, EventSink
-from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
-from gpu_fault.collectors.host.inventory import HostInventoryMixin
-from gpu_fault.collectors.host.network import HostNetworkMixin
-from gpu_fault.collectors.host.system_metrics import HostSystemMetricsMixin
+from gpu_fault.models import WorkloadState
 
 LOGGER = logging.getLogger(__name__)
 

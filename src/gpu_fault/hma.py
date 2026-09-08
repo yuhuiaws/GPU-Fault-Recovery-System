@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -11,15 +11,14 @@ from pydantic import Field
 
 from gpu_fault.models import StrictModel, WorkloadState
 from gpu_fault.policy import (
-    FaultPolicyDecision,
     NVIDIA_ALWAYS_FATAL_SXIDS,
+    FaultPolicyDecision,
     SxidClassification,
     SxidEvent,
     SxidLinkScope,
     XidEvent,
     load_sxid_policy,
 )
-
 
 HMA_HEALTH_STATUS = "sagemaker.amazonaws.com/node-health-status"
 HMA_FAULT_TYPES = "sagemaker.amazonaws.com/fault-types"

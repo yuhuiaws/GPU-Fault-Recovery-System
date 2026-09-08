@@ -80,7 +80,8 @@ def test_the_dispatcher_hold_records_one_hold_event_however_often_it_polls():
 def test_the_dispatcher_give_up_records_a_plan_rewrite_with_the_timeout_code():
     store = build_store()
     _busy_node(store)
-    _job_workflow(store, created_at=datetime.now(timezone.utc) - timedelta(minutes=10))
+    long_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+    _job_workflow(store, created_at=long_ago, held_since=long_ago)
     dispatcher, _ = _dispatcher(store)
 
     dispatcher.run_once()

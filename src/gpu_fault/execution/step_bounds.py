@@ -51,8 +51,13 @@ ATTEMPT_DETAIL_KEYS = (
     "gpu_reset_commit_attempt",
     "gpu_client_quiesce_attempt",
     "step_waiting_seconds",
+    "step_waiting_slow",
 )
 _ATTEMPT_DETAIL_STRING_LIMIT = 128
+# D-10: a WAITING attempt that differs from the previous one only in how long
+# it has waited says nothing new; the record carries the age, the event does
+# not need repeating. Every other allow-listed key is part of the identity.
+_ATTEMPT_VOLATILE_DETAIL_KEYS = frozenset({"step_waiting_seconds"})
 
 
 # Compensation that restores what the workflow itself stopped. It never
@@ -239,8 +244,13 @@ def record_attempt(
     phase = execution_phase(workflow)
     previous = previous_execution(workflow, step, index)
     # The record below replaces this step's last one; the event is what keeps
-    # the attempts that came before it (RF-2).
-    workflow = _record_attempt_event(workflow, step, index, outcome, phase)
+    # the attempts that came before it (RF-2) -- unless this attempt is the
+    # same wait as the last one, polled again (D-10): a step waiting on a
+    # remote command is redispatched every tick, and one event per tick filled
+    # the bounded event list in twenty minutes and evicted the history the
+    # events exist to keep.
+    if not _same_wait(previous, outcome):
+        workflow = _record_attempt_event(workflow, step, index, outcome, phase)
     execution = WorkflowStepExecution(
         step_index=index,
         operation=step.operation,
@@ -279,6 +289,28 @@ def record_attempt(
             "step_executions": sorted(executions, key=lambda item: item.step_index),
             "updated_at": datetime.now(timezone.utc),
         }
+    )
+
+
+def _same_wait(
+    previous: WorkflowStepExecution | None, outcome: WorkflowStepOutcome
+) -> bool:
+    """Is ``outcome`` the wait ``previous`` already recorded, seen again?"""
+
+    if (
+        previous is None
+        or previous.status is not WorkflowStepStatus.WAITING
+        or outcome.status is not WorkflowStepStatus.WAITING
+        or previous.error != outcome.error
+        or previous.adapter_operation_id != outcome.adapter_operation_id
+    ):
+        return False
+    before = previous.details or {}
+    after = outcome.details or {}
+    return all(
+        before.get(key) == after.get(key)
+        for key in ATTEMPT_DETAIL_KEYS
+        if key not in _ATTEMPT_VOLATILE_DETAIL_KEYS
     )
 
 
@@ -399,39 +431,89 @@ def step_elapsed_since(
 
     ``started_at`` can predate the current execution window: a merged or branched
     workflow inherits the executions of the record it absorbed. So the window's
-    own start -- recoverable from the deadline, which is set once, to first-claim
-    plus the workflow budget -- is the floor. Clamping can only push the cap
-    later, never fire it early on inherited time.
+    own start (``execution_window_start``) is the floor. Clamping can only push
+    the cap later, never fire it early on inherited time.
     """
 
     since = previous.started_at
-    if workflow.execution_deadline is None:
+    window_start = execution_window_start(executor, workflow)
+    if window_start is None:
         return since
-    # Recover the window the deadline was stamped from -- with the same budget
-    # ``claim_deadlines`` used. A workflow holding an operator-acknowledgement
-    # step (CHECK_MECHANICALS) is floored at ``now + acknowledgement timeout``
-    # at claim time; subtracting only the plain execution timeout put the
-    # window start ~24 h in the future and ``step_waiting_seconds`` went
-    # negative (-84599 observed live), so the step's age -- and the alert that
-    # watches the oldest waiting step -- reported a wait that never grew.
-    budget_seconds = float(executor.config.workflow_execution_timeout_seconds)
-    if any(
-        step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
-        for step in workflow.official_steps
-    ):
-        budget_seconds = max(
-            budget_seconds,
-            float(
-                getattr(
-                    executor.config,
-                    "operator_acknowledgement_timeout_seconds",
-                    budget_seconds,
-                )
-            ),
-        )
-    window_start = workflow.execution_deadline - timedelta(seconds=budget_seconds)
-    # A window cannot start in the future: whatever stamped the deadline did so
-    # no later than now, so the clamp only ever restores a wait that the budget
-    # arithmetic above would otherwise deny.
+    # A window cannot start in the future: whatever stamped it did so no later
+    # than now, so the clamp only ever restores a wait that the arithmetic
+    # below would otherwise deny.
     window_start = min(window_start, datetime.now(timezone.utc))
     return max(since, window_start)
+
+
+def execution_window_start(executor: Any, workflow: WorkflowRequest) -> datetime | None:
+    """When this record's execution window opened, or ``None`` if unknown.
+
+    Three anchors say when the record was first claimed, and none of them can
+    be earlier than that moment, so the earliest one is the closest answer:
+
+    * the first ``CLAIM`` event -- written by the claim that leased the record
+      and kept at the head of the bounded event list; on a row that was already
+      running when CLAIM events were introduced it names a later claim;
+    * ``lifetime_deadline_at`` minus the lifetime ``claim_deadlines`` stamped it
+      with (F-N1) -- set once and inherited, except that an
+      operator-acknowledgement workflow re-floors it on every claim;
+    * ``execution_deadline`` minus the execution budget -- stable for a
+      sequential workflow, but re-stamped on every claim of a DAG workflow, so
+      for a DAG it is not read at all: it put the window start at the current
+      tick and ``step_waiting_seconds`` read 0 for every step of every
+      multi-node job workflow (control-plane review 2026-09-08, D-1).
+
+    A workflow holding an operator-acknowledgement step (CHECK_MECHANICALS) has
+    both deadlines floored at ``now + acknowledgement timeout`` at claim time;
+    subtracting only the plain budget put the window start ~24 h in the future
+    and ``step_waiting_seconds`` went negative (-84599 observed live), so the
+    same floor is applied to the budget here.
+    """
+
+    anchors: list[datetime] = []
+    first_claim = next(
+        (
+            event.at
+            for event in workflow.events
+            if event.kind is WorkflowEventKind.CLAIM
+        ),
+        None,
+    )
+    if first_claim is not None:
+        anchors.append(first_claim)
+    acknowledgement = (
+        float(
+            getattr(
+                executor.config,
+                "operator_acknowledgement_timeout_seconds",
+                0,
+            )
+        )
+        if any(
+            step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+            for step in workflow.official_steps
+        )
+        else 0.0
+    )
+    if workflow.lifetime_deadline_at is not None:
+        is_job = workflow.dag_enabled or any(
+            step.operation is WorkflowOperation.RESTART_WORKLOAD
+            for step in workflow.official_steps
+        )
+        lifetime_seconds = float(
+            executor.config.job_workflow_lifetime_seconds
+            if is_job
+            else executor.config.node_workflow_lifetime_seconds
+        )
+        anchors.append(
+            workflow.lifetime_deadline_at
+            - timedelta(seconds=max(lifetime_seconds, acknowledgement))
+        )
+    if workflow.execution_deadline is not None and not workflow.dag_enabled:
+        budget_seconds = float(executor.config.workflow_execution_timeout_seconds)
+        anchors.append(
+            workflow.execution_deadline
+            - timedelta(seconds=max(budget_seconds, acknowledgement))
+        )
+    return min(anchors, default=None)

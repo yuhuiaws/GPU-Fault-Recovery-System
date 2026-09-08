@@ -16,7 +16,6 @@ from gpu_fault.admin.artifact_configmaps import (
     COMPRESSED_ARTIFACT_SUFFIX,
     compress_artifact,
 )
-from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -39,6 +38,7 @@ from gpu_fault.admin.grafana import GrafanaSettings, ensure_grafana_dashboards
 from gpu_fault.admin.monitoring_subscriptions import (
     ensure_monitoring_subscriptions,
 )
+from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
 from gpu_fault.admin.site import archive_s3_prefix_arn
 
 SNS_TOPIC_GENERATION_TAG = "gpu-fault:topic-generation"

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
+from dataclasses import dataclass
 from typing import Callable
 
 from gpu_fault.hyperpod import HyperPodAdvisoryDisposition, HyperPodRecoveryAdvisory
@@ -13,7 +13,6 @@ from gpu_fault.notifications.registry import (
 )
 from gpu_fault.orchestration import OPERATION_CAPABILITY
 from gpu_fault.policy import ActionDisposition, FaultPolicyDecision, SxidEvent, XidEvent
-
 
 MANAGED_HYPERPOD_OWNER_PREFIX = "hyperpod-managed-"
 ADVISORY_OPERATION_PRIORITY = {

@@ -94,9 +94,12 @@ def _diagnostic(event: TerminalEvent, created_at: datetime) -> DiagnosticRequest
 def test_decisions_by_status_respect_the_diagnostic_age_bound(store) -> None:
     old = _event("attempt-old")
     fresh = _event("attempt-fresh")
-    orphan = _event("attempt-orphan")
+    # Diagnostic row never persisted: the decision's age falls back to its
+    # terminal event's ``ended_at`` (control-plane review 2026-09-08, F-7).
+    orphan = _event("attempt-orphan", ended_at=NOW - timedelta(hours=3))
+    orphan_fresh = _event("attempt-orphan-fresh", ended_at=NOW - timedelta(minutes=1))
     planned = _event("attempt-planned")
-    for event in (old, fresh, orphan, planned):
+    for event in (old, fresh, orphan, orphan_fresh, planned):
         assert store.save_event_if_absent(event), f"{event.attempt_id} not inserted"
     store.save_diagnostic(_diagnostic(old, NOW - timedelta(hours=2)))
     store.save_diagnostic(_diagnostic(fresh, NOW - timedelta(minutes=1)))
@@ -119,6 +122,13 @@ def test_decisions_by_status_respect_the_diagnostic_age_bound(store) -> None:
             diagnostic_request_id="diag-never-persisted",
         )
     )
+    store.save_decision(
+        _decision(
+            orphan_fresh,
+            DecisionStatus.PENDING_TRIAGE,
+            diagnostic_request_id="diag-never-persisted-either",
+        )
+    )
     store.save_decision(_decision(planned, DecisionStatus.PLAN_CREATED))
 
     everything = store.list_decisions_by_status(DecisionStatus.PENDING_TRIAGE)
@@ -126,13 +136,16 @@ def test_decisions_by_status_respect_the_diagnostic_age_bound(store) -> None:
         "attempt-fresh",
         "attempt-old",
         "attempt-orphan",
+        "attempt-orphan-fresh",
     ]
 
     stale = store.list_decisions_by_status(
         DecisionStatus.PENDING_TRIAGE, older_than=NOW - timedelta(hours=1)
     )
-    # A decision whose diagnostic request cannot be found is stale by
-    # definition: nothing can ever report on it. Oldest first, unknown age first.
+    # A decision whose diagnostic request cannot be found ages by its event:
+    # the one that ended three hours ago is stale, the one from a minute ago
+    # is not -- "no diagnostic row" used to mean "infinitely old" and expired
+    # a fresh decision on the first scan (F-7). Oldest first.
     assert [item.attempt_id for item in stale] == ["attempt-orphan", "attempt-old"]
 
     assert store.list_decisions_by_status(

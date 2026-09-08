@@ -18,7 +18,6 @@ from gpu_fault.operation_registry import (
     OperationScope,
 )
 
-
 FAILURE_DOMAIN_MAP_ENV = "GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP"
 
 # cluster_id -> node_id -> failure domain. The map is the only source of a

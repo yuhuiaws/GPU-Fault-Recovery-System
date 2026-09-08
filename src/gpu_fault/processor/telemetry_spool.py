@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 import json
 import logging
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any, Callable
 from urllib import request as urllib_request
 
 from gpu_fault.processor.rejected_events import status_class
@@ -59,6 +59,24 @@ class TelemetrySpoolCoordinatorMixin:
     telemetry_spool_replay_batch_max_items: Any
     telemetry_spool_replay_handler: Callable[[dict[str, Any]], dict[str, Any]] | None
     telemetry_spool_retry_backoff_seconds: Any
+    _stale_disposition: Callable[..., Any]
+
+    # Spooled samples retired by ``_stale_disposition`` without a replay
+    # (E-7). A class default so the mixin owns its counter; the coordinator
+    # may initialise it explicitly like the others.
+    spool_stale_completed_total: int = 0
+
+    # The payload fields ``_stale_disposition`` reads. A spooled sample is
+    # handed to it as a reduced body so a 4 MiB batch is not re-serialised
+    # only to have its ``observed_at`` compared.
+    _STALE_DISPOSITION_KEYS = (
+        "observed_at",
+        "edge_filter_reasons",
+        "collection_errors",
+        "cluster_id",
+        "attempt_id",
+        "rank",
+    )
 
     def run_telemetry_spool(self) -> None:
         """Drain telemetry through the dedicated spool path."""
@@ -118,6 +136,7 @@ class TelemetrySpoolCoordinatorMixin:
                 self._spool_work_available.clear()
                 claimed_any = False
                 claim_failed = False
+                abandoned_any = False
                 empty_paths: set[str] = set()
                 # Derived from the registry, not written down: the schedule
                 # repeats weighted paths, and "every path came back empty"
@@ -186,7 +205,6 @@ class TelemetrySpoolCoordinatorMixin:
                         break
                     if not rows:
                         break
-                    claimed_any = True
                     batch_bytes = self._telemetry_spool_batch_bytes(rows)
                     if (
                         self._stop.is_set()
@@ -194,7 +212,12 @@ class TelemetrySpoolCoordinatorMixin:
                         or in_flight_bytes + batch_bytes
                         > self.telemetry_spool_max_in_flight_bytes
                     ):
+                        # Not a claim: the rows go straight back and the
+                        # head row is still the head row, so re-entering
+                        # the loop at once would take it again and abandon
+                        # it again with no sleep in between (E-6 / F-D8).
                         self._abandon_telemetry_spool(rows)
+                        abandoned_any = True
                         break
                     try:
                         future = pool.submit(
@@ -204,6 +227,7 @@ class TelemetrySpoolCoordinatorMixin:
                     except Exception:
                         self._abandon_telemetry_spool(rows)
                         raise
+                    claimed_any = True
                     in_flight[future] = batch_bytes
                     with self._state_lock:
                         self._spool_in_flight_bytes = sum(in_flight.values())
@@ -215,6 +239,13 @@ class TelemetrySpoolCoordinatorMixin:
                     self._stop.wait(self.poll_seconds)
                     continue
                 if claimed_any:
+                    continue
+                if abandoned_any:
+                    # The budget is what is missing, and a replay finishing
+                    # is what frees it. ``_stop.wait`` rather than the
+                    # notification event: the abandon itself rewrites
+                    # ``available_at`` and so fires the spool trigger.
+                    self._stop.wait(self.poll_seconds)
                     continue
                 # LISTEN/NOTIFY is the normal wake path. Poll only as a
                 # bounded safety net for reconnect gaps, lost notifications
@@ -314,19 +345,79 @@ class TelemetrySpoolCoordinatorMixin:
                 sorted({item.path for item in items}),
             )
 
-    def _replay_telemetry_spool(self, items: list) -> None:
-        started = time.monotonic()
-        batch_request = {
-            "items": [
-                {
-                    "request_id": item.request_id,
-                    "path": item.path,
-                    "payload": item.payload,
-                }
-                for item in items
-            ]
+    def _spooled_stale_disposition(
+        self, item: Any
+    ) -> tuple[str, datetime, float, float] | None:
+        """``_stale_disposition`` for a spooled sample (E-7).
+
+        The queue path retires an expired inventory snapshot or healthy
+        summary before executing it; the spool path replayed every row of a
+        backlog only for ``observed_at`` to discard it under a row lock.
+        The disposition only reads a handful of fields, so it is given a
+        body carrying just those.
+        """
+
+        payload = item.payload if isinstance(item.payload, dict) else None
+        if payload is None:
+            return None
+        reduced = {
+            key: payload[key] for key in self._STALE_DISPOSITION_KEYS if key in payload
         }
+        probe = SimpleNamespace(
+            path=item.path,
+            body=lambda: json.dumps(reduced, default=str).encode(),
+        )
+        disposition: tuple[str, datetime, float, float] | None = (
+            self._stale_disposition(probe)
+        )
+        return disposition
+
+    def _replay_telemetry_spool(self, items: list[Any]) -> None:
+        started = time.monotonic()
+        # Keys whose rows this replay has already completed; on a failure
+        # anything else it holds is released so a crash between the handler
+        # and ``complete_telemetry_spool`` does not leave rows leased for the
+        # full lease with nothing counted (E-5).
+        completed_keys: set[str] = set()
         try:
+            live: list[Any] = []
+            stale: list[Any] = []
+            for item in items:
+                disposition = self._spooled_stale_disposition(item)
+                if disposition is None:
+                    live.append(item)
+                    continue
+                reason, observed_at, age_seconds, limit_seconds = disposition
+                LOGGER.info(
+                    "telemetry spool retired stale sample request_id=%s path=%s "
+                    "reason=%s observed_at=%s age_seconds=%.0f limit_seconds=%s",
+                    item.request_id,
+                    item.path,
+                    reason,
+                    observed_at.isoformat(),
+                    age_seconds,
+                    limit_seconds,
+                )
+                stale.append(item)
+            if stale:
+                completed = self.store.complete_telemetry_spool(stale)
+                completed_keys.update(item.spool_key for item in stale)
+                with self._state_lock:
+                    self.spool_completed_total += completed
+                    self.spool_stale_completed_total += completed
+                    self.spool_superseded_total += len(stale) - completed
+            if not live:
+                return
+            batch_request = {
+                "items": [
+                    {
+                        "request_id": item.request_id,
+                        "path": item.path,
+                        "payload": item.payload,
+                    }
+                    for item in live
+                ]
+            }
             if self.telemetry_spool_replay_handler is not None:
                 with self._state_lock:
                     self.spool_direct_replay_total += 1
@@ -343,7 +434,7 @@ class TelemetrySpoolCoordinatorMixin:
                     headers={
                         "Content-Type": "application/json",
                         "X-GPU-Fault-Processor-Replay": (self.internal_token),
-                        "Idempotency-Key": ",".join(item.request_id for item in items),
+                        "Idempotency-Key": ",".join(item.request_id for item in live),
                     },
                     method="POST",
                 )
@@ -352,10 +443,58 @@ class TelemetrySpoolCoordinatorMixin:
                     timeout=self.request_max_execution_seconds,
                 ) as response:
                     body = json.loads(response.read())
+            by_id = {result["request_id"]: result for result in body.get("results", [])}
+            done = []
+            retry = []
+            for item in live:
+                result = by_id.get(item.request_id)
+                status = 500 if result is None else int(result.get("status", 500))
+                # A 4xx is the endpoint's verdict on the payload, not a
+                # transient failure, so retrying it would only occupy spool
+                # depth until the attempt cap dropped it anyway. Deleting it
+                # loses one sample of a stream whose next sample restates the
+                # same node state - and it is logged, which a queued request
+                # answering 422 into a response body nobody reads is not.
+                if status >= 500:
+                    retry.append(item)
+                    continue
+                if status >= 400:
+                    LOGGER.warning(
+                        "telemetry spool replay rejected request_id=%s "
+                        "path=%s status=%s detail=%s",
+                        item.request_id,
+                        item.path,
+                        status,
+                        (result or {}).get("body"),
+                    )
+                done.append(item)
+                # Same per-path/status-class ledger as the queue path (G1), so
+                # a spooled channel that starts answering 4xx is visible too.
+                with self._state_lock:
+                    by_status = self._completions_by_path_status.setdefault(
+                        item.path, {}
+                    )
+                    by_status[status_class(status)] = (
+                        by_status.get(status_class(status), 0) + 1
+                    )
+            if done:
+                completed = self.store.complete_telemetry_spool(done)
+                completed_keys.update(item.spool_key for item in done)
+                with self._state_lock:
+                    self.spool_completed_total += completed
+                    # The difference is rows a newer sample took over while
+                    # this replay was in flight. The newer payload is still
+                    # spooled and claimable, which is the whole reason
+                    # completion is fenced on the revision.
+                    self.spool_superseded_total += len(done) - completed
+            if retry:
+                self._release_telemetry_spool(retry)
         except Exception:
             with self._state_lock:
                 self.spool_errors_total += 1
-            self._release_telemetry_spool(items)
+            self._release_telemetry_spool(
+                [item for item in items if item.spool_key not in completed_keys]
+            )
             raise
         finally:
             elapsed = time.monotonic() - started
@@ -364,49 +503,6 @@ class TelemetrySpoolCoordinatorMixin:
                 self.spool_replay_seconds_max = max(
                     self.spool_replay_seconds_max, elapsed
                 )
-        by_id = {result["request_id"]: result for result in body.get("results", [])}
-        done = []
-        retry = []
-        for item in items:
-            result = by_id.get(item.request_id)
-            status = 500 if result is None else int(result.get("status", 500))
-            # A 4xx is the endpoint's verdict on the payload, not a
-            # transient failure, so retrying it would only occupy spool
-            # depth until the attempt cap dropped it anyway. Deleting it
-            # loses one sample of a stream whose next sample restates the
-            # same node state - and it is logged, which a queued request
-            # answering 422 into a response body nobody reads is not.
-            if status >= 500:
-                retry.append(item)
-                continue
-            if status >= 400:
-                LOGGER.warning(
-                    "telemetry spool replay rejected request_id=%s "
-                    "path=%s status=%s detail=%s",
-                    item.request_id,
-                    item.path,
-                    status,
-                    (result or {}).get("body"),
-                )
-            done.append(item)
-            # Same per-path/status-class ledger as the queue path (G1), so a
-            # spooled channel that starts answering 4xx is visible too.
-            with self._state_lock:
-                by_status = self._completions_by_path_status.setdefault(item.path, {})
-                by_status[status_class(status)] = (
-                    by_status.get(status_class(status), 0) + 1
-                )
-        if done:
-            completed = self.store.complete_telemetry_spool(done)
-            with self._state_lock:
-                self.spool_completed_total += completed
-                # The difference is rows a newer sample took over while
-                # this replay was in flight. The newer payload is still
-                # spooled and claimable, which is the whole reason
-                # completion is fenced on the revision.
-                self.spool_superseded_total += len(done) - completed
-        if retry:
-            self._release_telemetry_spool(retry)
 
     def _backlog_is_lane_blocked(
         self,

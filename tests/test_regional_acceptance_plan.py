@@ -59,8 +59,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    # 181 catalogued cases; 9 are DO_NOT_RUN (two retired earlier, seven folded
-    # into their supersets on 2026-09-07), so 172 run.
+    # 183 catalogued cases; 9 are DO_NOT_RUN (two retired earlier, seven folded
+    # into their supersets on 2026-09-07), so 174 run.
     retired = (
         "GF-REGIONAL-DESTR-004",
         "GF-REGIONAL-AUTH-012",
@@ -72,8 +72,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 172
-    assert len(plan.cases) == 181
+    assert len(plan.execution_order) == 174
+    assert len(plan.cases) == 183
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
     assert plan.do_not_run_case_ids == retired
@@ -244,7 +244,7 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     ]
     # pytest + command cases plus the live-non-destructive manual cases whose
     # related_pytest is a local proxy (NET-006, CMD-017, DESTR-020, ...) of the
-    # 181 cases. The number only moves when a case gains or loses a local
+    # 183 cases. The number only moves when a case gains or loses a local
     # answer, so it is stated rather than derived. 112 -> 106 on 2026-09-07:
     # PREEMPT-013/023/034 (pytest wrappers) and AUTH-010/NOTIFY-002/DESTR-011
     # (local-proxy manual cases) were folded into the cases that already ran

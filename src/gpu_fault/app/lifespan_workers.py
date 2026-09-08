@@ -5,8 +5,9 @@ import os
 import random
 import time
 from threading import Event, Thread
-from typing import Any
+from typing import Any, Callable
 
+import gpu_fault.app.process_metrics as process_metrics
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 from gpu_fault.env_validation import training_health_monitor_enabled
 
@@ -319,6 +320,24 @@ def start_notification_worker(
     worker = Thread(
         target=dispatch,
         name="gpu-fault-notification-dispatcher",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def start_process_metrics_worker(
+    render: Callable[[], list[str]], stop: Event
+) -> Thread:
+    """Share this process's /metrics render with the Pod's other uvicorn
+    processes every few seconds, so a scrape answered by any of them merges
+    the whole Pod (see ``process_metrics``). Every process, every role; the
+    thread returns at once when sharing is off (no POD_UID)."""
+
+    worker = Thread(
+        target=process_metrics.publish_forever,
+        args=(render, stop),
+        name="gpu-fault-process-metrics",
         daemon=True,
     )
     worker.start()

@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import GPU_METRICS_PATH
+from gpu_fault.collectors.gpu.discovery import (
+    deliver_gpu_inventory,
+    query_nvidia_temperature_limits,
+)
+from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
 from gpu_fault.env import env_bool
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
@@ -20,17 +28,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSource,
     GpuMetricsThresholds,
 )
-
-
-from gpu_fault.collectors.gpu.discovery import (
-    deliver_gpu_inventory,
-    query_nvidia_temperature_limits,
-)
 from gpu_fault.transport.http_client import urlopen
-from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import CollectorError, EventSink
-from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
 
 LOGGER = logging.getLogger(__name__)
 

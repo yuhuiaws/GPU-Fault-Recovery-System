@@ -16,12 +16,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from gpu_fault.store.postgres import ddl
-
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
     POSTGRES_SCHEMA_MIGRATIONS,
 )
+from gpu_fault.store.postgres import ddl
 from gpu_fault.store.postgres.ddl import declared_index_names
 
 # The DDL source is checksummed into the migration registry, so the statement
@@ -72,6 +71,75 @@ def index_health(connection: Any) -> list[dict[str, Any]]:
         {"name": name, "present": name in found, "valid": found.get(name, False)}
         for name in names
     ]
+
+
+_INDEX_TABLE = re.compile(r"\bON\s+(\w+)", re.IGNORECASE)
+_INDEX_HEADER = re.compile(
+    r"^CREATE\s+(UNIQUE\s+)?INDEX\s+\S+\s+ON\s+\S+\s+", re.IGNORECASE
+)
+
+
+def _normalized_indexdef(definition: str) -> str:
+    """``pg_get_indexdef`` output with the index and table names removed, so two
+    deparsed definitions compare on what they index and where."""
+
+    return _INDEX_HEADER.sub(
+        lambda m: f"CREATE {(m.group(1) or '').upper()}INDEX ON ",
+        " ".join(definition.split()),
+        1,
+    )
+
+
+def index_definition_defects(cursor: Any) -> list[str]:
+    """Live indexes whose definition differs from the DDL's, by name (G-6).
+
+    ``pg_indexes.indexdef`` is the server's deparse, which no textual
+    normalisation of our source statement can reproduce (casts, ``ANY(ARRAY)``
+    for ``IN`` lists, parenthesisation). So each declared statement is
+    created against an empty session-temporary clone of its table -- an empty
+    index costs a millisecond and takes no lock on the real table -- and the
+    two deparses are compared with the index and table names stripped. The
+    temp tables are ``ON COMMIT DROP``; the caller runs this inside one
+    transaction on one connection.
+    """
+
+    statements = declared_index_statements()
+    cursor.execute(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE indexname = ANY(%s)",
+        (sorted(statements),),
+    )
+    live = {row[0]: str(row[1]) for row in cursor.fetchall()}
+    probed_tables: set[str] = set()
+    defects: list[str] = []
+    for name in sorted(statements):
+        if name not in live:
+            continue
+        statement = statements[name]
+        match = _INDEX_TABLE.search(statement)
+        if match is None:  # pragma: no cover - declared statements always name a table
+            continue
+        table = match.group(1)
+        probe_table = f"gf_indexdef_probe_{table}"
+        if table not in probed_tables:
+            cursor.execute(
+                f"CREATE TEMP TABLE {probe_table} (LIKE {table}) ON COMMIT DROP"
+            )
+            probed_tables.add(table)
+        probe_index = f"gf_indexdef_probe_{name}"[:63]
+        probe_statement = _INDEX_TABLE.sub(f"ON {probe_table}", statement, count=1)
+        probe_statement = re.sub(
+            r"INDEX\s+IF\s+NOT\s+EXISTS\s+\w+",
+            f"INDEX {probe_index}",
+            probe_statement,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        cursor.execute(probe_statement)
+        cursor.execute("SELECT pg_get_indexdef(to_regclass(%s))", (probe_index,))
+        expected = str(cursor.fetchone()[0])
+        if _normalized_indexdef(live[name]) != _normalized_indexdef(expected):
+            defects.append(name)
+    return defects
 
 
 def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
@@ -160,6 +228,12 @@ def _schema_preflight_report(
     health = index_health(connection)
     missing = [row["name"] for row in health if not row["present"]]
     invalid = [row["name"] for row in health if row["present"] and not row["valid"]]
+    # The probe creates ON COMMIT DROP temp tables, which the read-only default
+    # set by ``schema_preflight`` refuses; this one transaction opts back out.
+    # Nothing durable is written and the real tables are never locked.
+    with connection.transaction():
+        cursor.execute("SET TRANSACTION READ WRITE")
+        drifted = index_definition_defects(cursor)
     if registered < LATEST_POSTGRES_SCHEMA_VERSION:
         reasons.append(
             f"schema version {registered} is behind the wheel's "
@@ -182,6 +256,11 @@ def _schema_preflight_report(
             "indexes invalid (rebuild with --build-indexes-concurrently): "
             + ", ".join(invalid)
         )
+    if drifted:
+        reasons.append(
+            "indexes whose definition differs from the DDL (drop, then rebuild "
+            "with --build-indexes-concurrently): " + ", ".join(drifted)
+        )
     if unflagged:
         reasons.append(
             f"{unflagged} in-flight safety workflow(s) predate safety_only; "
@@ -195,7 +274,12 @@ def _schema_preflight_report(
             "required": LATEST_POSTGRES_SCHEMA_VERSION,
             "history_ok": history_ok,
         },
-        "indexes": {"missing": missing, "invalid": invalid, "declared": len(health)},
+        "indexes": {
+            "missing": missing,
+            "invalid": invalid,
+            "drifted": drifted,
+            "declared": len(health),
+        },
         "in_flight_safety_workflows_without_flag": unflagged,
         "blocking_reasons": reasons,
         "diagnostics": diagnostics,
@@ -229,6 +313,23 @@ def database_diagnostics(cursor: Any) -> dict[str, Any]:
         "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements')"
     )
     report["pg_stat_statements_installed"] = bool(cursor.fetchone()[0])
+    # The hot table's bloat (control-plane review 2026-09-08, G-9): whole-row
+    # JSONB upserts under ~50 expression indexes cannot be HOT-pruned, so the
+    # dead-tuple count is the number to read before blaming the planner.
+    cursor.execute(
+        """
+        SELECT s.n_dead_tup, s.n_live_tup, c.reloptions
+        FROM pg_class c
+        LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+        WHERE c.oid = to_regclass('gpu_fault_objects')
+        """
+    )
+    row = cursor.fetchone()
+    report["gpu_fault_objects_n_dead_tup"] = int(row[0] or 0) if row else 0
+    report["gpu_fault_objects_n_live_tup"] = int(row[1] or 0) if row else 0
+    report["gpu_fault_objects_autovacuum_options"] = sorted(
+        str(item) for item in ((row[2] if row else None) or [])
+    )
     return report
 
 

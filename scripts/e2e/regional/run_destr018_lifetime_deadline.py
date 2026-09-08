@@ -1083,18 +1083,9 @@ def known_incidents(run: LiveRun) -> list[str]:
     return [item for item in (run.support_incident_id, run.incident_id) if item]
 
 
-def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
-    """Release the isolation through a validated restore, never by hand.
-
-    Runs *after* the env window has closed: a restore workflow created inside
-    the window inherits the compressed lifetime and can fail on it. Both
-    incidents are restored, as DESTR-017 does -- the support incident owns the
-    taint, and the reset incident must not be left ESCALATED over a node
-    nobody isolates any more.
-    """
-
+def _node_isolated(run: LiveRun) -> bool:
     snapshot = run.regional.node_snapshot(run.settings.node)
-    isolated = bool(
+    return bool(
         snapshot.get("unschedulable")
         or snapshot.get("ownership_annotations")
         or any(
@@ -1102,13 +1093,80 @@ def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
             for taint in snapshot.get("taints") or []
         )
     )
+
+
+def close_reset_incident(
+    run: LiveRun, warm: WarmSpareLiveFixture, incident_id: str
+) -> tuple[str, str] | None:
+    """Close the ESCALATED reset incident through the operator API.
+
+    The product exit for exactly this state (DESTR-018 product gap): the node
+    is back, nobody isolates it, and the incident only keeps recording the
+    node's faults. Returns ``(state, path)`` -- ``auto-closed`` when the
+    support restore's terminal hook already closed it, ``close-api`` when the
+    POST closed it -- or ``None`` when the route refused (409: a workflow of
+    the incident is still open) or does not exist yet (404: an older release),
+    so the caller falls back to the validated restore workflow.
+    """
+
+    current = warm.incident_by_id(incident_id)
+    if current.get("state") == "RECOVERED":
+        return "RECOVERED", "auto-closed"
+    response = warm.close_incident(
+        incident_id,
+        reason=f"{CASE_ID} cleanup: node restored through the support incident",
+        operator=f"{CASE_ID}-cleanup",
+    )
+    body = response.get("body") or {}
+    incident = body.get("incident") or {}
+    if response.get("status") == 200 and incident.get("state") == "RECOVERED":
+        return "RECOVERED", "close-api"
+    run.case_dir.joinpath(f"close-{incident_id}-refused.json").write_text(
+        json.dumps(response, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return None
+
+
+def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
+    """Release the isolation through a validated restore, never by hand; close
+    the incident that no longer owns any isolation through the operator API.
+
+    Runs *after* the env window has closed: a restore workflow created inside
+    the window inherits the compressed lifetime and can fail on it. The support
+    incident owns the taint and is restored first, through a validated restore
+    workflow, as DESTR-017 does. The reset incident then sits ESCALATED over a
+    node nobody isolates any more; it is closed through
+    ``POST /v1/incidents/{id}/close`` (``close_reset_incident``) -- or found
+    already RECOVERED by the restore's terminal hook -- and only falls back to a
+    second restore workflow when the route refuses. An incident that still owns
+    the isolation (no support escalation happened) is never closed by hand.
+    """
+
+    isolated = _node_isolated(run)
     report: dict[str, Any] = {"isolated": isolated}
     ordered = known_incidents(run)
     if isolated and not ordered:
         raise RegionalFixtureError("the node is isolated but no incident is known")
     warm = WarmSpareLiveFixture(run.regional, "")
+    owner = ordered[0] if ordered else ""
     for incident_id in ordered:
         warm.wait_incident_idle(incident_id)
+        if incident_id != owner and not _node_isolated(run):
+            closed = close_reset_incident(run, warm, incident_id)
+            if closed is not None:
+                report[incident_id], report[f"{incident_id}:path"] = closed
+                continue
+            refused = json.loads(
+                run.case_dir.joinpath(f"close-{incident_id}-refused.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            report[f"{incident_id}:close_refused"] = (
+                f"{refused.get('status')}: "
+                f"{(refused.get('body') or {}).get('detail') or refused.get('body')}"
+            )
+        report[f"{incident_id}:path"] = "restore-workflow"
         created = warm.create_restore_workflow(
             incident_id=incident_id,
             node=run.settings.node,

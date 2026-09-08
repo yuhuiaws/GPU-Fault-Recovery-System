@@ -10,6 +10,10 @@ from gpu_fault.remote_command_models import (
 )
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.remote_commands import (
+    stale_fence,
+    stale_fence_update,
+)
 from gpu_fault.store.shared.remote_helpers import (
     LEGACY_EXECUTOR_SAFETY_REJECTION_ERRORS,
     UNCLAIMED_DEADLINE_STATUS_SOURCE,
@@ -637,6 +641,81 @@ class PostgresRemoteCommandMixin:
                     "remote_command",
                     command.command_id,
                     _unclaimed_expiry_update(command, now),
+                )
+                expired += 1
+        return expired
+
+    def expire_stale_fenced_remote_commands(
+        self,
+        *,
+        lease_expired_before: datetime,
+        limit: int,
+    ) -> int:
+        """Fail LEASED commands whose lease lapsed under a stale generation.
+
+        Candidates are selected in SQL -- LEASED, lease expired before the
+        cut-off, and the owning workflow at another ``fencing_token`` -- then
+        re-read under the per-command advisory lock (in ``command_id`` order,
+        like the claim) and the row lock, and only failed if still in that
+        state (control-plane review 2026-09-08, D-9).
+        """
+
+        now = datetime.now(timezone.utc)
+        expired = 0
+        with self._state_transaction("remote_command/stale-fence"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT cmd.key FROM gpu_fault_objects AS cmd
+                    WHERE cmd.kind='remote_command'
+                      AND cmd.payload->>'status'='LEASED'
+                      AND (cmd.payload->>'lease_expires_at')::timestamptz <= %s
+                      AND EXISTS (
+                          SELECT 1 FROM gpu_fault_objects AS flow
+                          WHERE flow.kind='workflow'
+                            AND flow.key = cmd.payload->>'workflow_request_id'
+                            AND flow.payload->>'fencing_token'
+                                IS DISTINCT FROM cmd.payload->>'fencing_token'
+                      )
+                    ORDER BY cmd.payload->>'created_at', cmd.key
+                    LIMIT %s
+                    """,
+                    (lease_expired_before, limit),
+                )
+                keys = sorted(row[0] for row in cursor.fetchall())
+                if not keys:
+                    return 0
+                cursor.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(
+                            'remote_command/' || command_id, 0
+                        )
+                    )
+                    FROM (
+                        SELECT unnest(%s::text[]) AS command_id
+                        ORDER BY command_id
+                    ) AS ordered
+                    """,
+                    (keys,),
+                )
+            for key in keys:
+                try:
+                    command = self._get_for_update("remote_command", key)
+                except NotFoundError:
+                    continue
+                workflow = self._get_optional("workflow", command.workflow_request_id)
+                if (
+                    command.status is not RemoteCommandStatus.LEASED
+                    or command.lease_expires_at is None
+                    or command.lease_expires_at > lease_expired_before
+                    or not stale_fence(command, workflow)
+                ):
+                    continue
+                self._put(
+                    "remote_command",
+                    command.command_id,
+                    stale_fence_update(command, workflow, now, swept=True),
                 )
                 expired += 1
         return expired

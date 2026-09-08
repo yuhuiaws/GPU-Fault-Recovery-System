@@ -25,7 +25,6 @@ from gpu_fault.models import (
     WorkflowStepSpec,
 )
 
-
 LOGGER = logging.getLogger(__name__)
 
 HYPERPOD_JOB_AUTO_RESUME_ANNOTATION = "sagemaker.amazonaws.com/enable-job-auto-resume"

@@ -140,3 +140,75 @@ def test_the_freshness_window_cannot_be_shorter_than_the_match_window() -> None:
         WorkloadTopologyService(
             build_store(), max_age_seconds=120, freshness_seconds=60
         )
+
+
+# --- coverage heartbeat -------------------------------------------------------
+#
+# A cluster with no managed attempt produces no observation, so "no fresh
+# observation" could not tell an idle cluster from a dead watcher and the
+# design fell closed to UNKNOWN. The watcher now reports after every full
+# scan, even an empty one; a fresh heartbeat is coverage, so an idle cluster
+# resolves IDLE while a silent one still resolves UNKNOWN.
+
+
+def _heartbeat(scanned_at: datetime, *, attempt_count: int = 0):
+    from gpu_fault.watcher import WorkloadCoverageHeartbeat
+
+    return WorkloadCoverageHeartbeat(
+        cluster_id=CLUSTER, scanned_at=scanned_at, attempt_count=attempt_count
+    )
+
+
+def test_a_fresh_coverage_heartbeat_makes_an_unobserved_node_idle() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(NOW - timedelta(seconds=30)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "IDLE", (
+        "the watcher scanned the cluster and found nothing: the node is idle"
+    )
+    assert context.attempt_ids == []
+
+
+def test_a_stale_coverage_heartbeat_leaves_the_node_unknown() -> None:
+    store = build_store()
+    topology = _topology(store, freshness_seconds=600)
+    topology.observe_coverage(_heartbeat(NOW - timedelta(seconds=601)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "a heartbeat older than the freshness window is a dead watcher"
+    )
+
+
+def test_a_coverage_heartbeat_never_makes_a_node_active() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(NOW, attempt_count=3))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "IDLE"
+    assert context.job_ids == []
+
+
+def test_an_older_heartbeat_does_not_overwrite_a_newer_one() -> None:
+    store = build_store()
+    newer = _heartbeat(NOW)
+    older = _heartbeat(NOW - timedelta(seconds=45))
+
+    assert store.save_workload_coverage(newer) is True
+    assert store.save_workload_coverage(older) is False
+    assert store.get_workload_coverage(CLUSTER) == newer
+
+
+def test_coverage_is_per_cluster() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(NOW))
+
+    assert topology.resolve("cluster-b", "node-1", NOW).workload_state == "UNKNOWN"
+    assert store.get_workload_coverage("cluster-b") is None

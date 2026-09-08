@@ -9,8 +9,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib import error as urllib_error
-from urllib.parse import quote
 from urllib import request as urllib_request
+from urllib.parse import quote
 
 
 def _nodes(value: str) -> list[str]:

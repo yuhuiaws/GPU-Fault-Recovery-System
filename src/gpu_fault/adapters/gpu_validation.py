@@ -3,16 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.dcgm_fields import missing_fabric_metric_groups
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
-from gpu_fault.dcgm_fields import missing_fabric_metric_groups
-from gpu_fault.gpu_metrics import GpuMetricsService
-from gpu_fault.gpu_metrics import GpuMetricSource
-from gpu_fault.telemetry import (
-    CollectorKind,
-)
+from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepSpec,
@@ -21,6 +17,9 @@ from gpu_fault.models import (
 from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
+)
+from gpu_fault.telemetry import (
+    CollectorKind,
 )
 
 

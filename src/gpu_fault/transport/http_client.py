@@ -16,6 +16,8 @@ from urllib.request import (
     Request,
     getproxies,
     proxy_bypass,
+)
+from urllib.request import (
     urlopen as _urllib_urlopen,
 )
 from urllib.response import addinfourl

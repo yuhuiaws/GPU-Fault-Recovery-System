@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import json
 import logging
 import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-
+from typing import Any, Callable
 
 from gpu_fault.host_health import (
     HostMetricSample,
 )
-
 
 LOGGER = logging.getLogger(__name__)
 

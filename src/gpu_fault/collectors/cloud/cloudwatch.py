@@ -9,15 +9,6 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-
-from gpu_fault.hma import (
-    HMA_FAULT_DETAILS,
-    HMA_FAULT_REASONS,
-    HMA_FAULT_TYPES,
-    HMA_HEALTH_STATUS,
-)
-
-
 from gpu_fault.collectors.context import (
     context_from_environment,
     sink_from_environment,
@@ -27,6 +18,12 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     SqsEventSink,
+)
+from gpu_fault.hma import (
+    HMA_FAULT_DETAILS,
+    HMA_FAULT_REASONS,
+    HMA_FAULT_TYPES,
+    HMA_HEALTH_STATUS,
 )
 
 LOGGER = logging.getLogger(__name__)

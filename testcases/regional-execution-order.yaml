@@ -141,7 +141,15 @@ phases:
       - case: GF-REGIONAL-DESTR-020
         predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-021
+      - case: GF-REGIONAL-DESTR-023
+        predecessor: GF-REGIONAL-DESTR-001
+      - case: GF-REGIONAL-DESTR-024
     notes:
+      - DESTR-023 以 DESTR-001 PASS 为证据前置，在无任何受管作业、观测流全部过期、只剩 watcher 覆盖心跳的
+        真正空闲集群上再做一次真实 GPU reset，证明节点不因 UNKNOWN 被 BLOCKED；不改任何控制面或 watcher 设置。
+      - DESTR-024 以 DESTR-023 PASS 为前置，把 completion watcher 缩到 0 让心跳过期，注入同一 XID 46，
+        只允许 FREEZE/MARK_UNSCHEDULABLE/QUARANTINE 与 BLOCKED，不 quiesce、不 reset、不 reboot；watcher 由 detached
+        watchdog 兜底恢复，隔离只经 validated restore 工作流解除。
       - DESTR-020 以 DESTR-001 PASS 为证据前置，对一个 Kubernetes 与 fleet 都不认识的别名 node_id 走 API 重放的目录外 XID
         （SITE_SAFETY 隔离计划，无任何物理步骤），只证明 MARK_UNSCHEDULABLE 对 404 fail closed；别名没有 Node Agent 也没有
         provider 节点，任何 reset/reboot 都不可能被 arm；support 升级恰一次（containment_refused，只 FREEZE_EVIDENCE→ESCALATE_SUPPORT），链深度 ≤1。

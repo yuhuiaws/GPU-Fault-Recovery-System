@@ -95,11 +95,22 @@ spec:
               value: active
             - name: GPU_FAULT_SERVICE_ROLE
               value: ingress
+            # Start-up fallback only. The env is captured when the Pod is
+            # created and never updated; the store reads the DSN through
+            # GPU_FAULT_STORE_URL_FILE below, which kubelet keeps in step with
+            # the Secret after every credential refresh (CP-3). Kept for one
+            # release so settings/admission/executor code that still reads
+            # the env before the store opens keeps working.
             - name: GPU_FAULT_STORE_URL
               valueFrom:
                 secretKeyRef:
                   name: gpu-fault-aurora
                   key: postgres-url
+            # The projected postgres-url key of the aurora-credentials mount.
+            # The pool re-reads it on every connect, so a rotated Aurora
+            # password reaches running replicas without a restart.
+            - name: GPU_FAULT_STORE_URL_FILE
+              value: /etc/gpu-fault/aurora/postgres-url
             # The Aurora DSN uses sslmode=verify-full, so the RDS CA bundle
             # mounted below must be readable here. Aligns with the path baked
             # into the DSN by gpu_fault.admin.bootstrap._aurora_dsn.
@@ -597,6 +608,14 @@ spec:
             - name: rds-ca-bundle
               mountPath: /etc/gpu-fault/rds
               readOnly: true
+            # The gpu-fault-aurora Secret as files: postgres-url (the DSN the
+            # pool re-reads on every connect) and last-refresh-status.json
+            # (written by the credential refresher, exported as a metric). No
+            # subPath: kubelet only propagates Secret updates to whole-volume
+            # mounts.
+            - name: aurora-credentials
+              mountPath: /etc/gpu-fault/aurora
+              readOnly: true
       volumes:
         - name: artifact
           configMap:
@@ -611,6 +630,9 @@ spec:
         - name: rds-ca-bundle
           configMap:
             name: gpu-fault-rds-ca-bundle
+        - name: aurora-credentials
+          secret:
+            secretName: gpu-fault-aurora
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

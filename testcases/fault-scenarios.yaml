@@ -4147,6 +4147,64 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
   related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
+- id: GF-REGIONAL-DESTR-023
+  title: 真正空闲集群的自主复位：无受管作业、观测流全部过期时，watcher 覆盖心跳让节点保持 IDLE，XID 46 走完八步 RESET_GPU 而不被 UNKNOWN 阻塞
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: >-
+    WorkloadTopologyService.resolve 只在集群有新鲜覆盖（freshness_seconds 内的任一 attempt 观测）时才把节点判为 IDLE，
+    否则 fail-closed 为 UNKNOWN，compile_steps 拒绝一切改动节点的计划（"node workload state is UNKNOWN"）。
+    completion watcher 过去只为受管 attempt 发布观测，所以一个真正空闲的集群在 10 分钟后就是"监控丢失"；
+    此前 DESTR-001/010/016 在空闲节点上通过，只是因为残留训练作业维持着观测流，2026-09-08 DESTR-016 第 4 次尝试在真正空闲的集群上被 BLOCKED。
+    CP-8 让 watcher 在每次全量扫描后（哪怕零个受管 attempt）POST /v1/workload-coverage 心跳，拓扑服务把新鲜心跳视为覆盖。
+    真机必须证明：观测流完全过期、只剩心跳时节点仍是 IDLE，且 XID 46 真的复位成功。
+  injection: >-
+    前置确认集群没有任何 gpu-fault.io/managed=true 的 Pod、没有 coverage-canary Job、watcher Deployment 恰一个 Ready 副本、
+    控制面 store 具备 get_workload_coverage。等待直到最新 attempt 观测的年龄超过 freshness_seconds 而心跳仍新鲜、
+    目标节点 workload_state=IDLE（每 15 s 记录一次覆盖探针）；随后用宿主探针向 /dev/kmsg 写入一条 XID 46，
+    复用 DESTR-001 的注入、采样器与宿主断言。不改任何控制面或 watcher 设置。
+  expected:
+  - 预置门禁：控制面 store 有 get_workload_coverage（否则先部署 CP-8 版本，拒绝执行）；集群无受管 Pod、无 gpu-fault-coverage-canary Job；watcher Deployment replicas=1 且 readyReplicas=1
+  - 注入前的覆盖探针：心跳 scanned_at 年龄 <= freshness_seconds；最新 attempt 观测的年龄 > freshness_seconds 或不存在（IDLE 只能归因于心跳）；目标节点 workload_state=IDLE
+  - 工作流 blocked_reasons 不含"node workload state is UNKNOWN"，status 不为 BLOCKED
+  - 其余全部等于 DESTR-001 的 reset 契约：八步 official_steps、SUCCEEDED、远端 WAITING 明细 mutation_submitted_by_control_plane=false、Node Agent ledger 恰一条 RESET_GPU、宿主采样器看到目标 GPU 离开并回来、服务与 timer 回到基线、无 provider 变更、控制面 EKS 状态不变
+  - 清理后节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；探针 Pod/ConfigMap 无残留
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-023
+  related_pytest: tests/regional/test_destr023_idle_cluster_reset.py::test_fresh_coverage_refuses_idle_that_a_leftover_job_could_explain
+- id: GF-REGIONAL-DESTR-024
+  title: watcher 停机时 fail-closed：覆盖心跳过期后节点为 UNKNOWN，XID 46 只做隔离并 BLOCKED，不 quiesce 不 reset；watcher 恢复后心跳回来，隔离经 validated restore 解除
+  category: regional-destructive-acceptance
+  level: staging
+  risk: live-isolation
+  problem: >-
+    覆盖心跳的另一半：心跳是活着的 watcher 的证明，不是无条件信任的表。watcher 死掉、集群沉默、心跳过期时，
+    拓扑服务必须回到 UNKNOWN，改动节点的计划必须被拒绝，而安全步骤（FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUARANTINE）仍要跑完把节点圈住。
+    只有单元证据；真机要证明部署的控制面在 watcher 副本为 0、心跳过期时真的把 XID 46 的 RESET_GPU 计划 BLOCKED 且一个物理步骤都没有下发，
+    并且 watcher 回来后心跳真的前进、节点回到 IDLE。
+  injection: >-
+    先在独立会话里武装一个 detached watchdog（sleep 后把 watcher 副本数恢复到基线），再把 gpu-fault-completion-watcher Deployment 缩到 0 并等 Pod 消失；
+    每 15 s 读覆盖探针直到心跳与最新观测都比 freshness_seconds 更老、目标节点 workload_state=UNKNOWN；
+    用宿主探针向 /dev/kmsg 写入一条 XID 46；工作流终态后把 watcher 缩回基线副本数、等 rollout；
+    确认心跳前进；最后用 WarmSpareLiveFixture.create_restore_workflow 的 validation-first restore 工作流解除隔离。
+    不改任何控制面设置，不手删 taint。
+  expected:
+  - 预置门禁：DESTR-023 PASS；控制面有 get_workload_coverage；缩容前心跳新鲜、节点 IDLE；集群无受管 Pod、无 canary Job；watcher 恰一个 Ready 副本
+  - 缩容后 watcher Deployment replicas=0、无 app=gpu-fault-completion-watcher Pod；随后覆盖探针：心跳年龄 > freshness_seconds（或无心跳）、无新鲜 attempt 观测、目标节点 workload_state=UNKNOWN
+  - 注入的 XID 46 kmsg 事件被策略判为 RESET_GPU，但工作流 status=BLOCKED、blocked_kind=SAFETY_SETTLED、blocked_reasons 含"node workload state is UNKNOWN"
+  - 安全步骤 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE 完成，目标节点被隔离（unschedulable 或 gpu-fault.io/ taint 或 ownership 注解）
+  - 无任何物理步骤：official_steps、completed_operations、step_executions、远端命令中都没有 QUIESCE_GPU_SERVICES/VERIFY_NO_GPU_CLIENTS/RESET_GPU/RESTORE_GPU_SERVICES/RESTART_NODE；Node Agent ledger 无新增物理行；宿主无 quiesce state；GPU 数与基线 active 服务不变
+  - watcher 恢复到基线副本并 rollout 完成后，心跳 scanned_at 严格晚于过期前的值、年龄 <= freshness_seconds、目标节点 workload_state 回到 IDLE
+  - validated restore 工作流 SUCCEEDED；节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；watchdog 在 watcher 真机恢复成功之后才解除
+  - 全程无 provider 变更；控制面 EKS 状态与基线相同；探针资源无残留；若节点仍隔离且未经 validated restore，直接判 FAIL
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-024
+  related_pytest: tests/regional/test_destr024_watcher_down_fail_closed.py::test_a_workflow_that_ran_is_the_failure_the_case_exists_to_catch
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance
@@ -4567,7 +4625,7 @@ test_cases:
     verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-009
-  related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_restarts_every_configured_consumer
+  related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_updates_the_secret_and_leaves_every_deployment_alone
 - id: GF-REGIONAL-HA-010
   title: Aurora 写入端故障转移只让控制面 NotReady 而不重启任何 Pod，启动退避有界
   category: regional-high-availability

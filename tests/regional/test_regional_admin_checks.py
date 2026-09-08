@@ -64,6 +64,7 @@ def test_unconfirmed_sns_subscription_is_a_warning_not_a_failure(
         "_check_cpu_workloads",
         "check_email_notifications",
         "check_aurora_refresh",
+        "check_adot_self_metrics",
         "_verify_profile",
         "run_read_only_verifiers",
         "_check_runtime_component_identity",
@@ -381,6 +382,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "_check_nlb_inputs",
         "_check_aurora",
         "check_aurora_refresh",
+        "check_control_record_archive_bucket",
         "check_email_notifications",
         "_check_monitoring",
         "workflow_safety_snapshot",
@@ -405,6 +407,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "nlb_inputs",
         "aurora",
         "aurora_credential_refresh",
+        "control_record_archive_bucket",
         "email_notifications",
         "monitoring",
         "workflow_safety",
@@ -541,6 +544,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "_check_cpu_workloads",
         "check_email_notifications",
         "check_aurora_refresh",
+        "check_adot_self_metrics",
         "_verify_profile",
         "run_read_only_verifiers",
         "_check_runtime_component_identity",
@@ -589,6 +593,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "cpu_workloads",
         "email_notifications",
         "aurora_credential_refresh",
+        "adot_self_metrics",
         "runtime_profile",
         "read_only_verifiers",
         "runtime_component_identity",
@@ -906,6 +911,7 @@ def test_gpu_cluster_check_is_pinned_to_the_node_wheel(monkeypatch) -> None:
         "_check_cpu_workloads",
         "check_email_notifications",
         "check_aurora_refresh",
+        "check_adot_self_metrics",
         "_verify_profile",
         "run_read_only_verifiers",
         "_check_runtime_component_identity",
@@ -958,9 +964,15 @@ def test_control_api_health_rejects_stuck_or_broken_commands(
 def test_certificate_hostname_matching_is_single_label() -> None:
     module = CHECKS
 
-    assert module._hostname_matches("control.example", "control.example")
-    assert module._hostname_matches("*.example", "control.example")
-    assert not module._hostname_matches("*.example", "nested.control.example")
+    assert module._hostname_matches("control.example", "control.example"), (
+        "an exact hostname matches itself"
+    )
+    assert module._hostname_matches("*.example", "control.example"), (
+        "a wildcard matches one label"
+    )
+    assert not module._hostname_matches("*.example", "nested.control.example"), (
+        "a wildcard must not span two labels"
+    )
 
 
 def _nlb_release(calls: list[str], *, certificate_status: str = "ISSUED"):
@@ -1278,3 +1290,378 @@ def test_quick_health_report_runs_only_the_cheap_checks(monkeypatch) -> None:
     assert set(report) >= {"mode", "site_name", "healthy", "summary", "checks"}, (
         "quick health must keep the health-report shape"
     )
+
+
+# --- check_aurora_refresh judges the Secret's status file, not a rollout -------
+#
+# CP-3: running Pods reload the mounted Secret, so the refresher no longer rolls
+# any Deployment; the check must not expect a generation to advance. H1-2/H1-3:
+# the refresher writes last-refresh-status.json into the Secret on every run and
+# Jobs carry the ``app`` label, so a failed refresh is visible at preflight.
+
+
+def _aurora_cronjob(targets: list[str]) -> dict:
+    return {
+        "spec": {
+            "schedule": "17 * * * *",
+            "jobTemplate": {
+                "metadata": {"labels": {"app": "gpu-fault-aurora-credential-refresh"}},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {
+                                            "name": (
+                                                "GPU_FAULT_AURORA_RESTART_DEPLOYMENTS"
+                                            ),
+                                            "value": ",".join(targets),
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+        },
+        "status": {"lastSuccessfulTime": "2026-09-08T09:17:20Z"},
+    }
+
+
+def _aurora_role(targets: list[str]) -> dict:
+    return {
+        "rules": [
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "resourceNames": targets,
+                "verbs": ["get", "patch"],
+            }
+        ]
+    }
+
+
+def _aurora_secret(status: dict | None) -> dict:
+    data = {"postgres-url": "eA==", "master-secret-arn": "eQ=="}
+    if status is not None:
+        data["last-refresh-status.json"] = base64.b64encode(
+            json.dumps(status).encode()
+        ).decode()
+    return {"data": data}
+
+
+def _aurora_release(cronjob, role, secret, jobs=None):
+    class AuroraRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            if "role" in command:
+                return role
+            if "job" in command:
+                return {"items": jobs or []}
+            if "secret" in command:
+                return secret
+            return cronjob
+
+    return AuroraRelease()
+
+
+TARGETS = ["gpu-fault-api-ha", "gpu-fault-control-worker"]
+
+
+def _status(status: str, *, minutes_ago: int, error: str | None = None) -> dict:
+    finished = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return {
+        "status": status,
+        "finished_at": finished.isoformat(timespec="seconds"),
+        "error": error,
+        "rotated": False,
+        "restarted": False,
+        "reason": "secret already carries the AWSCURRENT password",
+    }
+
+
+def test_aurora_refresh_check_reports_a_fresh_ok_status() -> None:
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=20)),
+    )
+
+    value = module.check_aurora_refresh(release, require_success=True)
+
+    assert value.details["deployment_targets"] == TARGETS
+    status = value.details["last_refresh_status"]
+    assert status["status"] == "ok"
+    assert 19 * 60 <= status["age_seconds"] <= 21 * 60
+    assert value.details["restarts_deployments"] is False
+
+
+def test_aurora_refresh_check_fails_on_a_failed_status_even_at_preflight() -> None:
+    """The root cause used to surface only inside the release transaction."""
+
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(
+            _status(
+                "failed",
+                minutes_ago=5,
+                error="RuntimeError: managed secret has no password field",
+            )
+        ),
+    )
+
+    with pytest.raises(module.ReleaseError, match="no password field"):
+        module.check_aurora_refresh(release)
+
+
+def test_aurora_refresh_check_fails_a_verify_on_a_stale_status() -> None:
+    """Hourly schedule: three missed ticks with no status write means the
+    refresher is not running, whatever lastSuccessfulTime says."""
+
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=4 * 60)),
+    )
+
+    with pytest.raises(module.ReleaseError, match="stale"):
+        module.check_aurora_refresh(release, require_success=True)
+    # At preflight a stale status is reported, not fatal: the orchestrator runs
+    # the refresh Job itself before touching anything.
+    value = module.check_aurora_refresh(release)
+    assert value.details["last_refresh_status"]["stale"] is True
+
+
+def test_aurora_refresh_check_verify_requires_a_status_at_all() -> None:
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS), _aurora_role(TARGETS), _aurora_secret(None)
+    )
+
+    with pytest.raises(module.ReleaseError, match="never recorded"):
+        module.check_aurora_refresh(release, require_success=True)
+    # Preflight tolerates an older refresher build that never wrote one.
+    value = module.check_aurora_refresh(release)
+    assert value.details["last_refresh_status"] is None
+
+
+def test_aurora_refresh_check_surfaces_the_latest_failed_job() -> None:
+    """H1-3: with the ``app`` label on the Job the branch finally sees Jobs."""
+
+    module = _checks_module()
+    jobs = [
+        {
+            "metadata": {
+                "name": "refresh-old",
+                "creationTimestamp": "2026-09-08T08:17:00Z",
+            },
+            "status": {"conditions": [{"type": "Complete", "status": "True"}]},
+        },
+        {
+            "metadata": {
+                "name": "refresh-new",
+                "creationTimestamp": "2026-09-08T09:17:00Z",
+            },
+            "status": {"conditions": [{"type": "Failed", "status": "True"}]},
+        },
+    ]
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=90)),
+        jobs=jobs,
+    )
+
+    with pytest.raises(module.ReleaseError, match="refresh-new"):
+        module.check_aurora_refresh(release)
+
+
+def test_aurora_refresh_check_lists_jobs_by_the_job_label() -> None:
+    module = _checks_module()
+    seen: list[tuple] = []
+    base = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=1)),
+    )
+    original = base._get_json
+
+    def recording(command):
+        seen.append(command)
+        return original(command)
+
+    base._get_json = recording
+    module.check_aurora_refresh(base)
+
+    job_commands = [command for command in seen if "job" in command]
+    assert job_commands and "app=gpu-fault-aurora-credential-refresh" in job_commands[0]
+
+
+def test_archive_bucket_check_requires_the_site_region(monkeypatch) -> None:
+    module = _checks_module()
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            aws_region="us-east-2",
+            retention=SimpleNamespace(
+                archive_s3_uri="s3://gpu-fault-control-records/site/archive"
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "us-east-2"}
+    )
+    value = module.check_control_record_archive_bucket(release)
+    assert value.details == {
+        "bucket": "gpu-fault-control-records",
+        "prefix": "site/archive",
+        "region": "us-east-2",
+    }
+
+    monkeypatch.setattr(
+        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "eu-west-1"}
+    )
+    with pytest.raises(module.ReleaseError, match="expected the site Region"):
+        module.check_control_record_archive_bucket(release)
+
+    release.config.retention.archive_s3_uri = "s3://bucket-only"
+    with pytest.raises(module.ReleaseError, match="s3://bucket/prefix"):
+        module.check_control_record_archive_bucket(release)
+
+    release.config.retention.archive_s3_uri = None
+    with pytest.raises(module.CheckSkipped):
+        module.check_control_record_archive_bucket(release)
+
+
+def test_adot_self_metrics_check_reads_the_live_collector() -> None:
+    module = _checks_module()
+    required = module.adot_self_metric_names()
+    assert "otelcol_process_memory_rss" in required, "the memory alert reads it"
+
+    class Runner:
+        def __init__(self, body: str) -> None:
+            self.body = body
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(self, command, capture=False, **_kwargs):
+            self.commands.append(tuple(command))
+            return self.body
+
+    class AdotRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        def __init__(self, body: str) -> None:
+            self.runner = Runner(body)
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(_command):
+            return {
+                "items": [
+                    {
+                        "metadata": {"name": "gpu-fault-adot-1"},
+                        "status": {"phase": "Running"},
+                    }
+                ]
+            }
+
+    complete = "\n".join(
+        [f'# TYPE {name} gauge\n{name}{{x="y"}} 1' for name in sorted(required)]
+    )
+    release = AdotRelease(complete)
+    value = module.check_adot_self_metrics(release)
+    assert "gpu-fault-adot-1" in value.summary
+    assert "8889/proxy/metrics" in release.runner.commands[-1][-1]
+
+    with pytest.raises(module.ReleaseError, match="otelcol_process_memory_rss"):
+        module.check_adot_self_metrics(
+            AdotRelease(
+                complete.replace(
+                    "otelcol_process_memory_rss", "otelcol_process_memory_rss_bytes"
+                )
+            )
+        )
+
+
+def _cpu_node(name: str, pods_allocatable: int) -> dict:
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "allocatable": {"pods": str(pods_allocatable)},
+            "conditions": [{"type": "Ready", "status": "True"}],
+        },
+    }
+
+
+def _tenant_pod(node: str, app: str | None = None, phase: str = "Running") -> dict:
+    labels = {"app": app} if app else {}
+    return {
+        "metadata": {"name": f"{app or 'x'}-{node}", "labels": labels},
+        "spec": {"nodeName": node},
+        "status": {"phase": phase},
+    }
+
+
+def _capacity_release(nodes: list[dict], pods: list[dict], worker_replicas: int = 24):
+    class Release:
+        config = SimpleNamespace(
+            cpu_hyperpod_cluster_name="cpu",
+            admin_config=SimpleNamespace(
+                capacity=SimpleNamespace(
+                    control_worker_replicas=worker_replicas,
+                    telemetry_spool=SimpleNamespace(replicas=0),
+                )
+            ),
+        )
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            if "nodes" in command:
+                return {"items": nodes}
+            return {"items": pods}
+
+    return Release()
+
+
+def test_cpu_capacity_check_counts_pod_slots_for_single_process_pods() -> None:
+    """The control-plane Pods plus one rolling surge per role must fit the
+    free Pod slots of the Ready CPU nodes."""
+
+    from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
+
+    module = _checks_module()
+    nodes = [_cpu_node(f"n{i}", 29) for i in range(4)]
+    tenants = [_tenant_pod(f"n{i}", app=None) for i in range(4) for _ in range(9)]
+    # Control-plane Pods already running and terminal Pods do not occupy a slot.
+    tenants.append(_tenant_pod("n0", app="gpu-fault-control-worker"))
+    tenants.append(_tenant_pod("n0", app=None, phase="Succeeded"))
+
+    value = module._check_cpu_capacity(_capacity_release(nodes, tenants))
+
+    assert value.details["free_pod_slots"] == 80
+    assert value.details["required_pod_slots"] == INGRESS_REPLICAS + 24 + 2
+
+    crowded = tenants + [_tenant_pod("n1", app=None) for _ in range(60)]
+    with pytest.raises(module.ReleaseError, match="free Pod slots"):
+        module._check_cpu_capacity(_capacity_release(nodes, crowded))
+
+    with pytest.raises(module.ReleaseError, match="at least 3 Ready nodes"):
+        module._check_cpu_capacity(_capacity_release(nodes[:2], []))

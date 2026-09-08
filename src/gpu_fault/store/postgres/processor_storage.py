@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import time
 from datetime import datetime, timezone
+from typing import Any, Callable
 
+from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 from gpu_fault.store.contracts import ProcessorQueueStats
 from gpu_fault.store.shared.errors import NotFoundError
-from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 
 
 class PostgresProcessorStorageMixin:

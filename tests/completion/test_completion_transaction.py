@@ -314,3 +314,112 @@ def test_the_watchdog_polls_the_adapter_outside_the_completion_transaction(
     assert ("decision", failed_event.event_key) in recording_store.writes, (
         "the expiry decision was written outside the completion transaction"
     )
+
+
+# --------------------------------------------------------------------------
+# Control-plane review 2026-09-08, F-7: the watchdog's age predicate and its
+# failure accounting.
+
+
+def test_a_pending_triage_decision_without_a_diagnostic_row_is_not_expired_early(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """``older_than`` treated "no diagnostic row" as "infinitely old": a decision
+    whose diagnostic write was lost was expired into a conservative plan within
+    the first scan. The event's ``ended_at`` is the fallback age, and a decision
+    with neither is never a candidate."""
+
+    service: CompletionService = context.completion
+    context.store.save_event_if_absent(failed_event)
+    context.store.save_decision(
+        CompletionDecision(
+            cluster_id=failed_event.cluster_id,
+            attempt_id=failed_event.attempt_id,
+            event_key=failed_event.event_key,
+            status=DecisionStatus.PENDING_TRIAGE,
+            reason="triage submitted",
+            diagnostic_request_id="diag-never-written",
+        )
+    )
+    just_after = failed_event.ended_at + timedelta(minutes=1)
+
+    assert service.reconcile_pending_triage(now=just_after) == [], (
+        "a decision with no diagnostic row was expired inside the deadline"
+    )
+    stored = context.store.get_decision_by_event(failed_event.event_key)
+    assert stored is not None and stored.status is DecisionStatus.PENDING_TRIAGE
+
+    expired = service.reconcile_pending_triage(
+        now=failed_event.ended_at
+        + service.pending_triage_deadline
+        + timedelta(minutes=1)
+    )
+    assert [item.event_key for item in expired] == [failed_event.event_key]
+    assert expired[0].status is DecisionStatus.PLAN_CREATED
+
+
+def test_watchdog_failures_are_counted_by_reason_and_exported(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """A decision the watchdog cannot expire -- here its event row is gone --
+    used to log a traceback every scan and count nowhere."""
+
+    from types import SimpleNamespace
+
+    from gpu_fault.app.periodic_services import PeriodicServiceRunner
+
+    service: CompletionService = context.completion
+    old = failed_event.ended_at - timedelta(hours=2)
+    context.store.save_diagnostic(
+        DiagnosticRequest(
+            request_id="diag-orphan",
+            cluster_id=failed_event.cluster_id,
+            attempt_id=failed_event.attempt_id,
+            node_ids=["node-a"],
+            checks=["dcgm"],
+            created_at=old,
+        )
+    )
+    context.store.save_decision(
+        CompletionDecision(
+            cluster_id=failed_event.cluster_id,
+            attempt_id=failed_event.attempt_id,
+            event_key=failed_event.event_key,
+            status=DecisionStatus.PENDING_TRIAGE,
+            reason="triage submitted",
+            diagnostic_request_id="diag-orphan",
+        )
+    )
+
+    assert service.reconcile_pending_triage(now=failed_event.ended_at) == []
+
+    assert service.pending_triage_reconcile_failures_total == {"NotFoundError": 1}
+    assert service.pending_triage_reconcile_failure_last_seen_timestamp_seconds > 0
+
+    runner = PeriodicServiceRunner.__new__(PeriodicServiceRunner)
+    runner.__init__(
+        context=context,
+        processor=SimpleNamespace(
+            is_healthy=lambda: True,
+            active_consumers=False,
+            is_leader=lambda: True,
+            owner_id="pod-a:1",
+        ),
+        stop=__import__("threading").Event(),
+        identity_registries=[],
+        ingest_node_health_findings=lambda *a, **k: None,
+        notify_silent_collectors=lambda *a, **k: None,
+    )
+    # The runner exports the counter; rendering it as
+    # gpu_fault_completion_pending_triage_reconcile_failures_total{reason}
+    # is Agent 5's line in builtin_metric_contributors (HANDOFF-agent4).
+    snapshot = runner.metrics_snapshot()
+    assert snapshot["completion_pending_triage_reconcile_failures_total"] == {
+        "NotFoundError": 1
+    }
+    assert (
+        snapshot[
+            "completion_pending_triage_reconcile_failure_last_seen_timestamp_seconds"
+        ]
+        > 0
+    )

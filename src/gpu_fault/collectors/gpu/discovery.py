@@ -13,16 +13,14 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import GPU_INVENTORY_PATH
+from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.sinks import CollectorError, EventSink
 from gpu_fault.gpu_metrics import (
     GpuInventoryDevice,
     GpuInventorySnapshot,
     GpuMetricSample,
     GpuMetricSource,
 )
-
-
-from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import CollectorError, EventSink
 
 LOGGER = logging.getLogger(__name__)
 

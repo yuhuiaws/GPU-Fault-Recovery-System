@@ -177,7 +177,10 @@ def test_suppressed_backlog_can_be_requeued_on_demand() -> None:
     assert service.dispatch_outbox("pod-a").suppressed_backlog == 1
     assert notifier.notifications == []
 
-    assert service.send(stale.notification_id).status is (NotificationStatus.QUEUED)
+    # A suppressed row is a dead letter; ``send`` no longer revives those
+    # (F-2), the operator's explicit ``requeue`` does.
+    assert service.send(stale.notification_id).status is NotificationStatus.FAILED
+    assert service.requeue(stale.notification_id).status is NotificationStatus.QUEUED
     report = service.dispatch_outbox("pod-a")
 
     assert report.sent == 1

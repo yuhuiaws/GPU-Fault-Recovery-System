@@ -822,9 +822,19 @@ class RegionalRemoteWorkflowAdapter:
         if current.status is RemoteCommandStatus.FAILED:
             if restart_reservation is not None:
                 self.store.release_job_restart(*restart_reservation)
+            # ``status_source`` rides along so the executor can tell a command
+            # the workflow itself cancelled (``workflow-preempted``,
+            # ``workflow-timeout``) from a node refusing the action (D-8).
             return WorkflowStepOutcome.failed(
                 current.error or "remote cluster action failed",
-                details=current.result_details,
+                details={
+                    **current.result_details,
+                    **(
+                        {"remote_status_source": current.status_source}
+                        if current.status_source is not None
+                        else {}
+                    ),
+                },
             )
         return WorkflowStepOutcome.waiting(
             operation_id=operation_id,

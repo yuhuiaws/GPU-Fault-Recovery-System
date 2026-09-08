@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections import Counter
 import logging
 import re
+from collections import Counter
 from threading import RLock
 
 from gpu_fault.policy.models import CatalogProductFamily
-
 
 LOGGER = logging.getLogger(__name__)
 

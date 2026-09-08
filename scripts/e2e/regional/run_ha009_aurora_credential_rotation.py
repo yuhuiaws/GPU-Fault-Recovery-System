@@ -49,15 +49,41 @@ DEPLOYMENTS = (
 # synthetic registration's TTL, the probe Pod's active deadline and the
 # detached refresh watchdog are all derived from these rather than guessed: a
 # 45-minute registration under a worst path of ~60 minutes expired mid-case.
+#
+# Path A (CP-3): a rotation is a Secret write. Running Pods mount the Secret
+# and their pool re-reads the DSN on every connect, so instead of a consumer
+# rollout the case waits for kubelet to project the new file into every Pod
+# (secret_propagation), then waits out the pool's max_idle so every idle
+# connection has been recycled against the new password (idle_window), then
+# watches /healthz, the pool metrics and the Pod logs (post_idle_observation).
 PHASE_BUDGETS = {
     "managed_rotation": 600,
     "first_refresh_job": 700,
-    "consumer_rollout": 900,
+    "secret_propagation": 300,
+    "idle_window": 480,
+    "post_idle_observation": 120,
     "outbox_convergence": 300,
     "runtime_records": 180,
     "processor_receipts": 180,
     "second_refresh_job": 700,
 }
+# GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS as the base manifest ships it; the
+# live value is read from the control-worker's -config-postgres ConfigMap.
+DEFAULT_POOL_MAX_IDLE_SECONDS = 300
+IDLE_WINDOW_MARGIN_SECONDS = 60
+# Whole-Pod evidence for the idle window: one line per refused handshake.
+# The Pod runs four uvicorn processes; the Pod's log interleaves all of them.
+AUTH_FAILURE_LOG_MARKER = "password authentication failed"
+DSN_FILE = "/etc/gpu-fault/aurora/postgres-url"
+POOL_METRIC_NAMES = (
+    "gpu_fault_postgres_pool_size",
+    "gpu_fault_postgres_pool_available",
+    "gpu_fault_postgres_pool_requests_waiting",
+    "gpu_fault_postgres_pool_requests_errors_total",
+    "gpu_fault_postgres_pool_connections_errors_total",
+    "gpu_fault_postgres_pool_connections_lost_total",
+    "gpu_fault_aurora_credential_refresh_last_success_age_seconds",
+)
 BUDGET_MARGIN_SECONDS = 600
 # If the runner dies after rotate-secret and before the refresh Job ran, every
 # new Pod fails Aurora auth until someone refreshes the Secret. The watchdog
@@ -197,6 +223,179 @@ def kubernetes_secret_digest() -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def kubernetes_secret_dsn_digest() -> str:
+    """SHA-256 of the decoded postgres-url, comparable with the mounted file."""
+
+    import base64
+
+    encoded = BASE.control(
+        "get",
+        "secret",
+        SECRET_NAME,
+        "-o",
+        "jsonpath={.data.postgres-url}",
+    ).strip()
+    if not encoded:
+        raise CaseError("Aurora Kubernetes Secret has no postgres-url")
+    return hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+
+
+_POD_PYTHON = "/opt/gpu-fault/control-plane/bin/python"
+
+
+def pod_dsn_file_digest(pod: str) -> str:
+    """SHA-256 of the projected postgres-url inside ``pod`` (never its text)."""
+
+    return BASE.control(
+        "exec",
+        pod,
+        "--",
+        _POD_PYTHON,
+        "-c",
+        "import hashlib, pathlib; "
+        f"print(hashlib.sha256(pathlib.Path({DSN_FILE!r}).read_bytes()).hexdigest())",
+        timeout=60,
+    ).strip()
+
+
+def parse_pool_metrics(text: str) -> dict[str, float]:
+    """The unlabelled pool/credential gauges from a /metrics exposition."""
+
+    values: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or parts[0] not in POOL_METRIC_NAMES:
+            continue
+        try:
+            values[parts[0]] = float(parts[1])
+        except ValueError:
+            continue
+    return values
+
+
+def probe_pod(pod: str) -> dict:
+    """``/healthz`` status and the pool metrics of one Pod, read from inside it.
+
+    ``/healthz`` is readiness: it checks out a pooled connection, so a 200
+    after the idle window proves that process reconnected with the rotated
+    password. Loopback ``/metrics`` needs no token.
+    """
+
+    raw = BASE.control(
+        "exec",
+        pod,
+        "--",
+        _POD_PYTHON,
+        "-c",
+        "import json, urllib.error, urllib.request\n"
+        "def get(path):\n"
+        "    try:\n"
+        "        with urllib.request.urlopen('http://127.0.0.1:8080' + path, "
+        "timeout=10) as response:\n"
+        "            return response.status, response.read().decode()\n"
+        "    except urllib.error.HTTPError as exc:\n"
+        "        return exc.code, ''\n"
+        "    except Exception as exc:\n"
+        "        return 0, type(exc).__name__\n"
+        "health, _ = get('/healthz')\n"
+        "status, body = get('/metrics')\n"
+        "print(json.dumps({'healthz_status': health, 'metrics_status': status, "
+        "'metrics_text': body}))",
+        check=False,
+        timeout=60,
+    )
+    try:
+        payload = json.loads(raw.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"healthz_status": 0, "metrics_status": 0, "metrics": {}}
+    return {
+        "healthz_status": int(payload.get("healthz_status") or 0),
+        "metrics_status": int(payload.get("metrics_status") or 0),
+        "metrics": parse_pool_metrics(str(payload.get("metrics_text") or "")),
+    }
+
+
+def pool_max_idle_seconds() -> int:
+    raw = BASE.control(
+        "get",
+        "configmap",
+        "gpu-fault-control-worker-config-postgres",
+        "-o",
+        "jsonpath={.data.GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS}",
+        check=False,
+    ).strip()
+    try:
+        return int(float(raw)) if raw else DEFAULT_POOL_MAX_IDLE_SECONDS
+    except ValueError:
+        return DEFAULT_POOL_MAX_IDLE_SECONDS
+
+
+def idle_wait_seconds(max_idle: int, *, budget: int) -> int:
+    """Past ``max_idle`` every idle connection has been recycled; bounded by
+    the phase budget so a mis-set site value cannot hang the case."""
+
+    return min(int(max_idle) + IDLE_WINDOW_MARGIN_SECONDS, int(budget))
+
+
+def enabled_pods(deployments: dict) -> list[str]:
+    return [
+        pod
+        for name in enabled_roles(deployments)
+        for pod, _value in deployments[name]["pods"]
+    ]
+
+
+def wait_secret_propagated(pods: list[str], digest: str) -> dict:
+    """Every Pod's projected postgres-url matches the Secret."""
+
+    deadline = time.monotonic() + PHASE_BUDGETS["secret_propagation"]
+    seen: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        seen = {pod: pod_dsn_file_digest(pod) for pod in pods}
+        if all(value == digest for value in seen.values()):
+            return {"digest": digest, "pods": seen}
+        time.sleep(5)
+    return {"digest": digest, "pods": seen}
+
+
+def auth_failures_in_logs(pod: str, since: datetime) -> int:
+    text = BASE.control(
+        "logs",
+        pod,
+        "--all-containers",
+        f"--since-time={since.isoformat(timespec='seconds')}",
+        check=False,
+        timeout=120,
+    )
+    return sum(1 for line in text.splitlines() if AUTH_FAILURE_LOG_MARKER in line)
+
+
+def observe_after_idle(
+    pods: list[str], *, samples: int = 6, interval: int = 10
+) -> dict:
+    """H1-5: with every idle connection recycled, each Pod must still answer
+    ``/healthz`` and no process may have been refused a reconnect."""
+
+    started = datetime.now(timezone.utc)
+    collected: dict[str, list[dict]] = {pod: [] for pod in pods}
+    deadline = time.monotonic() + PHASE_BUDGETS["post_idle_observation"]
+    for index in range(samples):
+        for pod in pods:
+            collected[pod].append(probe_pod(pod))
+        if index + 1 < samples and time.monotonic() < deadline:
+            time.sleep(interval)
+    return {
+        "started_at": started.isoformat(timespec="seconds"),
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "samples": collected,
+        "auth_failures_in_logs": {
+            pod: auth_failures_in_logs(pod, started) for pod in pods
+        },
+    }
+
+
 def deployment_snapshot() -> dict:
     deployments = json.loads(
         BASE.control("get", "deployment", *DEPLOYMENTS, "-o", "json")
@@ -249,18 +448,19 @@ def deployment_snapshot() -> dict:
 
 
 def role_status(deployments: dict) -> dict[str, str]:
-    """``ROLLED`` for an enabled role, ``SKIPPED_NOT_ENABLED`` for replicas=0.
+    """``STEADY`` for an enabled role, ``SKIPPED_NOT_ENABLED`` for replicas=0.
 
     The catalog wants an unconfigured role recorded as skipped, not silently
     passed or failed; the spool-worker ships with replicas=0 on sites without
-    telemetry spooling.
+    telemetry spooling. ``STEADY`` is the path-A expectation: the role's Pods
+    are the same before and after the rotation.
     """
 
     return {
         name: (
             "SKIPPED_NOT_ENABLED"
             if int(deployments[name].get("replicas") or 0) == 0
-            else "ROLLED"
+            else "STEADY"
         )
         for name in DEPLOYMENTS
     }
@@ -268,7 +468,7 @@ def role_status(deployments: dict) -> dict[str, str]:
 
 def enabled_roles(deployments: dict) -> list[str]:
     return [
-        name for name, status in role_status(deployments).items() if status == "ROLLED"
+        name for name, status in role_status(deployments).items() if status == "STEADY"
     ]
 
 
@@ -633,13 +833,44 @@ print(json.dumps({
     return result
 
 
+def deployments_steady(before: dict, current: dict) -> list[str]:
+    """Path A: nothing about an enabled role may have moved.
+
+    Same generation (no template patch), the same Pod UIDs (no replacement),
+    the same restartCount (no crash into the rotated password), and every
+    declared replica Ready. Returns the violations, empty when steady.
+    """
+
+    errors = []
+    for name in enabled_roles(before):
+        item = current[name]
+        if item["generation"] != before[name]["generation"]:
+            errors.append(f"{name} generation changed: a rotation must not roll it")
+        before_pods = dict(before[name]["pods"])
+        after_pods = dict(item["pods"])
+        if {v["uid"] for v in before_pods.values()} != {
+            v["uid"] for v in after_pods.values()
+        }:
+            errors.append(f"{name} Pod set changed: a rotation must not replace Pods")
+        for pod, value in after_pods.items():
+            restarts_before = int((before_pods.get(pod) or {}).get("restarts", 0))
+            if int(value.get("restarts", 0)) != restarts_before:
+                errors.append(f"{name} Pod {pod} restarted during the rotation")
+            if not value.get("ready"):
+                errors.append(f"{name} Pod {pod} is not Ready after the rotation")
+        if int(item.get("ready") or 0) != int(item.get("replicas") or 0):
+            errors.append(f"{name} is not fully Ready after the rotation")
+    return errors
+
+
 def deployments_rolled(before: dict, current: dict) -> bool:
     """Every enabled role rolled to a new generation with all old Pods replaced.
 
-    Uses HA-005's ``rollout_complete`` -- Ready, updated and available all equal
-    to replicas, generation observed, old UIDs gone -- rather than a bare
-    ``ready == replicas``, which is true half-way through a rollout while the
-    old Pods still hold the old credentials. A replicas=0 role is skipped.
+    Only meaningful for the refresher's ``--restart-deployments`` compatibility
+    mode (Pods that do not mount the Secret); path A asserts the opposite via
+    ``deployments_steady``. Uses HA-005's ``rollout_complete`` -- Ready, updated
+    and available all equal to replicas, generation observed, old UIDs gone --
+    rather than a bare ``ready == replicas``. A replicas=0 role is skipped.
     """
 
     for name in enabled_roles(before):
@@ -777,8 +1008,20 @@ def _run_rotation_case(
     state["refresh_succeeded"] = True
     state["watchdog_result"] = stop_refresh_watchdog(state["watchdog"])
     state["watchdog"] = None
-    deployments_after = wait_deployments(deployments_before)
     digest_after = kubernetes_secret_digest()
+    pods = enabled_pods(deployments_before)
+    log("waiting for kubelet to project the refreshed Secret into every Pod")
+    propagation = wait_secret_propagated(pods, kubernetes_secret_dsn_digest())
+    write_json_atomic(case_dir / "secret-propagation.json", propagation)
+    max_idle = pool_max_idle_seconds()
+    idle_wait = idle_wait_seconds(max_idle, budget=PHASE_BUDGETS["idle_window"])
+    log(f"waiting {idle_wait}s (pool max_idle {max_idle}s) for connections to recycle")
+    time.sleep(idle_wait)
+    idle_observation = observe_after_idle(pods)
+    idle_observation["pool_max_idle_seconds"] = max_idle
+    idle_observation["idle_wait_seconds"] = idle_wait
+    write_json_atomic(case_dir / "idle-observation.json", idle_observation)
+    deployments_after = deployment_snapshot()
     write_json_atomic(
         case_dir / "first-refresh.json",
         {
@@ -840,6 +1083,8 @@ def _run_rotation_case(
         second_job,
         deployments_before,
         deployments_after,
+        propagation,
+        idle_observation,
         final_probe,
         receipts,
         runtime,
@@ -862,6 +1107,8 @@ def rotation_errors(
     second_job: dict,
     deployments_before: dict,
     deployments_after: dict,
+    propagation: dict,
+    idle_observation: dict,
     final_probe: dict,
     receipts: dict,
     runtime: dict,
@@ -877,23 +1124,44 @@ def rotation_errors(
         errors.append("old AWSCURRENT did not become AWSPREVIOUS")
     if digest_after == digest_before:
         errors.append("Kubernetes Aurora Secret digest did not change")
-    if "rotated=True restarted=True" not in "\n".join(first_job["logs"]):
-        errors.append("first refresh Job did not report rotation and restart")
-    roles = role_status(deployments_before)
-    for name in DEPLOYMENTS:
-        if roles[name] != "ROLLED":
-            continue
-        if int(deployments_after[name]["generation"]) <= int(
-            deployments_before[name]["generation"]
-        ):
-            errors.append(f"{name} generation did not advance")
-        old_uids = {value["uid"] for _pod, value in deployments_before[name]["pods"]}
-        if not BASE.rollout_complete(deployments_after[name], old_uids):
+    first_logs = "\n".join(first_job["logs"])
+    if "rotated=True" not in first_logs:
+        errors.append("first refresh Job did not report a rotation")
+    if "restarted=False" not in first_logs:
+        errors.append(
+            "first refresh Job did not report restarted=False: path A must not roll"
+        )
+    # Path A: the Pods that served before the rotation still serve after it.
+    errors.extend(deployments_steady(deployments_before, deployments_after))
+    for pod, digest in sorted(propagation.get("pods", {}).items()):
+        if digest != propagation.get("digest"):
             errors.append(
-                f"{name} did not complete its rollout (ready/updated/available/uids)"
+                f"{pod} projected postgres-url did not catch up with the Secret"
             )
-        if any(value["restarts"] for _pod, value in deployments_after[name]["pods"]):
-            errors.append(f"{name} replacement Pod restarted")
+    # H1-5: after max_idle every reconnect used the new password.
+    for pod, samples in sorted(idle_observation.get("samples", {}).items()):
+        if not samples:
+            errors.append(f"{pod} was not observed after the idle window")
+            continue
+        for index, sample in enumerate(samples):
+            if int(sample.get("healthz_status") or 0) != 200:
+                errors.append(
+                    f"{pod} /healthz returned {sample.get('healthz_status')} after the "
+                    f"idle window (sample {index})"
+                )
+            metrics = sample.get("metrics") or {}
+            if "gpu_fault_postgres_pool_connections_errors_total" not in metrics:
+                errors.append(
+                    f"{pod} /metrics does not export "
+                    "gpu_fault_postgres_pool_connections_errors_total"
+                )
+                break
+    for pod, count in sorted(idle_observation.get("auth_failures_in_logs", {}).items()):
+        if int(count or 0) != 0:
+            errors.append(
+                f"{pod} logged {count} password authentication failure(s) after the idle "
+                "window: the pool did not pick up the rotated password"
+            )
     accepted_ids = sorted(set(final_probe.get("accepted_request_ids", [])))
     errors.extend(
         BASE.continuity_errors(final_probe, receipts, accepted_ids=accepted_ids)
@@ -929,6 +1197,8 @@ def _rotation_result(
     second_job: dict,
     deployments_before: dict,
     deployments_after: dict,
+    propagation: dict,
+    idle_observation: dict,
     final_probe: dict,
     receipts: dict,
     runtime: dict,
@@ -946,6 +1216,8 @@ def _rotation_result(
         second_job=second_job,
         deployments_before=deployments_before,
         deployments_after=deployments_after,
+        propagation=propagation,
+        idle_observation=idle_observation,
         final_probe=final_probe,
         receipts=receipts,
         runtime=runtime,
@@ -975,6 +1247,8 @@ def _rotation_result(
         "second_refresh": second_job,
         "deployments_before": deployments_before,
         "deployments_after": deployments_after,
+        "secret_propagation": propagation,
+        "idle_observation": idle_observation,
         "probe_final": final_probe,
         "processor_receipts": receipts,
         "runtime_records": runtime,
@@ -1135,6 +1409,11 @@ def main() -> int:
                 "refresh_cronjob": CRONJOB,
                 "aurora_secret_name": SECRET_NAME,
                 "probe": "continuous claim, telemetry, command and notification",
+                "expectation": (
+                    "no Deployment rolls: running Pods reload the mounted Secret; "
+                    "after the pool's max_idle every Pod still serves /healthz with "
+                    "no password authentication failure in its log"
+                ),
                 "phase_budgets_seconds": PHASE_BUDGETS,
                 "total_budget_seconds": total_budget_seconds(),
                 "rollback": [

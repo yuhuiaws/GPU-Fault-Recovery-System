@@ -18,7 +18,6 @@ from gpu_fault.models import (
     recovery_action_sort_key,
 )
 
-
 ACTION_CAPABILITY = {
     RecoveryAction.MARK_UNSCHEDULABLE: CapabilityName.SCHEDULER_DRAIN,
     RecoveryAction.DRAIN: CapabilityName.SCHEDULER_DRAIN,

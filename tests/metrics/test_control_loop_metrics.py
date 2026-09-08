@@ -125,3 +125,28 @@ def test_escalation_chain_counters_reach_the_metrics_endpoint(monkeypatch) -> No
         "gpu_fault_hardware_escalation_containment_refused_total 4",
     ):
         assert line in text, line
+
+
+def test_incident_closure_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
+    """DESTR-018 product gap: the two ways an ESCALATED incident is closed --
+    by the restore that freed its node, by an operator -- are each counted,
+    and an alert can be written against the counter, not the attribute."""
+
+    monkeypatch.setenv("GPU_FAULT_PROCESSOR_MODE", "active-active")
+    monkeypatch.setenv("POD_UID", "pod-metrics-closure")
+    token = "processor-metrics-token-" + "z" * 32
+    context = ApplicationContext(execution_token=token)
+    app = create_app(context)
+
+    context.incident_closure.operator_closed_total = 31
+    context.incident_closure.auto_closed_by_restore_total = 32
+
+    text = _scrape(app)
+
+    for line in (
+        "# TYPE gpu_fault_incident_operator_closed_total counter",
+        "gpu_fault_incident_operator_closed_total 31",
+        "# TYPE gpu_fault_incident_auto_closed_by_restore_total counter",
+        "gpu_fault_incident_auto_closed_by_restore_total 32",
+    ):
+        assert line in text, line

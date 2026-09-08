@@ -18,7 +18,6 @@ from gpu_fault.models import (
 from gpu_fault.recovery_actions import RECOVERY_ACTION_PROFILES
 from gpu_fault.store import NotFoundError
 
-
 #: Derived from the one recovery-action table shared with the spare-blocking
 #: set in :mod:`gpu_fault.markers`; see :mod:`gpu_fault.recovery_actions`.
 ACTION_OPERATION: dict[RecoveryAction, WorkflowOperation] = {

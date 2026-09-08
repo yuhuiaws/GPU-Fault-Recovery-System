@@ -15,10 +15,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from pydantic import ValidationError
 
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
+from gpu_fault.execution.models import WorkflowRecordInvalidError
 from gpu_fault.models import (
     IncidentState,
     WorkflowEventKind,
@@ -124,10 +124,8 @@ def test_the_watchdog_reap_records_one_terminal_event_as_the_watchdog() -> None:
 def test_blocking_on_an_internal_error_records_one_terminal_event() -> None:
     store = build_store()
     _, workflow = workflow_state(store, [QUARANTINE])
-    try:
-        WorkflowRequest.model_validate({"incident_id": "x"})
-    except ValidationError as error:
-        invalid = error
+    # The one internal error that proves the record itself is unusable (D-5).
+    invalid = WorkflowRecordInvalidError("workflow row cannot be decoded")
 
     class _Raising:
         owner = "simulated-runtime"
@@ -146,7 +144,7 @@ def test_blocking_on_an_internal_error_records_one_terminal_event() -> None:
     assert len(terminal) == 1, [event.model_dump() for event in blocked.events]
     assert terminal[0].actor == INTERNAL
     assert terminal[0].status == WorkflowStatus.BLOCKED.value
-    assert "ValidationError" in (terminal[0].reason or "")
+    assert "WorkflowRecordInvalidError" in (terminal[0].reason or "")
     # The path names its own incident state: an internal error is an
     # operator matter, not a settled safety phase.
     assert store.get_incident(workflow.incident_id).state is IncidentState.ESCALATED

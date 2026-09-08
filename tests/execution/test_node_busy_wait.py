@@ -15,6 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
+from gpu_fault.execution.executor import (
+    DISPATCHER_ACTOR,
+    HOLD_REASON_NODE_UNDER_REMEDIATION,
+    record_hold_event,
+)
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
 from tests._builders import (
     active_workflow_executor,
@@ -54,7 +59,12 @@ def _busy_node(store) -> None:
     store.save_incident_and_workflow(incident, workflow)
 
 
-def _job_workflow(store, *, created_at: datetime) -> None:
+def _job_workflow(
+    store, *, created_at: datetime, held_since: datetime | None = None
+) -> None:
+    """The job workflow; ``held_since`` pre-records the dispatcher's first HOLD,
+    which is where the rule A window opens (D-11)."""
+
     incident = fault_incident(
         "inc-job",
         "event-job",
@@ -87,6 +97,22 @@ def _job_workflow(store, *, created_at: datetime) -> None:
         created_at=created_at,
         updated_at=created_at,
     )
+    if held_since is not None:
+        held = record_hold_event(
+            workflow,
+            reason=HOLD_REASON_NODE_UNDER_REMEDIATION,
+            remediation_workflow_id="wf-node",
+            actor=DISPATCHER_ACTOR,
+            details={"held_since": held_since.isoformat()},
+        )
+        assert held is not None
+        workflow = held.model_copy(
+            update={
+                "events": [
+                    event.model_copy(update={"at": held_since}) for event in held.events
+                ]
+            }
+        )
     store.save_incident_and_workflow(incident, workflow)
 
 
@@ -126,7 +152,8 @@ def test_a_job_workflow_waits_while_one_of_its_nodes_is_being_repaired():
 def test_past_the_wait_the_job_workflow_stops_the_job_and_fails():
     store = build_store()
     _busy_node(store)
-    _job_workflow(store, created_at=datetime.now(timezone.utc) - timedelta(minutes=10))
+    long_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+    _job_workflow(store, created_at=long_ago, held_since=long_ago)
     dispatcher, adapter = _dispatcher(store)
 
     dispatcher.run_once()  # rewrites the plan to a stop-only failure

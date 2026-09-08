@@ -7,8 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
-from gpu_fault_release import regional_deployment_inventory as inventory
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
+from gpu_fault.regional_compatibility import (
+    RegionalExecutorCompatibilityPolicy,
+)
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
@@ -21,10 +25,6 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_rendering import render_gpu_rollout_manifests
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
-
-from gpu_fault.regional_compatibility import (
-    RegionalExecutorCompatibilityPolicy,
-)
 
 ProgressSelection = ReleaseComponent | tuple[ReleaseComponent, ...]
 ProgressCallback = Callable[[ProgressSelection, str, dict[str, Any] | None], None]

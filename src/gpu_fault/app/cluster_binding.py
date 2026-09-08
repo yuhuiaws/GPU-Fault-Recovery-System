@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 CLUSTER_IDENTIFIER_FIELDS = frozenset({"cluster_id", "clusterId", "cluster"})
 
 

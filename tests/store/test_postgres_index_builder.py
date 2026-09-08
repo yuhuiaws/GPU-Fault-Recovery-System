@@ -124,7 +124,12 @@ def test_the_preflight_reports_the_diagnostic_settings_without_blocking(connecti
         "log_min_duration_statement",
         "shared_preload_libraries",
         "pg_stat_statements_installed",
+        # Control-plane review 2026-09-08, G-9: the hot table's bloat.
+        "gpu_fault_objects_n_dead_tup",
+        "gpu_fault_objects_n_live_tup",
+        "gpu_fault_objects_autovacuum_options",
     }
+    assert isinstance(diagnostics["gpu_fault_objects_n_dead_tup"], int)
     assert diagnostics["log_lock_waits"] in {"on", "off"}
     assert diagnostics["deadlock_timeout"] is not None
     assert isinstance(diagnostics["pg_stat_statements_installed"], bool), diagnostics

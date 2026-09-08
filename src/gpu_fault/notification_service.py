@@ -11,10 +11,18 @@ from gpu_fault.env import env_bool
 from gpu_fault.models import (
     AdvisoryNotification,
     NotificationDelivery,
+    NotificationDeliveryStatus,
     NotificationDispatchReport,
     NotificationResult,
     NotificationStatus,
     WorkflowOperation,
+)
+from gpu_fault.notification_preview import (
+    AdvisoryNotApplicableError as AdvisoryNotApplicableError,
+)
+from gpu_fault.notification_preview import (
+    NotificationPreviewCallbacks,
+    NotificationPreviewService,
 )
 from gpu_fault.notifications import (
     EfaRdmaEventEmailBuilder,
@@ -30,17 +38,12 @@ from gpu_fault.notifications.registry import (
     NotificationBuilderRegistry,
     NotificationKind,
 )
-from gpu_fault.notification_preview import (
-    AdvisoryNotApplicableError as AdvisoryNotApplicableError,
-    NotificationPreviewCallbacks,
-    NotificationPreviewService,
-)
-from gpu_fault.ports import NotificationPort
 from gpu_fault.policy import (
     FaultPolicyDecision,
     SxidEvent,
     XidEvent,
 )
+from gpu_fault.ports import NotificationPort
 from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,
@@ -93,6 +96,22 @@ def _is_throttled(exc: BaseException) -> bool:
         if isinstance(error, dict):
             codes.add(str(error.get("Code", "")))
     return bool(codes & THROTTLE_ERROR_CODES)
+
+
+class _ProviderThrottled(Exception):
+    """The provider rate-limited a send; the cause is the provider error."""
+
+
+class _BookkeepingFailed(Exception):
+    """The provider answered but the store write recording it failed.
+
+    Carries the provider's ``result`` so the cycle report still counts the
+    attempt; a SENT result has already been persisted by the raiser (F-3).
+    """
+
+    def __init__(self, result: NotificationResult | None) -> None:
+        super().__init__("delivery outcome could not be recorded")
+        self.result = result
 
 
 def _resolved_dispatch_scan_limit(configured: int | None) -> int:
@@ -363,6 +382,14 @@ class AdvisoryNotificationService:
         self.expired_last_seen_timestamp_seconds = 0.0
         self.dead_lettered_total = 0
         self.suppressed_drills_total = 0
+        # Per-delivery store errors inside a dispatch cycle: the provider may
+        # have been called, the write recording it failed, and the row was
+        # handed back rather than left LEASED (control-plane review
+        # 2026-09-08, F-3). Exported as
+        # gpu_fault_notification_delivery_errors_total and
+        # gpu_fault_notification_delivery_error_last_seen_timestamp_seconds.
+        self.delivery_errors_total = 0
+        self.delivery_error_last_seen_timestamp_seconds = 0.0
         self.last_cycle_timestamp_seconds = 0.0
         LOGGER.info(
             "notification delivery: %s",
@@ -676,12 +703,7 @@ class AdvisoryNotificationService:
                 self.store.save_notification_result(result)
                 return result
             if self.async_delivery:
-                self.store.enqueue_notification_delivery(notification.notification_id)
-                return NotificationResult(
-                    notification_id=notification.notification_id,
-                    status=NotificationStatus.QUEUED,
-                    reason="queued for asynchronous delivery",
-                )
+                return self._queue_for_delivery(notification)
             try:
                 result = self.notifier.send(notification)
             except Exception as exc:
@@ -692,6 +714,83 @@ class AdvisoryNotificationService:
                 )
             self.store.save_notification_result(result)
             return result
+
+    def _queue_for_delivery(
+        self, notification: AdvisoryNotification
+    ) -> NotificationResult:
+        """Make sure the notification is in the outbox, touching nothing that
+        is already there.
+
+        Saving a notification creates its delivery row, so a repeat ``send``
+        -- the collector-silence scan asks every 60 s for the same still-silent
+        collector -- used to re-enqueue a row the dispatcher had already
+        backed off (RETRY -> PENDING, ``available_at=now``) or given up on
+        (DEAD -> PENDING with its attempts intact, so it died again on the
+        next try). That made the retry budget unbounded and grew
+        ``dead_lettered_total`` by one a minute (control-plane review
+        2026-09-08, F-2). Now a leased or retrying row is left where the
+        dispatcher put it, a dead letter stays dead until an operator calls
+        :meth:`requeue`, and only a notification with no delivery row -- or
+        one still PENDING, where asking again restarts its shelf life and
+        nothing else -- is enqueued.
+        """
+
+        delivery = self.store.get_notification_delivery(notification.notification_id)
+        if delivery is None or delivery.status is NotificationDeliveryStatus.PENDING:
+            self.store.enqueue_notification_delivery(notification.notification_id)
+            return NotificationResult(
+                notification_id=notification.notification_id,
+                status=NotificationStatus.QUEUED,
+                reason="queued for asynchronous delivery",
+            )
+        if delivery.status is NotificationDeliveryStatus.DEAD:
+            return NotificationResult(
+                notification_id=notification.notification_id,
+                status=NotificationStatus.FAILED,
+                reason=(
+                    f"dead-lettered after {delivery.attempts} attempt(s)"
+                    f"{': ' + delivery.last_error if delivery.last_error else ''}"
+                    "; requeue it explicitly to try again"
+                ),
+            )
+        return NotificationResult(
+            notification_id=notification.notification_id,
+            status=NotificationStatus.QUEUED,
+            reason=(
+                f"already in the outbox ({delivery.status.value}, "
+                f"{delivery.attempts} attempt(s)); not re-queued"
+            ),
+        )
+
+    def requeue(self, notification_id: str) -> NotificationResult:
+        """An operator's explicit request to try a notification again.
+
+        The one path that revives a RETRY or DEAD delivery: it goes back to
+        PENDING with a fresh attempt budget and a restarted shelf life. A
+        notification the store already records as SENT is not sent twice.
+        """
+
+        with self._notification_lock(notification_id):
+            notification = self.store.get_notification(notification_id)
+            existing = self.store.get_notification_result(notification_id)
+            if existing is not None and existing.status is NotificationStatus.SENT:
+                return existing.model_copy(
+                    update={"status": NotificationStatus.DUPLICATE}
+                )
+            delivery = self.store.enqueue_notification_delivery(
+                notification.notification_id
+            )
+            LOGGER.warning(
+                "notification %s requeued by operator (was %s after %d attempt(s))",
+                notification_id,
+                delivery.status.value,
+                delivery.attempts,
+            )
+            return NotificationResult(
+                notification_id=notification.notification_id,
+                status=NotificationStatus.QUEUED,
+                reason="requeued for asynchronous delivery",
+            )
 
     def dispatch_outbox(
         self,
@@ -725,134 +824,74 @@ class AdvisoryNotificationService:
         suppressed_drills = 0
         oldest_expired: float = 0.0
         for index, delivery in enumerate(deliveries):
-            notification = self.store.get_notification(delivery.notification_id)
-            # ``send`` keeps drills out of the outbox, so reaching one here
-            # means it was enqueued before the switch was set -- or by a
-            # caller that enqueued directly. Retiring it costs one write
-            # against re-claiming it every cycle until it expires.
-            suppression = self.suppresses(notification)
-            if suppression is not None:
-                self._retire_delivery(
-                    notification,
+            try:
+                kind, result, age = self._dispatch_one(
                     delivery,
                     owner_id=owner_id,
-                    reason=suppression,
+                    now=now,
+                    max_attempts=max_attempts,
+                    retry_base_seconds=retry_base_seconds,
+                    retry_max_seconds=retry_max_seconds,
                 )
+            except _ProviderThrottled as throttle:
+                # The provider is rate limiting this process, not
+                # objecting to this message. Every further send in
+                # this batch would deepen the throttle and charge an
+                # attempt to a notification that did nothing wrong --
+                # which is how a storm ends up mailed three times and
+                # then declared undeliverable. Hand the rest of the
+                # batch back untouched and let the next poll retry one.
+                remaining = deliveries[index:]
+                throttled = len(remaining)
+                self._release_throttled(
+                    remaining,
+                    owner_id=owner_id,
+                    retry_seconds=retry_base_seconds,
+                )
+                LOGGER.warning(
+                    "notification delivery throttled by the provider "
+                    "(%s); returned %d claimed notification(s) to the "
+                    "outbox without charging an attempt and stopped "
+                    "this cycle -- lower "
+                    "GPU_FAULT_NOTIFICATION_BATCH_SIZE or the number "
+                    "of dispatcher replicas if this repeats",
+                    throttle.__cause__,
+                    throttled,
+                )
+                break
+            except _BookkeepingFailed as failed:
+                # The provider was asked and answered; only the store
+                # write after it failed. ``_record_delivery_outcome`` has
+                # already persisted a SENT verdict where there was one, so
+                # the row cannot be mailed twice; here the attempt is
+                # counted as an error and the row is handed back so the
+                # rest of the batch is not stuck behind it (control-plane
+                # review 2026-09-08, F-3).
+                self._delivery_failed(
+                    delivery, owner_id=owner_id, retry_seconds=retry_base_seconds
+                )
+                if failed.result is not None:
+                    results.append(failed.result)
+                continue
+            except Exception:
+                # Any other store error on this one row -- reading the
+                # notification, retiring a drill, expiring it -- must not
+                # end the cycle: the other claimed rows would sit LEASED
+                # for the whole lease with nobody working on them (F-3).
+                self._delivery_failed(
+                    delivery, owner_id=owner_id, retry_seconds=retry_base_seconds
+                )
+                continue
+            if kind == "suppressed":
                 suppressed_drills += 1
                 self.suppressed_drills_total += 1
-                continue
-            deadline = self.delivery_deadline(notification, delivery)
-            if deadline is not None and deadline <= now:
-                age = (now - notification.created_at).total_seconds()
-                self._expire_delivery(
-                    notification,
-                    delivery,
-                    owner_id=owner_id,
-                    deadline=deadline,
-                    age_seconds=age,
-                )
+            elif kind == "expired":
                 expired += 1
                 self.expired_total += 1
                 self.expired_last_seen_timestamp_seconds = now.timestamp()
                 oldest_expired = max(oldest_expired, age)
-                continue
-            recorded = self.store.get_notification_result(notification.notification_id)
-            if recorded is not None and recorded.status is NotificationStatus.SENT:
-                # The notification id is the idempotency key and the
-                # recorded result is the shared truth: an inline ``send``
-                # on a sibling, or a dispatcher whose lease lapsed after
-                # its mail went out, may have delivered this since the
-                # claim. The claim query skips SENT rows, but only as of
-                # the claim (P0-38B). Retire the delivery without calling
-                # the provider again.
-                result = recorded.model_copy(
-                    update={
-                        "reason": (
-                            recorded.reason
-                            or "already delivered by another path; not sent again"
-                        )
-                    }
-                )
-                self._record_delivery_outcome(
-                    notification,
-                    delivery,
-                    owner_id=owner_id,
-                    result=result,
-                    now=datetime.now(timezone.utc),
-                    retry_at=None,
-                    terminal=False,
-                )
+            elif result is not None:
                 results.append(result)
-                continue
-            try:
-                result = self.notifier.send(notification)
-            except Exception as exc:
-                if _is_throttled(exc):
-                    # The provider is rate limiting this process, not
-                    # objecting to this message. Every further send in
-                    # this batch would deepen the throttle and charge an
-                    # attempt to a notification that did nothing wrong --
-                    # which is how a storm ends up mailed three times and
-                    # then declared undeliverable. Hand the rest of the
-                    # batch back untouched and let the next poll retry one.
-                    remaining = deliveries[index:]
-                    throttled = len(remaining)
-                    self._release_throttled(
-                        remaining,
-                        owner_id=owner_id,
-                        retry_seconds=retry_base_seconds,
-                    )
-                    LOGGER.warning(
-                        "notification delivery throttled by the provider "
-                        "(%s); returned %d claimed notification(s) to the "
-                        "outbox without charging an attempt and stopped "
-                        "this cycle -- lower "
-                        "GPU_FAULT_NOTIFICATION_BATCH_SIZE or the number "
-                        "of dispatcher replicas if this repeats",
-                        exc,
-                        throttled,
-                    )
-                    break
-                result = NotificationResult(
-                    notification_id=notification.notification_id,
-                    status=NotificationStatus.FAILED,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-            if (
-                result.status is NotificationStatus.DUPLICATE
-                and result.provider_message_id
-            ):
-                result = result.model_copy(
-                    update={
-                        "status": NotificationStatus.SENT,
-                        "reason": (
-                            result.reason
-                            or "provider already accepted this notification"
-                        ),
-                    }
-                )
-            completed_at = datetime.now(timezone.utc)
-            attempts = delivery.attempts + 1
-            terminal = (
-                result.status is not NotificationStatus.SENT
-                and attempts >= max_attempts
-            )
-            if terminal:
-                self.dead_lettered_total += 1
-            delay = min(
-                retry_max_seconds,
-                retry_base_seconds * (2 ** max(0, attempts - 1)),
-            )
-            self._record_delivery_outcome(
-                notification,
-                delivery,
-                owner_id=owner_id,
-                result=result,
-                now=completed_at,
-                retry_at=completed_at + timedelta(seconds=delay),
-                terminal=terminal,
-            )
-            results.append(result)
         if expired:
             # One line per cycle, not per notification: a flood of drops
             # logged individually is the same noise problem in the log
@@ -878,6 +917,158 @@ class AdvisoryNotificationService:
             throttled=throttled,
             suppressed_drills=suppressed_drills,
         )
+
+    def _dispatch_one(
+        self,
+        delivery: NotificationDelivery,
+        *,
+        owner_id: str,
+        now: datetime,
+        max_attempts: int,
+        retry_base_seconds: int,
+        retry_max_seconds: int,
+    ) -> tuple[str, NotificationResult | None, float]:
+        """Handle one claimed delivery: ``("suppressed", None, 0)``,
+        ``("expired", None, age_seconds)`` or ``("result", result, 0)``.
+
+        Raises ``_ProviderThrottled`` when the provider rate-limited the
+        call and ``_BookkeepingFailed`` when the provider answered but the
+        store write after it failed; anything else is a store error on this
+        row. ``dispatch_outbox`` isolates all three per delivery (F-3).
+        """
+
+        notification = self.store.get_notification(delivery.notification_id)
+        # ``send`` keeps drills out of the outbox, so reaching one here
+        # means it was enqueued before the switch was set -- or by a
+        # caller that enqueued directly. Retiring it costs one write
+        # against re-claiming it every cycle until it expires.
+        suppression = self.suppresses(notification)
+        if suppression is not None:
+            self._retire_delivery(
+                notification,
+                delivery,
+                owner_id=owner_id,
+                reason=suppression,
+            )
+            return ("suppressed", None, 0.0)
+        deadline = self.delivery_deadline(notification, delivery)
+        if deadline is not None and deadline <= now:
+            age = (now - notification.created_at).total_seconds()
+            self._expire_delivery(
+                notification,
+                delivery,
+                owner_id=owner_id,
+                deadline=deadline,
+                age_seconds=age,
+            )
+            return ("expired", None, age)
+        recorded = self.store.get_notification_result(notification.notification_id)
+        if recorded is not None and recorded.status is NotificationStatus.SENT:
+            # The notification id is the idempotency key and the
+            # recorded result is the shared truth: an inline ``send``
+            # on a sibling, or a dispatcher whose lease lapsed after
+            # its mail went out, may have delivered this since the
+            # claim. The claim query skips SENT rows, but only as of
+            # the claim (P0-38B). Retire the delivery without calling
+            # the provider again.
+            result = recorded.model_copy(
+                update={
+                    "reason": (
+                        recorded.reason
+                        or "already delivered by another path; not sent again"
+                    )
+                }
+            )
+            self._record_delivery_outcome(
+                notification,
+                delivery,
+                owner_id=owner_id,
+                result=result,
+                now=datetime.now(timezone.utc),
+                retry_at=None,
+                terminal=False,
+            )
+            return ("result", result, 0.0)
+        try:
+            result = self.notifier.send(notification)
+        except Exception as exc:
+            if _is_throttled(exc):
+                raise _ProviderThrottled() from exc
+            result = NotificationResult(
+                notification_id=notification.notification_id,
+                status=NotificationStatus.FAILED,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        if result.status is NotificationStatus.DUPLICATE and result.provider_message_id:
+            result = result.model_copy(
+                update={
+                    "status": NotificationStatus.SENT,
+                    "reason": (
+                        result.reason or "provider already accepted this notification"
+                    ),
+                }
+            )
+        completed_at = datetime.now(timezone.utc)
+        attempts = delivery.attempts + 1
+        terminal = (
+            result.status is not NotificationStatus.SENT and attempts >= max_attempts
+        )
+        if terminal:
+            self.dead_lettered_total += 1
+        delay = min(
+            retry_max_seconds,
+            retry_base_seconds * (2 ** max(0, attempts - 1)),
+        )
+        self._record_delivery_outcome(
+            notification,
+            delivery,
+            owner_id=owner_id,
+            result=result,
+            now=completed_at,
+            retry_at=completed_at + timedelta(seconds=delay),
+            terminal=terminal,
+        )
+        return ("result", result, 0.0)
+
+    def _delivery_failed(
+        self,
+        delivery: NotificationDelivery,
+        *,
+        owner_id: str,
+        retry_seconds: int,
+    ) -> None:
+        """Count a per-delivery store error and hand the row back (F-3).
+
+        The release is best effort: the store that just failed may fail
+        again, in which case the lease expires on its own and the next
+        claim picks the row up -- with any SENT verdict already recorded.
+        """
+
+        self.delivery_errors_total += 1
+        self.delivery_error_last_seen_timestamp_seconds = datetime.now(
+            timezone.utc
+        ).timestamp()
+        LOGGER.exception(
+            "notification %s: delivery bookkeeping failed; releasing it to the "
+            "outbox and continuing with the rest of the batch",
+            delivery.notification_id,
+        )
+        now = datetime.now(timezone.utc)
+        try:
+            self.store.release_notification_delivery(
+                delivery.notification_id,
+                owner_id=owner_id,
+                lease_epoch=delivery.lease_epoch,
+                now=now,
+                retry_at=now + timedelta(seconds=retry_seconds),
+            )
+        except Exception:
+            LOGGER.warning(
+                "notification %s could not be released either; its lease "
+                "will expire on its own",
+                delivery.notification_id,
+                exc_info=True,
+            )
 
     def _record_delivery_outcome(
         self,
@@ -927,6 +1118,27 @@ class AdvisoryNotificationService:
                 result.status.value,
                 recorded,
             )
+        except Exception as exc:
+            # Not a lease problem: the store itself failed (pool timeout,
+            # OperationalError) after the provider answered. The same
+            # duplicate-mail hazard as above applies to a SENT result --
+            # the row is still LEASED, has no result row, and the next
+            # claim after the lease lapses would mail it again from a
+            # replica whose in-process dedup cache knows nothing -- so the
+            # verdict is written by the single-statement path before the
+            # error is surfaced to the caller (control-plane review
+            # 2026-09-08, F-3). A failed attempt has nothing to protect.
+            if result.status is NotificationStatus.SENT:
+                try:
+                    self.store.save_notification_result(result)
+                except Exception:
+                    LOGGER.exception(
+                        "notification %s was SENT but neither its delivery nor "
+                        "its result could be recorded; it may be sent again "
+                        "when its lease lapses",
+                        notification.notification_id,
+                    )
+            raise _BookkeepingFailed(result) from exc
 
     def _release_throttled(
         self,

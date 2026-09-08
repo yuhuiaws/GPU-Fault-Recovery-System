@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from gpu_fault.store.shared.telemetry_models import (
     TELEMETRY_SPOOL_MAX_ATTEMPTS,

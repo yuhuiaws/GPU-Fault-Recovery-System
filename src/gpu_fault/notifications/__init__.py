@@ -93,6 +93,10 @@ _EXPORTS = {
         "gpu_fault.notifications.dcgm_diagnostic",
         "DcgmDiagnosticEmailBuilder",
     ),
+    "DiagnosticInconclusiveEmailBuilder": (
+        "gpu_fault.notifications.diagnostic_inconclusive",
+        "DiagnosticInconclusiveEmailBuilder",
+    ),
     "RestartGuardEmailBuilder": (
         "gpu_fault.notifications.restart_guard",
         "RestartGuardEmailBuilder",

@@ -110,7 +110,6 @@ from gpu_fault.node_action_keys import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 
-
 # A fleet node identifier is a bare host label (Kubernetes node name, HyperPod
 # instance id, or EC2 private DNS name). Anchor it so a client-supplied value
 # cannot smuggle whitespace, control characters, path traversal, URL userinfo,

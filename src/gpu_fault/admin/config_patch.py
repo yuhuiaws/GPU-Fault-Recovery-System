@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 
+from gpu_fault.admin.capacity_defaults import DEFAULT_CONTROL_WORKER_REPLICAS
 from gpu_fault.admin.capacity_evidence import aurora_min_acu_floor
 from gpu_fault.admin.config import (
     AdminConfig,
@@ -58,7 +59,7 @@ def preset_admin_config(name: str) -> AdminConfig:
     min_acu: float = aurora_min_acu_floor(managed_nodes)
     config = AdminConfig(
         capacity=CapacityConfig(
-            control_worker_replicas=6,
+            control_worker_replicas=DEFAULT_CONTROL_WORKER_REPLICAS,
             telemetry_spool=spool,
             remediation=RemediationCapacity(
                 max_active_region=clusters * 4,

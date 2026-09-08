@@ -74,6 +74,11 @@ class RegionalRegistryRuntime:
         # started with; None when the caller did not supply one.
         self.secret_config_sha256: str | None = None
         self._secret_drift_logged: bool | None = None
+        # The member row as last written and when: the heartbeat is re-written
+        # only when its content changes or a third of the stale window has
+        # passed, not on every 1 s poll (control-plane review 2026-09-08, F-5).
+        self._last_heartbeat_at: datetime | None = None
+        self._last_heartbeat_fingerprint: tuple[object, ...] | None = None
 
     @classmethod
     def bootstrap(
@@ -195,9 +200,14 @@ class RegionalRegistryRuntime:
     def is_ready(self, observed_at: datetime | None = None) -> bool:
         observed = observed_at or self.now()
         with self._lock:
+            # ``_last_error`` is no longer a criterion (A-7): one closed
+            # connection (~1/min baseline) failed readiness for the whole
+            # process until the next 1 s refresh, so
+            # GPU_FAULT_REGISTRY_STALE_SECONDS never applied to the error
+            # path. A divergent head is not transient: refresh_once moves the
+            # target to it, and the comparison below fails at once.
             return (
                 self._snapshot is not None
-                and self._last_error is None
                 and self._snapshot.generation == self._target_generation
                 and self._snapshot.content_sha256 == self._target_content_sha256
                 and self._last_successful_refresh is not None
@@ -263,6 +273,7 @@ class RegionalRegistryRuntime:
 
     def refresh_once(self, *, raise_on_failure: bool = False) -> bool:
         observed = self.now()
+        head = None
         try:
             head = self.store.get_regional_registry_head()
             revision = self.store.get_regional_registry_revision(head.generation)
@@ -293,17 +304,22 @@ class RegionalRegistryRuntime:
                 self._snapshot = snapshot
                 self._last_successful_refresh = observed
                 self._last_error = None
-            self.store.save_regional_registry_member(
-                self._member(snapshot, ready=True, observed_at=observed)
-            )
+            self._heartbeat(self._member(snapshot, ready=True, observed_at=observed))
             self._log_secret_drift()
             return True
         except Exception as exc:
             with self._lock:
                 self._last_error = f"{type(exc).__name__}: {exc}"
+                if head is not None:
+                    # The head was read and could not be served (digest or
+                    # generation mismatch, or the revision read failed):
+                    # fail readiness now rather than serve a snapshot the
+                    # head disagrees with.
+                    self._target_generation = head.generation
+                    self._target_content_sha256 = head.content_sha256
                 current_snapshot = self._snapshot
             try:
-                self.store.save_regional_registry_member(
+                self._heartbeat(
                     self._member(
                         current_snapshot,
                         ready=False,
@@ -315,6 +331,42 @@ class RegionalRegistryRuntime:
             if raise_on_failure:
                 raise
             return False
+
+    @staticmethod
+    def heartbeat_interval_seconds(stale_seconds: float) -> float:
+        """How long an unchanged member row may go without being re-written.
+
+        A third of the stale window: two heartbeats can be lost to a slow
+        store before ``active_registry_member_ids`` stops counting the
+        process, and with the production ``GPU_FAULT_REGISTRY_STALE_SECONDS=90``
+        it turns ~36 upserts/s across the fleet into ~1.2/s (F-5).
+        """
+
+        return stale_seconds / 3.0
+
+    def _heartbeat(self, member: RegionalRegistryMember) -> None:
+        """Write the member row if its content changed or the heartbeat is due."""
+
+        fingerprint: tuple[object, ...] = (
+            member.generation,
+            member.content_sha256,
+            member.ready,
+            member.error,
+        )
+        with self._lock:
+            last_written = self._last_heartbeat_at
+            unchanged = fingerprint == self._last_heartbeat_fingerprint
+        if (
+            unchanged
+            and last_written is not None
+            and (member.last_seen_at - last_written).total_seconds()
+            < self.heartbeat_interval_seconds(self.stale_seconds)
+        ):
+            return
+        self.store.save_regional_registry_member(member)
+        with self._lock:
+            self._last_heartbeat_at = member.last_seen_at
+            self._last_heartbeat_fingerprint = fingerprint
 
     def run(self, stop: Event) -> None:
         while not stop.is_set():

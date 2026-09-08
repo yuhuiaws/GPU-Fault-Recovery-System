@@ -32,7 +32,7 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
 from gpu_fault.training_models import TrainingProgressHeartbeat, TrainingProgressState
-from gpu_fault.watcher import AttemptObservation
+from gpu_fault.watcher import AttemptObservation, WorkloadCoverageHeartbeat
 
 
 class MemoryTelemetryMixin(MemoryAttemptEventState):
@@ -49,6 +49,7 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
     _gpu_metrics_batches: dict[GpuMetricsBatchKey, GpuMetricsIngestionResult]
     _telemetry_metric_latest: dict[tuple[str, str, str, str], TelemetryMetricLatest]
     _training_progress: dict[tuple[str, str, int], TrainingProgressState]
+    _workload_coverage: dict[str, WorkloadCoverageHeartbeat]
 
     _gpu_finding_history: dict[str, GpuHealthFinding]
     _lock: Any
@@ -306,6 +307,20 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
                 for key, item in self._telemetry_metric_latest.items()
                 if key[0] == cluster_id and key[1] == node_id
             ]
+
+    def save_workload_coverage(self, heartbeat: WorkloadCoverageHeartbeat) -> bool:
+        with self._lock:
+            previous = self._workload_coverage.get(heartbeat.cluster_id)
+            if previous is not None and heartbeat.scanned_at < previous.scanned_at:
+                return False
+            self._workload_coverage[heartbeat.cluster_id] = heartbeat
+            return True
+
+    def get_workload_coverage(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None:
+        with self._lock:
+            return self._workload_coverage.get(cluster_id)
 
     def save_attempt_observation(self, observation: AttemptObservation) -> bool:
         key = (

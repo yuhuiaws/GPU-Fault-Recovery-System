@@ -4,7 +4,6 @@ import errno
 import socket
 from urllib.error import URLError
 
-
 _RETRYABLE_ERRNOS = frozenset(
     {
         errno.ECONNABORTED,

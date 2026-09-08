@@ -10,6 +10,7 @@ from typing import (
     Iterable,
     Mapping,
     Protocol,
+    Sequence,
     TypedDict,
     runtime_checkable,
 )
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     from gpu_fault.telemetry_models import (
         WorkloadObservationState,
     )
+    from gpu_fault.watcher import WorkloadCoverageHeartbeat
 
 
 # Upper bound for one cluster's active (PENDING/RUNNING/SAFETY_PENDING)
@@ -309,7 +311,13 @@ class WorkflowStore(Protocol):
         self,
         incident: FaultIncident,
         workflow: WorkflowRequest,
-    ) -> None: ...
+        *,
+        extra_event_ids: Sequence[str] = (),
+    ) -> None:
+        """Write the pair and link ``incident.event_id`` plus every
+        ``extra_event_ids`` member event in the same transaction (control-plane
+        review 2026-09-08, C-10)."""
+        ...
 
     def reconcile_restored_workflow(
         self,
@@ -357,9 +365,12 @@ class WorkflowStore(Protocol):
         incident: FaultIncident,
         *,
         expected: FaultIncident | None = None,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         """Write one incident row and its event link without overwriting a row
         that has moved (architecture review 2026-09-07, item D1).
+        ``extra_event_ids`` are linked to the incident in the same transaction
+        (control-plane review 2026-09-08, C-09).
 
         Without ``expected`` the write is version-guarded like
         ``save_workflow``: a missing row is inserted; an existing row is
@@ -496,6 +507,22 @@ class WorkflowStore(Protocol):
 
         The mirror image of ``list_orphan_workflows``: a pointer to a record that
         was never persisted or has been cleaned up. Read-only.
+        """
+        ...
+
+    def list_incidents_by_state(
+        self,
+        cluster_id: str,
+        states: Collection[IncidentState],
+        *,
+        node_ids: set[str] | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
+    ) -> list[FaultIncident]:
+        """Incidents of ``cluster_id`` in one of ``states``, newest
+        ``updated_at`` first, optionally only those naming one of ``node_ids``
+        (an empty set matches nothing). Independent of any workflow row: the
+        incidents this serves (``IncidentClosureService``) are ESCALATED behind
+        a workflow that already ended. Read-only.
         """
         ...
 
@@ -669,6 +696,17 @@ class WorkflowStore(Protocol):
 
     def get_remote_command(self, command_id: str) -> RemoteActionCommand: ...
 
+    def expire_stale_fenced_remote_commands(
+        self,
+        *,
+        lease_expired_before: datetime,
+        limit: int,
+    ) -> int:
+        """Fail LEASED commands whose lease lapsed before ``lease_expired_before``
+        while their workflow sits at another ``fencing_token`` (control-plane
+        review 2026-09-08, D-9): ``status_source="stale-fence"``."""
+        ...
+
     def list_remote_commands(
         self,
         *,
@@ -835,6 +873,12 @@ class CompletionStore(Protocol):
         newest_first: bool = False,
     ) -> list[WorkloadObservationState]: ...
 
+    def save_workload_coverage(self, heartbeat: WorkloadCoverageHeartbeat) -> bool: ...
+
+    def get_workload_coverage(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None: ...
+
     def get_efa_traffic_state(self, state_key: str) -> EfaTrafficState: ...
 
     @staticmethod
@@ -905,6 +949,10 @@ class NotificationStore(Protocol):
     def get_notification_result(
         self, notification_id: str
     ) -> NotificationResult | None: ...
+
+    def get_notification_delivery(
+        self, notification_id: str
+    ) -> NotificationDelivery | None: ...
 
     def enqueue_notification_delivery(
         self,

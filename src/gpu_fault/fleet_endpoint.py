@@ -5,7 +5,6 @@ import re
 from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
-
 DEFAULT_AGENT_ENDPOINT_PORTS = frozenset({9099})
 EndpointNetworks = tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
 NODE_ADDRESS_LABEL_PATTERN = re.compile(r"^ip-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})$")

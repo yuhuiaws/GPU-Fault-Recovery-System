@@ -847,6 +847,11 @@ class WorkflowEventCode(StrEnum):
     # Operator reconciliation (``record_operator_event`` via the Store)
     OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
     OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
+    # The incident this workflow belonged to was closed RECOVERED after the
+    # workflow had ended (``IncidentClosureService``): by the restore that
+    # freed its node (kind TERMINAL) or by an operator (kind
+    # OPERATOR_RECONCILED). ``details["closed_by"]`` says which.
+    INCIDENT_CLOSED = "INCIDENT_CLOSED"
     # Bounded history (``append_workflow_event``)
     HISTORY_TRUNCATED = "HISTORY_TRUNCATED"
 

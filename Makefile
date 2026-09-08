@@ -86,52 +86,81 @@ CI_TOOLING_TESTS = \
 	tests/test_ci_gate.py \
 	tests/test_ci_unit_gate.py
 POSTGRES_TESTS = \
-	tests/store/test_postgres_store.py \
-	tests/store/test_postgres_processor_claim.py \
-	tests/store/test_postgres_reconnect.py \
-	tests/store/test_postgres_stuck_workflow_audit.py \
-	tests/store/test_store_error_classification.py \
-	tests/store/test_merge_executor_isolation.py \
-	tests/store/test_postgres_merge_vs_executor.py \
-	tests/store/test_postgres_workflow_indexes.py \
-	tests/store/test_postgres_lane_claim_guard.py \
-	tests/store/test_reconcile_narrow_reads.py \
-	tests/store/test_active_workflow_incidents_bound.py \
-	tests/store/test_postgres_claim_window.py \
-	tests/store/test_workflow_scan_pushdown.py \
-	tests/store/test_postgres_remote_claim_cancellation.py \
-	tests/execution/test_workload_withdrawal.py \
-	tests/execution/test_branch_settlement.py \
-	tests/store/test_control_record_archive.py \
-	tests/store/test_incident_state_counts.py \
-	tests/store/test_reconcile_epoch_cas.py \
-	tests/store/test_health_signal_notified_latch.py \
-	tests/store/test_postgres_core_guards.py \
-	tests/processor/test_observation_interlock_liveness.py \
-	tests/store/test_duplicate_event_fast_path.py \
-	tests/store/test_preemption_pending_marker.py \
+	tests/app_services/test_cleanup_unbounded_kinds.py \
 	tests/app_services/test_collector_ingestion_transaction.py \
-	tests/store/test_orphan_workflow_inspection.py \
-	tests/store/test_completion_decision_reads.py \
-	tests/store/test_postgres_observation_sweep.py \
-	tests/store/test_postgres_processor_legacy_paths.py \
-	tests/store/test_postgres_processor_expired_leases.py \
-	tests/store/test_postgres_remote_sweeper.py \
-	tests/store/test_postgres_processor_counters.py \
-	tests/store/test_workflow_scan_cursor.py \
-	tests/store/test_schema_trigger_definitions.py \
-	tests/store/test_postgres_index_builder.py \
+	tests/execution/test_branch_settlement.py \
+	tests/execution/test_workload_withdrawal.py \
+	tests/metrics/test_processor_counter_mode_metric.py \
+	tests/notifications/test_delivery_state.py \
+	tests/orchestration/test_incident_closure.py \
+	tests/processor/test_observation_interlock_liveness.py \
 	tests/processor/test_queue_priority_tiers.py \
 	tests/processor/test_routine_coalescing_boundaries.py \
+	tests/processor/test_telemetry_spool.py \
+	tests/regional/test_stuck_workflow_baseline.py \
+	tests/store/test_active_workflow_incidents_bound.py \
+	tests/store/test_cleanup_logging.py \
+	tests/store/test_completion_decision_reads.py \
+	tests/store/test_control_record_archive.py \
+	tests/store/test_duplicate_event_fast_path.py \
+	tests/store/test_evidence_pinned_to_incident.py \
+	tests/store/test_health_signal_notified_latch.py \
+	tests/store/test_incident_state_counts.py \
+	tests/store/test_lease_renewal_half_life.py \
+	tests/store/test_marker_retirement_history.py \
+	tests/store/test_merge_duplicate_event_contract.py \
+	tests/store/test_merge_executor_isolation.py \
+	tests/store/test_operator_event_recording.py \
+	tests/store/test_orphan_workflow_inspection.py \
+	tests/store/test_postgres_admission_vs_claim.py \
+	tests/store/test_postgres_claim_window.py \
+	tests/store/test_postgres_core_guards.py \
+	tests/store/test_postgres_dedicated_hot_state_startup.py \
+	tests/store/test_postgres_ensure_schema_locks.py \
+	tests/store/test_postgres_find_open_remote_command.py \
+	tests/store/test_postgres_health_signal_claim_isolation.py \
+	tests/store/test_postgres_index_builder.py \
+	tests/store/test_postgres_lane_claim_guard.py \
+	tests/store/test_postgres_merge_vs_executor.py \
+	tests/store/test_postgres_notification_delivery_lock.py \
+	tests/store/test_postgres_observation_sweep.py \
+	tests/store/test_postgres_processor_claim.py \
+	tests/store/test_postgres_processor_counters.py \
+	tests/store/test_postgres_processor_expired_leases.py \
+	tests/store/test_postgres_processor_legacy_paths.py \
+	tests/store/test_postgres_reconnect.py \
+	tests/store/test_postgres_remote_claim_cancellation.py \
+	tests/store/test_postgres_remote_command_lock_key.py \
+	tests/store/test_postgres_remote_sweeper.py \
+	tests/store/test_postgres_spool_notify_trigger.py \
+	tests/store/test_postgres_store.py \
+	tests/store/test_postgres_store_review_indexes.py \
+	tests/store/test_postgres_stuck_workflow_audit.py \
+	tests/store/test_postgres_workflow_indexes.py \
+	tests/store/test_postgres_workflow_lock_order.py \
+	tests/store/test_preemption_pending_marker.py \
+	tests/store/test_processor_batch_completion_contract.py \
+	tests/store/test_processor_release_cas.py \
+	tests/store/test_recent_markers_trusted_predicate.py \
+	tests/store/test_reconcile_epoch_cas.py \
+	tests/store/test_reconcile_narrow_reads.py \
+	tests/store/test_remote_command_stale_fence.py \
 	tests/store/test_save_incident_guard.py \
 	tests/store/test_save_plan_guard.py \
-	tests/store/test_evidence_pinned_to_incident.py \
-	tests/store/test_postgres_find_open_remote_command.py \
-	tests/store/test_postgres_notification_delivery_lock.py \
-	tests/notifications/test_delivery_state.py \
-	tests/store/test_operator_event_recording.py \
-	tests/store/test_marker_retirement_history.py \
-	tests/store/test_store_contracts.py
+	tests/store/test_save_workflow_guard.py \
+	tests/store/test_schema_trigger_definitions.py \
+	tests/store/test_store_contracts.py \
+	tests/store/test_store_error_classification.py \
+	tests/store/test_store_migrate.py \
+	tests/store/test_workflow_scan_cursor.py \
+	tests/store/test_workflow_scan_pushdown.py \
+	tests/store/test_workflow_scan_whole_second.py
+
+# POSTGRES_TESTS above: every test module that skips without
+# GPU_FAULT_TEST_POSTGRES_URL (G-1), kept equal to
+# scripts/ci_coverage_config.pytest_targets(root, "postgres") by
+# tests/test_ci_unit_gate.py. Regenerate with
+#   .venv/bin/python -c 'from pathlib import Path; from scripts.ci_coverage_config import pytest_targets; print("\n".join(pytest_targets(Path("."), "postgres")))'
 COVERAGE_IGNORE_ARGS = $(foreach test,$(DOCUMENTATION_TESTS) $(CI_TOOLING_TESTS) $(POSTGRES_TESTS),--ignore=$(test))
 
 .PHONY: test test-postgres test-postgres-stress test-shuffled test-parallel test-parallel-release test-impact regional-impact-plan impact-check coverage coverage-shard coverage-combine fault-test-cases fault-test-cases-ci fault-test-cases-with-cap005 run format check check-static check-static-sequential python-cache-clean html artifact-check runtime-image-check release-build release-build-promoted release-build-staging release-preflight release-deploy deploy-host-bundle deploy-host-sign deploy-host-setup deploy-host-setup-online deploy-host-check architecture-check architecture-baseline code-size-audit mypy-check mixin-check private-test-coupling-check test-source-assertion-check assert-message-check public-release-check ci-tooling-check docs-check docs-static-check doc-impact-check env-doc-check xid-catalog-check config-check case-index-check manual-command-order-check doc-reference-check doc-anchor-check fault-evidence-check deployment-contracts-update deployment-contracts-check deploy-check artifacts-safety-check artifacts-local-safety-check artifacts-retention yaml-check shell-check lazy-export-check cfn-lint-check doc-facts-check pip-audit-check sbom ci-supply-chain-tools promtool-check grafana-dashboards grafana-dashboards-check

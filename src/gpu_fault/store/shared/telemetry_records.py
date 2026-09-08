@@ -42,7 +42,7 @@ from gpu_fault.store.shared.telemetry_models import (
 from gpu_fault.telemetry import CollectorMetricsSnapshotRecord
 from gpu_fault.telemetry_models import WorkloadObservationState
 from gpu_fault.training_models import TrainingProgressHeartbeat, TrainingProgressState
-from gpu_fault.watcher import AttemptObservation
+from gpu_fault.watcher import AttemptObservation, WorkloadCoverageHeartbeat
 
 
 class SharedTelemetryRecordMixin:
@@ -137,6 +137,28 @@ class SharedTelemetryRecordMixin:
             for item in cast("list[GpuMetricLatest]", self._list("gpu_metric_latest"))
             if item.cluster_id == cluster_id and item.node_id == node_id
         ]
+
+    def save_workload_coverage(self, heartbeat: WorkloadCoverageHeartbeat) -> bool:
+        """Record the watcher's latest scan of a cluster; ``False`` when an
+        older heartbeat arrives after a newer one and is left alone."""
+
+        with self._state_transaction(f"workload_coverage/{heartbeat.cluster_id}"):
+            previous = cast(
+                "WorkloadCoverageHeartbeat | None",
+                self._get_optional("workload_coverage", heartbeat.cluster_id),
+            )
+            if previous is not None and heartbeat.scanned_at < previous.scanned_at:
+                return False
+            self._put("workload_coverage", heartbeat.cluster_id, heartbeat)
+            return True
+
+    def get_workload_coverage(
+        self, cluster_id: str
+    ) -> WorkloadCoverageHeartbeat | None:
+        return cast(
+            "WorkloadCoverageHeartbeat | None",
+            self._get_optional("workload_coverage", cluster_id),
+        )
 
     def save_attempt_observation(self, observation: AttemptObservation) -> bool:
         storage_key = self._state_key((observation.cluster_id, observation.attempt_id))

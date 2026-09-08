@@ -24,16 +24,16 @@ from gpu_fault.aws_errors import (
     aws_configuration_error,
     missing_aws_credentials,
 )
+from gpu_fault.env import env_bool
 from gpu_fault.env_validation import (
     validate_gpu_fault_environment,
 )
-from gpu_fault.env import env_bool
 from gpu_fault.execution import WorkflowStepContext
-from gpu_fault.execution.transient_errors import retryable_adapter_error
 from gpu_fault.execution.fleet_preflight import (
     command_requires_fleet_preflight,
     fleet_preflight_reason,
 )
+from gpu_fault.execution.transient_errors import retryable_adapter_error
 from gpu_fault.fleet import (
     AgentLifecycleState,
     AgentRecord,

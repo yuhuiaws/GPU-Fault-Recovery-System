@@ -6,16 +6,16 @@ import os
 from pathlib import Path
 from typing import Any
 
-from gpu_fault_release import regional_deployment_inventory as inventory
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
+from gpu_fault.admin.config import AdminConfig
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
     render_nlb_manifest,
 )
-
-from gpu_fault.admin.config import AdminConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
@@ -144,6 +144,42 @@ def rendered_release_manifest_sha256(release: Any) -> str:
     return _payload_digest(render_release_payload(release))
 
 
+def render_cpu_manifest_text(release: Any, filename: str, text: str) -> str:
+    """One generated CPU manifest with every release-time placeholder filled.
+
+    Mirrors the ``sed`` in ``apply-control-plane-role-split.sh``; the two must
+    know the same placeholders. Fails closed on anything left over: a
+    ``REPLACE_WITH_*`` that reaches a ConfigMap is a literal the runtime
+    rejects (the archive URI, for one) or silently misroutes.
+    """
+
+    config = release.config
+    replacements = {
+        "gpu-fault-control-plane-wheel-0100": release.wheel_cm,
+        "namespace: gpu-fault-system": f"namespace: {config.namespace}",
+        "REPLACE_WITH_AWS_REGION": config.aws_region,
+        "REPLACE_WITH_RUNTIME_PROFILE_VERSION": (config.runtime_profile_version),
+        DEFAULT_RUNTIME_IMAGE: release.runtime_image,
+        "GPU_FAULT_ALLOW_EMAIL: 'true'": (
+            f"GPU_FAULT_ALLOW_EMAIL: '{str(config.notifications.allow_email).lower()}'"
+        ),
+        "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'": (
+            "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: "
+            f"'{str(config.notifications.acknowledge_external_alert_channel).lower()}'"
+        ),
+    }
+    for source, destination in replacements.items():
+        text = text.replace(source, destination)
+    text = text.replace(
+        "gpu-fault.io/artifact-sha256: "
+        "209840015cc3057e191931f113d35dff733cf1b7483d68dd6b6b26a7de9a112b",
+        f"gpu-fault.io/artifact-sha256: {release.wheel_sha}",
+    )
+    if "REPLACE_WITH" in text:
+        raise ReleaseError(f"{filename} still contains a placeholder")
+    return text
+
+
 def _render_release_payload(release: Any) -> dict[str, Any]:
     config = release.config
     generated = ROOT / "deploy/control-plane/regional/generated"
@@ -156,28 +192,10 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
     ]
     cpu_documents: dict[str, list[dict[str, Any]]] = {}
     for filename in manifest_names:
-        text = (generated / filename).read_text(encoding="utf-8")
-        replacements = {
-            "gpu-fault-control-plane-wheel-0100": release.wheel_cm,
-            "namespace: gpu-fault-system": f"namespace: {config.namespace}",
-            "REPLACE_WITH_AWS_REGION": config.aws_region,
-            "REPLACE_WITH_RUNTIME_PROFILE_VERSION": (config.runtime_profile_version),
-            DEFAULT_RUNTIME_IMAGE: release.runtime_image,
-            "GPU_FAULT_ALLOW_EMAIL: 'true'": (
-                "GPU_FAULT_ALLOW_EMAIL: "
-                f"'{str(config.notifications.allow_email).lower()}'"
-            ),
-            "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'": (
-                "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: "
-                f"'{str(config.notifications.acknowledge_external_alert_channel).lower()}'"
-            ),
-        }
-        for source, destination in replacements.items():
-            text = text.replace(source, destination)
-        text = text.replace(
-            "gpu-fault.io/artifact-sha256: "
-            "209840015cc3057e191931f113d35dff733cf1b7483d68dd6b6b26a7de9a112b",
-            f"gpu-fault.io/artifact-sha256: {release.wheel_sha}",
+        text = render_cpu_manifest_text(
+            release,
+            filename,
+            (generated / filename).read_text(encoding="utf-8"),
         )
         cpu_documents[filename] = _documents(text)
 

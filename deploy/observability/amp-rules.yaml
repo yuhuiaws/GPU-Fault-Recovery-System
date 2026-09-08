@@ -118,6 +118,30 @@ groups:
             with GpuFaultControlPlaneMetricsMissing: both absent means the
             collector or the write path is down, this one alone means the
             self-telemetry reader or its keep filter changed.
+      # The collector's own memory (H2-4). The container is capped at 256Mi
+      # with GOMEMLIMIT 220MiB; a cardinality growth that pushes it into an
+      # OOMKill loop is otherwise invisible, because each restart lands a
+      # batch before dying, so neither absent(up) nor the drop counter fires.
+      # 200MiB leaves ~10% below GOMEMLIMIT for the alert to fire before the
+      # runtime starts thrashing the GC.
+      - alert: GpuFaultAdotMemoryHigh
+        expr: >-
+          max by (control_plane_cluster, region)
+          (otelcol_process_memory_rss) > 209715200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: The ADOT collector is close to its memory limit
+          runbook_url: docs/管理员日常运维.md#gpufaultadotmemoryhigh
+          description: >-
+            The collector's resident memory has stayed above 200MiB for ten
+            minutes against a 256Mi container limit (GOMEMLIMIT 220MiB). The
+            next step is an OOMKill loop in which every restart still lands a
+            batch, so the absence alerts stay quiet while AMP fills with gaps.
+            Check the Pod restart count and the series cardinality reaching the
+            keep filter (new cluster_id or pod labels); raise the limit only
+            with the cardinality understood.
   - name: gpu-fault-control-plane-capacity
     rules:
       - alert: GpuFaultControlPlaneMetricsMissing
@@ -134,6 +158,52 @@ groups:
             ingress Pod state and startup guard log, target discovery, and the
             namespace and port in the scrape config. Absence of alerts must not
             be read as absence of faults while this is firing.
+      # One Pod's /metrics failing (H2-1). ``absent(up == 1)`` above only fires
+      # when every target is gone; a single control-worker whose scrape times
+      # out or returns 500 simply disappears from every ``min by (pod)`` and
+      # ``sum(...)`` rule -- including GpuFaultProcessorUnhealthy, which was
+      # written for exactly that Pod. ``up`` carries pod and service_role from
+      # the target relabels, so this is per replica by construction.
+      - alert: GpuFaultControlPlaneReplicaScrapeFailing
+        expr: up{job="gpu-fault-control-plane"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A control-plane replica's /metrics scrape is failing
+          runbook_url: docs/管理员日常运维.md#gpufaultcontrolplanereplicascrapefailing
+          description: >-
+            Pod {{ $labels.pod }} ({{ $labels.service_role }}) has not answered
+            a scrape for five minutes: the request timed out or returned a
+            non-200. Every per-Pod rule is blind to this Pod meanwhile, so its
+            processor health and loop liveness are unknown, not healthy. Check
+            the Pod's readiness, its /metrics by kubectl exec on loopback, and
+            gpu_fault_metrics_contributor_errors_total on its neighbours for a
+            store-side cause; a pool that lost its slots to a rotated password
+            shows up here first.
+      # A contributor that raises is skipped and counted rather than failing
+      # the scrape (G-8). The counter is summed over the Pod's processes;
+      # increase() over 10m
+      # catches a contributor failing every scrape without paging on one
+      # transient store error.
+      - alert: GpuFaultMetricsContributorFailing
+        expr: >-
+          sum by (control_plane_cluster, region, pod, service_role, contributor)
+          (increase(gpu_fault_metrics_contributor_errors_total[10m])) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A /metrics contributor keeps failing on one replica
+          runbook_url: docs/管理员日常运维.md#gpufaultmetricscontributorfailing
+          description: >-
+            Contributor {{ $labels.contributor }} on Pod {{ $labels.pod }} has
+            raised on most scrapes for ten minutes, so its families are missing
+            from AMP while the rest of the endpoint still renders. The first
+            failure is logged with a traceback under
+            gpu_fault.app.metric_contributors; the usual cause is a store read
+            failing (pool timeout, failover, schema drift). Treat the missing
+            families as unknown, not zero.
       - alert: GpuFaultProcessorQueueDepthHigh
         expr: max(gpu_fault_processor_queue_depth) > 7000
         for: 5m
@@ -310,8 +380,9 @@ groups:
       # delayed by at least one lease -- a fact no queue-depth rule can see,
       # because the depth does not change when a lease is reclaimed.
       #
-      # `sum by` over `increase`: the counter is per process, so a worker that
-      # restarts resets its own series and every replica reclaims on behalf of
+      # `sum by` over `increase`: the counter is summed over a Pod's processes,
+      # so a process that restarts drops the Pod's series and every replica
+      # reclaims on behalf of
       # the same queue. Ten minutes is long enough that one lease expiry from a
       # rolling restart is still visible and short enough to name the deploy.
       - alert: GpuFaultProcessorExpiredLeasesReclaimed
@@ -436,9 +507,9 @@ groups:
       # had: pending age 0, no errors, no drift. The `_last_cycle_timestamp_`
       # gauges are stamped at the top of every cycle and are the one thing a
       # dead loop cannot keep fresh (ARCH-E E3). `max` across replicas: the
-      # stamp is 0 on replicas whose loop never ran (ingress), and on a
-      # multi-process Pod a scrape samples one process, so only "no process
-      # anywhere has ticked for five minutes" fires.
+      # stamp is 0 on replicas whose loop never ran (ingress), and a Pod's
+      # /metrics reports the newest stamp over its four processes, so only
+      # "no process anywhere has ticked for five minutes" fires.
       - alert: GpuFaultWorkflowDispatcherStalled
         expr: >-
           time()
@@ -495,6 +566,32 @@ groups:
             processor log; the usual causes are a lost store connection or a
             schema version the wheel does not accept. Its share of the queue is
             being served by the other replicas until it recovers or restarts.
+      # Process up, claim rounds flat (B-6). The consumer loop had no liveness
+      # signal of its own: a thread that died or wedged on one store call kept
+      # ``gpu_fault_processor_healthy`` at 1 while the replica claimed nothing.
+      # 30 s is several times the loop's longest voluntary wait (5 s
+      # notification fallback, 2 s idle backoff).
+      - alert: GpuFaultProcessorConsumerStalled
+        expr: >-
+          min by (control_plane_cluster, region, pod)
+          (gpu_fault_processor_consumer_running{pod=~"gpu-fault-control-worker-.*"}) == 0
+          or
+          max by (control_plane_cluster, region, pod)
+          (gpu_fault_processor_consumer_last_cycle_age_seconds{pod=~"gpu-fault-control-worker-.*"}) > 30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A control-worker's processor consumer loop is dead or wedged
+          runbook_url: docs/管理员日常运维.md#gpufaultprocessorconsumerstalled
+          description: >-
+            Pod {{ $labels.pod }} reports its processor consumer loop as not
+            running, or has not started a claim cycle for over 30 seconds, for
+            two minutes. Its share of the queue is not being claimed while its
+            health gauge may still read 1. /livez on that Pod names
+            processor-consumer as the dead thread and kubelet restarts it; if
+            it keeps recurring, read gpu_fault_processor_consumer_cycle_errors_total
+            and the processor log for the store call the loop blocks on.
       - alert: GpuFaultProcessorNoActiveConsumer
         expr: >-
           sum by (control_plane_cluster, region)
@@ -582,9 +679,10 @@ groups:
       # dropped without a decision (ARCH-G1). The counter lives in the
       # processor, which publishes no last-seen timestamp for it, so this rule
       # has the same sampled-counter exposure as
-      # GpuFaultProcessorLeaseRenewalFailing above: control-worker is a
-      # four-process Pod scraped one process at a time, and increase() can read
-      # the interleaving as a reset. A missed alert, never a false one.
+      # GpuFaultProcessorLeaseRenewalFailing above: the Pod's /metrics sums
+      # the counter over its four processes, so scrapes no longer interleave,
+      # but one process restarting drops the sum and increase() reads that as
+      # a reset. A missed alert, never a false one.
       - alert: GpuFaultProcessorFaultEventsRejected
         expr: >-
           sum by (control_plane_cluster, region)
@@ -606,7 +704,8 @@ groups:
             4xx on one path after a release is a schema drift between the
             collector and the control plane, not a node fault.
       # Timestamps, not increase(): see GpuFaultNotificationExpiredUnsent for
-      # why a per-process counter on a four-process Pod cannot be rated.
+      # why the newest event's stamp is the robust read of a process-local
+      # counter.
       - alert: GpuFaultPeriodicServiceErrors
         expr: >-
           time()
@@ -911,6 +1010,81 @@ groups:
   # the system exists to deliver, so they get their own group and their own
   # thresholds, expressed against the closed-loop metrics the control plane
   # already publishes.
+      # Control-plane review 2026-09-08 counters that used to be log lines only.
+      # Each ``increase`` is summed across replicas: the periodic and archive
+      # jobs run on whichever worker holds the lease, the dispatcher and the
+      # outbox drainer on any worker.
+      - alert: GpuFaultRemoteCommandStaleFenceSwept
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_periodic_cleanup_rows_total{job="stale_fence_remote_commands"}[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A remote command was failed by the stale-fence sweep
+          runbook_url: docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept
+          description: >-
+            {{ $value }} LEASED remote command(s) whose workflow moved to
+            another fencing token had their lease lapse without the data plane
+            reporting a result, and the periodic sweep failed them with
+            status_source=stale-fence (D-9). Each one is a node action that ran
+            on a superseded generation with nobody collecting its outcome:
+            read result_details.stale_fence_swept on the command and check the
+            node for an overlapping action before treating the workflow's
+            current generation as clean.
+      - alert: GpuFaultNotificationDeliveryErrors
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_notification_delivery_errors_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Notification outbox deliveries are raising
+          runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryerrors
+          description: >-
+            {{ $value }} outbox deliveries in fifteen minutes raised inside the
+            provider call or the bookkeeping after it (F-3); each row was
+            released for retry and the rest of the batch continued, so this is
+            a slower outbox, not a lost one, unless it keeps firing. The
+            exception is logged by gpu_fault.notification_service; SES timeouts
+            and Secret/IAM errors are the usual causes.
+      - alert: GpuFaultControlRecordArchiveErrors
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_control_record_archive_errors_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: The control-record archiver is failing on candidates
+          runbook_url: docs/管理员日常运维.md#gpufaultcontrolrecordarchiveerrors
+          description: >-
+            {{ $value }} archive candidate(s) in the last hour failed with an
+            exception other than a safety refusal (F-8); the run continued and
+            the incident stays in the database for the next run. Read the
+            reason label (exception type) and the archiver log; S3 permission
+            or bucket errors keep every candidate failing, so retention
+            silently stops reclaiming.
+      - alert: GpuFaultPendingTriageReconcileFailing
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_completion_pending_triage_reconcile_failures_total[30m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: The PENDING_TRIAGE watchdog cannot expire a decision
+          runbook_url: docs/管理员日常运维.md#gpufaultpendingtriagereconcilefailing
+          description: >-
+            {{ $value }} attempt(s) in thirty minutes to expire an overdue
+            PENDING_TRIAGE decision raised (F-7): the decision stays pending,
+            the conservative plan is not compiled, and the watchdog retries
+            every tick. The reason label is the exception type; a missing
+            event or profile row is the usual cause. Compare with
+            GpuFaultCompletionPendingTriageBacklog, which counts the decisions
+            themselves.
   - name: gpu-fault-recovery-outcome
     rules:
       # BLOCKED is the fail-closed terminal state: the workflow stopped because
@@ -953,13 +1127,19 @@ groups:
             successor, so each one still holds a GPU node out of the training
             pool. Read the blocking reason per workflow; do not clear BLOCKED by
             editing Store rows.
+      # The ratio is configuration arithmetic (threads that may hold a
+      # connection / pool ceiling) and the worker role has run at ~1.5x since
+      # the day it was deployed without ever queueing on checkout, so it is
+      # information, not a page (G-7). The two rules after it read the live
+      # pool: callers actually waiting, and connection attempts actually
+      # failing -- the shape a rotated password or a failover takes.
       - alert: GpuFaultPostgresPoolOversubscribed
         expr: >-
           max by (control_plane_cluster, region, service_role)
           (gpu_fault_postgres_pool_oversubscription_ratio) > 1
         for: 10m
         labels:
-          severity: warning
+          severity: info
         annotations:
           summary: A control-plane role can hold more connections than its pool has
           runbook_url: docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed
@@ -967,7 +1147,90 @@ groups:
             Role {{ $labels.service_role }}: the threads that can each hold a pooled PostgreSQL connection
             outnumber the pool ceiling by {{ $value }}x; under load callers queue
             on checkout and the request deadline, not the database, becomes the
-            limit.
+            limit. Informational: GpuFaultPostgresPoolCheckoutQueueing says
+            whether anyone is actually waiting.
+      - alert: GpuFaultPostgresPoolCheckoutQueueing
+        expr: >-
+          max by (control_plane_cluster, region, service_role, pod)
+          (gpu_fault_postgres_pool_requests_waiting) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Callers are queueing for a PostgreSQL pool connection
+          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespoolcheckoutqueueing
+          description: >-
+            Pod {{ $labels.pod }} ({{ $labels.service_role }}) has had callers
+            blocked on pool checkout on every sample for two minutes: every
+            pooled connection is in use and the next PoolTimeout turns into a
+            503 or a stalled worker thread. Compare gpu_fault_postgres_pool_size
+            with gpu_fault_postgres_pool_max_size -- a pool below its ceiling
+            is losing slots (see GpuFaultPostgresPoolConnectionErrors), a pool
+            at its ceiling is genuinely saturated; then read Aurora latency
+            and the lane wait summary before adding connections.
+      - alert: GpuFaultPostgresPoolConnectionErrors
+        expr: >-
+          sum by (control_plane_cluster, region, service_role, pod)
+          (increase(gpu_fault_postgres_pool_connections_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A PostgreSQL pool cannot open new connections
+          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespoolconnectionerrors
+          description: >-
+            Pod {{ $labels.pod }} ({{ $labels.service_role }}) has failed to open
+            pooled connections for five minutes. After a master password
+            rotation this is the pool re-dialling with the old password; the
+            pool re-reads the mounted Secret on each failure
+            (gpu_fault_postgres_credential_rotations_total rises when the file
+            changed), so a rising counter with no rotation means the Secret was
+            never updated -- check GpuFaultAuroraCredentialRefreshStale and the
+            refresher CronJob. During a failover the counter rises briefly and
+            stops; sustained growth with an unchanged Secret is DNS, security
+            group or Aurora availability.
+      # The refresher's last verdict, read from the Secret it writes (H1-2).
+      # Hourly CronJob; three missed hours means the next rotation (every 7
+      # days) will reach the pools before the Secret does.
+      - alert: GpuFaultAuroraCredentialRefreshStale
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_aurora_credential_refresh_last_success_age_seconds) > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: The Aurora credential refresher has not succeeded for three hours
+          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshstale
+          description: >-
+            The hourly gpu-fault-aurora-credential-refresh CronJob last
+            verified and published the master password more than three hours
+            ago, so the mounted Secret may not survive the next rotation.
+            gpu_fault_aurora_credential_refresh_last_attempt_failed says
+            whether it is failing or simply not being scheduled; read the
+            failure_reason in last-refresh-status.json and the newest Job's log,
+            then run the Job by hand once the cause is fixed.
+      # The status file only records the last run, so a failed run withholds
+      # the success age above; this is the companion that fires on consecutive
+      # failures rather than on age.
+      - alert: GpuFaultAuroraCredentialRefreshFailing
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_aurora_credential_refresh_last_run_ok) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: The Aurora credential refresher's last run failed
+          runbook_url: docs/管理员日常运维.md#gpufaultauroracredentialrefreshfailing
+          description: >-
+            The most recent gpu-fault-aurora-credential-refresh run finished
+            with a non-ok status and no later run has succeeded in fifteen
+            minutes, so the mounted Secret will not follow the next master
+            password rotation. The error text (password redacted) is in the
+            Secret's last-refresh-status.json and the Job log; typical causes
+            are the Secrets Manager read, the verify connection (network,
+            CA bundle) or RBAC on the Secret patch.
       - alert: GpuFaultBranchEscalationBudgetRefused
         expr: >-
           sum by (control_plane_cluster, region)
@@ -1217,10 +1480,11 @@ groups:
       # and reads as an attack to the mail provider. It is still a notification
       # nobody received, and a steady trickle of them says the outbox drains
       # slower than it fills. Read as the newest expiry's timestamp rather than
-      # increase() of the counter: control-worker Pods run four processes and a
-      # scrape samples one, so a per-process counter interleaves across scrapes
-      # and increase() reads the interleaving as resets. max() of a timestamp
-      # is the newest event whichever process reported it.
+      # increase() of the counter: the Pod's /metrics sums the counter over
+      # its four processes, but the sum still drops when a process restarts
+      # and a rollout of six replicas is six resets; max() of a timestamp is
+      # the newest event whichever replica reported it and survives all of
+      # them.
       - alert: GpuFaultNotificationExpiredUnsent
         expr: >-
           time()

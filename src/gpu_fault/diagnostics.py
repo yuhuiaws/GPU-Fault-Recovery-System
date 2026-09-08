@@ -14,7 +14,6 @@ from gpu_fault.models import (
     TriageReport,
 )
 
-
 RESET_REQUIRED_COUNTERS = {
     "DCGM_FI_DEV_RETIRED_PENDING",
     "DCGM_FI_DEV_ROW_REMAP_PENDING",

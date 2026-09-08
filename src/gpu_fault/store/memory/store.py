@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from threading import RLock
 
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
@@ -22,15 +23,6 @@ from gpu_fault.models import (
     WorkflowRequest,
     XidMetricBaseline,
 )
-from gpu_fault.installation_resources import InstallationResource
-from gpu_fault.store.shared.compositions import SharedCompositionMixin
-from gpu_fault.store.shared.efa import SharedEfaTrafficRulesMixin
-from gpu_fault.store.shared.errors import (
-    EfaTrafficAdminConflict as EfaTrafficAdminConflict,
-    NotFoundError as NotFoundError,
-    WorkflowLeaseError as WorkflowLeaseError,
-)
-from gpu_fault.store.shared.xid import SharedXidSignalMixin
 from gpu_fault.store.memory.control_records import MemoryControlRecordMixin
 from gpu_fault.store.memory.efa import MemoryEfaTrafficMixin
 from gpu_fault.store.memory.fleet import MemoryFleetMixin
@@ -42,6 +34,18 @@ from gpu_fault.store.memory.telemetry import MemoryTelemetryMixin
 from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
 from gpu_fault.store.memory.workflows import MemoryWorkflowMixin
 from gpu_fault.store.memory.xid import MemoryXidMixin
+from gpu_fault.store.shared.compositions import SharedCompositionMixin
+from gpu_fault.store.shared.efa import SharedEfaTrafficRulesMixin
+from gpu_fault.store.shared.errors import (
+    EfaTrafficAdminConflict as EfaTrafficAdminConflict,
+)
+from gpu_fault.store.shared.errors import (
+    NotFoundError as NotFoundError,
+)
+from gpu_fault.store.shared.errors import (
+    WorkflowLeaseError as WorkflowLeaseError,
+)
+from gpu_fault.store.shared.xid import SharedXidSignalMixin
 
 
 class InMemoryStore(
@@ -106,6 +110,7 @@ class InMemoryStore(
         self._collector_statuses = {}
         self._telemetry_metric_latest = {}
         self._attempt_observations = {}
+        self._workload_coverage = {}
         self._training_progress = {}
         self._raw_evidence = {}
         self._hyperpod_node_identities = {}

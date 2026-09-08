@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import get_type_hints
 from uuid import uuid4
 
@@ -47,6 +48,7 @@ from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflow
 from gpu_fault.store.sqlite.processor_leases import SqliteProcessorLeaseMixin
 from gpu_fault.store.sqlite.processor_queue import SqliteProcessorQueueMixin
 from gpu_fault.watcher import WorkloadPhase
+from scripts.ci_coverage_config import pytest_targets as _postgres_shard_targets
 from tests._builders import (
     attempt_observation,
     build_store,
@@ -82,6 +84,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "add_marker",
         "amend_workflow",
         "apply_efa_traffic_admin_action",
+        "cleanup_stale_regional_registry_members",
         "complete_active_processor_requests_batch",
         "complete_notification_delivery",
         "complete_remote_command",
@@ -108,6 +111,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "get_incident",
         "get_incident_by_event",
         "get_notification",
+        "get_notification_delivery",
         "get_notification_result",
         "get_notification_watermark",
         "get_plan",
@@ -118,6 +122,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "get_regional_registry_revision",
         "get_restart_budget",
         "get_workflow",
+        "get_workload_coverage",
         "get_xid_correlation",
         "get_xid_event",
         "get_xid_events",
@@ -167,6 +172,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_triage_report",
+        "save_workload_coverage",
         "save_xid_policy_decision",
         "try_enqueue_processor_requests_batch",
     }
@@ -213,6 +219,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "get_incident",
         "get_incident_by_event",
         "get_notification",
+        "get_notification_delivery",
         "get_notification_result",
         "get_notification_watermark",
         "get_plan",
@@ -223,6 +230,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "get_regional_registry_revision",
         "get_restart_budget",
         "get_workflow",
+        "get_workload_coverage",
         "get_xid_correlation",
         "get_xid_event",
         "get_xid_policy_decision",
@@ -257,6 +265,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_triage_report",
+        "save_workload_coverage",
         "save_xid_policy_decision",
     }
 )
@@ -361,6 +370,7 @@ TRANSACTIONAL_WORKFLOW_PUBLIC = frozenset(
 
 MEMORY_FLEET_PUBLIC = frozenset(
     {
+        "cleanup_stale_regional_registry_members",
         "cleanup_terminal_fleet_deployments",
         "delete_regional_cluster",
         "get_agent",
@@ -557,6 +567,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
+        if migration.version <= 12
     }
 
     assert historical == {
@@ -576,7 +587,9 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         "a published migration's checksum changed: do not edit v1-v12 (not even "
         "a comment inside its apply callback); append a new migration instead"
     )
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 12
+    # v13 (control-plane review 2026-09-08 indexes) is pinned here once it has
+    # been released to production; until then its checksum follows the DDL.
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 13
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:
@@ -990,3 +1003,117 @@ def test_postgres_cleanup_terminal_reconcile_is_not_starved_by_old_events() -> N
         assert states[current.attempt_id] is WorkloadPhase.FAILED
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Control-plane review 2026-09-08, G-10: the contract tests above compare
+# signatures, and the memory backend serialises everything behind one RLock,
+# so a Postgres-only method or a Postgres-only concurrency semantic is
+# invisible to every unit test that runs without GPU_FAULT_TEST_POSTGRES_URL.
+# This registry makes the difference explicit: every Postgres-only public
+# method and every shared method whose behaviour under concurrency only exists
+# on Postgres must name the Postgres test file that exercises it, and that
+# file must be in the CI postgres shard (G-1), or be registered as a known gap.
+# ---------------------------------------------------------------------------
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+# Postgres-only public methods -> the Postgres-gated test file exercising them.
+# ``None`` records a known gap rather than hiding it; adding a method without
+# an entry fails the test below.
+POSTGRES_ONLY_PUBLIC_METHODS: dict[str, str | None] = {
+    "backfill_hot_state_tables": "tests/store/test_store_migrate.py",
+    "backfill_processor_queue_state_columns": None,  # legacy backfill; no Postgres test
+    "claim_active_processor_query": "tests/store/test_postgres_claim_window.py",
+    "finalize_processor_counter_shards": "tests/store/test_postgres_processor_counters.py",
+    "hot_state_backfill_gaps": "tests/store/test_postgres_dedicated_hot_state_startup.py",
+    "hot_state_migration_status": "tests/store/test_postgres_dedicated_hot_state_startup.py",
+    "listen_processor_queue_notifications": "tests/store/test_postgres_processor_claim.py",
+    "listen_telemetry_spool_notifications": "tests/store/test_postgres_processor_claim.py",
+    "pool_metrics": None,  # rendered by /metrics; the pool snapshot itself has no Postgres test
+    "processor_counter_mode": "tests/store/test_postgres_processor_counters.py",
+    "processor_queue_state_status": None,  # legacy status probe; no Postgres test
+    "purge_legacy_hot_state": "tests/store/test_store_migrate.py",
+    "restore_legacy_processor_counters": "tests/store/test_postgres_processor_counters.py",
+    "telemetry_spool_depths": None,  # spool admission projection (E-2); memory-only test so far
+    "unhandled_failed_workflows_query": "tests/store/test_postgres_workflow_indexes.py",
+    "workflow_scan_query": "tests/store/test_postgres_workflow_indexes.py",
+}
+
+# Methods every backend implements whose concurrency semantics -- advisory
+# locks, row locks, SKIP LOCKED, NOTIFY, guarded upserts -- only exist on
+# Postgres. The memory RLock makes each of them trivially "correct" in a unit
+# test; only the named Postgres test can observe the race it guards against.
+POSTGRES_CONCURRENCY_SEMANTICS: dict[str, str] = {
+    "_state_transaction": "tests/store/test_postgres_workflow_lock_order.py",
+    "save_workflow": "tests/store/test_save_workflow_guard.py",
+    "save_incident": "tests/store/test_save_incident_guard.py",
+    "save_plan": "tests/store/test_save_plan_guard.py",
+    "claim_workflow": "tests/store/test_postgres_merge_vs_executor.py",
+    "claim_active_processor_requests": "tests/store/test_postgres_processor_claim.py",
+    "claim_remote_commands": "tests/store/test_postgres_remote_command_lock_key.py",
+    "claim_notification_deliveries": "tests/store/test_postgres_notification_delivery_lock.py",
+    "complete_notification_delivery": "tests/store/test_postgres_notification_delivery_lock.py",
+    "acquire_periodic_task_lease": "tests/store/test_postgres_store.py",
+    "completion_transaction": "tests/store/test_postgres_core_guards.py",
+    "claim_due_xid_correlations": "tests/store/test_postgres_store.py",
+    "renew_workflow_lease": "tests/store/test_lease_renewal_half_life.py",
+    "claim_health_signal_transitions": (
+        "tests/store/test_postgres_health_signal_claim_isolation.py"
+    ),
+}
+
+
+def _postgres_only_public_methods() -> set[str]:
+    def public(cls) -> set[str]:
+        return {
+            name
+            for name in dir(cls)
+            if not name.startswith("_") and callable(getattr(cls, name, None))
+        }
+
+    return public(PostgresStore) - public(InMemoryStore) - public(SqliteStore)
+
+
+def test_postgres_only_public_methods_are_registered_with_their_postgres_test() -> None:
+    actual = _postgres_only_public_methods()
+    registered = set(POSTGRES_ONLY_PUBLIC_METHODS)
+
+    assert actual == registered, {
+        "unregistered (add to POSTGRES_ONLY_PUBLIC_METHODS with its Postgres test)": (
+            sorted(actual - registered)
+        ),
+        "stale (no longer Postgres-only)": sorted(registered - actual),
+    }
+
+
+def test_postgres_semantics_registry_points_at_postgres_shard_tests() -> None:
+    shard = set(_postgres_shard_targets(_REPOSITORY_ROOT, "postgres"))
+    referenced = {
+        *(path for path in POSTGRES_ONLY_PUBLIC_METHODS.values() if path),
+        *POSTGRES_CONCURRENCY_SEMANTICS.values(),
+    }
+
+    for method in POSTGRES_CONCURRENCY_SEMANTICS:
+        assert hasattr(PostgresStore, method), method
+        # ``_state_transaction`` is the Postgres advisory-lock primitive the
+        # memory backend replaces with its RLock; every public entry must be a
+        # shared method, or it belongs in POSTGRES_ONLY_PUBLIC_METHODS.
+        if not method.startswith("_"):
+            assert hasattr(InMemoryStore, method), (
+                f"{method} is not a shared method; register it in "
+                "POSTGRES_ONLY_PUBLIC_METHODS instead"
+            )
+    for path in sorted(referenced):
+        assert (_REPOSITORY_ROOT / path).is_file(), (
+            f"registered Postgres test is missing: {path}"
+        )
+        assert path in shard, (
+            f"{path} is registered as Postgres evidence but is not in the CI "
+            "postgres shard; it must read GPU_FAULT_TEST_POSTGRES_URL or import "
+            "a tests helper that does (G-1)"
+        )
+    gaps = sorted(
+        name for name, path in POSTGRES_ONLY_PUBLIC_METHODS.items() if not path
+    )
+    assert len(gaps) <= 4, f"the known-gap list only grows with a review: {gaps}"

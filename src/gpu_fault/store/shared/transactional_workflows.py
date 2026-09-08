@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from gpu_fault.models import (
     FaultIncident,
@@ -13,6 +13,9 @@ from gpu_fault.models import (
     append_workflow_event,
     record_operator_event,
 )
+from gpu_fault.retired_generation import retired_generation_records
+from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
+from gpu_fault.store.shared.preemption import preemption_pending_update
 from gpu_fault.store.shared.primitives import (
     GetLink,
     GetRecord,
@@ -20,9 +23,7 @@ from gpu_fault.store.shared.primitives import (
     PutRecord,
     StateTransaction,
 )
-from gpu_fault.retired_generation import retired_generation_records
-from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
-from gpu_fault.store.shared.preemption import preemption_pending_update
+from gpu_fault.store.shared.record_guards import stale_incident_versions
 from gpu_fault.workflow_resolution import reconciled_restore_records
 
 if TYPE_CHECKING:
@@ -90,6 +91,31 @@ def lease_extension_due(
     expires_at = workflow.execution_lease_expires_at
     assert expires_at is not None  # validated by the caller
     return expires_at - renewed_at <= lease_duration / 2
+
+
+def incident_pointer_moved(
+    current: FaultIncident | None, incident: FaultIncident
+) -> bool:
+    """Whether a leased writer's incident snapshot predates a pointer move.
+
+    ``save_workflow_and_incident_if_leased`` writes the incident wholesale, and
+    ``FaultIncident`` has no merge revision. The one field that says "a merge
+    re-parented this incident since you read it" is ``workflow_request_id``:
+    a QUEUE_SUCCESSOR merge moves it to the successor and leaves the
+    predecessor row -- and therefore the executor's ``merge_revision`` --
+    untouched (control-plane review 2026-09-08, C-02). The executor used to
+    check this with an autocommit ``get_incident`` *before* its transaction,
+    which left the window between that read and the row lock open. The three
+    backends now compare inside the lock: a snapshot whose pointer disagrees
+    with the row's is stale and the incident write is skipped, so the
+    successor keeps the pointer and the scope the merge gave it. The
+    dispatcher's abandoned-generation audit reads the incident fresh, so its
+    copy agrees with the row and still lands.
+    """
+
+    return current is not None and (
+        current.workflow_request_id != incident.workflow_request_id
+    )
 
 
 class TransactionalWorkflowMixin:
@@ -252,6 +278,65 @@ class TransactionalWorkflowMixin:
             update={"merge_revision": existing.merge_revision + 1}
         )
 
+    def _stamped(
+        self,
+        existing_incident: FaultIncident | None,
+        existing_workflow: WorkflowRequest | None,
+        incident: FaultIncident,
+        workflow: WorkflowRequest,
+    ) -> WorkflowRequest:
+        """Stamp whatever rows a builder returned, group-linked or adopted.
+
+        ``_merged`` only knew the row the group link pointed at. Six builders
+        return a *different* pair -- ``grouped_faults`` / ``grouped_health``
+        ``_active_attempt_recovery``, sxid ``_build_state``, the two drain
+        incumbent joins and ``node_lifecycle._parallel_branch`` all adopt a
+        RUNNING pair stored under another key (or under no group key at all:
+        escalation, reset, health and node-scope faults create pairs the
+        attempt group later adopts). Those rows were written back without a
+        row lock and without a ``merge_revision`` bump, so the executor's next
+        ``save_workflow_if_leased`` overwrote the adoption while the event
+        link already said "handled" -- a fault with no step anywhere
+        (control-plane review 2026-09-08, C-01).
+
+        For a returned row that is not the group's, this locks it
+        (``_locked_optional``, a real ``FOR UPDATE`` on PostgreSQL) and
+        stamps the *stored* ``merge_revision + 1`` onto the returned copy; the
+        incident goes through the same generation guard ``save_incident``
+        applies (``stale_incident_versions``). Lock order: the adopted incident
+        before the adopted workflow, both after the group's own rows. Two
+        groups adopting each other's rows concurrently can still deadlock on
+        PostgreSQL; 40P01 is classified retryable and the ingest retries with
+        a fresh read.
+        """
+
+        adopted_incident = (
+            existing_incident is None
+            or existing_incident.incident_id != incident.incident_id
+        )
+        if adopted_incident:
+            stored_incident = self._locked_optional("incident", incident.incident_id)
+            if stored_incident is not None:
+                stale = stale_incident_versions(stored_incident, incident)
+                if stale is not None:
+                    raise stale
+        if (
+            existing_workflow is not None
+            and existing_workflow.request_id == workflow.request_id
+        ):
+            return self._merged(existing_workflow, workflow)
+        stored_workflow = self._locked_optional("workflow", workflow.request_id)
+        if stored_workflow is None:
+            return workflow
+        LOGGER.info(
+            "merge adopted workflow %s (incident %s) from outside its group link; "
+            "stamping merge_revision %s",
+            workflow.request_id,
+            incident.incident_id,
+            stored_workflow.merge_revision + 1,
+        )
+        return self._merged(stored_workflow, workflow)
+
     def amend_workflow(
         self,
         request_id: str,
@@ -287,6 +372,8 @@ class TransactionalWorkflowMixin:
         self,
         incident: FaultIncident,
         workflow: WorkflowRequest,
+        *,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         if incident.workflow_request_id != workflow.request_id:
             raise ValueError("incident workflow pointer does not match workflow")
@@ -307,6 +394,9 @@ class TransactionalWorkflowMixin:
                 incident.event_id,
                 incident.incident_id,
             )
+            for event_id in extra_event_ids:
+                if event_id != incident.event_id:
+                    self._link("incident_by_event", event_id, incident.incident_id)
 
     def reconcile_restored_workflow(
         self,
@@ -446,6 +536,7 @@ class TransactionalWorkflowMixin:
             if duplicate is not None:
                 return duplicate[0], duplicate[1], False
             incident, workflow = builder()
+            workflow = self._stamped(None, None, incident, workflow)
             self._put("incident", incident.incident_id, incident)
             self._put("workflow", workflow.request_id, workflow)
             self._stamp_preemption_pending(workflow)
@@ -506,7 +597,9 @@ class TransactionalWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
-            workflow = self._merged(existing_workflow, workflow)
+            workflow = self._stamped(
+                existing_incident, existing_workflow, incident, workflow
+            )
             self._put("incident", incident.incident_id, incident)
             self._put("workflow", workflow.request_id, workflow)
             self._stamp_preemption_pending(workflow)
@@ -556,7 +649,9 @@ class TransactionalWorkflowMixin:
                 else None
             )
             incident, workflow = builder(existing_incident, existing_workflow)
-            workflow = self._merged(existing_workflow, workflow)
+            workflow = self._stamped(
+                existing_incident, existing_workflow, incident, workflow
+            )
             self._put("incident", incident.incident_id, incident)
             self._put("workflow", workflow.request_id, workflow)
             self._stamp_preemption_pending(workflow)

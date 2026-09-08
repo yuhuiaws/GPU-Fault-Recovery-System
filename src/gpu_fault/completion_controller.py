@@ -16,11 +16,11 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from gpu_fault.collectors import EventSink
-from gpu_fault.env import env_bool
 from gpu_fault.completion_attempt_state import (
     AttemptSpec,
     cache_terminal_attempt_observation,
     publish_attempt_observation,
+    publish_workload_coverage,
     restore_persisted_attempt_observations,
 )
 from gpu_fault.completion_metrics_server import start_completion_metrics_server
@@ -38,6 +38,7 @@ from gpu_fault.completion_outbox import (
     completion_sink_from_environment,
     replay_completion_outbox,
 )
+from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.models import Environment
@@ -517,6 +518,7 @@ class KubernetesCompletionController:
         emergency_fallback_seconds: float | None = None,
         reconcile_debounce_seconds: float = 0.5,
         publish_observations: bool = False,
+        coverage_heartbeat_seconds: float = 15,
         observe_unmanaged_workloads: bool = False,
         observation_runtime_profile_version: str | None = None,
         observation_only_retention_cycles: int = 3,
@@ -536,6 +538,10 @@ class KubernetesCompletionController:
             )
         if reconcile_debounce_seconds < 0:
             raise CompletionControllerError("reconcile debounce must be non-negative")
+        if coverage_heartbeat_seconds < 0:
+            raise CompletionControllerError(
+                "coverage heartbeat interval must be non-negative"
+            )
         self.core_api = core_api
         self.sink = sink
         self.cluster_id = cluster_id
@@ -553,6 +559,11 @@ class KubernetesCompletionController:
         self.emergency_fallback_seconds = emergency_fallback_seconds
         self.reconcile_debounce_seconds = reconcile_debounce_seconds
         self.publish_observations = publish_observations
+        # Full-pass coverage heartbeat (idle clusters resolve IDLE, not
+        # UNKNOWN); 0 sends one per full pass.
+        self.coverage_heartbeat_seconds = coverage_heartbeat_seconds
+        self._last_coverage_heartbeat_at: datetime | None = None
+        self.coverage_heartbeats_total = 0
         self.observation_only = ObservationOnlyTracker(
             observe_unmanaged_workloads,
             observation_runtime_profile_version,
@@ -650,7 +661,29 @@ class KubernetesCompletionController:
                 LOGGER.exception("cannot reconcile attempt %s", attempt_id)
         if attempt_filter is None:
             self._evict_pruned_attempts(grouped)
+            self._publish_coverage(observed_at, len(grouped))
         return results
+
+    def _publish_coverage(self, scanned_at: datetime, attempt_count: int) -> None:
+        """After a full pass, tell the control plane the cluster was scanned.
+
+        Only a full pass has seen the whole cluster; a filtered pass reconciles
+        the attempts a watch event touched and says nothing about the rest.
+        """
+
+        if not self.publish_observations:
+            return
+        last = self._last_coverage_heartbeat_at
+        if (
+            last is not None
+            and (scanned_at - last).total_seconds() < self.coverage_heartbeat_seconds
+        ):
+            return
+        if publish_workload_coverage(
+            self, scanned_at=scanned_at, attempt_count=attempt_count
+        ):
+            self._last_coverage_heartbeat_at = scanned_at
+            self.coverage_heartbeats_total += 1
 
     def _evict_pruned_attempts(self, grouped: dict[str, list[dict[str, Any]]]) -> None:
         """Drop controller state for attempts the watcher core has pruned.
@@ -1605,6 +1638,9 @@ def controller_from_environment() -> KubernetesCompletionController:
             )
         ),
         publish_observations=env_bool("GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS", True),
+        coverage_heartbeat_seconds=float(
+            os.getenv("GPU_FAULT_WORKLOAD_COVERAGE_HEARTBEAT_SECONDS", "15")
+        ),
         observe_unmanaged_workloads=env_bool(
             "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED", False
         ),

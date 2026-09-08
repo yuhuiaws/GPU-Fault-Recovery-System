@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, cast
 
+from gpu_fault.admin import operator_identity
 from gpu_fault.admin.aurora_capacity import (
     await_aurora_capacity,
     reconcile_aurora_capacity,
@@ -50,14 +51,25 @@ from gpu_fault.admin.config import (
     load_desired_admin_config,
     matching_pending_admin_config_apply,
 )
-from gpu_fault.admin import operator_identity
-from gpu_fault.admin.config_parser import AdminConfigError
 from gpu_fault.admin.config_file import (
     admin_config_file_path,
     load_admin_config_file,
     write_admin_config_file,
 )
+from gpu_fault.admin.config_parser import AdminConfigError
 from gpu_fault.admin.deploy_command import DeployHooks, run_deploy
+from gpu_fault.admin.failure_domain_map import (
+    add_failure_domain_map_command,
+    run_failure_domain_map_command,
+)
+from gpu_fault.admin.grafana import (
+    add_grafana_arguments,
+    grafana_environment,
+    grafana_request_fields,
+)
+from gpu_fault.admin.incident_close import exit_code as incident_close_exit_code
+from gpu_fault.admin.incident_close import result_lines as incident_close_lines
+from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.notification_precheck import WAIT_FLAG
 from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
@@ -69,6 +81,10 @@ from gpu_fault.admin.release_artifacts import verify_prebuilt_release
 from gpu_fault.admin.release_state import live_release_state as _live_release_state
 from gpu_fault.admin.rollback_alignment import materialized_rollback_status_site
 from gpu_fault.admin.rollback_command import run_rollback
+from gpu_fault.admin.rotate_token import (
+    add_rotate_token_command,
+    run_rotate_token_command,
+)
 from gpu_fault.admin.site import (
     RenderedSite,
     SiteConfigError,
@@ -76,24 +92,11 @@ from gpu_fault.admin.site import (
     load_site,
     materialized_release_config,
 )
-from gpu_fault.admin.failure_domain_map import (
-    add_failure_domain_map_command,
-    run_failure_domain_map_command,
-)
-from gpu_fault.admin.rotate_token import (
-    add_rotate_token_command,
-    run_rotate_token_command,
-)
+from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.submit_remediation import (
     add_submit_remediation_command,
     run_submit_remediation_command,
 )
-from gpu_fault.admin.grafana import (
-    add_grafana_arguments,
-    grafana_environment,
-    grafana_request_fields,
-)
-from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
 from gpu_fault_release.regional_admin_commands import status_header_lines
@@ -464,6 +467,35 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         action="store_true",
         help="print the plan with its node evidence and write nothing",
     )
+    _add_incident_close_arguments(reconcile)
+
+
+def _add_incident_close_arguments(reconcile: argparse.ArgumentParser) -> None:
+    """``--close-incident``: the operator exit for an ESCALATED incident.
+
+    Rides the ``workflow-reconcile`` verb because it is the same kind of
+    disposition -- an operator ending a record the runtime handed over --
+    and reaches the control plane the same way (a script in the CPU ingress
+    Pod calling the service the API route calls). ``--reference`` is the
+    verb's existing approved-change reference; ``--dry-run`` reports the
+    verdicts and writes nothing.
+    """
+
+    reconcile.add_argument(
+        "--close-incident",
+        action="append",
+        default=[],
+        metavar="INCIDENT_ID",
+        help=(
+            "close this ESCALATED incident RECOVERED (repeatable); needs --reason "
+            "and --reference; refused while a workflow of it is still open"
+        ),
+    )
+    reconcile.add_argument(
+        "--reason",
+        metavar="TEXT",
+        help="why the incident is closed; recorded on the incident and its audit event",
+    )
 
 
 def _managed_site_file(
@@ -833,7 +865,35 @@ def _run_uninstall(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _run_incident_close(arguments: argparse.Namespace) -> int:
+    site_file = _managed_site_file(arguments, command="workflow-reconcile")
+    assert site_file is not None
+    if arguments.state_dir is None:
+        raise SiteConfigError(
+            "workflow-reconcile --close-incident requires --state-dir"
+        )
+    state_dir = arguments.state_dir.expanduser().resolve()
+    try:
+        with administrator_operation_lock(state_dir):
+            site = load_site(site_file, repository_root=arguments.repo_root)
+            result = run_incident_close(
+                site,
+                state_dir,
+                incident_ids=tuple(arguments.close_incident),
+                reason=arguments.reason or "",
+                reference=arguments.reference,
+                dry_run=bool(getattr(arguments, "dry_run", False)),
+            )
+    except BootstrapError as exc:
+        raise SiteConfigError(str(exc)) from exc
+    for line in incident_close_lines(result):
+        print(line)
+    return incident_close_exit_code(result)
+
+
 def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "close_incident", None):
+        return _run_incident_close(arguments)
     site_file = _managed_site_file(arguments, command="workflow-reconcile")
     assert site_file is not None
     # ``-f`` names the site without a state directory, but the archive and the

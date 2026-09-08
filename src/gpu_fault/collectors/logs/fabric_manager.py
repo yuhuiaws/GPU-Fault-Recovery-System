@@ -17,7 +17,6 @@ from gpu_fault.channel_registry import (
     COLLECTOR_HEALTH_PATH,
     FABRIC_MANAGER_PATH,
 )
-
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event

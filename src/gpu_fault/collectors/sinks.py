@@ -17,10 +17,7 @@ from urllib.request import (
     Request,
 )
 
-
 from gpu_fault import __version__
-
-
 from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)

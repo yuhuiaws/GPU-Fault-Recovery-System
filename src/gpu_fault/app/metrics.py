@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 
+import gpu_fault.app.process_metrics as process_metrics
+from gpu_fault.app.aurora_refresh_metrics import (
+    aurora_credential_refresh_metric_lines,
+)
 from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
     completion_state_metric_lines,
     control_loop_metric_lines,
-    postgres_pool_metric_lines,
     fleet_pin_drift_metric_lines,
     fleet_rollout_metric_lines,
     orchestration_metric_lines,
     policy_metric_lines,
+    postgres_pool_metric_lines,
     regional_registry_metric_lines,
     remote_command_metric_lines,
     spare_reservation_metric_lines,
@@ -22,6 +29,7 @@ from gpu_fault.app.builtin_metric_contributors import (
 from gpu_fault.app.metric_contributors import (
     MetricContributorRegistry,
 )
+from gpu_fault.app.metric_scan_cache import metric_scan_cache
 from gpu_fault.app.metrics_sections import (
     render_admission_metrics,
     render_capacity_metrics,
@@ -36,7 +44,6 @@ from gpu_fault.app.metrics_sections import (
     render_spool_metrics_two,
 )
 from gpu_fault.app.runtime import AppRuntime
-from gpu_fault.async_store import StoreIoCapacityExceeded
 from gpu_fault.store.contracts import ProcessorQueueStats
 
 
@@ -106,8 +113,7 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
     ctx = app_runtime.context
     processor = app_runtime.processor
     processor_replay_tracker = app_runtime.processor_replay_tracker
-    store_io = app_runtime.store_io
-    decode_io = app_runtime.decode_io
+    store_io, decode_io = app_runtime.store_io, app_runtime.decode_io
     fault_store_io = app_runtime.fault_store_io
     evidence_store_io = app_runtime.evidence_store_io
     fault_decode_io = app_runtime.fault_decode_io
@@ -295,6 +301,7 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
         processor_queue_bypass_enabled,
         processor_queue_bypass_paths,
         processor_queue_bypasses_by_path,
+        scan_cache=metric_scan_cache(app_runtime),
     )
     spool_runtime = render_spool_metrics_one(
         lines,
@@ -316,7 +323,7 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
         telemetry_spool_batcher,
         telemetry_spool_admitted_by_path,
     )
-    render_pool_metrics(lines, pool_metrics, runtime)
+    render_pool_metrics(lines, pool_metrics, runtime, app_runtime)
     return lines
 
 
@@ -326,16 +333,23 @@ def capacity_metric_lines(_runtime: AppRuntime) -> list[str]:
     return lines
 
 
+# ``fleet_level=True`` marks the contributors that read a cluster-level fact
+# out of the store; every replica publishes the same number and the alerts
+# ``max by`` over them, so roles without background services (ingress,
+# spool-worker) skip them instead of repeating the worker tier's table scans
+# (A-6). Everything else is a per-replica fact and renders on every role.
 METRIC_CONTRIBUTORS = MetricContributorRegistry()
 METRIC_CONTRIBUTORS.register("core", render_prometheus_metrics)
 METRIC_CONTRIBUTORS.register("capacity", capacity_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "remote-command",
     remote_command_metric_lines,
+    fleet_level=True,
 )
 METRIC_CONTRIBUTORS.register(
     "fleet-rollout",
     fleet_rollout_metric_lines,
+    fleet_level=True,
 )
 METRIC_CONTRIBUTORS.register("fleet-pin-drift", fleet_pin_drift_metric_lines)
 METRIC_CONTRIBUTORS.register("spare-reservations", spare_reservation_metric_lines)
@@ -344,11 +358,17 @@ METRIC_CONTRIBUTORS.register("policy", policy_metric_lines)
 METRIC_CONTRIBUTORS.register(
     "orchestration",
     orchestration_metric_lines,
+    fleet_level=True,
 )
-METRIC_CONTRIBUTORS.register("closed-loop", closed_loop_metric_lines)
+METRIC_CONTRIBUTORS.register("closed-loop", closed_loop_metric_lines, fleet_level=True)
 METRIC_CONTRIBUTORS.register("control-loop", control_loop_metric_lines)
-METRIC_CONTRIBUTORS.register("completion-state", completion_state_metric_lines)
+METRIC_CONTRIBUTORS.register(
+    "completion-state", completion_state_metric_lines, fleet_level=True
+)
 METRIC_CONTRIBUTORS.register("postgres-pool", postgres_pool_metric_lines)
+METRIC_CONTRIBUTORS.register(
+    "aurora-credential-refresh", aurora_credential_refresh_metric_lines
+)
 METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,
@@ -356,11 +376,45 @@ METRIC_CONTRIBUTORS.register(
 
 
 def render_metric_response(app_runtime: AppRuntime) -> Response:
-    lines = METRIC_CONTRIBUTORS.render(app_runtime)
+    # The Pod runs several uvicorn processes behind one port; this process's
+    # render is merged with every live sibling's published render before it
+    # is answered, so the scrape reads the Pod whichever process accepted it.
+    lines = process_metrics.pod_coherent_lines(METRIC_CONTRIBUTORS.render(app_runtime))
     return Response(
         content="\n".join(lines) + "\n",
         media_type="text/plain; version=0.0.4",
     )
+
+
+def process_local_metric_lines(app: Any) -> list[str]:
+    """What the process-metrics publisher shares every few seconds: this
+    process's full render. The fleet-level families cost one store read per
+    scan-cache TTL per process however often they render, and some of those
+    contributors also carry process-local counters that would otherwise never
+    leave the process that counted them."""
+
+    return METRIC_CONTRIBUTORS.render(app.state.runtime)
+
+
+# The scrape renders on its own thread, never through ``runtime.store_io``
+# (H2-2). That executor's admission semaphore is exactly the resource the
+# store_io saturation alerts watch, and a scrape queued behind saturated
+# request work timed out at ADOT's deadline -- so the saturation the alert
+# existed for was the moment it lost its samples. One thread per process: a
+# second scrape arriving mid-render waits for the first rather than doubling
+# the store reads, and the pool's own timeout still bounds the render.
+_RENDER_EXECUTOR: ThreadPoolExecutor | None = None
+_RENDER_EXECUTOR_LOCK = Lock()
+
+
+def _render_executor() -> ThreadPoolExecutor:
+    global _RENDER_EXECUTOR
+    with _RENDER_EXECUTOR_LOCK:
+        if _RENDER_EXECUTOR is None:
+            _RENDER_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="gpu-fault-metrics"
+            )
+        return _RENDER_EXECUTOR
 
 
 @router.get("/metrics", include_in_schema=False)
@@ -368,14 +422,10 @@ def render_metric_response(app_runtime: AppRuntime) -> Response:
 async def prometheus_metrics(
     runtime: AppRuntime = Depends(get_app_runtime),
 ) -> Response:
-    try:
-        return await runtime.store_io.run(render_metric_response, runtime)
-    except StoreIoCapacityExceeded as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="store I/O capacity exceeded",
-            headers={"Retry-After": "2"},
-        ) from exc
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _render_executor(), render_metric_response, runtime
+    )
 
 
 @router.get("/v1/internal/metrics/collector-silence")

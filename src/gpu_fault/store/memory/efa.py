@@ -1,5 +1,5 @@
-from typing import Any, Callable
 from datetime import datetime
+from typing import Any, Callable
 
 from gpu_fault.models import (
     EfaTrafficAdminAction,

@@ -13,6 +13,10 @@ from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import (
     NotFoundError,
 )
+from gpu_fault.store.shared.remote_commands import (
+    stale_fence,
+    stale_fence_update,
+)
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_stats as _remote_command_stats,
 )
@@ -240,6 +244,46 @@ class SqliteRemoteCommandMixin:
                     "remote_command",
                     command.command_id,
                     _unclaimed_expiry_update(command, now),
+                )
+                expired += 1
+        return expired
+
+    def expire_stale_fenced_remote_commands(
+        self,
+        *,
+        lease_expired_before: datetime,
+        limit: int,
+    ) -> int:
+        """See ``MemoryRemoteCommandMixin.expire_stale_fenced_remote_commands``.
+
+        Same sweep-level key discipline as ``expire_unclaimed_remote_commands``:
+        on SQLite the ``BEGIN IMMEDIATE`` is the exclusion; Postgres overrides
+        this with the per-command advisory locks.
+        """
+
+        now = datetime.now(timezone.utc)
+        expired = 0
+        with self._state_transaction("remote_command/stale-fence"):
+            stale = [
+                item
+                for item in sorted(
+                    self._list("remote_command"),
+                    key=lambda item: (item.created_at, item.command_id),
+                )
+                if item.status is RemoteCommandStatus.LEASED
+                and item.lease_expires_at is not None
+                and item.lease_expires_at <= lease_expired_before
+            ]
+            for command in stale:
+                if expired >= limit:
+                    break
+                workflow = self._get_optional("workflow", command.workflow_request_id)
+                if not stale_fence(command, workflow):
+                    continue
+                self._put(
+                    "remote_command",
+                    command.command_id,
+                    stale_fence_update(command, workflow, now, swept=True),
                 )
                 expired += 1
         return expired

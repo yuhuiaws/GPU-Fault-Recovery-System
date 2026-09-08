@@ -222,3 +222,80 @@ def test_cluster_lifecycle_route_policy(
     item = registration("cluster-a").model_copy(update={"lifecycle_state": state})
 
     assert regional_cluster_request_allowed(item, path=path, method=method) is allowed
+
+
+# --- A-7: one transient refresh error must not fail readiness -----------------
+
+
+class _FlakyOnceStore:
+    """Aurora closes one connection; the head has not moved."""
+
+    def __init__(self, target: InMemoryStore) -> None:
+        self.target = target
+        self.failures_left = 1
+
+    def get_regional_registry_head(self):
+        if self.failures_left:
+            self.failures_left -= 1
+            raise ConnectionError("Remote end closed connection without response")
+        return self.target.get_regional_registry_head()
+
+    def __getattr__(self, name: str):
+        return getattr(self.target, name)
+
+
+def test_a_transient_refresh_error_keeps_a_fresh_snapshot_ready() -> None:
+    """``is_ready`` required ``_last_error is None``, so one closed connection
+    (a ~1/min baseline on this control plane) made ``/healthz`` and every
+    cluster-token request answer 503 for up to a second, per process, and
+    ``GPU_FAULT_REGISTRY_STALE_SECONDS`` never applied to the error path."""
+
+    store = InMemoryStore()
+    store.save_regional_cluster(registration("cluster-a"))
+    clock = [NOW]
+    loaded = runtime(store, clock)
+    loaded.store = _FlakyOnceStore(store)
+    clock[0] += timedelta(seconds=1)
+
+    assert not loaded.refresh_once(), loaded.status()
+    assert loaded.status()["error"], "the error must still be reported"
+    assert loaded.is_ready(), "a fresh snapshot with an unchanged head is ready"
+
+    # Past the stale window the error path fails closed like the silent one.
+    clock[0] += timedelta(seconds=5)
+    assert not loaded.is_ready(), loaded.status()
+
+    # The next successful refresh clears the error.
+    clock[0] = NOW + timedelta(seconds=2)
+    assert loaded.refresh_once(), loaded.status()
+    assert loaded.is_ready()
+    assert loaded.status()["error"] is None
+
+
+def test_a_head_digest_mismatch_still_fails_readiness_at_once() -> None:
+    """A-7 narrows the error rule to transient errors; a divergent head is not
+    one -- serving a snapshot the head disagrees with is what the check is for."""
+
+    class BadHeadStore:
+        def __init__(self, target: InMemoryStore) -> None:
+            self.target = target
+
+        def get_regional_registry_head(self):
+            return RegionalRegistryHead(
+                generation=1,
+                content_sha256="f" * 64,
+                updated_at=NOW + timedelta(seconds=1),
+            )
+
+        def __getattr__(self, name: str):
+            return getattr(self.target, name)
+
+    store = InMemoryStore()
+    store.save_regional_cluster(registration("cluster-a"))
+    clock = [NOW]
+    loaded = runtime(store, clock)
+    loaded.store = BadHeadStore(store)
+    clock[0] += timedelta(seconds=1)
+
+    assert not loaded.refresh_once(), loaded.status()
+    assert not loaded.is_ready(), loaded.status()

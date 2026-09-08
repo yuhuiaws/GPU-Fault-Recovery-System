@@ -14,10 +14,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from pydantic import ValidationError
 
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
+from gpu_fault.execution.models import WorkflowRecordInvalidError
 from gpu_fault.models import (
     IncidentState,
     WorkflowOperation,
@@ -126,10 +126,8 @@ def test_blocking_on_an_internal_error_applies_the_waiting_ttl(
         )
     )
     store.reserve_job_restart(CLUSTER, JOB, 1, _reservation(workflow, 1))
-    try:
-        WorkflowRequest.model_validate({"incident_id": "x"})
-    except ValidationError as error:
-        invalid = error
+    # The one internal error that proves the record itself is unusable (D-5).
+    invalid = WorkflowRecordInvalidError("workflow row cannot be decoded")
 
     class _Raising:
         owner = "simulated-runtime"

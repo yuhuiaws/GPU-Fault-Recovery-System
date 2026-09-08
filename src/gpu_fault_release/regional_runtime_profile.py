@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (

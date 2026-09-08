@@ -13,18 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from gpu_fault_release import regional_deployment_inventory as inventory
 import yaml  # type: ignore[import-untyped,unused-ignore]
-from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
-from gpu_fault_release.regional_release_diff import (
-    ReleaseComponent,
-    ReleaseExecutionPlan,
-)
-from gpu_fault_release.regional_release_history import record_release_history
-from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
-from gpu_fault_release.regional_release_narration import narrate_phase
-from gpu_fault_release.regional_release_probes import probe_source
-from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 
 from gpu_fault.admin.config import (
     AdminConfig,
@@ -38,6 +27,17 @@ from gpu_fault.release_state_snapshot import (
     hydrate_previous_snapshot,
     validate_snapshot_config_map,
 )
+from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_diff import (
+    ReleaseComponent,
+    ReleaseExecutionPlan,
+)
+from gpu_fault_release.regional_release_history import record_release_history
+from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
+from gpu_fault_release.regional_release_narration import narrate_phase
+from gpu_fault_release.regional_release_probes import probe_source
+from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 PREVIOUS_SNAPSHOT_LABEL = "gpu-fault.io/release-previous-snapshot"

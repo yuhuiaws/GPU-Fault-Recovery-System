@@ -71,9 +71,12 @@ def test_silent_collector_notifications_are_deduplicated() -> None:
     )
 
     assert first == 4
-    assert second == 4
+    # The same hour bucket: nothing new was created, so nothing is sent
+    # again. Re-sending the existing notification every scan re-queued a
+    # RETRY/DEAD delivery and made its retry budget unbounded (F-2).
+    assert second == 0
     assert len(store.list_notifications()) == 4
-    assert len(set(sent)) == 4
+    assert len(sent) == 4 and len(set(sent)) == 4
 
 
 def test_expired_active_agent_is_not_reported_silent() -> None:

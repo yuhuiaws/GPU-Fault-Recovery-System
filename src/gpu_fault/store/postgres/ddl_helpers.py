@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 _CREATE_INDEX = re.compile(r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)")
 
 
@@ -128,6 +127,50 @@ def _enable_trigger_if_disabled(cursor: Any, table: str, name: str) -> None:
     row = cursor.fetchone()
     if row is not None and row[0] != "O":
         cursor.execute(f"ALTER TABLE {table} ENABLE TRIGGER {name}")
+
+
+def _set_table_options_if_different(
+    cursor: Any, table: str, options: dict[str, str]
+) -> None:
+    """``ALTER TABLE ... SET (option=value, ...)`` only for the options whose
+    stored value differs (item J: the ALTER takes ShareUpdateExclusiveLock
+    even when nothing changes).
+
+    Control-plane review 2026-09-08, G-9: ``gpu_fault_objects`` is a whole-row
+    JSONB upsert table under ~50 expression indexes, so every lease renewal
+    leaves a dead tuple that cannot be HOT-pruned; the default 20 % dead-tuple
+    vacuum threshold let a 300k-row table accumulate 60k dead tuples before a
+    vacuum. Options are validated as identifiers and numerics here because they
+    are interpolated into DDL text.
+    """
+
+    for name, value in options.items():
+        if not name.replace("_", "").isalnum() or not _is_numeric(value):
+            raise ValueError(f"unsafe table option: {name}={value}")
+    cursor.execute(
+        "SELECT reloptions FROM pg_class WHERE oid=to_regclass(%s)", (table,)
+    )
+    row = cursor.fetchone()
+    current: dict[str, str] = {}
+    stored = row[0] if row else None
+    for item in stored if isinstance(stored, (list, tuple)) else []:
+        key, _, value = str(item).partition("=")
+        current[key] = value
+    pending = {
+        name: value for name, value in options.items() if current.get(name) != value
+    }
+    if not pending:
+        return
+    rendered = ", ".join(f"{name}={value}" for name, value in sorted(pending.items()))
+    cursor.execute(f"ALTER TABLE {table} SET ({rendered})")
+
+
+def _is_numeric(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _recorded_schema_version(cursor: Any) -> int | None:

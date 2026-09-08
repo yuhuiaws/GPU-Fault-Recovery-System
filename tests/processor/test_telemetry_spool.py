@@ -1271,3 +1271,388 @@ def test_the_inline_bypass_wins_over_the_spool(monkeypatch) -> None:
     assert not store.has_incomplete_processor_requests(CLUSTER), (
         "expected store.has_incomplete_processor_requests(CLUSTER) to be falsy"
     )
+
+
+# --- E-5: the replay's bookkeeping is inside the try --------------------------
+
+
+def _coordinator(store, **spool_overrides) -> ProcessorCoordinator:
+    settings = {
+        "telemetry_spool_enabled": True,
+        "telemetry_spool_workers": 2,
+        "telemetry_spool_retry_backoff_seconds": 1.0,
+    }
+    settings.update(spool_overrides)
+    return ProcessorCoordinator(
+        store,
+        owner_id=OWNER,
+        internal_token=TOKEN,
+        active_consumers=False,
+        spool=ProcessorSpoolSettings(**settings),
+        lease=ProcessorLeaseSettings(poll_seconds=0.02),
+    )
+
+
+def _ok_handler(batch_request: dict) -> dict:
+    return {
+        "results": [
+            {"request_id": item["request_id"], "status": 200, "body": {}}
+            for item in batch_request["items"]
+        ]
+    }
+
+
+def test_a_failed_completion_is_counted_and_releases_the_rows(monkeypatch) -> None:
+    """``complete_telemetry_spool`` used to run outside the try (E-5).
+
+    A writer failover landing on the completion left the rows leased for the
+    full 60 s lease, counted nothing, and so kept
+    ``GpuFaultTelemetrySpoolReplayError`` quiet while the same batch was
+    replayed again and again.
+    """
+
+    store = build_store()
+    spool(store, [make_request(GPU_METRICS_PATH, gpu_metrics_payload(), "req-1")])
+    processor = _coordinator(store)
+    processor.telemetry_spool_replay_handler = _ok_handler
+    at = now()
+    claimed = store.claim_telemetry_spool(
+        OWNER, now=at, lease_duration=timedelta(seconds=60), limit=10
+    )
+    real_complete = store.complete_telemetry_spool
+    failures = {"count": 0}
+
+    def flaky_complete(items):
+        if failures["count"] == 0:
+            failures["count"] += 1
+            raise ConnectionError("writer failover in progress")
+        return real_complete(items)
+
+    monkeypatch.setattr(store, "complete_telemetry_spool", flaky_complete)
+
+    with pytest.raises(ConnectionError):
+        processor._replay_telemetry_spool(claimed)
+
+    runtime = processor.metrics_snapshot()["spool"]
+    assert runtime["errors"] == 1, runtime
+    assert runtime["completed"] == 0, runtime
+    # Released with the retry backoff, not left leased for 60 s.
+    stats = store.telemetry_spool_stats(now=at + timedelta(seconds=2))
+    assert stats["depth"] == 1 and stats["leased"] == 0, stats
+    again = store.claim_telemetry_spool(
+        OWNER,
+        now=at + timedelta(seconds=2),
+        lease_duration=timedelta(seconds=60),
+        limit=10,
+    )
+    assert len(again) == 1
+    processor._replay_telemetry_spool(again)
+    assert store.telemetry_spool_stats()["depth"] == 0
+    assert processor.metrics_snapshot()["spool"]["completed"] == 1
+
+
+def test_a_malformed_handler_result_is_an_error_not_a_crash_without_release() -> None:
+    """``int(result.get("status"))`` on a garbage result raised outside the try."""
+
+    store = build_store()
+    spool(store, [make_request(GPU_METRICS_PATH, gpu_metrics_payload(), "req-1")])
+    processor = _coordinator(store)
+    processor.telemetry_spool_replay_handler = lambda _batch: {
+        "results": [{"request_id": "req-1", "status": "not-a-number"}]
+    }
+    at = now()
+    claimed = store.claim_telemetry_spool(
+        OWNER, now=at, lease_duration=timedelta(seconds=60), limit=10
+    )
+
+    with pytest.raises(ValueError):
+        processor._replay_telemetry_spool(claimed)
+
+    assert processor.metrics_snapshot()["spool"]["errors"] == 1
+    stats = store.telemetry_spool_stats(now=at + timedelta(seconds=2))
+    assert stats["leased"] == 0, "the row stayed leased after the crash"
+
+
+# --- E-6: the abandon branch must not spin ------------------------------------
+
+
+def test_spool_workers_times_batch_bytes_must_fit_in_flight() -> None:
+    """12 workers x 8 MiB against 64 MiB passed validation and reopened F-D8."""
+
+    with pytest.raises(ValueError, match="in-flight"):
+        ProcessorSpoolSettings(
+            telemetry_spool_enabled=True,
+            telemetry_spool_workers=12,
+            telemetry_spool_replay_batch_max_bytes=8 * 1024 * 1024,
+            telemetry_spool_max_in_flight_bytes=64 * 1024 * 1024,
+        )
+    # 8 x 8 MiB = 64 MiB, the production shape, still passes.
+    ProcessorSpoolSettings(
+        telemetry_spool_enabled=True,
+        telemetry_spool_workers=8,
+        telemetry_spool_replay_batch_max_bytes=8 * 1024 * 1024,
+        telemetry_spool_max_in_flight_bytes=64 * 1024 * 1024,
+    )
+
+
+def test_an_abandoned_claim_waits_out_the_poll_interval_instead_of_spinning(
+    monkeypatch,
+) -> None:
+    """Abandon set ``claimed_any`` and re-entered the loop with no sleep.
+
+    The head row is always selected (``row_number=1``), so a row the byte
+    budget cannot take is claimed, abandoned and claimed again at whatever
+    rate six SQL statements allow (E-6 / F-D8).
+    """
+
+    store = build_store()
+    oversize = gpu_metrics_payload(batch_id="huge")
+    oversize["samples"] = [{"name": "x" * 64, "value": index} for index in range(900)]
+    spool(store, [make_request(GPU_METRICS_PATH, oversize, "req-huge")])
+    processor = _coordinator(
+        store,
+        telemetry_spool_workers=2,
+        telemetry_spool_replay_batch_max_bytes=64 * 1024,
+        telemetry_spool_max_in_flight_bytes=128 * 1024,
+    )
+    row_bytes = store.claim_telemetry_spool(
+        "probe", now=now(), lease_duration=timedelta(seconds=0), limit=1
+    )[0].payload_bytes
+    assert row_bytes > 64 * 1024, row_bytes
+    monkeypatch.setattr(
+        processor,
+        "_replay_telemetry_spool",
+        lambda _items: pytest.fail("an oversize batch must never be replayed"),
+    )
+    thread = Thread(target=processor.run_telemetry_spool)
+    thread.start()
+    try:
+        time.sleep(0.3)
+        abandoned = processor.spool_abandoned_total
+    finally:
+        processor.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert abandoned >= 1, "the oversize head row was never claimed"
+    # 0.3 s at a 0.02 s poll is at most ~15 rounds; a spin would be hundreds.
+    assert abandoned <= 30, f"the abandon branch spun {abandoned} times in 0.3 s"
+
+
+# --- E-7: stale spooled samples are completed, not replayed -------------------
+
+
+def test_a_stale_spooled_sample_is_completed_without_replay() -> None:
+    """The queue path runs ``_complete_if_stale`` before execution; the spool
+    path replayed everything, so a two-hour backlog of inventory snapshots cost
+    one transaction and one advisory lock each only to be discarded on
+    ``observed_at`` (E-7).
+    """
+
+    store = build_store()
+    stale = inventory_payload(snapshot_id="old", observed_at=now() - timedelta(hours=2))
+    fresh = inventory_payload(snapshot_id="new")
+    fresh["node_id"] = "node-b"
+    spool(
+        store,
+        [
+            make_request(INVENTORY_PATH, stale, "req-old"),
+            make_request(INVENTORY_PATH, fresh, "req-new"),
+        ],
+    )
+    processor = _coordinator(store)
+    replayed: list[str] = []
+
+    def handler(batch_request: dict) -> dict:
+        replayed.extend(item["request_id"] for item in batch_request["items"])
+        return _ok_handler(batch_request)
+
+    processor.telemetry_spool_replay_handler = handler
+    claimed = store.claim_telemetry_spool(
+        OWNER, now=now(), lease_duration=timedelta(seconds=60), limit=10
+    )
+    assert len(claimed) == 2
+
+    processor._replay_telemetry_spool(claimed)
+
+    assert replayed == ["req-new"], replayed
+    assert store.telemetry_spool_stats()["depth"] == 0
+    runtime = processor.metrics_snapshot()["spool"]
+    assert runtime["completed"] == 2, runtime
+    assert processor.spool_stale_completed_total == 1
+
+
+# --- E-4: memory and postgres agree on what coalescing does to attempts -------
+
+
+@pytest.fixture(params=["memory", "postgres"])
+def spool_store(request):
+    """The in-memory store and, when configured, the real Postgres store.
+
+    The two backends disagreed on whether a coalescing sample resets the
+    failure budget, and the test pinning the design intent ran only against
+    ``InMemoryStore`` (E-4): on Postgres a node re-sending an unexecutable
+    payload every second never reached the drop threshold.
+    """
+
+    if request.param == "memory":
+        yield build_store()
+        return
+    from tests.store._postgres_processor_claim_support import (
+        POSTGRES_URL,
+        postgres_store_instance,
+    )
+
+    if not POSTGRES_URL:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is not configured")
+    yield from postgres_store_instance()
+
+
+def test_a_failed_replay_comes_back_and_then_gives_up_on_every_store(
+    spool_store,
+) -> None:
+    store = spool_store
+    spool(store, [make_request(GPU_METRICS_PATH, gpu_metrics_payload(), "req-1")])
+    at = now()
+    for attempt in range(store.TELEMETRY_SPOOL_MAX_ATTEMPTS):
+        claimed = store.claim_telemetry_spool(
+            OWNER, now=at, lease_duration=timedelta(seconds=30), limit=10
+        )
+        assert len(claimed) == 1, attempt
+        released, dropped = store.release_telemetry_spool(
+            claimed, now=at, backoff=timedelta(seconds=1)
+        )
+        if attempt < store.TELEMETRY_SPOOL_MAX_ATTEMPTS - 1:
+            assert (released, dropped) == (1, 0), attempt
+        else:
+            assert (released, dropped) == (0, 1), attempt
+        at += timedelta(seconds=2)
+    assert store.telemetry_spool_stats()["depth"] == 0
+
+
+def test_a_backoff_is_not_applied_to_a_newer_sample_on_every_store(spool_store) -> None:
+    store = spool_store
+    spool(
+        store,
+        [make_request(GPU_METRICS_PATH, gpu_metrics_payload(batch_id="old"), "req-1")],
+    )
+    at = now()
+    claimed = store.claim_telemetry_spool(
+        OWNER, now=at, lease_duration=timedelta(seconds=30), limit=10
+    )
+    spool(
+        store,
+        [make_request(GPU_METRICS_PATH, gpu_metrics_payload(batch_id="new"), "req-2")],
+        now=at,
+    )
+
+    assert store.release_telemetry_spool(
+        claimed, now=at, backoff=timedelta(seconds=600)
+    ) == (0, 0)
+    fresh = store.claim_telemetry_spool(
+        OWNER, now=at, lease_duration=timedelta(seconds=30), limit=10
+    )
+    assert [item.payload["batch_id"] for item in fresh] == ["new"]
+
+
+def test_coalescing_keeps_the_failure_budget_on_every_store(spool_store) -> None:
+    """A stream that keeps failing and keeps re-sending is still bounded.
+
+    Postgres reset ``attempts`` to 0 on conflict "because the budget belongs
+    to the payload"; the memory store did not. A node whose gpu-metrics
+    payload the endpoint cannot execute re-sends every second, so on Postgres
+    every claim started from zero and the row was never dropped.
+    """
+
+    store = spool_store
+    at = now()
+    spool(
+        store,
+        [make_request(GPU_METRICS_PATH, gpu_metrics_payload(batch_id="b1"), "req-1")],
+        now=at,
+    )
+    for _ in range(2):
+        claimed = store.claim_telemetry_spool(
+            OWNER, now=at, lease_duration=timedelta(seconds=30), limit=10
+        )
+        assert len(claimed) == 1
+        store.release_telemetry_spool(claimed, now=at, backoff=timedelta(0))
+    assert claimed[0].attempts == 2
+
+    spool(
+        store,
+        [make_request(GPU_METRICS_PATH, gpu_metrics_payload(batch_id="b2"), "req-2")],
+        now=at,
+    )
+    again = store.claim_telemetry_spool(
+        OWNER, now=at, lease_duration=timedelta(seconds=30), limit=10
+    )
+
+    assert [item.payload["batch_id"] for item in again] == ["b2"]
+    assert again[0].attempts == 3, "coalescing reset the failure budget"
+
+
+# --- E-2: the admission projection counts rows, it does not serialise them -----
+
+
+def test_the_depth_projection_query_never_touches_the_payload() -> None:
+    """Every 0.25 s each ingress process ran ``sum(octet_length(payload::text))``
+    over the whole spool to decide whether one more row fits (E-2)."""
+
+    from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
+
+    executed: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, *_params):
+            executed.append(" ".join(sql.split()))
+
+        def fetchall(self):
+            return [("cluster-a", 3), ("__unscoped__", 1)]
+
+    class Db:
+        def cursor(self):
+            return Cursor()
+
+    class Store(PostgresTelemetrySpoolMixin):
+        _db = Db()
+        url = "postgresql://unused"
+
+    store = Store()
+    cache = store._projected_telemetry_spool_depths(now=now())
+
+    assert cache["depth"] == 4
+    assert cache["by_cluster"] == {"cluster-a": 3, "__unscoped__": 1}
+    assert len(executed) == 1
+    assert "payload" not in executed[0], executed[0]
+    assert "count(*)" in executed[0]
+    assert "GROUP BY" in executed[0]
+    assert PostgresTelemetrySpoolMixin._TELEMETRY_SPOOL_DEPTH_TTL_SECONDS >= 1.0
+
+
+def test_the_depth_counts_agree_with_the_full_stats_on_postgres(spool_store) -> None:
+    store = spool_store
+    if not hasattr(store, "telemetry_spool_depths"):
+        pytest.skip("the in-memory spool has no separate depth projection")
+    spool(
+        store,
+        [
+            make_request(
+                GPU_METRICS_PATH,
+                gpu_metrics_payload(batch_id=f"b{index}", node_id=f"node-{index}"),
+                f"req-{index}",
+            )
+            for index in range(3)
+        ],
+    )
+
+    depths = store.telemetry_spool_depths()
+    stats = store.telemetry_spool_stats()
+
+    assert depths["depth"] == stats["depth"] == 3
+    assert depths["by_cluster"] == stats["by_cluster"]

@@ -46,35 +46,41 @@ def notify_silent_collectors(
                     <= thresholds[collector]
                 ):
                     continue
-                notification = context.store.save_notification_if_absent(
-                    AdvisoryNotification(
-                        deduplication_key=(
-                            "collector-silent/"
-                            f"{registration.cluster_id}/"
-                            f"{agent.node_id}/"
-                            f"{collector.value}/{bucket}"
-                        ),
-                        cluster_name=registration.cluster_id,
-                        incident_id=(f"collector-silent-{agent.node_id}"),
-                        subject=(
-                            "[GPU collector warning] "
-                            f"{agent.node_id} "
-                            f"{collector_producer(collector)} "
-                            f"channel {collector.value} is silent"
-                        ),
-                        body_text=(
-                            f"Cluster: {registration.cluster_id}\n"
-                            f"Node: {agent.node_id}\n"
-                            "Collector: "
-                            f"{collector_producer(collector)}\n"
-                            f"Signal channel: {collector.value}\n"
-                            f"Last success: {last_success}"
-                        ),
-                        support_case_draft=(
-                            "Check systemd service, TLS/token and collector outbox."
-                        ),
-                    )
+                candidate = AdvisoryNotification(
+                    deduplication_key=(
+                        "collector-silent/"
+                        f"{registration.cluster_id}/"
+                        f"{agent.node_id}/"
+                        f"{collector.value}/{bucket}"
+                    ),
+                    cluster_name=registration.cluster_id,
+                    incident_id=(f"collector-silent-{agent.node_id}"),
+                    subject=(
+                        "[GPU collector warning] "
+                        f"{agent.node_id} "
+                        f"{collector_producer(collector)} "
+                        f"channel {collector.value} is silent"
+                    ),
+                    body_text=(
+                        f"Cluster: {registration.cluster_id}\n"
+                        f"Node: {agent.node_id}\n"
+                        "Collector: "
+                        f"{collector_producer(collector)}\n"
+                        f"Signal channel: {collector.value}\n"
+                        f"Last success: {last_success}"
+                    ),
+                    support_case_draft=(
+                        "Check systemd service, TLS/token and collector outbox."
+                    ),
                 )
+                notification = context.store.save_notification_if_absent(candidate)
+                if notification.notification_id != candidate.notification_id:
+                    # Same hour bucket, same collector: the notification is
+                    # already in the outbox and the dispatcher owns its
+                    # retries. Sending it again every scan re-queued a
+                    # RETRY/DEAD delivery and made its attempt budget
+                    # unbounded (control-plane review 2026-09-08, F-2).
+                    continue
                 context.advisory_notifications.send(notification.notification_id)
                 sent += 1
     return sent

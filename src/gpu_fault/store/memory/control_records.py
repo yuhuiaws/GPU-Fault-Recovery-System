@@ -38,6 +38,7 @@ from gpu_fault.store.shared.record_guards import record_matches_expected
 class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _decisions: Any
+    _incident_by_event: Any
     _diagnostics: Any
     _hyperpod_node_identities: Any
     _hyperpod_submissions: Any
@@ -181,6 +182,62 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             "attempt_observation_terminalized": terminalized,
         }
 
+    def cleanup_inactive_markers(self, *, older_than: datetime, limit: int) -> int:
+        with self._lock:
+            marker_ids = [
+                marker.marker_id
+                for marker in sorted(
+                    self._markers.values(),
+                    key=lambda item: (item.observed_at, item.marker_id),
+                )
+                if not marker.active
+                and marker.observed_at <= older_than
+                and marker.incident_id not in self._incidents
+            ][:limit]
+            for marker_id in marker_ids:
+                del self._markers[marker_id]
+        return log_cleanup("marker", marker_ids)
+
+    def cleanup_completion_records(self, *, older_than: datetime, limit: int) -> int:
+        with self._lock:
+            live_event_ids = {
+                incident.event_id for incident in self._incidents.values()
+            }
+            candidates = []
+            for decision in self._decisions.values():
+                if decision.status is DecisionStatus.PENDING_TRIAGE:
+                    continue
+                event = self._events.get(decision.event_key)
+                if event is None or event.ended_at > older_than:
+                    continue
+                linked = self._incident_by_event.get(decision.event_key)
+                if linked is not None and linked in self._incidents:
+                    continue
+                if decision.event_key in live_event_ids:
+                    continue
+                plan = (
+                    self._plans.get(decision.recovery_plan_id)
+                    if decision.recovery_plan_id
+                    else None
+                )
+                if plan is not None and plan.incident_id in self._incidents:
+                    continue
+                candidates.append((event.ended_at, decision, event, plan))
+            candidates.sort(key=lambda item: (item[0], item[1].event_key))
+            removed = []
+            for _ended_at, decision, event, plan in candidates[:limit]:
+                key = decision.event_key
+                self._decisions.pop(key, None)
+                self._events.pop(key, None)
+                self._attempt_event_keys.pop((event.cluster_id, event.attempt_id), None)
+                if decision.diagnostic_request_id:
+                    self._diagnostics.pop(decision.diagnostic_request_id, None)
+                    self._triage_reports.pop(decision.diagnostic_request_id, None)
+                if plan is not None:
+                    self._plans.pop(plan.plan_id, None)
+                removed.append(key)
+        return log_cleanup("completion_decision", removed)
+
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
         with self._lock:
             existing = self._events.get(event.event_key)
@@ -292,10 +349,16 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             return self._decisions.get(event_key)
 
     def _decision_age_key(self, decision: CompletionDecision) -> datetime | None:
-        if not decision.diagnostic_request_id:
-            return None
-        request = self._diagnostics.get(decision.diagnostic_request_id)
-        return request.created_at if request is not None else None
+        # Diagnostic ``created_at``, else the terminal event's ``ended_at``;
+        # ``None`` (neither row) is never older than a cutoff (F-7).
+        if decision.diagnostic_request_id:
+            request = self._diagnostics.get(decision.diagnostic_request_id)
+            if request is not None:
+                created_at: datetime | None = request.created_at
+                return created_at
+        event = self._events.get(decision.event_key)
+        ended_at: datetime | None = event.ended_at if event is not None else None
+        return ended_at
 
     def list_decisions_by_status(
         self,
@@ -316,7 +379,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             candidates = [
                 (created_at, decision)
                 for created_at, decision in candidates
-                if created_at is None or created_at <= older_than
+                if created_at is not None and created_at <= older_than
             ]
         floor = datetime.min.replace(tzinfo=timezone.utc)
         candidates.sort(
@@ -373,6 +436,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                     marker
                     for marker in self._markers.values()
                     if marker.active
+                    and marker.trusted
                     and (
                         marker.observed_at >= observed_after
                         or (

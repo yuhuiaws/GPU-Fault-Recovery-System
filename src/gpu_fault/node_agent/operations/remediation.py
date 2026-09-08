@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )

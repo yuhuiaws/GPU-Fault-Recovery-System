@@ -5,6 +5,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
+from gpu_fault.execution.restart_budget_preflight import (
+    release_unattempted_restart_reservations,
+)
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -31,9 +34,6 @@ from gpu_fault.workflow_resolution import (
     restore_reconciliation_reasons,
     verified_restore_successor,
     workflow_never_changed_a_node,
-)
-from gpu_fault.execution.restart_budget_preflight import (
-    release_unattempted_restart_reservations,
 )
 
 # How an eligible item will be terminalized. Both end SUPERSEDED; the first

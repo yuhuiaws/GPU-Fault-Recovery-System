@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import zipfile
@@ -113,6 +114,119 @@ def test_coverage_test_partition_is_complete_and_disjoint() -> None:
     )
     assert assigned == collectable - set(config["tests"]["coverage_excluded_files"])
     assert sum(counts.values()) == len(assigned)
+
+
+_POSTGRES_URL_READ = re.compile(
+    r"(?:getenv|environ\.get|environ)\s*[\(\[]\s*['\"]GPU_FAULT_TEST_POSTGRES_URL['\"]"
+)
+
+
+def _postgres_gated_test_files() -> set[str]:
+    """Every collected test file whose cases skip without a Postgres URL.
+
+    Written as a textual expression on purpose, independent from the partition
+    code under test: a module is gated when it reads the variable from the
+    process environment itself, or imports a ``tests`` helper that does (the
+    claim-support module reads it once and every Postgres fixture goes through
+    it). A dict literal or ``monkeypatch.setenv`` mentioning the name is not a
+    gate.
+    """
+
+    tests = ROOT / "tests"
+    readers = {
+        path
+        for path in tests.rglob("*.py")
+        if _POSTGRES_URL_READ.search(path.read_text(encoding="utf-8"))
+    }
+    reader_modules = {
+        ".".join(path.relative_to(ROOT).with_suffix("").parts) for path in readers
+    }
+    gated: set[str] = set()
+    for path in tests.rglob("test_*.py"):
+        relative = path.relative_to(ROOT).as_posix()
+        if path in readers:
+            gated.add(relative)
+            continue
+        text = path.read_text(encoding="utf-8")
+        if any(f"from {module} import" in text for module in reader_modules):
+            gated.add(relative)
+    return gated
+
+
+def _makefile_postgres_tests() -> set[str]:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    block = makefile.split("POSTGRES_TESTS = \\\n", 1)[1].split("\n\n", 1)[0]
+    entries = set()
+    for line in block.splitlines():
+        entry = line.strip().rstrip("\\").strip()
+        if entry and not entry.startswith("#") and "=" not in entry:
+            entries.add(entry)
+    return entries
+
+
+def test_every_postgres_gated_test_file_runs_in_the_postgres_shard() -> None:
+    # G-1: the CI postgres shard used to name four files while sixty-odd test
+    # modules skip without GPU_FAULT_TEST_POSTGRES_URL, and every other shard
+    # clears the variable -- so an EXPLAIN or lock-order assertion could go
+    # red in the repository without any CI job ever running it.
+    config = ci_coverage_gate.load_config(ROOT)
+    gated = _postgres_gated_test_files() - set(
+        config["tests"]["coverage_excluded_files"]
+    )
+    shard = set(ci_coverage_gate.pytest_targets(ROOT, "postgres"))
+    makefile = _makefile_postgres_tests()
+
+    assert len(gated) > 40, sorted(gated)
+    assert gated <= shard, sorted(gated - shard)
+    assert makefile == shard, {
+        "makefile_only": sorted(makefile - shard),
+        "shard_only": sorted(shard - makefile),
+    }
+
+
+def test_postgres_gate_detection_reads_the_environment_not_mentions(
+    tmp_path: Path,
+) -> None:
+    root = _identity_root(tmp_path)
+    files = {
+        "tests/store/_pg_support.py": (
+            "import os\nPOSTGRES_URL = os.getenv('GPU_FAULT_TEST_POSTGRES_URL')\n"
+        ),
+        "tests/store/test_direct.py": (
+            "import os, pytest\n"
+            "if not os.environ.get('GPU_FAULT_TEST_POSTGRES_URL'):\n"
+            "    pytest.skip('x', allow_module_level=True)\n"
+        ),
+        "tests/store/test_indirect.py": (
+            "from tests.store._pg_support import POSTGRES_URL\n"
+        ),
+        "tests/regional/test_baseline.py": (
+            "import os\nURL = os.environ['GPU_FAULT_TEST_POSTGRES_URL']\n"
+        ),
+        "tests/test_mention.py": (
+            "def test_env(monkeypatch):\n"
+            "    monkeypatch.setenv('GPU_FAULT_TEST_POSTGRES_URL', 'postgresql://x')\n"
+        ),
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git(root, "add", ".")
+
+    postgres = set(ci_coverage_gate.pytest_targets(root, "postgres"))
+    runtime = set(ci_coverage_gate.pytest_targets(root, "runtime_0"))
+    deployment = set(ci_coverage_gate.pytest_targets(root, "deployment"))
+
+    assert {
+        "tests/store/test_direct.py",
+        "tests/store/test_indirect.py",
+        "tests/regional/test_baseline.py",
+        "tests/store/test_postgres_store.py",
+    } <= postgres
+    assert "tests/test_mention.py" in runtime
+    assert "tests/regional/test_baseline.py" not in deployment
+    assert "tests/test_mention.py" not in postgres
 
 
 def test_runtime_nodeid_partitions_are_stable_disjoint_and_complete() -> None:

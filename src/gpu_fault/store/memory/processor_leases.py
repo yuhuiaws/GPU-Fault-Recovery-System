@@ -154,16 +154,28 @@ class MemoryProcessorLeaseMixin:
         not_before: datetime | None = None,
         retry_count: int | None = None,
     ) -> None:
+        # Lane and queue row are released on their own CAS each (B-2); see
+        # the Postgres store for why neither is a precondition of the other.
         with self._lock:
             current = self.get_processor_request(request_id)
             lane_key = current.ordering_key()
             lane = self._processor_lanes.get(lane_key)
+            now = datetime.now(timezone.utc)
             if (
-                lane is None
-                or lane.owner_id != owner_id
-                or lane.epoch != lane_epoch
-                or lane.lease_token != lease_token
-                or current.lease_owner != owner_id
+                lane is not None
+                and lane.owner_id == owner_id
+                and lane.epoch == lane_epoch
+                and lane.lease_token == lease_token
+                and lane.lease_expires_at > now
+            ):
+                self._processor_lanes[lane_key] = lane.model_copy(
+                    update={
+                        "lease_expires_at": now,
+                        "updated_at": now,
+                    }
+                )
+            if (
+                current.lease_owner != owner_id
                 or current.leader_epoch != lane_epoch
                 or current.lease_token != lease_token
             ):
@@ -175,13 +187,6 @@ class MemoryProcessorLeaseMixin:
             # three backends answer the same for the same input.
             if current.status != ProcessorRequestStatus.LEASED:
                 return
-            now = datetime.now(timezone.utc)
-            self._processor_lanes[lane_key] = lane.model_copy(
-                update={
-                    "lease_expires_at": now,
-                    "updated_at": now,
-                }
-            )
             self._processor_requests[request_id] = current.model_copy(
                 update={
                     "status": ProcessorRequestStatus.PENDING,

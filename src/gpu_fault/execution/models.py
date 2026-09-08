@@ -14,12 +14,27 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 
-
 LOGGER = logging.getLogger(__name__)
 
 
 class WorkflowExecutionError(ValueError):
     pass
+
+
+class WorkflowStructureError(WorkflowExecutionError):
+    """The record's own shape cannot be executed: a DAG with a cycle, a
+    dependency on a step that does not exist, more steps than one workflow may
+    carry. Deterministic, so retrying it is a hot loop; the dispatcher writes
+    the record BLOCKED for an operator instead (control-plane review
+    2026-09-08, D-6)."""
+
+
+class WorkflowRecordInvalidError(WorkflowExecutionError):
+    """The workflow row itself could not be decoded (a ``ValidationError`` from
+    ``get_workflow`` of the record being executed). The one decode failure that
+    proves *this record* cannot run; a decode failure of any other row -- a
+    plan, a remote command, an incident -- says nothing about it (control-plane
+    review 2026-09-08, D-5)."""
 
 
 def _failure_details(adapter: Any, exc: BaseException) -> dict[str, Any]:

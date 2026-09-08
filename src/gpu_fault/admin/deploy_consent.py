@@ -28,8 +28,10 @@ from gpu_fault_release.regional_admin_commands import (
 from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
 from gpu_fault_release.regional_schema_change import (
     recorded_acceptance,
-    refusal_message as schema_change_refusal_message,
     requested_acceptance_mode,
+)
+from gpu_fault_release.regional_schema_change import (
+    refusal_message as schema_change_refusal_message,
 )
 
 

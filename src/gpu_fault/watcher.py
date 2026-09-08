@@ -109,6 +109,21 @@ class AttemptObservation(StrictModel):
         )
 
 
+class WorkloadCoverageHeartbeat(StrictModel):
+    """The watcher's statement that it scanned a cluster at ``scanned_at``.
+
+    An idle cluster has no managed attempt and therefore produces no
+    ``AttemptObservation``; without this heartbeat the control plane could
+    not tell "no attempt" from "watcher dead" and fell closed to UNKNOWN.
+    ``attempt_count`` is informational: coverage is the fact of the scan.
+    """
+
+    cluster_id: str
+    scanned_at: datetime
+    attempt_count: int = Field(ge=0)
+    observe_unmanaged: bool = False
+
+
 class FailureDetectedEvent(StrictModel):
     cluster_id: str
     job_id: str

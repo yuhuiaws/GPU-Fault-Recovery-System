@@ -101,6 +101,23 @@ def _dispatcher(store, adapter: FakeAdapter) -> WorkflowDispatcher:
     )
 
 
+def _rewind(store, request_id: str, by: timedelta) -> None:
+    """Move the row's clock ``by`` into the past: its ``created_at`` and every
+    HOLD the dispatcher stamped on it (the rule A window opens at the first)."""
+
+    current = store.get_workflow(request_id)
+    store.amend_workflow(
+        request_id,
+        {
+            "created_at": current.created_at - by,
+            "events": [
+                event.model_copy(update={"at": event.at - by})
+                for event in current.events
+            ],
+        },
+    )
+
+
 def _repair_finished(store) -> None:
     node_workflow = store.get_workflow("wf-node")
     store.save_workflow(
@@ -134,10 +151,10 @@ def test_a_restart_waits_on_the_busy_node_then_fails_without_restarting():
     assert adapter.calls == [], "nothing restarts while the node is under repair"
     assert store.get_workflow("wf-restart").status is WorkflowStatus.PENDING
 
-    # The window passes with the node still under the other remediation.
-    store.amend_workflow(
-        "wf-restart", {"created_at": now - timedelta(seconds=WINDOW + 60)}
-    )
+    # The window passes with the node still under the other remediation. The
+    # wait is measured from the first HOLD the dispatcher recorded (D-11), so
+    # that is what moves into the past, along with ``created_at``.
+    _rewind(store, "wf-restart", timedelta(seconds=WINDOW + 60))
     gave_up = dispatcher.run_once()
     dispatcher.run_once()
 

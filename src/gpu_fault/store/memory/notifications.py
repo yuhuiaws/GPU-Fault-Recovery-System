@@ -11,21 +11,20 @@ from gpu_fault.models import (
     NotificationResult,
     NotificationStatus,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import (
     NotFoundError,
     WorkflowLeaseError,
 )
 from gpu_fault.store.shared.notification_helpers import (
     bound_notifications,
-)
-from gpu_fault.store.shared.notification_helpers import (
-    with_incident_drill_label as _with_incident_drill_label,
-)
-from gpu_fault.store.shared.notification_helpers import (
     check_delivery_lease,
     completed_delivery,
     delivery_stats_from_rows,
     released_delivery,
+)
+from gpu_fault.store.shared.notification_helpers import (
+    with_incident_drill_label as _with_incident_drill_label,
 )
 
 
@@ -209,9 +208,12 @@ class MemoryNotificationMixin:
             current = self._notification_deliveries.get(notification_id)
             if current is not None:
                 queued_at = now or datetime.now(timezone.utc)
-                # Asking for a delivery again restarts its shelf life:
-                # otherwise the dispatcher expires it unsent for exactly
-                # the reason it was asked for a second time.
+                # Asking for a delivery again is an explicit requeue: it
+                # restarts the shelf life -- otherwise the dispatcher expires
+                # it unsent for exactly the reason it was asked for a second
+                # time -- and, for a row the dispatcher had backed off or
+                # given up on, the attempt budget. ``send`` no longer reaches
+                # this branch (control-plane review 2026-09-08, F-2).
                 update: dict = {
                     "requeued_at": queued_at,
                     "updated_at": queued_at,
@@ -222,6 +224,7 @@ class MemoryNotificationMixin:
                 }:
                     update |= {
                         "status": NotificationDeliveryStatus.PENDING,
+                        "attempts": 0,
                         "available_at": queued_at,
                         "lease_owner": None,
                         "lease_expires_at": None,
@@ -306,6 +309,54 @@ class MemoryNotificationMixin:
             value = released_delivery(current, now=now, retry_at=retry_at)
             self._notification_deliveries[notification_id] = value
             return value
+
+    def cleanup_terminal_notifications(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        with self._lock:
+            victims = []
+            for notification in sorted(
+                self._notifications.values(),
+                key=lambda item: (item.created_at, item.notification_id),
+            ):
+                if notification.created_at > older_than:
+                    continue
+                if notification.incident_id in self._incidents:
+                    continue
+                delivery = self._notification_deliveries.get(
+                    notification.notification_id
+                )
+                if delivery is not None and delivery.status not in {
+                    NotificationDeliveryStatus.SENT,
+                    NotificationDeliveryStatus.DEAD,
+                }:
+                    continue
+                victims.append(notification)
+                if len(victims) >= limit:
+                    break
+            for notification in victims:
+                self._notifications.pop(notification.notification_id, None)
+                self._notification_deliveries.pop(notification.notification_id, None)
+                self._notification_results.pop(notification.notification_id, None)
+                if (
+                    self._notification_by_deduplication_key.get(
+                        notification.deduplication_key
+                    )
+                    == notification.notification_id
+                ):
+                    del self._notification_by_deduplication_key[
+                        notification.deduplication_key
+                    ]
+        return log_cleanup("notification", [item.notification_id for item in victims])
+
+    def get_notification_delivery(
+        self, notification_id: str
+    ) -> NotificationDelivery | None:
+        with self._lock:
+            delivery: NotificationDelivery | None = self._notification_deliveries.get(
+                notification_id
+            )
+            return delivery
 
     def get_notification(self, notification_id: str) -> AdvisoryNotification:
         with self._lock:

@@ -5,20 +5,21 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from gpu_fault.models import (
-    bounded_reasons,
     FaultIncident,
     IncidentState,
     WorkflowRequest,
     WorkflowStatus,
     WorkloadState,
+    bounded_reasons,
 )
+from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
     SxidEvent,
     XidEvent,
 )
-from gpu_fault.orchestration.disposition import DispositionApplier
 
 
 @dataclass(frozen=True)
@@ -245,11 +246,7 @@ class NodeScopedFaultService:
         existing_workflow: WorkflowRequest,
         now: datetime,
     ) -> tuple[FaultIncident, WorkflowRequest]:
-        mutable = (
-            existing_workflow.status is WorkflowStatus.PENDING
-            and existing_workflow.execution_owner_id is None
-            and not existing_workflow.completed_step_indexes
-        )
+        mutable = workflow_is_mutable(existing_workflow)  # D-9 companion
         disposition = self.callbacks.merge_disposition(
             existing_workflow,
             candidate_workflow,

@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
-from gpu_fault.training_health import TrainingProgressHeartbeat
-
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.training_health import TrainingProgressHeartbeat
 
 LOGGER = logging.getLogger(__name__)
 

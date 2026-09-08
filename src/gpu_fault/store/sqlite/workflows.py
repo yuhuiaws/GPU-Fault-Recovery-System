@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Collection, ContextManager
+from typing import Any, Callable, Collection, ContextManager, Sequence
 
 from gpu_fault.models import (
     FaultIncident,
@@ -28,11 +29,14 @@ from gpu_fault.store.shared.remediation_budgets import (
 )
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
+    incident_pointer_moved,
     lease_extension_due,
     stale_workflow_versions,
     workflow_matches_expected,
 )
 from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SqliteWorkflowMixin:
@@ -51,6 +55,7 @@ class SqliteWorkflowMixin:
         incident: FaultIncident,
         *,
         expected: FaultIncident | None = None,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         """See ``WorkflowStore.save_incident`` (architecture review, item D1).
 
@@ -75,6 +80,9 @@ class SqliteWorkflowMixin:
                 incident.event_id,
                 incident.incident_id,
             )
+            for event_id in extra_event_ids:
+                if event_id != incident.event_id:
+                    self._link("incident_by_event", event_id, incident.incident_id)
 
     def save_workflow(
         self,
@@ -327,6 +335,43 @@ class SqliteWorkflowMixin:
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+        return [FaultIncident.model_validate_json(row[0]) for row in rows]
+
+    def list_incidents_by_state(
+        self,
+        cluster_id: str,
+        states: Collection[IncidentState],
+        *,
+        node_ids: set[str] | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
+    ) -> list[FaultIncident]:
+        wanted = sorted({IncidentState(state).value for state in states})
+        if not wanted or (node_ids is not None and not node_ids):
+            return []
+        clauses = [
+            "i.kind='incident'",
+            "json_extract(i.payload, '$.cluster_id')=?",
+            "json_extract(i.payload, '$.state') IN ("
+            + ",".join("?" for _ in wanted)
+            + ")",
+        ]
+        parameters: list[object] = [cluster_id, *wanted]
+        if node_ids is not None:
+            placeholders = ",".join("?" for _ in node_ids)
+            clauses.append(
+                "EXISTS ("
+                "SELECT 1 FROM json_each(i.payload, '$.node_ids') n "
+                f"WHERE n.value IN ({placeholders})"
+                ")"
+            )
+            parameters.extend(sorted(node_ids))
+        rows = self._db.execute(
+            "SELECT i.payload FROM objects i WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY json_extract(i.payload, '$.updated_at') DESC, i.key DESC"
+            " LIMIT ?",
+            [*parameters, limit],
         ).fetchall()
         return [FaultIncident.model_validate_json(row[0]) for row in rows]
 
@@ -618,6 +663,7 @@ class SqliteWorkflowMixin:
         now: datetime | None = None,
     ) -> None:
         with self._state_transaction(f"workflow/{workflow.request_id}"):
+            current_incident = self._get_optional("incident", incident.incident_id)
             current = self._get("workflow", workflow.request_id)
             checked_at = now or datetime.now(timezone.utc)
             if (
@@ -634,6 +680,17 @@ class SqliteWorkflowMixin:
                 workflow.request_id,
                 workflow,
             )
+            if incident_pointer_moved(current_incident, incident):
+                # Same rule as PostgreSQL (C-02); the process lock is the row
+                # lock here.
+                LOGGER.warning(
+                    "incident %s moved its workflow pointer to %s since %s read "
+                    "it; keeping the merged incident and writing only the workflow",
+                    incident.incident_id,
+                    current_incident.workflow_request_id,
+                    workflow.request_id,
+                )
+                return
             self._put(
                 "incident",
                 incident.incident_id,

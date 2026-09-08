@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from gpu_fault.env import env_bool
 from gpu_fault.notifications.common import (
     AdvisoryNotification,
@@ -75,6 +77,22 @@ class SesNotificationConfig(StrictModel):
 class SesEmailNotifier:
     """Read-only by default SES v2 notification adapter."""
 
+    # Bound on the in-process dedup hint. The cross-process truth is the
+    # ``notification_result`` row; this only saves a provider call when the
+    # same process sees the same key twice, so it is a hint, not a ledger,
+    # and does not need to remember every notification the process ever
+    # sent (control-plane review 2026-09-08, F-4).
+    RESULT_CACHE_LIMIT = 1024
+
+    # One ``send_email`` must finish well inside the 120 s delivery lease:
+    # botocore's defaults (60 s connect, 60 s read, legacy retries up to
+    # five attempts) let one hung call outlive the lease while ``send``
+    # held the process lock, and the next replica to claim the row mailed
+    # it again in parallel (F-4). 2 attempts x (5 + 20) s < 60 s.
+    CONNECT_TIMEOUT_SECONDS = 5
+    READ_TIMEOUT_SECONDS = 20
+    MAX_ATTEMPTS = 2
+
     def __init__(
         self,
         config: SesNotificationConfig,
@@ -82,16 +100,32 @@ class SesEmailNotifier:
     ) -> None:
         self.config = config
         self.client = client or self._create_client(config)
-        self._results: dict[str, NotificationResult] = {}
+        self._results: OrderedDict[str, NotificationResult] = OrderedDict()
         self._lock = RLock()
 
-    @staticmethod
-    def _create_client(config: SesNotificationConfig):
+    @classmethod
+    def _create_client(cls, config: SesNotificationConfig) -> SesV2Client:
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise RuntimeError("install gpu-fault-control-plane[hyperpod]") from exc
-        return boto3.client("sesv2", region_name=config.region_name)
+        client: SesV2Client = boto3.client(
+            "sesv2",
+            region_name=config.region_name,
+            config=Config(
+                connect_timeout=cls.CONNECT_TIMEOUT_SECONDS,
+                read_timeout=cls.READ_TIMEOUT_SECONDS,
+                retries={"max_attempts": cls.MAX_ATTEMPTS, "mode": "standard"},
+            ),
+        )
+        return client
+
+    def _remember(self, key: str, result: NotificationResult) -> None:
+        self._results[key] = result
+        self._results.move_to_end(key)
+        while len(self._results) > self.RESULT_CACHE_LIMIT:
+            self._results.popitem(last=False)
 
     def _subject(self, notification: AdvisoryNotification) -> str:
         return subject_with_context(
@@ -150,7 +184,7 @@ class SesEmailNotifier:
                 status=NotificationStatus.SENT,
                 provider_message_id=response.get("MessageId"),
             )
-            self._results[notification.deduplication_key] = result
+            self._remember(notification.deduplication_key, result)
             return result
 
 

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
 from gpu_fault_release.regional_release_config import ReleaseError
 
 # Fields the API server owns. Applying them back either fails outright

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
-
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable
 
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 

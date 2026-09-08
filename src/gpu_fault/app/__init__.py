@@ -1,13 +1,13 @@
-from gpu_fault.app.context import (
-    ApplicationContext,
-    default_simulated_profile,
-)
 from gpu_fault.app.admission import (
     _ProcessorAdmissionBatcher,
     _StripedAdmissionScope,
 )
 from gpu_fault.app.collector_silence import (
     notify_silent_collectors,
+)
+from gpu_fault.app.context import (
+    ApplicationContext,
+    default_simulated_profile,
 )
 from gpu_fault.app.factory import (
     create_app,

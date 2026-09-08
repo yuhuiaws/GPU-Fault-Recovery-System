@@ -1,28 +1,27 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import logging
 from typing import Any, Literal, Sequence
 
+import gpu_fault.execution.step_bounds as step_bounds
+from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.remediation_budget import remediation_budget_claims
 from gpu_fault.models import (
-    resolved_step_indexes,
     FaultIncident,
     IncidentState,
-    WorkflowOperation,
     WorkflowExecutionRequest,
+    WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    resolved_step_indexes,
 )
 from gpu_fault.store import NotFoundError
-from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
-from gpu_fault.execution.remediation_budget import remediation_budget_claims
-import gpu_fault.execution.step_bounds as step_bounds
-
 
 LOGGER = logging.getLogger(__name__)
 _REQUIRED_RESTART_PARAMETERS = frozenset(
@@ -153,10 +152,22 @@ def reserve_restart_budgets(
         phase = reservation_phase(workflow)
     # A superseded restart will never run, so it needs no reservation (F-C2).
     completed = set(resolved_step_indexes(workflow))
+    # A restart whose adapter already ran holds its reservation -- the adapter
+    # reserves under the same id -- and is only released by a terminal write,
+    # so re-reserving it on every claim was one budget write per tick for
+    # nothing (D-10).
+    already_attempted = {
+        item.step_index
+        for item in workflow.step_executions
+        if item.operation is WorkflowOperation.RESTART_WORKLOAD
+        and item.status is WorkflowStepStatus.WAITING
+        and item.phase in (None, phase)
+    }
     for step_index, step in enumerate(steps):
         if (
             step.operation is not WorkflowOperation.RESTART_WORKLOAD
             or step_index in completed
+            or step_index in already_attempted
         ):
             continue
         parameters = step.parameters
@@ -272,11 +283,14 @@ def prepare_claimed_workflow(
     execution_epoch = workflow.execution_epoch
     workflow = executor._adopt_quiesce_handoff_from_predecessor(workflow, incident)
     executor._save_leased(workflow, execution_epoch)
-    if workflow.pending_failure_step_index is not None:
+    if (
+        workflow.pending_failure_step_index is not None
+        and not executor._job_failure_still_deferred(workflow)
+    ):
         return ClaimedWorkflowPreparation(
             workflow=workflow,
             execution_epoch=execution_epoch,
-            result=executor._resume_failure_compensation(
+            result=executor._land_pending_failure(
                 workflow,
                 incident,
                 request,

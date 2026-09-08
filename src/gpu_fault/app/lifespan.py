@@ -8,16 +8,16 @@ from dataclasses import dataclass
 from threading import Event, Thread
 from typing import Any, Callable
 
-from gpu_fault.app.runtime import EventLoopLag
 from gpu_fault.app.lifespan_workers import (
     start_nonprocessor_workers,
     start_notification_worker,
+    start_process_metrics_worker,
     start_processor_threads,
     start_regional_registry_worker,
     start_spool_threads,
 )
+from gpu_fault.app.runtime import EventLoopLag
 from gpu_fault.lifecycle import ShutdownCoordinator
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,11 +49,15 @@ class LifespanDependencies:
     event_loop_lag: EventLoopLag
     collector_metrics_snapshot: Any
     regional_registry_runtime: Any | None
+    # Renders this process's own /metrics families for the process-metrics
+    # publisher; takes the FastAPI app because the runtime is attached to
+    # ``app.state`` after the lifespan is built.
+    process_metrics_render: Callable[[Any], list[str]] | None = None
 
 
 def create_lifespan(dependencies: LifespanDependencies):
     @asynccontextmanager
-    async def lifespan(_):
+    async def lifespan(app):
         ctx = dependencies.context
         processor = dependencies.processor
         processor_diagnostics_publisher = dependencies.processor_diagnostics_publisher
@@ -112,6 +116,12 @@ def create_lifespan(dependencies: LifespanDependencies):
             daemon=True,
         )
         collector_metrics_worker.start()
+        process_metrics_worker = None
+        if dependencies.process_metrics_render is not None:
+            render = dependencies.process_metrics_render
+            process_metrics_worker = start_process_metrics_worker(
+                lambda: render(app), training_stop
+            )
         processor_threads: list[Thread] = []
         diagnostics_worker = None
         identity_registries = [
@@ -223,6 +233,7 @@ def create_lifespan(dependencies: LifespanDependencies):
                 collector_metrics_worker,
                 "collector metrics snapshot",
             )
+            shutdown.join(process_metrics_worker, "process metrics publisher")
             shutdown.join(registry_worker, "regional registry watcher")
             shutdown.join(
                 diagnostics_worker,

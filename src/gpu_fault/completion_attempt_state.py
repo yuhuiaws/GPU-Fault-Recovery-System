@@ -7,8 +7,13 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from gpu_fault.attempt_observation_state import terminal_attempt_observation
+from gpu_fault.channel_registry import WORKLOAD_COVERAGE_PATH
 from gpu_fault.models import Environment, TerminalEvent
-from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+from gpu_fault.watcher import (
+    AttemptObservation,
+    WorkloadCoverageHeartbeat,
+    WorkloadPhase,
+)
 
 LOGGER = logging.getLogger(__name__)
 ACTIVE_PHASES = frozenset({WorkloadPhase.PENDING, WorkloadPhase.RUNNING})
@@ -119,6 +124,31 @@ def cache_terminal_attempt_observation(
             terminal_attempt_observation(event, observation),
         ),
     )
+
+
+def publish_workload_coverage(
+    controller: Any, *, scanned_at: Any, attempt_count: int
+) -> bool:
+    """Tell the control plane the cluster was scanned; ``True`` when sent.
+
+    Fire-and-forget: the next scan supersedes this one, so a failed post is
+    logged and dropped rather than buffered.
+    """
+
+    heartbeat = WorkloadCoverageHeartbeat(
+        cluster_id=controller.cluster_id,
+        scanned_at=scanned_at,
+        attempt_count=attempt_count,
+        observe_unmanaged=bool(controller.observation_only.enabled),
+    )
+    try:
+        controller.sink.post(WORKLOAD_COVERAGE_PATH, heartbeat.model_dump(mode="json"))
+    except Exception:
+        LOGGER.exception(
+            "cannot publish workload coverage heartbeat for %s", controller.cluster_id
+        )
+        return False
+    return True
 
 
 def publish_attempt_observation(

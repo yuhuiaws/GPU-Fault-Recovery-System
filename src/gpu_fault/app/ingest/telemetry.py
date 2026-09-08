@@ -20,15 +20,14 @@ from gpu_fault.gpu_metrics import (
 )
 from gpu_fault.host_health import (
     HostTelemetryBatch,
-    NodeLogBatch,
     NodeHealthCategory,
     NodeHealthFinding,
     NodeHealthIngestionResult,
+    NodeLogBatch,
 )
 from gpu_fault.models import RecoveryAction, Severity
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from gpu_fault.telemetry import CollectorKind, EvidenceKind
-
 
 LOGGER = logging.getLogger(__name__)
 TelemetryBatch = GpuMetricBatch | HostTelemetryBatch | NodeLogBatch

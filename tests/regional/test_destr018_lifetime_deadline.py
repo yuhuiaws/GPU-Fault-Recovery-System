@@ -1442,6 +1442,10 @@ class _Recorder:
 
 class _FakeWarm:
     recorder: _Recorder
+    # Incident state the control plane reports, by id; ESCALATED unless set.
+    states: dict[str, str] = {}
+    # What POST /v1/incidents/{id}/close answers; 200 RECOVERED unless set.
+    close_responses: dict[str, dict[str, Any]] = {}
 
     def __init__(self, regional: Any, hyperpod_cluster: str) -> None:
         self.regional = regional
@@ -1449,6 +1453,26 @@ class _FakeWarm:
     def wait_incident_idle(self, incident_id: str, **_: Any) -> dict[str, Any]:
         self.recorder.calls.append(f"idle:{incident_id}")
         return {"incident_id": incident_id}
+
+    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
+        self.recorder.calls.append(f"incident:{incident_id}")
+        return {
+            "incident_id": incident_id,
+            "state": self.states.get(incident_id, "ESCALATED"),
+        }
+
+    def close_incident(
+        self, incident_id: str, *, reason: str, operator: str
+    ) -> dict[str, Any]:
+        self.recorder.calls.append(f"close:{incident_id}")
+        assert reason and operator, "the close names its reason and operator"
+        return self.close_responses.get(
+            incident_id,
+            {
+                "status": 200,
+                "body": {"closed": True, "incident": {"state": "RECOVERED"}},
+            },
+        )
 
     def create_restore_workflow(self, **kwargs: Any) -> dict[str, Any]:
         self.recorder.calls.append(f"restore:{kwargs['incident_id']}")
@@ -1479,17 +1503,155 @@ class _FakeRegional:
         self.identity = identity
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
+        """Isolated until a restore workflow has run; released after."""
+
         self.recorder.calls.append("node_snapshot")
+        restored = any(item.startswith("restore:") for item in self.recorder.calls)
         return {
             "name": node,
             "ready": "True",
-            "unschedulable": True,
+            "unschedulable": not restored,
             "ownership_annotations": {},
-            "taints": [{"key": verdicts.QUARANTINE_TAINT}],
+            "taints": [] if restored else [{"key": verdicts.QUARANTINE_TAINT}],
         }
 
     def runtime_identity(self) -> dict[str, Any]:
         return self.identity
+
+
+def _cleanup_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorder: _Recorder
+) -> destr018.LiveRun:
+    _FakeWarm.recorder = recorder
+    monkeypatch.setattr(_FakeWarm, "states", {})
+    monkeypatch.setattr(_FakeWarm, "close_responses", {})
+    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
+    monkeypatch.setattr(env_window, "survey", lambda regional: {"survey": True})
+
+    def close_window(window: Any, regional: Any, report: Any) -> dict[str, Any]:
+        recorder.calls.append("close_window")
+        return {"closed_at": "now", "close_survey": report}
+
+    monkeypatch.setattr(env_window, "close_window", close_window)
+    monkeypatch.setattr(destr018, "identity_errors", lambda *a, **k: [])
+    identity = _identity(generation=3)
+    return destr018.LiveRun(
+        settings=_settings(tmp_path),
+        regional=_FakeRegional(recorder, identity),  # type: ignore[arg-type]
+        case_dir=tmp_path,
+        preflight={"runtime_identity": identity},
+        run_id="destr018-x-a1",
+        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
+        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
+        window=env_window.Settings(
+            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
+        ),
+        incident_id="inc-reset",
+        support_incident_id=SUPPORT_INCIDENT_ID,
+        holder_armed=True,
+        window_opened=True,
+    )
+
+
+def _restore_calls(recorder: _Recorder) -> list[str]:
+    return [
+        item
+        for item in recorder.calls
+        if item.startswith(("restore:", "close:", "incident:"))
+    ]
+
+
+def test_the_reset_incident_is_closed_through_the_operator_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The support incident owns the isolation and is restored through a
+    validated restore workflow; the reset incident, ESCALATED over a node
+    nobody isolates any more, is closed through POST /v1/incidents/{id}/close
+    -- the product exit for exactly this state -- not by a second restore."""
+
+    recorder = _Recorder()
+    run = _cleanup_run(tmp_path, monkeypatch, recorder)
+
+    report = destr018.restore_isolated_node(run)
+
+    assert _restore_calls(recorder) == [
+        f"restore:{SUPPORT_INCIDENT_ID}",
+        "incident:inc-reset",
+        "close:inc-reset",
+    ]
+    assert report == {
+        "isolated": True,
+        SUPPORT_INCIDENT_ID: "SUCCEEDED",
+        f"{SUPPORT_INCIDENT_ID}:path": "restore-workflow",
+        "inc-reset": "RECOVERED",
+        "inc-reset:path": "close-api",
+    }
+
+
+def test_a_reset_incident_the_restore_already_closed_needs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validated restore's terminal hook closes the ESCALATED sibling on
+    its own; the cleanup then finds it RECOVERED and neither closes nor
+    restores it again."""
+
+    recorder = _Recorder()
+    run = _cleanup_run(tmp_path, monkeypatch, recorder)
+    monkeypatch.setattr(_FakeWarm, "states", {"inc-reset": "RECOVERED"})
+
+    report = destr018.restore_isolated_node(run)
+
+    assert _restore_calls(recorder) == [
+        f"restore:{SUPPORT_INCIDENT_ID}",
+        "incident:inc-reset",
+    ]
+    assert report["inc-reset"] == "RECOVERED"
+    assert report["inc-reset:path"] == "auto-closed"
+
+
+def test_a_refused_close_falls_back_to_the_validated_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 409 (a workflow still open) or a 404 from a release that predates the
+    route must not fail the cleanup: the restore workflow path still closes
+    the incident the way it always did."""
+
+    recorder = _Recorder()
+    run = _cleanup_run(tmp_path, monkeypatch, recorder)
+    monkeypatch.setattr(
+        _FakeWarm,
+        "close_responses",
+        {"inc-reset": {"status": 409, "body": {"detail": "open workflow wf-x"}}},
+    )
+
+    report = destr018.restore_isolated_node(run)
+
+    assert _restore_calls(recorder) == [
+        f"restore:{SUPPORT_INCIDENT_ID}",
+        "incident:inc-reset",
+        "close:inc-reset",
+        "restore:inc-reset",
+    ]
+    assert report["inc-reset"] == "SUCCEEDED"
+    assert report["inc-reset:path"] == "restore-workflow"
+    assert report["inc-reset:close_refused"] == "409: open workflow wf-x"
+
+
+def test_an_isolation_owner_is_never_closed_by_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a support escalation the reset incident owns the cordon; a
+    hand close would leave the node unschedulable, so it is restored."""
+
+    recorder = _Recorder()
+    run = _cleanup_run(tmp_path, monkeypatch, recorder)
+    run.support_incident_id = ""
+
+    report = destr018.restore_isolated_node(run)
+
+    assert _restore_calls(recorder) == ["restore:inc-reset"]
+    assert report["inc-reset"] == "SUCCEEDED"
+    assert report["inc-reset:path"] == "restore-workflow"
 
 
 def test_cleanup_closes_the_window_before_it_creates_the_restore(
@@ -1501,6 +1663,8 @@ def test_cleanup_closes_the_window_before_it_creates_the_restore(
 
     recorder = _Recorder()
     _FakeWarm.recorder = recorder
+    monkeypatch.setattr(_FakeWarm, "states", {})
+    monkeypatch.setattr(_FakeWarm, "close_responses", {})
     monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
     monkeypatch.setattr(env_window, "survey", lambda regional: {"survey": True})
 
@@ -1538,7 +1702,9 @@ def test_cleanup_closes_the_window_before_it_creates_the_restore(
     ordered = [
         item
         for item in recorder.calls
-        if item.startswith(("holder:disarm", "idle:", "close_window", "restore:"))
+        if item.startswith(
+            ("holder:disarm", "idle:", "close_window", "restore:", "close:")
+        )
     ]
     assert ordered == [
         "holder:disarm-holder",
@@ -1548,12 +1714,14 @@ def test_cleanup_closes_the_window_before_it_creates_the_restore(
         f"idle:{SUPPORT_INCIDENT_ID}",
         f"restore:{SUPPORT_INCIDENT_ID}",
         "idle:inc-reset",
-        "restore:inc-reset",
+        "close:inc-reset",
     ], ordered
     assert result["restore_isolated_node"] == {
         "isolated": True,
         SUPPORT_INCIDENT_ID: "SUCCEEDED",
-        "inc-reset": "SUCCEEDED",
+        f"{SUPPORT_INCIDENT_ID}:path": "restore-workflow",
+        "inc-reset": "RECOVERED",
+        "inc-reset:path": "close-api",
     }
     assert run.window_closed is True
 

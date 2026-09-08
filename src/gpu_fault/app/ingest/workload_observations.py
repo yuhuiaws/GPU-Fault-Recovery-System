@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Protocol
 
-from gpu_fault.watcher import AttemptObservation
+from gpu_fault.watcher import AttemptObservation, WorkloadCoverageHeartbeat
 
 if TYPE_CHECKING:
     from gpu_fault.execution.dispatcher import WorkflowDispatcher
@@ -39,6 +39,14 @@ def ingest_workload_observation(
         # Process-local (F-A8): shortens the poll only when the ingress and
         # the worker share a process; the scan cadence is the real bound.
         context.dispatcher.wake()
+
+
+def ingest_workload_coverage(
+    context: ObservationIngestContext, heartbeat: WorkloadCoverageHeartbeat
+) -> None:
+    """Record the watcher's scan heartbeat; an older one is a harmless no-op."""
+
+    context.topology.observe_coverage(heartbeat)
 
 
 def hold_attempt_placement(

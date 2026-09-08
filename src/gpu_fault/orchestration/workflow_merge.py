@@ -6,6 +6,7 @@ from typing import Callable
 
 from gpu_fault.models import (
     EXECUTABLE_WORKFLOW_STATUSES,
+    BlockedKind,
     FaultIncident,
     WorkflowEventCode,
     WorkflowEventKind,
@@ -26,6 +27,50 @@ from gpu_fault.orchestration.disposition import Disposition
 from gpu_fault.orchestration.preemption_boundary import preemption_boundary
 
 LOGGER = logging.getLogger(__name__)
+
+
+def workflow_is_mutable(workflow: WorkflowRequest) -> bool:
+    """Whether a merge may rewrite this row in place (same ``request_id``).
+
+    REPLACE_IN_PLACE swaps the plan and bumps ``fencing_token`` under the same
+    id, and ABSORB re-arms the aggregation window. Both assume nobody acted on
+    the row yet. ``completed_step_indexes`` alone said so; a step with an
+    execution record but no completion -- WAITING on a remote command -- is a
+    command an agent already holds for this row, and replacing the plan under
+    it would fence that command while the row it belongs to still reads
+    PENDING (D-9 companion, control-plane review 2026-09-08). The families
+    share this one definition instead of four copies.
+    """
+
+    return (
+        workflow.status is WorkflowStatus.PENDING
+        and workflow.execution_owner_id is None
+        and not workflow.completed_step_indexes
+        and not workflow.step_executions
+    )
+
+
+def never_executed_operator_block(workflow: WorkflowRequest) -> bool:
+    """A BLOCKED(NEEDS_OPERATOR) record that never touched a node.
+
+    Compilation refused it -- an idle cluster's UNKNOWN workload state
+    (``WORKLOAD_STATE_UNKNOWN_REASON``), a missing profile owner -- before any
+    step ran. F-A4 makes NEEDS_OPERATOR occupy its node so a workflow that
+    *did* reboot the node is not treated as free; this record did nothing, so
+    there is nothing on the node for an operator to reconcile. User decision
+    2026-09-08 (CP-8, second layer): such a record is no longer a predecessor.
+    ``disposition`` replaces it in place and ``active_node_exclusive_workflow``
+    does not name it as an incumbent.
+    """
+
+    return (
+        workflow.status is WorkflowStatus.BLOCKED
+        and workflow.blocked_kind is BlockedKind.NEEDS_OPERATOR
+        and not workflow.step_executions
+        and not workflow.completed_step_indexes
+        and not workflow.superseded_step_indexes
+        and workflow.execution_owner_id is None
+    )
 
 
 class WorkflowMergeService:
@@ -71,6 +116,20 @@ class WorkflowMergeService:
             # is winding down (F-N1 §7). The event is recorded, not planned.
             self.withdrawn_record_only_total += 1
             return Disposition.ABSORB_RECORD_ONLY
+        if never_executed_operator_block(existing):
+            # C-03: BLOCKED(NEEDS_OPERATOR) is open to the dispatcher (F-A4),
+            # so a successor queued behind it never dispatched, and every
+            # idle-period fault on the node grew the chain. The record never
+            # changed a node: recompile it under its own id (the applier's
+            # REPLACE_IN_PLACE keeps the history and bumps the generation),
+            # which also passes ``compile_steps`` once the workload is ACTIVE.
+            LOGGER.info(
+                "merge target %s is BLOCKED(NEEDS_OPERATOR) and never ran a "
+                "step; replacing it in place with %s",
+                existing.request_id,
+                candidate.request_id,
+            )
+            return Disposition.REPLACE_IN_PLACE
         if existing.status not in EXECUTABLE_WORKFLOW_STATUSES:
             # Nothing merges into a record that will never execute again --
             # BLOCKED included. ABSORB / WIDEN into one silently dropped the
@@ -95,11 +154,7 @@ class WorkflowMergeService:
                 self.absorbed_record_only_total += 1
                 return Disposition.ABSORB_RECORD_ONLY
             return Disposition.QUEUE_SUCCESSOR
-        mutable = (
-            existing.status is WorkflowStatus.PENDING
-            and existing.execution_owner_id is None
-            and not existing.completed_step_indexes
-        )
+        mutable = workflow_is_mutable(existing)
         existing_rank = self.arbiter.workflow_recovery_rank(existing)
         candidate_rank = self.arbiter.workflow_recovery_rank(candidate)
         if allow_job_branch_merge and self.can_append_parallel_branch(

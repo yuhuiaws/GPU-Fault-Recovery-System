@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 import hashlib
 import inspect
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -85,6 +85,21 @@ def _apply_store_review_indexes_v12(cursor: MigrationCursor) -> None:
     # partial ``gpu_fault_remote_command_workflow`` served, so that one goes
     # here the way v11 dropped the twin claim-window index.
     cursor.execute("DROP INDEX IF EXISTS gpu_fault_remote_command_workflow")
+
+
+def _apply_control_plane_review_indexes_v13(cursor: MigrationCursor) -> None:
+    # Control-plane review 2026-09-08, items G-2 / G-9 / F-9 / F-I1 / G-6:
+    # seven new partial indexes on gpu_fault_objects (the all-status workflow
+    # updated_at order the /metrics detail scan reads, the incident -> workflow
+    # pointer and workflow -> predecessor join keys the orphan inspections
+    # probe, the incident and fleet-deployment updated_at orders the archiver
+    # and the retention sweep use, and the two missing marker scope GINs) plus
+    # per-table autovacuum factors for the whole-row-upsert hot table. Same
+    # three-step method as v9-v12: declared IF NOT EXISTS by the idempotent
+    # DDL, built CONCURRENTLY by the operator/deploy Job first, validated at
+    # startup -- and from this version the startup check also refuses an
+    # INVALID index and a definition that drifted from the DDL.
+    cursor.execute("SELECT 1")
 
 
 def _apply_dispatcher_indexes_v9(cursor: MigrationCursor) -> None:
@@ -222,6 +237,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="store-review-hot-query-indexes",
         ddl_checksum="37e84d0dbacd405f6eb05223c65f997e44b0be2524d7b7ed577f3ced0a222c99",
         apply=_apply_store_review_indexes_v12,
+    ),
+    SchemaMigration(
+        version=13,
+        name="control-plane-review-indexes-and-autovacuum",
+        ddl_checksum="b8d1ac08876ac315c9b170691dfa87867803bf4300730018fba596277fcc2986",
+        apply=_apply_control_plane_review_indexes_v13,
     ),
 )
 

@@ -46,6 +46,7 @@ from gpu_fault.app.lifespan import (
 from gpu_fault.app.metric_scan_cache import MetricScanCache
 from gpu_fault.app.metrics import (
     get_app_runtime,
+    process_local_metric_lines,
 )
 from gpu_fault.app.metrics import (
     router as metrics_router,
@@ -152,6 +153,7 @@ from gpu_fault.capabilities import ProfileValidationError
 from gpu_fault.channel_registry import (
     COLLECTOR_EVENT_PREFIX,
     TRAINING_PROGRESS_PATH,
+    WORKLOAD_COVERAGE_PATH,
     WORKLOAD_OBSERVATIONS_PATH,
     channel_for_path,
     is_fault_path,
@@ -391,6 +393,7 @@ def _configure_service_runtime(
             event_loop_lag=event_loop_lag,
             collector_metrics_snapshot=collector_metrics_snapshot,
             regional_registry_runtime=regional_auth_registry,
+            process_metrics_render=process_local_metric_lines,
         )
     )
     return (
@@ -418,6 +421,10 @@ def _install_regional_auth(
     decode_io,
     decode_json_body,
     processor_max_request_bytes,
+    *,
+    fault_decode_io=None,
+    is_fault_path=None,
+    admission=None,
 ):
     registry = ExplicitAuthorizationRegistry()
     registry.load(app.routes)
@@ -471,6 +478,12 @@ def _install_regional_auth(
             decode_json_body=decode_json_body,
             payload_cluster_ids=payload_cluster_ids,
             processor_max_request_bytes=processor_max_request_bytes,
+            # A-3 / A-4 / A-8 / E-3 (control-plane review 2026-09-08)
+            fault_decode_io=fault_decode_io,
+            is_fault_path=is_fault_path,
+            dispatch_state=admission.dispatch_state if admission else None,
+            decode_rejections=admission.decode_rejections if admission else None,
+            retry_after_seconds=admission.retry_after_seconds if admission else 2,
         ),
     )
 
@@ -600,6 +613,7 @@ def _install_core_routes(
         dispatch_state=dispatch_state,
         collector_metrics_snapshot=collector_metrics_snapshot,
         metric_scan_cache=MetricScanCache(ctx.store),
+        decode_rejections=admission.decode_rejections,
     )
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)
@@ -873,6 +887,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         "/v1/advisory-notifications/",
         "/v1/workflows/",
         WORKLOAD_OBSERVATIONS_PATH,
+        WORKLOAD_COVERAGE_PATH,
         "/v1/attempts/",
         "/v1/triage-results",
         "/v1/recovery-plans/",
@@ -928,6 +943,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             replay_authorized=processor_replay_authorized,
             returns_processor_receipt=returns_processor_receipt,
             is_fault_ingress_path=is_fault_path,
+            decode_rejections=admission.decode_rejections,
             decode_json_body=decode_json_body,
             processor_max_queue_depth=processor_max_queue_depth,
             processor_max_cluster_queue_depth=(processor_max_cluster_queue_depth),
@@ -998,6 +1014,9 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         decode_io,
         decode_json_body,
         processor_max_request_bytes,
+        fault_decode_io=fault_decode_io,
+        is_fault_path=is_fault_path,
+        admission=admission,
     )
 
     install_ingress_backpressure(

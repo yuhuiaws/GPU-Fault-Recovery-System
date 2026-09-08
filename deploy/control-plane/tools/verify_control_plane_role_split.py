@@ -8,10 +8,13 @@ whether the split works at all, neither of which shows up in pod status:
     with the worker tier scaled above zero. A control plane with no
     worker still returns 202 for every request and simply never
     processes any of them;
-  * each tier's uvicorn command matches the tier - ingress on 8080 with
-    several workers, worker on 8081 with one, and no request-count worker
-    recycling on any tier. Ingress recycling removes serving capacity
-    during bursts; worker recycling can strand leases;
+  * each tier's uvicorn command matches the tier - ingress on 8080 and
+    worker on 8081 with four uvicorn workers each, spool on 8082 with one,
+    and no request-count worker recycling on any tier. The worker count
+    is the capacity model (pools and shards are replicas x workers) and
+    /metrics is aggregated over the Pod's processes by the application;
+    ingress recycling removes serving capacity during bursts; worker
+    recycling can strand leases;
   * the ingress tier carries no processor pool sizing. Those pools are
     created by run_processor, which never starts on an ingress replica,
     so a value there is inert - and inert config is worse than absent
@@ -206,6 +209,104 @@ def env_names(item: dict) -> set[str]:
     return set(env_values(item))
 
 
+UVICORN_WORKERS_PER_POD = 4
+SPOOL_UVICORN_WORKERS_PER_POD = 1
+
+
+def require_uvicorn_workers(
+    problems: list[str],
+    deployment_name: str,
+    command: str,
+    expected: int,
+) -> None:
+    """The tier's process count is the capacity model.
+
+    Pools, consumer processes and notification shards are computed as
+    replicas x uvicorn workers by the renderer, so a command that says a
+    different ``--workers`` (a ``kubectl edit`` is how that happens) breaks
+    the shard cover or the connection budget silently. /metrics is
+    aggregated over the Pod's processes by the application, so the count
+    is not a scrape concern.
+    """
+
+    if (
+        command.count("--workers ") != 1
+        or f"--workers {expected} " not in command + " "
+    ):
+        problems.append(
+            f"{deployment_name} must run exactly {expected} uvicorn "
+            f"process{'es' if expected != 1 else ''} per Pod"
+        )
+
+
+AURORA_SECRET_NAME = "gpu-fault-aurora"
+AURORA_VOLUME_NAME = "aurora-credentials"
+AURORA_MOUNT_DIR = "/etc/gpu-fault/aurora"
+
+
+def require_aurora_credential_mount(
+    problems: list[str],
+    deployment_name: str,
+    item: dict[str, Any],
+    role_container: dict[str, Any],
+) -> None:
+    """Every role Deployment projects the Aurora Secret as files (CP-3).
+
+    Running Pods reload the DSN from ``/etc/gpu-fault/aurora/postgres-url``
+    after a password rotation; without the mount a rotated password only
+    reaches a Pod on restart and the pool degrades to PoolTimeout once
+    max_idle recycles a connection. A ``subPath`` mount is rejected because
+    kubelet never updates it.
+    """
+
+    spec = item.get("spec", {}).get("template", {}).get("spec", {})
+    volume = next(
+        (v for v in spec.get("volumes", []) if v.get("name") == AURORA_VOLUME_NAME),
+        None,
+    )
+    if volume is None:
+        problems.append(f"{deployment_name}: no {AURORA_VOLUME_NAME} volume")
+        return
+    secret = volume.get("secret") or {}
+    if secret.get("secretName") != AURORA_SECRET_NAME:
+        problems.append(
+            f"{deployment_name}: {AURORA_VOLUME_NAME} must project {AURORA_SECRET_NAME}"
+        )
+    if secret.get("items"):
+        problems.append(
+            f"{deployment_name}: {AURORA_VOLUME_NAME} must project the whole Secret"
+        )
+    mount = next(
+        (
+            m
+            for m in role_container.get("volumeMounts", [])
+            if m.get("name") == AURORA_VOLUME_NAME
+        ),
+        None,
+    )
+    if mount is None:
+        problems.append(
+            f"{deployment_name}: container does not mount {AURORA_VOLUME_NAME}"
+        )
+        return
+    if mount.get("mountPath") != AURORA_MOUNT_DIR:
+        problems.append(
+            f"{deployment_name}: {AURORA_VOLUME_NAME} must mount at {AURORA_MOUNT_DIR}"
+        )
+    if mount.get("subPath") or mount.get("subPathExpr"):
+        problems.append(
+            f"{deployment_name}: {AURORA_VOLUME_NAME} must not use subPath (never updated)"
+        )
+    if mount.get("readOnly") is not True:
+        problems.append(f"{deployment_name}: {AURORA_VOLUME_NAME} must be read-only")
+    url_file = env_value(role_container, "GPU_FAULT_STORE_URL_FILE")
+    if url_file not in (None, f"{AURORA_MOUNT_DIR}/postgres-url"):
+        problems.append(
+            f"{deployment_name}: GPU_FAULT_STORE_URL_FILE must point at "
+            f"{AURORA_MOUNT_DIR}/postgres-url"
+        )
+
+
 def reject_request_count_recycling(
     problems: list[str],
     deployment_name: str,
@@ -388,8 +489,9 @@ def main() -> int:
     command = api["args"][0]
     if "--port 8080" not in command:
         problems.append("gpu-fault-api-ha does not serve on 8080")
-    if "--workers 4" not in command:
-        problems.append("gpu-fault-api-ha lost its uvicorn worker count")
+    require_uvicorn_workers(
+        problems, "gpu-fault-api-ha", command, UVICORN_WORKERS_PER_POD
+    )
     reject_request_count_recycling(problems, "gpu-fault-api-ha", command)
     inert = sorted(env_names(api) & set(PROCESSOR_POOL_ENV))
     if inert:
@@ -422,6 +524,9 @@ def main() -> int:
     worker_command = control_worker["args"][0]
     if "--port 8081" not in worker_command:
         problems.append("gpu-fault-control-worker does not serve on 8081")
+    require_uvicorn_workers(
+        problems, "gpu-fault-control-worker", worker_command, UVICORN_WORKERS_PER_POD
+    )
     reject_request_count_recycling(problems, "gpu-fault-control-worker", worker_command)
     replicas = worker["spec"].get("replicas", 0)
     if not replicas:
@@ -530,10 +635,12 @@ def main() -> int:
     spool_command = spool_worker["args"][0]
     if "--port 8082" not in spool_command:
         problems.append("gpu-fault-telemetry-spool-worker does not serve on 8082")
-    if "--workers 1" not in spool_command:
-        problems.append(
-            "gpu-fault-telemetry-spool-worker must run exactly one uvicorn process per Pod"
-        )
+    require_uvicorn_workers(
+        problems,
+        "gpu-fault-telemetry-spool-worker",
+        spool_command,
+        SPOOL_UVICORN_WORKERS_PER_POD,
+    )
     spool_replicas = spool["spec"].get("replicas", 0)
     spool_ready = spool.get("status", {}).get("readyReplicas", 0)
     if spool_admission == "true" and not spool_replicas:
@@ -549,6 +656,13 @@ def main() -> int:
             "gpu-fault-telemetry-spool-worker must be scaled to zero "
             "while ingress admission is disabled"
         )
+
+    for deployment_name, item, role_container in (
+        ("gpu-fault-api-ha", ingress, api),
+        ("gpu-fault-control-worker", worker, control_worker),
+        ("gpu-fault-telemetry-spool-worker", spool, spool_worker),
+    ):
+        require_aurora_credential_mount(problems, deployment_name, item, role_container)
 
     for problem in problems:
         print(f"role-split check failed: {problem}")

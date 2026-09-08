@@ -425,8 +425,19 @@ def test_preempt034_a_job_on_a_node_under_repair_waits_then_stops_the_job(tmp_pa
         assert adapter.calls == []
         assert store.get_workflow("wf-job").status is WorkflowStatus.PENDING
 
-        # Five minutes later the node is still under the other remediation.
-        store.amend_workflow("wf-job", {"created_at": now - timedelta(minutes=6)})
+        # Five minutes later the node is still under the other remediation
+        # (the wait is measured from the first HOLD, D-11).
+        held = store.get_workflow("wf-job")
+        store.amend_workflow(
+            "wf-job",
+            {
+                "created_at": now - timedelta(minutes=6),
+                "events": [
+                    event.model_copy(update={"at": event.at - timedelta(minutes=6)})
+                    for event in held.events
+                ],
+            },
+        )
         dispatcher.run_once()  # gives up: the plan becomes stop-only
         dispatcher.run_once()  # executes the stop
 

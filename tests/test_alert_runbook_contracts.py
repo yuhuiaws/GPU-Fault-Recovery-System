@@ -617,3 +617,150 @@ def test_the_keep_list_admits_the_completion_incident_and_finding_families() -> 
     ]
 
     assert MODULE.keep_filter_defects(scrapes, probe) == []
+
+
+# Control-plane review 2026-09-08 (H2-1, H2-2, H2-4, G-7, G-8, H1-2): the
+# scrape path itself was a blind spot -- one Pod's /metrics failing was
+# invisible, the pool's live state was unexported, the collector's own memory
+# was dropped before AMP, and the credential refresher's failures had no face.
+
+
+def _scrape_job(name: str) -> dict:
+    scrapes = adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+    return next(job for job in scrapes if job["job_name"] == name)
+
+
+def _keep_admits(job: dict, metric: str) -> bool:
+    import re
+
+    keeps = [
+        rule["regex"]
+        for rule in job["metric_relabel_configs"]
+        if rule["action"] == "keep"
+    ]
+    return any(re.fullmatch(keep, metric) for keep in keeps)
+
+
+def test_a_single_replica_scrape_failure_has_its_own_alert() -> None:
+    """``absent(up == 1)`` only fires when every Pod is gone (H2-1)."""
+    rule = _rule("GpuFaultControlPlaneReplicaScrapeFailing")
+    expr = _expression("GpuFaultControlPlaneReplicaScrapeFailing")
+
+    assert 'up{job="gpu-fault-control-plane"} == 0' in expr, expr
+    assert rule["for"] == "5m"
+    assert rule["labels"]["severity"] == "critical"  # type: ignore[index]
+    description = str(rule["annotations"]["description"])  # type: ignore[index]
+    assert "{{ $labels.pod }}" in description
+    assert "{{ $labels.service_role }}" in description
+
+
+def test_contributor_failures_are_alerted_and_reach_amp() -> None:
+    expr = _expression("GpuFaultMetricsContributorFailing")
+
+    assert "increase(gpu_fault_metrics_contributor_errors_total[" in expr, expr
+    assert "contributor" in expr
+    assert _keep_admits(
+        _scrape_job("gpu-fault-control-plane"),
+        "gpu_fault_metrics_contributor_errors_total",
+    ), "the contributor error counter must pass the AMP keep filter"
+
+
+def test_pool_alerts_read_the_live_pool_statistics() -> None:
+    """The constant oversubscription ratio fired from deploy day (G-7)."""
+    queueing = _rule("GpuFaultPostgresPoolCheckoutQueueing")
+    errors = _rule("GpuFaultPostgresPoolConnectionErrors")
+
+    assert "gpu_fault_postgres_pool_requests_waiting" in _expression(
+        "GpuFaultPostgresPoolCheckoutQueueing"
+    )
+    assert queueing["for"] == "2m"
+    assert "increase(gpu_fault_postgres_pool_connections_errors_total[5m])" in (
+        _expression("GpuFaultPostgresPoolConnectionErrors")
+    )
+    assert errors["labels"]["severity"] == "critical"  # type: ignore[index]
+    assert (
+        _rule("GpuFaultPostgresPoolOversubscribed")["labels"]["severity"]  # type: ignore[index]
+        == "info"
+    )
+    for alert in (
+        "GpuFaultPostgresPoolCheckoutQueueing",
+        "GpuFaultPostgresPoolConnectionErrors",
+    ):
+        assert "pod" in _expression(alert), alert
+
+
+def test_the_control_plane_scrape_timeout_leaves_room_for_a_store_bound_render() -> (
+    None
+):
+    """A 5 s timeout equal to the store_io admission budget lost the whole
+    sample exactly when the process was saturated (H2-2)."""
+    job = _scrape_job("gpu-fault-control-plane")
+
+    assert job["scrape_interval"] == "15s"
+    assert job["scrape_timeout"] == "10s", job["scrape_timeout"]
+
+
+def test_adot_memory_is_kept_and_alerted() -> None:
+    self_job = _scrape_job("gpu-fault-adot-self")
+
+    assert _keep_admits(self_job, "otelcol_process_memory_rss"), (
+        "the ADOT rss gauge must pass the AMP keep filter"
+    )
+    assert _keep_admits(self_job, "otelcol_process_runtime_heap_alloc_bytes"), (
+        "the ADOT heap gauge must pass the AMP keep filter"
+    )
+    expr = _expression("GpuFaultAdotMemoryHigh")
+    assert "otelcol_process_memory_rss" in expr, expr
+    assert _rule("GpuFaultAdotMemoryHigh")["for"] == "10m"
+
+
+def test_aurora_refresh_staleness_is_alerted() -> None:
+    expr = _expression("GpuFaultAuroraCredentialRefreshStale")
+
+    assert "gpu_fault_aurora_credential_refresh_last_success_age_seconds" in expr
+    assert "> 10800" in expr, expr
+    assert _keep_admits(
+        _scrape_job("gpu-fault-control-plane"),
+        "gpu_fault_aurora_credential_refresh_last_success_age_seconds",
+    ), "the refresh age gauge must pass the AMP keep filter"
+
+
+def test_the_consumer_loop_has_a_per_pod_stall_alert() -> None:
+    """B-6: process up, claim rounds flat."""
+    rule = _rule("GpuFaultProcessorConsumerStalled")
+    expr = _expression("GpuFaultProcessorConsumerStalled")
+
+    assert "gpu_fault_processor_consumer_running" in expr
+    assert "gpu_fault_processor_consumer_last_cycle_age_seconds" in expr
+    assert "> 30" in expr
+    assert 'pod=~"gpu-fault-control-worker-.*"' in expr
+    assert rule["labels"]["severity"] == "critical"  # type: ignore[index]
+
+
+def test_the_review_counters_each_have_an_alert() -> None:
+    expectations = {
+        "GpuFaultRemoteCommandStaleFenceSwept": (
+            'gpu_fault_periodic_cleanup_rows_total{job="stale_fence_remote_commands"}'
+        ),
+        "GpuFaultNotificationDeliveryErrors": "gpu_fault_notification_delivery_errors_total",
+        "GpuFaultControlRecordArchiveErrors": "gpu_fault_control_record_archive_errors_total",
+        "GpuFaultPendingTriageReconcileFailing": (
+            "gpu_fault_completion_pending_triage_reconcile_failures_total"
+        ),
+        "GpuFaultAuroraCredentialRefreshFailing": (
+            "gpu_fault_aurora_credential_refresh_last_run_ok"
+        ),
+    }
+    scrapes = adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+
+    for alert, metric in expectations.items():
+        assert metric in _expression(alert), alert
+    assert MODULE.keep_filter_defects(scrapes, amp_rules()) == []
+    assert _keep_admits(
+        _scrape_job("gpu-fault-control-plane"),
+        "gpu_fault_ingress_decode_rejections_total",
+    ), "the decode rejection counter must pass the AMP keep filter"

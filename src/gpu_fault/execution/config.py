@@ -7,13 +7,12 @@ from typing import Mapping
 from uuid import uuid4
 
 from gpu_fault.env import env_bool
-from gpu_fault.models import (
-    WorkflowOperation,
-)
 from gpu_fault.execution.invariants import InvariantMode
 from gpu_fault.execution.models import WorkflowExecutionError
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
-
+from gpu_fault.models import (
+    WorkflowOperation,
+)
 
 LOGGER = logging.getLogger(__name__)
 

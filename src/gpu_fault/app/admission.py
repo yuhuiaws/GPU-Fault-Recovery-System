@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
 import time
+from dataclasses import dataclass
 from typing import Callable
 
-from gpu_fault.store.shared.errors import operation_should_retry
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
     AsyncStoreExecutor,
+    RequestDeadlineExceeded,
     StoreIoCapacityExceeded,
 )
-
+from gpu_fault.store.shared.errors import operation_should_retry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -250,7 +250,9 @@ class _ProcessorAdmissionBatcher:
             projected = self._projected_scope_wait_seconds(ahead)
             if projected > deadline - time.monotonic():
                 self.shed_total += 1
-                raise StoreIoCapacityExceeded(
+                # The request's own budget is what cannot be met, so it is
+                # reported as a deadline and not as store capacity (A-1).
+                raise RequestDeadlineExceeded(
                     "processor admission batch cannot reach this "
                     "request within its deadline"
                 )
@@ -302,7 +304,7 @@ class _ProcessorAdmissionBatcher:
                     dropped += 1
                     if not entry.future.done():
                         entry.future.set_exception(
-                            StoreIoCapacityExceeded(
+                            RequestDeadlineExceeded(
                                 "request deadline exceeded while "
                                 "waiting for a processor admission "
                                 "batch"

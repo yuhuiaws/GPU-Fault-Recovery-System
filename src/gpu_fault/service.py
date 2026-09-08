@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
-
+from datetime import datetime, timedelta, timezone
 from typing import NoReturn
 
-import logging
-from datetime import datetime, timedelta, timezone
-
+from gpu_fault.markers import marker_is_diagnostic, retire_markers_for_incident
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
@@ -27,7 +26,6 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     recovery_action_sort_key,
 )
-from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.planner import PlanBuilder
 from gpu_fault.ports import DiagnosticPort
 from gpu_fault.store import NotFoundError
@@ -97,6 +95,13 @@ class CompletionService:
         # How long a decision may wait in PENDING_TRIAGE before
         # ``reconcile_pending_triage`` expires it into a conservative plan.
         self.pending_triage_deadline = pending_triage_deadline
+        # Decisions the watchdog could not expire, by exception type, and the
+        # newest such failure: a decision it cannot close (event or profile
+        # row missing) used to log a traceback every scan and count nowhere
+        # (control-plane review 2026-09-08, F-7). Exported by the periodic
+        # runner as gpu_fault_completion_pending_triage_reconcile_failures_total.
+        self.pending_triage_reconcile_failures_total: dict[str, int] = {}
+        self.pending_triage_reconcile_failure_last_seen_timestamp_seconds = 0.0
         # No process lock (F-G2 / P1-62G): active-active replicas serialize
         # on ``store.completion_transaction(event_key)`` instead, which is
         # also what makes the event row and its decision one write.
@@ -596,7 +601,14 @@ class CompletionService:
         for decision in stale:
             try:
                 updated = self._expire_pending_triage(decision, observed)
-            except Exception:  # noqa: BLE001 - one attempt must not block the rest
+            except Exception as exc:  # noqa: BLE001 - one attempt must not block the rest
+                reason = type(exc).__name__
+                self.pending_triage_reconcile_failures_total[reason] = (
+                    self.pending_triage_reconcile_failures_total.get(reason, 0) + 1
+                )
+                self.pending_triage_reconcile_failure_last_seen_timestamp_seconds = (
+                    datetime.now(timezone.utc).timestamp()
+                )
                 LOGGER.exception(
                     "could not expire PENDING_TRIAGE decision %s", decision.event_key
                 )
@@ -784,6 +796,9 @@ class CompletionService:
         (``active=False``) so it stops matching and stops disqualifying the
         node as a spare. An incident about this attempt, or one that names no
         attempt, still matches: that is the pinned after-incident restart.
+
+        A diagnostic marker (see ``marker_is_diagnostic``) that names a stored
+        incident is skipped: it observes the node, it does not repair it.
         """
         live: list[NodeMarker] = []
         for marker in self._matching_markers(event):
@@ -794,6 +809,14 @@ class CompletionService:
                 incident = self.store.get_incident(marker.incident_id)
             except NotFoundError:
                 live.append(marker)
+                continue
+            if marker_is_diagnostic(marker):
+                LOGGER.info(
+                    "diagnostic marker %s of incident %s does not own attempt %s",
+                    marker.marker_id,
+                    incident.incident_id,
+                    event.attempt_id,
+                )
                 continue
             if (
                 incident.attempt_id is None

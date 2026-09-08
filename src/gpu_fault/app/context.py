@@ -20,8 +20,6 @@ from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
-from gpu_fault.execution.branch_escalation import BranchEscalator
-from gpu_fault.execution.config import validate_timing_from_environment
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
@@ -31,6 +29,8 @@ from gpu_fault.execution import (
     WorkflowDispatcherConfig,
     managed_recovery_timeout_seconds,
 )
+from gpu_fault.execution.branch_escalation import BranchEscalator
+from gpu_fault.execution.config import validate_timing_from_environment
 from gpu_fault.execution.executor import TerminalHook
 from gpu_fault.fleet import (
     BarrierCoordinator,
@@ -71,6 +71,7 @@ from gpu_fault.models import (
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import notification_notifier_from_environment
 from gpu_fault.orchestration import IncidentOrchestrator
+from gpu_fault.orchestration.incident_closure import IncidentClosureService
 from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
@@ -290,6 +291,11 @@ class ApplicationContext:
         register_spare_reservation_release(
             self.workflow_executor, production_adapters or []
         )
+        # DESTR-018 product gap: a restore that frees a node closes the
+        # ESCALATED incidents waiting on it; the same service backs the
+        # operator close (POST /v1/incidents/{id}/close).
+        self.incident_closure = IncidentClosureService(self.store)
+        self.workflow_executor.on_terminal.append(self.incident_closure.on_terminal)
         self.workflow_executor.fleet_registry = fleet_registry
         self.workflow_executor.branch_escalator = _branch_escalator(self.orchestrator)
         self.execution_token = execution_token
@@ -435,6 +441,9 @@ class ApplicationContext:
             notification_sender=context.advisory_notifications.send,
         )
         register_spare_reservation_release(context.workflow_executor, adapters)
+        context.workflow_executor.on_terminal.append(
+            context.incident_closure.on_terminal
+        )
         context.workflow_executor.fleet_registry = context.fleet_registry
         context.workflow_executor.branch_escalator = _branch_escalator(
             context.orchestrator
@@ -484,6 +493,9 @@ class ApplicationContext:
                 store_url,
                 archive_uri,
                 retention=timedelta(days=retention_days),
+                # Borrow the store's pool instead of two bare connections
+                # per incident (control-plane review 2026-09-08, F-8).
+                store=store,
             )
         # An active control plane executes real recovery actions, so a
         # step that fails, a command no executor claims, or a workflow

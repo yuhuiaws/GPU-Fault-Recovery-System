@@ -18,6 +18,22 @@ The TTL is deliberately opt-outable: ``GPU_FAULT_METRICS_SCAN_TTL_SECONDS=0``
 makes every call re-read, which is what a test that asserts freshness wants. The
 defaults are spelled as literals in the ``os.getenv`` calls so the generated
 environment reference prints a concrete value rather than a constant name.
+
+Control-plane review 2026-09-08 (G-2, G-12, F-6, H2-3) changed three things.
+The default TTL is 60 s. The ingress and worker Pods run four uvicorn
+processes behind one port and ADOT scrapes a Pod every 15 s, so each process
+answers about one scrape a minute and a 10 s TTL never survived between two
+scrapes of the same process: every scrape was a fresh store aggregate. At 60 s
+each process runs one aggregate per minute at most, however many scrapes (or
+``process_metrics`` publisher ticks) it answers in between. The workflow detail
+scan no longer asks for every
+status newest-first -- that shape has no index (every ``updated_at`` index is
+partial per status) and sorted the whole kind on disk -- but reads the open
+statuses through the executable/BLOCKED partial indexes and the newest terminal
+slice through ``gpu_fault_workflow_updated_all``. And the other whole-kind
+aggregates a scrape used to run every time (orphan inspection, notification
+outbox, remote-command backlog, spool depth) go through :meth:`shared` so they
+too cost one read per TTL.
 """
 
 from __future__ import annotations
@@ -28,7 +44,23 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Callable, TypeVar, cast
 
+from gpu_fault.models import WorkflowStatus
+
 T = TypeVar("T")
+
+# The detail scan's two slices (G-2). Together they are every WorkflowStatus;
+# the split is what lets each half be an index range scan.
+OPEN_WORKFLOW_STATUSES: frozenset[WorkflowStatus] = frozenset(
+    {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.SAFETY_PENDING,
+        WorkflowStatus.BLOCKED,
+    }
+)
+TERMINAL_WORKFLOW_STATUSES: frozenset[WorkflowStatus] = frozenset(
+    set(WorkflowStatus) - OPEN_WORKFLOW_STATUSES
+)
 
 
 @dataclass(frozen=True)
@@ -52,7 +84,7 @@ class ObservationScan:
 def scan_ttl_seconds_from_env() -> float:
     return max(
         0.0,
-        float(os.getenv("GPU_FAULT_METRICS_SCAN_TTL_SECONDS", "10")),
+        float(os.getenv("GPU_FAULT_METRICS_SCAN_TTL_SECONDS", "60")),
     )
 
 
@@ -116,21 +148,45 @@ class MetricScanCache:
         return self._cached("workflows", self._read_workflows)
 
     def _read_workflows(self) -> WorkflowScan:
-        # One row over the budget is requested so truncation is observed rather
-        # than inferred from a full page, which cannot distinguish "exactly the
+        # Two bounded slices rather than one all-status read (G-2). The open
+        # slice is what the step-waiting, overdue and budget families describe
+        # and is small by construction; the terminal slice is newest-first so
+        # the duration and milestone summaries keep describing recent history
+        # -- GpuFaultClosedLoopSlow takes a 6 h delta over them. One row over
+        # the budget is requested on each so truncation is observed rather than
+        # inferred from a full page, which cannot distinguish "exactly the
         # limit" from "more than the limit".
         limit = self.workflow_limit
-        rows = list(
+        open_rows = list(
             self._store.list_workflows(
+                set(OPEN_WORKFLOW_STATUSES),
+                limit=limit + 1,
+                newest_first=True,
+            )
+        )
+        terminal_rows = list(
+            self._store.list_workflows(
+                set(TERMINAL_WORKFLOW_STATUSES),
                 limit=limit + 1,
                 newest_first=True,
             )
         )
         return WorkflowScan(
-            workflows=tuple(rows[:limit]),
+            workflows=(*open_rows[:limit], *terminal_rows[:limit]),
             limit=limit,
-            truncated=len(rows) > limit,
+            truncated=len(open_rows) > limit or len(terminal_rows) > limit,
         )
+
+    def shared(self, key: str, produce: Callable[[], T]) -> T:
+        """One store aggregate per TTL, shared by every scrape of this process.
+
+        For the whole-kind reads a contributor cannot bound (orphan inspection,
+        notification outbox counts, remote-command backlog, spool depth). The
+        key is the caller's; a contributor that reads the same aggregate with
+        different arguments must use different keys.
+        """
+
+        return self._cached(f"shared:{key}", produce)
 
     def observation_states(self) -> ObservationScan:
         return self._cached("observation_states", self._read_observation_states)

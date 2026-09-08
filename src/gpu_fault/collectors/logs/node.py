@@ -15,7 +15,9 @@ from typing import Any, Callable
 
 from gpu_fault.channel_registry import NODE_LOG_PATH
 from gpu_fault.collector_requirements import COLLECTOR_SYSTEMD_UNITS
+from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.sinks import EventSink, deliver_event
 from gpu_fault.host_health import (
     NodeLogBatch,
     NodeLogEntry,
@@ -24,10 +26,6 @@ from gpu_fault.log_rules import (
     log_signal_priority,
     matching_log_rules,
 )
-
-
-from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import EventSink, deliver_event
 
 LOGGER = logging.getLogger(__name__)
 

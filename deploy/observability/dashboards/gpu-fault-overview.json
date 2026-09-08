@@ -846,7 +846,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "In-flight Store calls over the per-process admission capacity. api-ha and control-worker run four uvicorn workers behind one port, so each scrape samples one of four processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
+      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
       "fieldConfig": {
         "defaults": {
           "color": {

@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from gpu_fault.models import (
-    bounded_reasons,
     FaultIncident,
     IncidentState,
     PlanStatus,
@@ -13,6 +12,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
+    bounded_reasons,
 )
 from gpu_fault.operation_registry import (
     CONTAINMENT_ONLY_OPERATIONS,

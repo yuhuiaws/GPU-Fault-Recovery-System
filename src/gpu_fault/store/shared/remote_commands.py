@@ -1,10 +1,22 @@
 """Remote-command row transitions shared by the key/value stores: create if
 absent, renew a lease, complete. Each reads one row and writes it back inside
-one ``_state_transaction`` keyed by the command."""
+one ``_state_transaction`` keyed by the command.
+
+The generation fence (control-plane review 2026-09-08, D-9, direction B): a
+command minted under ``fencing_token`` N whose workflow has since moved to N+1
+-- the same ``request_id`` replaced in place -- is dead, but the data plane may
+already be executing it. The claim path never hands it out again; here the
+renewal tells the executor to stop (``cancellation_requested_at`` on the row
+and in the response, lease still extended so it can report), the completion
+settles it FAILED with ``status_source="stale-fence"`` instead of refusing the
+result, and ``stale_fence_update`` is the one shape both writers and the
+``expire_stale_fenced_remote_commands`` sweeps use.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from gpu_fault.remote_command_models import (
     RemoteCommandStatus,
@@ -22,6 +34,62 @@ from gpu_fault.store.shared.primitives import (
 from gpu_fault.store.shared.remote_helpers import (
     remote_command_identity as _remote_command_identity,
 )
+
+STALE_FENCE_STATUS_SOURCE = "stale-fence"
+
+
+def stale_fence(command: Any, workflow: Any) -> bool:
+    """Whether ``command`` was minted under a generation ``workflow`` has left."""
+
+    return workflow is not None and workflow.fencing_token != command.fencing_token
+
+
+def stale_fence_reason(command: Any, workflow: Any) -> str:
+    return (
+        f"workflow {command.workflow_request_id} moved to generation "
+        f"{workflow.fencing_token}; this command belongs to generation "
+        f"{command.fencing_token}"
+    )
+
+
+def stale_fence_update(
+    command: Any,
+    workflow: Any,
+    now: datetime,
+    *,
+    result: Any | None = None,
+    swept: bool = False,
+) -> Any:
+    """The FAILED row a stale-fenced command settles into.
+
+    ``result`` is what the executor reported (kept under ``post_stale_fence_*``
+    so the node-side outcome is not lost); ``swept`` marks a row closed by the
+    sweep because its executor never reported.
+    """
+
+    details = dict(command.result_details)
+    if result is not None:
+        details = {
+            **result.details,
+            "post_stale_fence_status": result.status.value,
+            "post_stale_fence_error": result.error,
+        }
+    if swept:
+        details["stale_fence_swept"] = True
+    return command.model_copy(
+        update={
+            "status": RemoteCommandStatus.FAILED,
+            "error": command.cancellation_reason
+            or stale_fence_reason(command, workflow),
+            "status_source": STALE_FENCE_STATUS_SOURCE,
+            "result_details": details,
+            "last_lease_owner": command.lease_owner or command.last_lease_owner,
+            "lease_owner": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+            "updated_at": now,
+        }
+    )
 
 
 class SharedRemoteCommandMixin:
@@ -65,12 +133,20 @@ class SharedRemoteCommandMixin:
                 or command.lease_expires_at <= now
             ):
                 raise WorkflowLeaseError("remote command lease is stale")
-            command = command.model_copy(
-                update={
-                    "lease_expires_at": lease_deadline(lease_seconds),
-                    "updated_at": now,
-                }
-            )
+            update: dict[str, Any] = {
+                "lease_expires_at": lease_deadline(lease_seconds),
+                "updated_at": now,
+            }
+            workflow = self._get_optional("workflow", command.workflow_request_id)
+            if (
+                stale_fence(command, workflow)
+                and command.cancellation_requested_at is None
+            ):
+                # The executor reads this off the renewal and starts nothing
+                # further; the lease is still extended so it can report.
+                update["cancellation_requested_at"] = now
+                update["cancellation_reason"] = stale_fence_reason(command, workflow)
+            command = command.model_copy(update=update)
             self._put("remote_command", command_id, command)
             return command
 
@@ -85,13 +161,18 @@ class SharedRemoteCommandMixin:
             command = self._get_optional("remote_command", command_id)
             if command is None or command.cluster_id != cluster_id:
                 raise NotFoundError(f"{cluster_id}/{command_id}")
-            workflow = self._get_optional("workflow", command.workflow_request_id)
-            if workflow is not None and workflow.fencing_token != command.fencing_token:
-                raise WorkflowLeaseError("remote command fencing token is stale")
             if command.status in {
                 RemoteCommandStatus.SUCCEEDED,
                 RemoteCommandStatus.FAILED,
             }:
+                return command
+            workflow = self._get_optional("workflow", command.workflow_request_id)
+            if stale_fence(command, workflow):
+                # Refusing the result (a 409) left the row LEASED for ever;
+                # the generation that owns the node has moved on, so whatever
+                # the executor did is recorded and the command ends FAILED.
+                command = stale_fence_update(command, workflow, now, result=result)
+                self._put("remote_command", command_id, command)
                 return command
             if (
                 command.status is not RemoteCommandStatus.LEASED

@@ -19,7 +19,11 @@ from gpu_fault.telemetry_models import (
 from gpu_fault.telemetry_models import (
     WorkloadObservationState as WorkloadObservationState,
 )
-from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+from gpu_fault.watcher import (
+    AttemptObservation,
+    WorkloadCoverageHeartbeat,
+    WorkloadPhase,
+)
 
 
 def collector_producer(channel: CollectorKind) -> str:
@@ -172,6 +176,17 @@ class WorkloadTopologyService:
     def observe(self, observation: AttemptObservation) -> None:
         self.store.save_attempt_observation(observation)
 
+    def observe_coverage(self, heartbeat: WorkloadCoverageHeartbeat) -> None:
+        self.store.save_workload_coverage(heartbeat)
+
+    def _heartbeat_covers(self, cluster_id: str, observed_at: datetime) -> bool:
+        heartbeat = self.store.get_workload_coverage(cluster_id)
+        return (
+            heartbeat is not None
+            and (observed_at - heartbeat.scanned_at).total_seconds()
+            <= self.freshness_seconds
+        )
+
     def resolve(
         self,
         cluster_id: str,
@@ -192,12 +207,14 @@ class WorkloadTopologyService:
         instead of once per node; the age filter below is what bounds
         staleness either way.
 
-        ``workload_state`` fails closed: IDLE needs fresh observation
-        coverage of the cluster (any attempt, any phase, observed within
-        ``freshness_seconds``) that simply does not name this node. A cluster
-        with no coverage -- the watcher down, the cluster silent, a stale
-        feed -- is UNKNOWN, which the compilers treat as "someone may be
-        using it" (design: monitoring loss is Unknown; ARCH-E2E-1 finding 2).
+        ``workload_state`` fails closed: IDLE needs fresh coverage of the
+        cluster -- an attempt observation (any attempt, any phase, observed
+        within ``freshness_seconds``) that simply does not name this node, or
+        the watcher's scan heartbeat, which is how a cluster with no managed
+        attempt at all proves the feed is alive. A cluster with neither --
+        the watcher down, the cluster silent, a stale feed -- is UNKNOWN,
+        which the compilers treat as "someone may be using it" (design:
+        monitoring loss is Unknown; ARCH-E2E-1 finding 2).
         """
 
         if observations is None:
@@ -206,7 +223,7 @@ class WorkloadTopologyService:
             (observed_at - observation.observed_at).total_seconds()
             <= self.freshness_seconds
             for observation in observations
-        )
+        ) or self._heartbeat_covers(cluster_id, observed_at)
         workloads: list[str] = []
         jobs: list[str] = []
         attempts: list[str] = []

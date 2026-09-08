@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
+from gpu_fault.adapters.common import ANNOTATION_MECHANICAL_INSPECTION_COMPLETE
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault.admin.operator_identity import resolve_operator_identity
@@ -46,7 +47,6 @@ from gpu_fault.admin.workflow_reconcile import (
     gpu_kubectl_command,
     run_control_plane_script,
 )
-from gpu_fault.adapters.common import ANNOTATION_MECHANICAL_INSPECTION_COMPLETE
 from gpu_fault.models import RecoveryAction
 
 STATE_ROOT = "submit-remediation"

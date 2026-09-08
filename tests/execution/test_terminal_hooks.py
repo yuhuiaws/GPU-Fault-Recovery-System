@@ -86,7 +86,9 @@ def test_hook_fires_once_when_the_workflow_fails():
     assert result.status is WorkflowStatus.FAILED, result
     assert ended.status is WorkflowStatus.FAILED, ended.status
     assert ended_incident is not None, "the incident is handed to the hook"
-    assert ended_incident.state is IncidentState.ESCALATED, ended_incident.state
+    # A FREEZE-only workflow never touched the node, so its failure is a
+    # diagnostic that did not conclude: the incident ends RECOVERED.
+    assert ended_incident.state is IncidentState.RECOVERED, ended_incident.state
 
 
 def test_hook_fires_when_a_predecessor_is_preempted_at_the_step_boundary():

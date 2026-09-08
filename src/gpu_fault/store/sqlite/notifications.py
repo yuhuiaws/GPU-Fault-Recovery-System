@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -10,6 +11,7 @@ from gpu_fault.models import (
     NotificationResult,
     NotificationStatus,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.notification_helpers import (
     bound_notifications,
     delivery_stats_from_rows,
@@ -22,10 +24,12 @@ from gpu_fault.store.shared.notification_helpers import (
 class SqliteNotificationMixin:
     # Attributes supplied by the composed concrete implementation.
     _get: Callable[..., Any]
+    _delete: Callable[..., Any]
     _get_link: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _link: Callable[..., Any]
     _list: Callable[..., Any]
+    _db: sqlite3.Connection
     _lock: Any
     _put: Callable[..., Any]
     _state_transaction: Callable[..., Any]
@@ -66,6 +70,45 @@ class SqliteNotificationMixin:
                 ),
             )
             return notification
+
+    def cleanup_terminal_notifications(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        with self._state_transaction("notification/cleanup"):
+            victims = []
+            for notification in sorted(
+                self._list("notification"),
+                key=lambda item: (item.created_at, item.notification_id),
+            ):
+                if notification.created_at > older_than:
+                    continue
+                if self._get_optional("incident", notification.incident_id) is not None:
+                    continue
+                delivery = self._get_optional(
+                    "notification_delivery", notification.notification_id
+                )
+                if delivery is not None and delivery.status not in {
+                    NotificationDeliveryStatus.SENT,
+                    NotificationDeliveryStatus.DEAD,
+                }:
+                    continue
+                victims.append(notification)
+                if len(victims) >= limit:
+                    break
+            for notification in victims:
+                for kind in (
+                    "notification",
+                    "notification_delivery",
+                    "notification_result",
+                ):
+                    self._delete(kind, notification.notification_id)
+                self._db.execute(
+                    "DELETE FROM links WHERE kind='notification_dedup' AND key=? AND value=?",
+                    (notification.deduplication_key, notification.notification_id),
+                )
+            return log_cleanup(
+                "notification", [item.notification_id for item in victims]
+            )
 
     def list_notifications(
         self,

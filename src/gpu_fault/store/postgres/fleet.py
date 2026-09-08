@@ -157,7 +157,11 @@ class PostgresFleetMixin:
 
         The parent implementation decodes every deployment to sort them
         in Python, which is exactly the cost the retention drain exists
-        to remove.
+        to remove. Predicate and ordering are shape-for-shape with the
+        partial index ``gpu_fault_fleet_deployment_terminal``
+        (``((payload->>'updated_at')) WHERE kind='fleet_deployment' AND
+        payload->>'status' IN ('SUCCEEDED','FAILED')``, declared by Agent 5;
+        control-plane review 2026-09-08, F-9) -- keep them in step.
         """
 
         with self._state_transaction("fleet_deployment/cleanup"):
@@ -189,6 +193,43 @@ class PostgresFleetMixin:
                 )
                 keys = [row[0] for row in cursor.fetchall()]
             return log_cleanup("fleet_deployment", keys)
+
+    def cleanup_stale_regional_registry_members(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        """Drop heartbeat rows of processes not seen since ``older_than``.
+
+        One row per process (POD_UID:pid); every rolling update left the old
+        ones behind for good and the readiness convergence check listed the
+        whole kind (F-5 / F-8). Same set-based shape as the deployment sweep.
+        """
+
+        with self._state_transaction("regional_registry_member/cleanup"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH victims AS (
+                        SELECT key
+                        FROM gpu_fault_objects
+                        WHERE kind='regional_registry_member'
+                          AND payload->>'last_seen_at' <= %s
+                        ORDER BY payload->>'last_seen_at', key
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS objects
+                        USING victims
+                        WHERE objects.kind='regional_registry_member'
+                          AND objects.key=victims.key
+                        RETURNING objects.key
+                    )
+                    SELECT key FROM deleted ORDER BY key
+                    """,
+                    (_utc_text(older_than), limit),
+                )
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("regional_registry_member", keys)
 
     def replace_agent_if_matches(self, replacement, expected) -> bool:
         key = self._agent_key(

@@ -1,7 +1,7 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
     SXID_EVENT_EMAIL_TEMPLATE,
     SXID_EVENT_TEMPLATE_VERSION,
+    AdvisoryNotification,
 )
 
 

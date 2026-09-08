@@ -28,9 +28,12 @@ def _create_telemetry_spool(cursor) -> None:
     #
     # Coalescing comes from the primary key instead of from a
     # ``SELECT ... FOR UPDATE`` followed by an update: ``spool_key`` is
-    # the ordering key for a channel that supersedes its own samples
-    # and carries the request id for one that does not, so one
-    # ``INSERT ... ON CONFLICT`` both admits and coalesces.
+    # ``{path}|{ordering_key}`` for a channel that supersedes its own
+    # samples and ``{path}|{ordering_key}:{request_id}`` for one that
+    # does not (F-E6) -- the queue lane is shared by every edge-filtered
+    # channel, so the channel path has to be part of a key that
+    # coalesces -- and one ``INSERT ... ON CONFLICT`` both admits and
+    # coalesces (E-9).
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS gpu_fault_telemetry_spool (
@@ -94,7 +97,17 @@ def _create_telemetry_spool(cursor) -> None:
         LANGUAGE plpgsql
         AS $$
         BEGIN
-            IF NEW.available_at <= clock_timestamp() THEN
+            -- Notify on every insert and on every update that makes the
+            -- row available no later than before (E-8). The old
+            -- ``NEW.available_at <= clock_timestamp()`` compared the
+            -- ingress clock with the database clock, so whenever the
+            -- application clock led, a brand-new row sent no NOTIFY and
+            -- the consumer fell back to its 2-5 s poll. Coalescing
+            -- (same available_at, new revision) and abandon (earlier
+            -- available_at) notify; a claim or release that pushes the
+            -- lease into the future does not, so the consumer is not
+            -- woken by its own bookkeeping.
+            IF TG_OP = 'INSERT' OR NEW.available_at <= OLD.available_at THEN
                 PERFORM pg_notify(
                     'gpu_fault_telemetry_spool',
                     json_build_object(

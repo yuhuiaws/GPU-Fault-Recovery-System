@@ -8,6 +8,7 @@ from threading import Event as ThreadEvent
 from typing import Any, Callable
 
 from gpu_fault.store.contracts import ProcessorQueueCountStatus
+from gpu_fault.store.postgres.pool import _reject_reader
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 
 
@@ -31,8 +32,17 @@ class PostgresProcessorAdminMixin:
         timeout_seconds: float = 1.0,
         on_progress: Callable[[], int] | None = None,
         stall_seconds: float = 5.0,
+        writer_check_seconds: float = 5.0,
     ) -> None:
         """Wake a consumer when a queue row becomes pending.
+
+        The LISTEN connection is opened outside the pool, so the pool's
+        writer probes never see it (G-11). After an Aurora failover it stays
+        on the demoted instance, which does not forward NOTIFY: connected,
+        deaf, and reported healthy. After an idle ``notifies`` timeout, at most
+        once per ``writer_check_seconds``, the loop asks the server whether it
+        is a reader and treats "yes" like a dropped connection: close, report
+        disconnected, reconnect through the writer endpoint.
 
         Notifications are hints, not state. The processor retains a
         polling fallback, so reconnects and PostgreSQL's best-effort
@@ -77,8 +87,16 @@ class PostgresProcessorAdminMixin:
                     claim_not_before = 0.0
                     progress_seen: int | None = None
                     first_forward_at: float | None = None
+                    last_writer_check = time.monotonic()
                     while not stop_event.is_set():
                         monotonic = time.monotonic()
+                        if monotonic - last_writer_check >= writer_check_seconds:
+                            last_writer_check = monotonic
+                            _reject_reader(
+                                connection,
+                                "processor LISTEN connection is on a read-only "
+                                "replica; NOTIFY is not forwarded there",
+                            )
                         if (
                             owned_shard is None
                             and monotonic >= claim_not_before

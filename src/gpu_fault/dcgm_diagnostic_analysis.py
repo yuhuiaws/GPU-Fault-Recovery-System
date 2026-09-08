@@ -4,7 +4,6 @@ import re
 from collections import defaultdict
 from typing import Any
 
-
 MAX_FINDINGS = 100
 MAX_MESSAGES_PER_FINDING = 20
 MAX_MESSAGE_LENGTH = 512

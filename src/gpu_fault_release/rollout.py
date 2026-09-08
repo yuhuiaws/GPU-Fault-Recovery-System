@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
+from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
@@ -19,11 +21,11 @@ from gpu_fault_release.regional_admin_checks import (
     report_exit_code,
 )
 from gpu_fault_release.regional_admin_commands import (
+    apply_rds_ca_bundle,
     bootstrap_cpu_is_current,
     build_release_diff,
-    build_status,
-    apply_rds_ca_bundle,
     build_release_summary,
+    build_status,
     compact_report,
     ensure_schema,
     full_report_requested,
@@ -55,8 +57,6 @@ from gpu_fault_release.regional_observability_rollback import (
     capture_observability_snapshot,
     restore_observability_snapshot,
 )
-from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
-from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release.regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
@@ -113,6 +113,10 @@ from gpu_fault_release.regional_release_iam import (
 from gpu_fault_release.regional_release_iam import (
     validate_executor_iam_role,
 )
+from gpu_fault_release.regional_release_narration import (
+    narrate_release_end,
+    narrate_release_start,
+)
 from gpu_fault_release.regional_release_node_runtime_rollout import (
     preflight_node_runtime,
     roll_node_runtime,
@@ -137,10 +141,6 @@ from gpu_fault_release.regional_release_orchestration import (
     build_rollback_environment as build_rollback_environment,
 )
 from gpu_fault_release.regional_release_preflight import ensure_region_contexts
-from gpu_fault_release.regional_release_narration import (
-    narrate_release_end,
-    narrate_release_start,
-)
 from gpu_fault_release.regional_release_probes import probe_label
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,

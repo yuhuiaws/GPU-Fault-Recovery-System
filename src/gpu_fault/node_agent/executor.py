@@ -9,9 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, RLock
-from typing import Any
-from typing import Callable
-
+from typing import Any, Callable
 
 from gpu_fault.fleet import (
     NODE_ACTION_KEY_VERSION_DERIVED,
@@ -19,14 +17,6 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.ledger import NodeActionLedger
-from gpu_fault.node_agent.protocol import (
-    NodeActionCommand,
-    NodeActionResult,
-    NodeActionStatus,
-    SignedNodeAction,
-    sign_node_action,
-)
-from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
 from gpu_fault.node_agent.operations import (
     ClientOperationsMixin,
     DiagnosticOperationsMixin,
@@ -42,6 +32,14 @@ from gpu_fault.node_agent.operations.registry import (
     operation_handler_name,
     validate_operation_handlers,
 )
+from gpu_fault.node_agent.protocol import (
+    NodeActionCommand,
+    NodeActionResult,
+    NodeActionStatus,
+    SignedNodeAction,
+    sign_node_action,
+)
+from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
 
 LOGGER = logging.getLogger(__name__)
 

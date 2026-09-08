@@ -144,6 +144,7 @@ def _is_deployment_input(relative: str, deployment_only: set[str]) -> bool:
 def _identity_group(
     relative: str,
     *,
+    root: Path,
     config: Mapping[str, Any],
     deployment_only: set[str],
 ) -> str | None:
@@ -154,7 +155,7 @@ def _identity_group(
     if relative in set(config["identity"]["protocol_files"]):
         return "protocol"
     if relative.startswith("tests/"):
-        return _test_owner(relative, config)
+        return _test_owner(relative, config, root=root)
     if relative.startswith("testcases/") or relative in FAULT_RUNNER_FILES:
         return "fault_runner_source"
     if _is_deployment_input(relative, deployment_only):
@@ -190,6 +191,7 @@ def input_groups(root: Path = ROOT) -> dict[str, dict[str, object]]:
         relative = path.relative_to(root).as_posix()
         group = _identity_group(
             relative,
+            root=root,
             config=config,
             deployment_only=deployment_only,
         )

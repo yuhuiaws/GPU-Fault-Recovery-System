@@ -128,6 +128,22 @@ class MemoryFleetMixin:
             )
             return sorted(members, key=lambda item: item.member_id)
 
+    def cleanup_stale_regional_registry_members(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        with self._lock:
+            member_ids = [
+                item.member_id
+                for item in sorted(
+                    self._regional_registry_members.values(),
+                    key=lambda item: (item.last_seen_at, item.member_id),
+                )
+                if item.last_seen_at <= older_than
+            ][:limit]
+            for member_id in member_ids:
+                del self._regional_registry_members[member_id]
+        return log_cleanup("regional_registry_member", member_ids)
+
     def save_agent(self, agent) -> None:
         with self._lock:
             self._agents[(agent.cluster_id, agent.node_id)] = agent

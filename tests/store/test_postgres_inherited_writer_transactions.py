@@ -91,6 +91,7 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_profile",
         "save_regional_cluster",
         "save_regional_registry_member",
+        "save_workload_coverage",
         "save_triage_report",
         "save_xid_policy_decision",
     }

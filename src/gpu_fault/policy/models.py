@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-import re
 from uuid import uuid4
 
 from pydantic import Field, model_validator

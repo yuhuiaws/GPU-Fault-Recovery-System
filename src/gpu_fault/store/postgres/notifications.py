@@ -10,18 +10,19 @@ from gpu_fault.models import (
     NotificationResult,
     NotificationStatus,
 )
+from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError, WorkflowLeaseError
-from gpu_fault.store.shared.notification_helpers import (
-    with_incident_drill_label as _with_incident_drill_label,
-)
-from gpu_fault.store.shared.time import (
-    utc_text as _utc_text,
-)
 from gpu_fault.store.shared.notification_helpers import (
     UNDELIVERED_STATUSES,
     check_delivery_lease,
     completed_delivery,
     released_delivery,
+)
+from gpu_fault.store.shared.notification_helpers import (
+    with_incident_drill_label as _with_incident_drill_label,
+)
+from gpu_fault.store.shared.time import (
+    utc_text as _utc_text,
 )
 
 
@@ -34,6 +35,7 @@ class PostgresNotificationMixin:
     _get_link: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _put: Callable[..., Any]
+    _state_transaction: Callable[..., Any]
 
     def list_notifications(
         self,
@@ -362,6 +364,72 @@ class PostgresNotificationMixin:
                 ),
             )
         return len(rows)
+
+    def cleanup_terminal_notifications(
+        self, *, older_than: datetime, limit: int
+    ) -> int:
+        """Drop settled notifications past retention with their delivery,
+        result and dedup link (F-8 / G-9).
+
+        A notification whose incident still exists is kept for the archiver
+        (F-I1); one whose delivery is still PENDING/RETRY/LEASED is the
+        dispatcher's. The dedup link is removed through the notification's
+        own ``deduplication_key`` (the links primary key), never by value.
+        """
+
+        with self._state_transaction("notification/cleanup"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH victims AS (
+                        SELECT notification.key,
+                               notification.payload->>'deduplication_key'
+                                   AS deduplication_key
+                        FROM gpu_fault_objects AS notification
+                        LEFT JOIN gpu_fault_objects AS delivery
+                          ON delivery.kind='notification_delivery'
+                         AND delivery.key=notification.key
+                        WHERE notification.kind='notification'
+                          AND notification.payload->>'created_at' <= %s
+                          AND (
+                              delivery.key IS NULL
+                              OR delivery.payload->>'status' IN ('SENT', 'DEAD')
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM gpu_fault_objects AS incident
+                              WHERE incident.kind='incident'
+                                AND incident.key=notification.payload->>'incident_id'
+                          )
+                        ORDER BY notification.payload->>'created_at',
+                                 notification.key
+                        LIMIT %s
+                        FOR UPDATE OF notification SKIP LOCKED
+                    ),
+                    deleted_links AS (
+                        DELETE FROM gpu_fault_links AS link
+                        USING victims
+                        WHERE link.kind='notification_dedup'
+                          AND link.key=victims.deduplication_key
+                          AND link.value=victims.key
+                        RETURNING link.key
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS target
+                        USING victims
+                        WHERE target.kind IN (
+                                  'notification',
+                                  'notification_delivery',
+                                  'notification_result'
+                              )
+                          AND target.key=victims.key
+                        RETURNING target.kind, target.key
+                    )
+                    SELECT key FROM deleted WHERE kind='notification' ORDER BY key
+                    """,
+                    (_utc_text(older_than), limit),
+                )
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("notification", keys)
 
     def save_notification_if_absent(
         self, notification: AdvisoryNotification

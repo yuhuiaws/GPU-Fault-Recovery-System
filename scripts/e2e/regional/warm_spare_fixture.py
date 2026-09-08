@@ -161,6 +161,45 @@ print(json.dumps(result, sort_keys=True))
 """
 
 
+CLOSE_INCIDENT_POST = r"""
+import json
+import os
+import sys
+from urllib.error import HTTPError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+incident_id, reason, operator = sys.argv[1:]
+body = json.dumps(
+    {"reason": reason, "operator": operator}, separators=(",", ":")
+).encode()
+request = Request(
+    "http://127.0.0.1:8080/v1/incidents/" + quote(incident_id, safe="") + "/close",
+    data=body,
+    method="POST",
+    headers={
+        "Content-Type": "application/json",
+        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
+    },
+)
+try:
+    with urlopen(request, timeout=60) as response:
+        content = response.read()
+        result = {
+            "status": response.status,
+            "body": json.loads(content) if content else {},
+        }
+except HTTPError as exc:
+    content = exc.read()
+    try:
+        decoded = json.loads(content) if content else {}
+    except ValueError:
+        decoded = {"detail": content.decode(errors="replace")}
+    result = {"status": exc.code, "body": decoded}
+print(json.dumps(result, sort_keys=True))
+"""
+
+
 RELEASE_SPARES = r"""
 import json
 import sys
@@ -750,6 +789,25 @@ class WarmSpareLiveFixture:
                 profile_version,
                 reason,
                 attempts=1,
+            ),
+        )
+
+    def close_incident(
+        self, incident_id: str, *, reason: str, operator: str
+    ) -> dict[str, Any]:
+        """``POST /v1/incidents/{id}/close`` from inside the CPU ingress Pod.
+
+        The operator exit for an ESCALATED incident whose node is back
+        (DESTR-018 product gap). Returns ``{"status", "body"}``; a 409 names
+        the open workflow or the state that refused it, a 404 is a release
+        that predates the route -- the caller decides whether to fall back.
+        Not retried: a close that landed must not be repeated blindly.
+        """
+
+        return cast(
+            dict[str, Any],
+            self.regional.cpu_python(
+                CLOSE_INCIDENT_POST, incident_id, reason, operator, attempts=1
             ),
         )
 

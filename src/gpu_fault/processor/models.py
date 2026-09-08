@@ -7,12 +7,14 @@ import logging
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import Field, PrivateAttr
+
 from gpu_fault.channel_registry import (
-    COLLECTOR_HEALTH_PATH,
     COLLECTOR_EVENT_PREFIX,
+    COLLECTOR_HEALTH_PATH,
     WORKLOAD_OBSERVATIONS_PATH,
     ChannelLane,
     channel_for_path,
@@ -144,9 +146,13 @@ class ProcessorRequest(StrictModel):
             try:
                 payload = json.loads(body) if body else {}
             except (UnicodeDecodeError, json.JSONDecodeError):
-                payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
+                payload = None
+        # ``payload_object`` is what ``_json_payload`` would return for this
+        # body: the object, or ``None`` when the body is not one. The field
+        # lookups below substitute ``{}`` for convenience; the tier and the
+        # lane must not, because "no readable body" is not a routine batch.
+        payload_object = payload if isinstance(payload, dict) else None
+        payload = payload_object if payload_object is not None else {}
         channel = channel_for_path(path)
         if (
             channel is not None
@@ -193,18 +199,16 @@ class ProcessorRequest(StrictModel):
                         separators=(",", ":"),
                     )
                 )
+        priority = cls._queue_priority_for(path, payload_object)
         lane_policy = ProcessorLanePolicy.STRICT
-        if (
-            channel is not None
-            and channel.latest_wins
-            and channel.priority(payload) == 100
-        ):
+        if channel is not None and channel.latest_wins and priority == 100:
             lane_policy = ProcessorLanePolicy.REORDERABLE
-        return cls(
+        body_base64 = base64.b64encode(body).decode("ascii")
+        item = cls(
             method=method,
             path=path,
             query=query,
-            body_base64=base64.b64encode(body).decode("ascii"),
+            body_base64=body_base64,
             content_type=content_type,
             cluster_id=cluster_id,
             correlation_key=correlation_key,
@@ -212,6 +216,33 @@ class ProcessorRequest(StrictModel):
             execution_authorized=execution_authorized,
             lane_policy=lane_policy,
         )
+        if payload_object is not None:
+            # The decode pool has parsed this body once already; the tier
+            # it just derived used to be thrown away, and the first
+            # ``queue_priority()`` -- in ``_enqueue``, on the event loop --
+            # decoded and parsed the whole body again, then ``ordering_key()``
+            # did it a third time on the store thread (A-2). Both caches
+            # carry the same witness the lazy path checks, so a
+            # ``model_copy`` that changes the body or path recomputes.
+            item._queue_priority_cache = (body_base64, path, priority)
+            item._ordering_key_cache = (
+                body_base64,
+                path,
+                cluster_id or "",
+                cls._ordering_key_for(path, cluster_id, payload_object),
+            )
+        return item
+
+    def __eq__(self, other: object) -> bool:
+        # Pydantic compares ``__pydantic_private__`` too, which would make a
+        # request whose caches ``from_http`` filled unequal to the same row
+        # read back from a store. The caches are derived from the fields,
+        # so the fields alone are the identity.
+        if not isinstance(other, ProcessorRequest):
+            return NotImplemented
+        return self.__dict__ == other.__dict__
+
+    __hash__ = None  # type: ignore[assignment]  # unhashable, as before
 
     def body(self) -> bytes:
         return base64.b64decode(self.body_base64)
@@ -308,17 +339,23 @@ class ProcessorRequest(StrictModel):
         return payload if isinstance(payload, dict) else None
 
     def _compute_ordering_key(self) -> str:
-        cluster = self.cluster_id or "__unscoped__"
-        payload = self._json_payload() or {}
+        return self._ordering_key_for(self.path, self.cluster_id, self._json_payload())
+
+    @staticmethod
+    def _ordering_key_for(
+        path: str, cluster_id: str | None, payload_object: dict[str, Any] | None
+    ) -> str:
+        cluster = cluster_id or "__unscoped__"
+        payload = payload_object or {}
         attempt_id = payload.get("attempt_id")
         if (
             (
                 (
-                    (channel := channel_for_path(self.path)) is not None
+                    (channel := channel_for_path(path)) is not None
                     and channel.lane is ChannelLane.ATTEMPT
                 )
-                or self.path in {"/v1/gpu-events/xid", "/v1/gpu-events/sxid"}
-                or self.path.startswith("/v1/attempts/")
+                or path in {"/v1/gpu-events/xid", "/v1/gpu-events/sxid"}
+                or path.startswith("/v1/attempts/")
             )
             and isinstance(attempt_id, str)
             and attempt_id
@@ -337,13 +374,13 @@ class ProcessorRequest(StrictModel):
                 set(),
             ),
         ):
-            if self.path.startswith(prefix):
-                resource_id = self.path.removeprefix(prefix).split("/", 1)[0]
+            if path.startswith(prefix):
+                resource_id = path.removeprefix(prefix).split("/", 1)[0]
                 if resource_id and resource_id not in reserved:
                     return f"{cluster}:{scope_name}:{resource_id}"
         node_id = payload.get("node_id")
         if (
-            self.path.startswith(
+            path.startswith(
                 (
                     COLLECTOR_EVENT_PREFIX,
                     "/v1/provider-events/",
@@ -353,7 +390,7 @@ class ProcessorRequest(StrictModel):
             and isinstance(node_id, str)
             and node_id
         ):
-            channel = channel_for_path(self.path)
+            channel = channel_for_path(path)
             if channel and channel.lane is ChannelLane.GPU_INVENTORY:
                 return f"{cluster}:node:{node_id}:gpu-inventory"
             if channel and channel.lane is ChannelLane.EDGE_SUMMARY:
@@ -363,7 +400,7 @@ class ProcessorRequest(StrictModel):
                     suffix = channel.summary_lane_suffix
                     if suffix is None:
                         return f"{cluster}:node:{node_id}"
-                    if self.path == COLLECTOR_HEALTH_PATH:
+                    if path == COLLECTOR_HEALTH_PATH:
                         collector = str(payload.get("collector") or "unknown").lower()
                         suffix = f"{suffix}-{collector}"
                     return f"{cluster}:node:{node_id}:{suffix}"
@@ -461,13 +498,17 @@ class ProcessorRequest(StrictModel):
         return priority
 
     def _compute_queue_priority(self) -> int:
-        if is_control_plane_action_path(self.path):
+        return self._queue_priority_for(self.path, self._json_payload())
+
+    @staticmethod
+    def _queue_priority_for(path: str, payload_object: dict[str, Any] | None) -> int:
+        if is_control_plane_action_path(path):
             return CONTROL_PLANE_ACTION_PRIORITY
-        if is_fault_path(self.path):
+        if is_fault_path(path):
             return DEVICE_EVENT_PRIORITY
-        channel = channel_for_path(self.path)
+        channel = channel_for_path(path)
         if channel is not None:
-            return channel.priority(self._json_payload())
+            return channel.priority(payload_object)
         return EVIDENCE_PRIORITY
 
     def is_reserved_tier(self) -> bool:

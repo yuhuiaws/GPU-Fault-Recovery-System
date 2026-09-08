@@ -177,9 +177,21 @@ def test_preempt035_past_the_window_a_hold_stops_the_job_and_fails(tmp_path):
 
         assert dispatcher.run_once().filtered.get("node_busy") == 1
 
-        # The window passes with node-a still under the other remediation.
+        # The window passes with node-a still under the other remediation. The
+        # wait is measured from the first HOLD the dispatcher recorded (D-11),
+        # so that moves into the past along with ``created_at``.
+        held = store.get_workflow(request_id)
         store.amend_workflow(
-            request_id, {"created_at": now - timedelta(seconds=WINDOW + 60)}
+            request_id,
+            {
+                "created_at": now - timedelta(seconds=WINDOW + 60),
+                "events": [
+                    event.model_copy(
+                        update={"at": event.at - timedelta(seconds=WINDOW + 60)}
+                    )
+                    for event in held.events
+                ],
+            },
         )
         gave_up = dispatcher.run_once()  # keeps the STOP, marks the failure
         assert gave_up.filtered.get("node_busy_timeout") == 1
@@ -215,8 +227,19 @@ def test_a_hold_that_lost_the_race_to_its_own_timeout_is_not_dissolved(tmp_path)
         incident_id, request_id = _open_hold(store, now)
         adapter = _AnyOwnerAdapter({STOP: WorkflowStepOutcome.succeeded()})
         dispatcher = _dispatcher(store, adapter)
+        assert dispatcher.run_once().filtered.get("node_busy") == 1
+        held = store.get_workflow(request_id)
         store.amend_workflow(
-            request_id, {"created_at": now - timedelta(seconds=WINDOW + 60)}
+            request_id,
+            {
+                "created_at": now - timedelta(seconds=WINDOW + 60),
+                "events": [
+                    event.model_copy(
+                        update={"at": event.at - timedelta(seconds=WINDOW + 60)}
+                    )
+                    for event in held.events
+                ],
+            },
         )
         assert dispatcher.run_once().filtered.get("node_busy_timeout") == 1
 

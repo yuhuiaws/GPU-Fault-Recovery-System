@@ -90,6 +90,10 @@ COMPONENTS = {
                 "dcgm-diagnostic": (
                     "gpu_fault.notifications.dcgm_diagnostic:DcgmDiagnosticEmailBuilder"
                 ),
+                "diagnostic-inconclusive": (
+                    "gpu_fault.notifications.diagnostic_inconclusive:"
+                    "DiagnosticInconclusiveEmailBuilder"
+                ),
                 "efa-rdma": (
                     "gpu_fault.notifications.efa_rdma:EfaRdmaEventEmailBuilder"
                 ),

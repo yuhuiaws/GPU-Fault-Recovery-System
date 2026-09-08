@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.store.postgres import ddl_processor_retry
+from gpu_fault.store.postgres.ddl_control_plane_review import create_v13_stage
 from gpu_fault.store.postgres.ddl_helpers import (
     _CREATE_INDEX,
     _add_column_if_missing,
@@ -12,9 +14,6 @@ from gpu_fault.store.postgres.ddl_helpers import (
     _enable_trigger_if_disabled,
     _ensure_trigger,
     _recorded_schema_version,
-)
-from gpu_fault.store.postgres.ddl_processor_retry import (
-    upgrade_processor_retry_schedule,
 )
 from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
 
@@ -516,6 +515,7 @@ def _create_dispatcher_indexes(cursor: Any) -> None:
         WHERE kind='decision'
         """,
     )
+    create_v13_stage(cursor)
 
 
 def _create_domain_indexes_two(cursor) -> None:
@@ -845,7 +845,7 @@ def _create_processor_tables(cursor) -> None:
     _add_column_if_missing(
         cursor, "gpu_fault_processor_queue", "response_body_base64", "TEXT"
     )
-    upgrade_processor_retry_schedule(cursor)
+    ddl_processor_retry.upgrade_processor_retry_schedule(cursor)
     cursor.execute(
         """
         CREATE OR REPLACE FUNCTION
