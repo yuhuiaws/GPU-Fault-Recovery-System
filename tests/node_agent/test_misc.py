@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from threading import Event, current_thread
 
 from tests._builders import copy_model, node_action_result
 
@@ -1043,3 +1044,82 @@ def test_verify_queries_the_device_map_once_per_verification(tmp_path) -> None:
 
     assert result.status is NodeActionStatus.SUCCEEDED, result.error
     assert runner.xml_queries() == 1, runner.commands
+
+
+def test_a_poll_answers_a_persisted_result_over_a_fabricated_interrupt(
+    tmp_path, monkeypatch
+) -> None:
+    """A row that finished between the two reads must answer with its result.
+
+    The pool wrapper's close path decides on ``latest_row`` and then closes the
+    attempt with ``mark_interrupted``, which answers None for a row that
+    already carries a result -- exactly what happens when the attempt finishes
+    between those two reads. The branch then fabricated an INTERRUPTED answer
+    of its own, so a SUCCEEDED reset sitting on disk was reported to the
+    control plane as needing manual confirmation: the node stays quarantined
+    and an operator is paged for a GPU that is already back. The executor's own
+    close path already falls back to the persisted result; the pool wrapper in
+    ``app.py`` did not.
+
+    ``latest_row`` is pinned to the pre-result view and ``get`` left honest,
+    which is the interleaving itself: two reads of the same row, the second one
+    after the result was committed.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_NODE_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_CLUSTER_ID", raising=False)
+    runner = FakeRunner()
+    agent = reset_agent(tmp_path, "stale-inprogress-read.db", runner)
+    real_execute = agent.execute
+    real_latest_row = agent.ledger.latest_row
+    poll_done = Event()
+
+    def execute_then_crash(value: SignedNodeAction):
+        # The result is written before ``execute`` returns, so anything that
+        # fails afterwards -- the pool wrapper included -- fails with a real
+        # result already on disk.
+        result = real_execute(value)
+        raise sqlite3.OperationalError(f"database is locked ({result.status.value})")
+
+    def latest_row_before_the_result(command_id: str):
+        row = real_latest_row(command_id)
+        if row is None or row[2] is None:
+            return row
+        if current_thread().name.startswith("gpu-fault-node-action"):
+            # The pool's done-callback closes the attempt too, and it drops the
+            # future on its way out. Hold it until the poll has answered so the
+            # HTTP caller is the one that has to close this attempt.
+            poll_done.wait(timeout=5)
+        return "IN_PROGRESS", row[1], None
+
+    monkeypatch.setattr(agent, "execute", execute_then_crash)
+    monkeypatch.setattr(agent.ledger, "latest_row", latest_row_before_the_result)
+    monkeypatch.setattr(
+        agent.ledger,
+        "get",
+        lambda command_id: (real_latest_row(command_id) or (None, None, None))[2],
+    )
+    signed = envelope(command(WorkflowOperation.RESET_GPU))
+
+    with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
+        submitted = submit_action(client, signed)
+        polled = wait_for_result(client, signed.command.command_id)
+        poll_done.set()
+
+    assert reset_invocations(runner) == 1, (
+        f"the GPU must be reset exactly once: {runner.commands}"
+    )
+    assert polled.status_code == 200, f"the poll must answer: {polled.text}"
+    for answer in (submitted, polled):
+        payload = answer.json()
+        assert payload["state"] in {
+            NodeActionExecutionState.PENDING.value,
+            NodeActionExecutionState.SUCCEEDED.value,
+        }, f"the persisted SUCCEEDED result is the only answer: {payload}"
+    assert polled.json()["state"] == NodeActionExecutionState.SUCCEEDED.value, (
+        polled.json()
+    )
+    history = agent.ledger.attempt_history(signed.command.command_id)
+    assert [(row["attempt"], row["state"]) for row in history] == [(1, "SUCCEEDED")], (
+        f"a persisted result must not be rewritten or retried: {history}"
+    )

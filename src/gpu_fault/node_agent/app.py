@@ -288,7 +288,12 @@ def create_node_agent_app(
                     exc,
                 )
                 try:
-                    closed = agent.ledger.mark_interrupted(command_id, row[1], error)
+                    # None means the row already carries a result -- it finished
+                    # between the two reads -- and that result is the answer;
+                    # fabricating INTERRUPTED buries a SUCCEEDED reset.
+                    closed = agent.ledger.mark_interrupted(
+                        command_id, row[1], error
+                    ) or agent.ledger.get(command_id)
                 except Exception:
                     LOGGER.exception(
                         "failed to close an asynchronous node action attempt "
