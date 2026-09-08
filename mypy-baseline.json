@@ -236,7 +236,7 @@
   "src/gpu_fault/notifications/hardware_inventory.py:type-arg": 1,
   "src/gpu_fault/notifications/host_resource.py:type-arg": 1,
   "src/gpu_fault/notifications/registry.py:no-untyped-def": 1,
-  "src/gpu_fault/notifications/ses.py:no-untyped-def": 3,
+  "src/gpu_fault/notifications/ses.py:no-untyped-def": 2,
   "src/gpu_fault/operation_registry.py:no-untyped-def": 1,
   "src/gpu_fault/orchestration/arbitration.py:assignment": 1,
   "src/gpu_fault/orchestration/coordinator.py:arg-type": 5,

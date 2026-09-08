@@ -11,13 +11,13 @@ without an AWS call.
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
 
-from gpu_fault.admin import bootstrap_services as services
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -191,7 +191,7 @@ class Account:
         raise AssertionError(f"unexpected process: {[str(item) for item in arguments]}")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(services.subprocess, "run", self.process)
+        monkeypatch.setattr(subprocess, "run", self.process)
 
     def mutations(self, fragment: str) -> list[list[str]]:
         return [argv for argv in self.calls if fragment in " ".join(argv)]
@@ -253,6 +253,33 @@ def test_the_control_plane_policy_pins_email_to_the_verified_sender() -> None:
     assert email["Condition"] == {
         "StringEquals": {"ses:FromAddress": "alerts@example.com"}
     }
+
+
+def test_the_control_plane_policy_publishes_only_to_the_site_topic() -> None:
+    """``channel: sns`` grants Publish on one topic and nothing about SES.
+
+    The topic is the administrator's one confirmed subscription; a wider SNS
+    grant would let a compromised control plane page every topic in the
+    account, and any SES grant would be a permission with no sender behind it.
+    """
+
+    topic = f"arn:aws:sns:{REGION}:{ACCOUNT}:gpu-fault-{SITE}-alerts"
+    document = control_plane_policy_document(
+        region=REGION, account_id=ACCOUNT, sns_topic_arn=topic
+    )
+    publish = next(
+        item
+        for item in document["Statement"]
+        if item.get("Sid") == "AdministratorNotificationTopic"
+    )
+
+    assert publish["Action"] == "sns:Publish"
+    assert publish["Resource"] == topic
+    assert "Condition" not in publish
+    assert not [action for action in _actions(document) if action.startswith("ses:")]
+    assert [action for action in _actions(document) if action.startswith("sns:")] == [
+        "sns:Publish"
+    ]
 
 
 def test_the_pod_identity_trust_is_scoped_to_one_cluster() -> None:

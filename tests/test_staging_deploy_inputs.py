@@ -320,7 +320,8 @@ def test_email_precheck_stops_before_the_source_scan(
     assert status == 2
     assert events == ["email-check"], "the refusal comes before the source scan"
     err = capsys.readouterr().err
-    assert "SES sender identity operations@example.com" in err
+    assert "SNS alert subscription operations@example.com" in err
+    assert "SES" not in err, "an sns site is asked for one confirmation only"
     assert "SNS alert subscription operations@example.com" in err
     assert f"rerun: gpu-fault-admin deploy --state-dir {state}" in err
     assert "--wait-for-email-confirmation" in err
@@ -349,7 +350,27 @@ def test_email_precheck_forwards_the_wait_and_the_rerun_line(
     assert seen["wait_minutes"] == 15
     assert seen["admin_email"] == EMAIL
     assert seen["cpu_cluster_arn"] == CPU_ARN
+    assert seen["channel"] == "sns", "a site with only adminEmail notifies over SNS"
     assert seen["rerun_command"] == f"gpu-fault-admin deploy --state-dir {state}"
+
+
+def test_managed_site_reports_the_channel_the_precheck_must_confirm(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    _write_site(state)
+    assert staging_deploy.managed_site_inputs(state)["notification_channel"] == "sns"
+
+    document = yaml.safe_load((state / "site.yaml").read_text(encoding="utf-8"))
+    document["spec"]["notifications"]["emailSender"] = EMAIL
+    (state / "site.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    assert staging_deploy.managed_site_inputs(state)["notification_channel"] == (
+        "ses"
+    ), "a site written with an SES sender keeps SES until the operator flips it"
+
+    document["spec"]["notifications"]["channel"] = "sns"
+    (state / "site.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    assert staging_deploy.managed_site_inputs(state)["notification_channel"] == "sns"
 
 
 def test_early_supersede_refusal_happens_before_gates_and_build(

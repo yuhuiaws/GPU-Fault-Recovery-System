@@ -421,7 +421,7 @@ class AdvisoryNotificationService:
     def describe_delivery_mode(self) -> str:
         """Spell out what the delivery switches *combine* to.
 
-        Three independent switches -- ALLOW_EMAIL (may we call SES),
+        Three independent switches -- ALLOW_EMAIL (may we call SNS/SES),
         DISPATCHER_ENABLED (does this process drain the outbox) and
         ASYNC_DELIVERY (does send() enqueue or deliver inline) -- decide
         whether an operator is actually paged. Each is individually
@@ -442,14 +442,14 @@ class AdvisoryNotificationService:
         )
         if channel is None:
             outcome = (
-                "NOT DELIVERED -- no delivery channel is configured "
-                "(set GPU_FAULT_EMAIL_SENDER and "
-                "GPU_FAULT_EMAIL_RECIPIENTS); notifications are "
-                "persisted only"
+                "NOT DELIVERED -- no delivery channel is configured (set "
+                "GPU_FAULT_SNS_TOPIC_ARN, or GPU_FAULT_NOTIFICATION_CHANNEL=ses "
+                "with GPU_FAULT_EMAIL_SENDER and GPU_FAULT_EMAIL_RECIPIENTS); "
+                "notifications are persisted only"
             )
         elif not email_enabled:
             outcome = (
-                "NOT DELIVERED -- notifications are persisted but SES "
+                "NOT DELIVERED -- notifications are persisted but the channel "
                 "is disabled (set GPU_FAULT_ALLOW_EMAIL=true to send)"
             )
         elif not self.async_delivery:

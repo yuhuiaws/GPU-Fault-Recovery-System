@@ -1,4 +1,9 @@
-"""The first-minute SES/SNS check behind ``gpu-fault-admin deploy``."""
+"""The first-minute confirmation check behind ``gpu-fault-admin deploy``.
+
+The default channel (``sns``) has one address to confirm: the administrator's
+subscription on the site topic. A site that opted into ``ses`` also has its
+sender identity to verify and is told about both.
+"""
 
 from __future__ import annotations
 
@@ -88,7 +93,9 @@ class Runner:
         return ""
 
 
-def test_first_run_sends_both_mails_and_reports_both_pending(tmp_path: Path) -> None:
+def test_sns_first_run_sends_one_mail_and_never_touches_ses(tmp_path: Path) -> None:
+    """The default channel: one confirmation, one address in the message."""
+
     runner = Runner(ses_verified=None, sns_confirmed=False)
     state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
 
@@ -96,7 +103,56 @@ def test_first_run_sends_both_mails_and_reports_both_pending(tmp_path: Path) -> 
         runner, cpu=_cpu(), site_id="site-a", admin_email=EMAIL, state=state
     )
 
-    assert result.confirmed is False
+    assert result.channel == "sns" and result.confirmed is False
+    assert result.ses_verified is True and result.ses_identity_created is False
+    assert not any(c[0] == "sesv2" for c in runner.commands), "no SES read"
+    assert not any("create-email-identity" in c for c in runner.commands), (
+        "no SES identity is created for the SNS channel"
+    )
+    assert len([c for c in runner.commands if c[0:2] == ("sns", "subscribe")]) == 1
+    assert state.value["resources"]["sns_email_subscription"]["status"] == "PENDING"
+
+    message = PRECHECK.email_confirmation_refusal(
+        result, rerun_command="gpu-fault-admin deploy --state-dir /secure/x"
+    )
+    assert "SES" not in message, "one email channel: the message names one address"
+    assert "the confirmation mail" in message
+    assert f"SNS alert subscription {EMAIL} on {TOPIC_ARN}: confirmation mail sent" in (
+        message
+    )
+    assert "rerun: gpu-fault-admin deploy --state-dir /secure/x" in message
+    assert PRECHECK.WAIT_FLAG in message
+
+
+def test_sns_rerun_after_the_link_is_confirmed(tmp_path: Path) -> None:
+    runner = Runner(ses_verified=None, sns_confirmed=True)
+
+    result = PRECHECK.check_email_confirmations(
+        runner, cpu=_cpu(), site_id="site-a", admin_email=EMAIL, state=None
+    )
+
+    assert result.confirmed is True and result.sns_confirmed is True
+    assert result.as_dict()["channel"] == "sns"
+    assert not any(c[0] == "sesv2" for c in runner.commands), "no SES read"
+    assert not any(c[0:2] == ("sns", "subscribe") for c in runner.commands), (
+        "a confirmed subscription is only read"
+    )
+
+
+def test_first_run_sends_both_mails_and_reports_both_pending(tmp_path: Path) -> None:
+    runner = Runner(ses_verified=None, sns_confirmed=False)
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
+
+    result = PRECHECK.check_email_confirmations(
+        runner,
+        cpu=_cpu(),
+        site_id="site-a",
+        admin_email=EMAIL,
+        state=state,
+        channel="ses",
+    )
+
+    assert result.channel == "ses" and result.confirmed is False
     assert result.ses_verified is False and result.ses_identity_created is True
     assert result.sns_status == "PENDING" and result.sns_topic_arn == TOPIC_ARN
     creates = [c for c in runner.commands if "create-email-identity" in c]
@@ -121,7 +177,12 @@ def test_rerun_after_both_links_is_confirmed_and_sends_nothing(tmp_path: Path) -
     runner = Runner(ses_verified=True, sns_confirmed=True)
 
     result = PRECHECK.check_email_confirmations(
-        runner, cpu=_cpu(), site_id="site-a", admin_email=EMAIL, state=None
+        runner,
+        cpu=_cpu(),
+        site_id="site-a",
+        admin_email=EMAIL,
+        state=None,
+        channel="ses",
     )
 
     assert result.confirmed is True
@@ -140,6 +201,7 @@ def test_one_pending_address_is_still_a_refusal(tmp_path: Path) -> None:
         site_id="site-a",
         admin_email=EMAIL,
         state=None,
+        channel="ses",
     )
 
     assert result.ses_verified is True and result.sns_confirmed is False
@@ -215,4 +277,5 @@ def _result(*, ses: bool, sns: str) -> PRECHECK.EmailConfirmation:
         sns_topic_arn=TOPIC_ARN,
         sns_status=sns,
         sns_subscription_arn=None,
+        channel="ses",
     )

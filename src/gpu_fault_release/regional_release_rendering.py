@@ -331,6 +331,9 @@ def build_cpu_apply_environment(
         # Present only when site.yaml spec.retention turns archive-first
         # deletion on; the renderer forwards these to the control-worker.
         **config.retention.environment(),
+        # The alert channel and its SNS topic; every role runs the notifier
+        # guard at startup, so the renderer places these on all three.
+        **config.notification_environment(),
         "KUBECONFIG": config.cpu_kubeconfig,
         "GPU_FAULT_AWS_REGION": config.aws_region,
         "GPU_FAULT_NAMESPACE": config.namespace,

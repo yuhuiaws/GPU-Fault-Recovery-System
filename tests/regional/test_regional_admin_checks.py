@@ -270,14 +270,102 @@ def test_email_check_validates_declared_routing_and_site_context(monkeypatch) ->
                 email_sender="sender@example.com",
                 email_recipients=("ops@example.com", "oncall@example.com"),
                 email_subject_prefix="[PROD]",
+                channel="ses",
             ),
         )
     )
 
     result = module.check_email_notifications(release)
 
+    assert result.details["channel"] == "ses"
     assert result.details["recipient_count"] == 2
     assert result.details["site_id"] == "site-a"
+
+
+SNS_TOPIC = "arn:aws:sns:us-west-2:123456789012:gpu-fault-alerts"
+
+
+def _sns_release(*, secret_values: dict[str, str], topic: str | None):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="site-a",
+            cpu_eks_arn="arn:aws:eks:us-west-2:123456789012:cluster/cpu",
+            health=SimpleNamespace(sns_topic_arn=topic),
+            notifications=SimpleNamespace(
+                allow_email=True,
+                acknowledge_external_alert_channel=False,
+                admin_email="owner@example.com",
+                email_sender=None,
+                email_recipients=(),
+                email_subject_prefix="[PROD]",
+                channel="sns",
+            ),
+        )
+    ), {
+        "data": {
+            key: base64.b64encode(value.encode()).decode()
+            for key, value in secret_values.items()
+        }
+    }
+
+
+def test_sns_email_check_needs_the_topic_and_site_context_but_no_ses(
+    monkeypatch,
+) -> None:
+    """On ``sns`` the check never asks SES anything: the topic is the channel
+    and the Secret only has to carry the site context every channel reads."""
+
+    module = _checks_module()
+    release, secret = _sns_release(
+        secret_values={
+            "email-subject-prefix": "[PROD]",
+            "site-id": "site-a",
+            "aws-account-id": "123456789012",
+        },
+        topic=SNS_TOPIC,
+    )
+
+    def no_aws(*_args, **_kwargs):
+        raise AssertionError("the sns channel must not reach SES")
+
+    monkeypatch.setattr(module, "_aws_json", no_aws)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+
+    result = module.check_email_notifications(release)
+
+    assert result.details == {
+        "enabled": True,
+        "channel": "sns",
+        "sns_topic_arn": SNS_TOPIC,
+        "site_id": "site-a",
+    }
+
+
+def test_sns_email_check_fails_without_a_topic_or_site_context(monkeypatch) -> None:
+    module = _checks_module()
+    monkeypatch.setattr(module, "_aws_json", lambda *_args, **_kwargs: {})
+    complete = {
+        "email-subject-prefix": "[PROD]",
+        "site-id": "site-a",
+        "aws-account-id": "123456789012",
+    }
+
+    release, secret = _sns_release(secret_values=complete, topic=None)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="sns_topic_arn"):
+        module.check_email_notifications(release)
+
+    release, secret = _sns_release(secret_values={"site-id": "site-a"}, topic=SNS_TOPIC)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="aws-account-id"):
+        module.check_email_notifications(release)
+
+    release, secret = _sns_release(
+        secret_values={**complete, "site-id": "site-b"}, topic=SNS_TOPIC
+    )
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="differs"):
+        module.check_email_notifications(release)
 
 
 def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:

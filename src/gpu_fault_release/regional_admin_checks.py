@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
@@ -300,64 +301,13 @@ def check_email_notifications(release: Any) -> CheckValue:
                 {"enabled": False},
             )
         raise ReleaseError("no administrator notification channel is enabled")
-    if not config.admin_email or not config.email_sender or not config.email_recipients:
-        raise ReleaseError("email notification addresses are missing")
-    identity = _aws_json(
+    summary, details = check_notification_channel(
         release,
-        [
-            "sesv2",
-            "get-email-identity",
-            "--email-identity",
-            config.email_sender,
-        ],
+        aws_json=lambda arguments: _aws_json(release, arguments),
+        read_secret=lambda name: _secret(release, name),
+        decode_secret=_decode_secret,
     )
-    verified = bool(identity.get("VerifiedForSendingStatus")) or (
-        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
-    )
-    if not verified:
-        raise ReleaseError("SES sender identity is not verified")
-    account = _aws_json(release, ["sesv2", "get-account"])
-    if not bool(account.get("SendingEnabled")):
-        raise ReleaseError("SES sending is disabled")
-    secret = _secret(release, "gpu-fault-email").get("data") or {}
-    required = {
-        "email-sender",
-        "email-recipients",
-        "email-subject-prefix",
-        "site-id",
-        "aws-account-id",
-    }
-    if missing := sorted(required - set(secret)):
-        raise ReleaseError("gpu-fault-email is missing: " + ", ".join(missing))
-    sender = _decode_secret(secret["email-sender"]).decode()
-    recipients = tuple(
-        item.strip()
-        for item in _decode_secret(secret["email-recipients"]).decode().split(",")
-        if item.strip()
-    )
-    subject_prefix = _decode_secret(secret["email-subject-prefix"]).decode()
-    site_id = _decode_secret(secret["site-id"]).decode()
-    account_id = _decode_secret(secret["aws-account-id"]).decode()
-    expected_account_id = str(release.config.cpu_eks_arn).split(":")[4]
-    if (
-        sender != config.email_sender
-        or recipients != config.email_recipients
-        or subject_prefix != config.email_subject_prefix
-        or site_id != release.config.site_name
-        or account_id != expected_account_id
-    ):
-        raise ReleaseError("gpu-fault-email differs from the declared site addresses")
-    return CheckValue(
-        "SES administrator notification channel is configured",
-        {
-            "enabled": True,
-            "sender_verified": True,
-            "sending_enabled": True,
-            "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
-            "recipient_count": len(recipients),
-            "site_id": site_id,
-        },
-    )
+    return CheckValue(summary, details)
 
 
 def _check_load_balancer_controller(release: Any) -> CheckValue:

@@ -99,15 +99,6 @@ def _bootstrap_state() -> dict:
                 "workspace_ownership": "CREATED",
                 "sns_topic_arn": ("arn:aws:sns:us-east-1:123456789012:test-alerts"),
                 "sns_topic_ownership": "CREATED",
-                "sqs_queue_url": (
-                    "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"
-                ),
-                "sqs_queue_arn": ("arn:aws:sqs:us-east-1:123456789012:test-alerts"),
-                "sqs_queue_ownership": "CREATED",
-                "queue_subscription_arn": (
-                    "arn:aws:sns:us-east-1:123456789012:test-alerts:sub"
-                ),
-                "queue_subscription_ownership": "CREATED",
                 "email_subscription_arn": (
                     "arn:aws:sns:us-east-1:123456789012:test-alerts:email-sub"
                 ),
@@ -235,6 +226,72 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
     )
 
 
+LEGACY_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"
+
+
+def _legacy_queue_state() -> dict:
+    """A state written while bootstrap still created the alerts SQS queue."""
+
+    state = _bootstrap_state()
+    state["resources"]["monitoring_resources"].update(
+        {
+            "sqs_queue_url": LEGACY_QUEUE_URL,
+            "sqs_queue_arn": "arn:aws:sqs:us-east-1:123456789012:test-alerts",
+            "sqs_queue_ownership": "CREATED",
+            "queue_subscription_arn": (
+                "arn:aws:sns:us-east-1:123456789012:test-alerts:sub"
+            ),
+            "queue_subscription_ownership": "CREATED",
+        }
+    )
+    return state
+
+
+def test_a_fresh_bootstrap_registers_no_alerts_queue(tmp_path) -> None:
+    """Nothing consumed the alerts queue, so bootstrap no longer creates it and
+    the registry must not invent a row uninstall would then fail to find."""
+
+    site = load_site(site_file(tmp_path))
+    snapshot = build_installation_snapshot(site, _bootstrap_state(), {})
+    by_key = {resource.resource_key: resource for resource in snapshot.resources}
+
+    queue_rows = sorted(
+        key
+        for key, resource in by_key.items()
+        if key.startswith("aws/sqs/") or resource.resource_type.startswith("sqs_")
+    )
+    assert queue_rows == [], f"fresh bootstrap registered queue rows: {queue_rows}"
+    assert "aws/sns/queue-subscription" not in by_key
+    assert "aws/sns/topic" in by_key
+    assert "aws/sns/email-subscription/af3c82544f648b38" in by_key
+
+
+def test_a_legacy_queue_state_keeps_its_rows_so_uninstall_deletes_them(
+    tmp_path,
+) -> None:
+    """Sites bootstrapped before the queue was dropped still own one; the
+    registry keeps both rows from the old state so uninstall removes it."""
+
+    site = load_site(site_file(tmp_path))
+    snapshot = build_installation_snapshot(site, _legacy_queue_state(), {})
+    by_key = {resource.resource_key: resource for resource in snapshot.resources}
+
+    queue = by_key["aws/sqs/queue"]
+    assert queue.resource_type == "sqs_queue"
+    assert queue.resource_id == LEGACY_QUEUE_URL
+    assert queue.delete_policy is InstallationResourceDeletePolicy.DELETE
+    binding = by_key["aws/sqs/topic-policy-binding"]
+    assert binding.resource_type == "sqs_policy_binding"
+    assert binding.delete_policy is InstallationResourceDeletePolicy.DETACH
+    assert binding.attributes["topic_arn"] == (
+        "arn:aws:sns:us-east-1:123456789012:test-alerts"
+    )
+    assert by_key["aws/sns/queue-subscription"].dependencies == [
+        "aws/sns/topic",
+        "aws/sqs/queue",
+    ]
+
+
 def test_a_state_written_before_parameter_groups_registers_no_group(tmp_path) -> None:
     """A cluster bootstrapped before the diagnostics group existed sits on the
     engine default group; there is nothing of ours to delete, and inventing a
@@ -253,6 +310,33 @@ def test_a_state_written_before_parameter_groups_registers_no_group(tmp_path) ->
         "aws/aurora/security-group",
         "aws/aurora/subnet-group",
     ]
+
+
+def test_the_master_secret_is_registered_from_the_readiness_task_too(tmp_path) -> None:
+    """Since the instance wait left the ``aurora`` task, a fresh bootstrap
+    records the master Secret ARN under ``aurora_ready``; uninstall must still
+    see ``aws/aurora/managed-master`` exactly as it did from the old shape."""
+
+    site = load_site(site_file(tmp_path))
+    state = _bootstrap_state()
+    old_shape = build_installation_snapshot(site, state, {})
+    arn = state["resources"]["aurora"].pop("master_secret_arn")
+    state["resources"]["aurora_ready"] = {
+        "master_secret_arn": arn,
+        "master_secret_kms_key_arn": "",
+    }
+
+    new_shape = build_installation_snapshot(site, state, {})
+
+    # Everything but the two ``record()`` timestamps must read the same.
+    timestamps = {"created_at", "updated_at"}
+    old_master = {r.resource_key: r for r in old_shape.resources}[
+        "aws/aurora/managed-master"
+    ].model_dump(exclude=timestamps)
+    new_master = {r.resource_key: r for r in new_shape.resources}[
+        "aws/aurora/managed-master"
+    ].model_dump(exclude=timestamps)
+    assert new_master == old_master, "the registry's view of the master secret changed"
 
 
 def test_registry_snapshot_digest_detects_tampering(tmp_path) -> None:

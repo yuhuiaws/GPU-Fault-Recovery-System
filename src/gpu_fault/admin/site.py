@@ -270,6 +270,45 @@ def site_retention(site: Mapping[str, Any] | None) -> RetentionSiteConfig:
     return RetentionSiteConfig.from_value(spec.get("retention"))
 
 
+NOTIFICATION_CHANNEL_SNS = "sns"
+NOTIFICATION_CHANNEL_SES = "ses"
+NOTIFICATION_CHANNELS = (NOTIFICATION_CHANNEL_SNS, NOTIFICATION_CHANNEL_SES)
+
+
+def default_notification_channel(notifications: Mapping[str, Any] | None) -> str:
+    """The channel a ``spec.notifications`` block means when it names none.
+
+    New sites get SNS: one topic, one confirmed subscription, the same channel
+    the AMP alerts already use. A site written before the channel existed
+    carries an ``emailSender`` (bootstrap always filled it), and that sender is
+    a verified SES identity the operator went through a mail to confirm, so
+    such a site keeps SES until the operator declares ``channel: sns``. A
+    routine upgrade therefore never moves a live site's notifications.
+    """
+
+    if isinstance(notifications, Mapping) and notifications.get("emailSender"):
+        return NOTIFICATION_CHANNEL_SES
+    return NOTIFICATION_CHANNEL_SNS
+
+
+def site_notification_channel(site: Mapping[str, Any] | None) -> str:
+    """``spec.notifications.channel`` of a raw site document, defaulted as above.
+
+    Raw-document companion of ``NotificationSiteConfig.channel`` for the paths
+    (bootstrap, the deploy precheck) that must answer before the site is
+    validated whole; an unreadable document answers ``sns``.
+    """
+
+    spec = site.get("spec") if isinstance(site, Mapping) else None
+    notifications = spec.get("notifications") if isinstance(spec, Mapping) else None
+    if not isinstance(notifications, Mapping):
+        return NOTIFICATION_CHANNEL_SNS
+    declared = notifications.get("channel")
+    if isinstance(declared, str) and declared.strip() in NOTIFICATION_CHANNELS:
+        return declared.strip()
+    return default_notification_channel(notifications)
+
+
 @dataclass(frozen=True)
 class CpuSiteConfig:
     kubeconfig: str
@@ -584,12 +623,23 @@ class HealthSiteConfig:
 
 @dataclass(frozen=True)
 class NotificationSiteConfig:
+    """``spec.notifications``: where the control plane's own alerts go.
+
+    ``channel`` is ``sns`` (the site's health topic, the default for a block
+    that never named a sender) or ``ses`` (the verified sender a bootstrap
+    before the channel existed wrote; kept until the operator declares
+    ``channel: sns``). On ``sns`` only ``adminEmail`` is required, and naming
+    one implies ``allowEmail``; a leftover ``emailSender``/``emailRecipients``
+    is carried but not required, so flipping a live site edits one key.
+    """
+
     allow_email: bool = False
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
+    channel: str = NOTIFICATION_CHANNEL_SNS
 
     @classmethod
     def from_value(cls, value: object) -> NotificationSiteConfig:
@@ -603,12 +653,25 @@ class NotificationSiteConfig:
                 "emailSender",
                 "emailRecipients",
                 "emailSubjectPrefix",
+                "channel",
             },
         )
+        channel = data.get("channel")
+        if channel is None:
+            channel = default_notification_channel(data)
+        elif not isinstance(channel, str) or channel not in NOTIFICATION_CHANNELS:
+            raise SiteConfigError(
+                "spec.notifications.channel must be one of "
+                + ", ".join(NOTIFICATION_CHANNELS)
+            )
+        # An adminEmail on the sns channel implies the channel is wanted; a
+        # block that names no address keeps the acknowledged-off default.
         allow_email = _boolean(
             data.get("allowEmail"),
             "spec.notifications.allowEmail",
-            default=False,
+            default=(
+                channel == NOTIFICATION_CHANNEL_SNS and bool(data.get("adminEmail"))
+            ),
         )
         acknowledge = _boolean(
             data.get("acknowledgeExternalAlertChannel"),
@@ -639,8 +702,12 @@ class NotificationSiteConfig:
             raise SiteConfigError(
                 "notifications must enable email or acknowledge an external alert channel"
             )
-        if allow_email and (
-            admin_email is None or email_sender is None or not email_recipients
+        if allow_email and channel == NOTIFICATION_CHANNEL_SNS and admin_email is None:
+            raise SiteConfigError("SNS notifications require notifications.adminEmail")
+        if (
+            allow_email
+            and channel == NOTIFICATION_CHANNEL_SES
+            and (admin_email is None or email_sender is None or not email_recipients)
         ):
             raise SiteConfigError(
                 "email notifications require notifications.adminEmail "
@@ -653,6 +720,7 @@ class NotificationSiteConfig:
             email_sender=email_sender,
             email_recipients=email_recipients,
             email_subject_prefix=email_subject_prefix,
+            channel=channel,
         )
 
 
@@ -1044,6 +1112,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "email_sender": site.spec.notifications.email_sender,
             "email_recipients": list(site.spec.notifications.email_recipients),
             "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
+            "channel": site.spec.notifications.channel,
         },
         "admin_config": {
             "config": admin_config.as_dict(),

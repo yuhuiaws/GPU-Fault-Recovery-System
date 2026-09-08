@@ -1050,6 +1050,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         state_dir=state_dir,
         cpu_cluster_arn=cpu_cluster_arn,
         admin_email=admin_email,
+        channel=str(site_inputs.get("notification_channel") or "sns"),
         wait_minutes=int(getattr(arguments, "wait_for_email_confirmation", 0) or 0),
         rerun_command=deploy_rerun_command(
             state_dir=state_dir,

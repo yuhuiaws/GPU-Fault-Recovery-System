@@ -13,6 +13,10 @@ from gpu_fault.notifications.common import (
     model_validator,
     os,
 )
+from gpu_fault.notifications.delivery_context import (
+    body_with_context,
+    subject_with_context,
+)
 
 
 class SesV2Client(Protocol):
@@ -90,42 +94,21 @@ class SesEmailNotifier:
         return boto3.client("sesv2", region_name=config.region_name)
 
     def _subject(self, notification: AdvisoryNotification) -> str:
-        context = [
-            value
-            for value in (
-                self.config.subject_prefix,
-                (f"[site:{self.config.site_id}]" if self.config.site_id else None),
-                (
-                    f"[region:{self.config.region_name}]"
-                    if self.config.region_name
-                    else None
-                ),
-                (
-                    f"[account:{self.config.account_id}]"
-                    if self.config.account_id
-                    else None
-                ),
-            )
-            if value
-        ]
-        return " ".join([*context, notification.subject])
+        return subject_with_context(
+            notification,
+            subject_prefix=self.config.subject_prefix,
+            site_id=self.config.site_id,
+            region_name=self.config.region_name,
+            account_id=self.config.account_id,
+        )
 
     def _body(self, notification: AdvisoryNotification) -> str:
-        context = [
-            ("Site", self.config.site_id),
-            ("AWS Account", self.config.account_id),
-            ("Region", self.config.region_name),
-            ("Cluster", notification.cluster_name),
-        ]
-        if not any(value for _label, value in context[:-1]):
-            return notification.body_text
-        header = "\n".join(
-            [
-                "通知上下文",
-                *[f"- {label}: {value or 'UNKNOWN'}" for label, value in context],
-            ]
+        return body_with_context(
+            notification,
+            site_id=self.config.site_id,
+            account_id=self.config.account_id,
+            region_name=self.config.region_name,
         )
-        return f"{header}\n\n{notification.body_text}"
 
     def send(self, notification: AdvisoryNotification) -> NotificationResult:
         with self._lock:
@@ -180,16 +163,3 @@ class DisabledNotificationNotifier:
             status=NotificationStatus.SKIPPED,
             reason="no notification delivery channel is configured",
         )
-
-
-def notification_notifier_from_environment():
-    sender = os.getenv("GPU_FAULT_EMAIL_SENDER")
-    recipients = os.getenv("GPU_FAULT_EMAIL_RECIPIENTS")
-    if not sender and not recipients:
-        return DisabledNotificationNotifier()
-    if not sender or not recipients:
-        raise ValueError(
-            "GPU_FAULT_EMAIL_SENDER and "
-            "GPU_FAULT_EMAIL_RECIPIENTS must be configured together"
-        )
-    return SesEmailNotifier(SesNotificationConfig.from_environment())

@@ -421,20 +421,28 @@ categories:
 
   - title: 通知、证据与保留
     description: >-
-      业务通知走 Aurora outbox + SES；AMP/SNS 是控制面自身指标告警。notification 已
-      QUEUED 不等于已送达，必须看到 SENT 和 provider message ID。
+      业务通知走 Aurora outbox，再由 dispatcher 发到站点 SNS topic（默认 channel=sns，
+      与 AMP 指标告警共用同一个 topic 和同一封订阅确认邮件），或按站点声明改走 SES
+      （channel=ses）。notification 已 QUEUED 不等于已送达，必须看到 SENT 和 provider
+      message ID。
     variables:
       - name: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL
         production: false（生产不得开启）
         description: "无外发通知通道时是否仅记录。只允许应急兼容，生产保持 false。"
+      - name: GPU_FAULT_NOTIFICATION_CHANNEL
+        production: 由 site.yaml 的 spec.notifications.channel 渲染（新站点 sns）
+        description: "业务通知通道：sns（站点 SNS topic，纯文本）、ses（已验证发件身份）或 disabled（只入库）。未声明时按有 topic ARN → sns、有 SES 地址对 → ses 推断。"
+      - name: GPU_FAULT_SNS_TOPIC_ARN
+        production: 由 site.yaml 的 spec.health.snsTopicArn 渲染
+        description: "channel=sns 时发布业务通知的 SNS topic ARN；控制面 role 只对它持有 sns:Publish。"
       - name: GPU_FAULT_ALLOW_EMAIL
-        description: "是否允许本方案通过 SES 实际发送邮件。"
+        description: "是否实际外发业务通知（SNS 或 SES）。channel=sns 时默认 true，设 false 为总闸。"
       - name: GPU_FAULT_EMAIL_SENDER
-        production: 由 site.yaml 的已验证 SES identity 注入
-        description: "SES 发件身份；与管理员联系人和接收列表是三个独立概念。"
+        production: channel=ses 时由 site.yaml 的已验证 SES identity 注入
+        description: "SES 发件身份，仅 channel=ses 使用；与管理员联系人和接收列表是三个独立概念。"
       - name: GPU_FAULT_EMAIL_RECIPIENTS
-        production: 由 site.yaml 的 emailRecipients 注入
-        description: "逗号分隔的业务通知接收人列表。"
+        production: channel=ses 时由 site.yaml 的 emailRecipients 注入
+        description: "逗号分隔的业务通知接收人列表，仅 channel=ses 使用。"
       - name: GPU_FAULT_EMAIL_SUBJECT_PREFIX
         description: "邮件环境/站点前缀，不替代正文中的 site、Region、account 和 cluster。"
       - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY

@@ -293,19 +293,49 @@ class RegionalHealthConfig:
         )
 
 
+NOTIFICATION_CHANNEL_SNS = "sns"
+NOTIFICATION_CHANNEL_SES = "ses"
+NOTIFICATION_CHANNELS = (NOTIFICATION_CHANNEL_SNS, NOTIFICATION_CHANNEL_SES)
+NOTIFICATION_ENVIRONMENT = (
+    "GPU_FAULT_NOTIFICATION_CHANNEL",
+    "GPU_FAULT_SNS_TOPIC_ARN",
+)
+
+
 @dataclass(frozen=True)
 class RegionalNotificationConfig:
+    """``notifications`` from the release config: ``site.yaml`` ``spec.notifications``.
+
+    ``channel`` defaults the way the site does: a release config written before
+    the key existed carries an ``email_sender`` and stays on ``ses``, so a
+    rollback onto such a record keeps the channel it shipped with; anything
+    else is ``sns``. On ``sns`` only ``admin_email`` is required.
+    """
+
     allow_email: bool = False
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
+    channel: str = NOTIFICATION_CHANNEL_SNS
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
         if not value:
             return cls()
+        channel = value.get("channel")
+        if channel is None:
+            channel = (
+                NOTIFICATION_CHANNEL_SES
+                if value.get("email_sender")
+                else NOTIFICATION_CHANNEL_SNS
+            )
+        elif not isinstance(channel, str) or channel not in NOTIFICATION_CHANNELS:
+            raise ReleaseError(
+                "notifications.channel must be one of "
+                + ", ".join(NOTIFICATION_CHANNELS)
+            )
         allow_email = bool(value.get("allow_email", True))
         acknowledge = bool(value.get("acknowledge_external_alert_channel", False))
         admin_email = (
@@ -334,8 +364,12 @@ class RegionalNotificationConfig:
             raise ReleaseError(
                 "notifications must allow email or acknowledge an external alert channel"
             )
-        if allow_email and (
-            admin_email is None or email_sender is None or not email_recipients
+        if allow_email and channel == NOTIFICATION_CHANNEL_SNS and admin_email is None:
+            raise ReleaseError("SNS notifications require notifications.admin_email")
+        if (
+            allow_email
+            and channel == NOTIFICATION_CHANNEL_SES
+            and (admin_email is None or email_sender is None or not email_recipients)
         ):
             raise ReleaseError(
                 "email notifications require notifications.admin_email "
@@ -348,6 +382,7 @@ class RegionalNotificationConfig:
             email_sender=email_sender,
             email_recipients=email_recipients,
             email_subject_prefix=subject_prefix,
+            channel=channel,
         )
 
 
@@ -787,6 +822,23 @@ class ReleaseConfig:
             admin_config=admin_config or self.admin_config,
             auto_rollback=False,
         )
+
+    def notification_environment(self) -> dict[str, str]:
+        """The control-plane variables naming the alert channel, on every role.
+
+        Each role builds the notifier and runs the fail-closed "no alert
+        channel" guard at startup, so the channel and (for ``sns``) the site
+        topic must reach all three; a rollback rendered without them would
+        leave a worker that cannot start.
+        """
+
+        values = {NOTIFICATION_ENVIRONMENT[0]: self.notifications.channel}
+        if (
+            self.notifications.channel == NOTIFICATION_CHANNEL_SNS
+            and self.health.sns_topic_arn
+        ):
+            values[NOTIFICATION_ENVIRONMENT[1]] = self.health.sns_topic_arn
+        return values
 
     @classmethod
     def load(cls, path: Path) -> ReleaseConfig:

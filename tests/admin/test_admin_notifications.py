@@ -19,6 +19,13 @@ ROUTING = NotificationRouting(
     sender="sender@example.com",
     recipients=("ops@example.com", "oncall@example.com"),
     subject_prefix="[PROD]",
+    channel="ses",
+)
+SNS_ROUTING = NotificationRouting(
+    sender="ops@example.com",
+    recipients=("ops@example.com",),
+    subject_prefix="[PROD]",
+    channel="sns",
 )
 
 
@@ -143,6 +150,78 @@ def test_email_notifications_require_verified_ses_and_apply_secret(
     assert "--from-literal=email-subject-prefix=[PROD]" in secret_command
     assert "--from-literal=site-id=site-a" in secret_command
     assert "--from-literal=aws-account-id=123456789012" in secret_command
+
+
+def test_sns_channel_touches_no_ses_and_writes_an_addressless_secret(
+    tmp_path: Path,
+) -> None:
+    """One email channel per site: the default channel never creates or reads an
+    SES identity, and the Secret carries only what the runtime still needs from
+    it -- the subject prefix and the site context."""
+
+    runner = Runner([])
+
+    result = ensure_email_notifications(
+        runner,
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        routing=SNS_ROUTING,
+    )
+
+    assert [command for command in runner.commands if command[0] == "aws"] == [], (
+        "the SNS channel must not call sesv2 at all"
+    )
+    assert result["channel"] == "sns"
+    assert result["verification_status"] == "NOT_REQUIRED"
+    assert result["identity_ownership"] == "NONE"
+    assert "sender_email" not in result and "identity_arn" not in result
+    secret_command = next(
+        command[1]
+        for command in runner.commands
+        if command[0] == "run"
+        and "create" in command[1]
+        and "gpu-fault-email" in command[1]
+    )
+    literals = [item for item in secret_command if item.startswith("--from-literal=")]
+    assert literals == [
+        "--from-literal=email-subject-prefix=[PROD]",
+        "--from-literal=site-id=site-a",
+        "--from-literal=aws-account-id=123456789012",
+    ], "no sender and no recipient list exist on the SNS channel"
+
+
+def test_sns_channel_probe_reuses_a_matching_addressless_secret(tmp_path: Path) -> None:
+    values = {
+        "email-subject-prefix": "[PROD]",
+        "site-id": "site-a",
+        "aws-account-id": "123456789012",
+    }
+    runner = Runner(
+        [],
+        secret_data={
+            key: base64.b64encode(value.encode()).decode()
+            for key, value in values.items()
+        },
+    )
+
+    ensure_email_notifications(
+        runner,
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        routing=SNS_ROUTING,
+    )
+
+    assert [
+        command[2]
+        for command in runner.commands
+        if command[0] == "run" and command[2].get("mutate")
+    ] == []
 
 
 def test_unverified_ses_identity_is_recorded_not_fatal(tmp_path: Path) -> None:

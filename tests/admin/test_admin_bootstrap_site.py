@@ -332,24 +332,32 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
     )
+    # Both graph builders receive the baseline scope; the one run that follows
+    # answers for both former phases.
+    monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", record("foundation"))
+    monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record("platform"))
     monkeypatch.setattr(
         admin_bootstrap,
-        "run_foundation_tasks",
-        record(
-            "foundation",
-            {
-                "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
-                "aurora": {},
-                "monitoring_resources": {},
-                "nlb_network": {},
-                "pki": {},
-            },
-        ),
+        "run_bootstrap_tasks",
+        lambda **_keywords: {
+            "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
+            "aurora": {"cluster_id": "c"},
+            "aurora_ready": {"master_secret_arn": "arn:new"},
+            "monitoring_resources": {},
+            "nlb_network": {},
+            "pki": {},
+        },
     )
-    monkeypatch.setattr(
-        admin_bootstrap, "run_platform_prerequisite_tasks", record("platform")
-    )
-    monkeypatch.setattr(admin_bootstrap, "_site_document", record("site_document", {}))
+    documents: dict[str, object] = {}
+
+    def site_document(*_arguments, gpu_clusters=(), aurora=None, **_kwargs):
+        scopes["site_document"] = tuple(
+            cluster.hyperpod_name for cluster in gpu_clusters
+        )
+        documents["aurora"] = aurora
+        return {}
+
+    monkeypatch.setattr(admin_bootstrap, "_site_document", site_document)
     monkeypatch.setattr(
         admin_bootstrap,
         "finalize_bootstrap_site",
@@ -369,6 +377,9 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     )
     scopes["kubeconfigs"] = tuple(kubeconfig_clusters)
 
+    # The readiness task's master Secret ARN is merged over the foundation's
+    # ``aurora`` record before the site document is built.
+    assert documents["aurora"] == {"cluster_id": "c", "master_secret_arn": "arn:new"}
     baseline = (gpu_a.hyperpod_name,)
     assert scopes == {
         "release": baseline,

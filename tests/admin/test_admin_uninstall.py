@@ -186,6 +186,76 @@ def test_last_sqs_topic_binding_clears_the_policy_attribute(
     assert attributes == {"Policy": ""}
 
 
+def test_legacy_alerts_queue_rows_are_still_deleted_by_uninstall(
+    tmp_path, monkeypatch
+) -> None:
+    """Bootstrap stopped creating the alerts queue, but sites installed before
+    that still own one. A registry snapshot carrying the old ``sqs_queue`` and
+    ``sqs_policy_binding`` rows must detach the binding first and then delete
+    the queue, exactly as before."""
+
+    site = load_site(site_file(tmp_path))
+    topic_arn = "arn:aws:sns:us-east-1:123456789012:test-alerts"
+    queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"
+    queue = {"deleted": False, "policy": json.dumps({"Statement": [{"C": topic_arn}]})}
+    calls: list[list[str]] = []
+
+    def sqs(arguments, **kwargs):
+        del kwargs
+        calls.append(list(arguments))
+        if "sqs" not in arguments:
+            raise AssertionError(arguments)
+        if queue["deleted"]:
+            return subprocess.CompletedProcess(
+                arguments,
+                254,
+                stdout="",
+                stderr="An error occurred (AWS.SimpleQueueService.NonExistentQueue)",
+            )
+        if "get-queue-attributes" in arguments:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps({"Attributes": {"Policy": queue["policy"]}}),
+                stderr="",
+            )
+        if "set-queue-attributes" in arguments:
+            attributes = json.loads(arguments[arguments.index("--attributes") + 1])
+            queue["policy"] = attributes["Policy"]
+        elif "delete-queue" in arguments:
+            queue["deleted"] = True
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", sqs)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    binding = _resource(
+        "aws/sqs/topic-policy-binding",
+        "sqs_policy_binding",
+        queue_url,
+        policy=InstallationResourceDeletePolicy.DETACH,
+    ).model_copy(update={"attributes": {"topic_arn": topic_arn}})
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site",
+        resources=[_resource("aws/sqs/queue", "sqs_queue", queue_url), binding],
+    )
+
+    _delete_non_aurora_resources(
+        cleaner,
+        snapshot,
+        cpu_disposition="keep",
+        state_path=tmp_path / "uninstall-state.json",
+        state={"phase": "STARTED"},
+    )
+
+    operations = [call[2] for call in calls]
+    assert "set-queue-attributes" in operations, "binding was never detached"
+    assert "delete-queue" in operations, "legacy queue was never deleted"
+    assert operations.index("set-queue-attributes") < operations.index(
+        "delete-queue"
+    ), "queue deleted before its policy binding was detached"
+    assert queue["deleted"] is True
+
+
 def test_gpu_cleanup_verification_uses_site_kubeconfig_environment(tmp_path) -> None:
     site = load_site(site_file(tmp_path))
     site = replace(

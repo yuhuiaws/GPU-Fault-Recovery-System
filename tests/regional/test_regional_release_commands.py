@@ -34,6 +34,7 @@ from tests.regional._release_orchestrator_support import (
     GPU_EKS_ARN,
     REGION,
     ROOT,
+    SNS_TOPIC_ARN,
     config_file,
     manifest_config_file,
 )
@@ -221,6 +222,10 @@ def rollback_environment(
                 allow_email=allow_email,
                 acknowledge_external_alert_channel=not allow_email,
             ),
+            notification_environment=lambda: {
+                "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
+                "GPU_FAULT_SNS_TOPIC_ARN": SNS_TOPIC_ARN,
+            },
         ),
         metadata=metadata,
         cpu_wheel="previous-cpu-wheel",
@@ -274,6 +279,11 @@ def test_rollback_preserves_the_alerting_configuration(
     assert acknowledged["GPU_FAULT_ALLOW_EMAIL"] == "false"
     assert acknowledged["GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL"] == "true"
     assert enabled["GPU_FAULT_NOTIFICATION_CONFIG_SHA256"] == "f" * 64
+    assert enabled["GPU_FAULT_NOTIFICATION_CHANNEL"] == "sns", (
+        "a rolled-back role runs the alert-channel guard at startup and must "
+        "be told which channel the snapshot shipped with"
+    )
+    assert enabled["GPU_FAULT_SNS_TOPIC_ARN"] == SNS_TOPIC_ARN
 
 
 def test_last_cluster_can_be_removed_from_the_cpu_registry(

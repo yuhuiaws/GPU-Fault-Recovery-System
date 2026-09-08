@@ -85,6 +85,7 @@ def config_domain(name: str) -> str:
             "notification",
             (
                 "GPU_FAULT_NOTIFICATION_",
+                "GPU_FAULT_SNS_",
                 "GPU_FAULT_SES_",
                 "GPU_FAULT_EMAIL_",
             ),
@@ -649,6 +650,26 @@ def configure_control_record_retention(container: dict[str, Any]) -> None:
             set_env(container, name, declared.strip())
 
 
+# site.yaml spec.notifications.channel and the site's SNS topic, forwarded by
+# the release engine's apply (and rollback) environment. Every role: each
+# builds the notifier and runs the fail-closed alert-channel guard at startup.
+NOTIFICATION_CHANNEL_ENV = (
+    "GPU_FAULT_NOTIFICATION_CHANNEL",
+    "GPU_FAULT_SNS_TOPIC_ARN",
+)
+
+
+def configure_notification_channel(container: dict[str, Any]) -> None:
+    """Carry the channel variables when declared; leave none behind otherwise."""
+
+    for name in NOTIFICATION_CHANNEL_ENV:
+        declared = os.getenv(name)
+        if declared is None or not declared.strip():
+            unset_env(container, name)
+        else:
+            set_env(container, name, declared.strip())
+
+
 def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
     processor = config.processor
     workflow = config.workflow
@@ -700,6 +721,7 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
 def configure_base(container: dict, config: AdminConfig) -> None:
     configure_processor_retry(container)
     configure_admin_tuning(container, config)
+    configure_notification_channel(container)
 
 
 def parse_options() -> tuple[argparse.Namespace, AdminConfig]:

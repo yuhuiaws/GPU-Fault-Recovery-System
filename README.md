@@ -63,7 +63,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 - 多副本 processor、lane lease、fencing token 和幂等 workflow。
 - GPU 服务 quiesce、GPU reset、节点 reboot 和 warm-spare 故障转移。
 - Completion Watcher、训练重启预算和 GPU 数量一致性门禁。
-- SES 通知、AMP/Alertmanager/SNS 观测和长期证据归档。
+- 经站点 SNS topic 发出的管理员通知（可选 SES）、AMP/Alertmanager/SNS 观测和长期证据归档。
 
 ## 文档入口
 

@@ -254,7 +254,7 @@ def bind_bootstrap_inputs(
 
         That is only safe for a task whose completion is re-proved on every
         deploy. `bootstrap_tasks.py` revalidates `pod_identity_agent`,
-        `monitoring_install`, `aurora_refresh`, `node_keys:*`,
+        `monitoring_install`, `aurora_ready`, `aurora_refresh`, `node_keys:*`,
         `load_balancer_controller`, `control_plane_role`, `email_notifications`,
         `monitoring_resources` and `executor_role:*` through a read-only probe
         that enters ensure on detected drift, so for those the probe is the
@@ -307,6 +307,9 @@ def bind_bootstrap_inputs(
             "aurora",
             {"admin_config_sha256": payload["admin_config_sha256"]},
         ),
+        # Instances available and the control-plane Secret present: nothing
+        # static decides it, so the probe is its only trigger (like the add-on).
+        "aurora_ready": task_digest("aurora_ready", {"eks_arn": cpu.eks_arn}),
         "load_balancer_controller": task_digest(
             "load_balancer_controller", {"eks_arn": cpu.eks_arn}
         ),

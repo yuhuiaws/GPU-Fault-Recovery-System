@@ -487,9 +487,10 @@ class ApplicationContext:
             )
         # An active control plane executes real recovery actions, so a
         # step that fails, a command no executor claims, or a workflow
-        # that stalls has to reach a human. Path A (SES) is the only
-        # channel the control plane itself owns; path B (metrics -> AMP ->
-        # SNS) lives in an optional collector this process cannot see. The
+        # that stalls has to reach a human. Path A (the site SNS topic, or
+        # SES for a site that opted in) is the only channel the control
+        # plane itself owns; path B (metrics -> AMP -> SNS) lives in an
+        # optional collector this process cannot see. The
         # deployed configuration had ALLOW_EMAIL=false, the dispatcher off
         # and the collector at replicas=0, which means no alert existed
         # anywhere -- a silently unexecuted recovery was indistinguishable
@@ -500,8 +501,9 @@ class ApplicationContext:
                 raise RuntimeError(
                     "active executor has no external alert channel: "
                     + context.advisory_notifications.describe_delivery_mode()
-                    + ". Configure GPU_FAULT_EMAIL_SENDER/"
-                    "GPU_FAULT_EMAIL_RECIPIENTS with "
+                    + ". Configure GPU_FAULT_SNS_TOPIC_ARN (or "
+                    "GPU_FAULT_NOTIFICATION_CHANNEL=ses with "
+                    "GPU_FAULT_EMAIL_SENDER/GPU_FAULT_EMAIL_RECIPIENTS) with "
                     "GPU_FAULT_ALLOW_EMAIL=true (and either "
                     "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED=true or "
                     "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY=false), or "

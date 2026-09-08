@@ -80,9 +80,19 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
         admin_bootstrap_services, "provision_node_action_keys", lambda *_a, **_k: {}
     )
 
-    bootstrap_tasks.run_platform_prerequisite_tasks(
+    # The platform graph reads its foundation inputs from the state at task
+    # start, so the two it depends on are recorded as an earlier run would have.
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
+    state.record(
+        "monitoring_resources",
+        {"workspace_id": "ws-a", "sns_topic_arn": "arn:aws:sns:x:1:t"},
+    )
+    state.complete("monitoring_resources")
+    state.record("aurora", {})
+    state.complete("aurora")
+    bootstrap_tasks.platform_task_graph(
         runner=CommandRunner(),
-        state=BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE),
+        state=state,
         repository_root=tmp_path,
         cpu=_cluster(),
         gpu_clusters=[_gpu("gpu-a")],
@@ -90,15 +100,14 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
         gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
         namespace="gpu-fault-system",
         site_id=SITE,
-        monitoring={"workspace_id": "ws-a", "sns_topic_arn": "arn:aws:sns:x:1:t"},
         adot_image="adot@sha256:bbb",
         alert_email="ops@example.com",
         release_manifest=tmp_path / "release.json",
         runtime_image="runtime@sha256:aaa",
-        aurora={},
         fleet_master_file=tmp_path / "fleet-master",
+        ensure_aurora_ready=lambda *_a, **_k: {},
         grafana=settings,
-    )
+    ).run(state=state)
 
     assert received and received[0]["grafana"] == settings
 
@@ -193,7 +202,7 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
@@ -296,9 +305,12 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
     )
+    monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", lambda **_k: None)
+    # The platform graph builder is what receives the resolved Grafana settings.
+    monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record_platform)
     monkeypatch.setattr(
         admin_bootstrap,
-        "run_foundation_tasks",
+        "run_bootstrap_tasks",
         lambda **_k: {
             "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
             "aurora": {},
@@ -306,9 +318,6 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
             "nlb_network": {},
             "pki": {},
         },
-    )
-    monkeypatch.setattr(
-        admin_bootstrap, "run_platform_prerequisite_tasks", record_platform
     )
     monkeypatch.setattr(admin_bootstrap, "_site_document", record_document)
     monkeypatch.setattr(

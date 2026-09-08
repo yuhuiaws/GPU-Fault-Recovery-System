@@ -32,6 +32,7 @@ from gpu_fault.admin.notification_precheck import (
     check_email_confirmations,
     email_confirmation_refusal,
 )
+from gpu_fault.admin.site import site_notification_channel
 
 if __package__:
     from scripts.staging_state_hygiene import SourceCheckout, StagingDeployError
@@ -77,6 +78,9 @@ def managed_site_inputs(state_dir: Path) -> dict[str, object] | None:
         "gpu_cluster_arns": gpu_arns,
         "admin_email": str(admin_email) if admin_email else None,
         "auto_rollback": auto_rollback if isinstance(auto_rollback, bool) else True,
+        # The channel the existing site notifies over decides which
+        # confirmation(s) the first-minute check asks for.
+        "notification_channel": site_notification_channel(document),
     }
 
 
@@ -146,12 +150,14 @@ def precheck_email_confirmations(
     wait_minutes: int,
     rerun_command: str,
     runner: CommandRunner | None = None,
+    channel: str = "sns",
 ) -> EmailConfirmation:
-    """The first-minute SES/SNS check; raises with both addresses when unconfirmed.
+    """The first-minute notification check; raises naming the address when unconfirmed.
 
     Discovers the CPU cluster (the site id and Region come from it), sends the
-    two confirmation mails once, and stops -- exit status 2 -- with one message
-    naming both addresses and the rerun line. ``wait_minutes`` polls instead.
+    confirmation mail once (two for a ``ses`` site: the SES verification as
+    well), and stops -- exit status 2 -- with one message naming the address(es)
+    and the rerun line. ``wait_minutes`` polls instead.
     """
 
     active_runner = runner or CommandRunner()
@@ -173,6 +179,7 @@ def precheck_email_confirmations(
                 site_id=site_id,
                 admin_email=admin_email,
                 state=state,
+                channel=channel,
             )
 
         result = await_email_confirmations(check, wait_minutes=wait_minutes)

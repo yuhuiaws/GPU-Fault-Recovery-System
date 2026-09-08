@@ -22,9 +22,14 @@ from gpu_fault.admin.aurora_capacity import (
     create_db_cluster_arguments,
 )
 from gpu_fault.admin.bootstrap_aurora import (
+    AURORA_SECRET_NAME,
+    assert_aurora_ready,
+    await_aurora_ready,
     bootstrap_aurora_capacity,
     ensure_cluster_parameter_group,
+    ensure_rds_site_tag,
     ensure_serverless_instances,
+    ensure_subnet_group,
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
 )
@@ -64,9 +69,10 @@ from gpu_fault.admin.bootstrap_site import (
     unique_gpu_vpcs,
 )
 from gpu_fault.admin.bootstrap_tasks import (
+    foundation_task_graph,
+    platform_task_graph,
     revalidate_pod_identity_agent,
-    run_foundation_tasks,
-    run_platform_prerequisite_tasks,
+    run_bootstrap_tasks,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.deploy_consent import refuse_unconsented_release
@@ -1334,40 +1340,6 @@ def _ensure_pki(
     }
 
 
-def _ensure_rds_site_tag(
-    runner: CommandRunner,
-    *,
-    region: str,
-    resource_arn: str,
-    tags: object,
-    site_id: str,
-    description: str,
-) -> None:
-    tagged = assert_site_tag(
-        tags,
-        site_id=site_id,
-        description=description,
-        allow_missing=True,
-    )
-    if tagged:
-        return
-    runner.run(
-        [
-            "aws",
-            "rds",
-            "add-tags-to-resource",
-            "--region",
-            region,
-            "--resource-name",
-            resource_arn,
-            "--tags",
-            f"Key={SITE_TAG_KEY},Value={site_id}",
-        ],
-        mutate=True,
-        capture=False,
-    )
-
-
 def _cpu_node_security_groups(
     runner: CommandRunner,
     *,
@@ -1430,78 +1402,30 @@ def _ensure_aurora(
     site_id: str,
     capacity: AuroraCapacityConfig,
 ) -> dict[str, Any]:
+    """The foundation ``aurora`` task: everything up to the instance creates.
+
+    Subnet group, security group, parameter group, the cluster and the two
+    ``create-db-instance`` calls -- but not the five-to-ten-minute wait for the
+    instances, nor the credential read that needs them. Those are
+    ``_aurora_ready``, a platform-graph task that depends on this one, so the
+    wait overlaps the monitoring and node-key installs instead of holding them.
+    ``master_secret_arn`` is reported here when RDS already exposes it (it does
+    on an existing cluster and in the create response); ``_aurora_ready`` is
+    the authoritative source and overrides it.
+    """
+
     cluster_id = _safe_name(f"gpu-fault-{site_id}-aurora", maximum=63)
     subnets = _private_subnets(runner, cpu)
     subnet_ids = [item["SubnetId"] for item in subnets]
     availability_zones = [item["AvailabilityZone"] for item in subnets]
     subnet_group = cluster_id
-    subnet_groups = describe_or_absent(
+    ensure_subnet_group(
         runner,
-        cpu.region,
-        "rds",
-        "describe-db-subnet-groups",
-        "--db-subnet-group-name",
-        subnet_group,
-        not_found=("DBSubnetGroupNotFoundFault",),
+        aws_region=cpu.region,
+        name=subnet_group,
+        subnet_ids=subnet_ids,
+        site_id=site_id,
     )
-    if subnet_groups is not None:
-        subnet_group_details = subnet_groups["DBSubnetGroups"][0]
-        _ensure_rds_site_tag(
-            runner,
-            region=cpu.region,
-            resource_arn=str(subnet_group_details["DBSubnetGroupArn"]),
-            tags=runner.aws_json(
-                cpu.region,
-                "rds",
-                "list-tags-for-resource",
-                "--resource-name",
-                str(subnet_group_details["DBSubnetGroupArn"]),
-            ).get("TagList"),
-            site_id=site_id,
-            description=f"RDS subnet group {subnet_group}",
-        )
-        # The modify is a mutation even when nothing changes (and RDS answers it
-        # slowly); a group that already holds these subnets is left alone.
-        current_subnet_ids = sorted(
-            str(item.get("SubnetIdentifier") or "")
-            for item in subnet_group_details.get("Subnets") or []
-        )
-        if current_subnet_ids != sorted(subnet_ids):
-            runner.run(
-                [
-                    "aws",
-                    "rds",
-                    "modify-db-subnet-group",
-                    "--region",
-                    cpu.region,
-                    "--db-subnet-group-name",
-                    subnet_group,
-                    "--subnet-ids",
-                    *subnet_ids,
-                ],
-                mutate=True,
-                capture=False,
-            )
-    else:
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "create-db-subnet-group",
-                "--region",
-                cpu.region,
-                "--db-subnet-group-name",
-                subnet_group,
-                "--db-subnet-group-description",
-                "GPU fault regional Aurora",
-                "--subnet-ids",
-                *subnet_ids,
-                "--tags",
-                f"Key=gpu-fault:site-id,Value={site_id}",
-            ],
-            mutate=True,
-            capture=False,
-        )
     security_group = _ensure_security_group(
         runner,
         cluster=cpu,
@@ -1546,9 +1470,11 @@ def _ensure_aurora(
         not_found=("DBClusterNotFoundFault",),
     )
     cluster_exists = clusters is not None
+    master_secret: dict[str, Any] = {}
     if clusters is not None:
         existing_cluster = clusters["DBClusters"][0]
-        _ensure_rds_site_tag(
+        master_secret = existing_cluster.get("MasterUserSecret") or {}
+        ensure_rds_site_tag(
             runner,
             region=cpu.region,
             resource_arn=str(existing_cluster["DBClusterArn"]),
@@ -1592,7 +1518,7 @@ def _ensure_aurora(
         )
         # The argument list is owned by ``aurora_capacity`` -- the one writer of
         # the ACU window, shared with the legacy deploy script's ``create``.
-        runner.aws_json(
+        created = runner.aws_json(
             cpu.region,
             *create_db_cluster_arguments(
                 AuroraClusterSpec(
@@ -1606,59 +1532,29 @@ def _ensure_aurora(
             ),
             mutate=True,
         )
+        master_secret = (created.get("DBCluster") or {}).get("MasterUserSecret") or {}
     instance_ids = ensure_serverless_instances(
         runner,
         aws_region=cpu.region,
         cluster_id=cluster_id,
         availability_zones=availability_zones,
         safe_name=_safe_name,
+        wait=False,
     )
     if cluster_exists:
-        # After the instances: the shared reconciler proves the window on both
-        # members, so a resumed bootstrap that had created the cluster but not
-        # its instances must not reach it first.
+        # After the instance creates: the shared reconciler proves the window on
+        # both members (waiting for any still creating), so a resumed bootstrap
+        # that had created the cluster but not its instances must not reach it
+        # first.
         reconcile_existing_capacity(
             runner,
             aws_region=cpu.region,
             cluster_id=cluster_id,
             cluster=existing_cluster,
             capacity=capacity,
+            instance_ids=instance_ids,
         )
-    database = runner.aws_json(
-        cpu.region,
-        "rds",
-        "describe-db-clusters",
-        "--db-cluster-identifier",
-        cluster_id,
-    )["DBClusters"][0]
-    secret_arn = database["MasterUserSecret"]["SecretArn"]
-    secret_value = json.loads(
-        runner.aws_text(
-            cpu.region,
-            "secretsmanager",
-            "get-secret-value",
-            "--secret-id",
-            secret_arn,
-            "--query",
-            "SecretString",
-            sensitive=True,
-        )
-    )
-    url = _aurora_dsn(
-        username=secret_value["username"],
-        password=secret_value["password"],
-        endpoint=database["Endpoint"],
-    )
-    manifest = _secret_manifest(
-        name="gpu-fault-aurora",
-        namespace=namespace,
-        string_data={
-            "postgres-url": url,
-            "master-secret-arn": secret_arn,
-        },
-    )
-    _kubectl_apply(runner, cpu_kubeconfig, manifest)
-    return {
+    aurora: dict[str, Any] = {
         "cluster_id": cluster_id,
         "cluster_ownership": "CREATED",
         "instance_ids": [
@@ -1672,10 +1568,65 @@ def _ensure_aurora(
         # registered so uninstall deletes it after the cluster.
         "parameter_group": parameter_group,
         "parameter_group_ownership": "CREATED",
-        "master_secret_arn": secret_arn,
-        "master_secret_kms_key_arn": str(
-            database["MasterUserSecret"].get("KmsKeyId") or ""
-        ),
+    }
+    if master_secret.get("SecretArn"):
+        aurora["master_secret_arn"] = str(master_secret["SecretArn"])
+        aurora["master_secret_kms_key_arn"] = str(master_secret.get("KmsKeyId") or "")
+    return aurora
+
+
+def _aurora_ready(
+    runner: CommandRunner,
+    *,
+    cpu: ClusterIdentity,
+    cpu_kubeconfig: Path,
+    namespace: str,
+    aurora: Mapping[str, Any],
+    probe_only: bool = False,
+) -> dict[str, Any]:
+    """The platform ``aurora_ready`` task: wait for the writer and reader the
+    foundation created, then hand the control plane its DSN Secret.
+
+    The credential refresh CronJob and the release's schema Jobs are what wait
+    on this; the monitoring and node-key installs do not, and run alongside it.
+    ``probe_only`` is the read-only re-proof on a rerun -- both instances
+    available and the Secret present -- and costs two reads.
+    """
+
+    cluster_id = str(aurora["cluster_id"])
+    instance_ids = [str(item) for item in aurora["instance_ids"]]
+    if probe_only:
+        assert_aurora_ready(
+            runner,
+            aws_region=cpu.region,
+            cluster_id=cluster_id,
+            instance_ids=instance_ids,
+            kubeconfig=cpu_kubeconfig,
+            namespace=namespace,
+        )
+        return {}
+    ready = await_aurora_ready(
+        runner,
+        aws_region=cpu.region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
+    )
+    manifest = _secret_manifest(
+        name=AURORA_SECRET_NAME,
+        namespace=namespace,
+        string_data={
+            "postgres-url": _aurora_dsn(
+                username=ready.username,
+                password=ready.password,
+                endpoint=ready.endpoint,
+            ),
+            "master-secret-arn": ready.secret_arn,
+        },
+    )
+    _kubectl_apply(runner, cpu_kubeconfig, manifest)
+    return {
+        "master_secret_arn": ready.secret_arn,
+        "master_secret_kms_key_arn": ready.kms_key_arn,
     }
 
 
@@ -1792,14 +1743,7 @@ def _site_document(
                 "requireConfirmedSnsSubscription": True,
                 **grafana_health,
             },
-            "notifications": {
-                "allowEmail": True,
-                "acknowledgeExternalAlertChannel": False,
-                "adminEmail": admin_email,
-                "emailSender": routing.sender,
-                "emailRecipients": list(routing.recipients),
-                "emailSubjectPrefix": routing.subject_prefix,
-            },
+            "notifications": routing.site_notifications(admin_email),
             "clusters": cluster_documents,
         },
     }
@@ -1933,7 +1877,9 @@ def bootstrap_from_arns(
         manifest_path=Path(str(release["manifest"])),
         existing_site=existing_site,
     )
-    admin_email, routing = notification_routing(active_runner, cpu, request, state)
+    admin_email, routing = notification_routing(
+        active_runner, cpu, request, state, existing_site=existing_site
+    )
     namespace = "gpu-fault-system"
     token_files, secure_dir = _initial_secure_files(
         state_dir=request.state_dir,
@@ -1952,54 +1898,63 @@ def bootstrap_from_arns(
     )
     adot_image = str(release["images"]["adot"])
 
-    first_phase = run_foundation_tasks(
-        runner=active_runner,
+    grafana = grafana_settings(request, existing_site=existing_site, state=state)
+    # One dependency-aware graph: monitoring, node keys and the Aurora instance
+    # wait no longer sit behind the whole AWS foundation; each task starts when
+    # the tasks it reads from are done (see ``bootstrap_tasks``).
+    results = run_bootstrap_tasks(
         state=state,
-        cpu=cpu,
-        gpu_clusters=managed_gpu_clusters,
-        cpu_kubeconfig=cpu_kubeconfig,
-        namespace=namespace,
-        site_id=site_id,
-        state_dir=request.state_dir,
-        admin_email=admin_email,
-        routing=routing,
-        aurora_capacity=bootstrap_aurora_capacity(request.state_dir),
-        ensure_nlb_network=_ensure_nlb_network,
-        ensure_pki=_ensure_pki,
-        ensure_aurora=_ensure_aurora,
-        # spec.retention is operator-declared in the existing site; a rerun of
-        # deploy is what widens the control-plane role to the archive prefix.
-        archive_s3_uri=site_retention(existing_site).archive_s3_uri,
+        foundation=foundation_task_graph(
+            runner=active_runner,
+            state=state,
+            cpu=cpu,
+            gpu_clusters=managed_gpu_clusters,
+            cpu_kubeconfig=cpu_kubeconfig,
+            namespace=namespace,
+            site_id=site_id,
+            state_dir=request.state_dir,
+            admin_email=admin_email,
+            routing=routing,
+            aurora_capacity=bootstrap_aurora_capacity(request.state_dir),
+            ensure_nlb_network=_ensure_nlb_network,
+            ensure_pki=_ensure_pki,
+            ensure_aurora=_ensure_aurora,
+            # spec.retention is operator-declared in the existing site; a rerun
+            # of deploy is what widens the control-plane role to the archive
+            # prefix.
+            archive_s3_uri=site_retention(existing_site).archive_s3_uri,
+        ),
+        platform=platform_task_graph(
+            runner=active_runner,
+            state=state,
+            repository_root=request.repository_root,
+            cpu=cpu,
+            gpu_clusters=managed_gpu_clusters,
+            cpu_kubeconfig=cpu_kubeconfig,
+            gpu_kubeconfig=gpu_kubeconfig,
+            namespace=namespace,
+            site_id=site_id,
+            adot_image=adot_image,
+            alert_email=admin_email,
+            release_manifest=Path(release["manifest"]),
+            runtime_image=str(release["images"]["runtime"]),
+            fleet_master_file=fleet_master_file,
+            ensure_aurora_ready=_aurora_ready,
+            grafana=grafana,
+        ),
     )
-    state.phase("aws-infrastructure-ready")
     executor_roles = {
         name.removeprefix("executor_role:"): value["role_arn"]
-        for name, value in first_phase.items()
+        for name, value in results.items()
         if name.startswith("executor_role:")
     }
-    aurora = cast(dict[str, Any], first_phase["aurora"])
-    monitoring = cast(dict[str, Any], first_phase["monitoring_resources"])
-    grafana = grafana_settings(request, existing_site=existing_site, state=state)
-    run_platform_prerequisite_tasks(
-        runner=active_runner,
-        state=state,
-        repository_root=request.repository_root,
-        cpu=cpu,
-        gpu_clusters=managed_gpu_clusters,
-        cpu_kubeconfig=cpu_kubeconfig,
-        gpu_kubeconfig=gpu_kubeconfig,
-        namespace=namespace,
-        site_id=site_id,
-        monitoring=monitoring,
-        adot_image=adot_image,
-        alert_email=request.alert_email,
-        release_manifest=Path(release["manifest"]),
-        runtime_image=str(release["images"]["runtime"]),
-        aurora=aurora,
-        fleet_master_file=fleet_master_file,
-        grafana=grafana,
+    # The readiness task owns the master Secret ARN; a checkpoint written before
+    # the split still carries it on ``aurora`` itself, and either shape serves.
+    aurora = cast(
+        dict[str, Any],
+        {**results["aurora"], **(results.get("aurora_ready") or {})},
     )
-    state.phase("platform-prerequisites-ready")
+    monitoring = cast(dict[str, Any], results["monitoring_resources"])
     for line in grafana_access_lines(state):
         print(line, file=sys.stderr, flush=True)
     site_file = request.state_dir / "site.yaml"
@@ -2011,8 +1966,8 @@ def bootstrap_from_arns(
         cpu_kubeconfig=cpu_kubeconfig,
         gpu_kubeconfig=gpu_kubeconfig,
         release=release,
-        nlb=cast(dict[str, Any], first_phase["nlb_network"]),
-        pki=cast(dict[str, Any], first_phase["pki"]),
+        nlb=cast(dict[str, Any], results["nlb_network"]),
+        pki=cast(dict[str, Any], results["pki"]),
         aurora=aurora,
         monitoring=monitoring,
         executor_roles=executor_roles,

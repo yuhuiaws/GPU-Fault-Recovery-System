@@ -359,6 +359,10 @@ def _rollback_environment(
             notifications=SimpleNamespace(
                 allow_email=True, acknowledge_external_alert_channel=False
             ),
+            notification_environment=lambda: {
+                "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
+                "GPU_FAULT_SNS_TOPIC_ARN": "arn:aws:sns:us-west-2:1:gpu-fault",
+            },
         ),
         metadata={},
         cpu_wheel="previous-cpu-wheel",

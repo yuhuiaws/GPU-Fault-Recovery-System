@@ -518,10 +518,12 @@ rules:
       - tests/notifications/**
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
+      - tests/admin/test_admin_site_notification_channel.py
     pytest:
       - tests/notifications
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
+      - tests/admin/test_admin_site_notification_channel.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001
       - GF-REGIONAL-NOTIFY-003..007

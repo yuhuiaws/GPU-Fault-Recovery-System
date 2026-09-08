@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -505,17 +504,19 @@ def control_plane_policy_document(
     account_id: str,
     email_sender: str | None = None,
     archive_s3_uri: str | None = None,
+    sns_topic_arn: str | None = None,
 ) -> dict[str, Any]:
     """Every AWS permission the regional control plane is allowed to hold.
 
     This is a value rather than a literal buried in ``ensure_control_plane_role``
     because it is the whole blast-radius argument for the CPU side: SageMaker
-    read-only, no node mutation of any kind, email only from the verified
-    sender, and -- only when ``site.yaml`` ``spec.retention`` names an archive
-    bucket -- ``PutObject`` under that one prefix, because the archiver writes
-    bundles and never reads or deletes them. Stated as a document it can be
-    checked against the same validator the release path applies to the
-    executor role, without an AWS account.
+    read-only, no node mutation of any kind, notifications only to the site's
+    own SNS topic (``channel: sns``) or only from the verified sender
+    (``channel: ses``), and -- only when ``site.yaml`` ``spec.retention`` names
+    an archive bucket -- ``PutObject`` under that one prefix, because the
+    archiver writes bundles and never reads or deletes them. Stated as a
+    document it can be checked against the same validator the release path
+    applies to the executor role, without an AWS account.
     """
 
     statements: list[dict[str, Any]] = [
@@ -543,6 +544,17 @@ def control_plane_policy_document(
                         "ses:FromAddress": email_sender,
                     }
                 },
+            }
+        )
+    if sns_topic_arn:
+        # Publish only: the control plane never subscribes, lists or deletes;
+        # the topic itself stays a bootstrap-owned resource.
+        statements.append(
+            {
+                "Sid": "AdministratorNotificationTopic",
+                "Effect": "Allow",
+                "Action": "sns:Publish",
+                "Resource": sns_topic_arn,
             }
         )
     if archive_s3_uri:
@@ -591,6 +603,7 @@ def ensure_control_plane_role(
     site_id: str,
     email_sender: str | None = None,
     archive_s3_uri: str | None = None,
+    sns_topic_arn: str | None = None,
 ) -> dict[str, str]:
     _ensure_pod_identity_agent(runner, cpu, site_id)
     _ensure_service_account(
@@ -611,6 +624,7 @@ def ensure_control_plane_role(
             account_id=cpu.account_id,
             email_sender=email_sender,
             archive_s3_uri=archive_s3_uri,
+            sns_topic_arn=sns_topic_arn,
         ),
         site_id=site_id,
     )
@@ -861,14 +875,25 @@ def _ensure_amp_workspace(
     return workspace_id, False
 
 
+def site_sns_topic_arn(cpu: ClusterIdentity, site_id: str) -> str:
+    """The ARN ``ensure_sns_topic`` creates or finds for this site.
+
+    Deterministic so the control-plane role can be granted ``sns:Publish`` on
+    it in the same parallel phase that creates the topic.
+    """
+
+    topic_name = safe_name(f"gpu-fault-{site_id}-alerts", maximum=256)
+    return f"arn:aws:sns:{cpu.region}:{cpu.account_id}:{topic_name}"
+
+
 def ensure_sns_topic(
     runner: CommandRunner,
     *,
     cpu: ClusterIdentity,
     site_id: str,
 ) -> tuple[str, bool, str]:
-    topic_name = safe_name(f"gpu-fault-{site_id}-alerts", maximum=256)
-    expected_topic_arn = f"arn:aws:sns:{cpu.region}:{cpu.account_id}:{topic_name}"
+    expected_topic_arn = site_sns_topic_arn(cpu, site_id)
+    topic_name = expected_topic_arn.rsplit(":", 1)[1]
     topic_reused = (
         describe_or_absent(
             runner,
@@ -940,139 +965,6 @@ def ensure_sns_topic(
     return topic_arn, False, generation
 
 
-def _ensure_sqs_queue(
-    runner: CommandRunner,
-    *,
-    cpu: ClusterIdentity,
-    site_id: str,
-    topic_arn: str,
-) -> tuple[str, str, bool]:
-    queue_name = safe_name(f"gpu-fault-{site_id}-alerts", maximum=80)
-    queue_lookup = subprocess.run(
-        [
-            "aws",
-            "sqs",
-            "get-queue-url",
-            "--region",
-            cpu.region,
-            "--queue-name",
-            queue_name,
-            "--query",
-            "QueueUrl",
-            "--output",
-            "text",
-        ],
-        text=True,
-        capture_output=True,
-    )
-    queue_reused = queue_lookup.returncode == 0
-    if queue_reused:
-        queue_url = queue_lookup.stdout.strip()
-        tags = runner.aws_json(
-            cpu.region,
-            "sqs",
-            "list-queue-tags",
-            "--queue-url",
-            queue_url,
-        ).get("Tags", {})
-        tagged = assert_site_tag(
-            tags,
-            site_id=site_id,
-            description=f"SQS queue {queue_url}",
-            allow_missing=True,
-        )
-        if not tagged:
-            runner.run(
-                [
-                    "aws",
-                    "sqs",
-                    "tag-queue",
-                    "--region",
-                    cpu.region,
-                    "--queue-url",
-                    queue_url,
-                    "--tags",
-                    f"{SITE_TAG_KEY}={site_id}",
-                ],
-                mutate=True,
-                capture=False,
-            )
-    else:
-        queue_url = runner.aws_text(
-            cpu.region,
-            "sqs",
-            "create-queue",
-            "--queue-name",
-            queue_name,
-            "--tags",
-            f"gpu-fault:site-id={site_id}",
-            "--query",
-            "QueueUrl",
-            mutate=True,
-        )
-    attributes = runner.aws_json(
-        cpu.region,
-        "sqs",
-        "get-queue-attributes",
-        "--queue-url",
-        queue_url,
-        "--attribute-names",
-        "QueueArn",
-        "Policy",
-    ).get("Attributes", {})
-    queue_arn = str(attributes.get("QueueArn") or "")
-    if not queue_arn:
-        raise BootstrapError(f"SQS queue {queue_url} has no QueueArn")
-    queue_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "sns.amazonaws.com"},
-                "Action": "sqs:SendMessage",
-                "Resource": queue_arn,
-                "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
-            }
-        ],
-    }
-    try:
-        existing_policy = json.loads(str(attributes.get("Policy") or "{}"))
-    except json.JSONDecodeError:
-        existing_policy = None
-    if not _documents_match(existing_policy, queue_policy):
-        runner.run(
-            [
-                "aws",
-                "sqs",
-                "set-queue-attributes",
-                "--region",
-                cpu.region,
-                "--queue-url",
-                queue_url,
-                "--attributes",
-                json.dumps(
-                    {
-                        "Policy": json.dumps(
-                            queue_policy,
-                            separators=(",", ":"),
-                        )
-                    },
-                    separators=(",", ":"),
-                ),
-            ],
-            mutate=True,
-            capture=False,
-        )
-    return queue_url, queue_arn, False
-
-
-def probe_sqs_queue(
-    runner: CommandRunner,
-    **kwargs: Any,
-) -> tuple[str, str, bool]:
-    return _ensure_sqs_queue(ReadOnlyProbeRunner(runner), **kwargs)
-
-
 def ensure_monitoring_resources(
     runner: CommandRunner,
     *,
@@ -1091,23 +983,12 @@ def ensure_monitoring_resources(
         cpu=cpu,
         site_id=site_id,
     )
-    queue_url, queue_arn, queue_reused = _ensure_sqs_queue(
-        runner,
-        cpu=cpu,
-        site_id=site_id,
-        topic_arn=topic_arn,
-    )
-    (
-        queue_subscription_arn,
-        queue_subscription_ownership,
-        email_subscription,
-    ) = ensure_monitoring_subscriptions(
+    email_subscription = ensure_monitoring_subscriptions(
         runner,
         state=state,
         cpu=cpu,
         topic_arn=topic_arn,
         topic_generation=topic_generation,
-        queue_arn=queue_arn,
         alert_email=alert_email,
     )
     return {
@@ -1116,11 +997,6 @@ def ensure_monitoring_resources(
         "sns_topic_arn": topic_arn,
         "sns_topic_ownership": "REUSED" if topic_reused else "CREATED",
         "sns_topic_generation": topic_generation,
-        "sqs_queue_url": queue_url,
-        "sqs_queue_arn": queue_arn,
-        "sqs_queue_ownership": "REUSED" if queue_reused else "CREATED",
-        "queue_subscription_arn": queue_subscription_arn,
-        "queue_subscription_ownership": queue_subscription_ownership,
         "email_subscription_arn": (
             email_subscription.get("subscription_arn")
             if email_subscription is not None

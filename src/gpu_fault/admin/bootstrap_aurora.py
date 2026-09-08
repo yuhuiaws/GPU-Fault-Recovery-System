@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from gpu_fault.admin.aurora_capacity import (
     CAPACITY_SETTLE_STABLE_POLLS,
     reconcile_aurora_capacity,
 )
 from gpu_fault.admin.bootstrap_common import (
+    SITE_TAG_KEY,
     BootstrapError,
+    BootstrapMutationRequired,
     CommandRunner,
+    assert_site_tag,
     describe_or_absent,
 )
+from gpu_fault.admin.bootstrap_platform_probes import kubectl_projection
 from gpu_fault.admin.config import (
     AdminConfigError,
     AuroraCapacityConfig,
@@ -21,6 +28,15 @@ from gpu_fault.admin.config import (
 
 CAPACITY_SETTLE_POLL_SECONDS = 10.0
 CAPACITY_SETTLE_TIMEOUT_SECONDS = 1800.0
+# The Kubernetes Secret the control plane reads its DSN from.
+AURORA_SECRET_NAME = "gpu-fault-aurora"
+# RDS reports the managed master secret's ARN before Secrets Manager can serve
+# its value (the secret is created with the cluster; its AWSCURRENT version
+# lands a little later). Once the instances are available the value is nearly
+# always there, so this bound is for the lag, not for a broken account: eighteen
+# reads ten seconds apart, three minutes, then a hard failure.
+MASTER_SECRET_READ_ATTEMPTS = 18
+MASTER_SECRET_READ_POLL_SECONDS = 10.0
 
 # What the control plane needs the database to record about itself (store
 # review 2026-09-07, item K). The store retries deadlocks (40P01) silently and
@@ -47,6 +63,118 @@ def bootstrap_aurora_capacity(state_dir: Path) -> AuroraCapacityConfig:
     ).aurora
 
 
+def ensure_rds_site_tag(
+    runner: CommandRunner,
+    *,
+    region: str,
+    resource_arn: str,
+    tags: object,
+    site_id: str,
+    description: str,
+) -> None:
+    tagged = assert_site_tag(
+        tags,
+        site_id=site_id,
+        description=description,
+        allow_missing=True,
+    )
+    if tagged:
+        return
+    runner.run(
+        [
+            "aws",
+            "rds",
+            "add-tags-to-resource",
+            "--region",
+            region,
+            "--resource-name",
+            resource_arn,
+            "--tags",
+            f"Key={SITE_TAG_KEY},Value={site_id}",
+        ],
+        mutate=True,
+        capture=False,
+    )
+
+
+def ensure_subnet_group(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    name: str,
+    subnet_ids: Sequence[str],
+    site_id: str,
+) -> None:
+    """Create the DB subnet group over the private subnets, or adopt the site's."""
+
+    subnet_groups = describe_or_absent(
+        runner,
+        aws_region,
+        "rds",
+        "describe-db-subnet-groups",
+        "--db-subnet-group-name",
+        name,
+        not_found=("DBSubnetGroupNotFoundFault",),
+    )
+    if subnet_groups is None:
+        runner.run(
+            [
+                "aws",
+                "rds",
+                "create-db-subnet-group",
+                "--region",
+                aws_region,
+                "--db-subnet-group-name",
+                name,
+                "--db-subnet-group-description",
+                "GPU fault regional Aurora",
+                "--subnet-ids",
+                *subnet_ids,
+                "--tags",
+                f"Key={SITE_TAG_KEY},Value={site_id}",
+            ],
+            mutate=True,
+            capture=False,
+        )
+        return
+    details = subnet_groups["DBSubnetGroups"][0]
+    ensure_rds_site_tag(
+        runner,
+        region=aws_region,
+        resource_arn=str(details["DBSubnetGroupArn"]),
+        tags=runner.aws_json(
+            aws_region,
+            "rds",
+            "list-tags-for-resource",
+            "--resource-name",
+            str(details["DBSubnetGroupArn"]),
+        ).get("TagList"),
+        site_id=site_id,
+        description=f"RDS subnet group {name}",
+    )
+    # The modify is a mutation even when nothing changes (and RDS answers it
+    # slowly); a group that already holds these subnets is left alone.
+    current_subnet_ids = sorted(
+        str(item.get("SubnetIdentifier") or "") for item in details.get("Subnets") or []
+    )
+    if current_subnet_ids != sorted(subnet_ids):
+        runner.run(
+            [
+                "aws",
+                "rds",
+                "modify-db-subnet-group",
+                "--region",
+                aws_region,
+                "--db-subnet-group-name",
+                name,
+                "--subnet-ids",
+                *subnet_ids,
+            ],
+            mutate=True,
+            capture=False,
+        )
+
+
 def reconcile_existing_capacity(
     runner: CommandRunner,
     *,
@@ -54,6 +182,7 @@ def reconcile_existing_capacity(
     cluster_id: str,
     cluster: dict[str, Any],
     capacity: AuroraCapacityConfig,
+    instance_ids: Sequence[str] = (),
 ) -> None:
     """Bring an existing cluster to the administrator's window.
 
@@ -61,7 +190,10 @@ def reconcile_existing_capacity(
     writer shared with ``config apply`` -- and go through the runner so a
     ``--dry-run`` holds the mutation back. The caller has just described the
     cluster; a window that already matches costs no further call. Both member
-    instances must exist: the reconciler proves the change on them.
+    instances must be available: the reconciler proves the change on them, so
+    when ``instance_ids`` are given the ones still creating are waited for
+    first -- only on a drifted window, which is the one case that still needs
+    the instances inside the foundation task.
     """
 
     scaling = cluster.get("ServerlessV2ScalingConfiguration") or {}
@@ -71,6 +203,14 @@ def reconcile_existing_capacity(
     )
     if live_capacity == (capacity.min_acu, capacity.max_acu):
         return
+    if instance_ids:
+        pending = pending_serverless_instances(
+            runner,
+            aws_region=aws_region,
+            cluster_id=cluster_id,
+            instance_ids=instance_ids,
+        )
+        await_serverless_instances(runner, aws_region=aws_region, instance_ids=pending)
     try:
         reconcile_aurora_capacity(
             aws_region=aws_region,
@@ -160,7 +300,16 @@ def ensure_serverless_instances(
     cluster_id: str,
     availability_zones: list[str],
     safe_name: Callable[..., str],
+    wait: bool = True,
 ) -> list[str]:
+    """Create the writer and the reader that are missing; returns both ids.
+
+    The foundation ``aurora`` task passes ``wait=False``: the five-to-ten-minute
+    instance wait then belongs to ``aurora_ready``, which runs alongside the
+    platform tasks that need no database. ``wait=True`` keeps the old contract
+    of returning only once both instances are available.
+    """
+
     instance_ids = [
         safe_name(f"{cluster_id}-{suffix}", maximum=63)
         for suffix in ("writer", "reader")
@@ -204,7 +353,27 @@ def ensure_serverless_instances(
             mutate=True,
             capture=False,
         )
-    for instance_id in instance_ids:
+    if wait:
+        await_serverless_instances(
+            runner, aws_region=aws_region, instance_ids=instance_ids
+        )
+    return instance_ids
+
+
+def await_serverless_instances(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    instance_ids: Sequence[str],
+) -> None:
+    """Block until every instance reads ``available``, waiting for all at once.
+
+    Two ``rds wait`` calls back to back cost the sum of both creations; issued
+    together they cost the slower one. The wait is a mutation to the read-only
+    probe runner on purpose: a probe must answer in seconds, not block on RDS.
+    """
+
+    def wait_for(instance_id: str) -> None:
         runner.run(
             [
                 "aws",
@@ -219,7 +388,205 @@ def ensure_serverless_instances(
             mutate=True,
             capture=False,
         )
-    return instance_ids
+
+    if not instance_ids:
+        return
+    with ThreadPoolExecutor(max_workers=min(2, len(instance_ids))) as pool:
+        futures = [pool.submit(wait_for, instance_id) for instance_id in instance_ids]
+        failures = [
+            failure
+            for failure in (future.exception() for future in futures)
+            if failure is not None
+        ]
+    if failures:
+        raise failures[0]
+
+
+def pending_serverless_instances(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_ids: Sequence[str],
+) -> list[str]:
+    """The instances that do not yet read ``available``, from one describe.
+
+    An instance the listing does not know is pending too: its create may still
+    be propagating, and the waiter that follows fails closed on one that never
+    appears rather than letting this read stand in for it.
+    """
+
+    listed = (
+        runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-instances",
+            "--filters",
+            f"Name=db-cluster-id,Values={cluster_id}",
+        ).get("DBInstances")
+        or []
+    )
+    statuses = {
+        str(instance.get("DBInstanceIdentifier") or ""): str(
+            instance.get("DBInstanceStatus") or ""
+        )
+        for instance in listed
+    }
+    return [
+        instance_id
+        for instance_id in instance_ids
+        if statuses.get(instance_id) != "available"
+    ]
+
+
+@dataclass(frozen=True)
+class AuroraReadiness:
+    """What the control plane needs to reach the database: the writer endpoint,
+    the managed master secret and its credentials. The credentials are kept out
+    of the repr so a failure message or a log line never carries them."""
+
+    endpoint: str
+    secret_arn: str
+    kms_key_arn: str
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+
+
+_RETRYABLE_SECRET_READ = ("ResourceNotFoundException", "AWSCURRENT")
+
+
+def read_master_secret(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    attempts: int = MASTER_SECRET_READ_ATTEMPTS,
+    poll_seconds: float = MASTER_SECRET_READ_POLL_SECONDS,
+) -> AuroraReadiness:
+    """Read the managed master secret, retrying only while it is not there yet.
+
+    Bounded, and never fail-open: after ``attempts`` reads the deploy fails
+    with the last error rather than continuing without a credential. A read
+    that fails for any other reason -- a denied permission, a broken CLI --
+    reads the same on every try and surfaces at once with its own message.
+    """
+
+    last_error: str = "the cluster reports no managed master secret yet"
+    for attempt in range(1, attempts + 1):
+        database = runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-clusters",
+            "--db-cluster-identifier",
+            cluster_id,
+        )["DBClusters"][0]
+        master = database.get("MasterUserSecret") or {}
+        secret_arn = str(master.get("SecretArn") or "")
+        if secret_arn:
+            try:
+                value = json.loads(
+                    runner.aws_text(
+                        aws_region,
+                        "secretsmanager",
+                        "get-secret-value",
+                        "--secret-id",
+                        secret_arn,
+                        "--query",
+                        "SecretString",
+                        sensitive=True,
+                    )
+                )
+            except BootstrapError as exc:
+                message = str(exc)
+                if not any(code in message for code in _RETRYABLE_SECRET_READ):
+                    raise
+                last_error = message
+            except ValueError:
+                last_error = "the secret value is not JSON yet"
+            else:
+                username = str(value.get("username") or "")
+                password = str(value.get("password") or "")
+                if username and password:
+                    return AuroraReadiness(
+                        endpoint=str(database["Endpoint"]),
+                        secret_arn=secret_arn,
+                        kms_key_arn=str(master.get("KmsKeyId") or ""),
+                        username=username,
+                        password=password,
+                    )
+                last_error = "the secret value carries no username/password yet"
+        if attempt < attempts:
+            time.sleep(poll_seconds)
+    raise BootstrapError(
+        f"Aurora cluster {cluster_id}: master user secret is not readable after "
+        f"{attempts} attempts ({last_error})"
+    )
+
+
+def await_aurora_ready(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_ids: Sequence[str],
+) -> AuroraReadiness:
+    """Wait for the instances the foundation created, then read the credentials.
+
+    One describe decides which instances still need an ``rds wait``, so a rerun
+    against an available cluster issues no wait at all; the writer and reader
+    still creating on a first deploy are waited for together.
+    """
+
+    pending = pending_serverless_instances(
+        runner,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
+    )
+    await_serverless_instances(runner, aws_region=aws_region, instance_ids=pending)
+    return read_master_secret(runner, aws_region=aws_region, cluster_id=cluster_id)
+
+
+def assert_aurora_ready(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_ids: Sequence[str],
+    kubeconfig: Path,
+    namespace: str,
+) -> None:
+    """The read-only probe behind ``aurora_ready``: both instances available and
+    the control-plane Secret present, else ``BootstrapMutationRequired``.
+
+    Two reads, no wait: a probe answers in seconds. Nothing here reads Secret
+    material -- the jsonpath projects only the object's name.
+    """
+
+    pending = pending_serverless_instances(
+        runner,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        instance_ids=instance_ids,
+    )
+    if pending:
+        raise BootstrapMutationRequired(
+            f"Aurora instance(s) not available: {', '.join(pending)}"
+        )
+    present = kubectl_projection(
+        runner,
+        kubeconfig=kubeconfig,
+        namespace=namespace,
+        arguments=[
+            "get",
+            "secret",
+            AURORA_SECRET_NAME,
+            "-o",
+            "jsonpath={.metadata.name}",
+        ],
+    )
+    if present != AURORA_SECRET_NAME:
+        raise BootstrapMutationRequired(f"{AURORA_SECRET_NAME} Secret")
 
 
 def cluster_parameter_group_name(

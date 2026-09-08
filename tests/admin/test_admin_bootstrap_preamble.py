@@ -24,7 +24,11 @@ import pytest
 
 from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin import bootstrap_dependencies as admin_bootstrap_dependencies
-from gpu_fault.admin.bootstrap import RDS_CA_BUNDLE_ENVIRONMENT, _ensure_aurora
+from gpu_fault.admin.bootstrap import (
+    RDS_CA_BUNDLE_ENVIRONMENT,
+    _aurora_ready,
+    _ensure_aurora,
+)
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     BootstrapState,
@@ -470,7 +474,9 @@ class _AuroraAccount:
         return answers.get(operation, {})
 
 
-def _aurora(account: _AuroraAccount, monkeypatch, tmp_path: Path) -> dict:
+def _aurora(
+    account: _AuroraAccount, monkeypatch, tmp_path: Path, *, stub_instances: bool = True
+) -> dict:
     monkeypatch.setenv(RDS_CA_BUNDLE_ENVIRONMENT, "/etc/rds/ca.pem")
     monkeypatch.setattr(
         admin_bootstrap.subprocess,
@@ -482,9 +488,10 @@ def _aurora(account: _AuroraAccount, monkeypatch, tmp_path: Path) -> dict:
     monkeypatch.setattr(
         admin_bootstrap, "ensure_cluster_parameter_group", lambda *_a, **_k: "pg"
     )
-    monkeypatch.setattr(
-        admin_bootstrap, "ensure_serverless_instances", lambda *_a, **_k: ["w", "r"]
-    )
+    if stub_instances:
+        monkeypatch.setattr(
+            admin_bootstrap, "ensure_serverless_instances", lambda *_a, **_k: ["w", "r"]
+        )
     return _ensure_aurora(
         account,
         cpu=_cluster(),
@@ -526,3 +533,107 @@ def test_the_subnet_group_is_modified_when_its_subnets_drifted(
     _aurora(drifted, monkeypatch, tmp_path)
 
     assert "modify-db-subnet-group" in drifted.mutations
+
+
+def test_the_foundation_aurora_task_neither_waits_for_instances_nor_reads_the_secret(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The instance wait and the credential read moved to ``aurora_ready`` so the
+    monitoring and node-key installs no longer sit behind them. What RDS already
+    exposes -- the master secret ARN of an existing cluster -- still rides along,
+    so a checkpoint reader that knew the old shape keeps working."""
+
+    settled = _AuroraAccount(
+        subnet_group_subnets=["subnet-private-a", "subnet-private-b"]
+    )
+
+    result = _aurora(settled, monkeypatch, tmp_path, stub_instances=False)
+
+    operations = [argv[2] for argv in settled.calls if argv[0] == "aws"]
+    assert "wait" not in operations, "the foundation task waited for an instance"
+    assert "get-secret-value" not in operations, "the foundation read the secret"
+    assert "kubectl" not in settled.mutations, "the foundation applied the Secret"
+    assert result["instance_ids"] == [
+        "gpu-fault-site-a-aurora-writer",
+        "gpu-fault-site-a-aurora-reader",
+    ]
+    assert result["master_secret_arn"] == "arn:aws:secretsmanager:x"
+
+
+class _ReadyAccount(_AuroraAccount):
+    """The account as ``aurora_ready`` sees it: both instances available, and
+    the applied manifests kept so a test can read what reached kubectl."""
+
+    def __init__(self) -> None:
+        super().__init__(subnet_group_subnets=[])
+        self.applied: list[str] = []
+
+    def run(self, arguments, **kwargs) -> str:
+        argv = [str(item) for item in arguments]
+        if argv[0] == "kubectl" and "apply" in argv:
+            self.applied.append(str(kwargs.get("input_text")))
+        if argv[0] == "kubectl" and "secret" in argv and not kwargs.get("mutate"):
+            self.calls.append(argv)
+            return "gpu-fault-aurora"
+        return super().run(arguments, **kwargs)
+
+    def aws_json(self, region, *arguments, **kwargs) -> dict:
+        if arguments[1] == "describe-db-instances":
+            self.run(["aws", *arguments, "--region", region], **kwargs)
+            return {
+                "DBInstances": [
+                    {"DBInstanceIdentifier": "w", "DBInstanceStatus": "available"},
+                    {"DBInstanceIdentifier": "r", "DBInstanceStatus": "available"},
+                ]
+            }
+        return super().aws_json(region, *arguments, **kwargs)
+
+
+def _ready(account: _ReadyAccount, tmp_path: Path, *, probe_only: bool) -> dict:
+    return _aurora_ready(
+        account,
+        cpu=_cluster(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        aurora={"cluster_id": "gpu-fault-site-a-aurora", "instance_ids": ["w", "r"]},
+        probe_only=probe_only,
+    )
+
+
+def test_aurora_ready_hands_the_control_plane_its_secret_once_both_instances_are_up(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(RDS_CA_BUNDLE_ENVIRONMENT, "/etc/rds/ca.pem")
+    account = _ReadyAccount()
+
+    result = _ready(account, tmp_path, probe_only=False)
+
+    assert result == {
+        "master_secret_arn": "arn:aws:secretsmanager:x",
+        "master_secret_kms_key_arn": "k",
+    }
+    assert account.mutations == ["kubectl"], (
+        "aurora_ready mutated something other than the control-plane Secret"
+    )
+    manifest = json.loads(account.applied[0])
+    assert manifest["metadata"]["name"] == "gpu-fault-aurora"
+    assert manifest["stringData"]["master-secret-arn"] == "arn:aws:secretsmanager:x"
+    url = manifest["stringData"]["postgres-url"]
+    assert url.startswith("postgresql://u:p@c.cluster.example:5432/"), url
+    assert "sslmode=verify-full" in url
+
+
+def test_the_aurora_ready_probe_reads_two_facts_and_mutates_nothing(
+    tmp_path: Path,
+) -> None:
+    account = _ReadyAccount()
+
+    result = _ready(account, tmp_path, probe_only=True)
+
+    assert result == {}
+    assert account.mutations == []
+    operations = [argv[2] for argv in account.calls if argv[0] == "aws"]
+    assert operations == ["describe-db-instances"], operations
+    assert any(argv[0] == "kubectl" and "secret" in argv for argv in account.calls), (
+        "the probe did not check that the control-plane Secret is present"
+    )

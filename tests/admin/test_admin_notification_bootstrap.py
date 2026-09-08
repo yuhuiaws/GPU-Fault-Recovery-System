@@ -83,8 +83,47 @@ def test_configured_alert_email_is_recorded_as_the_routing_source(
     assert routing == NotificationRouting(
         sender="ops@example.com", recipients=("ops@example.com",), subject_prefix=""
     )
+    assert routing.channel == "sns", "a new site notifies over the site topic"
     assert state.value["resources"]["admin_email_source"] == "configured"
+    assert state.value["resources"]["notification_channel"] == "sns"
     assert runner.commands == [], "a configured address must not be looked up in AWS"
+
+
+@pytest.mark.parametrize(
+    ("notifications", "expected"),
+    [
+        (None, "sns"),
+        ({"adminEmail": "ops@example.com"}, "sns"),
+        # Written before the channel existed: bootstrap always filled a sender,
+        # and that sender is a verified SES identity the operator confirmed.
+        ({"adminEmail": "ops@example.com", "emailSender": "ops@example.com"}, "ses"),
+        ({"channel": "ses", "adminEmail": "ops@example.com"}, "ses"),
+        (
+            {
+                "channel": "sns",
+                "adminEmail": "ops@example.com",
+                "emailSender": "ops@example.com",
+            },
+            "sns",
+        ),
+    ],
+)
+def test_the_channel_comes_from_the_existing_site(
+    tmp_path: Path, notifications: dict[str, Any] | None, expected: str
+) -> None:
+    """A routine upgrade never moves a live site's notifications; the operator
+    flips ``spec.notifications.channel`` and reruns deploy."""
+
+    existing_site = (
+        {"spec": {"notifications": notifications}} if notifications else None
+    )
+
+    _admin_email, routing = notification_routing(
+        Runner(), _cpu(), _request(tmp_path), _state(tmp_path), existing_site
+    )
+
+    assert routing.channel == expected
+    assert routing.uses_ses is (expected == "ses")
 
 
 def test_discovered_alert_email_is_both_sender_and_recipient(tmp_path: Path) -> None:
@@ -148,6 +187,7 @@ def test_notification_tasks_send_as_the_routing_sender_and_alert_the_admin(
         sender="sender@example.com",
         recipients=("oncall@example.com",),
         subject_prefix="[PROD]",
+        channel="ses",
     )
     tasks = notification_bootstrap_tasks(
         Runner(),
@@ -171,6 +211,9 @@ def test_notification_tasks_send_as_the_routing_sender_and_alert_the_admin(
         task()
 
     assert calls["ensure_control_plane_role"]["email_sender"] == "sender@example.com"
+    assert calls["ensure_control_plane_role"]["sns_topic_arn"] is None, (
+        "an SES site's role gets no Publish grant it would never use"
+    )
     assert calls["ensure_email_notifications"]["routing"] == routing, (
         "the SES task receives the resolved routing whole"
     )
@@ -179,3 +222,50 @@ def test_notification_tasks_send_as_the_routing_sender_and_alert_the_admin(
     # comes from the sender, but a monitoring alarm has to reach a human.
     assert calls["ensure_monitoring_resources"]["alert_email"] == "ops@example.com"
     assert calls["ensure_monitoring_resources"]["state"] is state
+
+
+def test_sns_tasks_grant_publish_on_the_site_topic_and_no_ses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The default channel: the role may publish to the one site topic, whose
+    ARN is known before the monitoring task creates it, and no SES sender is
+    granted or verified."""
+
+    calls: dict[str, dict[str, Any]] = {}
+
+    def spy(name: str):
+        def record(runner: Any, **kwargs: Any) -> dict[str, str]:
+            calls[name] = kwargs
+            return {"name": name}
+
+        return record
+
+    for target in (
+        "ensure_control_plane_role",
+        "ensure_email_notifications",
+        "ensure_monitoring_resources",
+    ):
+        monkeypatch.setattr(admin_notification_bootstrap, target, spy(target))
+    routing = NotificationRouting(
+        sender="ops@example.com", recipients=("ops@example.com",), subject_prefix=""
+    )
+
+    tasks = notification_bootstrap_tasks(
+        Runner(),
+        state=_state(tmp_path),
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        routing=routing,
+    )
+    for task in tasks.values():
+        task()
+
+    assert calls["ensure_control_plane_role"]["email_sender"] is None
+    assert calls["ensure_control_plane_role"]["sns_topic_arn"] == (
+        "arn:aws:sns:us-west-2:123456789012:gpu-fault-site-a-alerts"
+    )
+    assert calls["ensure_email_notifications"]["routing"].channel == "sns"
+    assert calls["ensure_monitoring_resources"]["alert_email"] == "ops@example.com"
