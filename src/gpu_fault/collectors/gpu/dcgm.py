@@ -6,8 +6,8 @@ import math
 import os
 import subprocess
 import time
-from collections import OrderedDict, deque
-from datetime import datetime, timezone
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -15,7 +15,6 @@ from gpu_fault.channel_registry import GPU_METRICS_PATH
 from gpu_fault.env import env_bool
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
-    GpuMetricHistoryPoint,
     GpuMetricSample,
     GpuMetricSource,
     GpuMetricsThresholds,
@@ -42,6 +41,14 @@ DCGM_BLANK_MAGNITUDE = 9.0e18
 # A violation counter cannot accumulate more time than has elapsed. The small
 # margin absorbs the skew between the exporter's own sampling and ours.
 DUTY_CYCLE_MAX_PLAUSIBLE = 1.05
+# How long a device's violation counter stays written off as "not a duration"
+# before the collector says so again: long enough that a permanently broken
+# counter cannot warn every tick, short enough that an operator who joined
+# later still learns why the counter is ignored.
+DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS = 10
+# Consecutive temperature-limit failures after which the query drops to the
+# inventory cadence instead of costing every tick a 15 s subprocess timeout.
+TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD = 3
 DCGM_NANOSECOND_DURATION_FIELDS = {
     "power_violation_total_us",
     "thermal_violation_total_us",
@@ -179,6 +186,7 @@ class DcgmMetricsCollector:
         startup_spread_seconds: int | None = None,
         force_snapshot_path: str | None = None,
         violation_duty_cycle_threshold: float | None = None,
+        failure_backoff_threshold: int = 3,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -234,6 +242,11 @@ class DcgmMetricsCollector:
                 ("/var/lib/gpu-fault/health-snapshot/gpu.request"),
             )
         )
+        # ``GpuMetricBatch.context_history`` has always shipped empty: the
+        # control plane reads none of it, so the per-tick deque that fed it is
+        # gone. The bound stays configured and validated because the installer
+        # and the systemd unit still write it, and an operator who sets it to a
+        # nonsense value deserves the same startup failure as before.
         history_points = (
             history_max_points
             if history_max_points is not None
@@ -266,18 +279,26 @@ class DcgmMetricsCollector:
             raise ValueError(
                 "DCGM violation duty cycle threshold must be within (0, 1]"
             )
+        self.failure_backoff_threshold = failure_backoff_threshold
+        if self.failure_backoff_threshold <= 0:
+            raise ValueError("DCGM failure backoff threshold must be positive")
         self.thresholds = GpuMetricsThresholds.from_environment()
-        self._history: deque[GpuMetricHistoryPoint] = deque(maxlen=history_points)
-        self._previous_values: OrderedDict[str, float] = OrderedDict()
+        # Value *and* the time that value was first seen, per key: a counter is
+        # graded against its own previous observation, never against the
+        # collector's tick, so the exporter's collect interval cannot scale the
+        # duty cycle (F2).
+        self._previous_values: OrderedDict[str, tuple[float, datetime]] = OrderedDict()
         self._candidate_streaks: dict[str, int] = {}
-        self._implausible_duty_cycle_keys: set[str] = set()
-        self._last_observed_at: datetime | None = None
+        self._implausible_duty_cycle_keys: dict[str, datetime] = {}
         self._last_delivered_at: datetime | None = None
         self._last_inventory_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
         self._next_inventory_at: datetime | None = None
         self._temperature_limit_samples: list[GpuMetricSample] | None = None
+        self._temperature_limit_failures = 0
+        self._next_temperature_limit_attempt_at: datetime | None = None
         self._previous_devices: set[str] | None = None
+        self._consecutive_failures = 0
 
     def collect_text(
         self,
@@ -361,12 +382,6 @@ class DcgmMetricsCollector:
             evidence_ref=f"prometheus://{self.metrics_url}",
         )
         deliver, reasons = self._should_deliver(batch)
-        self._history.append(
-            GpuMetricHistoryPoint(
-                observed_at=timestamp,
-                samples=samples,
-            )
-        )
         if deliver:
             batch = batch.model_copy(
                 update={
@@ -440,7 +455,17 @@ class DcgmMetricsCollector:
     def _duty_cycle(
         self, sample: GpuMetricSample, observed_at: datetime
     ) -> float | None:
-        """Fraction of the elapsed interval spent in violation.
+        """Fraction of the counter's own elapsed window spent in violation.
+
+        The window is measured from the last observation that carried a
+        *different* value, not from the previous tick. The exporter refreshes
+        its counters on its own schedule (30 s by default), so a collector
+        scraping every 15 s reads the identical value on every other tick and
+        then attributes one full exporter window of accumulated violation time
+        to a single 15 s tick: a real 60% throttle graded 1.20, was written off
+        as an implausible counter, and never produced a delivery edge (F2).
+        Grading against the counter's own previous observation makes the result
+        independent of both cadences.
 
         Returns ``None`` while no comparable previous sample exists, and
         ``0`` for a counter reset, which is not itself a fault edge.
@@ -449,12 +474,13 @@ class DcgmMetricsCollector:
         if not self._is_duty_cycle_counter(sample):
             return None
         previous = self._previous_values.get(self._sample_key(sample))
-        if previous is None or self._last_observed_at is None:
+        if previous is None:
             return None
-        elapsed = (observed_at - self._last_observed_at).total_seconds()
+        previous_value, previous_observed_at = previous
+        elapsed = (observed_at - previous_observed_at).total_seconds()
         if elapsed <= 0:
             return None
-        delta = sample.value - previous
+        delta = sample.value - previous_value
         if delta <= 0:
             return 0.0
         return delta / (elapsed * 1_000_000)
@@ -463,6 +489,7 @@ class DcgmMetricsCollector:
         self,
         sample: GpuMetricSample,
         duty_cycle: float,
+        observed_at: datetime,
     ) -> bool:
         """Whether a violation-duration counter is a candidate this sample.
 
@@ -478,15 +505,28 @@ class DcgmMetricsCollector:
         the counter rather than through the summary phase. Refusing to grade an
         impossible duty cycle keeps the noise guard without letting an unusable
         counter mask the fault it is supposed to reveal.
+
+        The write-off is remembered per key only to rate-limit the warning, and
+        it expires after ``DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS`` intervals:
+        a counter that stays broken says so once per window rather than every
+        tick, and a device whose counter becomes usable again is forgotten, so
+        the next implausible value is reported immediately.
         """
 
+        key = self._sample_key(sample)
         if duty_cycle < self.violation_duty_cycle_threshold:
+            self._implausible_duty_cycle_keys.pop(key, None)
             return False
         if duty_cycle <= DUTY_CYCLE_MAX_PLAUSIBLE:
+            self._implausible_duty_cycle_keys.pop(key, None)
             return True
-        key = self._sample_key(sample)
-        if key not in self._implausible_duty_cycle_keys:
-            self._implausible_duty_cycle_keys.add(key)
+        warned_at = self._implausible_duty_cycle_keys.get(key)
+        expiry_seconds = self.interval_seconds * DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS
+        if (
+            warned_at is None
+            or (observed_at - warned_at).total_seconds() >= expiry_seconds
+        ):
+            self._implausible_duty_cycle_keys[key] = observed_at
             LOGGER.warning(
                 "ignoring %s for edge detection on %s: duty cycle %.2f exceeds "
                 "the elapsed interval, so the counter is not a duration in "
@@ -527,7 +567,9 @@ class DcgmMetricsCollector:
                 or (name == "xid_last_error" and sample.value > 0)
             )
             duty_cycle = self._duty_cycle(sample, batch.observed_at)
-            if duty_cycle is not None and self._duty_cycle_breached(sample, duty_cycle):
+            if duty_cycle is not None and self._duty_cycle_breached(
+                sample, duty_cycle, batch.observed_at
+            ):
                 breached = True
             if breached:
                 candidates.add(self._sample_key(sample))
@@ -573,8 +615,9 @@ class DcgmMetricsCollector:
         lost_devices = self._lost_devices(batch)
         if not self.edge_filter_enabled:
             for sample in batch.samples:
-                self._remember_value(self._sample_key(sample), sample.value)
-            self._last_observed_at = batch.observed_at
+                self._remember_value(
+                    self._sample_key(sample), sample.value, batch.observed_at
+                )
             return True, ["filter-disabled"]
         reasons: list[str] = []
         if lost_devices:
@@ -622,7 +665,7 @@ class DcgmMetricsCollector:
 
         for sample in batch.samples:
             key = self._sample_key(sample)
-            previous = self._remember_value(key, sample.value)
+            previous = self._remember_value(key, sample.value, batch.observed_at)
             if (
                 previous is not None
                 and self._is_counter(sample)
@@ -637,16 +680,28 @@ class DcgmMetricsCollector:
                 and sample.value != previous
             ):
                 reasons.append("xid-changed")
-        self._last_observed_at = batch.observed_at
         return bool(reasons), list(dict.fromkeys(reasons))
 
-    def _remember_value(self, key: str, value: float) -> float | None:
+    def _remember_value(
+        self, key: str, value: float, observed_at: datetime
+    ) -> float | None:
+        """Record this key's value and return the previous one.
+
+        An unchanged value keeps the timestamp of the observation that first
+        carried it, so a counter the exporter has not refreshed yet is graded
+        over the window it actually accumulated in rather than over one
+        collector tick (F2).
+        """
+
         previous = self._previous_values.get(key)
-        self._previous_values[key] = value
+        if previous is not None and previous[0] == value:
+            self._previous_values[key] = (value, previous[1])
+        else:
+            self._previous_values[key] = (value, observed_at)
         self._previous_values.move_to_end(key)
         while len(self._previous_values) > self.state_max_keys:
             self._previous_values.popitem(last=False)
-        return previous
+        return None if previous is None else previous[0]
 
     def collect_once(self) -> GpuMetricBatch:
         observed_at = self.now()
@@ -684,7 +739,14 @@ class DcgmMetricsCollector:
                     snapshot.snapshot_id,
                     len(snapshot.devices),
                 )
-            except CollectorError:
+            # Every inventory failure mode is a CollectorError by contract
+            # (`query_gpu_inventory`, `read_host_boot_id`, and the snapshot's own
+            # pydantic validation), and none of them may cost the scrape its
+            # tick: an operator `--expected-gpu-count` below the real device
+            # count used to silence GPU_METRICS on the node entirely (F3). The
+            # subprocess exceptions are caught as well so a future runner cannot
+            # reopen that path.
+            except (CollectorError, OSError, subprocess.TimeoutExpired):
                 LOGGER.exception("mandatory GPU inventory delivery failed")
         try:
             with urlopen(self.metrics_url, timeout=10) as response:
@@ -693,21 +755,106 @@ class DcgmMetricsCollector:
             raise CollectorError(
                 f"cannot scrape DCGM exporter: {self.metrics_url}"
             ) from exc
-        if self._temperature_limit_samples is None:
-            try:
-                discovered = query_nvidia_temperature_limits(self.runner)
-                if discovered:
-                    self._temperature_limit_samples = discovered
-            except CollectorError as exc:
-                LOGGER.warning(
-                    "NVIDIA temperature limits unavailable; "
-                    "using configured fallback thresholds: %s",
-                    exc,
-                )
+        self._refresh_temperature_limits(observed_at)
         return self.collect_text(
             text,
             observed_at=observed_at,
             extra_samples=self._temperature_limit_samples,
+        )
+
+    def _refresh_temperature_limits(self, observed_at: datetime) -> None:
+        """Read the firmware temperature limits once, and never at the tick's cost.
+
+        A wedged driver hangs ``nvidia-smi -q -x`` for its full 15 s timeout and
+        then raises ``TimeoutExpired``, which is not a ``CollectorError``: it
+        escaped the guard here *after* the DCGM scrape had already succeeded, so
+        the node's telemetry went silent for the whole hang (F1). After
+        ``TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD`` consecutive failures the
+        retry drops to the inventory cadence, so a driver that stays wedged
+        costs one probe per inventory interval instead of one per tick.
+        """
+
+        if self._temperature_limit_samples is not None:
+            return
+        if (
+            self._next_temperature_limit_attempt_at is not None
+            and observed_at < self._next_temperature_limit_attempt_at
+        ):
+            return
+        try:
+            discovered = query_nvidia_temperature_limits(self.runner)
+        except (CollectorError, OSError, subprocess.TimeoutExpired) as exc:
+            self._temperature_limit_failures += 1
+            if (
+                self._temperature_limit_failures
+                >= TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD
+            ):
+                self._next_temperature_limit_attempt_at = observed_at + timedelta(
+                    seconds=self.inventory_interval_seconds
+                )
+            LOGGER.warning(
+                "NVIDIA temperature limits unavailable (%d consecutive); "
+                "using configured fallback thresholds: %s",
+                self._temperature_limit_failures,
+                exc,
+            )
+            return
+        self._temperature_limit_failures = 0
+        self._next_temperature_limit_attempt_at = None
+        if discovered:
+            self._temperature_limit_samples = discovered
+
+    def _report_collection_error(self, exc: BaseException) -> None:
+        """Deliver an erroring, sample-less batch so the node is not silent.
+
+        DCGM mode used to log the failure and sleep: a dead exporter, a hung
+        ``nvidia-smi``, or an unusable inventory reached the control plane only
+        as GPU_METRICS silence, which cannot be told apart from a dead
+        collector or a dead node (F5).
+        """
+
+        timestamp = self.now()
+        batch = GpuMetricBatch(
+            batch_id=(f"dcgm-{self.node_id}-{int(timestamp.timestamp() * 1_000_000)}"),
+            cluster_id=self.context.cluster_id,
+            node_id=self.node_id,
+            observed_at=timestamp,
+            collected_at=timestamp,
+            source=GpuMetricSource.DCGM_EXPORTER,
+            samples=[],
+            collection_errors=[f"{type(exc).__name__}: {exc}"],
+            edge_filter_reasons=["collection-error"],
+            runtime_profile_version=(self.context.runtime_profile_version),
+            product=self.context.product,
+            driver_branch=self.context.driver_branch,
+            cuda_version=self.context.cuda_version,
+            workload_state=self.context.workload_state,
+            affected_workload_ids=(self.context.affected_workload_ids),
+            checkpoint_manifest_ref=(self.context.checkpoint_manifest_ref),
+            evidence_ref=f"prometheus://{self.metrics_url}",
+        )
+        try:
+            deliver_event(
+                self.sink, GPU_METRICS_PATH, batch.model_dump(mode="json")
+            ).raise_for_failure()
+        except Exception:
+            LOGGER.exception("DCGM collection error report was not delivered")
+
+    def next_interval_seconds(self) -> float:
+        """The sleep before the next tick: the interval, doubled while failing.
+
+        Mirrors the nvidia-smi collector: the first
+        ``failure_backoff_threshold - 1`` failures keep the normal cadence so a
+        transient blip is retried promptly; from the threshold on the wait
+        doubles per failure, capped at four intervals.
+        """
+
+        excess = self._consecutive_failures - self.failure_backoff_threshold
+        if excess < 0:
+            return self.interval_seconds
+        return min(
+            self.interval_seconds * 4,
+            self.interval_seconds * float(2 ** (excess + 1)),
         )
 
     def run(self) -> None:
@@ -731,12 +878,18 @@ class DcgmMetricsCollector:
             try:
                 self.collect_once()
                 succeeded = True
-            except Exception:
-                LOGGER.exception("DCGM metrics collection failed")
+                self._consecutive_failures = 0
+            except Exception as exc:
+                self._consecutive_failures += 1
+                LOGGER.exception(
+                    "DCGM metrics collection failed (%d consecutive)",
+                    self._consecutive_failures,
+                )
+                self._report_collection_error(exc)
             if force_snapshot and succeeded:
                 self.force_snapshot_path.unlink(missing_ok=True)
                 force_snapshot = False
-            time.sleep(self.interval_seconds)
+            time.sleep(self.next_interval_seconds())
 
 
 def build_from_environment(

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from pydantic import ValidationError
+
 from gpu_fault.channel_registry import GPU_INVENTORY_PATH
 from gpu_fault.gpu_metrics import (
     GpuInventoryDevice,
@@ -89,14 +91,27 @@ CUDA_VERSION_PATTERN = re.compile(r"\bCUDA Version:\s*(\d+(?:\.\d+)*)", re.IGNOR
 def query_nvidia_temperature_limits(
     runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
 ) -> list[GpuMetricSample]:
-    """Read firmware/driver temperature limits from nvidia-smi XML."""
-    result = runner(
-        ["nvidia-smi", "-q", "-x"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    """Read firmware/driver temperature limits from nvidia-smi XML.
+
+    Every failure mode answers ``CollectorError``, the way
+    ``query_gpu_inventory`` does: a wedged driver hangs this call into
+    ``TimeoutExpired`` and a missing binary raises ``FileNotFoundError``, and
+    both used to escape the caller's ``except CollectorError`` guard *after*
+    the DCGM scrape had already succeeded, discarding the whole tick.
+    """
+
+    try:
+        result = runner(
+            ["nvidia-smi", "-q", "-x"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CollectorError(
+            f"nvidia-smi temperature limit query unavailable: {exc}"
+        ) from exc
     if result.returncode != 0:
         raise CollectorError(
             "nvidia-smi temperature limit query failed: " + result.stderr.strip()
@@ -347,15 +362,22 @@ def query_gpu_inventory(
         )
     if not devices:
         raise CollectorError("nvidia-smi returned no GPU inventory")
-    # Reuse the model's duplicate/invariant validation.
-    GpuInventorySnapshot(
-        cluster_id="validation",
-        node_id="validation",
-        observed_at=datetime.now(timezone.utc),
-        source=GpuMetricSource.NVIDIA_SMI,
-        source_boot_id="validation",
-        devices=devices,
-    )
+    # Reuse the model's duplicate/invariant validation. Its ``ValidationError``
+    # is a ``ValueError``, so it has to be converted here or a duplicate UUID
+    # escapes every caller's ``except CollectorError``.
+    try:
+        GpuInventorySnapshot(
+            cluster_id="validation",
+            node_id="validation",
+            observed_at=datetime.now(timezone.utc),
+            source=GpuMetricSource.NVIDIA_SMI,
+            source_boot_id="validation",
+            devices=devices,
+        )
+    except ValidationError as exc:
+        raise CollectorError(
+            f"nvidia-smi GPU inventory failed validation: {exc}"
+        ) from exc
     return sorted(devices, key=lambda item: item.gpu_index)
 
 
@@ -367,23 +389,35 @@ def deliver_gpu_inventory(
     observed_at: datetime,
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> GpuInventorySnapshot:
-    expected = expected_gpu_count_from_environment()
-    snapshot = GpuInventorySnapshot(
-        snapshot_id=(
-            f"gpu-inventory-{node_id}-{int(observed_at.timestamp() * 1_000_000)}"
-        ),
-        cluster_id=context.cluster_id,
-        node_id=node_id,
-        observed_at=observed_at,
-        collected_at=observed_at,
-        source=GpuMetricSource.NVIDIA_SMI,
-        source_boot_id=read_host_boot_id(),
-        node_instance_id=(os.getenv("GPU_FAULT_NODE_INSTANCE_ID") or None),
-        devices=query_gpu_inventory(runner),
-        expected_gpu_count=expected,
-        runtime_profile_version=context.runtime_profile_version,
-        evidence_ref=f"nvidia-smi://{node_id}/inventory",
-    )
+    devices = query_gpu_inventory(runner)
+    boot_id = read_host_boot_id()
+    # ``GpuInventorySnapshot`` enforces its own invariants with pydantic, whose
+    # ``ValidationError`` is a ``ValueError`` and not a ``CollectorError``: an
+    # operator ``--expected-gpu-count`` below the real device count (or a
+    # malformed ``GPU_FAULT_EXPECTED_GPU_COUNT``) used to escape every caller's
+    # guard and take the whole collection tick down with it.
+    try:
+        expected = expected_gpu_count_from_environment()
+        snapshot = GpuInventorySnapshot(
+            snapshot_id=(
+                f"gpu-inventory-{node_id}-{int(observed_at.timestamp() * 1_000_000)}"
+            ),
+            cluster_id=context.cluster_id,
+            node_id=node_id,
+            observed_at=observed_at,
+            collected_at=observed_at,
+            source=GpuMetricSource.NVIDIA_SMI,
+            source_boot_id=boot_id,
+            node_instance_id=(os.getenv("GPU_FAULT_NODE_INSTANCE_ID") or None),
+            devices=devices,
+            expected_gpu_count=expected,
+            runtime_profile_version=context.runtime_profile_version,
+            evidence_ref=f"nvidia-smi://{node_id}/inventory",
+        )
+    except ValidationError as exc:
+        raise CollectorError(f"GPU inventory snapshot is not valid: {exc}") from exc
+    except ValueError as exc:
+        raise CollectorError(f"GPU inventory snapshot is not usable: {exc}") from exc
     result = deliver_event(
         sink,
         GPU_INVENTORY_PATH,

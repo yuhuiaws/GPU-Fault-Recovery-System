@@ -221,6 +221,234 @@ def test_dcgm_vanished_device_with_confirmed_candidate_is_not_recovered() -> Non
     )
 
 
+class _DcgmExporterResponse:
+    """The keep-alive response object ``dcgm.urlopen`` returns."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def __enter__(self) -> _DcgmExporterResponse:
+        return self
+
+    def __exit__(self, *_args) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._text.encode("utf-8")
+
+
+_DCGM_SCRAPE = 'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 80\n'
+
+
+def _dcgm_environment(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("boot-a\n", encoding="ascii")
+    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+
+
+def _stop_dcgm_after(monkeypatch: pytest.MonkeyPatch, count: int) -> list[float]:
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= count:
+            raise StopIteration
+
+    monkeypatch.setattr("gpu_fault.collectors.gpu.dcgm.time.sleep", sleep)
+    return sleeps
+
+
+def test_dcgm_scrape_is_delivered_when_temperature_limit_query_hangs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A wedged driver hangs ``nvidia-smi -q -x``; the exporter still answers.
+
+    ``query_nvidia_temperature_limits`` let ``TimeoutExpired`` escape the
+    ``except CollectorError`` guard *after* the scrape had already succeeded, so
+    the node's DCGM telemetry went silent for the whole hang.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.urlopen",
+        lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
+    )
+    hangs: list[list[str]] = []
+
+    def runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
+        if "-q" in command:
+            hangs.append(list(command))
+            raise subprocess.TimeoutExpired(list(command), timeout=15)
+        return subprocess.CompletedProcess(
+            command, 0, stdout="0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n", stderr=""
+        )
+
+    sink = RecordingSink()
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=runner,
+        inventory_interval_seconds=3600,
+    )
+
+    collector.collect_once()
+    collector.collect_once()
+
+    metrics = [payload for path, payload in sink.requests if path == GPU_METRICS_PATH]
+    assert len(metrics) == 1, (
+        "a hung nvidia-smi -q -x discarded a successful DCGM scrape"
+    )
+    assert hangs, "the temperature-limit query was never attempted"
+
+
+def test_dcgm_metrics_survive_inventory_validation_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """``--expected-gpu-count 4`` on an 8-GPU node must not silence metrics.
+
+    ``GpuInventorySnapshot`` raises pydantic's ``ValidationError`` -- a
+    ``ValueError``, not a ``CollectorError`` -- so the tick died before the
+    scrape, and because the inventory schedule never advanced it died the same
+    way on every following tick.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("GPU_FAULT_EXPECTED_GPU_COUNT", "4")
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.urlopen",
+        lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
+    )
+    sink = RecordingSink()
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=_inventory_runner(8),
+        inventory_interval_seconds=3600,
+    )
+
+    collector.collect_once()
+    collector.collect_once()
+
+    paths = [path for path, _payload in sink.requests]
+    assert paths.count(GPU_METRICS_PATH) == 1, (
+        "an unusable expected GPU count blocked every metrics tick"
+    )
+    assert paths.count(GPU_INVENTORY_PATH) == 0, (
+        "an invalid inventory snapshot must not be delivered"
+    )
+
+
+def test_dcgm_temperature_limit_query_backs_off_after_repeated_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A driver that stays wedged must not cost one 15 s probe per tick.
+
+    ``nvidia-smi -q -x`` hangs for its full timeout while the driver is wedged.
+    Probing it every 15 s tick keeps a hung subprocess permanently in flight, so
+    after three consecutive failures the retry drops to the inventory cadence.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.urlopen",
+        lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
+    )
+    probes: list[list[str]] = []
+
+    def runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
+        if "-q" in command:
+            probes.append(list(command))
+            raise subprocess.TimeoutExpired(list(command), timeout=15)
+        return subprocess.CompletedProcess(
+            command, 0, stdout="0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n", stderr=""
+        )
+
+    ticks = iter(NOW + timedelta(seconds=15 * step) for step in range(7))
+    collector = DcgmMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        inventory_interval_seconds=60,
+        now=lambda: next(ticks),
+        runner=runner,
+    )
+
+    for _ in range(3):
+        collector.collect_once()
+
+    assert len(probes) == 3, "the first three ticks each probe the limits once"
+
+    for _ in range(3):
+        collector.collect_once()
+
+    assert len(probes) == 3, (
+        "a wedged limits query must back off to the inventory interval, "
+        f"not run on every tick: {len(probes)} probes"
+    )
+
+    collector.collect_once()
+
+    assert len(probes) == 4, "the probe resumes once the inventory interval elapses"
+
+
+def test_dcgm_run_reports_scrape_failure_as_error_batch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A dead exporter must reach the control plane as an error, not as silence.
+
+    DCGM mode logged the failure and slept the same interval, so the control
+    plane learned of it only from the 420 s GPU_METRICS silence threshold and
+    could not tell a dead exporter from a dead collector.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("gpu_fault.collectors.gpu.dcgm.urlopen", refuse)
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        startup_spread_seconds=1,
+        force_snapshot_path=str(tmp_path / "gpu.request"),
+        now=lambda: NOW,
+        runner=_inventory_runner(8),
+    )
+    sleeps = _stop_dcgm_after(monkeypatch, 4)
+
+    with pytest.raises(StopIteration):
+        collector.run()
+
+    errors = [
+        payload
+        for path, payload in sink.requests
+        if path == GPU_METRICS_PATH and payload["collection_errors"]
+    ]
+    assert len(errors) == 3, (
+        f"every failed DCGM round must report an error batch: {sink.requests}"
+    )
+    assert errors[0]["samples"] == [], "an erroring round carries no metric samples"
+    assert errors[0]["edge_filter_reasons"] == ["collection-error"], errors[0]
+    assert any(
+        "cannot scrape DCGM exporter" in item for item in errors[0]["collection_errors"]
+    ), errors[0]["collection_errors"]
+    # The startup spread, then two plain intervals, then the doubling backoff.
+    assert sleeps[1:] == [15, 15, 30], sleeps
+
+
 def _inventory_runner(count: int):
     def runner(argv, **_kwargs):
         if "-q" in argv:

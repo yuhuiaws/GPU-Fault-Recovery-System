@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from ._support import (
     NOW,
     NVIDIA_SMI_CORE_FIELDS,
@@ -328,6 +330,113 @@ def test_dcgm_edge_filter_ignores_a_violation_counter_that_outruns_the_clock() -
     assert len(reasons) == 2
     assert reasons[0] == ["initial-baseline"]
     assert "candidate-confirmed" in reasons[1]
+
+
+DCGM_LOGGER = "gpu_fault.collectors.gpu.dcgm"
+
+
+def _power_violation_text(nanoseconds: int) -> str:
+    return (
+        'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
+        "DCGM_FI_DEV_POWER_VIOLATION"
+        f'{{gpu="0",UUID="GPU-a"}} {nanoseconds}\n'
+    )
+
+
+def _duty_cycle_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == DCGM_LOGGER and "duty cycle" in record.getMessage()
+    ]
+
+
+def test_duty_cycle_uses_the_counters_own_previous_observation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The exporter's refresh rate must not double the graded duty cycle.
+
+    A 30 s exporter collect interval scraped every 15 s repeats the identical
+    counter value on every other tick, so a real 18 s-per-30 s throttle was
+    divided by a 15 s wall clock, graded 1.20, and written off as a counter
+    that does not hold microseconds. Grading from the counter's own previous
+    observation restores the true 0.60.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=1,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=DCGM_LOGGER):
+        collector.collect_text(_power_violation_text(0), observed_at=NOW)
+        collector.collect_text(
+            _power_violation_text(0), observed_at=NOW + timedelta(seconds=15)
+        )
+        collector.collect_text(
+            _power_violation_text(18_000_000_000),
+            observed_at=NOW + timedelta(seconds=30),
+        )
+
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    assert reasons == [["initial-baseline"], ["candidate-confirmed"]], (
+        "a 60% throttle spanning two scrapes of one exporter sample was not graded"
+    )
+    assert _duty_cycle_warnings(caplog) == [], (
+        "the true 60% duty cycle was rejected as implausible"
+    )
+
+
+def test_implausible_duty_cycle_blacklist_expires(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A counter that is not a duration stays ignored, but not silently forever.
+
+    The warning that a device's violation counter outruns the clock was emitted
+    once per process lifetime, so an operator who joined later never saw why the
+    counter was ignored. It re-arms after ten intervals -- and not sooner, so a
+    permanently broken counter cannot warn every tick.
+    """
+
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        health_summary_seconds=3600,
+        edge_confirmation_samples=1,
+        violation_duty_cycle_threshold=0.05,
+    )
+
+    # 1.1e9 ns of claimed throttling per wall-clock second: implausible at
+    # every spacing, so the duty cycle can never be graded.
+    def text(seconds: int) -> str:
+        return _power_violation_text(1_100_000_000 * seconds)
+
+    with caplog.at_level(logging.WARNING, logger=DCGM_LOGGER):
+        collector.collect_text(text(0), observed_at=NOW)
+        collector.collect_text(text(15), observed_at=NOW + timedelta(seconds=15))
+        collector.collect_text(text(30), observed_at=NOW + timedelta(seconds=30))
+        warned_within_the_window = _duty_cycle_warnings(caplog)
+        collector.collect_text(text(180), observed_at=NOW + timedelta(seconds=180))
+
+    assert len(warned_within_the_window) == 1, (
+        "a broken counter must warn once per expiry window, not every tick"
+    )
+    assert len(_duty_cycle_warnings(caplog)) == 2, (
+        "the implausible-counter warning never re-armed after ten intervals"
+    )
+    reasons = [payload["edge_filter_reasons"] for _path, payload in sink.requests]
+    assert reasons == [["initial-baseline"]], (
+        "an implausible duty cycle must not become a candidate after expiry"
+    )
 
 
 def test_dcgm_violation_duty_cycle_threshold_is_validated() -> None:
@@ -834,21 +943,146 @@ GPU_INVENTORY_CHANNEL = "/v1/collector-events/gpu-inventory"
 GPU_METRICS_CHANNEL = "/v1/collector-events/gpu-metrics"
 
 
-def _nvidia_smi_runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
-    """Answer the inventory and core-metric queries; refuse everything else.
+_NVIDIA_SMI_VALUES = {
+    "index": "0",
+    "uuid": "GPU-a",
+    "name": "NVIDIA H100",
+    "pci.bus_id": "00000000:B9:00.0",
+    "temperature.gpu": "75",
+    "power.draw": "350.5",
+    "utilization.gpu": "98",
+    "utilization.memory": "72",
+    "memory.used": "40000",
+    "memory.free": "41000",
+    "remapped_rows.pending": "Yes",
+    "remapped_rows.failure": "No",
+}
 
-    The optional ECC/retired/remap queries and the XML temperature-limit query
-    are allowed to fail: the collector treats them as best effort.
+
+def _nvidia_smi_csv(command) -> str:
+    """One CSV row answering exactly the fields the command asked for."""
+
+    prefix = "--query-gpu="
+    requested = next(
+        str(item)[len(prefix) :] for item in command if str(item).startswith(prefix)
+    )
+    return (
+        ", ".join(_NVIDIA_SMI_VALUES.get(field, "0") for field in requested.split(","))
+        + "\n"
+    )
+
+
+def _nvidia_smi_runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
+    """Answer the inventory and metric queries; refuse everything else.
+
+    The XML temperature-limit query is allowed to fail: the collector treats it
+    as best effort.
     """
 
     joined = " ".join(str(item) for item in command)
     if "--query-gpu=index,uuid,pci.bus_id,name" in joined:
         return completed_nvidia_smi("0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n")
     if "temperature.gpu" in joined:
-        return completed_nvidia_smi(
-            "0, GPU-a, NVIDIA H100, 00000000:B9:00.0, 75, 350.5, 98, 72, 40000, 41000\n"
-        )
+        return completed_nvidia_smi(_nvidia_smi_csv(command))
     return completed_nvidia_smi("", returncode=1, stderr="unsupported query")
+
+
+def _nvidia_smi_environment(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("boot-a\n", encoding="ascii")
+    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+
+
+def test_nvidia_smi_round_issues_one_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Four ``--query-gpu`` calls per round cost four 15 s timeouts.
+
+    With a slow driver a round took up to 90 s and ``observed_at``, stamped
+    before the first call, predated the samples by that much -- which is the
+    spacing the control plane divides its counter rates by.
+    """
+
+    _nvidia_smi_environment(monkeypatch, tmp_path)
+    queries: list[str] = []
+
+    def runner(command, **kwargs) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(str(item) for item in command)
+        if "temperature.gpu" in joined:
+            queries.append(joined)
+        return _nvidia_smi_runner(command, **kwargs)
+
+    times = iter([NOW, NOW + timedelta(seconds=3)])
+    collector = NvidiaSmiMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=runner,
+    )
+
+    batch = collector.collect_once()
+
+    assert len(queries) == 1, f"one round must issue one --query-gpu: {queries}"
+    canonical = {sample.canonical_name for sample in batch.samples}
+    assert {
+        "gpu_temperature_c",
+        "ecc_sbe_volatile_total",
+        "retired_pages_pending",
+        "row_remap_failure",
+    } <= canonical, canonical
+    assert batch.observed_at == NOW + timedelta(seconds=3), (
+        "observed_at must be stamped after the query returned"
+    )
+
+
+def test_nvidia_smi_round_splits_the_query_only_when_a_field_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """One unsupported field costs its group, never the whole round."""
+
+    _nvidia_smi_environment(monkeypatch, tmp_path)
+    queries: list[str] = []
+
+    def runner(command, **kwargs) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(str(item) for item in command)
+        if "--query-gpu=index,uuid,pci.bus_id,name" in joined:
+            return _nvidia_smi_runner(command, **kwargs)
+        queries.append(joined)
+        if "retired_pages.pending" in joined:
+            return completed_nvidia_smi(
+                "",
+                returncode=1,
+                stderr='Field "retired_pages.pending" is not a valid field to query.',
+            )
+        if "--query-gpu=" not in joined:
+            return completed_nvidia_smi("", returncode=1, stderr="no xml")
+        return completed_nvidia_smi(_nvidia_smi_csv(command))
+
+    times = iter([NOW, NOW + timedelta(seconds=3)])
+    collector = NvidiaSmiMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=runner,
+    )
+
+    batch = collector.collect_once()
+
+    canonical = {sample.canonical_name for sample in batch.samples}
+    assert "gpu_temperature_c" in canonical, (
+        "a refused optional field blanked the required core metrics"
+    )
+    assert "ecc_sbe_volatile_total" in canonical, (
+        "a refused optional field blanked an unrelated optional group"
+    )
+    assert "retired_pages_pending" not in canonical, canonical
+    assert len([item for item in queries if "--query-gpu=" in item]) == 5, (
+        f"the refused merged query must split into the four groups: {queries}"
+    )
 
 
 def test_nvidia_smi_inventory_the_outbox_took_is_not_re_sent_every_round(
@@ -862,13 +1096,18 @@ def test_nvidia_smi_inventory_the_outbox_took_is_not_re_sent_every_round(
     sample-less error batch for a round whose records were all safely buffered.
     """
 
-    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
-    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
-    boot_id = tmp_path / "boot_id"
-    boot_id.write_text("boot-a\n", encoding="ascii")
-    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+    _nvidia_smi_environment(monkeypatch, tmp_path)
     sink = BufferingSink()
-    times = iter([NOW, NOW + timedelta(seconds=30)])
+    # Two stamps per round: the schedule check, then the batch's own
+    # ``observed_at`` once the merged query has returned.
+    times = iter(
+        [
+            NOW,
+            NOW + timedelta(seconds=1),
+            NOW + timedelta(seconds=30),
+            NOW + timedelta(seconds=31),
+        ]
+    )
     collector = NvidiaSmiMetricsCollector(
         sink,
         context(),

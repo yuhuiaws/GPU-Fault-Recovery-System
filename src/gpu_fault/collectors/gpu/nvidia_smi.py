@@ -146,17 +146,17 @@ class NvidiaSmiMetricsCollector:
         self._consecutive_failures = 0
 
     def collect_once(self) -> GpuMetricBatch:
-        timestamp = self.now()
+        started_at = self.now()
         if (
             self._last_inventory_delivered_at is None
             or (
                 self._next_inventory_at is not None
-                and timestamp >= self._next_inventory_at
+                and started_at >= self._next_inventory_at
             )
             or (
                 self._next_inventory_at is None
                 and self._last_inventory_delivered_at is not None
-                and (timestamp - self._last_inventory_delivered_at).total_seconds()
+                and (started_at - self._last_inventory_delivered_at).total_seconds()
                 >= self.inventory_interval_seconds
             )
         ):
@@ -164,24 +164,18 @@ class NvidiaSmiMetricsCollector:
                 self.sink,
                 self.context,
                 node_id=self.node_id,
-                observed_at=timestamp,
+                observed_at=started_at,
                 runner=self.runner,
             )
-            self._last_inventory_delivered_at = timestamp
+            self._last_inventory_delivered_at = started_at
             self._next_inventory_at = next_stable_phase(
-                timestamp,
+                started_at,
                 cluster_id=self.context.cluster_id,
                 node_id=self.node_id,
                 channel="gpu-inventory",
                 interval_seconds=self.inventory_interval_seconds,
             )
-        samples = self._query(NVIDIA_SMI_CORE_FIELDS, required=True)
-        for optional_fields in (
-            NVIDIA_SMI_ECC_FIELDS,
-            NVIDIA_SMI_RETIRED_FIELDS,
-            NVIDIA_SMI_REMAP_FIELDS,
-        ):
-            samples.extend(self._query(optional_fields, required=False))
+        samples = self._collect_samples()
         if self._temperature_limit_samples is None:
             try:
                 discovered = query_nvidia_temperature_limits(self.runner)
@@ -194,6 +188,10 @@ class NvidiaSmiMetricsCollector:
                     exc,
                 )
         samples.extend(self._temperature_limit_samples or [])
+        # Stamped only now: with a slow driver the queries above can take most
+        # of a minute, and an ``observed_at`` from the top of the round is the
+        # spacing the control plane divides its counter rates by (F6).
+        timestamp = self.now()
         batch = GpuMetricBatch(
             batch_id=(
                 f"nvidia-smi-{self.node_id}-{int(timestamp.timestamp() * 1_000_000)}"
@@ -318,6 +316,55 @@ class NvidiaSmiMetricsCollector:
         except Exception:
             LOGGER.exception("nvidia-smi collection error report was not delivered")
 
+    def _collect_samples(self) -> list[GpuMetricSample]:
+        """Every metric field of one round, in as few subprocesses as possible.
+
+        Four ``--query-gpu`` calls per round cost four 15 s timeouts on a slow
+        driver, so a round could run 90 s (F6). One merged query answers them
+        all; ``nvidia-smi`` refuses a *whole* query it cannot parse, so a
+        non-zero exit -- and only a non-zero exit -- falls back to the per-group
+        queries, where one unsupported field group costs itself and nothing
+        else. Fields the driver reports as ``[Not Supported]`` inside a
+        successful query are skipped per field by ``parse_csv`` as before.
+        """
+
+        merged: dict[str, tuple[str, str | None]] = {
+            **NVIDIA_SMI_CORE_FIELDS,
+            **NVIDIA_SMI_ECC_FIELDS,
+            **NVIDIA_SMI_RETIRED_FIELDS,
+            **NVIDIA_SMI_REMAP_FIELDS,
+        }
+        query_fields = [*self._IDENTITY_FIELDS, *merged]
+        result = self._run_query(query_fields)
+        if result.returncode == 0:
+            return self.parse_csv(result.stdout, query_fields, merged)
+        LOGGER.warning(
+            "merged nvidia-smi query refused (%s); querying each field group",
+            result.stderr.strip() or "no error detail",
+        )
+        samples = self._query(NVIDIA_SMI_CORE_FIELDS, required=True)
+        for optional_fields in (
+            NVIDIA_SMI_ECC_FIELDS,
+            NVIDIA_SMI_RETIRED_FIELDS,
+            NVIDIA_SMI_REMAP_FIELDS,
+        ):
+            samples.extend(self._query(optional_fields, required=False))
+        return samples
+
+    def _run_query(self, query_fields: list[str]) -> subprocess.CompletedProcess[str]:
+        command = [
+            "nvidia-smi",
+            f"--query-gpu={','.join(query_fields)}",
+            "--format=csv,noheader,nounits",
+        ]
+        return self.runner(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
     def _query(
         self,
         fields: dict[str, tuple[str, str | None]],
@@ -325,18 +372,7 @@ class NvidiaSmiMetricsCollector:
         required: bool,
     ) -> list[GpuMetricSample]:
         query_fields = [*self._IDENTITY_FIELDS, *fields]
-        command = [
-            "nvidia-smi",
-            f"--query-gpu={','.join(query_fields)}",
-            "--format=csv,noheader,nounits",
-        ]
-        result = self.runner(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        result = self._run_query(query_fields)
         if result.returncode != 0:
             if required:
                 raise CollectorError(
@@ -357,6 +393,10 @@ class NvidiaSmiMetricsCollector:
     ) -> list[GpuMetricSample]:
         samples = []
         for row in csv.reader(io.StringIO(text)):
+            # The discovery parsers skip blank rows; failing the whole required
+            # query on a trailing newline was a parity gap, not a guard (F9).
+            if not row or all(not item.strip() for item in row):
+                continue
             if len(row) != len(query_fields):
                 raise CollectorError("unexpected nvidia-smi CSV column count")
             values = {
