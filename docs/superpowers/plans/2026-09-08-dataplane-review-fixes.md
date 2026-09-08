@@ -346,6 +346,16 @@ Target: dedupe on a hash of the HMA-relevant subset (labels/annotations ∩ `HMA
 - [ ] Tests (red): `test_kubernetes_collector_skips_unchanged_hma_content_across_resource_versions`; `test_hma_watcher_resumes_from_resource_version_and_relists_on_410`; `test_sqs_consumer_survives_receive_error`; `test_sqs_poison_message_is_dropped_after_five_receives`.
 - [ ] Run, expect FAIL; implement; run `tests/collectors/`, expect PASS.
 
+### Task 25: migrate the duplicated BUFFERED/FAILED handling to `deliver_or_raise`
+
+**Files:** Modify `src/gpu_fault/collectors/host/collector.py`, `gpu/dcgm.py`, `gpu/discovery.py`, `gpu/nvidia_smi.py`, `training_progress.py`, `cloud/kubernetes.py`, `cloud/cloudwatch.py`; Test `tests/collectors/**` (existing tests must keep passing; add one test per family asserting the shared warning text).
+**Evidence:** Task 9 review (collector-shared-layer) Minor: the six-line `result.raise_for_failure()` + "persisted to the collector outbox" warning block is repeated 8× across the callers; Task 10 added the public `deliver_or_raise(sink, path, payload, *, logger, what) -> DeliveryResult` in `sinks.py` for exactly this. Coordinator ruling (2026-09-08): migrate after Tasks 11/12/13/24 landed so no file is edited concurrently.
+
+Target: each of the 8 call sites calls `deliver_or_raise(...)` and drops its local BUFFERED-warning block; behaviour is unchanged (FAILED still raises the original `CollectorError`; BUFFERED logs exactly one warning with the id and `result.error`); no caller keeps a hand-rolled copy. `grep -rn "persisted to the collector outbox" src/gpu_fault/collectors` afterwards hits only `sinks.py`.
+
+- [ ] Tests (red): one test per family (host, gpu, cloud, training-progress) asserting the BUFFERED warning comes from `deliver_or_raise` (single record, the shared text) — red because the local text differs or is duplicated.
+- [ ] Implement; run `tests/collectors/`, expect PASS.
+
 ---
 
 ## WP-D: Deploy, installer, reconciler, HMA ingest (`deploy/dataplane/**` except `completion-watcher.yaml` and `cluster-action-executor.yaml`, `deploy/systemd/**` except `gpu-fault-host-collector.service`, `deploy/node/**`, `src/gpu_fault/node_installer_reconciler.py`, `src/gpu_fault_release/regional_gpu_bootstrap.py`, `src/gpu_fault/hma.py`, `src/gpu_fault/app/routes/gpu_events.py`, `tests/node_agent/test_node_installer_reconciler.py`, `tests/node_agent/test_node_deployment.py`, `tests/deploy/**`, `tests/test_deploy_layout.py`, `tests/test_installation_resources.py`, `tests/hma/**`)
