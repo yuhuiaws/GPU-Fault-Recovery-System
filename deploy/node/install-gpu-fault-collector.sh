@@ -1073,13 +1073,13 @@ for row in rows:
     fi
 }
 NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS="120"
-# The measured install + verify duration (venv build, unit/env writes, stop,
-# slot switch, daemon-reload, restart, verify) plus margin. The drain before the
-# first write must leave this much Job budget behind it, or the kubelet kills
-# the half-installed node that drain exists to prevent. Tunable per site.
+# Estimated install + verify duration plus margin (generous on a warm upgrade,
+# tight on a cold docker-mode first install). The drain before the first write
+# must leave this much Job budget, or the kubelet kills the half-installed node
+# it exists to prevent. Tunable per site; no leading zero (bash reads octal).
 INSTALL_RESERVE_SECONDS="${INSTALLER_INSTALL_RESERVE_SECONDS:-420}"
-[[ "${INSTALL_RESERVE_SECONDS}" =~ ^[0-9]+$ ]] ||
-    die "INSTALLER_INSTALL_RESERVE_SECONDS must be a non-negative integer"
+[[ "${INSTALL_RESERVE_SECONDS}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    die "INSTALLER_INSTALL_RESERVE_SECONDS must be a non-negative decimal integer"
 wait_for_node_action_ledger_idle() {
     local reserve="${1:-0}" deadline job_deadline="" pending unreadable
     deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
