@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import logging
+
 from ._support import (
     HMA_FAULT_DETAILS,
     HMA_FAULT_REASONS,
@@ -447,17 +450,37 @@ def test_kubernetes_node_resources_rejected_node_does_not_stop_the_cycle() -> No
 
 
 class _FakeNodeWatch:
-    """One ``watch.Watch()`` replaying a scripted event list, then ending."""
+    """One ``watch.Watch()`` replaying a scripted event list, then ending.
 
-    def __init__(self, events: list[dict[str, Any]]) -> None:
+    ``error`` is raised once the scripted events run out, which is how a resumed
+    watch whose ``resourceVersion`` left the apiserver watch cache ends: an
+    ``ApiException`` with status 410.
+    """
+
+    def __init__(
+        self, events: list[dict[str, Any]], *, error: BaseException | None = None
+    ) -> None:
         self.events = list(events)
+        self.error = error
         self.stop_calls = 0
+        self.stream_kwargs: list[dict[str, Any]] = []
 
-    def stream(self, *_args, **_kwargs):
+    def stream(self, *_args, **kwargs):
+        self.stream_kwargs.append(dict(kwargs))
         yield from self.events
+        if self.error is not None:
+            raise self.error
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+def _expired_watch_error() -> BaseException:
+    """What the apiserver answers once a resumed resourceVersion is too old."""
+
+    from kubernetes.client.rest import ApiException
+
+    return ApiException(status=410, reason="Expired: too old resource version")
 
 
 class _FakeNodeApi:
@@ -466,25 +489,30 @@ class _FakeNodeApi:
     def __init__(self, rounds: list[Any]) -> None:
         self.rounds = list(rounds)
         self.calls = 0
+        self.list_kwargs: list[dict[str, Any]] = []
 
-    def list_node(self, **_kwargs):
+    def list_node(self, **kwargs):
         self.calls += 1
+        self.list_kwargs.append(dict(kwargs))
         if not self.rounds:
             raise StopTheLoop
         outcome = self.rounds.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return SimpleNamespace(
-            items=list(outcome), metadata=SimpleNamespace(resource_version="7")
+            items=list(outcome),
+            metadata=SimpleNamespace(resource_version="7", _continue=None),
         )
 
 
-def _hma_node(resource_version: str, name: str = "gpu-worker") -> dict[str, Any]:
+def _hma_node(
+    resource_version: str, name: str = "gpu-worker", health: str = "Unschedulable"
+) -> dict[str, Any]:
     return {
         "metadata": {
             "name": name,
             "resourceVersion": resource_version,
-            "labels": {HMA_HEALTH_STATUS: "Unschedulable"},
+            "labels": {HMA_HEALTH_STATUS: health},
         }
     }
 
@@ -502,7 +530,14 @@ def _patch_kubernetes(
     )
     queue = list(watches)
     monkeypatch.setattr(
-        "kubernetes.watch.Watch", lambda: queue.pop(0) if queue else _FakeNodeWatch([])
+        "kubernetes.watch.Watch",
+        lambda: (
+            queue.pop(0)
+            if queue
+            # An unscripted watch ends the way a long-lived one really does:
+            # 410 Gone, which is the collector's only cue to relist.
+            else _FakeNodeWatch([], error=_expired_watch_error())
+        ),
     )
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
 
@@ -705,3 +740,359 @@ def test_sqs_consumer_deletes_a_delivered_message() -> None:
         "an accepted forward left the message for SQS to redeliver"
     )
     assert delivered == 1, "the accepted forward was not counted as handled"
+
+
+def _hma_content_node(
+    resource_version: str,
+    *,
+    health: str = "Unschedulable",
+    detail: str = "NVRM: Xid (PCI:0000:b9:00): 94",
+    taint_value: str | None = "Unschedulable",
+    ready: str = "True",
+    annotate_faults: bool = True,
+    noise: str = "{}",
+    image_size: int = 12345,
+) -> dict[str, Any]:
+    """One HMA-labelled Node, every field the control plane reads made variable.
+
+    ``noise`` and ``image_size`` are the fields it does **not** read: they change
+    on every kubelet status report and must never make the collector re-post.
+    """
+
+    annotations: dict[str, Any] = {
+        "kubectl.kubernetes.io/last-applied-configuration": noise
+    }
+    if annotate_faults:
+        annotations[HMA_FAULT_DETAILS] = json.dumps(
+            {"faults": [{"timestamp": NOW.isoformat(), "message": detail}]}
+        )
+    return {
+        "metadata": {
+            "name": "gpu-worker",
+            "resourceVersion": resource_version,
+            "labels": {
+                HMA_HEALTH_STATUS: health,
+                HMA_FAULT_REASONS: "XidHardwareFailure",
+                "kubernetes.io/hostname": "gpu-worker",
+            },
+            "annotations": annotations,
+        },
+        "spec": {
+            "taints": (
+                [
+                    {
+                        "key": HMA_HEALTH_STATUS,
+                        "value": taint_value,
+                        "effect": "NoSchedule",
+                    }
+                ]
+                if taint_value is not None
+                else []
+            )
+        },
+        "status": {
+            "allocatable": {"nvidia.com/gpu": "8"},
+            "conditions": [
+                {
+                    "type": "Ready",
+                    "status": ready,
+                    "reason": "KubeletReady",
+                    "message": "kubelet is posting ready status",
+                    "lastTransitionTime": NOW.isoformat(),
+                }
+            ],
+            "images": [{"names": ["nginx:latest"], "sizeBytes": image_size}],
+        },
+    }
+
+
+def test_kubernetes_collector_skips_unchanged_hma_content_across_resource_versions() -> (
+    None
+):
+    """Dedupe on the HMA content, not on ``resourceVersion``.
+
+    HMA labels every node (``Schedulable`` on a healthy one) and each kubelet
+    status report bumps ``resourceVersion`` every 5 minutes, so a
+    ``resourceVersion`` dedupe re-posted every node's whole object -- the
+    ``status.images`` list included -- forever. The hash must still change for
+    every field the control plane reads, or a real health change is deduped away.
+    """
+
+    sink = RecordingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+
+    assert collector.collect_node(_hma_content_node("1")).delivered == 1, (
+        "the first HMA node record was not delivered"
+    )
+    assert collector.collect_node(_hma_content_node("2")).duplicates == 1, (
+        "a node whose only change was its resourceVersion was posted again"
+    )
+    assert (
+        collector.collect_node(
+            _hma_content_node("3", noise='{"spec":"changed"}', image_size=99)
+        ).duplicates
+        == 1
+    ), (
+        "a change outside the HMA keys (an unrelated annotation, a pulled image) "
+        "was treated as an HMA content change"
+    )
+    assert (
+        collector.collect_node(
+            _hma_content_node("4", detail="NVRM: Xid (PCI:0000:b9:00): 79")
+        ).delivered
+        == 1
+    ), "a new fault detail was deduplicated away"
+    assert (
+        collector.collect_node(_hma_content_node("5", health="Schedulable")).delivered
+        == 1
+    ), "a health-status label change was deduplicated away"
+    assert (
+        collector.collect_node(_hma_content_node("6", taint_value=None)).delivered == 1
+    ), "the HMA taint leaving the node was deduplicated away"
+    assert (
+        collector.collect_node(_hma_content_node("7", ready="False")).delivered == 1
+    ), "a node condition flipping was deduplicated away"
+    assert (
+        collector.collect_node(_hma_content_node("8", annotate_faults=False)).delivered
+        == 1
+    ), (
+        "the fault-details annotation being removed -- the node healed -- was "
+        "deduplicated away"
+    )
+
+    source = _hma_content_node("9", detail="NVRM: Xid (PCI:0000:b9:00): 48")
+    assert collector.collect_node(source).delivered == 1, (
+        "the last HMA node record was not delivered"
+    )
+    posted = sink.requests[-1][1]["node"]
+    assert "images" not in posted["status"], (
+        "status.images was posted: megabytes of image digests per node per post"
+    )
+    assert posted["status"]["allocatable"] == {"nvidia.com/gpu": "8"}, (
+        "stripping status.images dropped the rest of the node status"
+    )
+    assert posted["status"]["conditions"], "stripping status.images dropped conditions"
+    assert "images" in source["status"], (
+        "the collector mutated the node object it was handed"
+    )
+
+
+def test_hma_watcher_resumes_from_resource_version_and_relists_on_410(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watch timeout resumes; only 410 Gone relists, and it does not re-post.
+
+    The 300 s watch timeout used to force a full LIST of every node plus a
+    ``sanitize_for_serialization`` of each one every five minutes. The watcher
+    must resume the watch from the last observed ``resourceVersion`` and relist
+    only when the apiserver says that version is gone -- and the relist that
+    follows must not re-post nodes whose HMA content has not changed.
+    """
+
+    sink = RecordingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    api = _FakeNodeApi([[_hma_node("42")], [_hma_node("44", health="Schedulable")]])
+    first = _FakeNodeWatch(
+        [{"type": "MODIFIED", "object": _hma_node("43", health="Schedulable")}]
+    )
+    resumed = _FakeNodeWatch([], error=_expired_watch_error())
+    _patch_kubernetes(monkeypatch, api, [first, resumed])
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert first.stream_kwargs[0]["resource_version"] == "7", (
+        "the watch did not start from the LIST's resourceVersion"
+    )
+    assert resumed.stream_kwargs[0]["resource_version"] == "43", (
+        "a plain watch timeout relisted instead of resuming from the last "
+        "observed resourceVersion"
+    )
+    assert api.calls == 3, (
+        "the watcher relisted on a watch timeout instead of only on 410 Gone"
+    )
+    assert [
+        payload["node"]["metadata"]["resourceVersion"]
+        for _path, payload in sink.requests
+    ] == ["42", "43"], (
+        "the relist after the 410 re-posted a node whose HMA content was unchanged"
+    )
+
+
+def test_hma_watcher_paginates_the_relist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The relist follows ``metadata._continue`` like the sibling collector.
+
+    One unpaginated LIST of a 500-node cluster is 5-10 MB and, past the watch
+    cache window, an etcd read; the watch that follows must resume from the
+    first page's resourceVersion, which is the snapshot the pages were read at.
+    """
+
+    class _PagedNodeApi:
+        def __init__(self) -> None:
+            self.list_kwargs: list[dict[str, Any]] = []
+
+        def list_node(self, **kwargs: Any) -> Any:
+            self.list_kwargs.append(dict(kwargs))
+            if len(self.list_kwargs) > 2:
+                raise StopTheLoop
+            if kwargs.get("_continue"):
+                return SimpleNamespace(
+                    items=[_hma_node("44", "gpu-worker-b")],
+                    metadata=SimpleNamespace(resource_version="9", _continue=None),
+                )
+            return SimpleNamespace(
+                items=[_hma_node("43", "gpu-worker-a")],
+                metadata=SimpleNamespace(resource_version="7", _continue="page-two"),
+            )
+
+    api = _PagedNodeApi()
+    sink = RecordingSink()
+    collector = KubernetesHmaNodeCollector(
+        sink, context(), now=lambda: NOW, list_page_size=1
+    )
+    watch = _FakeNodeWatch([], error=_expired_watch_error())
+    _patch_kubernetes(monkeypatch, api, [watch])
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert api.list_kwargs[:2] == [
+        {"limit": 1, "_continue": None},
+        {"limit": 1, "_continue": "page-two"},
+    ], "the HMA relist asked the apiserver for every node in a single call"
+    assert [
+        payload["node"]["metadata"]["name"] for _path, payload in sink.requests
+    ] == ["gpu-worker-a", "gpu-worker-b"], "the second page of the relist was dropped"
+    assert watch.stream_kwargs[0]["resource_version"] == "7", (
+        "the watch did not resume from the first page's resourceVersion snapshot"
+    )
+
+
+class _FlakySqsClient:
+    """``receive_message`` fails twice, then hands over one HMA message."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.deleted: list[str] = []
+
+    def receive_message(self, **_kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        if self.calls <= 2:
+            raise RuntimeError("ExpiredTokenException")
+        if self.calls > 3:
+            raise StopTheLoop
+        return {
+            "Messages": [
+                {
+                    "MessageId": "message-1",
+                    "Body": json.dumps(
+                        {
+                            "path": "/v1/provider-events/hyperpod-hma/cloudwatch",
+                            "payload": {"node_id": "worker-1"},
+                        }
+                    ),
+                    "ReceiptHandle": "receipt-1",
+                    "Attributes": {"ApproximateReceiveCount": "1"},
+                }
+            ]
+        }
+
+    def delete_message(self, **kwargs: Any) -> None:
+        self.deleted.append(kwargs["ReceiptHandle"])
+
+
+def test_sqs_consumer_survives_receive_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A throttle or an expired IRSA token must not end the consumer.
+
+    ``run()`` was a bare ``while True: self.run_once()``, so the first
+    ``receive_message`` exception exited the process and left the HMA queue
+    unattended until Kubernetes restarted the Pod -- and restarted it again on
+    the next one.
+    """
+
+    from gpu_fault.collectors.cloud import cloudwatch as module
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    client = _FlakySqsClient()
+    consumer = SqsHmaConsumer(RecordingSink(), "https://sqs/queue", client=client)
+
+    with pytest.raises(StopTheLoop):
+        consumer.run()
+
+    assert client.deleted == ["receipt-1"], (
+        "a receive_message error ended the consumer instead of backing off"
+    )
+    assert sleeps == [1.0, 2.0], (
+        "the receive backoff did not start at one second and double"
+    )
+
+
+class _PoisonSqsClient:
+    """One unparsable message the queue has already redelivered five times."""
+
+    def __init__(self, body: str) -> None:
+        self.body = body
+        self.deleted: list[str] = []
+        self.receive_kwargs: list[dict[str, Any]] = []
+
+    def receive_message(self, **kwargs: Any) -> dict[str, Any]:
+        self.receive_kwargs.append(dict(kwargs))
+        if len(self.receive_kwargs) > 1:
+            return {}
+        return {
+            "Messages": [
+                {
+                    "MessageId": "message-9",
+                    "Body": self.body,
+                    "ReceiptHandle": "receipt-9",
+                    "Attributes": {"ApproximateReceiveCount": "5"},
+                }
+            ]
+        }
+
+    def delete_message(self, **kwargs: Any) -> None:
+        self.deleted.append(kwargs["ReceiptHandle"])
+
+
+def test_sqs_poison_message_is_dropped_after_five_receives(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A message nothing can forward leaves the queue, digest-logged, not echoed.
+
+    There is no redrive policy on this queue, so a malformed body was retried
+    every 60 s visibility timeout forever, and each retry logged a full
+    traceback. The drop must name the MessageId and the body digest -- never the
+    body, which carries HMA fault text.
+    """
+
+    body = json.dumps(
+        {
+            "path": "/v1/provider-events/hyperpod-hma/cloudwatch",
+            "payload": "worker-1-fault-text",
+        }
+    )
+    client = _PoisonSqsClient(body)
+    sink = RecordingSink()
+    consumer = SqsHmaConsumer(sink, "https://sqs/queue", client=client)
+
+    with caplog.at_level(logging.WARNING):
+        delivered = consumer.run_once(wait_time_seconds=0)
+
+    assert delivered == 0, "a dropped poison message was counted as delivered"
+    assert sink.requests == [], "the poison message was forwarded a sixth time"
+    assert client.deleted == ["receipt-9"], (
+        "the poison message stayed on the queue to be retried every visibility "
+        "timeout forever"
+    )
+    assert client.receive_kwargs[0].get("MessageSystemAttributeNames") == [
+        "ApproximateReceiveCount"
+    ], "receive_message did not ask for the receive count it drops on"
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "message-9" in logged, "the drop did not name the MessageId"
+    assert hashlib.sha256(body.encode()).hexdigest() in logged, (
+        "the drop did not record the body digest"
+    )
+    assert "worker-1-fault-text" not in logged, (
+        "the message body was logged instead of its digest"
+    )

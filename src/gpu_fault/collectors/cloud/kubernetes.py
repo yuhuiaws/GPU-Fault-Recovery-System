@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -28,6 +29,107 @@ from gpu_fault.collectors.sinks import (
 
 LOGGER = logging.getLogger(__name__)
 
+#: What the apiserver answers once the requested ``resourceVersion`` has left
+#: its watch cache. It is the only response that makes a relist necessary.
+EXPIRED_RESOURCE_VERSION_STATUS = 410
+
+
+def _iter_node_pages(list_node: Callable[..., Any], page_size: int) -> Iterator[Any]:
+    """Yield each page of a Node LIST, following ``metadata._continue``.
+
+    One unpaginated LIST of a 500-node cluster is 5-10 MB and, once the
+    requested resourceVersion has fallen out of the apiserver watch cache, an
+    etcd read. Callers that also need the LIST's ``resourceVersion`` read it
+    from the first page: the continue token pins every later page to that same
+    snapshot.
+    """
+
+    token: str | None = None
+    while True:
+        response = list_node(limit=page_size, _continue=token)
+        yield response
+        metadata = getattr(response, "metadata", None)
+        token = getattr(metadata, "_continue", None) or None
+        if not token:
+            return
+
+
+def _digest_text(value: Any) -> str:
+    """One digest field as text: a missing value and an empty one are the same.
+
+    Every field is a string so the sorted lists below never compare ``None``
+    with ``str`` (a ``TypeError`` that would have taken the whole watch down).
+    """
+
+    return "" if value is None else str(value)
+
+
+def _hma_content_digest(node: dict[str, Any]) -> str:
+    """Digest exactly the Node fields the control plane reads for HMA.
+
+    HMA labels every node -- a healthy one carries ``Schedulable`` -- and every
+    kubelet status report bumps ``resourceVersion``, so deduplicating on
+    ``resourceVersion`` re-posted every HMA node's whole object every few
+    minutes. The digest therefore covers the HMA labels/annotations, the HMA
+    taint and the node's true conditions, which is everything
+    ``HyperPodHmaNormalizer.normalize_kubernetes_node`` turns into a snapshot.
+    Anything left out (``status.images``, unrelated annotations) cannot change a
+    verdict; anything covered must re-post, including a key that disappears
+    because the node healed.
+    """
+
+    metadata = node.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    annotations = metadata.get("annotations") or {}
+    spec = node.get("spec") or {}
+    status = node.get("status") or {}
+    content = {
+        "labels": {key: labels[key] for key in sorted(HMA_KEYS & set(labels))},
+        "annotations": {
+            key: annotations[key] for key in sorted(HMA_KEYS & set(annotations))
+        },
+        "taints": sorted(
+            [
+                _digest_text(taint.get("key")),
+                _digest_text(taint.get("value")),
+                _digest_text(taint.get("effect")),
+            ]
+            for taint in spec.get("taints") or []
+            if taint.get("key") in HMA_KEYS
+        ),
+        # A condition that stops being true drops out of the list, so the
+        # digest changes when a node recovers as well as when it degrades.
+        "conditions": sorted(
+            [
+                _digest_text(condition.get("type")),
+                _digest_text(condition.get("reason")),
+                _digest_text(condition.get("message")),
+                _digest_text(condition.get("lastTransitionTime")),
+            ]
+            for condition in status.get("conditions") or []
+            if str(condition.get("status") or "").lower() == "true"
+        ),
+    }
+    payload = json.dumps(content, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _node_without_images(node: dict[str, Any]) -> dict[str, Any]:
+    """Return the node without ``status.images``, leaving the original alone.
+
+    ``status.images`` is a list of every image on the kubelet with its digests
+    and sizes -- easily most of the object, and nothing the HMA path reads. The
+    copy is shallow on purpose: the caller still owns the node it handed over.
+    """
+
+    status = node.get("status")
+    if not isinstance(status, dict) or "images" not in status:
+        return node
+    return {
+        **node,
+        "status": {key: value for key, value in status.items() if key != "images"},
+    }
+
 
 class KubernetesHmaNodeCollector:
     def __init__(
@@ -35,12 +137,14 @@ class KubernetesHmaNodeCollector:
         sink: EventSink,
         context: CollectorContext,
         *,
+        list_page_size: int = 500,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.sink = sink
         self.context = context
+        self.list_page_size = list_page_size
         self.now = now or (lambda: datetime.now(timezone.utc))
-        self._resource_versions: dict[str, str] = {}
+        self._content_digests: dict[str, str] = {}
 
     def collect_node(self, node: dict[str, Any]) -> CollectorStats:
         metadata = node.get("metadata") or {}
@@ -53,10 +157,8 @@ class KubernetesHmaNodeCollector:
             return CollectorStats(observed=1, skipped=1)
 
         resource_version = str(metadata.get("resourceVersion") or "")
-        if (
-            resource_version
-            and self._resource_versions.get(node_id) == resource_version
-        ):
+        digest = _hma_content_digest(node)
+        if self._content_digests.get(node_id) == digest:
             return CollectorStats(observed=1, duplicates=1)
 
         collected_at = self.now()
@@ -67,18 +169,17 @@ class KubernetesHmaNodeCollector:
                 **self.context.model_dump(mode="json"),
                 "observed_at": collected_at.isoformat(),
                 "collected_at": collected_at.isoformat(),
-                "node": node,
+                "node": _node_without_images(node),
                 "evidence_ref": (
                     f"k8s://nodes/{node_id}?resourceVersion={resource_version}"
                 ),
             },
         )
-        # Only a record that went nowhere leaves the resourceVersion unrecorded:
-        # one the outbox took is replayed from there, and re-posting it on the
-        # next relist would buffer a duplicate for the whole outage (ARCH-G3).
+        # Only a record that went nowhere leaves the digest unrecorded: one the
+        # outbox took is replayed from there, and re-posting it on the next
+        # relist would buffer a duplicate for the whole outage (ARCH-G3).
         result.raise_for_failure()
-        if resource_version:
-            self._resource_versions[node_id] = resource_version
+        self._content_digests[node_id] = digest
         if result.buffered:
             LOGGER.warning(
                 "HMA node record for %s persisted to the collector outbox: %s",
@@ -89,14 +190,14 @@ class KubernetesHmaNodeCollector:
         return CollectorStats(observed=1, delivered=1)
 
     def forget_node(self, node_id: str) -> None:
-        """Drop a node's remembered resourceVersion.
+        """Drop a node's remembered HMA content digest.
 
         A deleted Node must not keep an entry: the table would grow with every
-        node the fleet ever had, and a recreated node whose apiserver
-        resourceVersion happened to match would be silently deduplicated.
+        node the fleet ever had, and a recreated node that came back with the
+        same HMA content would be silently deduplicated instead of announced.
         """
 
-        self._resource_versions.pop(node_id, None)
+        self._content_digests.pop(node_id, None)
 
     def run(self) -> None:
         try:
@@ -117,6 +218,11 @@ class KubernetesHmaNodeCollector:
 
         api = client.CoreV1Api()
         serializer = client.ApiClient().sanitize_for_serialization
+        # ``None`` is the only state that costs a LIST. The 300 s watch timeout
+        # used to relist every node -- and re-serialize every one of them --
+        # every five minutes; the watch is resumed from the last observed
+        # version instead, and only 410 Gone sends us back to a LIST.
+        resource_version: str | None = None
         while True:
             # The LIST and its posts belong inside the guard: `post` raises even
             # once the outbox has taken the record, so an unreachable control
@@ -125,10 +231,11 @@ class KubernetesHmaNodeCollector:
             # HMA-labelled node with an empty dedup table on each restart.
             watcher: Any | None = None
             try:
-                listing = api.list_node()
-                for item in listing.items:
-                    self._collect_node_without_ending_the_pass(serializer(item))
-                resource_version = listing.metadata.resource_version
+                if resource_version is None:
+                    # An empty version -- a LIST that answered without one --
+                    # means "watch from now"; it must not stay ``None``, or
+                    # every watch timeout would relist again.
+                    resource_version = self._relist(api.list_node, serializer) or ""
                 watcher = watch.Watch()
                 for event in watcher.stream(
                     api.list_node,
@@ -144,12 +251,45 @@ class KubernetesHmaNodeCollector:
                         self.forget_node(str(metadata.get("name") or ""))
                         continue
                     self._collect_node_without_ending_the_pass(node)
-            except Exception:
-                LOGGER.exception("Kubernetes HMA watch failed; relisting nodes")
+            except Exception as exc:
+                if getattr(exc, "status", None) == EXPIRED_RESOURCE_VERSION_STATUS:
+                    # Expected on any watch older than the apiserver cache
+                    # window: it is a relist, not a failure, and the content
+                    # digests keep the relist from re-posting unchanged nodes.
+                    LOGGER.info(
+                        "Kubernetes HMA watch resourceVersion %s expired; "
+                        "relisting nodes",
+                        resource_version,
+                    )
+                    resource_version = None
+                    continue
+                LOGGER.exception("Kubernetes HMA watch failed; resuming the watch")
                 time.sleep(2)
             finally:
                 if watcher is not None:
                     watcher.stop()
+
+    def _relist(
+        self,
+        list_node: Callable[..., Any],
+        serializer: Callable[[Any], dict[str, Any]],
+    ) -> str | None:
+        """Post every HMA node from a paginated LIST; return its resourceVersion.
+
+        The returned version is the first page's: the continue token pins every
+        later page to that snapshot, so it is the version the watch must resume
+        from to see everything that happened after the LIST.
+        """
+
+        resource_version: str | None = None
+        for page in _iter_node_pages(list_node, self.list_page_size):
+            if resource_version is None:
+                metadata = getattr(page, "metadata", None)
+                version = getattr(metadata, "resource_version", None)
+                resource_version = str(version) if version else None
+            for item in page.items:
+                self._collect_node_without_ending_the_pass(serializer(item))
+        return resource_version
 
     def _collect_node_without_ending_the_pass(self, node: dict[str, Any]) -> None:
         """Post one node; a node that cannot be delivered is not fatal.
@@ -293,14 +433,8 @@ class KubernetesNodeResourceCollector:
             raise CollectorError(
                 "Kubernetes node resource collector has no CoreV1Api client"
             )
-        token: str | None = None
-        while True:
-            response = self.core.list_node(limit=self.list_page_size, _continue=token)
+        for response in _iter_node_pages(self.core.list_node, self.list_page_size):
             yield from response.items
-            metadata = getattr(response, "metadata", None)
-            token = getattr(metadata, "_continue", None) or None
-            if not token:
-                return
 
     def collect_once(self) -> CollectorStats:
         if self.core is None:

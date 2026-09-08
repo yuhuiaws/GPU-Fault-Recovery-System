@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -38,6 +40,15 @@ HMA_KEYS = {
     HMA_FAULT_REASONS,
     HMA_FAULT_DETAILS,
 }
+
+#: How many failed receives make a queued message poison rather than unlucky.
+#: There is no redrive policy on this queue, so a message nothing can parse was
+#: retried every visibility timeout forever, logging a traceback each time.
+POISON_RECEIVE_COUNT = 5
+#: The receive backoff ladder: never a tight loop against a throttled queue,
+#: never long enough to look like the consumer has stopped.
+RECEIVE_BACKOFF_SECONDS = 1.0
+MAX_RECEIVE_BACKOFF_SECONDS = 60.0
 
 
 def cloudwatch_lambda_handler(
@@ -178,6 +189,7 @@ class SqsHmaConsumer:
             MaxNumberOfMessages=10,
             WaitTimeSeconds=wait_time_seconds,
             VisibilityTimeout=60,
+            MessageSystemAttributeNames=["ApproximateReceiveCount"],
         )
         delivered = 0
         for message in response.get("Messages", []):
@@ -211,10 +223,61 @@ class SqsHmaConsumer:
                         ReceiptHandle=message["ReceiptHandle"],
                     )
                 delivered += 1
-            except Exception:
-                LOGGER.exception("queued HMA event delivery failed")
+            except Exception as exc:
+                receives = self._receive_count(message)
+                if receives >= POISON_RECEIVE_COUNT:
+                    # Only a message that failed *again* is dropped: a forward
+                    # the outbox took never lands here, and a retryable failure
+                    # is left for the queue, so this is a body nothing can turn
+                    # into an event. Neither the body nor the rejection text is
+                    # logged -- a 4xx detail quotes the payload back, and HMA
+                    # fault text names nodes -- only the failure class, the
+                    # status and the body digest, which is enough to recognise
+                    # the same message twice. The four earlier receives already
+                    # logged the full reason with a traceback.
+                    LOGGER.warning(
+                        "dropping queued HMA event %s after %d receives "
+                        "(body sha256 %s): %s status=%s",
+                        message.get("MessageId", "<unknown>"),
+                        receives,
+                        hashlib.sha256(
+                            str(message.get("Body", "")).encode()
+                        ).hexdigest(),
+                        type(exc).__name__,
+                        getattr(exc, "status_code", None),
+                    )
+                    self.client.delete_message(
+                        QueueUrl=self.queue_url,
+                        ReceiptHandle=message["ReceiptHandle"],
+                    )
+                else:
+                    LOGGER.exception("queued HMA event delivery failed")
         return delivered
 
+    @staticmethod
+    def _receive_count(message: dict[str, Any]) -> int:
+        """How many times SQS has handed this message out, 0 if it did not say."""
+
+        raw = (message.get("Attributes") or {}).get("ApproximateReceiveCount")
+        try:
+            return int(str(raw))
+        except (TypeError, ValueError):
+            return 0
+
     def run(self) -> None:
+        backoff = RECEIVE_BACKOFF_SECONDS
         while True:
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception:
+                # A throttle or an expired IRSA token used to end the process:
+                # Kubernetes restarted the Pod straight into the same error, so
+                # the queue went unattended for the whole outage and the HMA
+                # events aged out of its 14-day retention.
+                LOGGER.exception(
+                    "HMA queue receive failed; retrying in %.0f s", backoff
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_RECEIVE_BACKOFF_SECONDS)
+            else:
+                backoff = RECEIVE_BACKOFF_SECONDS
