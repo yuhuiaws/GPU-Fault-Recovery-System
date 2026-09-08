@@ -465,6 +465,8 @@ spec:
               value: ${NODE_IP}
             - name: TARGET_NODE_UID
               value: ${NODE_UID}
+            - name: INSTALLER_ACTIVE_DEADLINE_SECONDS
+              value: "${INSTALLER_ACTIVE_DEADLINE_SECONDS}"
             - name: INSTALL_RUN_ID
               valueFrom:
                 fieldRef:
@@ -561,6 +563,10 @@ ${CONTROL_PLANE_ENV}
           command: ["/bin/bash", "-ceuo", "pipefail"]
           args:
             - |
+              # The installer bounds its node-agent drain by this Job's
+              # remaining activeDeadlineSeconds; scheduling and image pull
+              # before this line are covered by the installer's own margin.
+              INSTALLER_STARTED_EPOCH="\$(date +%s)"
               if [[ "\${PREFLIGHT_ONLY}" == "true" ]]; then
                 chroot /host /usr/bin/env \
                 GPU_FAULT_PREFLIGHT_HOST_ROOT=/ \
@@ -599,6 +605,8 @@ ${CONTROL_PLANE_ENV}
               ${CA_INSTALL_COMMAND}
               ${TOKEN_INSTALL_COMMAND}
               chroot /host /usr/bin/env \
+                INSTALLER_ACTIVE_DEADLINE_SECONDS="\${INSTALLER_ACTIVE_DEADLINE_SECONDS}" \
+                INSTALLER_STARTED_EPOCH="\${INSTALLER_STARTED_EPOCH}" \
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \

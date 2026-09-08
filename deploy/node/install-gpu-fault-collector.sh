@@ -1141,9 +1141,9 @@ clear_degraded_gpu_marker() {
 # `nvidia-smi --gpu-reset` or driver install dies with it and the ledger row is
 # left INTERRUPTED, which then needs manual confirmation.
 NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
-# Keep in step with TimeoutStopSec= in
-# deploy/systemd/gpu-fault-node-agent.service: the installer must not give up
-# on an in-flight command earlier than systemd itself would.
+# Keep in step with TimeoutStopSec= in the node-agent unit (deploy/systemd/):
+# the installer must not give up on an in-flight command earlier than systemd
+# itself would -- unless the installer Job it runs inside would die first.
 NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"
 NODE_AGENT_LEDGER_POLL_SECONDS="5"
 SQLITE_COMMAND="$(command -v sqlite3 2>/dev/null || true)"
@@ -1177,11 +1177,18 @@ for row in rows:
 ' "${NODE_ACTION_DB}"
     fi
 }
+NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS="120"
 wait_for_node_action_ledger_idle() {
-    local deadline
-    local pending
-    local unreadable
+    local deadline job_deadline pending unreadable
     deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
+    # The regional installer Job passes its budget in: a drain that outlives
+    # activeDeadlineSeconds is SIGKILLed with the cgroup and no EXIT trap runs.
+    if [[ "${INSTALLER_STARTED_EPOCH:-}" =~ ^[0-9]+$ &&
+        "${INSTALLER_ACTIVE_DEADLINE_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+        job_deadline=$(( INSTALLER_STARTED_EPOCH + INSTALLER_ACTIVE_DEADLINE_SECONDS
+            - NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS ))
+        (( job_deadline >= deadline )) || deadline="${job_deadline}"
+    fi
     while :; do
         unreadable="false"
         pending="$(in_progress_node_action_ids | tr '\n' ' ')" ||
@@ -1203,12 +1210,16 @@ wait_for_node_action_ledger_idle() {
     if [[ "${unreadable}" == "true" ]]; then
         die "node action ledger could not be read: ${NODE_ACTION_DB}"
     fi
-    die "node action agent has in-flight commands: ${pending}"
+    die "node agent still has an in-flight command; retry later: ${pending}"
 }
 drain_node_agent_before_restart() {
     systemctl is-active --quiet gpu-fault-node-agent.service || return 0
     wait_for_node_action_ledger_idle
 }
+# Before the first unit/env write (and again before the stop): nothing half-done.
+if [[ "${NO_START}" == "false" ]]; then
+    drain_node_agent_before_restart
+fi
 
 # 一块 GPU 掉线不能让整台机器装不上 Agent。
 # `nvidia-smi -L` exits non-zero as soon as one GPU is unreadable even though
@@ -1450,30 +1461,22 @@ fi
 
 install -m 0644 "${REPO_DIR}/deploy/dataplane/dcgm-counters.csv" \
     /etc/gpu-fault/dcgm-counters.csv
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-kernel-collector.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-kernel-collector.service" \
     /etc/systemd/system/gpu-fault-kernel-collector.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-metrics-collector.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-metrics-collector.service" \
     /etc/systemd/system/gpu-fault-metrics-collector.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-host-collector.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-host-collector.service" \
     /etc/systemd/system/gpu-fault-host-collector.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-log-collector.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-log-collector.service" \
     /etc/systemd/system/gpu-fault-log-collector.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-fabric-manager-collector.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-fabric-manager-collector.service" \
     /etc/systemd/system/gpu-fault-fabric-manager-collector.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-certificate-check.service" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-certificate-check.service" \
     /etc/systemd/system/gpu-fault-certificate-check.service
-install -m 0644 \
-    "${REPO_DIR}/deploy/systemd/gpu-fault-certificate-check.timer" \
+install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-certificate-check.timer" \
     /etc/systemd/system/gpu-fault-certificate-check.timer
 if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
-    install -m 0644 \
-        "${REPO_DIR}/deploy/systemd/gpu-fault-node-agent.service" \
+    install -m 0644 "${REPO_DIR}/deploy/systemd/gpu-fault-node-agent.service" \
         /etc/systemd/system/gpu-fault-node-agent.service
 fi
 install -m 0755 "${SCRIPT_DIR}/verify-gpu-fault-collector.sh" \
@@ -1780,12 +1783,9 @@ chmod 0644 /opt/gpu-fault/installed-units.txt
 if [[ "${NO_START}" == "false" ]]; then
     drain_node_agent_before_restart
     for runtime_unit in \
-        gpu-fault-node-agent.service \
-        gpu-fault-metrics-collector.service \
-        gpu-fault-host-collector.service \
-        gpu-fault-fabric-manager-collector.service \
-        gpu-fault-log-collector.service \
-        gpu-fault-kernel-collector.service; do
+        gpu-fault-node-agent.service gpu-fault-metrics-collector.service \
+        gpu-fault-host-collector.service gpu-fault-fabric-manager-collector.service \
+        gpu-fault-log-collector.service gpu-fault-kernel-collector.service; do
         if systemctl is-active --quiet "${runtime_unit}"; then
             systemctl stop "${runtime_unit}"
             RUNTIME_SERVICES_STOPPED="true"
