@@ -238,7 +238,7 @@ class OutboxFile:
         except FileNotFoundError:
             return False
 
-    def append(self, record: dict[str, Any]) -> None:
+    def append(self, record: dict[str, Any]) -> int:
         """Add one record with a single append and one ``fsync``.
 
         Append-only is what makes buffering during an outage O(1) instead of a
@@ -250,10 +250,15 @@ class OutboxFile:
         fragment concatenated the two into one unparseable line, so ``read()``
         dropped the *new* record too -- after the collector had been told it was
         buffered and had moved its cursor past a real event.
+
+        Returns how many lines the file gained in :meth:`count_lines` terms:
+        one, or two when the torn tail was closed. A caller tracking the depth
+        must add exactly this, or its count drifts one short of the file.
         """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
+        lines_added = 1
         with open(self.path, "a", encoding="utf-8") as handle:
             if self.ends_mid_line():
                 LOGGER.warning(
@@ -263,9 +268,11 @@ class OutboxFile:
                     self.path,
                 )
                 handle.write("\n")
+                lines_added += 1
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        return lines_added
 
     def write(self, records: list[dict[str, Any]]) -> None:
         """Replace the file with ``records``, durably (F9).

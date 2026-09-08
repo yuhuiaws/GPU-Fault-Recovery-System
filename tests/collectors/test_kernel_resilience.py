@@ -1078,3 +1078,157 @@ def test_a_dropped_health_summary_is_not_counted_as_a_lost_record(
     assert "health summary" in caplog.text.lower(), (
         f"the dropped health summary was not logged as one: {caplog.text}"
     )
+
+
+class _RetryLadderSink:
+    """``HttpEventSink``'s shape: ``post`` walks the retry ladder, ``deliver_once`` does not.
+
+    The control plane is gone and the outbox cannot be written (ENOSPC/EROFS),
+    so ``buffer_for_replay`` answers ``False`` and a live ``post`` spends every
+    attempt plus every backoff -- the ~47 s ladder in production, scaled here.
+    """
+
+    def __init__(self, attempt_seconds: float, attempts: int) -> None:
+        self.attempt_seconds = attempt_seconds
+        self.attempts = attempts
+        self.posts: list[str] = []
+        self.single_attempts: list[str] = []
+        self.entered = threading.Event()
+
+    def post(self, path, payload):
+        self.entered.set()
+        for _attempt in range(self.attempts):
+            self.posts.append(payload["record_id"])
+            time.sleep(self.attempt_seconds)
+        raise CollectorError("control-plane delivery failed after 4 attempts")
+
+    def deliver_once(self, path, payload):
+        self.entered.set()
+        self.single_attempts.append(payload["record_id"])
+        time.sleep(self.attempt_seconds)
+        raise CollectorError("control-plane delivery failed after 1 attempts")
+
+    def buffer_for_replay(self, path, payload):
+        return False
+
+
+def test_the_shutdown_drain_gives_each_unbuffered_record_one_attempt_not_the_ladder(
+    caplog,
+) -> None:
+    """A full disk at shutdown must not turn the drain into ``records x 47 s``.
+
+    The budget was checked only *between* records, and a record the outbox
+    refused went through ``deliver_event`` -- the full retry ladder. Task 16
+    set the unit's ``TimeoutStopSec`` believing the drain was bounded at about
+    ten seconds, so systemd SIGKILLed the process mid-ladder: the ``finally``
+    never ran, the lost-records ERROR never appeared, and the remaining queue
+    was lost in silence.
+    """
+
+    sink = _RetryLadderSink(attempt_seconds=0.2, attempts=4)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    started = time.monotonic()
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.collectors.logs.kernel"):
+        collector.stop_delivery(timeout_seconds=0.05, drain_budget_seconds=0.3)
+    elapsed = time.monotonic() - started
+
+    drained = sink.single_attempts
+    # The record in flight at the join timeout (42) is requeued first, then
+    # the queue in order; each gets exactly one bounded attempt.
+    assert drained[:2] == ["kmsg-boot-123-42", "kmsg-boot-123-43"], (
+        "the drain did not give the unbuffered records a single attempt each: "
+        f"single_attempts={drained} posts={sink.posts}"
+    )
+    assert all(drained.count(record_id) == 1 for record_id in drained), (
+        f"a record was attempted more than once during the drain: {drained}"
+    )
+    assert "kmsg-boot-123-43" not in sink.posts, (
+        f"the drain sent an unbuffered record down the full retry ladder: {sink.posts}"
+    )
+    assert elapsed < 1.5, (
+        f"the drain ran {elapsed:.1f}s against a 0.3s budget: the retry ladder "
+        "ran past the shutdown budget"
+    )
+    lost = collector.health_counters["delivery_dropped_at_shutdown"]
+    assert lost >= 1, (
+        f"the records the budget left were not counted as lost: "
+        f"{collector.health_counters}"
+    )
+    assert "kmsg-boot-123-45" in caplog.text, (
+        f"the records lost at shutdown were not named in the log: {caplog.text}"
+    )
+
+
+def test_a_health_summary_never_evicts_a_queued_xid(monkeypatch, caplog) -> None:
+    """A full queue drops the *summary*, not the oldest XID record.
+
+    Drop-oldest kept the newest record, which is right when the newcomer is an
+    XID. When the newcomer is the 300 s health summary it evicted real fault
+    evidence to make room for a liveness report; the summary drops itself and
+    is counted as ``health_summary_queue_drops``.
+    """
+
+    streams = [io.StringIO(FIRST), io.StringIO(SECOND), io.StringIO("")]
+
+    def fake_open(*_args, **_kwargs):
+        return streams.pop(0) if streams else io.StringIO("")
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    sink = _WedgedSink()
+    clock = [NOW]
+    rounds: list[int] = []
+
+    def stop(_seconds: float) -> None:
+        rounds.append(len(rounds))
+        if len(rounds) == 1:
+            # The delivery thread is inside the wedged post with FIRST, so the
+            # queue keeps everything the reader hands it from here on.
+            assert sink.entered.wait(5), "the delivery thread never reached the sink"
+            return
+        if len(rounds) == 2:
+            # Round 2 queued SECOND: the queue of one is full of fault evidence.
+            clock[0] = NOW + timedelta(seconds=600)
+            return
+        # Round 3 read nothing and owed a health summary.
+        sink.release.set()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), f"no SIGTERM handler was installed: {handler}"
+        handler(signal.SIGTERM, None)
+
+    collector = KernelLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: clock[0],
+        start_at_end=False,
+        sleep=stop,
+        delivery_queue_size=1,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.kernel"):
+        collector.run()
+
+    assert collector.health_counters["delivery_queue_drops"] == 0, (
+        f"a health summary evicted a queued XID record: {collector.health_counters}"
+    )
+    assert collector.health_counters["health_summary_queue_drops"] == 1, (
+        f"the summary that yielded to the XID was not counted: "
+        f"{collector.health_counters}"
+    )
+    assert "kmsg-boot-123-43" in sink.requests + sink.buffered, (
+        f"the queued XID never got a verdict: posted={sink.requests} "
+        f"buffered={sink.buffered}"
+    )
+    assert not any(item.startswith("kernel-health-") for item in sink.buffered), (
+        f"the summary took the XID's place in the queue: {sink.buffered}"
+    )
+    assert "health summary" in caplog.text.lower(), (
+        f"the dropped health summary was not logged as one: {caplog.text}"
+    )

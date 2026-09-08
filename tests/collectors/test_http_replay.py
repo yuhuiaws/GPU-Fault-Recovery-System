@@ -795,3 +795,131 @@ def test_replay_failures_that_differ_only_in_their_text_are_reported_once(
     assert f"Errno {errno.EROFS}" in tracebacks[1].getMessage(), (
         f"the second traceback is not the second fault: {tracebacks[1].getMessage()!r}"
     )
+
+
+class _ThreadThatCannotStart:
+    """``Thread.start`` at ``TasksMax``: ``RuntimeError("can't start new thread")``."""
+
+    started: list[str] = []
+
+    def __init__(self, *, target, name, daemon) -> None:
+        self.name = name
+
+    def start(self) -> None:
+        _ThreadThatCannotStart.started.append(self.name)
+        raise RuntimeError("can't start new thread")
+
+    def join(self, timeout=None) -> None:
+        return None
+
+
+def test_a_replay_thread_that_cannot_start_does_not_fail_the_delivered_post(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """``thread.start()`` raising escaped ``post()`` *after* a successful live post.
+
+    The unit's ``TasksMax`` (or a process at its thread limit) makes
+    ``Thread.start`` raise ``RuntimeError``. The live post had already been
+    accepted, but the caller saw an exception, treated the event as failed and
+    re-sent it -- and a kernel collector reopened ``/dev/kmsg`` over it. The
+    failure is logged once (deduped like every other replay failure), the
+    replay is marked inactive so the next post can kick a fresh one, and the
+    verdict on the event stays DELIVERED.
+    """
+
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen", lambda _request, **_kwargs: _Response()
+    )
+    monkeypatch.setattr("gpu_fault.collectors.sinks.Thread", _ThreadThatCannotStart)
+    _ThreadThatCannotStart.started.clear()
+    outbox = tmp_path / "outbox.ndjson"
+    _seed_outbox(outbox, 9)
+    sink = HttpEventSink(
+        "https://control",
+        outbox_path=str(outbox),
+        outbox_replay_batch_size=2,
+        outbox_replay_background_interval_seconds=0,
+    )
+
+    results = []
+    with caplog.at_level(logging.DEBUG, logger="gpu_fault.collectors.sinks"):
+        for sequence in range(3):
+            try:
+                results.append(
+                    sink.deliver(
+                        "/events", {"sequence": sequence, "event_id": f"e-{sequence}"}
+                    ).status
+                )
+            except Exception as exc:  # noqa: BLE001 -- the escape is the defect
+                results.append(f"raised {type(exc).__name__}: {exc}")
+
+    assert results == [DeliveryStatus.DELIVERED] * 3, (
+        f"a replay thread that could not start changed the verdict on a post the "
+        f"control plane accepted: {results}"
+    )
+    assert len(_ThreadThatCannotStart.started) == 3, (
+        "the replay was not marked inactive after the failed start, so the next "
+        f"post could not kick a fresh one: {_ThreadThatCannotStart.started}"
+    )
+    assert sink.wait_for_outbox_replay(0) is True, (
+        "the replay is still marked active although its thread never started"
+    )
+    reported = [
+        record for record in caplog.records if "replay" in record.getMessage().lower()
+    ]
+    tracebacks = [record for record in reported if record.exc_info]
+    assert len(tracebacks) == 1, (
+        f"3 identical thread-start failures logged {len(tracebacks)} traceback(s): "
+        f"{[record.getMessage() for record in reported]}"
+    )
+    assert "can't start new thread" in tracebacks[0].getMessage(), (
+        f"the one diagnosis did not carry the reason: {tracebacks[0].getMessage()!r}"
+    )
+
+
+def test_padding_a_torn_tail_counts_the_line_it_adds(tmp_path) -> None:
+    """The depth the compaction trigger reads must agree with ``count_lines()``.
+
+    Closing a torn tail writes an extra newline, so the file gains two lines,
+    but the in-memory depth grew by one: from then on the sink believed the
+    outbox one record shallower than it was, and compaction ran one append
+    late -- the ceiling ``outbox_max_records`` promises was exceeded by one.
+    """
+
+    outbox = tmp_path / "outbox.ndjson"
+    intact = "".join(
+        json.dumps(
+            {
+                "path": "/events",
+                "payload": {"sequence": index},
+                "replayable": True,
+                "error": "seeded",
+                "failed_at": "2026-08-30T00:00:00+00:00",
+            }
+        )
+        + "\n"
+        for index in range(2)
+    )
+    outbox.write_text(
+        intact + '{"path":"/events","payload":{"sequence":2', encoding="utf-8"
+    )
+    sink = HttpEventSink(
+        "https://control", outbox_path=str(outbox), outbox_max_records=3
+    )
+
+    assert sink.buffer_for_replay("/events", {"sequence": 3}) is True, (
+        "the record after the torn tail was not persisted"
+    )
+
+    assert OutboxFile(outbox).count_lines() <= 3, (
+        "the outbox stands above its ceiling after the append that closed the "
+        f"torn tail: {OutboxFile(outbox).count_lines()} lines, max_records=3 -- "
+        "the padding newline was written but never counted"
+    )
+    assert sink.outbox_evictions_total == 1, (
+        f"compaction ran one append late: evictions_total={sink.outbox_evictions_total}"
+    )
+    assert [item["payload"]["sequence"] for item in OutboxFile(outbox).read()] == [
+        1,
+        3,
+    ], f"compaction did not keep the newest records: {OutboxFile(outbox).read()}"

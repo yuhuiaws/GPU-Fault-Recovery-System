@@ -569,6 +569,24 @@ class HttpEventSink:
         self._kick_outbox_replay()
         return result
 
+    def deliver_once(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """One live attempt: no retry ladder, no outbox, no receipt poll, no replay.
+
+        For a collector draining its queue on SIGTERM after ``buffer_for_replay``
+        answered ``False`` (no outbox, or ENOSPC/EROFS): ``post`` would spend
+        the full ladder -- ``max_attempts`` timeouts plus backoff, ~47 s at the
+        defaults -- per record, against a control plane that may already be
+        gone, and then try the same failed outbox write again. That is what let
+        a drain believed to take "about ten seconds" outlive the unit's
+        ``TimeoutStopSec``. This call is bounded by one ``timeout_seconds``; it
+        is the same shape the outbox replay uses per record. Raises
+        ``CollectorError`` when the attempt fails; nothing is buffered.
+        """
+
+        return self._post_with_retry(
+            path, payload, buffer_failure=False, max_attempts=1, poll_receipt=False
+        )
+
     def deliver(self, path: str, payload: dict[str, Any]) -> DeliveryResult:
         """``post`` that answers with a :class:`DeliveryResult` instead of raising.
 
@@ -650,11 +668,22 @@ class HttpEventSink:
             self._outbox_replay_thread = thread
         try:
             thread.start()
-        except Exception:
+        except Exception as exc:
+            # ``RuntimeError("can't start new thread")`` at the unit's
+            # ``TasksMax``. Re-raising it escaped ``post()`` *after* the live
+            # post had succeeded, so the caller read a failure and re-sent an
+            # event the control plane had already accepted. Same rule as a
+            # failed replay: catch-up work is never a verdict on the event.
+            # Marked inactive so the next delivered post kicks a fresh replay,
+            # and logged once per cause like every other replay failure.
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
                 self._outbox_replay_thread = None
-            raise
+            _report_replay_failure(
+                "collector background outbox replay could not start its thread",
+                self.outbox_path,
+                exc,
+            )
 
     def _continue_outbox_replay(self, outcome: _OutboxReplayResult) -> bool:
         with self._outbox_replay_state_lock:
@@ -935,8 +964,10 @@ class HttpEventSink:
             with self._outbox_lock, outbox.locked():
                 if self._outbox_line_count is None:
                     self._outbox_line_count = outbox.count_lines()
-                outbox.append(record)
-                self._outbox_line_count += 1
+                # Two lines when the append first closed a torn tail: counting
+                # one made this depth read one short of ``count_lines()`` from
+                # then on, so compaction ran one append past the ceiling.
+                self._outbox_line_count += outbox.append(record)
                 if self._outbox_line_count > self.outbox_max_records:
                     self._compact_outbox_locked(outbox)
             return True

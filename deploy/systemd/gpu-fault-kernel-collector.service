@@ -9,10 +9,17 @@ EnvironmentFile=/etc/gpu-fault/collector.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector kernel
 Restart=always
 RestartSec=5
-# The collector drains its pending queue to the outbox on SIGTERM and that
-# is bounded at about ten seconds. Stating the budget keeps systemd's 90 s
-# default from standing in for it: a drain that stops being bounded would
-# otherwise look like a slow but healthy stop.
+# On SIGTERM the collector drains its pending queue to the outbox, and the
+# drain's upper bound is a sum, not a guess (kernel.py,
+# DELIVERY_DRAIN_BUDGET_SECONDS): the reader notices the stop within its
+# 1 s select timeout (+1 s reopen sleep), the delivery thread gets a 5 s join,
+# the drain itself has a 5 s budget checked between records, and the record
+# in flight when the budget runs out costs at most ONE single-attempt post
+# (HttpEventSink.deliver_once, bounded by GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS
+# = 10 s by default; never the retry ladder). 2 + 5 + 5 + 10 = 22 s; 30 s
+# leaves the margin. Records the drain cannot reach are counted and named in an
+# ERROR line before exit -- a SIGKILL here is what would silence that line, so
+# raising GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS means raising this too.
 TimeoutStopSec=30
 NoNewPrivileges=true
 ProtectSystem=strict

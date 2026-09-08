@@ -69,6 +69,13 @@ DELIVERY_JOIN_TIMEOUT_SECONDS = 5.0
 #: outbox to hand records to. A full queue of 2048 records at ~47 s of retries
 #: each fits inside no stop timeout, so the drain is single-shot and bounded;
 #: what does not fit is counted as lost, never dropped in silence.
+#:
+#: The budget is checked between records, so the drain's upper bound is this
+#: budget plus ONE single-attempt post (``HttpEventSink.deliver_once``, bounded
+#: by ``GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS``, 10 s by default), plus the
+#: ``DELIVERY_JOIN_TIMEOUT_SECONDS`` join before it: 5 + 10 + 5 = 20 s at the
+#: defaults. ``deploy/systemd/gpu-fault-kernel-collector.service`` states its
+#: ``TimeoutStopSec`` from this sum; change one and the other.
 DELIVERY_DRAIN_BUDGET_SECONDS = 5.0
 
 #: How many times a delivery thread that died on its own may be replaced before
@@ -111,6 +118,69 @@ def _report_lost_at_shutdown(
         saved,
         ", ".join(lost[:10]),
     )
+
+
+def _deliver_once_at_shutdown(
+    sink: EventSink,
+    counters: dict[str, int],
+    deliver_one: Callable[[str, str, dict[str, Any]], bool],
+    record_id: str,
+    path: str,
+    payload: dict[str, Any],
+) -> bool:
+    """One bounded attempt for a record the outbox refused; never raises.
+
+    ``deliver_event`` walks the sink's full retry ladder (~47 s at the defaults)
+    and then tries the same failed outbox write again, so a drain of a few
+    unbuffered records outlived the unit's ``TimeoutStopSec`` and was SIGKILLed
+    before the lost-records report could run. ``HttpEventSink.deliver_once`` is
+    bounded by one client timeout; a sink without it gets the caller's regular
+    single delivery, which is all the fakes and the SQS sink have.
+    """
+
+    deliver_once = getattr(sink, "deliver_once", None)
+    if not callable(deliver_once):
+        return deliver_one(record_id, path, payload)
+    try:
+        deliver_once(path, payload)
+    except Exception as exc:
+        counters["delivery_failures"] += 1
+        LOGGER.warning(
+            "kernel event delivery failed at shutdown and was not buffered: "
+            "record=%s error=%s",
+            record_id,
+            exc,
+        )
+        return False
+    return True
+
+
+def _count_queue_drop(
+    counters: dict[str, int], *, dropped_id: str, dropped_path: str, queue_size: int
+) -> None:
+    """Count one record a full delivery queue could not hold, and say so.
+
+    A dropped health summary is a lost liveness report, not lost fault
+    evidence; counting it as an XID drop would make the counter operators page
+    on untrue. One log line per drop would itself be a load source during a
+    storm, so the first drop is logged and then every ``n``-th.
+    """
+
+    summary = dropped_path == COLLECTOR_HEALTH_PATH
+    counter = "health_summary_queue_drops" if summary else "delivery_queue_drops"
+    counters[counter] += 1
+    drops = counters[counter]
+    if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
+        LOGGER.warning(
+            "kernel delivery queue is full at %d records; dropped entry=%s "
+            "(%s, dropped=%d). The control plane is not keeping up and these "
+            "%s are lost.",
+            queue_size,
+            dropped_id,
+            "health summary" if summary else "kmsg record",
+            drops,
+            "health summaries" if summary else "records",
+        )
 
 
 class KernelLogCollector:
@@ -379,10 +449,11 @@ class KernelLogCollector:
         try:
             for index, (record_id, path, payload) in enumerate(pending):
                 if time.monotonic() >= deadline:
-                    # One attempt each, and 2048 of them at ~47 s of retries
-                    # -- or of waiting on an outbox lock the sink's own replay
-                    # thread holds -- fits inside no stop timeout, so the rest
-                    # is reported lost rather than retried past SIGKILL.
+                    # The budget is checked here, between records, so the drain
+                    # can overrun it by at most one single-attempt post (see
+                    # ``DELIVERY_DRAIN_BUDGET_SECONDS`` for the sum the unit's
+                    # ``TimeoutStopSec`` is derived from). The rest is reported
+                    # lost rather than retried past SIGKILL.
                     lost.extend(item[0] for item in pending[index:])
                     break
                 if buffer_for_replay is not None:
@@ -401,8 +472,16 @@ class KernelLogCollector:
                         continue
                     # ``False`` means no outbox is configured, or the write
                     # failed on a read-only or full volume: the record is still
-                    # ours, so it gets its one delivery attempt anyway.
-                self._deliver_one(record_id, path, payload)
+                    # ours, so it gets its one delivery attempt anyway -- one
+                    # bounded attempt, never the sink's retry ladder.
+                _deliver_once_at_shutdown(
+                    self.sink,
+                    self.health_counters,
+                    self._deliver_one,
+                    record_id,
+                    path,
+                    payload,
+                )
         except BaseException:
             # Including the record this raised on: it has no verdict either.
             lost = [item[0] for item in pending[index:]]
@@ -416,10 +495,15 @@ class KernelLogCollector:
     def _submit(self, record_id: str, path: str, payload: dict[str, Any]) -> bool:
         """Queue one record for the delivery thread; False when there is none.
 
-        Never blocks: a full queue drops its oldest record, counts it and says
-        so. A thread that died on its own is counted, reported and replaced --
-        it used to fall back to inline delivery in silence, leaving everything
-        already queued waiting on nobody until the process exited.
+        Never blocks: a full queue drops a record, counts it and says so. Which
+        record depends on what arrived: an XID evicts the oldest entry (the
+        newest evidence is what an operator needs during a storm), a health
+        summary drops *itself* -- a liveness report must never evict fault
+        evidence -- and is counted as ``health_summary_queue_drops``; ``True``
+        is still answered because the summary has had its verdict. A thread
+        that died on its own is counted, reported and replaced -- it used to
+        fall back to inline delivery in silence, leaving everything already
+        queued waiting on nobody until the process exited.
         """
 
         for _attempt in (0, 1):
@@ -431,39 +515,23 @@ class KernelLogCollector:
                     return False
                 if thread.is_alive():
                     if len(self._delivery_queue) >= self.delivery_queue_size:
+                        if path == COLLECTOR_HEALTH_PATH:
+                            _count_queue_drop(
+                                self.health_counters,
+                                dropped_id=record_id,
+                                dropped_path=path,
+                                queue_size=self.delivery_queue_size,
+                            )
+                            return True
                         dropped_id, dropped_path, _payload = (
                             self._delivery_queue.popleft()
                         )
-                        # A dropped health summary is a lost liveness report,
-                        # not lost fault evidence; counting it as an XID drop
-                        # would make the counter operators page on untrue.
-                        counter = (
-                            "health_summary_queue_drops"
-                            if dropped_path == COLLECTOR_HEALTH_PATH
-                            else "delivery_queue_drops"
+                        _count_queue_drop(
+                            self.health_counters,
+                            dropped_id=dropped_id,
+                            dropped_path=dropped_path,
+                            queue_size=self.delivery_queue_size,
                         )
-                        self.health_counters[counter] += 1
-                        drops = self.health_counters[counter]
-                        if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
-                            LOGGER.warning(
-                                "kernel delivery queue is full at %d records; "
-                                "dropped the oldest entry=%s (%s, dropped=%d). "
-                                "The control plane is not keeping up and these "
-                                "%s are lost.",
-                                self.delivery_queue_size,
-                                dropped_id,
-                                (
-                                    "health summary"
-                                    if counter == "health_summary_queue_drops"
-                                    else "kmsg record"
-                                ),
-                                drops,
-                                (
-                                    "health summaries"
-                                    if counter == "health_summary_queue_drops"
-                                    else "records"
-                                ),
-                            )
                     self._delivery_queue.append((record_id, path, payload))
                     self._delivery_wakeup.notify()
                     return True
