@@ -528,3 +528,40 @@ def test_a_cluster_on_the_default_group_gets_the_group_and_the_log_export_in_one
         "diagnostics must never reboot an instance; the preload library waits for the operator"
     )
     assert "describe-db-clusters" in _operations(runner), "the settle wait ran"
+
+
+def test_an_existing_group_is_read_from_the_projected_parameter_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``aws rds describe-db-cluster-parameters --query Parameters[...]`` answers
+    with the bare list, not ``{"Parameters": [...]}``. The first live deploy
+    created the group and never listed it; the second one did and crashed."""
+
+    monkeypatch.setattr(
+        aurora.subprocess,
+        "run",
+        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
+    )
+
+    class ProjectedRunner(DiagnosticsRunner):
+        def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:
+            value = super().aws_json(region, *arguments, **keywords)
+            if arguments[1] == "describe-db-cluster-parameters":
+                return value["Parameters"]
+            return value
+
+    runner = ProjectedRunner(_settled({"log_lock_waits": "0"}))
+
+    aurora.ensure_cluster_parameter_group(
+        runner,
+        aws_region="us-west-2",
+        cluster_id="aurora-a",
+        engine_version="16.8",
+        safe_name=lambda value, maximum: value[:maximum],
+    )
+
+    modify = runner.calls[-1]
+    assert modify[2] == "modify-db-cluster-parameter-group", modify
+    assert modify[modify.index("--parameters") + 1 :] == (
+        "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate",
+    ), modify
