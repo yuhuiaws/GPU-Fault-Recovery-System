@@ -95,7 +95,6 @@ def test_retention_block_is_parsed_and_rendered_into_the_release_config(
     [
         ({"controlRecordRetentionDays": -1}, "must be within 0"),
         ({"controlRecordRetentionDays": "30"}, "must be an integer"),
-        ({"controlRecordRetentionDays": 30}, "archiveS3Uri is required"),
         (
             {"controlRecordRetentionDays": 30, "archiveS3Uri": "https://x/y"},
             "must be an s3://",
@@ -351,3 +350,27 @@ def test_regenerating_the_site_preserves_the_declared_retention() -> None:
     assert preserve_existing_site_contract(copy.deepcopy(generated), {"spec": {}}) == (
         generated
     )
+
+
+def test_retention_without_an_archive_uri_derives_the_site_bucket(
+    site_file: Path,
+) -> None:
+    """Turning retention on is one line: the bucket name follows the account,
+    Region and site so bootstrap can create it and the role can be granted."""
+
+    rendered = load_site(_site_document(site_file, {"controlRecordRetentionDays": 30}))
+
+    retention = rendered.release_config["retention"]
+    account = rendered.release_config["cpu_eks_arn"].split(":")[4]
+    region = rendered.release_config["aws_region"]
+    site_name = rendered.release_config["site_name"]
+    assert retention["control_record_retention_days"] == 30
+    assert retention["archive_s3_uri"] == (
+        f"s3://gpu-fault-control-records-{account}-{region}/{site_name}/control-record-archive"
+    )
+    assert (
+        RetentionSiteConfig.from_value(
+            {"controlRecordRetentionDays": 30}
+        ).archive_s3_uri
+        is None
+    ), "the raw block keeps None; resolution happens per site"

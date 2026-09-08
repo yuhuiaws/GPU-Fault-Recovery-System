@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence, cast
 
@@ -177,6 +177,30 @@ def archive_s3_prefix_arn(uri: str) -> str:
     return f"arn:aws:s3:::{match.group('bucket')}/{prefix + '/' if prefix else ''}*"
 
 
+def default_control_record_archive_s3_uri(
+    *, account_id: str, region: str, site_name: str
+) -> str:
+    """The archive destination a site gets when ``spec.retention`` names none.
+
+    One bucket per account and Region, one prefix per site, so turning
+    retention on is a single ``controlRecordRetentionDays`` line: bootstrap
+    creates and hardens the bucket, the control-plane role is granted the
+    prefix, and the deploy preflight checks it exists.
+    """
+
+    return (
+        f"s3://gpu-fault-control-records-{account_id}-{region}/"
+        f"{site_name}/control-record-archive"
+    )
+
+
+def eks_arn_account_id(arn: str) -> str:
+    parts = str(arn).split(":")
+    if len(parts) < 6 or not parts[4].isdigit():
+        raise SiteConfigError(f"not an EKS cluster ARN: {arn}")
+    return parts[4]
+
+
 @dataclass(frozen=True)
 class RetentionSiteConfig:
     """``spec.retention``: archive-first deletion of closed control records.
@@ -218,11 +242,8 @@ class RetentionSiteConfig:
         uri = _optional_text(data.get("archiveS3Uri"), "spec.retention.archiveS3Uri")
         if uri is not None:
             archive_s3_prefix_arn(uri)
-        elif days > 0:
-            raise SiteConfigError(
-                "spec.retention.archiveS3Uri is required when "
-                "controlRecordRetentionDays > 0: rows are archived before deletion"
-            )
+        # ``days > 0`` without a URI is allowed here: the site resolves it to
+        # the account/Region/site default (``resolved``) once it knows them.
         interval = data.get("archiveIntervalSeconds")
         return cls(
             control_record_retention_days=days,
@@ -237,6 +258,21 @@ class RetentionSiteConfig:
                     minimum=60,
                     maximum=86400 * 7,
                 )
+            ),
+        )
+
+    def resolved(
+        self, *, account_id: str, region: str, site_name: str
+    ) -> RetentionSiteConfig:
+        """This block with the default archive URI filled in when retention is
+        on and the operator named none."""
+
+        if not self.enabled or self.archive_s3_uri is not None:
+            return self
+        return replace(
+            self,
+            archive_s3_uri=default_control_record_archive_s3_uri(
+                account_id=account_id, region=region, site_name=site_name
             ),
         )
 
@@ -262,12 +298,35 @@ class RetentionSiteConfig:
 
 
 def site_retention(site: Mapping[str, Any] | None) -> RetentionSiteConfig:
-    """``spec.retention`` of a raw site document, off when absent or unreadable."""
+    """``spec.retention`` of a raw site document, off when absent or unreadable.
 
-    spec = site.get("spec") if isinstance(site, Mapping) else None
+    Resolves the default archive URI the same way ``RegionalSite`` does, so the
+    bootstrap rerun that widens the role and creates the bucket sees the same
+    target the release will render.
+    """
+
+    if not isinstance(site, Mapping):
+        return RetentionSiteConfig()
+    spec = site.get("spec")
     if not isinstance(spec, Mapping):
         return RetentionSiteConfig()
-    return RetentionSiteConfig.from_value(spec.get("retention"))
+    retention = RetentionSiteConfig.from_value(spec.get("retention"))
+    if not retention.enabled or retention.archive_s3_uri is not None:
+        return retention
+    cpu = spec.get("cpu")
+    metadata = site.get("metadata")
+    cpu_fields: Mapping[str, Any] = cpu if isinstance(cpu, Mapping) else {}
+    metadata_fields: Mapping[str, Any] = (
+        metadata if isinstance(metadata, Mapping) else {}
+    )
+    try:
+        return retention.resolved(
+            account_id=eks_arn_account_id(str(cpu_fields.get("eksArn") or "")),
+            region=str(spec.get("awsRegion") or ""),
+            site_name=str(metadata_fields.get("name") or ""),
+        )
+    except SiteConfigError:
+        return retention
 
 
 NOTIFICATION_CHANNEL_SNS = "sns"
@@ -944,7 +1003,17 @@ class RegionalSite:
         name = _required_text(metadata.get("name"), "metadata.name")
         if not IDENTIFIER_PATTERN.fullmatch(name):
             raise SiteConfigError("metadata.name contains unsupported characters")
-        return cls(name=name, spec=SiteSpec.from_value(data.get("spec")))
+        spec = SiteSpec.from_value(data.get("spec"))
+        if spec.retention.enabled and spec.retention.archive_s3_uri is None:
+            spec = replace(
+                spec,
+                retention=spec.retention.resolved(
+                    account_id=eks_arn_account_id(spec.cpu.eks_arn),
+                    region=spec.aws_region,
+                    site_name=name,
+                ),
+            )
+        return cls(name=name, spec=spec)
 
 
 @dataclass(frozen=True)

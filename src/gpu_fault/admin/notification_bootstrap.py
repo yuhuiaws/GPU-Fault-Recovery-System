@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from gpu_fault.admin.archive_bucket import ensure_control_record_archive_bucket
 from gpu_fault.admin.bootstrap_common import (
     BootstrapRequest,
     BootstrapState,
@@ -68,7 +69,16 @@ def notification_bootstrap_tasks(
     # The role is granted exactly the channel the site uses: Publish on the
     # site topic for sns, SendEmail from the verified sender for ses.
     uses_ses = routing.uses_ses
+    archive_tasks: dict[str, Callable[[], Any]] = {}
+    if archive_s3_uri:
+        # Retention names a bucket: create/harden it before anything archives.
+        archive_tasks["control_record_archive_bucket"] = (
+            lambda: ensure_control_record_archive_bucket(
+                runner, region=cpu.region, archive_s3_uri=archive_s3_uri
+            )
+        )
     return {
+        **archive_tasks,
         "control_plane_role": lambda: ensure_control_plane_role(
             runner,
             cpu=cpu,
