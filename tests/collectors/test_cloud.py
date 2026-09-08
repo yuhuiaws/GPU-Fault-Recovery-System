@@ -15,6 +15,7 @@ from ._support import (
     KubernetesHmaNodeCollector,
     KubernetesNodeResourceCollector,
     RecordingSink,
+    RejectingSink,
     SimpleNamespace,
     SqsHmaConsumer,
     StopTheLoop,
@@ -969,7 +970,7 @@ def test_hma_watcher_paginates_the_relist(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 class _FlakySqsClient:
-    """``receive_message`` fails twice, then hands over one HMA message."""
+    """``receive_message`` fails twice, hands over one HMA message, fails again."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -977,9 +978,11 @@ class _FlakySqsClient:
 
     def receive_message(self, **_kwargs: Any) -> dict[str, Any]:
         self.calls += 1
-        if self.calls <= 2:
+        # Two failures, one message, then a failure again: the last one is what
+        # shows whether the backoff was reset by the successful receive.
+        if self.calls in {1, 2, 4}:
             raise RuntimeError("ExpiredTokenException")
-        if self.calls > 3:
+        if self.calls > 4:
             raise StopTheLoop
         return {
             "Messages": [
@@ -1023,16 +1026,18 @@ def test_sqs_consumer_survives_receive_error(monkeypatch: pytest.MonkeyPatch) ->
     assert client.deleted == ["receipt-1"], (
         "a receive_message error ended the consumer instead of backing off"
     )
-    assert sleeps == [1.0, 2.0], (
-        "the receive backoff did not start at one second and double"
+    assert sleeps == [1.0, 2.0, 1.0], (
+        "the receive backoff did not start at one second, double, and reset "
+        "once a receive succeeded"
     )
 
 
 class _PoisonSqsClient:
-    """One unparsable message the queue has already redelivered five times."""
+    """One message the queue has already redelivered ``receives`` times."""
 
-    def __init__(self, body: str) -> None:
+    def __init__(self, body: str, *, receives: str = "5") -> None:
         self.body = body
+        self.receives = receives
         self.deleted: list[str] = []
         self.receive_kwargs: list[dict[str, Any]] = []
 
@@ -1046,7 +1051,7 @@ class _PoisonSqsClient:
                     "MessageId": "message-9",
                     "Body": self.body,
                     "ReceiptHandle": "receipt-9",
-                    "Attributes": {"ApproximateReceiveCount": "5"},
+                    "Attributes": {"ApproximateReceiveCount": self.receives},
                 }
             ]
         }
@@ -1095,4 +1100,129 @@ def test_sqs_poison_message_is_dropped_after_five_receives(
     )
     assert "worker-1-fault-text" not in logged, (
         "the message body was logged instead of its digest"
+    )
+
+
+def _forward_one_queued_event(sink: Any, *, receives: str) -> _PoisonSqsClient:
+    """Forward one well-formed queued event whose delivery the sink decides."""
+
+    client = _PoisonSqsClient(
+        json.dumps(
+            {
+                "path": "/v1/provider-events/hyperpod-hma/cloudwatch",
+                "payload": {"node_id": "worker-1"},
+            }
+        ),
+        receives=receives,
+    )
+    SqsHmaConsumer(sink, "https://sqs/queue", client=client).run_once(
+        wait_time_seconds=0
+    )
+    return client
+
+
+def test_sqs_retryable_failure_is_never_dropped_regardless_of_receive_count() -> None:
+    """Only the message can be poison; the transport being down never is.
+
+    ``VisibilityTimeout`` is 60 s, so a five-minute control-plane outage takes
+    every message past five receives. Dropping on the receive count alone
+    therefore deleted the whole backlog mid-outage -- and the optional consumer
+    manifest configures no outbox, so a transport failure there is FAILED, not
+    BUFFERED: the queue's 14-day retention was the only copy of those events.
+    """
+
+    kept = _forward_one_queued_event(RejectingSink(status_code=503), receives="9")
+    assert kept.deleted == [], (
+        "a retryable 503 was treated as poison and the event was deleted "
+        "instead of left for redelivery"
+    )
+    auth = _forward_one_queued_event(RejectingSink(status_code=401), receives="9")
+    assert auth.deleted == [], (
+        "a token-rotation 401 was treated as poison; the event behind it is real"
+    )
+    rejected = _forward_one_queued_event(RejectingSink(status_code=422), receives="9")
+    assert rejected.deleted == ["receipt-9"], (
+        "a rejection the control plane will repeat kept the message on the "
+        "queue forever"
+    )
+
+
+def test_hma_relist_backs_off_when_a_continue_token_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 410 must never spin the relist, and a continue token can expire.
+
+    The 410 branch was the only unthrottled path in the loop. etcd compaction
+    during a large paginated LIST expires the continue token, so page two 410s
+    while page one is fine -- "relist page 1, 410 on page 2, relist page 1" is a
+    tight loop of multi-MB LISTs plus a full sanitize against the apiserver.
+    """
+
+    class _CompactingNodeApi:
+        def __init__(self) -> None:
+            self.list_kwargs: list[dict[str, Any]] = []
+            self.expired_pages = 0
+
+        def list_node(self, **kwargs: Any) -> Any:
+            self.list_kwargs.append(dict(kwargs))
+            if len(self.list_kwargs) > 6:
+                raise StopTheLoop
+            if kwargs.get("_continue"):
+                if self.expired_pages < 2:
+                    self.expired_pages += 1
+                    raise _expired_watch_error()
+                return SimpleNamespace(
+                    items=[_hma_node("44", "gpu-worker-b")],
+                    metadata=SimpleNamespace(resource_version="9", _continue=None),
+                )
+            return SimpleNamespace(
+                items=[_hma_node("43", "gpu-worker-a")],
+                metadata=SimpleNamespace(resource_version="7", _continue="page-two"),
+            )
+
+    from gpu_fault.collectors.cloud import kubernetes as module
+
+    api = _CompactingNodeApi()
+    collector = KubernetesHmaNodeCollector(
+        RecordingSink(), context(), now=lambda: NOW, list_page_size=1
+    )
+    _patch_kubernetes(monkeypatch, api, [])
+    sleeps: list[float] = []
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert sleeps == [2, 2, 2], (
+        "a 410 relisted with no backoff at all: two expired continue tokens and "
+        "one expired watch each restarted a full LIST immediately"
+    )
+
+
+def test_kubernetes_collector_forgets_a_node_that_loses_every_hma_key() -> None:
+    """A node with no HMA keys left must not keep its digest.
+
+    HMA labels every node, so the skip branch is normally a non-HMA node -- but
+    if every HMA key is removed and the same fault later returns verbatim, the
+    stale digest would deduplicate the new occurrence away and the control plane
+    would never hear about it.
+    """
+
+    sink = RecordingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    faulted = _hma_content_node("1")
+    bare = {
+        "metadata": {"name": "gpu-worker", "resourceVersion": "2", "labels": {}},
+        "status": {},
+    }
+
+    assert collector.collect_node(faulted).delivered == 1, (
+        "the first HMA node record was not delivered"
+    )
+    assert collector.collect_node(bare).skipped == 1, (
+        "a node with no HMA keys must be skipped, not posted"
+    )
+    assert collector.collect_node(_hma_content_node("3")).delivered == 1, (
+        "the same fault returning after every HMA key was removed was "
+        "deduplicated against the digest of the first occurrence"
     )

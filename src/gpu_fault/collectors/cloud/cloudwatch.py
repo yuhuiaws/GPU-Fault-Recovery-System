@@ -30,6 +30,7 @@ from gpu_fault.collectors.sinks import (
     EventSink,
     SqsEventSink,
     deliver_event,
+    is_retryable_collector_status,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,37 @@ HMA_KEYS = {
 #: There is no redrive policy on this queue, so a message nothing can parse was
 #: retried every visibility timeout forever, logging a traceback each time.
 POISON_RECEIVE_COUNT = 5
+
+
+class InvalidQueuedHmaEvent(CollectorError):
+    """A queued body that is not an HMA event: no redelivery can fix it.
+
+    Its own class because the receive count alone must never authorise a drop:
+    this failure is about the message, a transport failure is not, and both used
+    to arrive as a bare :class:`CollectorError` with no status.
+    """
+
+
+def _is_poison_failure(exc: BaseException) -> bool:
+    """Whether a sixth attempt at this message would fail the same way.
+
+    Only the message can be poison. A transport failure carries no status code
+    (or a retryable/auth one): the event behind it is real and the queue, whose
+    retention is 14 days, is the only place it still exists.
+    """
+
+    if isinstance(exc, InvalidQueuedHmaEvent):
+        return True
+    if isinstance(exc, CollectorError):
+        return exc.status_code is not None and not is_retryable_collector_status(
+            exc.status_code
+        )
+    # ``json.JSONDecodeError`` is a ``ValueError``; a body without ``path`` or
+    # ``payload`` is a ``KeyError``. Everything else -- ``OSError`` and friends
+    # -- is the transport, and stays on the queue however often it is received.
+    return isinstance(exc, (KeyError, ValueError, TypeError))
+
+
 #: The receive backoff ladder: never a tight loop against a throttled queue,
 #: never long enough to look like the consumer has stopped.
 RECEIVE_BACKOFF_SECONDS = 1.0
@@ -200,7 +232,7 @@ class SqsHmaConsumer:
                 if not path.startswith(
                     "/v1/provider-events/hyperpod-hma/"
                 ) or not isinstance(payload, dict):
-                    raise CollectorError("invalid queued HMA event")
+                    raise InvalidQueuedHmaEvent("invalid queued HMA event")
                 result = deliver_event(self.sink, path, payload)
                 result.raise_for_failure()
                 if result.buffered:
@@ -225,16 +257,22 @@ class SqsHmaConsumer:
                 delivered += 1
             except Exception as exc:
                 receives = self._receive_count(message)
-                if receives >= POISON_RECEIVE_COUNT:
-                    # Only a message that failed *again* is dropped: a forward
-                    # the outbox took never lands here, and a retryable failure
-                    # is left for the queue, so this is a body nothing can turn
-                    # into an event. Neither the body nor the rejection text is
-                    # logged -- a 4xx detail quotes the payload back, and HMA
-                    # fault text names nodes -- only the failure class, the
-                    # status and the body digest, which is enough to recognise
-                    # the same message twice. The four earlier receives already
-                    # logged the full reason with a traceback.
+                if receives >= POISON_RECEIVE_COUNT and _is_poison_failure(exc):
+                    # Two conditions, and the second is the important one. The
+                    # visibility timeout is 60 s, so a five-minute control-plane
+                    # outage takes every message past five receives: dropping on
+                    # the count alone deleted the whole backlog mid-outage, and
+                    # the optional consumer manifest configures no outbox, so a
+                    # transport failure there is FAILED, not BUFFERED -- the
+                    # queue's 14-day retention was the only copy. So a message
+                    # leaves only when the failure is about the message itself
+                    # and a sixth attempt would fail identically.
+                    #
+                    # Neither the body nor the rejection text is logged -- a 4xx
+                    # detail quotes the payload back, and HMA fault text names
+                    # nodes -- only the failure class, the status and the body
+                    # digest, which is enough to recognise the same message
+                    # twice. The earlier receives already logged the full reason.
                     LOGGER.warning(
                         "dropping queued HMA event %s after %d receives "
                         "(body sha256 %s): %s status=%s",
@@ -251,7 +289,13 @@ class SqsHmaConsumer:
                         ReceiptHandle=message["ReceiptHandle"],
                     )
                 else:
-                    LOGGER.exception("queued HMA event delivery failed")
+                    LOGGER.warning(
+                        "queued HMA event %s delivery failed on receive %d; "
+                        "leaving it on the queue for redelivery",
+                        message.get("MessageId", "<unknown>"),
+                        receives,
+                        exc_info=True,
+                    )
         return delivered
 
     @staticmethod

@@ -132,6 +132,17 @@ def _node_without_images(node: dict[str, Any]) -> dict[str, Any]:
 
 
 class KubernetesHmaNodeCollector:
+    """Watches Nodes and posts each HMA state change once.
+
+    One digest per node of the HMA-relevant content decides what is new
+    (:func:`_hma_content_digest`); it is dropped when the node is deleted, and
+    also when a node stops carrying any HMA key at all. That second case is what
+    keeps the skip branch honest: HMA labels every node, so a node without a
+    single HMA key is normally a non-HMA node -- but if every key were removed
+    and the identical fault later returned, a remembered digest would deduplicate
+    the new occurrence away and the control plane would never hear about it.
+    """
+
     def __init__(
         self,
         sink: EventSink,
@@ -154,6 +165,7 @@ class KubernetesHmaNodeCollector:
         labels = metadata.get("labels") or {}
         annotations = metadata.get("annotations") or {}
         if not HMA_KEYS.intersection({*labels, *annotations}):
+            self.forget_node(str(node_id))
             return CollectorStats(observed=1, skipped=1)
 
         resource_version = str(metadata.get("resourceVersion") or "")
@@ -256,12 +268,18 @@ class KubernetesHmaNodeCollector:
                     # Expected on any watch older than the apiserver cache
                     # window: it is a relist, not a failure, and the content
                     # digests keep the relist from re-posting unchanged nodes.
+                    # It still sleeps: a continue token compacted out mid-LIST
+                    # 410s page two while page one keeps working, and this used
+                    # to be the one unthrottled path -- "relist page 1, 410 on
+                    # page 2, relist page 1" against the apiserver, multiple MB
+                    # and a full sanitize each time round.
                     LOGGER.info(
                         "Kubernetes HMA watch resourceVersion %s expired; "
                         "relisting nodes",
                         resource_version,
                     )
                     resource_version = None
+                    time.sleep(2)
                     continue
                 LOGGER.exception("Kubernetes HMA watch failed; resuming the watch")
                 time.sleep(2)
