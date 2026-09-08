@@ -4107,7 +4107,13 @@ test_cases:
   - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
   - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 04848fabe2eee7ef2c3ca0d391df46c9fb04bde5b6808a8e0f05f638d66eaa2f
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-019
   related_pytest: tests/regional/test_destr019_node_probe.py::test_the_migration_drill_report_satisfies_the_case_verdict
