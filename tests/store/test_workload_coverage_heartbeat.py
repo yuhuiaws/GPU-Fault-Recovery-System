@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from gpu_fault.store import InMemoryStore, PostgresStore, SqliteStore
 from gpu_fault.store.shared.primitives import state_key
@@ -218,11 +219,12 @@ class _UndecodableRowStore(SharedTelemetryRecordMixin):
     """A key/value store whose stored coverage row cannot be decoded at all.
 
     ``_get`` ends in ``self._models[kind].model_validate_json(payload)``, so a
-    row of a kind this build's ``record_models()`` does not carry raises
-    ``KeyError`` and a payload that is not even a JSON object can raise
-    ``TypeError`` before pydantic wraps it. Reading coverage happens on the
-    fault ingest path, where any of them raising fails the ingest of every
-    fault on the cluster -- the one thing this row must never do.
+    payload that is not even a JSON object can raise ``TypeError`` before
+    pydantic wraps it, and a naive stamp raises ``ValidationError``. Reading
+    coverage happens on the fault ingest path, where any of them raising fails
+    the ingest of every fault on the cluster -- the one thing this row must
+    never do. A ``KeyError`` is none of those: it is what ``_get`` raises when
+    this build's ``record_models()`` does not carry the kind at all.
     """
 
     def __init__(self, error: Exception) -> None:
@@ -245,23 +247,59 @@ class _UndecodableRowStore(SharedTelemetryRecordMixin):
 
 @pytest.mark.parametrize(
     "error",
-    [KeyError("workload_coverage_heartbeat"), TypeError("not a mapping"), ValueError()],
-    ids=["unknown-record-kind", "not-a-mapping", "not-a-value"],
+    [
+        TypeError("not a mapping"),
+        ValueError(),
+        ValidationError.from_exception_data("WorkloadCoverageHeartbeat", []),
+    ],
+    ids=["not-a-mapping", "not-a-value", "does-not-validate"],
 )
-def test_a_row_that_cannot_be_decoded_reads_as_no_coverage(error) -> None:
+def test_a_row_that_cannot_be_decoded_reads_as_no_coverage(error, caplog) -> None:
+    # The report is suppressed per cluster and this process is shared with
+    # every other test, so each parameter needs its own cluster.
+    cluster = f"cluster-undecodable-{type(error).__name__}"
     store = _UndecodableRowStore(error)
 
-    assert store.get_workload_coverage_heartbeat(CLUSTER) is None, (
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.telemetry"):
+        first = store.get_workload_coverage_heartbeat(cluster)
+        second = store.get_workload_coverage_heartbeat(cluster)
+
+    assert (first, second) == (None, None), (
         "an undecodable row must read as absent coverage; raising here fails "
         "the ingest of every fault on the cluster"
     )
-    accepted = store.save_workload_coverage_heartbeat(_heartbeat())
+    assert caplog.text.count("ignoring the stored coverage heartbeat") == 1, (
+        f"an undecodable row is one fact and must be reported once: {caplog.text}"
+    )
+    accepted = store.save_workload_coverage_heartbeat(_heartbeat(cluster_id=cluster))
 
     assert accepted is True, (
         "the writer reads the row too, and refusing there would leave the "
         "cluster's single row poisoned for ever"
     )
     assert store.rows and next(iter(store.rows.values())).observed_at == NOW, store.rows
+
+
+def test_a_record_kind_this_build_does_not_carry_is_not_an_unreadable_row() -> None:
+    """An unregistered kind is a build error and must reach the caller.
+
+    ``_get`` looks the kind up in ``record_models()``, so a build that does not
+    carry ``workload_coverage_heartbeat`` -- a narrow proxy, a half-applied
+    refactor -- raises ``KeyError`` for *every* cluster and every row of that
+    kind. Swallowing it with the tolerant read reported "the stored payload
+    cannot be read" once per cluster and then answered "no coverage" for ever:
+    the whole fleet would read UNKNOWN, every node-mutating plan would be
+    BLOCKED, and the logs would blame the watcher's data.
+    """
+
+    store = _UndecodableRowStore(KeyError("workload_coverage_heartbeat"))
+
+    with pytest.raises(KeyError) as raised:
+        store.get_workload_coverage_heartbeat(CLUSTER)
+
+    assert "workload_coverage_heartbeat" in str(raised.value), (
+        f"the failure must name the kind that is not registered: {raised.value}"
+    )
 
 
 def test_each_cluster_keeps_its_own_heartbeat(coverage_store) -> None:

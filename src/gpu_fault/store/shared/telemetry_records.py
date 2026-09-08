@@ -53,6 +53,10 @@ from gpu_fault.training_models import TrainingProgressHeartbeat, TrainingProgres
 from gpu_fault.watcher import AttemptObservation
 
 
+#: The record kind the one coverage heartbeat row per cluster is stored under.
+COVERAGE_HEARTBEAT_KIND = "workload_coverage_heartbeat"
+
+
 class SharedTelemetryRecordMixin:
     # Attributes supplied by the composed concrete implementation.
     _get: GetRecord
@@ -248,13 +252,13 @@ class SharedTelemetryRecordMixin:
         """
 
         storage_key = self._state_key((heartbeat.cluster_id,))
-        with self._state_transaction(f"workload_coverage_heartbeat/{storage_key}"):
+        with self._state_transaction(f"{COVERAGE_HEARTBEAT_KIND}/{storage_key}"):
             previous = self._read_coverage_heartbeat(heartbeat.cluster_id, storage_key)
             if previous is not None and not coverage_heartbeat_supersedes(
                 heartbeat, previous
             ):
                 return False
-            self._put("workload_coverage_heartbeat", storage_key, heartbeat)
+            self._put(COVERAGE_HEARTBEAT_KIND, storage_key, heartbeat)
             # The row is readable again, so the next unusable one is news.
             note_usable_coverage_heartbeat(heartbeat.cluster_id)
             return True
@@ -277,23 +281,30 @@ class SharedTelemetryRecordMixin:
         instead of leaving it poisoned for ever.
 
         Decoding fails in more ways than validation: ``_get`` ends in
-        ``self._models[kind].model_validate_json(payload)``, so a build whose
-        ``record_models()`` does not carry this kind raises ``KeyError`` and a
-        payload that is not a JSON object can raise before pydantic wraps it.
-        Every one of those is the same fact -- there is no readable coverage --
-        and answering it is what keeps this row out of the ingest path's
-        failure modes. A store or connection error is *not* caught: that is a
-        broken store, not a broken row, and the caller must see it.
+        ``self._models[kind].model_validate_json(payload)``, so a payload that
+        is not a JSON object can raise ``TypeError``/``ValueError`` before
+        pydantic wraps it. Every one of those is the same fact -- this row is
+        not readable coverage -- and answering it is what keeps this row out of
+        the ingest path's failure modes.
+
+        Two failures are *not* that fact and must reach the caller. A store or
+        connection error is a broken store, not a broken row. And the
+        ``KeyError`` raised when this build's ``record_models()`` does not carry
+        the kind at all is a build error: it applies to every row of the kind on
+        every cluster, so swallowing it here would have reported the watcher's
+        data once per cluster while the whole fleet read UNKNOWN and every
+        node-mutating plan stayed BLOCKED.
         """
 
         try:
             heartbeat = cast(
                 "WorkloadCoverageHeartbeat | None",
-                self._get_optional("workload_coverage_heartbeat", storage_key),
+                self._get_optional(COVERAGE_HEARTBEAT_KIND, storage_key),
             )
-        except (ValidationError, TypeError, ValueError, KeyError):
+        except (ValidationError, TypeError, ValueError):
             warn_unusable_coverage_heartbeat(
-                cluster_id, "the stored payload cannot be read as a coverage heartbeat"
+                cluster_id,
+                "the stored payload is not a readable coverage heartbeat",
             )
             return None
         if heartbeat is not None:
