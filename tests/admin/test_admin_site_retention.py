@@ -58,12 +58,65 @@ def _site_document(site_file: Path, retention: dict[str, Any] | None) -> Path:
     return site_file
 
 
-def test_retention_is_off_when_the_site_declares_nothing(site_file: Path) -> None:
-    site = RegionalSite.from_value(yaml.safe_load(site_file.read_text()))
+def test_retention_is_on_by_default_when_the_site_declares_nothing(
+    site_file: Path,
+) -> None:
+    """Nobody edits site.yaml to get retention: absent means 30 days, and the
+    archive URI is derived so bootstrap can create the bucket."""
 
-    assert site.spec.retention == RetentionSiteConfig()
+    document = yaml.safe_load(site_file.read_text())
+    site = RegionalSite.from_value(document)
+
+    assert site.spec.retention.control_record_retention_days == 30
+    assert site.spec.retention.enabled is True
+    account = document["spec"]["cpu"]["eksArn"].split(":")[4]
+    assert site.spec.retention.archive_s3_uri == (
+        f"s3://gpu-fault-control-records-{account}-{document['spec']['awsRegion']}/"
+        f"{document['metadata']['name']}/control-record-archive"
+    )
+    assert (
+        site.spec.retention.environment()["GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS"]
+        == "30"
+    )
+
+
+def test_retention_is_off_only_when_declared_zero(site_file: Path) -> None:
+    site = RegionalSite.from_value(
+        yaml.safe_load(
+            _site_document(site_file, {"controlRecordRetentionDays": 0}).read_text()
+        )
+    )
+
     assert site.spec.retention.enabled is False
     assert site.spec.retention.environment() == {}
+
+
+def test_bootstrap_archive_uri_defaults_before_a_site_exists() -> None:
+    from types import SimpleNamespace
+
+    from gpu_fault.admin.site import bootstrap_archive_s3_uri
+
+    identity = SimpleNamespace(account_id="123456789012", region="us-west-2")
+    first = bootstrap_archive_s3_uri(None, identity=identity, site_name="site-a")
+    assert first == (
+        "s3://gpu-fault-control-records-123456789012-us-west-2/site-a/control-record-archive"
+    )
+    assert (
+        bootstrap_archive_s3_uri(
+            {"spec": {"retention": {"controlRecordRetentionDays": 0}}},
+            identity=identity,
+            site_name="s",
+        )
+        is None
+    )
+    assert (
+        bootstrap_archive_s3_uri(
+            {"spec": {"retention": {"archiveS3Uri": ARCHIVE_URI}}},
+            identity=identity,
+            site_name="s",
+        )
+        == ARCHIVE_URI
+    )
 
 
 def test_retention_block_is_parsed_and_rendered_into_the_release_config(

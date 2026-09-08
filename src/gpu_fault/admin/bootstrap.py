@@ -103,7 +103,7 @@ from gpu_fault.admin.grafana import (
 )
 from gpu_fault.admin.notifications import NotificationRouting
 from gpu_fault.admin.release_repositories import prepare_signed_release
-from gpu_fault.admin.site import site_retention
+from gpu_fault.admin.site import bootstrap_archive_s3_uri
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
     "public.ecr.aws/aws-observability/aws-otel-collector@"
@@ -1939,10 +1939,10 @@ def bootstrap_from_arns(
             ensure_nlb_network=_ensure_nlb_network,
             ensure_pki=_ensure_pki,
             ensure_aurora=_ensure_aurora,
-            # spec.retention is operator-declared in the existing site; a rerun
-            # of deploy is what widens the control-plane role to the archive
-            # prefix.
-            archive_s3_uri=site_retention(existing_site).archive_s3_uri,
+            # Retention is on by default; controlRecordRetentionDays: 0 opts out.
+            archive_s3_uri=bootstrap_archive_s3_uri(
+                existing_site, identity=cpu, site_name=site_id
+            ),
         ),
         platform=platform_task_graph(
             runner=active_runner,

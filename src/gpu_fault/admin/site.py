@@ -8,7 +8,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence, cast
+from typing import Any, Iterator, Mapping, Protocol, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -194,6 +194,38 @@ def default_control_record_archive_s3_uri(
     )
 
 
+DEFAULT_CONTROL_RECORD_RETENTION_DAYS = 30
+
+
+class AwsAccountScope(Protocol):
+    """The account/region pair a default archive bucket name is derived from
+    (bootstrap passes its CPU ``ClusterIdentity``)."""
+
+    @property
+    def account_id(self) -> str: ...
+
+    @property
+    def region(self) -> str: ...
+
+
+def bootstrap_archive_s3_uri(
+    existing_site: Mapping[str, Any] | None,
+    *,
+    identity: AwsAccountScope,
+    site_name: str,
+) -> str | None:
+    """The archive target bootstrap must create and grant, or None when the
+    site turned retention off. A first bootstrap (no site yet) gets the
+    default: retention is on unless the operator later declares 0."""
+
+    retention = site_retention(existing_site)
+    if not retention.enabled:
+        return None
+    return retention.archive_s3_uri or default_control_record_archive_s3_uri(
+        account_id=identity.account_id, region=identity.region, site_name=site_name
+    )
+
+
 def eks_arn_account_id(arn: str) -> str:
     parts = str(arn).split(":")
     if len(parts) < 6 or not parts[4].isdigit():
@@ -205,13 +237,15 @@ def eks_arn_account_id(arn: str) -> str:
 class RetentionSiteConfig:
     """``spec.retention``: archive-first deletion of closed control records.
 
-    Absent means off: the runtime default for the retention days is ``0`` and
-    nothing is ever deleted. Turning it on is a site declaration followed by a
-    ``deploy --state-dir`` rerun, never a release change, so the operator
-    decision and the S3 destination sit in one reviewed file.
+    Absent means **on** with the product default (30 days; control-plane
+    review 2026-09-08): closed incidents and their workflows are archived to
+    the site's bucket and deleted after 30 days, the bucket being created by
+    bootstrap. An operator turns it off by declaring
+    ``controlRecordRetentionDays: 0`` explicitly, so the decision to keep rows
+    forever is the one that has to be written down.
     """
 
-    control_record_retention_days: int = 0
+    control_record_retention_days: int = DEFAULT_CONTROL_RECORD_RETENTION_DAYS
     archive_s3_uri: str | None = None
     archive_interval_seconds: int | None = None
 
@@ -235,7 +269,7 @@ class RetentionSiteConfig:
         days = _integer(
             data.get("controlRecordRetentionDays"),
             "spec.retention.controlRecordRetentionDays",
-            default=0,
+            default=DEFAULT_CONTROL_RECORD_RETENTION_DAYS,
             minimum=0,
             maximum=3650,
         )
