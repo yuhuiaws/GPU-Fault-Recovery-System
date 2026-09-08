@@ -9,6 +9,7 @@ from ._support import (
     NodeActionStatus,
     Path,
     ThreadPoolExecutor,
+    TimeoutExpired,
     WorkflowOperation,
     _flight_dump_payload,
     _torch_flight_dump,
@@ -124,6 +125,82 @@ def test_diagnostic_bundle_records_partial_failures(tmp_path) -> None:
     assert not any(path.is_dir() for path in output_dir.iterdir()), (
         "expected any(path.is_dir() for path in output_dir.iterdir()) to be falsy"
     )
+
+
+def test_a_strace_sample_that_outruns_the_runner_still_counts_its_traces(
+    tmp_path,
+) -> None:
+    """The traces strace wrote are evidence even when the runner never returns.
+
+    ``trace_file_count`` was globbed only on the happy path, so a sample whose
+    ``timeout(1)`` wrapper outlived our own ``duration + 5`` deadline -- the
+    deep hang this bundle exists to capture, where even signal delivery is slow
+    -- reported ``trace_file_count: 0`` while its trace sat in the archive
+    beside the manifest. Whoever read the manifest concluded nothing had been
+    captured and went looking for evidence that was already in their hands.
+    """
+
+    pid = os.getpid()
+    output_dir = tmp_path / "diagnostics"
+
+    class StuckStraceRunner:
+        def __call__(self, argv, **_):
+            if "--query-compute-apps=pid,gpu_uuid,process_name" in argv:
+                return CompletedProcess(
+                    argv, 0, stdout=f"{pid}, GPU-a, python\n", stderr=""
+                )
+            if "strace" in argv:
+                # strace traced the process and wrote its output; only the
+                # wrapper outlived our deadline, so the trace exists and no
+                # exit code ever will.
+                target = Path(argv[argv.index("-o") + 1])
+                target.with_name(f"{target.name}.{pid}").write_text(
+                    "clock_nanosleep(CLOCK_REALTIME, 0, {tv_sec=9}\n"
+                )
+                raise TimeoutExpired(argv, 6)
+            return CompletedProcess(argv, 0, stdout="captured", stderr="")
+
+    agent = node_action_executor(
+        tmp_path,
+        "strace-outran.db",
+        allowed_operations={WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE},
+        diagnostic_output_dir=str(output_dir),
+        expand_python_cgroup_processes=False,
+        runner=StuckStraceRunner(),
+        sleep=lambda _seconds: None,
+    )
+
+    result = agent.execute(
+        envelope(
+            command(
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                parameters={
+                    "capture_process_state": True,
+                    "strace_duration_seconds": 1,
+                    "strace_sample_count": 1,
+                    "strace_sample_interval_seconds": 0,
+                },
+            )
+        )
+    )
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    archive = next(output_dir.glob("*.tar.gz"))
+    with tarfile.open(archive) as bundle:
+        manifest = json.load(bundle.extractfile("diagnostics/manifest.json"))
+        names = set(bundle.getnames())
+    traces = [
+        item
+        for item in manifest["captures"]
+        if str(item["file"]).startswith(f"strace-{pid}-sample-")
+    ]
+    assert len(traces) == 1, manifest["captures"]
+    assert f"diagnostics/strace-{pid}-sample-01.{pid}" in names, sorted(names)
+    assert traces[0]["trace_file_count"] == 1, (
+        "the trace strace wrote before the runner gave up is in the archive, "
+        f"so the manifest must count it: {traces[0]}"
+    )
+    assert "TimeoutExpired" in str(traces[0].get("error", "")), traces[0]
 
 
 def test_diagnostic_archive_retention_prunes_age_and_count(tmp_path) -> None:

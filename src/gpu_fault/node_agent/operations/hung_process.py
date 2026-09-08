@@ -484,7 +484,6 @@ class HungProcessOperationsMixin:
             "interval_seconds": sample_interval,
             "started_at": started_at.isoformat(),
         }
-        trace_files: list[str] = []
         try:
             completed = self.runner(
                 argv,
@@ -494,25 +493,26 @@ class HungProcessOperationsMixin:
                 timeout=duration + 5,
             )
             capture["returncode"] = completed.returncode
-            # A fixed-duration sample is *supposed* to end by being
-            # killed: timeout(1) exits 124 and strace exits 130 on
-            # SIGINT. Reporting that as a failed capture made every
-            # healthy bundle report one failure per sample, so the
-            # summary's failed_capture_count was useless. Only count
-            # it as a failure when no trace file was produced.
-            #
-            # Listed inside the guard because this now runs in one thread per
-            # rank: anything that escapes here comes back out of
-            # ``future.result()`` and takes every other rank's sample with it.
-            trace_files = sorted(
-                item.name for item in work_dir.glob(f"{trace_prefix.name}*")
-            )
         except (
             OSError,
             subprocess.TimeoutExpired,
         ) as exc:
             capture.setdefault("returncode", None)
             capture["error"] = f"{type(exc).__name__}: {exc}"
+        # A fixed-duration sample is *supposed* to end by being killed:
+        # timeout(1) exits 124 and strace exits 130 on SIGINT. Reporting that
+        # as a failed capture made every healthy bundle report one failure per
+        # sample, so the summary's failed_capture_count was useless. Only count
+        # it as a failure when no trace file was produced.
+        #
+        # Counted outside the guard because the files are on disk either way:
+        # when the runner raises -- ``TimeoutExpired`` because the wall clock
+        # beat our own timeout, which is exactly the deep hang worth tracing --
+        # strace has usually been running for the whole sample and its output
+        # is the only record of it. Globbing only on the happy path reported
+        # ``trace_file_count: 0`` for those samples, so the bundle read as
+        # "nothing captured" while the traces sat beside the manifest.
+        trace_files = self._trace_files(work_dir, trace_prefix.name)
         capture["trace_file_count"] = len(trace_files)
         if capture["returncode"] in {124, 130} and trace_files:
             capture["terminated_by"] = "sample_duration"
@@ -527,6 +527,20 @@ class HungProcessOperationsMixin:
             )
         capture["completed_at"] = self.now().isoformat()
         return capture
+
+    @staticmethod
+    def _trace_files(work_dir: Path, prefix: str) -> list[str]:
+        """The trace files this sample wrote, whatever the runner reported.
+
+        Guarded because it runs in one thread per rank: anything that escapes
+        comes back out of ``future.result()`` and takes every other rank's
+        sample with it.
+        """
+
+        try:
+            return sorted(item.name for item in work_dir.glob(f"{prefix}*"))
+        except OSError:
+            return []
 
     def _capture_python_stack_sample(
         self,

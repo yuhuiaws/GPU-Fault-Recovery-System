@@ -73,13 +73,19 @@ class ClientOperationsMixin:
         state = self._device_path_state
         outer_entry = getattr(state, "entry", None)
         outer_caching = getattr(state, "caching", False)
+        outer_reasons = getattr(state, "reasons", None)
         state.entry = None
+        # Cleared with the table: a reason kept from an earlier command would
+        # explain this command's unresolvable target with the previous driver
+        # report, which is worse than saying nothing.
+        state.reasons = None
         state.caching = True
         try:
             yield
         finally:
             state.entry = outer_entry
             state.caching = outer_caching
+            state.reasons = outer_reasons
 
     def _gpu_device_paths(self) -> dict[str, str]:
         state = self._device_path_state
@@ -89,14 +95,38 @@ class ClientOperationsMixin:
         if entry is not None and entry[0] == id(self):
             cached: dict[str, str] = entry[1]
             return cached
-        paths = self._minor_number_device_paths()
+        paths, reasons = self._minor_number_device_map()
         if paths is None:
             paths = self._index_device_paths()
+            # The index map resolves by position and leaves nobody out, so a
+            # UUID missing from it is missing from the driver's report itself.
+            reasons = {}
+        # Kept beside the table (same thread, same executor) so a refusal can
+        # say *why* a target has no device node instead of only that it has
+        # none. Written whether or not a window is caching: the reader is the
+        # very next call after this one.
+        state.reasons = (id(self), reasons)
         if getattr(state, "caching", False):
             state.entry = (id(self), paths)
         return paths
 
-    def _minor_number_device_paths(self) -> dict[str, str] | None:
+    def _device_path_reasons(self) -> dict[str, str]:
+        """Why this executor's current map left a UUID out, if it knows.
+
+        Empty when the map came from an injected finder or from the index
+        fallback: the caller then falls back to a cause it can still establish
+        (a UUID no local GPU reports at all) or to a generic one.
+        """
+
+        entry = getattr(self._device_path_state, "reasons", None)
+        if entry is None or entry[0] != id(self):
+            return {}
+        reasons: dict[str, str] = entry[1]
+        return reasons
+
+    def _minor_number_device_map(
+        self,
+    ) -> tuple[dict[str, str] | None, dict[str, str]]:
         """uuid -> ``/dev/nvidia<minor>`` from the driver's own minor numbers.
 
         ``--query-gpu=index`` is ordered by PCI bus id; the device node's minor
@@ -114,23 +144,36 @@ class ClientOperationsMixin:
         map instead: degrading its seven healthy siblings to the index map is
         exactly the mapping that can point a UUID at another GPU's device node.
         An unresolved target fails the verification closed instead.
+
+        The second answer is why each excluded UUID is out, because only this
+        parse knows: "the driver reports no minor number" and "two GPUs claim
+        one device node" are the same symptom (an unresolvable target) with
+        different operator actions behind them, and the refusal is the only
+        place either is ever seen.
         """
 
         try:
             completed = self._run_checked(["nvidia-smi", "-q", "-x"], timeout=15)
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            return None
+            return None, {}
         try:
             root = ET.fromstring(completed.stdout or "")
         except ET.ParseError:
-            return None
+            return None, {}
         paths: dict[str, str] = {}
+        reasons: dict[str, str] = {}
         claimed: set[str] = set()
         duplicated: set[str] = set()
         for gpu in root.findall(".//gpu"):
             gpu_uuid = (gpu.findtext("uuid") or "").strip()
             minor = (gpu.findtext("minor_number") or "").strip()
-            if not gpu_uuid or not minor.isdigit():
+            if not gpu_uuid:
+                continue
+            if not minor.isdigit():
+                reasons[gpu_uuid] = (
+                    "the driver reports no minor number for it, so it has no "
+                    "device node"
+                )
                 continue
             device = f"/dev/nvidia{minor}"
             if device in claimed:
@@ -140,7 +183,7 @@ class ClientOperationsMixin:
         if not paths:
             # No GPU reported a usable minor number: this driver does not give
             # them, so the index map is all there is.
-            return None
+            return None, {}
         # Two UUIDs on one device node is a report that cannot be trusted for
         # either of them, so neither is resolved and both fail closed. The
         # answer stays a (possibly empty) map, never ``None``: minor numbers
@@ -149,8 +192,12 @@ class ClientOperationsMixin:
         for gpu_uuid in [
             uuid for uuid, device in paths.items() if device in duplicated
         ]:
+            reasons[gpu_uuid] = (
+                f"the driver reports device node {paths[gpu_uuid]} for more "
+                "than one GPU"
+            )
             del paths[gpu_uuid]
-        return paths
+        return paths, reasons
 
     def _index_device_paths(self) -> dict[str, str]:
         """The pre-minor-number mapping, kept for drivers that omit it."""
@@ -277,14 +324,57 @@ class ClientOperationsMixin:
 
         Reads the same finder ``_device_clients`` scans with, so the map that
         answers "resolvable" is the map the scan actually walks.
+
+        An empty ``gpu_uuids`` is not "no targets", it is "every GPU on this
+        node" -- that is how ``_device_clients`` and the reset itself read it --
+        so the local inventory becomes the target set and has to be just as
+        resolvable. Without this, a whole-node verification passed on a node
+        with one unmappable GPU, which is precisely the node a whole-node reset
+        should not run on.
         """
 
-        if not gpu_uuids:
-            return
+        inventory = None if gpu_uuids else self._gpu_inventory()
+        targets = set(gpu_uuids) if gpu_uuids else set(inventory or ())
         device_paths = self.gpu_device_path_finder()
-        missing = sorted(set(gpu_uuids) - set(device_paths))
-        if missing:
-            raise RuntimeError("cannot resolve device node for " + ", ".join(missing))
+        missing = sorted(targets - set(device_paths))
+        if not missing:
+            return
+        raise RuntimeError(
+            "cannot resolve device node for "
+            + ", ".join(
+                f"{gpu_uuid} ({self._unresolvable_cause(gpu_uuid, inventory)})"
+                for gpu_uuid in missing
+            )
+        )
+
+    def _unresolvable_cause(
+        self,
+        gpu_uuid: str,
+        inventory: list[str] | None,
+    ) -> str:
+        """Why this UUID has no device node, in the words of the evidence.
+
+        The three causes need three different operator actions -- a card that
+        fell off the bus, a workflow carrying a UUID this node never had (a
+        stale plan, or the wrong node), and a driver report two GPUs share a
+        device node in -- and the refusal used to name none of them, leaving
+        "cannot resolve device node for GPU-..." as the whole diagnosis of a
+        blocked destructive step.
+        """
+
+        reason = self._device_path_reasons().get(gpu_uuid)
+        if reason:
+            return reason
+        if inventory is None:
+            try:
+                inventory = self._gpu_inventory()
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                # Only ever asked on the way to a refusal, so a second probe
+                # that also fails costs nothing but this one cause.
+                inventory = None
+        if inventory is not None and gpu_uuid not in inventory:
+            return "no GPU on this node reports this UUID"
+        return "the driver reported no device node for it"
 
     def _persistent_device_clients(
         self, target: set[str]

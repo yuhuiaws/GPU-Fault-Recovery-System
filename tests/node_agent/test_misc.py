@@ -935,9 +935,15 @@ NO_MINOR_NUMBER_XML = """<?xml version="1.0" ?>
 class DevicePathRunner:
     """nvidia-smi on a node whose PCI order is not its device-minor order."""
 
-    def __init__(self, xml: str, index: str = "GPU-a, 0\nGPU-b, 1\n") -> None:
+    def __init__(
+        self,
+        xml: str,
+        index: str = "GPU-a, 0\nGPU-b, 1\n",
+        inventory: str = "GPU-a\nGPU-b\n",
+    ) -> None:
         self.xml = xml
         self.index = index
+        self.inventory = inventory
         self.commands: list[list[str]] = []
 
     def __call__(self, argv, **_):
@@ -949,7 +955,7 @@ class DevicePathRunner:
         if "--query-gpu=uuid,index" in argv:
             return CompletedProcess(argv, 0, stdout=self.index, stderr="")
         if "--query-gpu=uuid" in argv:
-            return CompletedProcess(argv, 0, stdout="GPU-a\nGPU-b\n", stderr="")
+            return CompletedProcess(argv, 0, stdout=self.inventory, stderr="")
         return CompletedProcess(argv, 0, stdout="", stderr="")
 
     def index_queries(self) -> int:
@@ -1053,6 +1059,8 @@ def test_verify_queries_the_device_map_once_per_verification(tmp_path) -> None:
 
 MIXED_MINOR_INDEX = "".join(f"GPU-{index}, {index}\n" for index in range(8))
 
+MIXED_MINOR_INVENTORY = "".join(f"GPU-{index}\n" for index in range(8))
+
 DUPLICATE_MINOR_XML = """<?xml version="1.0" ?>
 <nvidia_smi_log>
   <gpu id="00000000:53:00.0">
@@ -1149,6 +1157,55 @@ def test_a_target_without_a_minor_number_fails_the_verification_closed(
     assert "cannot resolve device node for GPU-7" in (result.error or ""), result.error
 
 
+@pytest.mark.parametrize("eighth_minor", ["N/A", ""])
+def test_a_verify_without_targets_means_every_gpu_in_the_inventory(
+    tmp_path, eighth_minor: str
+) -> None:
+    """No explicit UUIDs means "all of them", not "all the ones that resolved".
+
+    ``_require_resolvable_targets`` returned immediately on an empty target
+    list, and the scan then walked whatever the device map happened to contain.
+    On a node where one GPU no longer reports a minor number that is seven
+    device nodes out of eight, reported as ``verified_no_gpu_clients`` -- a
+    false green in front of a destructive step, and precisely the hole the
+    explicit-target check was added to close.
+    """
+
+    runner = DevicePathRunner(
+        _mixed_minor_xml(eighth_minor),
+        index=MIXED_MINOR_INDEX,
+        inventory=MIXED_MINOR_INVENTORY,
+    )
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    agent = _verify_agent(tmp_path, "implicit-targets.db", runner, proc)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, gpu_uuids=[]))
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "cannot resolve device node for GPU-7" in (result.error or ""), result.error
+
+
+def test_a_verify_without_targets_passes_when_the_whole_node_resolves(tmp_path) -> None:
+    """The implicit target set must not turn a healthy node into a refusal."""
+
+    runner = DevicePathRunner(MINOR_NUMBER_XML)
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    agent = _verify_agent(tmp_path, "implicit-ok.db", runner, proc)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, gpu_uuids=[]))
+    )
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert [item for item in runner.commands if "--query-gpu=uuid" in item], (
+        f"the implicit target set is the local inventory: {runner.commands}"
+    )
+
+
 def test_two_uuids_on_one_device_node_resolve_to_neither(tmp_path) -> None:
     """A report that gives two GPUs the same minor cannot be trusted for either.
 
@@ -1165,6 +1222,50 @@ def test_two_uuids_on_one_device_node_resolve_to_neither(tmp_path) -> None:
 
     assert result.status is NodeActionStatus.FAILED, result.details
     assert "cannot resolve device node for GPU-a" in (result.error or ""), result.error
+
+
+@pytest.mark.parametrize(
+    ("xml", "target", "cause"),
+    [
+        (_mixed_minor_xml("N/A"), "GPU-7", "reports no minor number for it"),
+        (MINOR_NUMBER_XML, "GPU-z", "no GPU on this node reports this UUID"),
+        (
+            DUPLICATE_MINOR_XML,
+            "GPU-a",
+            "reports device node /dev/nvidia0 for more than one GPU",
+        ),
+    ],
+    ids=["no-minor-number", "not-on-this-node", "duplicate-minor"],
+)
+def test_an_unresolvable_target_says_why_it_cannot_be_resolved(
+    tmp_path, xml: str, target: str, cause: str
+) -> None:
+    """ "cannot resolve device node for GPU-..." was the whole diagnosis.
+
+    The three causes want three different actions -- a card that fell off the
+    bus (drain and RMA the node), a workflow carrying a UUID this node never
+    had (a stale plan, or the wrong node in the step), and a driver report that
+    gives two GPUs one device node (nothing here can be trusted) -- and the
+    refusal that blocks the destructive step named none of them, leaving the
+    operator to re-derive the map by hand from ``nvidia-smi -q -x``.
+    """
+
+    runner = DevicePathRunner(xml, index=MIXED_MINOR_INDEX)
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    agent = _verify_agent(tmp_path, "unresolvable-cause.db", runner, proc)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, gpu_uuids=[target]))
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert f"cannot resolve device node for {target}" in (result.error or ""), (
+        result.error
+    )
+    assert cause in (result.error or ""), (
+        f"the refusal must name why {target} has no device node: {result.error}"
+    )
 
 
 def test_the_device_map_cache_is_per_command_not_per_executor(tmp_path) -> None:
