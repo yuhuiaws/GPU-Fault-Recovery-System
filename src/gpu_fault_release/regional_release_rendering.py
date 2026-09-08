@@ -16,10 +16,62 @@ from gpu_fault_release.regional_release_config import (
 )
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.node_installer_reconciler import _INVENTORY as INSTANCE_TYPES
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+#: What the checked-in DaemonSet carries in place of the instance-type list.
+SUPPORTED_INSTANCE_TYPES_PLACEHOLDER = "REPLACE_WITH_SUPPORTED_INSTANCE_TYPES"
+
+
+def _supported_instance_types() -> str:
+    """The exporter's node-affinity list, as a YAML flow sequence.
+
+    Read from the node installer's own inventory rather than copied: the two
+    must never disagree, because a GPU type the installer supports but the
+    exporter does not schedule on can never finish an install (its
+    ``dcgm_ready`` check has nothing to scrape), and the reconciler retries the
+    Job every 300 s forever. Each type is emitted twice, with and without the
+    ``ml.`` prefix, because HyperPod labels its nodes ``ml.<type>`` while a
+    self-managed node pool carries the bare EC2 type; ``_inventory()`` accepts
+    both for the same reason.
+    """
+
+    names = sorted(INSTANCE_TYPES)
+    return ", ".join(f'"ml.{name}", "{name}"' for name in names)
+
+
+def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
+    """The one exporter DaemonSet text, for the plan payload and for the apply.
+
+    Both used to substitute for themselves and the payload renderer knew only
+    about namespace and image, so the plan an approver read carried a literal
+    ``REPLACE_WITH_SUPPORTED_INSTANCE_TYPES`` where the applied DaemonSet
+    carried the real instance types -- the applied artifact was not the planned
+    one, which is the whole promise of the plan/apply gate.
+    """
+
+    text = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
+        encoding="utf-8"
+    )
+    text = (
+        text.replace(
+            "namespace: gpu-fault-system",
+            f"namespace: {namespace}",
+        )
+        .replace(DEFAULT_DCGM_EXPORTER_IMAGE, image)
+        .replace(
+            SUPPORTED_INSTANCE_TYPES_PLACEHOLDER,
+            _supported_instance_types(),
+        )
+    )
+    if SUPPORTED_INSTANCE_TYPES_PLACEHOLDER in text:
+        raise ReleaseError(
+            "DCGM exporter manifest still carries "
+            f"{SUPPORTED_INSTANCE_TYPES_PLACEHOLDER}"
+        )
+    return text
 
 
 def _number_text(value: float) -> str:
@@ -229,15 +281,9 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
         if config.nlb
         else []
     )
-    dcgm_text = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
-        encoding="utf-8"
-    )
-    dcgm_text = dcgm_text.replace(
-        "namespace: gpu-fault-system",
-        f"namespace: {config.namespace}",
-    ).replace(
-        DEFAULT_DCGM_EXPORTER_IMAGE,
-        release.dcgm_exporter_image,
+    dcgm_text = render_dcgm_exporter_manifest(
+        namespace=config.namespace,
+        image=release.dcgm_exporter_image,
     )
     observability_text = (
         ROOT / "deploy/observability/adot-control-plane.yaml"

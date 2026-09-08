@@ -78,7 +78,14 @@ component_inputs:
   dcgm:
     - deploy/dataplane/dcgm-counters.csv
     - deploy/dataplane/hyperpod-dcgm-exporter.yaml
+    # The exporter's node affinity is rendered from the node installer's
+    # instance-type inventory, and the renderer that substitutes it lives in
+    # regional_release_rendering.py: without both, adding a supported GPU type
+    # leaves the DaemonSet digest unchanged, the release skips the re-apply and
+    # the new nodes never get an exporter.
+    - src/gpu_fault/node_installer_reconciler.py
     - src/gpu_fault_release/regional_gpu_bootstrap.py
+    - src/gpu_fault_release/regional_release_rendering.py
   endpoint:
     - deploy/control-plane/regional/regional-control-plane-nlb.yaml
     - src/gpu_fault_release/regional_dns.py

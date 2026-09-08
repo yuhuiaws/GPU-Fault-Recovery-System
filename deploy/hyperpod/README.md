@@ -57,8 +57,13 @@ exporter. To require a platform-provided exporter:
 
 ```bash
 export GPU_FAULT_DCGM_EXPORTER_MODE=existing
-export GPU_FAULT_DCGM_METRICS_URL='http://{node_ip}:9400/metrics'
+export GPU_FAULT_DCGM_METRICS_URL='http://127.0.0.1:9400/metrics'
 ```
+
+The collector runs on the node it grades, so loopback is the endpoint to
+configure; `{node_ip}` is expanded per node and only works when the
+platform's exporter binds a routable address (this solution's exporter binds
+`127.0.0.1:9400` deliberately).
 
 The endpoint must expose the configured fault-decision DCGM fields on every
 node. An observability add-on that only remote-writes metrics to AMP is not a

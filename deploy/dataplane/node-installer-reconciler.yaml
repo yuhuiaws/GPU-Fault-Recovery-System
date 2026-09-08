@@ -211,10 +211,13 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
           # Readiness is a start-up breadcrumb and cannot answer "is the loop
-          # turning": none of the reconciler's apiserver calls pass a request
-          # timeout, so one half-open connection blocks the pass forever while
-          # the Pod stays Running and Ready and no GPU node is reconciled
-          # again. /tmp/reconciler-heartbeat is refreshed at the end of *every*
+          # turning". The apiserver calls do pass a request timeout
+          # (REQUEST_TIMEOUT = (5, 60)), so a half-open connection now raises
+          # instead of blocking forever; what is left is everything a per-call
+          # timeout cannot bound -- a wedged wait, a lock never released, a
+          # thread stuck outside the client -- which keeps the Pod Running and
+          # Ready while no GPU node is reconciled again.
+          # /tmp/reconciler-heartbeat is refreshed at the end of *every*
           # pass, including a pass that failed closed -- liveness answers
           # whether the loop is alive, not whether reconciliation succeeded.
           # 300 s is ~60 passes at GPU_FAULT_RECONCILE_SECONDS=5, so an idle or

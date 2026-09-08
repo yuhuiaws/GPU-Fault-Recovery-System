@@ -18,11 +18,13 @@ proves nothing looks exactly like a fixed manifest:
   unauthenticated (``§F8``), and collected on DCGM's 30 s default while the
   collector scrapes every 15 s, which makes real power throttling
   un-gradable (owner decision 3: ``-c 15000`` on *both* launch paths).
-* A half-open apiserver connection wedges a controller loop while the Pod
-  stays Running and Ready (``hma-installer-deploy §F6``). Liveness therefore
-  reads the age of a file the loop refreshes every cycle, not a start-up
-  breadcrumb, and the thresholds are wide enough that a healthy idle
-  component is never restarted.
+* A wedged controller loop keeps the Pod Running and Ready
+  (``hma-installer-deploy §F6``). Per-call request timeouts narrow the wedge
+  surface -- the reconciler now passes one -- but they cannot bound a wait
+  outside the client, and the node-resources collector passes none at all.
+  Liveness therefore reads the age of a file the loop refreshes every cycle,
+  not a start-up breadcrumb, and the thresholds are wide enough that a
+  healthy idle component is never restarted.
 * The reconciler tolerated every taint with no ``tolerationSeconds``
   (``§F7``), so taint-based eviction never moved the singleton off a dead
   node.
@@ -33,13 +35,17 @@ proves nothing looks exactly like a fixed manifest:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Iterator
 
 import yaml
 
+from scripts.release_identity import file_set_identity
+
 from gpu_fault.node_installer_reconciler import _INVENTORY as RECONCILER_INVENTORY
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
+from gpu_fault_release import regional_release_rendering as RENDERING
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
 from tests.regional._release_orchestrator_support import config_file
 
@@ -92,6 +98,17 @@ def _pod_spec(workload: dict[str, Any]) -> dict[str, Any]:
     return ((workload.get("spec") or {}).get("template") or {}).get("spec") or {}
 
 
+#: A pinned digest so the plan and the apply cannot agree by accident.
+DCGM_EXPORTER_IMAGE = "registry.example/dcgm@sha256:" + "b" * 64
+
+
+def _release(tmp_path: Path) -> Any:
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+    release = MODULE.RegionalRelease(config, _RecordingRunner())
+    release.dcgm_exporter_image = DCGM_EXPORTER_IMAGE
+    return release
+
+
 def _rendered_exporter(tmp_path: Path) -> dict[str, Any]:
     """The DaemonSet exactly as the regional deploy applies it.
 
@@ -100,16 +117,12 @@ def _rendered_exporter(tmp_path: Path) -> dict[str, Any]:
     manifest that decides where the Pods land.
     """
 
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    runner = _RecordingRunner()
-    release = MODULE.RegionalRelease(config, runner)
-    release.dcgm_exporter_image = "registry.example/dcgm@sha256:" + "b" * 64
-
-    BOOTSTRAP.preflight_gpu_dcgm_exporter(release, config.clusters[0])
+    release = _release(tmp_path)
+    BOOTSTRAP.preflight_gpu_dcgm_exporter(release, release.config.clusters[0])
 
     daemon_sets = [
         document
-        for _arguments, kwargs in runner.calls
+        for _arguments, kwargs in release.runner.calls
         for document in yaml.safe_load_all(kwargs.get("input_text") or "")
         if isinstance(document, dict) and document.get("kind") == "DaemonSet"
     ]
@@ -162,6 +175,41 @@ def test_dcgm_exporter_daemonset_matches_every_reconciler_instance_type(
     ), "the exporter must not be preempted off a GPU node by training work"
 
 
+def test_the_planned_exporter_daemonset_is_the_applied_one(tmp_path: Path) -> None:
+    """The plan payload and the apply must render one identical DaemonSet.
+
+    The payload renderer substituted only namespace and image, so the document
+    an approver read -- and the digest the plan/apply gate pins -- carried a
+    literal ``REPLACE_WITH_SUPPORTED_INSTANCE_TYPES`` where the applied
+    DaemonSet carried the real instance-type list. The approval then covered an
+    artifact nobody ever applied, and the affinity could drift without the
+    digest noticing.
+    """
+
+    payload = RENDERING.render_release_payload(_release(tmp_path))
+    planned = [
+        document for document in payload["dcgm"] if document.get("kind") == "DaemonSet"
+    ]
+
+    assert len(planned) == 1, (
+        f"expected exactly one planned exporter DaemonSet, got {planned}"
+    )
+    assert RENDERING.SUPPORTED_INSTANCE_TYPES_PLACEHOLDER not in yaml.safe_dump(
+        payload["dcgm"]
+    ), (
+        "the plan payload still carries the unsubstituted instance-type "
+        "placeholder, so the approved digest is not the applied DaemonSet"
+    )
+    applied = _rendered_exporter(tmp_path)
+    assert _instance_type_values(_pod_spec(planned[0])) == _instance_type_values(
+        _pod_spec(applied)
+    ), "the planned exporter lands on different nodes than the applied one"
+    assert planned[0] == applied, (
+        "the plan/apply gate only means anything if the two texts come from one "
+        "renderer"
+    )
+
+
 def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
     tmp_path: Path,
 ) -> None:
@@ -201,13 +249,11 @@ def test_exporter_binds_loopback(tmp_path: Path) -> None:
 
 def _liveness_heartbeat_seconds(probe: dict[str, Any]) -> int:
     command = " ".join(str(value) for value in (probe.get("exec") or {})["command"])
-    digits = [
-        int(word)
-        for word in command.replace("<", " ").replace(")", " ").split()
-        if word.isdigit()
-    ]
-    assert digits, f"the liveness probe reads no age threshold: {command}"
-    return max(digits)
+    thresholds = [int(match) for match in re.findall(r"<\s*(\d+)", command)]
+    assert len(thresholds) == 1, (
+        f"expected exactly one heartbeat age threshold, got {thresholds} in {command}"
+    )
+    return thresholds[0]
 
 
 def _assert_liveness_is_local(where: str, probe: dict[str, Any]) -> None:
@@ -230,6 +276,15 @@ def _assert_liveness_is_local(where: str, probe: dict[str, Any]) -> None:
     )
 
 
+#: The two heartbeat probes this work package owns. Every other data-plane
+#: Deployment still has to carry *a* liveness probe, but its cadence belongs to
+#: the work package that wrote it.
+HEARTBEAT_MANIFESTS = (
+    "kubernetes-node-resource-collector.yaml",
+    "node-installer-reconciler.yaml",
+)
+
+
 def test_every_data_plane_deployment_has_a_liveness_probe() -> None:
     """Readiness cannot answer "is the loop turning".
 
@@ -239,9 +294,7 @@ def test_every_data_plane_deployment_has_a_liveness_probe() -> None:
 
     deployments = _workloads(iter(sorted(DATAPLANE.glob("*.yaml"))), "Deployment")
 
-    assert len(deployments) == 4, (
-        f"expected the four regional data-plane Deployments, got {deployments}"
-    )
+    assert deployments, f"no data-plane Deployment was found under {DATAPLANE}"
     for path, deployment in deployments:
         for container in _pod_spec(deployment).get("containers") or []:
             where = f"{path.name}:{container.get('name')}"
@@ -250,10 +303,30 @@ def test_every_data_plane_deployment_has_a_liveness_probe() -> None:
                 f"{where}: a wedged loop keeps the Pod Running and Ready "
                 "forever without a liveness probe"
             )
-            assert probe.get("periodSeconds") == LIVENESS_PERIOD_SECONDS, (
-                f"{where}: liveness must be probed every {LIVENESS_PERIOD_SECONDS}s"
-            )
             _assert_liveness_is_local(where, probe)
+
+
+def test_heartbeat_probes_run_on_the_reviewed_cadence() -> None:
+    """A slow probe period turns a wedge into minutes of extra silence."""
+
+    checked = 0
+    for name in HEARTBEAT_MANIFESTS:
+        ((_path, deployment),) = _workloads(iter([DATAPLANE / name]), "Deployment")
+        for container in _pod_spec(deployment).get("containers") or []:
+            probe = container.get("livenessProbe") or {}
+            where = f"{name}:{container.get('name')}"
+            assert probe.get("periodSeconds") == LIVENESS_PERIOD_SECONDS, (
+                f"{where}: liveness must be probed every "
+                f"{LIVENESS_PERIOD_SECONDS}s, got {probe.get('periodSeconds')!r}"
+            )
+            assert _liveness_heartbeat_seconds(probe) >= MINIMUM_HEARTBEAT_SECONDS, (
+                f"{where}: a threshold below {MINIMUM_HEARTBEAT_SECONDS}s "
+                "restarts a component that is merely idle"
+            )
+            checked += 1
+    assert checked == len(HEARTBEAT_MANIFESTS), (
+        f"expected {len(HEARTBEAT_MANIFESTS)} heartbeat probes, saw {checked}"
+    )
 
 
 def test_liveness_heartbeat_directory_is_writable() -> None:
@@ -442,4 +515,75 @@ def test_optional_hma_manifests_use_the_regional_connection_secret() -> None:
     texts = [path.read_text(encoding="utf-8") for path, _spec, _c in containers]
     assert not any("gpu-fault-api-canary" in text for text in texts), (
         "the canary Service does not exist in the regional architecture"
+    )
+
+
+def _dcgm_component_patterns() -> tuple[str, ...]:
+    identity = yaml.safe_load(
+        (ROOT / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    return tuple(identity["component_inputs"]["dcgm"])
+
+
+def test_a_new_instance_type_changes_the_dcgm_component_digest(tmp_path: Path) -> None:
+    """Adding a supported GPU type has to redeploy the exporter DaemonSet.
+
+    The regional release re-applies the DaemonSet only when the ``dcgm``
+    component digest changed, and that digest is the content of the files
+    ``component_inputs.dcgm`` matches. The affinity list is rendered from
+    ``node_installer_reconciler._INVENTORY``, so while that module was not an
+    input, a release that added a GPU type shipped an installer for it and left
+    the exporter pinned to the old list -- the very outage the rendered affinity
+    exists to prevent (``§F4`` / ``§F1``), reintroduced one release later.
+    """
+
+    patterns = _dcgm_component_patterns()
+    for pattern in patterns:
+        for source in sorted(ROOT.glob(pattern)):
+            destination = tmp_path / source.relative_to(ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+    inventory = tmp_path / "src/gpu_fault/node_installer_reconciler.py"
+
+    assert inventory.is_file(), (
+        "no dcgm release input matches the instance-type inventory the "
+        f"exporter's affinity is rendered from: {list(patterns)}"
+    )
+    before = file_set_identity(tmp_path, patterns)["sha256"]
+    inventory.write_text(
+        inventory.read_text(encoding="utf-8").replace(
+            '    "p6-b300.48xlarge": (8, 16),\n',
+            '    "p6-b300.48xlarge": (8, 16),\n    "p7-c400.48xlarge": (8, 16),\n',
+        ),
+        encoding="utf-8",
+    )
+    after = file_set_identity(tmp_path, patterns)["sha256"]
+
+    assert after != before, (
+        "the dcgm component digest ignored a new supported instance type, so "
+        "the release would not re-apply the exporter DaemonSet"
+    )
+
+
+def test_the_legacy_deploy_path_substitutes_the_affinity_placeholder() -> None:
+    """The legacy single-cluster script applies this DaemonSet too.
+
+    ``deploy/hyperpod/deploy.sh`` has no renderer: it seds the image and then
+    patches a ``nodeSelector``. Left alone it would apply the affinity
+    placeholder verbatim, which matches no node -- zero exporter Pods, a
+    ``rollout status`` that passes on an empty DaemonSet, and a metrics probe
+    that fails with nothing pointing at the cause.
+    """
+
+    script = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
+    placeholder = RENDERING.SUPPORTED_INSTANCE_TYPES_PLACEHOLDER
+
+    assert f"s#{placeholder}#" in script, (
+        f"the legacy deploy path applies hyperpod-dcgm-exporter.yaml without "
+        f"substituting {placeholder}"
+    )
+    manifest = "deploy/dataplane/hyperpod-dcgm-exporter.yaml"
+    assert script.index(f"s#{placeholder}#") < script.index(manifest), (
+        "the substitution must belong to the sed that reads the manifest, so "
+        "the text handed to `kubectl apply` never carries the placeholder"
     )

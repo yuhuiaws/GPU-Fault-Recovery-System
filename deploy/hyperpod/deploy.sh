@@ -2647,16 +2647,30 @@ configure_dcgm_exporter() {
             gpu-fault-dcgm-exporter --ignore-not-found
         return 0
     fi
-    sed \
-        "s#${DEFAULT_DCGM_EXPORTER_IMAGE}#${DCGM_EXPORTER_IMAGE}#g" \
-        "${REPO_DIR}/deploy/dataplane/hyperpod-dcgm-exporter.yaml" |
-        kubectl apply -f -
     local instance_type
     instance_type="$(
         kubectl get nodes \
             -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}" \
             -o jsonpath='{.items[0].metadata.labels.node\.kubernetes\.io/instance-type}'
     )"
+    [[ -n "${instance_type}" ]] || {
+        printf 'ERROR: no node of cluster %s reports an instance type\n' \
+            "${HYPERPOD_CLUSTER_NAME}" >&2
+        return 1
+    }
+    # The checked-in DaemonSet carries a required nodeAffinity placeholder that
+    # the regional release renders from the node installer's instance-type
+    # inventory. This legacy single-cluster path has no renderer and pins the
+    # Pods to the one instance type it discovers above anyway (see the patch
+    # below), so it substitutes that type. Applying the placeholder verbatim
+    # would install an affinity that matches no node at all: zero Pods
+    # scheduled, `rollout status` passing trivially and the metrics probe below
+    # failing with nothing to explain it.
+    sed \
+        -e "s#${DEFAULT_DCGM_EXPORTER_IMAGE}#${DCGM_EXPORTER_IMAGE}#g" \
+        -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" \
+        "${REPO_DIR}/deploy/dataplane/hyperpod-dcgm-exporter.yaml" |
+        kubectl apply -f -
     kubectl -n "${NAMESPACE}" patch daemonset \
         gpu-fault-dcgm-exporter --type=merge \
         -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"node.kubernetes.io/instance-type\":\"${instance_type}\",\"sagemaker.amazonaws.com/cluster-name\":\"${HYPERPOD_CLUSTER_NAME}\"}}}}}"

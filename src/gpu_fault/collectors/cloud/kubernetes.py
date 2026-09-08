@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,13 +34,18 @@ LOGGER = logging.getLogger(__name__)
 #: its watch cache. It is the only response that makes a relist necessary.
 EXPIRED_RESOURCE_VERSION_STATUS = 410
 
-#: Refreshed at the end of every node-resource cycle. The Deployment's
-#: livenessProbe reads this file's age, which is the only way a wedged loop can
-#: be told from an idle one: ``list_node`` passes no request timeout, so a
-#: half-open apiserver connection blocks the cycle forever while the Pod stays
-#: Running and Ready. See deploy/dataplane/kubernetes-node-resource-collector
-#: .yaml, which mounts a writable /tmp because the container's root filesystem
-#: is read-only.
+#: Refreshed before the first cycle, after every sampled node and at the end of
+#: every cycle. The Deployment's livenessProbe reads this file's age, which is
+#: the only way a wedged loop can be told from an idle one: ``list_node`` passes
+#: no request timeout, so a half-open apiserver connection blocks the cycle
+#: forever while the Pod stays Running and Ready. Per node rather than per
+#: cycle because one cycle posts one host-telemetry batch per GPU node in
+#: series: on a large cluster the first cycle alone can outlast any liveness
+#: threshold, and a probe that killed the Pod mid-cycle would restart straight
+#: into the same first cycle forever. A wedged LIST is still caught, because
+#: then no node completes at all. See
+#: deploy/dataplane/kubernetes-node-resource-collector.yaml, which mounts a
+#: writable /tmp because the container's root filesystem is read-only.
 NODE_RESOURCE_HEARTBEAT_PATH = "/tmp/node-resource-collector-alive"  # noqa: S108
 
 
@@ -49,9 +53,9 @@ def _touch_node_resource_heartbeat() -> None:
     """Prove the collect loop turned. Read by the Deployment's livenessProbe."""
 
     try:
-        path = Path(NODE_RESOURCE_HEARTBEAT_PATH)
-        path.touch(exist_ok=True)
-        os.utime(path, None)
+        # `touch` on an existing file is a utime(None) of its own, so the
+        # timestamp the probe reads always moves.
+        Path(NODE_RESOURCE_HEARTBEAT_PATH).touch(exist_ok=True)
     except OSError:
         # Losing the heartbeat means liveness restarts this Pod, which is the
         # right answer for a container that cannot write its own /tmp. It must
@@ -499,6 +503,12 @@ class KubernetesNodeResourceCollector:
                     "continuing with the next node"
                 )
                 delta = CollectorStats(observed=1)
+            # One node finished, so the loop is turning. A cycle delivers one
+            # host-telemetry batch per GPU node in series -- each its own TLS
+            # handshake, each retried up to four times -- so a per-cycle
+            # heartbeat would let a large fleet's first cycle outlast the
+            # liveness threshold and restart a Pod that was working.
+            _touch_node_resource_heartbeat()
             stats = stats.model_copy(
                 update={
                     "observed": stats.observed + delta.observed,
@@ -694,6 +704,10 @@ class KubernetesNodeResourceCollector:
                 config.load_kube_config()
             self.core = client.CoreV1Api()
             self.serializer = client.ApiClient().sanitize_for_serialization
+        # Before the first cycle, so the first cycle gets the probe's whole
+        # threshold rather than the threshold minus its own start-up: the
+        # probe's initial delay only covers the client setup above.
+        _touch_node_resource_heartbeat()
         while True:
             try:
                 self.collect_once()
@@ -701,5 +715,7 @@ class KubernetesNodeResourceCollector:
                 LOGGER.exception("Kubernetes node resource collection failed")
             # After the guard, not inside it: liveness answers whether the loop
             # is turning, and a cycle that failed and logged is still a turn.
+            # This also covers a cluster with no sampled nodes, where the
+            # per-node heartbeat in `collect_once` never fires.
             _touch_node_resource_heartbeat()
             time.sleep(self.interval_seconds)

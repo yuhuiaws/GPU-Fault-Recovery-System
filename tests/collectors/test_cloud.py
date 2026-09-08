@@ -1293,3 +1293,94 @@ def test_kubernetes_hma_collector_uses_shared_buffered_warning(caplog) -> None:
     assert "id=" in message or "node/" in message, (
         "warning must include the event id or node identifier"
     )
+
+
+def test_node_resource_collector_heartbeats_before_its_first_cycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The first cycle must not have to finish for the Pod to look alive.
+
+    One cycle posts a ``baseline:*`` host-telemetry batch for every GPU node in
+    series, each its own TCP+TLS connection with a four-attempt retry ladder, so
+    on a large fleet the first cycle can outlast the livenessProbe's threshold.
+    A probe that fired then would kill the Pod, and the restart would begin the
+    same first cycle again: CrashLoopBackOff, with the whole cluster's EFA/GPU
+    advertisement coverage silent. So the heartbeat exists before the loop is
+    entered, and the first cycle gets the full threshold.
+    """
+
+    from gpu_fault.collectors.cloud import kubernetes as module
+
+    heartbeat = tmp_path / "node-resource-collector-alive"
+    monkeypatch.setattr(module, "NODE_RESOURCE_HEARTBEAT_PATH", str(heartbeat))
+
+    class _BlockingCore:
+        """A cycle that never returns: the very first apiserver read hangs."""
+
+        def list_pod_for_all_namespaces(self, **_kwargs: Any) -> Any:
+            raise StopTheLoop()
+
+        def list_node(self, **_kwargs: Any) -> Any:  # pragma: no cover - unreached
+            raise AssertionError("the cycle should not have got as far as list_node")
+
+    collector = KubernetesNodeResourceCollector(
+        RecordingSink(), context(), core_api=_BlockingCore(), now=lambda: NOW
+    )
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert heartbeat.exists(), (
+        "a cycle that has not returned yet leaves no heartbeat, so liveness "
+        "kills the Pod before its first sample can ever finish"
+    )
+
+
+def test_node_resource_collector_heartbeats_after_every_node(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A long cycle keeps proving itself; a wedged LIST still cannot.
+
+    The heartbeat moves as each node completes, so a cycle that takes longer
+    than the liveness threshold is never mistaken for a wedge. The distinction
+    survives because a half-open apiserver connection completes no node at all:
+    here the second page of the LIST hangs, and only the first page's node has
+    been sampled when the heartbeat is checked.
+    """
+
+    from gpu_fault.collectors.cloud import kubernetes as module
+
+    heartbeat = tmp_path / "node-resource-collector-alive"
+    monkeypatch.setattr(module, "NODE_RESOURCE_HEARTBEAT_PATH", str(heartbeat))
+
+    class _WedgedSecondPage:
+        def __init__(self) -> None:
+            self.pages = 0
+
+        def list_node(self, **_kwargs: Any) -> Any:
+            self.pages += 1
+            if self.pages > 1:
+                raise StopTheLoop()
+            return SimpleNamespace(
+                metadata=SimpleNamespace(_continue="page-2"),
+                items=[_paged_node("gpu-worker-a")],
+            )
+
+        def list_pod_for_all_namespaces(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(items=[])
+
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=_WedgedSecondPage(), now=lambda: NOW
+    )
+
+    with pytest.raises(StopTheLoop):
+        collector.collect_once()
+
+    assert heartbeat.exists(), (
+        "the heartbeat only moved when the whole cycle finished, so a fleet "
+        "whose cycle outlasts the probe threshold restarts forever"
+    )
+    assert [payload["node_id"] for _, payload in sink.requests] == ["gpu-worker-a"], (
+        "the heartbeat must follow a node that was actually sampled"
+    )
