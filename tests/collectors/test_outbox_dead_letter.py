@@ -19,6 +19,7 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
+from gpu_fault.collectors import outbox_file as collector_outbox
 from gpu_fault.collectors import sinks as collector_sinks
 from gpu_fault.collectors.sinks import OutboxFile
 
@@ -447,9 +448,7 @@ def test_requeue_dead_gives_up_on_a_held_lock_instead_of_waiting_for_ever(
     that ``--force`` exists. A bounded poll turns that into an answer.
     """
 
-    monkeypatch.setattr(
-        collector_sinks, "OUTBOX_LOCK_RETRY_SECONDS", 0.02, raising=False
-    )
+    monkeypatch.setattr(collector_outbox, "OUTBOX_LOCK_RETRY_SECONDS", 0.02)
     outbox_path = tmp_path / "outbox.ndjson"
     _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
     lock_path = OutboxFile(outbox_path).lock_path
@@ -496,11 +495,36 @@ def test_requeue_dead_gives_up_on_a_held_lock_instead_of_waiting_for_ever(
     )
 
 
+def test_the_outbox_file_layer_is_still_reachable_through_the_sink() -> None:
+    """The file layer moved to its own module; the old names must not move.
+
+    ``sinks.OutboxFile`` is what the CLI imports, what the runbooks name and what
+    every existing test patches, so the split re-exports the same objects rather
+    than a copy of them -- a second class would give a monkeypatch on one no
+    effect on the other.
+    """
+
+    for name in (
+        "OutboxFile",
+        "OutboxLockUnavailable",
+        "OUTBOX_LOCK_ATTEMPTS",
+        "OUTBOX_LOCK_RETRY_SECONDS",
+        "OUTBOX_LOCK_FORCE_ADVICE",
+        "UNLOCKED_WRITE_WARN_INTERVAL",
+        "unlocked_outbox_writes",
+    ):
+        assert getattr(collector_sinks, name) is getattr(collector_outbox, name), (
+            f"sinks.{name} is no longer the object outbox_file defines, so the "
+            "two layers can disagree"
+        )
+
+
 def test_the_bounded_outbox_lock_wait_is_short_enough_to_answer() -> None:
     """The bound exists to answer an operator, so it has to stay human-sized."""
 
     waited = (
-        collector_sinks.OUTBOX_LOCK_ATTEMPTS * collector_sinks.OUTBOX_LOCK_RETRY_SECONDS
+        collector_outbox.OUTBOX_LOCK_ATTEMPTS
+        * collector_outbox.OUTBOX_LOCK_RETRY_SECONDS
     )
     assert 1 <= waited <= 30, (
         f"the strict outbox lock waits {waited}s, which is either too short to "
@@ -546,9 +570,7 @@ def test_force_does_not_walk_back_into_the_block_it_escapes(
     escape. ``--force`` takes the same bounded poll and then works unlocked.
     """
 
-    monkeypatch.setattr(
-        collector_sinks, "OUTBOX_LOCK_RETRY_SECONDS", 0.02, raising=False
-    )
+    monkeypatch.setattr(collector_outbox, "OUTBOX_LOCK_RETRY_SECONDS", 0.02)
     outbox_path = tmp_path / "outbox.ndjson"
     _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
     lock_path = OutboxFile(outbox_path).lock_path
@@ -694,7 +716,7 @@ def test_the_refusal_names_the_wait_it_took_and_offers_force_once(
     """
 
     slept: list[float] = []
-    monkeypatch.setattr(collector_sinks.time, "sleep", slept.append)
+    monkeypatch.setattr(collector_outbox.time, "sleep", slept.append)
     outbox_path = tmp_path / "outbox.ndjson"
     _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
     lock_path = OutboxFile(outbox_path).lock_path
