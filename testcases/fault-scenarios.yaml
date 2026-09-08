@@ -3768,9 +3768,9 @@ test_cases:
     verified:
       case_digest: e79a81ac4ccfe9aff6b4e35602346de6991ed126587e1f57e25a6d65035b6c97
       components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+        control_plane: 52b038819f3ec15226a587a0430c9e8e4d4342325763cdf64c4599a6e28e2ee3
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
   related_pytest: tests/regional/test_destr008_shortage_matrix.py::test_notification_semantics_distinguish_no_pool_from_shortage
