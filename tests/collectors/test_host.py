@@ -760,14 +760,14 @@ def test_a_failing_drive_is_reported_within_one_cache_period(
     )
 
 
-def _efa_port(root, name: str = "rdmap0"):
+def _efa_port(root, name: str = "rdmap0", interface: str = "eth0"):
     """One EFA port with an error counter and byte counters, all quiet."""
 
     port = root / name / "ports" / "1"
     (port / "counters").mkdir(parents=True)
     (port / "hw_counters").mkdir()
     device = port.parents[1] / "device"
-    device.mkdir()
+    (device / "net" / interface).mkdir(parents=True)
     (device / "uevent").write_text("DRIVER=efa\n")
     (port / "state").write_text("4: ACTIVE\n")
     (port / "phys_state").write_text("5: LinkUp\n")
@@ -778,39 +778,100 @@ def _efa_port(root, name: str = "rdmap0"):
     return port
 
 
+def _quiet_interface(root, name: str = "eth0"):
+    """One physical interface whose error and drop counters never move."""
+
+    statistics = root / name / "statistics"
+    statistics.mkdir(parents=True)
+    for counter in ("rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+        (statistics / counter).write_text("7\n")
+    (root / name / "device").mkdir()
+    (root / name / "operstate").write_text("up\n")
+    return root / name
+
+
+def _quiet_ethtool_runner(argv, **_kwargs):
+    """``ethtool -S`` whose EFA congestion and error counters never move."""
+
+    return subprocess.CompletedProcess(
+        argv,
+        0,
+        stdout=(
+            "NIC statistics:\n"
+            "     rnr_naks: 3\n"
+            "     retry_count: 4\n"
+            "     cq_err: 5\n"
+            "     pfc_pause_tx: 6\n"
+            "     ecn_marked: 7\n"
+        ),
+        stderr="",
+    )
+
+
 def test_a_quiet_tick_ships_no_zero_valued_per_port_deltas(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     """~500 zero samples (~100 KB of JSON) per batch on an idle p5en (F-H8).
 
     The deltas the consumer reads as latest values still ship at zero: that is
-    the only way a fabric validation and the sustained-drop rule can clear.
+    the only way a fabric validation and the sustained-drop rule can clear. All
+    three producers are driven here, because the kept list is a fail-closed
+    contract with ``NodeHealthPolicy`` and not a property of one of them.
     """
 
-    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_rdma",))
-    _efa_port(tmp_path)
+    monkeypatch.setattr(
+        HostTelemetryCollector, "CONTRIBUTORS", ("_network", "_rdma", "_efa_network")
+    )
+    monkeypatch.setattr(
+        "gpu_fault.collectors.host.network.shutil.which",
+        lambda command: "/usr/sbin/ethtool" if command == "ethtool" else None,
+    )
+    infiniband = tmp_path / "infiniband"
+    net_class = tmp_path / "net"
+    _efa_port(infiniband)
+    _quiet_interface(net_class)
     times = iter([NOW, NOW + timedelta(seconds=15)])
     collector = HostTelemetryCollector(
         RecordingSink(),
         context(),
         node_id="worker-1",
         now=lambda: next(times),
-        infiniband_root=str(tmp_path),
+        infiniband_root=str(infiniband),
+        net_class_root=str(net_class),
+        required_interfaces=["eth0"],
+        runner=_quiet_ethtool_runner,
     )
 
     collector.collect_once()
     quiet = collector.collect_once()
 
-    names = {item.name for item in quiet.samples}
-    assert names == {
-        "rdma_link_down",
+    zero_is_a_reading = {
+        "network_errors_delta",
+        "network_drops_delta",
+        "network_pfc_pause_delta",
+        "network_ecn_marks_delta",
         "rdma_errors_delta",
+        "efa_rnr_errors_delta",
+        "efa_retry_errors_delta",
+        "efa_cq_errors_delta",
+    }
+    names = {item.name for item in quiet.samples}
+    assert names == zero_is_a_reading | {
+        "network_link_up",
+        "network_link_down",
+        "rdma_link_down",
         "efa_traffic_bytes_delta",
         "efa_traffic_bytes_per_second",
     }, names
-    assert [
-        item.value for item in quiet.samples if item.name == "rdma_errors_delta"
-    ] == [0.0], "the fabric error signal cannot clear without a zero reading"
+    still_reported = {
+        item.name: item.value
+        for item in quiet.samples
+        if item.name in zero_is_a_reading
+    }
+    assert still_reported == dict.fromkeys(zero_is_a_reading, 0.0), (
+        f"a signal the consumer reads as a latest value cannot clear without a "
+        f"zero reading: {still_reported}"
+    )
 
 
 def test_the_cpu_total_excludes_guest_time(
@@ -884,4 +945,99 @@ def test_a_new_attempt_does_not_inherit_the_previous_progress_clock(tmp_path) ->
     assert advanced["training_rank_seconds_since_progress"] == 0, advanced
     assert "training_rank_seconds_since_progress" not in restarted, (
         f"the new attempt inherited the previous attempt's progress time: {restarted}"
+    )
+
+
+def _smart_answer_runner(answers: list[tuple[str, int]], calls: list[list[str]]):
+    """A ``smartctl`` whose ``-H`` answer changes from tick to tick.
+
+    ``answers`` is consumed one entry per health check and the last entry
+    repeats, so a test can fail a query once and then recover.
+    """
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[1:] == ["--scan-open"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="/dev/nvme0 -d nvme\n", stderr=""
+            )
+        stdout, returncode = answers[0] if len(answers) == 1 else answers.pop(0)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    return runner
+
+
+def test_a_failed_smart_query_is_not_cached_as_a_healthy_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drive that starts refusing SMART queries read like a healthy one.
+
+    No verdict meant no sample, and the cache then held that silence for a
+    whole period -- so a dying NVMe could vanish from monitoring for 5 minutes.
+    """
+
+    calls: list[list[str]] = []
+    answers = [
+        ("smartctl: unable to open device\n", 2),
+        (json.dumps({"smart_status": {"passed": True}}), 0),
+    ]
+    collector = _smart_collector(
+        monkeypatch,
+        _smart_answer_runner(answers, calls),
+        [NOW, NOW + timedelta(seconds=15), NOW + timedelta(seconds=30)],
+    )
+
+    failed = collector.collect_once()
+    retried = collector.collect_once()
+    cached = collector.collect_once()
+
+    assert [
+        (item.name, item.value, item.labels.get("failure_mode"))
+        for item in failed.samples
+    ] == [("smart_health_failed", 1, "QUERY_FAILED")], (
+        f"a refused SMART query must be reported, not read as healthy: {failed.samples}"
+    )
+    assert len(_health_checks(calls)) == 2, (
+        f"the failed query started a 300 s cache window: {calls}"
+    )
+    assert [item.value for item in retried.samples] == [0], (
+        f"the retry's verdict was not reported: {retried.samples}"
+    )
+    assert [item.value for item in cached.samples] == [0], (
+        f"a successful verdict must refresh the cache: {cached.samples}"
+    )
+    assert len(_health_checks(calls)) == 2, (
+        f"the recovered verdict did not restore the cache window: {calls}"
+    )
+
+
+def test_a_drive_without_smart_status_is_not_a_failed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--scan-open`` lists devices that implement no SMART status at all.
+
+    Those answer cleanly with no verdict. Reporting that as a query failure
+    would quarantine every node carrying such a device, so it stays a
+    cacheable "nothing to report".
+    """
+
+    calls: list[list[str]] = []
+    answers = [(json.dumps({"smartctl": {"exit_status": 0}}), 0)]
+    collector = _smart_collector(
+        monkeypatch,
+        _smart_answer_runner(answers, calls),
+        [NOW, NOW + timedelta(seconds=15)],
+    )
+
+    first = collector.collect_once()
+    second = collector.collect_once()
+
+    assert [item.name for item in first.samples] == [], (
+        f"a device with no SMART status has no health to report: {first.samples}"
+    )
+    assert [item.name for item in second.samples] == [], (
+        f"the second tick invented a verdict: {second.samples}"
+    )
+    assert len(_health_checks(calls)) == 1, (
+        f"a clean verdict-less answer must stay cacheable: {calls}"
     )

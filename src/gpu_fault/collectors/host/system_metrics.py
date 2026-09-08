@@ -592,10 +592,20 @@ class HostSystemMetricsMixin:
             < _SMART_CACHE_SECONDS
         ):
             return list(cached.samples)
-        samples = [
-            sample for device in devices for sample in self._smart_verdict(device)
-        ]
-        self._smart_health = _SmartHealth(observed_at, devices, tuple(samples))
+        samples: list[HostMetricSample] = []
+        answered = True
+        for device in devices:
+            verdict, queried = self._smart_verdict(device)
+            samples.extend(verdict)
+            answered = answered and queried
+        # A failed query must not start a cache window. Caching it the way a
+        # verdict is cached would hide a drive that has begun refusing SMART
+        # queries -- a real dying-NVMe failure mode -- for a whole period,
+        # which is exactly what the cache may not do to a health change. With
+        # no timestamp the next tick is a miss and re-queries.
+        self._smart_health = _SmartHealth(
+            observed_at if answered else None, devices, tuple(samples)
+        )
         return samples
 
     def _smart_devices(self) -> tuple[str, ...]:
@@ -615,7 +625,22 @@ class HostSystemMetricsMixin:
                 devices.add(fields[0])
         return tuple(sorted(devices))
 
-    def _smart_verdict(self, device: str) -> list[HostMetricSample]:
+    def _smart_verdict(self, device: str) -> tuple[list[HostMetricSample], bool]:
+        """One drive's verdict, and whether the query itself answered.
+
+        A drive that has begun refusing SMART queries is a real dying-NVMe
+        failure mode, and it used to read exactly like a healthy one: no
+        sample at all. It is now reported as a failure of its own, tagged
+        ``failure_mode=QUERY_FAILED`` so an operator can tell it from a drive
+        whose own self-assessment failed, and the caller does not cache it.
+
+        A verdict-less answer from a *clean* ``smartctl`` is a different thing:
+        that is a device ``--scan-open`` can open but which implements no SMART
+        status at all. It has no health to report and is not a failure, so it
+        stays cacheable -- calling it failed would quarantine every node that
+        carries such a device.
+        """
+
         check = self.runner(
             ["smartctl", "-H", "-j", device],
             capture_output=True,
@@ -626,10 +651,19 @@ class HostSystemMetricsMixin:
         try:
             payload = json.loads(check.stdout)
         except json.JSONDecodeError:
-            return []
-        passed = payload.get("smart_status", {}).get("passed")
+            return [self._smart_query_failed(device)], False
+        if not isinstance(payload, dict):
+            return [self._smart_query_failed(device)], False
+        status = payload.get("smart_status")
+        passed = status.get("passed") if isinstance(status, dict) else None
         if passed is None:
-            return []
+            reported = payload.get("smartctl")
+            exit_status = (
+                reported.get("exit_status", 0) if isinstance(reported, dict) else 0
+            )
+            if check.returncode or exit_status:
+                return [self._smart_query_failed(device)], False
+            return [], True
         return [
             self._sample(
                 "smart_health_failed",
@@ -637,7 +671,24 @@ class HostSystemMetricsMixin:
                 None,
                 device,
             )
-        ]
+        ], True
+
+    @staticmethod
+    def _smart_query_failed(device: str) -> HostMetricSample:
+        """The marker for a drive whose SMART query could not be answered.
+
+        Same metric as a failed self-assessment -- a drive that cannot be
+        asked is not a drive that is known good -- with the reason in the
+        labels, which the consumer carries into the finding's diagnostic
+        parameters.
+        """
+
+        return HostMetricSample(
+            name="smart_health_failed",
+            value=1,
+            device=device,
+            labels={"failure_mode": "QUERY_FAILED"},
+        )
 
     def _bmc(self, _: datetime) -> list[HostMetricSample]:
         if not shutil.which("ipmitool"):
