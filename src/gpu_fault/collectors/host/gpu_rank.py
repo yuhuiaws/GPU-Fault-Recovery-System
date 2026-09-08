@@ -159,6 +159,21 @@ class HostGpuRankMixin:
             return None
         return starttime, counters
 
+    def _sampled_rank_identities(self) -> set[str]:
+        """The ``<pid>/<starttime>`` pairs the *previous* tick sampled.
+
+        Read from the delta baselines, which are pruned to the live ranks on
+        every tick, so no second copy of the cohort has to be kept in step with
+        them. Must be called before this tick's first ``_delta``, which writes
+        the new keys as it reads them.
+        """
+
+        return {
+            "/".join(key.split("/")[1:3])
+            for key in self._previous
+            if key.startswith("rank/")
+        }
+
     def _prune_rank_counters(self, live_keys: set[str]) -> None:
         """Drop delta baselines of ranks that no longer exist.
 
@@ -210,12 +225,15 @@ class HostGpuRankMixin:
         sampled = 0
         advancing = 0
         live_keys = set()
+        previous_ranks = self._sampled_rank_identities()
+        identities: set[str] = set()
         for pid in pids:
             reading = self._rank_counters(pid)
             if reading is None:
                 continue
             sampled += 1
             starttime, counters = reading
+            identities.add(f"{pid}/{starttime}")
             deltas = {}
             interval = 0.0
             for name, value in counters.items():
@@ -248,6 +266,16 @@ class HostGpuRankMixin:
             ):
                 advancing += 1
         self._prune_rank_counters(live_keys)
+        if identities and previous_ranks and identities.isdisjoint(previous_ranks):
+            # A different attempt's ranks: not one rank of the previous cohort
+            # survives. The clock was only reset on a tick that saw no compute
+            # process at all, so back-to-back attempts inherited the previous
+            # attempt's progress time -- and this clock is an input to the hang
+            # decision, so inheriting it either reports seconds of "no progress"
+            # the new attempt never had, or hides a rank that never started
+            # moving (F-H9). Absent, as after any attempt end, until this
+            # attempt is measured advancing.
+            self._rank_progress_at = None
         if advancing:
             self._rank_progress_at = observed_at
         result = [

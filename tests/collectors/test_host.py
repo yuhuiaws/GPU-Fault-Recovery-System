@@ -630,3 +630,258 @@ def test_host_batch_the_control_plane_rejected_is_redelivered(
         ["baseline"],
         ["baseline"],
     ], "a rejected batch must not be treated as delivered"
+
+
+def _smart_runner(devices: list[str], passed: list[bool], calls: list[list[str]]):
+    """A ``smartctl`` that records every fork it is asked to make.
+
+    ``devices`` and ``passed`` are read on every call, so a test can hot-add a
+    drive or flip a health verdict between ticks.
+    """
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv[1:] == ["--scan-open"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="".join(f"{device} -d nvme\n" for device in devices),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"smart_status": {"passed": passed[0]}}),
+            stderr="",
+        )
+
+    return runner
+
+
+def _smart_collector(
+    monkeypatch: pytest.MonkeyPatch, runner, times: list
+) -> HostTelemetryCollector:
+    monkeypatch.setattr(
+        "gpu_fault.collectors.host.system_metrics.shutil.which",
+        lambda command: "/usr/sbin/smartctl" if command == "smartctl" else None,
+    )
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_smart",))
+    stamps = iter(times)
+    return HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(stamps),
+        runner=runner,
+    )
+
+
+def _health_checks(calls: list[list[str]]) -> list[list[str]]:
+    return [item for item in calls if "-H" in item]
+
+
+def test_smart_health_is_read_once_per_cache_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SMART health moves in days; the tick paid for it every 15 s.
+
+    Eight NVMe on a p5 is nine ``smartctl`` forks with 20 s timeouts each, a
+    180 s worst case inside a 15 s tick (F-H7).
+    """
+
+    calls: list[list[str]] = []
+    collector = _smart_collector(
+        monkeypatch,
+        _smart_runner(["/dev/nvme0", "/dev/nvme1"], [True], calls),
+        [NOW, NOW + timedelta(seconds=15)],
+    )
+
+    collector.collect_once()
+    second = collector.collect_once()
+
+    assert len(_health_checks(calls)) == 2, (
+        f"the per-device health check re-forked on the next tick: {calls}"
+    )
+    assert sorted(item.device for item in second.samples) == [
+        "/dev/nvme0",
+        "/dev/nvme1",
+    ], "a cached verdict must still be reported on every tick"
+
+
+def test_a_hot_added_drive_is_checked_before_the_cache_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache is keyed on the device set, so a new drive is never invisible."""
+
+    calls: list[list[str]] = []
+    devices = ["/dev/nvme0"]
+    collector = _smart_collector(
+        monkeypatch,
+        _smart_runner(devices, [True], calls),
+        [NOW, NOW + timedelta(seconds=15)],
+    )
+
+    collector.collect_once()
+    devices.append("/dev/nvme1")
+    second = collector.collect_once()
+
+    assert len(_health_checks(calls)) == 3, (
+        f"the added drive was hidden by the cached verdict of the old set: {calls}"
+    )
+    assert sorted(item.device for item in second.samples) == [
+        "/dev/nvme0",
+        "/dev/nvme1",
+    ], "the hot-added drive reported no health sample"
+
+
+def test_a_failing_drive_is_reported_within_one_cache_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """300 s is the whole staleness the cache may add to a health *change*."""
+
+    calls: list[list[str]] = []
+    passed = [True]
+    collector = _smart_collector(
+        monkeypatch,
+        _smart_runner(["/dev/nvme0"], passed, calls),
+        [NOW, NOW + timedelta(seconds=15), NOW + timedelta(seconds=300)],
+    )
+
+    collector.collect_once()
+    passed[0] = False
+    stale = collector.collect_once()
+    fresh = collector.collect_once()
+
+    assert [item.value for item in stale.samples] == [0], (
+        "the cached verdict is what a tick inside the window reports"
+    )
+    assert [item.value for item in fresh.samples] == [1], (
+        f"the failing drive outlived the 300 s cache bound: {calls}"
+    )
+
+
+def _efa_port(root, name: str = "rdmap0"):
+    """One EFA port with an error counter and byte counters, all quiet."""
+
+    port = root / name / "ports" / "1"
+    (port / "counters").mkdir(parents=True)
+    (port / "hw_counters").mkdir()
+    device = port.parents[1] / "device"
+    device.mkdir()
+    (device / "uevent").write_text("DRIVER=efa\n")
+    (port / "state").write_text("4: ACTIVE\n")
+    (port / "phys_state").write_text("5: LinkUp\n")
+    (port / "counters" / "symbol_error").write_text("0\n")
+    (port / "hw_counters" / "rx_drops").write_text("0\n")
+    (port / "hw_counters" / "rx_bytes").write_text("1000\n")
+    (port / "hw_counters" / "tx_bytes").write_text("2000\n")
+    return port
+
+
+def test_a_quiet_tick_ships_no_zero_valued_per_port_deltas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """~500 zero samples (~100 KB of JSON) per batch on an idle p5en (F-H8).
+
+    The deltas the consumer reads as latest values still ship at zero: that is
+    the only way a fabric validation and the sustained-drop rule can clear.
+    """
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_rdma",))
+    _efa_port(tmp_path)
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        infiniband_root=str(tmp_path),
+    )
+
+    collector.collect_once()
+    quiet = collector.collect_once()
+
+    names = {item.name for item in quiet.samples}
+    assert names == {
+        "rdma_link_down",
+        "rdma_errors_delta",
+        "efa_traffic_bytes_delta",
+        "efa_traffic_bytes_per_second",
+    }, names
+    assert [
+        item.value for item in quiet.samples if item.name == "rdma_errors_delta"
+    ] == [0.0], "the fabric error signal cannot clear without a zero reading"
+
+
+def test_the_cpu_total_excludes_guest_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """``guest``/``guest_nice`` are already inside ``user``/``nice`` (F-H9)."""
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_cpu",))
+    stats = iter(["cpu 100 0 0 100 0 0 0 0 0 0\n", "cpu 200 0 0 200 0 0 0 0 100 0\n"])
+    original_read_text = type(tmp_path).read_text
+
+    def read_text(path, *args, **kwargs):
+        if str(path) == "/proc/stat":
+            return next(stats)
+        if str(path) == "/proc/loadavg":
+            return "1.00 1.00 1.00 1/100 1\n"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(tmp_path), "read_text", read_text)
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = HostTelemetryCollector(
+        RecordingSink(), context(), node_id="worker-1", now=lambda: next(times)
+    )
+
+    collector.collect_once()
+    second = collector.collect_once()
+
+    usage = [item.value for item in second.samples if item.name == "cpu_usage_percent"]
+    assert usage == [50.0], (
+        f"the guest ticks were counted twice in the CPU total: {usage}"
+    )
+
+
+def test_a_new_attempt_does_not_inherit_the_previous_progress_clock(tmp_path) -> None:
+    """Back-to-back attempts shared one progress time for a tick (F-H9).
+
+    The clock is the input to the hang decision: a new attempt inheriting a
+    stale progress time reports seconds of "no progress" it never had.
+    """
+
+    pids = ["1234\n5678\n"]
+
+    def runner(argv, **_kwargs):
+        stdout = (
+            pids[0]
+            if any("compute-apps" in str(item) for item in argv)
+            else "GPU-a, 99\nGPU-b, 99\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        proc_root=str(tmp_path),
+        runner=runner,
+    )
+    for pid in (1234, 5678):
+        write_fake_rank(tmp_path, pid, cpu_ticks=100, write_bytes=0, wchar=0)
+    rank_liveness_cycle(collector, NOW)
+    write_fake_rank(
+        tmp_path, 1234, cpu_ticks=140, write_bytes=0, wchar=900 * 1024 * 1024
+    )
+    advanced = rank_liveness_cycle(collector, NOW + timedelta(seconds=15))
+
+    pids[0] = "4321\n8765\n"
+    for pid in (4321, 8765):
+        write_fake_rank(tmp_path, pid, cpu_ticks=100, write_bytes=0, wchar=0)
+    restarted = rank_liveness_cycle(collector, NOW + timedelta(seconds=30))
+
+    assert advanced["training_rank_seconds_since_progress"] == 0, advanced
+    assert "training_rank_seconds_since_progress" not in restarted, (
+        f"the new attempt inherited the previous attempt's progress time: {restarted}"
+    )
