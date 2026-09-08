@@ -10,6 +10,7 @@ outbox evicted its oldest records silently.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import sys
@@ -18,6 +19,7 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
+from gpu_fault.collectors import sinks as collector_sinks
 from gpu_fault.collectors.sinks import OutboxFile
 
 from ._support import (
@@ -431,6 +433,79 @@ def test_requeue_dead_refuses_to_run_when_the_outbox_lock_cannot_be_taken(
         "requeue-dead changed the outbox although it could not take the lock"
     )
     capsys.readouterr()
+
+
+def test_requeue_dead_gives_up_on_a_held_lock_instead_of_waiting_for_ever(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """N-5: strict mode took the lock with a blocking ``flock``.
+
+    The holder an operator actually meets is the live collector's outbox replay,
+    and a saturated backlog keeps it busy for as long as the control plane is
+    unreachable. ``requeue-dead`` then printed nothing, made no progress and
+    could not be told from a wedged command; there was no timeout and no hint
+    that ``--force`` exists. A bounded poll turns that into an answer.
+    """
+
+    monkeypatch.setattr(
+        collector_sinks, "OUTBOX_LOCK_RETRY_SECONDS", 0.02, raising=False
+    )
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+    outcome: list[BaseException | None] = []
+
+    def requeue() -> None:
+        try:
+            collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
+        except BaseException as exc:  # the CLI reports a refusal as SystemExit
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    worker = Thread(target=requeue, daemon=True, name="requeue-dead-blocked")
+    try:
+        # A second open file description, which is what another process's lock
+        # looks like to ``flock``.
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        worker.start()
+        worker.join(10)
+        blocked = worker.is_alive()
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+        worker.join(10)
+    capsys.readouterr()
+
+    assert not blocked, (
+        "requeue-dead was still waiting for a held outbox lock after 10s; a "
+        "strict lock must be bounded, not blocking"
+    )
+    assert isinstance(outcome[0], SystemExit), (
+        f"a lock it could not take did not stop requeue-dead: {outcome[0]!r}"
+    )
+    message = str(outcome[0])
+    assert str(lock_path) in message, (
+        f"the refusal did not name the lock file to look at: {message!r}"
+    )
+    assert "--force" in message, f"the refusal did not offer a way through: {message!r}"
+    record = json.loads(outbox_path.read_text())
+    assert record["replayable"] is False, (
+        "requeue-dead rewrote the outbox although another holder had the lock"
+    )
+
+
+def test_the_bounded_outbox_lock_wait_is_short_enough_to_answer() -> None:
+    """The bound exists to answer an operator, so it has to stay human-sized."""
+
+    waited = (
+        collector_sinks.OUTBOX_LOCK_ATTEMPTS * collector_sinks.OUTBOX_LOCK_RETRY_SECONDS
+    )
+    assert 1 <= waited <= 30, (
+        f"the strict outbox lock waits {waited}s, which is either too short to "
+        "outlast one read-modify-write or too long to read as an answer"
+    )
 
 
 def test_requeue_dead_force_proceeds_without_the_lock_and_says_so(

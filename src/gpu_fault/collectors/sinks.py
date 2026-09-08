@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -347,6 +348,36 @@ _UNLOCKED_WRITES: dict[str, int] = {}
 _OUTBOX_WRITE_FAILURES: dict[str, int] = {}
 _OUTBOX_COUNTER_LOCK = Lock()
 
+#: How long an operator command polls for the outbox lock before giving up: a
+#: blocking ``flock`` behind a live collector's replay left ``requeue-dead`` with
+#: no output and no timeout, which reads as a wedged command.
+OUTBOX_LOCK_ATTEMPTS = 10
+OUTBOX_LOCK_RETRY_SECONDS = 0.5
+
+#: Distinct replay failures already reported; bounded, the text carries a path.
+REPLAY_FAILURE_TEXTS_REMEMBERED = 32
+_REPLAY_FAILURES: dict[str, int] = {}
+
+
+def _report_replay_failure(what: str, path: object, exc: BaseException) -> None:
+    """One traceback per distinct replay failure, then DEBUG for its repeats.
+
+    A replay failure cannot fail the post that already succeeded, so one that
+    repeats for ever costs only log volume -- but that volume was a traceback
+    per delivered event on a node whose outbox directory cannot be created.
+    """
+
+    text = f"{path}: {type(exc).__name__}: {exc}"
+    with _OUTBOX_COUNTER_LOCK:
+        repeats = _REPLAY_FAILURES.get(text, 0)
+        _REPLAY_FAILURES[text] = repeats + 1
+        if not repeats and len(_REPLAY_FAILURES) > REPLAY_FAILURE_TEXTS_REMEMBERED:
+            del _REPLAY_FAILURES[next(iter(_REPLAY_FAILURES))]
+    if repeats:
+        LOGGER.debug("%s failed again (%d time(s) so far): %s", what, repeats + 1, text)
+        return
+    LOGGER.exception("%s failed (%s)", what, text)
+
 
 def _bump(counters: dict[str, int], key: str) -> int:
     with _OUTBOX_COUNTER_LOCK:
@@ -428,7 +459,8 @@ class OutboxFile:
         warned about every :data:`UNLOCKED_WRITE_WARN_INTERVAL` writes.
 
         With ``required=True`` (an operator command, which has no in-process
-        lock to fall back on) the same failure raises
+        lock to fall back on) that failure, and a lock another holder still has
+        after :meth:`_take_lock`'s bounded wait, raise
         :class:`OutboxLockUnavailable` and the body never runs.
 
         A failure to create the outbox *directory* is not a lock problem and is
@@ -440,15 +472,11 @@ class OutboxFile:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle: int | None = None
         try:
-            handle = os.open(
-                self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
-            )
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            handle = self._take_lock(required=required)
+        except OutboxLockUnavailable:
+            raise
         except OSError as exc:
-            if handle is not None:
-                with contextlib.suppress(OSError):
-                    os.close(handle)
-                handle = None
+            handle = None
             if required:
                 raise OutboxLockUnavailable(
                     exc.errno or 0,
@@ -463,6 +491,42 @@ class OutboxFile:
                     fcntl.flock(handle, fcntl.LOCK_UN)
                 with contextlib.suppress(OSError):
                     os.close(handle)
+
+    def _take_lock(self, *, required: bool) -> int:
+        """Open ``<outbox>.lock`` and hold ``flock`` on it, or raise ``OSError``.
+
+        A collector waits: the other holder is one short read-modify-write and
+        its own writes must not fail. An operator command polls instead, so a
+        ``requeue-dead`` behind a saturated replay gets an answer, not a block.
+        """
+
+        handle = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if required else 0)
+        attempts = OUTBOX_LOCK_ATTEMPTS if required else 1
+        try:
+            while True:
+                try:
+                    fcntl.flock(handle, mode)
+                    return handle
+                except OSError as exc:
+                    attempts -= 1
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    if attempts <= 0:
+                        raise OutboxLockUnavailable(
+                            exc.errno or 0,
+                            f"another process still holds the collector outbox "
+                            f"lock {self.lock_path} after "
+                            f"{OUTBOX_LOCK_ATTEMPTS * OUTBOX_LOCK_RETRY_SECONDS:.0f}s "
+                            "(a live collector's outbox replay): retry, stop the "
+                            "collector, or pass --force to work without the "
+                            "lock, which can lose one side's update",
+                        ) from exc
+                time.sleep(OUTBOX_LOCK_RETRY_SECONDS)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(handle)
+            raise
 
     def _warn_unlocked_write(self, exc: OSError) -> None:
         total = _bump(_UNLOCKED_WRITES, str(self.lock_path))
@@ -489,9 +553,10 @@ class OutboxFile:
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
-                # A crash between an append and its fsync leaves a torn last
-                # line. Skipping it loses that one record; crashing here would
-                # take the whole outbox and the collector with it.
+                # A crash between an append and its fsync can leave a torn
+                # last line; one merely missing its newline still parses, so
+                # only a fragment torn mid-JSON lands here. Skipping it loses
+                # that record; crashing would take the whole outbox with it.
                 unparseable += 1
                 continue
             if isinstance(value, dict):
@@ -512,8 +577,9 @@ class OutboxFile:
 
         The append path needs a depth to compare against
         ``outbox_max_records``, and counting newlines is what keeps a buffered
-        event from re-parsing the whole backlog (F4). A torn final line with
-        no newline is not counted; :meth:`read` drops it too.
+        event from re-parsing the whole backlog (F4). A final line with no
+        newline of its own is not counted, so this can read one short of
+        :meth:`read`, which revives a *complete* but unterminated record.
         """
 
         if not self.path.exists():
@@ -541,10 +607,9 @@ class OutboxFile:
         """Add one record with a single append and one ``fsync``.
 
         Append-only is what makes buffering during an outage O(1) instead of a
-        full re-parse and rewrite per event (F4). A crash between the write
-        and the ``fsync`` may lose at most this record, and a torn line is
-        skipped by :meth:`read`; the whole backlog behind it survives, which a
-        rewrite of the entire file could not promise.
+        full re-parse and rewrite per event (F4). A crash between the write and
+        the ``fsync`` may lose at most this record, and only if it was torn
+        mid-JSON (see :meth:`read`).
 
         "At most this record" is why the torn tail gets a newline of its own
         first: appending straight onto a fragment left by an unclean shutdown
@@ -921,17 +986,14 @@ class HttpEventSink:
             self._outbox_replay_requested = False
         try:
             outcome = self._replay_outbox()
-        except Exception:
+        except Exception as exc:
             # Catch-up work that failed is never a verdict on the event that
             # just went out: the live post already succeeded. A full
-            # ``/var/lib`` used to raise ``OSError`` out of ``post()`` and
-            # ``deliver()``, which reopened ``/dev/kmsg`` and dropped
-            # everything written in between (ARCH-G4); a reconcile bug must
-            # not fail a delivered post either. The next successful post
-            # kicks a fresh replay.
-            LOGGER.exception(
-                "collector outbox replay failed after a delivered post (path=%s)",
-                self.outbox_path,
+            # ``/var/lib`` used to raise ``OSError`` out of ``post()``, which
+            # reopened ``/dev/kmsg`` and dropped everything written in between
+            # (ARCH-G4). The next successful post kicks a fresh replay.
+            _report_replay_failure(
+                "collector outbox replay after a delivered post", self.outbox_path, exc
             )
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
@@ -972,8 +1034,10 @@ class HttpEventSink:
                 outcome = self._replay_outbox()
                 if not self._continue_outbox_replay(outcome):
                     return
-        except Exception:
-            LOGGER.exception("collector background outbox replay failed")
+        except Exception as exc:
+            _report_replay_failure(
+                "collector background outbox replay", self.outbox_path, exc
+            )
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
                 self._outbox_replay_thread = None
@@ -1236,17 +1300,20 @@ class HttpEventSink:
                 if self._outbox_line_count > self.outbox_max_records:
                     self._compact_outbox_locked(outbox)
             return True
-        except OSError:
+        except OSError as exc:
             failures = _bump(_OUTBOX_WRITE_FAILURES, str(self.outbox_path))
             if failures == 1:
                 LOGGER.exception("cannot persist collector outbox event")
             else:
                 # A full or read-only volume fails for every record; one
-                # traceback per outbox is diagnosis, thousands are noise.
+                # traceback per outbox is diagnosis, thousands are noise --
+                # but without the reason, no line after the first can tell
+                # ENOSPC from EROFS from a chmod.
                 LOGGER.warning(
-                    "cannot persist collector outbox event (%d failure(s) for %s)",
+                    "cannot persist collector outbox event (%d failure(s) for %s): %s",
                     failures,
                     self.outbox_path,
+                    exc,
                 )
             return False
 

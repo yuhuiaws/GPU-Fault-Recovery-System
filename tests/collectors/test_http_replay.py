@@ -623,6 +623,71 @@ def test_an_undirectory_outbox_is_not_reported_as_a_lock_problem(
     assert len(with_traceback) == 1, (
         f"the write failure logged {len(with_traceback)} traceback(s), not one per path"
     )
+    repeats = [record.getMessage() for record in caplog.records if not record.exc_info]
+    assert len(repeats) == 1, f"the second failure was not reported once: {repeats}"
+    assert "Permission denied" in repeats[0], (
+        "N-1: the repeated write-failure warning dropped the reason, so every "
+        "line after the first cannot tell a read-only volume from a full one "
+        f"or from a permission change: {repeats[0]!r}"
+    )
+
+
+def test_a_replay_that_fails_the_same_way_every_time_is_reported_once(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """N-4: an unreachable outbox tracebacked after every delivered post.
+
+    Catching everything here is right -- catch-up work that failed is never a
+    verdict on the event that just went out -- but the kick logged a full
+    traceback per delivery. An outbox directory that cannot be created (a
+    read-only volume, a bad hostPath) fails identically for ever, and a busy
+    node delivers thousands of events an hour, so the one traceback worth
+    reading was buried under copies of itself.
+    """
+
+    read_only = tmp_path / "read-only"
+    read_only.mkdir()
+    read_only.chmod(0o500)
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen", lambda _request, **_kwargs: _Response()
+    )
+    sink = HttpEventSink(
+        "https://control",
+        outbox_path=str(read_only / "nested" / "outbox.ndjson"),
+        outbox_replay_background_interval_seconds=0,
+    )
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gpu_fault.collectors.sinks"):
+            for sequence in range(3):
+                result = sink.deliver(
+                    "/events", {"sequence": sequence, "event_id": f"e-{sequence}"}
+                )
+                assert result.status is DeliveryStatus.DELIVERED, (
+                    f"a replay that cannot run failed the delivered post: {result}"
+                )
+    finally:
+        read_only.chmod(0o700)
+
+    reported = [
+        record for record in caplog.records if "replay" in record.getMessage().lower()
+    ]
+    tracebacks = [record for record in reported if record.exc_info]
+    assert len(tracebacks) == 1, (
+        f"3 identical replay failures logged {len(tracebacks)} traceback(s): "
+        f"{[record.getMessage() for record in reported]}"
+    )
+    assert "Permission denied" in tracebacks[0].getMessage(), (
+        f"the one diagnosis did not carry the reason: {tracebacks[0].getMessage()!r}"
+    )
+    assert [record.levelno for record in reported] == [
+        logging.ERROR,
+        logging.DEBUG,
+        logging.DEBUG,
+    ], (
+        "a replay failure that repeats identically must drop to DEBUG after the "
+        f"first: {[(r.levelname, r.getMessage()) for r in reported]}"
+    )
 
 
 def test_a_filesystem_without_flock_still_buffers_and_warns_once(
