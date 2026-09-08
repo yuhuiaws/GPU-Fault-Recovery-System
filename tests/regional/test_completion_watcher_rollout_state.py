@@ -17,7 +17,13 @@ def _manifest() -> str:
                 "apiVersion": "v1",
                 "kind": "ConfigMap",
                 "metadata": {"name": "gpu-fault-completion-watcher-outbox"},
-                "data": {"active-attempts.json": "{}", "events.json": "[]"},
+                "data": {"events.json": "[]"},
+            },
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "gpu-fault-completion-watcher-outbox-active"},
+                "data": {"active-attempts.json": "{}"},
             },
             {
                 "apiVersion": "apps/v1",
@@ -64,3 +70,42 @@ def test_missing_watcher_state_configmap_is_created() -> None:
     )
 
     assert rendered == _manifest()
+
+
+def test_the_new_active_state_object_is_applied_while_the_outbox_is_preserved() -> None:
+    """The upgrade that splits the state: one object exists, the other does not.
+
+    Probing the pair as one object would have made this rollout either drop the
+    buffered outbox records or never create the object the new watcher persists
+    its attempt state to.
+    """
+
+    probes: list[str] = []
+
+    def probe_output(command, *_args, **_kwargs):
+        name = command[-1]
+        probes.append(name)
+        if name.endswith("-active"):
+            return (1, "", 'Error from server (NotFound): configmaps "x" not found')
+        return (0, "", "")
+
+    release = SimpleNamespace(
+        runner=SimpleNamespace(dry_run=False, probe_output=probe_output),
+        config=SimpleNamespace(namespace="gpu-fault-system"),
+        _gpu=lambda _target, *args: list(args),
+    )
+
+    rendered = ROLLOUT.preserve_completion_watcher_state(
+        release, SimpleNamespace(cluster_id="gpu-a"), _manifest()
+    )
+    documents = [item for item in yaml.safe_load_all(rendered) if item]
+
+    assert probes == list(ROLLOUT.COMPLETION_WATCHER_STATE_CONFIG_MAPS), (
+        f"both state objects must be probed, got {probes}"
+    )
+    assert [
+        (item["kind"], (item.get("metadata") or {}).get("name")) for item in documents
+    ] == [
+        ("ConfigMap", "gpu-fault-completion-watcher-outbox-active"),
+        ("Deployment", "gpu-fault-completion-watcher"),
+    ], f"only the missing state object may be applied, got {documents}"

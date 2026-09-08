@@ -28,7 +28,16 @@ from gpu_fault.regional_compatibility import (
 
 ProgressSelection = ReleaseComponent | tuple[ReleaseComponent, ...]
 ProgressCallback = Callable[[ProgressSelection, str, dict[str, Any] | None], None]
-COMPLETION_WATCHER_STATE_CONFIG_MAP = "gpu-fault-completion-watcher-outbox"
+#: Both Completion Watcher state objects, in the order the manifest declares
+#: them: the write-ahead outbox, then the routine attempt state that was split
+#: out of it so a large fleet's running-attempt records could not fill the object
+#: a terminal event is written to. Each is stripped from the applied manifest if
+#: it already exists, because the manifest declares them empty and re-applying
+#: either would drop live records.
+COMPLETION_WATCHER_STATE_CONFIG_MAPS = (
+    "gpu-fault-completion-watcher-outbox",
+    "gpu-fault-completion-watcher-outbox-active",
+)
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 NODE_INVENTORY_ATTRIBUTE = "_gpu_node_inventory"
 #: Label on every Role/RoleBinding this module renders into a workload
@@ -448,31 +457,39 @@ def preserve_completion_watcher_state(
 ) -> str:
     if release.runner.dry_run:
         return text
-    returncode, _stdout, stderr = release.runner.probe_output(
-        release._gpu(
-            target,
-            "-n",
-            release.config.namespace,
-            "get",
-            "configmap",
-            COMPLETION_WATCHER_STATE_CONFIG_MAP,
+    # Probed one object at a time so that the upgrade which introduces the
+    # second one still preserves the first: the new object does not exist yet
+    # and has to be applied, the outbox exists and must not be.
+    existing = set()
+    for name in COMPLETION_WATCHER_STATE_CONFIG_MAPS:
+        returncode, _stdout, stderr = release.runner.probe_output(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                "configmap",
+                name,
+            )
         )
-    )
-    if returncode:
+        if not returncode:
+            existing.add(name)
+            continue
         if "NotFound" in stderr or "not found" in stderr:
-            return text
+            continue
         raise ReleaseError(
             f"{target.cluster_id} cannot inspect Completion Watcher state: "
             + stderr.strip()
         )
+    if not existing:
+        return text
     documents = [
         document
         for document in yaml.safe_load_all(text)
         if not (
             isinstance(document, dict)
             and document.get("kind") == "ConfigMap"
-            and (document.get("metadata") or {}).get("name")
-            == COMPLETION_WATCHER_STATE_CONFIG_MAP
+            and (document.get("metadata") or {}).get("name") in existing
         )
     ]
     return yaml.safe_dump_all(documents, sort_keys=False)

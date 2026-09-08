@@ -30,6 +30,12 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BUFFERED_TAIL_BYTES = 8192
 #: Bound on the per-key "already reported" set behind the log-once rule.
 _MAX_LOGGED_APPEND_FAILURES = 1024
+#: Suffix of the second ConfigMap. ``<name>`` carries the critical write-ahead
+#: log and ``<name>-active`` the routine per-attempt state, because a ConfigMap
+#: is capped at 1 MiB *per object*: with both documents in one object N running
+#: Pods of routine state could fill it and the terminal event of a failing
+#: attempt could no longer be written ahead at all (F6).
+ACTIVE_STATE_SUFFIX = "-active"
 
 
 #: Marker in the ``post`` result: nothing was delivered live because the record
@@ -133,6 +139,58 @@ def completion_delivery_disposition(exc: BaseException) -> str:
     return "retry"
 
 
+# Pure helpers, module level rather than static methods: the outbox class is
+# at its architecture size limit, and none of them reads the instance.
+def _record_key(path: str, payload: dict[str, Any]) -> str:
+    cluster_id = str(payload.get("cluster_id") or "")
+    attempt_id = str(payload.get("attempt_id") or "")
+    if not cluster_id or not attempt_id:
+        raise ValueError("critical completion event requires cluster_id and attempt_id")
+    return f"{cluster_id}/{attempt_id}/{path.rsplit('/', 1)[-1]}"
+
+
+def _data(value: Any) -> dict[str, str]:
+    raw = value.get("data", {}) if isinstance(value, dict) else value.data
+    return dict(raw or {})
+
+
+def _resource_version(value: Any) -> str | None:
+    metadata = value.get("metadata", {}) if isinstance(value, dict) else value.metadata
+    if isinstance(metadata, dict):
+        return metadata.get("resourceVersion") or metadata.get("resource_version")
+    return getattr(metadata, "resource_version", None)
+
+
+def _attempt_key(payload: dict[str, Any]) -> str:
+    cluster_id = str(payload.get("cluster_id") or "")
+    attempt_id = str(payload.get("attempt_id") or "")
+    if not cluster_id or not attempt_id:
+        raise ValueError("attempt observation requires cluster_id and attempt_id")
+    return f"{cluster_id}/{attempt_id}"
+
+
+def _attempt_digest(payload: dict[str, Any]) -> str:
+    structural = dict(payload)
+    structural.pop("observed_at", None)
+    return hashlib.sha256(
+        json.dumps(
+            structural,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _attempt_document(attempts: dict[str, dict[str, Any]]) -> str:
+    return json.dumps(
+        attempts,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 class KubernetesCompletionOutbox:
     """ConfigMap-backed write-ahead delivery for critical watcher events.
 
@@ -174,6 +232,10 @@ class KubernetesCompletionOutbox:
         self.sink = sink
         self.namespace = namespace
         self.name = name
+        #: Routine attempt state; see ``ACTIVE_STATE_SUFFIX``. Both objects are
+        #: shipped by ``deploy/dataplane/completion-watcher.yaml`` and both are
+        #: named in the Role's ``resourceNames``.
+        self.active_name = f"{name}{ACTIVE_STATE_SUFFIX}"
         self.max_records = max_records
         self.max_bytes = max_bytes
         self.max_buffered_tail_bytes = max_buffered_tail_bytes
@@ -201,34 +263,26 @@ class KubernetesCompletionOutbox:
         # per scrape (F12).
         self.last_depth = 0
         self.last_quarantined_depth = 0
+        # What this process believes the WAL holds, so that the replay at the
+        # top of every reconcile pass (and every debounced flush) does not spend
+        # a whole-document GET on a document it emptied itself (F6). ``None`` is
+        # "unknown" -- a fresh process, or any write that raised -- and always
+        # forces the read; only a known zero may skip it.
+        self._known_depth: int | None = None
+        self._known_quarantined: int | None = None
+        # Replay passes that skipped the GET. Not a published metric -- the
+        # depth gauges already say what the WAL holds -- but the number that
+        # explains a drop in this pod's ConfigMap read rate.
+        self.replay_reads_skipped_total = 0
+        # Whether attempt state left in the WAL object by the previous release
+        # has been moved to ``active_name`` yet; done once per process, on the
+        # first read of the active state.
+        self._legacy_state_migrated = False
+        self._active_state_missing_logged = False
 
-    @staticmethod
-    def _record_key(path: str, payload: dict[str, Any]) -> str:
-        cluster_id = str(payload.get("cluster_id") or "")
-        attempt_id = str(payload.get("attempt_id") or "")
-        if not cluster_id or not attempt_id:
-            raise ValueError(
-                "critical completion event requires cluster_id and attempt_id"
-            )
-        return f"{cluster_id}/{attempt_id}/{path.rsplit('/', 1)[-1]}"
-
-    @staticmethod
-    def _data(value: Any) -> dict[str, str]:
-        raw = value.get("data", {}) if isinstance(value, dict) else value.data
-        return dict(raw or {})
-
-    @staticmethod
-    def _resource_version(value: Any) -> str | None:
-        metadata = (
-            value.get("metadata", {}) if isinstance(value, dict) else value.metadata
-        )
-        if isinstance(metadata, dict):
-            return metadata.get("resourceVersion") or metadata.get("resource_version")
-        return getattr(metadata, "resource_version", None)
-
-    def _read_data(self) -> tuple[dict[str, str], str | None]:
-        value = self.core_api.read_namespaced_config_map(self.name, self.namespace)
-        return self._data(value), self._resource_version(value)
+    def _read_data(self, name: str) -> tuple[dict[str, str], str | None]:
+        value = self.core_api.read_namespaced_config_map(name, self.namespace)
+        return _data(value), _resource_version(value)
 
     def _events(self, data: dict[str, str]) -> list[dict[str, Any]]:
         document = json.loads(data.get(self.DATA_KEY, "[]"))
@@ -248,33 +302,39 @@ class KubernetesCompletionOutbox:
         return document
 
     def _read(self) -> tuple[list[dict[str, Any]], str | None]:
-        data, resource_version = self._read_data()
-        return self._events(data), resource_version
+        data, resource_version = self._read_data(self.name)
+        records = self._events(data)
+        self._note_depth(records)
+        return records, resource_version
 
     def _write_data(
         self,
+        name: str,
         data: dict[str, str],
         resource_version: str | None,
     ) -> None:
-        records = self._events(data)
-        attempts = self._attempts(data)
         payload_bytes = sum(
             len(key.encode()) + len(value.encode()) for key, value in data.items()
         )
-        if (
-            len(records) > self.max_records
-            or len(attempts) > self.max_records
-            or payload_bytes > self.max_bytes
-        ):
+        if payload_bytes > self.max_bytes:
             raise CompletionOutboxFull(
-                "completion outbox or active attempt state exceeds its bounds"
+                f"{name} exceeds its byte bound "
+                f"({payload_bytes} > {self.max_bytes} bytes)"
+            )
+        # ``max_records`` bounds the write-ahead log only. Routine attempt state
+        # lives in its own object (F6), where the bound that matters is the
+        # 1 MiB one every ConfigMap has: capping it at 256 attempts would refuse
+        # to remember the 257th running job on a large cluster for no reason.
+        if len(self._events(data)) > self.max_records:
+            raise CompletionOutboxFull(
+                f"completion outbox exceeds its record bound of {self.max_records}"
             )
         self.core_api.replace_namespaced_config_map(
-            self.name,
+            name,
             self.namespace,
             {
                 "metadata": {
-                    "name": self.name,
+                    "name": name,
                     **(
                         {"resourceVersion": resource_version}
                         if resource_version is not None
@@ -287,10 +347,11 @@ class KubernetesCompletionOutbox:
 
     def _mutate_data(
         self,
+        name: str,
         function: Callable[[dict[str, str]], dict[str, str]],
     ) -> None:
         for attempt in range(3):
-            data, resource_version = self._read_data()
+            data, resource_version = self._read_data(name)
             updated = function(data)
             if updated is data:
                 # A mutation that changes nothing (a key that is already
@@ -298,11 +359,30 @@ class KubernetesCompletionOutbox:
                 # whole-document replace on this hot path.
                 return
             try:
-                self._write_data(updated, resource_version)
+                self._write_data(name, updated, resource_version)
                 return
             except Exception as exc:
                 if getattr(exc, "status", None) != 409 or attempt == 2:
                     raise
+
+    def _note_depth(self, records: list[dict[str, Any]]) -> None:
+        """Remember what the WAL object holds after a read or a write we own."""
+
+        self._known_depth = len(records)
+        self._known_quarantined = sum(
+            1 for record in records if record.get("quarantined", False)
+        )
+
+    def _forget_depth(self) -> None:
+        """Drop the in-process belief; the next replay must read the object.
+
+        Called whenever a write raised: the ConfigMap may hold what we tried to
+        write, what was there before, or a concurrent writer's document, and a
+        skipped read would then hide a buffered record for ever.
+        """
+
+        self._known_depth = None
+        self._known_quarantined = None
 
     def _mutate(
         self,
@@ -311,9 +391,13 @@ class KubernetesCompletionOutbox:
             list[dict[str, Any]],
         ],
     ) -> None:
+        written: list[dict[str, Any]] = []
+
         def update(data: dict[str, str]) -> dict[str, str]:
+            records = function(self._events(data))
+            written[:] = records
             document = json.dumps(
-                function(self._events(data)),
+                records,
                 sort_keys=True,
                 separators=(",", ":"),
                 default=str,
@@ -324,7 +408,12 @@ class KubernetesCompletionOutbox:
             result[self.DATA_KEY] = document
             return result
 
-        self._mutate_data(update)
+        try:
+            self._mutate_data(self.name, update)
+        except Exception:
+            self._forget_depth()
+            raise
+        self._note_depth(written)
 
     def _append(self, key: str, path: str, payload: dict[str, Any]) -> bool:
         """Buffer the pointer-sized copy; ``True`` when the caller must post.
@@ -415,7 +504,7 @@ class KubernetesCompletionOutbox:
         }
 
     def _upsert_latest(self, path: str, payload: dict[str, Any]) -> str:
-        key = self._record_key(path, payload)
+        key = _record_key(path, payload)
 
         def upsert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             retained = [item for item in records if item.get("key") != key]
@@ -466,38 +555,99 @@ class KubernetesCompletionOutbox:
                 key,
             )
 
-    @staticmethod
-    def _attempt_key(payload: dict[str, Any]) -> str:
-        cluster_id = str(payload.get("cluster_id") or "")
-        attempt_id = str(payload.get("attempt_id") or "")
-        if not cluster_id or not attempt_id:
-            raise ValueError("attempt observation requires cluster_id and attempt_id")
-        return f"{cluster_id}/{attempt_id}"
+    def _active_state_unavailable(self, exc: BaseException) -> bool:
+        """Whether ``exc`` is the ``<name>-active`` object simply not existing.
 
-    @staticmethod
-    def _attempt_digest(payload: dict[str, Any]) -> str:
-        structural = dict(payload)
-        structural.pop("observed_at", None)
-        return hashlib.sha256(
-            json.dumps(
-                structural,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode()
-        ).hexdigest()
+        It is shipped by ``deploy/dataplane/completion-watcher.yaml``, so this is
+        the upgrade window between a new watcher image and the manifest that
+        adds the object -- or an operator who deleted it. The watcher keeps
+        watching either way: attempt state is a restart optimisation, and the
+        Role deliberately grants no ``create`` (a ``create`` cannot be scoped by
+        ``resourceNames``, so it would let this pod make any ConfigMap).
+        """
+
+        if getattr(exc, "status", None) != 404:
+            return False
+        if not self._active_state_missing_logged:
+            self._active_state_missing_logged = True
+            LOGGER.error(
+                "ConfigMap %s/%s does not exist, so active attempt state is not "
+                "persisted and a watcher restart will re-derive its attempts "
+                "from live Pods; apply deploy/dataplane/completion-watcher.yaml",
+                self.namespace,
+                self.active_name,
+            )
+        return True
+
+    def _migrate_legacy_attempt_state(self) -> None:
+        """Adopt attempt state a previous release left in the WAL object (F6).
+
+        The new object is written first and the old key dropped only after, so a
+        crash in between repeats the migration rather than losing an attempt;
+        the adoption merges by key, which makes the repeat a no-op. A failure
+        leaves the flag down so the next call tries again.
+        """
+
+        if self._legacy_state_migrated:
+            return
+        self._legacy_state_migrated = True
+        try:
+            data, _resource_version = self._read_data(self.name)
+            legacy = self._attempts(data)
+            if not legacy:
+                return
+
+            def adopt(current: dict[str, str]) -> dict[str, str]:
+                attempts = {**legacy, **self._attempts(current)}
+                document = _attempt_document(attempts)
+                if document == current.get(self.ATTEMPTS_KEY):
+                    return current
+                result = dict(current)
+                result[self.ATTEMPTS_KEY] = document
+                return result
+
+            self._mutate_data(self.active_name, adopt)
+
+            def drop(current: dict[str, str]) -> dict[str, str]:
+                if self.ATTEMPTS_KEY not in current:
+                    return current
+                result = dict(current)
+                result.pop(self.ATTEMPTS_KEY)
+                return result
+
+            self._mutate_data(self.name, drop)
+            LOGGER.info(
+                "migrated %d persisted attempt observations from %s to %s",
+                len(legacy),
+                self.name,
+                self.active_name,
+            )
+        except Exception as exc:
+            if not self._active_state_unavailable(exc):
+                LOGGER.exception(
+                    "cannot migrate persisted attempt observations from %s to %s",
+                    self.name,
+                    self.active_name,
+                )
+            self._legacy_state_migrated = False
 
     def load_attempt_observations(self) -> list[dict[str, Any]]:
-        data, _resource_version = self._read_data()
+        self._migrate_legacy_attempt_state()
+        try:
+            data, _resource_version = self._read_data(self.active_name)
+        except Exception as exc:
+            if not self._active_state_unavailable(exc):
+                raise
+            return []
         attempts = self._attempts(data)
         self._attempt_digests = {
-            key: self._attempt_digest(payload) for key, payload in attempts.items()
+            key: _attempt_digest(payload) for key, payload in attempts.items()
         }
         return [dict(attempts[key]) for key in sorted(attempts)]
 
     def save_attempt_observation(self, payload: dict[str, Any]) -> bool:
-        key = self._attempt_key(payload)
-        digest = self._attempt_digest(payload)
+        key = _attempt_key(payload)
+        digest = _attempt_digest(payload)
         if self._attempt_digests.get(key) == digest:
             return False
 
@@ -505,20 +655,20 @@ class KubernetesCompletionOutbox:
             attempts = self._attempts(data)
             attempts[key] = dict(payload)
             result = dict(data)
-            result[self.ATTEMPTS_KEY] = json.dumps(
-                attempts,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+            result[self.ATTEMPTS_KEY] = _attempt_document(attempts)
             return result
 
-        self._mutate_data(update)
+        try:
+            self._mutate_data(self.active_name, update)
+        except Exception as exc:
+            if not self._active_state_unavailable(exc):
+                raise
+            return False
         self._attempt_digests[key] = digest
         return True
 
     def remove_attempt_observation(self, payload: dict[str, Any]) -> None:
-        key = self._attempt_key(payload)
+        key = _attempt_key(payload)
 
         def update(data: dict[str, str]) -> dict[str, str]:
             attempts = self._attempts(data)
@@ -526,15 +676,15 @@ class KubernetesCompletionOutbox:
                 return data
             attempts.pop(key)
             result = dict(data)
-            result[self.ATTEMPTS_KEY] = json.dumps(
-                attempts,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+            result[self.ATTEMPTS_KEY] = _attempt_document(attempts)
             return result
 
-        self._mutate_data(update)
+        try:
+            self._mutate_data(self.active_name, update)
+        except Exception as exc:
+            if not self._active_state_unavailable(exc):
+                raise
+            return
         self._attempt_digests.pop(key, None)
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -548,7 +698,7 @@ class KubernetesCompletionOutbox:
             return self.sink.post(path, payload)
         # A malformed payload has no key and is a caller bug, not a durability
         # problem: it still fails hard, before anything is attempted.
-        key = self._record_key(path, payload)
+        key = _record_key(path, payload)
         try:
             deliver_live = self._append(key, path, payload)
         except Exception as append_error:
@@ -602,6 +752,16 @@ class KubernetesCompletionOutbox:
         stays "records this pass delivered".
         """
 
+        if self._known_empty(include_quarantined=include_quarantined):
+            # The WAL is empty and this process emptied it, so there is nothing
+            # to read: the watcher replays at the top of every reconcile pass and
+            # on every debounced flush, and on a healthy cluster that was a
+            # whole-document GET per pass for an empty document (F6).
+            self.replay_reads_skipped_total += 1
+            self.last_depth = 0
+            self.last_quarantined_depth = 0
+            self.last_replay = {"replayed": 0, "deferred": 0, "quarantined": 0}
+            return 0
         try:
             records, _resource_version = self._read()
         except Exception:
@@ -629,6 +789,20 @@ class KubernetesCompletionOutbox:
             # Even a pass that died on an unwritable ConfigMap has to leave the
             # depth behind: that is exactly when an operator needs it.
             self._publish_depth(records, drained=drained, isolated=isolated)
+
+    def _known_empty(self, *, include_quarantined: bool) -> bool:
+        """Whether this process can prove the WAL holds nothing to replay.
+
+        Only a known zero counts. ``None`` -- a fresh process, or any write that
+        raised -- reads, because another watcher generation, an operator or a
+        half-applied write of our own may have left a record behind. A pass that
+        was asked for quarantined records also refuses to skip unless the
+        quarantined count is a known zero.
+        """
+
+        if self._known_depth != 0:
+            return False
+        return not include_quarantined or self._known_quarantined == 0
 
     def _replay_pass(
         self,

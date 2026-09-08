@@ -9,23 +9,53 @@ import pytest
 from gpu_fault.completion_outbox import CompletionOutboxFull, KubernetesCompletionOutbox
 
 
+OUTBOX_NAME = "gpu-fault-completion-watcher-outbox"
+ACTIVE_NAME = f"{OUTBOX_NAME}-active"
+
+
 class ConfigMapCore:
+    """Fake CoreV1 ConfigMap API holding each object on its own.
+
+    The watcher keeps the write-ahead log in ``<name>`` and routine attempt
+    state in ``<name>-active`` (F6), each with its own resourceVersion. ``data``
+    is the union of the two -- the two objects never share a key -- and
+    ``version`` their sum, so a test can keep asserting on whichever document it
+    cares about without knowing which object carries it.
+    """
+
     def __init__(self) -> None:
-        self.version = 1
-        self.data = {"active-attempts.json": "{}", "events.json": "[]"}
+        self.objects = {
+            OUTBOX_NAME: {"events.json": "[]"},
+            ACTIVE_NAME: {"active-attempts.json": "{}"},
+        }
+        self.versions = {name: 1 for name in self.objects}
+        self.reads: list[str] = []
+
+    @property
+    def data(self):
+        return {**self.objects[ACTIVE_NAME], **self.objects[OUTBOX_NAME]}
+
+    @property
+    def version(self):
+        return sum(self.versions.values())
 
     def read_namespaced_config_map(self, name, namespace):
-        assert name == "gpu-fault-completion-watcher-outbox"
+        assert name in self.objects, f"unexpected ConfigMap read: {name}"
         assert namespace == "gpu-fault-system"
+        self.reads.append(name)
         return SimpleNamespace(
-            metadata=SimpleNamespace(resource_version=str(self.version)),
-            data=dict(self.data),
+            metadata=SimpleNamespace(resource_version=str(self.versions[name])),
+            data=dict(self.objects[name]),
         )
 
     def replace_namespaced_config_map(self, name, namespace, body):
-        assert body["metadata"]["resourceVersion"] == str(self.version)
-        self.version += 1
-        self.data = dict(body["data"])
+        assert name in self.objects, f"unexpected ConfigMap write: {name}"
+        assert body["metadata"]["resourceVersion"] == str(self.versions[name])
+        self.versions[name] += 1
+        self.objects[name] = dict(body["data"])
+
+    def events(self, name):
+        return len(json.loads(self.objects[name].get("events.json", "[]")))
 
 
 class RecordingSink:
@@ -392,9 +422,8 @@ class BrokenRemovalCore(ConfigMapCore):
     """
 
     def replace_namespaced_config_map(self, name, namespace, body):
-        before = len(json.loads(self.data["events.json"]))
-        after = len(json.loads(body["data"]["events.json"]))
-        if after < before:
+        after = len(json.loads(body["data"].get("events.json", "[]")))
+        if after < self.events(name):
             raise FakeApiException(500)
         return super().replace_namespaced_config_map(name, namespace, body)
 
@@ -476,9 +505,8 @@ class OneBadRemovalCore(ConfigMapCore):
         self.removal_failures = 0
 
     def replace_namespaced_config_map(self, name, namespace, body):
-        before = len(json.loads(self.data["events.json"]))
-        after = len(json.loads(body["data"]["events.json"]))
-        if after < before and self.removal_failures == 0:
+        after = len(json.loads(body["data"].get("events.json", "[]")))
+        if after < self.events(name) and self.removal_failures == 0:
             self.removal_failures += 1
             raise FakeApiException(500)
         return super().replace_namespaced_config_map(name, namespace, body)
@@ -572,4 +600,102 @@ def test_depth_gauges_report_the_snapshot_a_failed_replay_pass_read() -> None:
     assert outbox.last_depth == 1, (
         "a pass that read nothing must leave the last known depth alone, got "
         f"{outbox.last_depth}"
+    )
+
+
+def test_replay_skips_the_get_when_the_outbox_is_known_empty() -> None:
+    """F6: an empty outbox must not cost a ConfigMap GET per reconcile.
+
+    The watcher replays at the top of every pass and every debounced flush, so
+    an idle cluster spent one whole-document read per pass on a document it had
+    just emptied itself. Depth is tracked in-process instead: unknown (a fresh
+    process, or any failed write) always reads, a known zero does not.
+    """
+
+    core = ConfigMapCore()
+    sink = RecordingSink()
+    outbox = KubernetesCompletionOutbox(core, sink)
+
+    assert outbox.replay() == 0, "nothing is buffered yet"
+    assert core.reads == [OUTBOX_NAME], (
+        f"a fresh process does not know its depth and must read: {core.reads}"
+    )
+
+    core.reads.clear()
+    assert outbox.replay() == 0, "still nothing buffered"
+    assert core.reads == [], (
+        f"a known-empty outbox must not be read again: {core.reads}"
+    )
+
+    outbox.post("/v1/attempts/terminal", payload())
+    core.reads.clear()
+    assert outbox.replay() == 0, "the live POST cleared the record it buffered"
+    assert core.reads == [], (
+        f"an append and its delivery leave the depth known-empty: {core.reads}"
+    )
+
+    core.reads.clear()
+    assert outbox.replay(include_quarantined=True) == 0, "nothing is buffered"
+    assert core.reads == [], (
+        "no record was ever quarantined, so include_quarantined may skip too: "
+        f"{core.reads}"
+    )
+
+
+def test_a_failed_write_makes_the_depth_unknown_again() -> None:
+    """A write that raised leaves a document nobody knows the contents of.
+
+    The one thing the in-process depth may never do is keep a stale zero over a
+    record that may have been written: the record would sit in the ConfigMap
+    with no pass ever reading it again.
+    """
+
+    core = UnwritableCore()
+    sink = RecordingSink()
+    outbox = KubernetesCompletionOutbox(core, sink)
+    assert outbox.replay() == 0, "nothing is buffered yet"
+
+    core.writable = False
+    sink.fail = True
+    with pytest.raises(FakeApiException):
+        outbox.post("/v1/workload-observations", payload())
+    core.reads.clear()
+    core.writable = True
+
+    assert outbox.replay() == 0, "the failed write buffered nothing"
+    assert core.reads == [OUTBOX_NAME], (
+        f"a failed write must force the next replay to read: {core.reads}"
+    )
+
+
+def test_legacy_attempt_state_migrates_to_the_active_config_map() -> None:
+    """The upgrade path: attempt state written by the previous release.
+
+    The record moves to ``<name>-active`` before it is dropped from ``<name>``,
+    so a crash between the two writes duplicates it rather than losing it, and
+    the next start migrates the leftover again.
+    """
+
+    core = ConfigMapCore()
+    legacy = {
+        "cluster_id": "cluster-a",
+        "attempt_id": "attempt-legacy",
+        "workload_phase": "RUNNING",
+    }
+    core.objects[OUTBOX_NAME]["active-attempts.json"] = json.dumps(
+        {"cluster-a/attempt-legacy": legacy}
+    )
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+
+    assert outbox.load_attempt_observations() == [legacy], (
+        "a record written by the previous release must still be restored"
+    )
+    assert json.loads(core.objects[ACTIVE_NAME]["active-attempts.json"]) == {
+        "cluster-a/attempt-legacy": legacy
+    }, f"the record must move to the active object: {core.objects[ACTIVE_NAME]}"
+    assert "active-attempts.json" not in core.objects[OUTBOX_NAME], (
+        f"the WAL object must not keep attempt state: {core.objects[OUTBOX_NAME]}"
+    )
+    assert outbox.load_attempt_observations() == [legacy], (
+        "the migration must be idempotent"
     )

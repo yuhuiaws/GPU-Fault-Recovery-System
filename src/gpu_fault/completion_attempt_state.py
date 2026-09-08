@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, cast
 
 from pydantic import ValidationError
 
 from gpu_fault.attempt_observation_state import terminal_attempt_observation
+from gpu_fault.completion_attempt_store import (
+    attempt_observation_payload,
+    attempt_state_record,
+)
 from gpu_fault.completion_observation import (
     TERMINAL_ORIGIN_MISSING_TOMBSTONE,
     TERMINAL_ORIGIN_OBSERVED,
@@ -26,6 +32,11 @@ ACTIVE_PHASES = frozenset({WorkloadPhase.PENDING, WorkloadPhase.RUNNING})
 #: a phase a future release adds -- may still hold a GPU, so
 #: :func:`active_pass_counts` counts it as running rather than guessing.
 FINISHED_POD_PHASES = frozenset({"SUCCEEDED", "FAILED"})
+#: How many (attempt, error) pairs :func:`log_reconcile_failure` remembers.
+#: Bounded because a cluster that churns attempts would otherwise grow the map
+#: for the lifetime of the process; the oldest pair is dropped, so its next
+#: failure prints one more traceback and nothing is lost but a repeat.
+REPEATED_FAILURE_CAP = 1024
 
 
 @dataclass(frozen=True)
@@ -76,7 +87,11 @@ def restore_persisted_attempt_observations(controller: Any) -> None:
         return
     for payload in load():
         try:
-            observation = AttemptObservation.model_validate(payload)
+            observation = AttemptObservation.model_validate(
+                attempt_observation_payload(payload)
+                if isinstance(payload, dict)
+                else payload
+            )
         except ValidationError as exc:
             controller.restore_skipped_total += 1
             LOGGER.warning(
@@ -122,6 +137,46 @@ def restore_persisted_attempt_observations(controller: Any) -> None:
         # the workload object first (F7). Cleared as soon as one of its Pods is
         # listed.
         controller._restored_attempts.add(observation.attempt_id)
+
+
+def log_reconcile_failure(controller: Any, attempt_id: str, exc: BaseException) -> None:
+    """Report a per-attempt reconcile failure once at ERROR, then at DEBUG (F9).
+
+    A Pod whose status will never become valid -- a ``startTime`` that is not a
+    timestamp, a field a future kubelet writes differently -- fails on every
+    pass for as long as it exists, and each failure used to print a full
+    traceback every ``reconcile_interval_seconds``. A day of that buries the
+    failures an operator can act on and costs real money in log ingest, while
+    dropping the repeats entirely would hide a permanent breakage. So the first
+    sighting of each failure is an ERROR with its traceback and every repeat is
+    one DEBUG line; ``reconcile_failures_total`` still counts them all, which is
+    what the alert reads.
+
+    Keyed by the error text, not its type: two malformed fields on the same
+    attempt are two different problems, and the same text is the same problem
+    however many passes it survives.
+    """
+
+    seen = getattr(controller, "_reconcile_failures_logged", None)
+    if seen is None:
+        # Created here rather than in the controller's constructor: this is the
+        # logger's own bookkeeping, and no other caller may read it.
+        seen = OrderedDict()
+        controller._reconcile_failures_logged = seen
+    description = f"{type(exc).__name__}: {exc}"
+    key = f"{attempt_id}/{hashlib.sha256(description.encode()).hexdigest()[:12]}"
+    if key in seen:
+        seen.move_to_end(key)
+        LOGGER.debug(
+            "cannot reconcile attempt %s, unchanged since it was first reported: %s",
+            attempt_id,
+            description,
+        )
+        return
+    seen[key] = None
+    while len(seen) > REPEATED_FAILURE_CAP:
+        seen.popitem(last=False)
+    LOGGER.error("cannot reconcile attempt %s", attempt_id, exc_info=exc)
 
 
 def cache_terminal_attempt_observation(
@@ -286,11 +341,15 @@ def publish_attempt_observation(
     attempt_id: str,
 ) -> None:
     payload = observation.model_dump(mode="json")
+    # What is persisted is the compact record; what is posted is the payload.
+    # The control plane's contract must not change because the watcher stopped
+    # writing GPU UUIDs it can re-read from the Pod (F6).
+    record = attempt_state_record(payload)
     if observation.workload_phase in ACTIVE_PHASES:
         persist = getattr(controller.sink, "save_attempt_observation", None)
         if persist is not None:
             try:
-                persist(payload)
+                persist(record)
             except Exception:
                 LOGGER.exception(
                     "cannot persist active attempt observation for %s",
@@ -309,7 +368,7 @@ def publish_attempt_observation(
     remove = getattr(controller.sink, "remove_attempt_observation", None)
     if remove is not None:
         try:
-            remove(payload)
+            remove(record)
         except Exception:
             LOGGER.exception(
                 "cannot remove persisted attempt observation for %s",

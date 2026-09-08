@@ -365,8 +365,16 @@ def test_blast003_the_completion_watcher_rbac_stays_read_only_cluster_wide() -> 
     configmap_rule = next(
         rule for rule in role["rules"] if rule["resources"] == ["configmaps"]
     )
-    # The only cluster-wide write is its own outbox, pinned by name.
-    assert configmap_rule["resourceNames"] == ["gpu-fault-completion-watcher-outbox"]
+    # The only cluster-wide writes are its own two state objects, each pinned by
+    # name: the write-ahead outbox and the active-attempt state split out of it.
+    assert configmap_rule["resourceNames"] == [
+        "gpu-fault-completion-watcher-outbox",
+        "gpu-fault-completion-watcher-outbox-active",
+    ], f"the watcher may write only its own state objects: {configmap_rule}"
+    assert "create" not in configmap_rule["verbs"], (
+        "a ConfigMap create cannot be scoped by resourceNames, so granting it "
+        f"would let the watcher make any ConfigMap: {configmap_rule}"
+    )
     assert binding["subjects"] == [
         {
             "kind": "ServiceAccount",

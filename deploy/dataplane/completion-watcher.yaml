@@ -10,8 +10,23 @@ metadata:
   name: gpu-fault-completion-watcher-outbox
   namespace: gpu-fault-system
 data:
-  active-attempts.json: "{}"
   events.json: "[]"
+---
+# Routine per-attempt state, deliberately a second object. A ConfigMap is
+# capped at 1 MiB *per object*, so while both documents shared one object a few
+# hundred running Pods' worth of attempt state filled it and the write-ahead
+# copy of a failing attempt's terminal event could no longer be written at all
+# -- routine state starving the delivery the outbox exists to make durable.
+# Losing this object costs a restart its memory of which attempts it was
+# watching (they are re-derived from live Pods); losing the outbox above can
+# lose a terminal event. Both are preserved verbatim across a regional rollout.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-completion-watcher-outbox-active
+  namespace: gpu-fault-system
+data:
+  active-attempts.json: "{}"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -42,7 +57,13 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["gpu-fault-completion-watcher-outbox"]
+    resourceNames:
+      - gpu-fault-completion-watcher-outbox
+      - gpu-fault-completion-watcher-outbox-active
+    # No `create`: RBAC cannot scope a create by resourceNames, so granting it
+    # would let this pod make any ConfigMap in any namespace. Both objects are
+    # shipped by this manifest; a watcher that finds one missing logs it once
+    # and keeps watching.
     verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

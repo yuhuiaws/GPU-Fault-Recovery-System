@@ -8,6 +8,7 @@ attempt record is not its own.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import timedelta
@@ -57,6 +58,40 @@ def test_a_malformed_pod_does_not_stop_other_attempts_from_reconciling() -> None
     assert terminal_attempts == ["attempt-b"]
     assert results == [{"accepted": True}]
     assert subject.reconcile_failures_total == 1
+
+
+def test_malformed_pod_logs_one_error_then_debug(caplog) -> None:
+    """F9: a permanently malformed Pod must not print a traceback per pass.
+
+    The Pod cannot be fixed by the watcher and the reconcile runs every 30 s
+    plus once per watch event, so the first occurrence of each distinct error
+    per attempt is an ERROR with its traceback and every repetition after it is
+    a DEBUG. ``reconcile_failures_total`` keeps counting, which is what the
+    alert reads.
+    """
+
+    broken = pod(0, exit_code=0, attempt_id="attempt-a")
+    broken["status"]["startTime"] = 12345
+    subject = controller(FakeCoreApi([broken]), FakeSink())
+
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            subject.run_once()
+
+    reported = [
+        record
+        for record in caplog.records
+        if "attempt-a" in record.getMessage() and "reconcile" in record.getMessage()
+    ]
+    levels = [record.levelname for record in reported]
+    assert levels == ["ERROR", "DEBUG", "DEBUG"], (
+        f"one ERROR then DEBUG per repetition, got {levels}: "
+        f"{[record.getMessage() for record in reported]}"
+    )
+    assert subject.reconcile_failures_total == 3, (
+        "every failed pass must still be counted, got "
+        f"{subject.reconcile_failures_total}"
+    )
 
 
 class PersistingSink(FakeSink):

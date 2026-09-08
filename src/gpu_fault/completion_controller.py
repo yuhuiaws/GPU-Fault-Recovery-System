@@ -23,6 +23,7 @@ from gpu_fault.completion_attempt_state import (
     AttemptSpec,
     active_pass_counts,
     cache_terminal_attempt_observation,
+    log_reconcile_failure,
     publish_attempt_observation,
     publish_coverage_heartbeat,
     restore_persisted_attempt_observations,
@@ -955,9 +956,9 @@ class KubernetesCompletionController:
             self.note_progress()
             try:
                 self._reconcile_attempt(attempt_id, attempt_pods, observed_at, results)
-            except Exception:
+            except Exception as exc:
                 self.reconcile_failures_total += 1
-                LOGGER.exception("cannot reconcile attempt %s", attempt_id)
+                log_reconcile_failure(self, attempt_id, exc)
             self.note_progress()
         if attempt_filter is None:
             self._evict_pruned_attempts(grouped)
@@ -1013,9 +1014,9 @@ class KubernetesCompletionController:
                     self, attempt_id, result.terminal_event, observation
                 )
             self._last_observations[attempt_id] = observation
-        except (CompletionControllerError, ValueError):
+        except (CompletionControllerError, ValueError) as exc:
             self.reconcile_failures_total += 1
-            LOGGER.exception("cannot reconcile attempt %s", attempt_id)
+            log_reconcile_failure(self, attempt_id, exc)
             return
         if self.publish_observations:
             publish_attempt_observation(self, observation, attempt_id)

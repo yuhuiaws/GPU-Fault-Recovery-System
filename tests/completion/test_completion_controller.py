@@ -23,7 +23,25 @@ class FakeCoreApi:
         self.list_calls = 0
         self.pod_patches = []
         self.config_map_version = 1
-        self.config_map_data = {"active-attempts.json": "{}", "events.json": "[]"}
+        # One entry per real object: the write-ahead log and the routine attempt
+        # state live in separate ConfigMaps so routine state cannot fill the one
+        # a terminal event is written to (F6).
+        self.config_maps = {
+            "gpu-fault-completion-watcher-outbox": {"events.json": "[]"},
+            "gpu-fault-completion-watcher-outbox-active": {
+                "active-attempts.json": "{}"
+            },
+        }
+
+    @property
+    def config_map_data(self):
+        """Both objects merged, so a test can assert on either key."""
+
+        return {
+            key: value
+            for item in self.config_maps.values()
+            for key, value in item.items()
+        }
 
     def list_pod_for_all_namespaces(self, **_kwargs):
         self.list_calls += 1
@@ -35,16 +53,18 @@ class FakeCoreApi:
     def read_namespaced_pod_log(self, *_args, **_kwargs):
         return "training log line\n"
 
-    def read_namespaced_config_map(self, _name, _namespace):
+    def read_namespaced_config_map(self, name, _namespace):
+        assert name in self.config_maps, f"unexpected ConfigMap read: {name}"
         return {
             "metadata": {"resourceVersion": str(self.config_map_version)},
-            "data": dict(self.config_map_data),
+            "data": dict(self.config_maps[name]),
         }
 
-    def replace_namespaced_config_map(self, _name, _namespace, body):
+    def replace_namespaced_config_map(self, name, _namespace, body):
         assert body["metadata"]["resourceVersion"] == str(self.config_map_version)
+        assert name in self.config_maps, f"unexpected ConfigMap write: {name}"
         self.config_map_version += 1
-        self.config_map_data = dict(body["data"])
+        self.config_maps[name] = dict(body["data"])
 
 
 class FakeWatch:
