@@ -1463,3 +1463,44 @@ def test_the_expected_step_sequence_is_the_reset_contract() -> None:
     assert destr018.EXPECTED_STEPS.index(verdicts.RESET_STEP) == 4
     assert destr018.EXPECTED_STEPS.index(verdicts.COMPENSATION_STEP) == 5
     assert isinstance(destr018.parser(), argparse.ArgumentParser) is True
+
+
+def test_arm_holder_only_sends_flags_the_node_probe_actually_accepts(
+    tmp_path: Path,
+) -> None:
+    """Every holder subcommand the runner invokes must parse against the real
+    on-node probe contract. `holder-status` derives its device from persisted
+    state and defines only `--run-id`; passing `--device` made argparse reject
+    the call ("unrecognized arguments: --device") after arm-holder had already
+    succeeded (observed live 2026-09-08, attempt 6)."""
+    from types import SimpleNamespace
+
+    from scripts.e2e.regional.probes import destr018_node_probe as probe
+
+    probe_parser = probe.parser()
+    calls: list[tuple[str, ...]] = []
+
+    class _FakeHolder:
+        settings = SimpleNamespace(run_id="run-abc")
+        host_script = "/run/gpu-fault-host-probe-deadbeef01.py"
+
+        def execute(self, *arguments: str, timeout: int = 0) -> dict[str, Any]:
+            calls.append(arguments)
+            return {"device_clients": [{"pid": "1234", "comm": "holder"}]}
+
+    run = SimpleNamespace(
+        holder=_FakeHolder(),
+        settings=SimpleNamespace(hold_seconds=900),
+        run_id="drill-xyz",
+        case_dir=tmp_path,
+        holder_armed=False,
+    )
+
+    destr018._arm_holder(run, "/dev/nvidia0")
+
+    assert calls, "arm-holder was never invoked"
+    subcommands = {call[0] for call in calls}
+    assert {"arm-holder", "holder-status"} <= subcommands
+    for call in calls:
+        # Would raise SystemExit on an unrecognized flag, mirroring the pod.
+        probe_parser.parse_args(list(call))

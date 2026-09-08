@@ -696,8 +696,6 @@ def _arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
         "holder-status",
         "--run-id",
         run.holder.settings.run_id,
-        "--device",
-        device,
         timeout=60,
     )
     write_json_atomic(run.case_dir / "holder-status.json", status)
