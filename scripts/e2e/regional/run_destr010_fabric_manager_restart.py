@@ -12,10 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
-
 if __package__:
-    from .acceptance_runner_common import write_json_atomic
+    from .acceptance_runner_common import processor_queue_backlog, write_json_atomic
     from .host_probe_fixture import (
         HostProbeFixture,
         HostProbeSettings,
@@ -27,7 +25,7 @@ if __package__:
     )
     from .regional_live_fixture import run_case_main
 else:
-    from acceptance_runner_common import write_json_atomic
+    from acceptance_runner_common import processor_queue_backlog, write_json_atomic
     from host_probe_fixture import HostProbeFixture, HostProbeSettings
     from live_driver_guard import (
         CaseRunner,
