@@ -198,7 +198,10 @@ def test_manual_documents_safe_regional_reset_and_retirement() -> None:
         "gpu-fault-completion-watcher",
         "gpu-fault-kubernetes-node-resource-collector",
         "gpu-fault-node-installer-reconciler",
-        "gpu-fault-metrics-collector",
+        # `gpu-fault-metrics-collector` is a node systemd unit only; its
+        # in-cluster DaemonSet manifest was never deployed regionally and is
+        # gone, so the cleanup inventory no longer carries it. The node unit is
+        # removed by the installer's own uninstall path, not by a reset.
         "gpu-fault-dcgm-exporter",
     ):
         assert component in inventory, f"regional reset omits {component}"

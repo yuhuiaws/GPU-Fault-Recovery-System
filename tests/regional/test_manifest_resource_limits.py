@@ -82,7 +82,6 @@ def test_in_cluster_collectors_mount_writable_state_directory() -> None:
             checked.add(where)
 
     assert checked == {
-        "deploy/dataplane/gpu-metrics-collector.yaml:collector",
         ("deploy/dataplane/kubernetes-node-resource-collector.yaml:collector"),
         ("deploy/dataplane/optional/hma-cloudwatch-consumer.yaml:consumer"),
         "deploy/dataplane/optional/hma-watcher.yaml:watcher",

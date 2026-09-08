@@ -432,7 +432,6 @@ rules:
       - tools/generate_nvidia_xid_policy.py
       - scripts/render_xid_catalog_summary.py
       - deploy/dataplane/dcgm-counters.csv
-      - deploy/dataplane/gpu-metrics-collector.yaml
       - deploy/dataplane/hyperpod-dcgm-exporter.yaml
       - deploy/dataplane/kubernetes-node-resource-collector.yaml
       - deploy/dataplane/optional/**

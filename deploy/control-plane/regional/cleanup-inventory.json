@@ -276,14 +276,6 @@
       },
       {
         "kind": "daemonset",
-        "name": "gpu-fault-metrics-collector",
-        "scope": "namespaced",
-        "phase": "producer",
-        "order": 60,
-        "clean": "delete"
-      },
-      {
-        "kind": "daemonset",
         "name": "gpu-fault-dcgm-exporter",
         "scope": "namespaced",
         "phase": "producer",
