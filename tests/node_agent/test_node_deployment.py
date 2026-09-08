@@ -655,13 +655,75 @@ def test_kubernetes_hma_collector_is_disabled_by_default() -> None:
 
 
 def test_data_plane_collectors_tolerate_cordoned_nodes() -> None:
+    """A quarantined or cordoned node must still run the data plane.
+
+    The reconciler is included because it used to carry a bare
+    ``operator: Exists``: that tolerates ``not-ready`` and ``unreachable``
+    forever, so taint-based eviction never took the singleton off a dead node
+    and the Deployment -- seeing one Pod -- never rescheduled it until the Node
+    object itself was deleted.
+    """
+
     for manifest in (
         "completion-watcher.yaml",
         "kubernetes-node-resource-collector.yaml",
+        "node-installer-reconciler.yaml",
     ):
-        content = (ROOT / "deploy/dataplane" / manifest).read_text()
-        assert "gpu-fault.io/quarantined" in content
-        assert "node.kubernetes.io/unschedulable" in content
+        path = ROOT / "deploy/dataplane" / manifest
+        content = path.read_text()
+        assert "gpu-fault.io/quarantined" in content, manifest
+        assert "node.kubernetes.io/unschedulable" in content, manifest
+        for document in yaml.safe_load_all(content):
+            if not isinstance(document, dict) or document.get("kind") != "Deployment":
+                continue
+            spec = document["spec"]["template"]["spec"]
+            for toleration in spec.get("tolerations") or []:
+                assert set(toleration) != {"operator"}, (
+                    f"{manifest}: a bare `operator: Exists` tolerates every "
+                    "taint, including the two that exist to evict this Pod"
+                )
+
+
+def test_node_agent_stop_waits_out_the_longest_handler() -> None:
+    """SIGTERM must not SIGKILL a GPU reset in flight.
+
+    ``lifespan`` shuts the action pool down without waiting, so a stop or
+    restart during a handler leaves systemd's default 90 s as the only budget:
+    the running ``nvidia-smi --gpu-reset`` or driver install dies with the
+    cgroup and the ledger row is left INTERRUPTED, which then needs manual
+    confirmation. ``KillMode=mixed`` sends the SIGTERM to the main process only
+    so the handler's own child is not killed out from under it, and the timeout
+    matches the installer's own drain budget -- the two must not disagree,
+    because the installer waits before it stops the unit.
+    """
+
+    service = (ROOT / "deploy/systemd/gpu-fault-node-agent.service").read_text()
+    installer = NODE_SCRIPTS[0].read_text()
+
+    assert "TimeoutStopSec=1900" in service, (
+        "the agent must be given at least the longest handler timeout to finish"
+    )
+    assert "KillMode=mixed" in service, (
+        "the default control-group kill signals the handler's child process too"
+    )
+    assert 'NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"' in installer, (
+        "the installer's drain budget and the unit's TimeoutStopSec must agree"
+    )
+
+
+def test_kernel_collector_unit_declares_its_drain_budget() -> None:
+    """The kernel collector drains its queue on SIGTERM in about ten seconds.
+
+    Leaving the stop timeout implicit means the only documented budget is
+    systemd's 90 s default, which reads as "this unit may take a minute and a
+    half to stop" and hides a regression that makes the drain unbounded.
+    """
+
+    unit = (ROOT / "deploy/systemd/gpu-fault-kernel-collector.service").read_text()
+
+    assert "TimeoutStopSec=30" in unit, (
+        "the drain budget must be explicit, not systemd's 90 s default"
+    )
 
 
 def test_nvidia_smi_metrics_collector_is_disabled_by_default() -> None:
@@ -956,7 +1018,7 @@ def _run_verify(
         'while [[ "${1:-}" == -* ]]; do shift; done\n'
         'unit="${1:-}"\n'
         f'down="{down}"\n'
-        'for name in ${down}; do\n'
+        "for name in ${down}; do\n"
         '    if [[ "${unit}" == "${name}" ]]; then\n'
         '        case "${verb}" in\n'
         "        is-active|is-enabled) exit 3 ;;\n"
@@ -1058,8 +1120,7 @@ def test_verify_warns_on_gpu_health_and_still_fails_on_software_integrity(
     )
 
     assert stopped.returncode == 1, (
-        "an inactive collector unit must stay fatal: "
-        f"{stopped.stdout}{stopped.stderr}"
+        f"an inactive collector unit must stay fatal: {stopped.stdout}{stopped.stderr}"
     )
     assert "FAIL  metrics collector service" in stopped.stdout, stopped.stdout
     assert "WARN  GPU persistence mode" in stopped.stdout, stopped.stdout
@@ -1075,9 +1136,7 @@ def test_verify_fails_when_no_gpu_is_enumerated_at_all(tmp_path: Path) -> None:
     )
     assert "FAIL  NVIDIA GPU enumeration" in empty.stdout, empty.stdout
 
-    partial = _run_verify(
-        tmp_path / "partial", enumerated_gpus=7, enumeration_exit=255
-    )
+    partial = _run_verify(tmp_path / "partial", enumerated_gpus=7, enumeration_exit=255)
 
     assert partial.returncode == 0, (
         "a partial enumeration is the degraded case the Agent must reach: "
@@ -1097,7 +1156,7 @@ def test_verify_keeps_every_software_integrity_check_fatal() -> None:
     )
     for name in VERIFY_FATAL_NAMES:
         assert name in fatal, f"{name} must stay a fatal verifier check"
-    assert "exit \"${failed}\"" in verifier, (
+    assert 'exit "${failed}"' in verifier, (
         "the verifier exit code must still be driven by FAILs alone"
     )
 
@@ -1347,8 +1406,8 @@ def test_installer_treats_an_unreadable_ledger_as_in_flight(tmp_path: Path) -> N
     _write_stub(
         binaries,
         "sqlite3",
-        f'printf \'%s\\n\' "$*" >> {shlex.quote(str(argument_log))}\n'
-        f'if [[ -f {shlex.quote(str(tmp_path / "BUSY_MARKER"))} ]];'
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(argument_log))}\n"
+        f"if [[ -f {shlex.quote(str(tmp_path / 'BUSY_MARKER'))} ]];"
         " then exit 0; fi\n"
         "printf 'Error: database is locked\\n' >&2\n"
         "exit 1\n",
@@ -1385,7 +1444,7 @@ def test_installer_waits_for_an_in_flight_command_to_settle(tmp_path: Path) -> N
     _write_stub(
         binaries,
         "sqlite3",
-        f'marker={shlex.quote(str(tmp_path / "polled"))}\n'
+        f"marker={shlex.quote(str(tmp_path / 'polled'))}\n"
         'if [[ -f "${marker}" ]]; then exit 0; fi\n'
         'printf served > "${marker}"\n'
         "printf 'cmd-slow\\n'\n",
@@ -1394,11 +1453,7 @@ def test_installer_waits_for_an_in_flight_command_to_settle(tmp_path: Path) -> N
     _ledger_with_state(database, IN_PROGRESS_STATE)
 
     result = _drain(
-        probe,
-        database,
-        sqlite_command=str(binaries / "sqlite3"),
-        timeout=5,
-        poll=1,
+        probe, database, sqlite_command=str(binaries / "sqlite3"), timeout=5, poll=1
     )
 
     assert "waiting for in-flight node actions: cmd-slow" in result.stdout, (
@@ -1568,7 +1623,7 @@ def _preflight_enumeration_probe(target: Path) -> Path:
     probe.write_text(
         "set -euo pipefail\n"
         "die() { printf 'DIE: %s\\n' \"$*\"; exit 1; }\n"
-        "host_shell() { /bin/bash -ceu \"$1\"; }\n"
+        'host_shell() { /bin/bash -ceu "$1"; }\n'
         f"{preflight[start:end]}\n"
         "printf 'PREFLIGHT_CONTINUED\\n'\n",
         encoding="utf-8",
@@ -1617,8 +1672,7 @@ def test_preflight_blocks_only_a_node_with_no_enumerable_gpu(tmp_path: Path) -> 
         f"a partial enumeration must not block the rollout: {degraded.stdout}"
     )
     assert (
-        "WARN  NVIDIA GPU enumeration (only 7 GPU(s) are enumerable)"
-        in degraded.stdout
+        "WARN  NVIDIA GPU enumeration (only 7 GPU(s) are enumerable)" in degraded.stdout
     ), degraded.stdout
     assert "PREFLIGHT_CONTINUED" in degraded.stdout, degraded.stdout
 

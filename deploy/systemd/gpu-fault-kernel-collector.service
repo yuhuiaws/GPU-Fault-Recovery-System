@@ -9,6 +9,11 @@ EnvironmentFile=/etc/gpu-fault/collector.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector kernel
 Restart=always
 RestartSec=5
+# The collector drains its pending queue to the outbox on SIGTERM and that
+# is bounded at about ten seconds. Stating the budget keeps systemd's 90 s
+# default from standing in for it: a drain that stops being bounded would
+# otherwise look like a slow but healthy stop.
+TimeoutStopSec=30
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

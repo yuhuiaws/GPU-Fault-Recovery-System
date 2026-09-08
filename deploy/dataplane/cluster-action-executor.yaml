@@ -84,6 +84,12 @@ spec:
         app: gpu-fault-cluster-executor
     spec:
       serviceAccountName: gpu-fault-cluster-executor
+      # The executor handles SIGTERM itself: it stops claiming and finishes the
+      # batch it already holds. The kubelet's 30 s default cut that short and
+      # SIGKILLed it mid-command, which leaves the claim to expire and the step
+      # to be retried by another replica. No preStop hook -- the process, not a
+      # sleep, decides when it is done.
+      terminationGracePeriodSeconds: 60
       tolerations:
         - key: gpu-fault.io/quarantined
           operator: Exists

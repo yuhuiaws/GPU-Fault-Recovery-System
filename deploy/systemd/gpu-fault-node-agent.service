@@ -9,6 +9,20 @@ EnvironmentFile=/etc/gpu-fault/node-agent.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-node-agent
 Restart=always
 RestartSec=5
+# `lifespan` shuts the action pool down without waiting, so a stop or a
+# restart in the middle of a handler leaves systemd's default 90 s as the
+# only budget: the running `nvidia-smi --gpu-reset` or driver install dies
+# with the cgroup and the ledger row stays INTERRUPTED, which needs manual
+# confirmation before the node can be used again. 1900 s clears the longest
+# handler timeout the agent accepts, and matches
+# NODE_AGENT_STOP_TIMEOUT_SECONDS in
+# deploy/node/install-gpu-fault-collector.sh -- the installer must not give
+# up on an in-flight command earlier than systemd would.
+TimeoutStopSec=1900
+# mixed, not the default control-group: SIGTERM goes to the agent alone so
+# the subprocess a handler is waiting on is not killed out from under it.
+# SIGKILL at the end of the timeout still covers the whole cgroup.
+KillMode=mixed
 # The agent writes one structured INFO line per command accept/start/
 # completion (command_id, incident_id, operation, attempt, status, duration).
 # Keep them in the journal, unfiltered, under a stable identifier:
