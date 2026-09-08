@@ -1357,3 +1357,14 @@ def test_configure_bounds_the_reboot_delay_and_the_device_hold() -> None:
         )
         with pytest.raises(RegionalFixtureError):
             destr017.configure(arguments)
+
+
+def test_the_holder_is_armed_with_the_host_path_of_the_probe_script() -> None:
+    """The arm unit runs on the node; /host is the Pod's mount, not the host's.
+    Live, the unit died with "can't open file '/host/run/...'" and nothing held."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/e2e/regional/run_destr017_out_of_band_reboot_fence.py"
+    ).read_text(encoding="utf-8")
+    assert "/host/run/gpu-fault-host-probe-" not in source, "pod-side path leaked"
+    assert "run.fence.host_script" in source, "arm-holder must receive host_script"

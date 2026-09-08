@@ -740,7 +740,9 @@ def _start_probes(run: _LiveRun) -> None:
         "--run-id",
         run.run_id,
         "--probe-script",
-        f"/host/run/gpu-fault-host-probe-{run.fence.pod.rsplit('-', 1)[-1]}.py",
+        # The host path: the transient unit runs on the node, where /host does
+        # not exist (live: "can't open file '/host/run/...'" and no holder).
+        run.fence.host_script,
         timeout=180,
     )
     run.holder_armed = True
