@@ -723,6 +723,32 @@ def reconcile_plan_errors(
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
+# The only incident state that means "this fault is over". A recent XID whose
+# incident has RECOVERED is residue from a prior drill on an idle node, not an
+# unhandled fault; a fresh drill correlates its own new event and is unaffected.
+RESOLVED_INCIDENT_STATES = frozenset({"RECOVERED"})
+
+
+def recent_unresolved_xid_events(
+    event: dict[str, Any] | None,
+    incident: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """The recent XID events a fresh drill must refuse to start over.
+
+    An uncorrelated recent XID (no incident) is a genuine unhandled fault and
+    blocks the drill. An event whose incident has already RECOVERED does not:
+    it is left-over evidence from an earlier attempt on the same idle node,
+    and blocking on it would wedge the campaign for the full lookback window
+    every time a drill that reboots the node had to be retried.
+    """
+
+    if not event:
+        return []
+    if incident and str(incident.get("state")) in RESOLVED_INCIDENT_STATES:
+        return []
+    return [event]
+
+
 def preflight_errors(
     *,
     node: str,

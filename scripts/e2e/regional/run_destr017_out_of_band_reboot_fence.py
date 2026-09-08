@@ -63,6 +63,7 @@ from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     lifetime_errors,
     preflight_errors,
     reboot_window_errors,
+    recent_unresolved_xid_events,
     reconcile_plan_errors,
     reset_journal_errors,
     schedulability_errors,
@@ -519,7 +520,9 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         business_workloads=regional.business_workloads(settings.node),
         queue=state.get("queue") or {},
         remote_commands=state.get("remote_commands") or {},
-        recent_events=[state["event"]] if state.get("event") else [],
+        recent_events=recent_unresolved_xid_events(
+            state.get("event"), state.get("incident")
+        ),
         host_snapshot=host_snapshot,
         reboot_status=reboot_state,
         expected_gpu_count=EXPECTED_GPU_COUNT,

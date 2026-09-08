@@ -1112,6 +1112,20 @@ def test_the_preflight_refuses_a_busy_control_plane_or_a_recent_event() -> None:
     assert len(errors) == 3, errors
 
 
+def test_a_recent_xid_from_a_recovered_incident_does_not_block_a_rerun() -> None:
+    """A drill that reboots the node leaves its XID behind for the full lookback
+    window; once the incident has RECOVERED, that residue must not wedge the
+    retry, but an uncorrelated or still-active event still must."""
+
+    event = {"event_id": "evt-xid-46"}
+    assert verdicts.recent_unresolved_xid_events(event, {"state": "RECOVERED"}) == []
+    assert verdicts.recent_unresolved_xid_events(event, {"state": "QUARANTINED"}) == [
+        event
+    ]
+    assert verdicts.recent_unresolved_xid_events(event, None) == [event]
+    assert verdicts.recent_unresolved_xid_events(None, {"state": "RECOVERED"}) == []
+
+
 # --------------------------------------------------------------------------- #
 # Timeline and arithmetic
 # --------------------------------------------------------------------------- #
