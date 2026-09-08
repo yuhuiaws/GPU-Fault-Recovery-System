@@ -71,12 +71,16 @@ HANDOFF_PARAMETER = "preemption_quiesce_handoff_after_reboot"
 BARRIER_OPERATION = "VERIFY_NO_GPU_CLIENTS"
 FORBIDDEN_LEDGER_OPERATIONS = ("RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES")
 # Node Agent operations the node must advertise before the case starts.
+# Node Agent operations the case dispatches to the node. VALIDATE_GPU is not
+# one of them: it runs through the GPU_VALIDATION adapter, so an Agent's
+# allowed_operations never lists it (live 2026-09-08, the preflight refused
+# every node for that reason).
 AGENT_OPERATIONS = (
     "QUIESCE_GPU_SERVICES",
     "VERIFY_NO_GPU_CLIENTS",
     "RESTORE_GPU_SERVICES",
-    "VALIDATE_GPU",
 )
+VALIDATION_OPERATION = "VALIDATE_GPU"
 RESET_ACTION = "RESET_GPU"
 REBOOT_ACTION = "RESTART_NODE"
 FIRST_XID = 46
