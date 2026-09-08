@@ -86,14 +86,6 @@ def _read_boot_id() -> str:
         return "unknown-boot"
 
 
-def _setting(value: int | None, name: str, default: int) -> int:
-    """A limit from the constructor, the environment, or the reviewed default."""
-
-    if value is not None:
-        return value
-    return int(os.getenv(f"GPU_FAULT_NODE_LOG_{name}", str(default)))
-
-
 def _stderr_detail(stderr: str | None) -> str:
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
     if not lines:
@@ -367,16 +359,30 @@ class NodeLogCollector:
         self._journal_timed_out = False
         self._cold_start_reason: str | None = "no state was loaded"
         self.state_path = Path(state_path) if state_path else None
-        self.initial_tail_bytes = _setting(initial_tail_bytes, "INITIAL_TAIL_BYTES", 0)
+        self.initial_tail_bytes = (
+            initial_tail_bytes
+            if initial_tail_bytes is not None
+            else int(os.getenv("GPU_FAULT_NODE_LOG_INITIAL_TAIL_BYTES", "0"))
+        )
         if self.initial_tail_bytes < 0:
             raise ValueError("node log initial tail bytes must be non-negative")
-        self.max_entries_per_batch = _setting(
-            max_entries_per_batch, "MAX_ENTRIES_PER_BATCH", 1000
+        self.max_entries_per_batch = (
+            max_entries_per_batch
+            if max_entries_per_batch is not None
+            else int(os.getenv("GPU_FAULT_NODE_LOG_MAX_ENTRIES_PER_BATCH", "1000"))
         )
-        self.max_batch_bytes = _setting(
-            max_batch_bytes, "MAX_BATCH_BYTES", 4 * 1024 * 1024
+        self.max_batch_bytes = (
+            max_batch_bytes
+            if max_batch_bytes is not None
+            else int(
+                os.getenv("GPU_FAULT_NODE_LOG_MAX_BATCH_BYTES", str(4 * 1024 * 1024))
+            )
         )
-        self.max_entry_bytes = _setting(max_entry_bytes, "MAX_ENTRY_BYTES", 64 * 1024)
+        self.max_entry_bytes = (
+            max_entry_bytes
+            if max_entry_bytes is not None
+            else int(os.getenv("GPU_FAULT_NODE_LOG_MAX_ENTRY_BYTES", str(64 * 1024)))
+        )
         if (
             self.max_entries_per_batch < 1
             or self.max_batch_bytes < 1024
@@ -386,7 +392,11 @@ class NodeLogCollector:
             raise ValueError("invalid node log batch limits")
         # How many neighbouring lines to keep around a matched one (see
         # ``_with_context``).
-        self.context_lines = _setting(context_lines, "CONTEXT_LINES", 2)
+        self.context_lines = (
+            context_lines
+            if context_lines is not None
+            else int(os.getenv("GPU_FAULT_NODE_LOG_CONTEXT_LINES", "2"))
+        )
         if self.context_lines < 0:
             raise ValueError("node log context lines must be non-negative")
         # What one poll may read from one source before it stops and leaves the
@@ -410,13 +420,17 @@ class NodeLogCollector:
         # `collection_errors` is carried in every batch until the node recovers,
         # so a node with a thousand rotating training logs would post a thousand
         # strings per poll. The count that was suppressed is reported instead.
-        self.max_collection_errors = _setting(None, "MAX_COLLECTION_ERRORS", 20)
+        self.max_collection_errors = int(
+            os.getenv("GPU_FAULT_NODE_LOG_MAX_COLLECTION_ERRORS", "20")
+        )
         if self.max_collection_errors < 1:
             raise ValueError("node log collection error limit must be at least 1")
         # The offset table is persisted, so a glob over dated filenames grows it
         # forever: months of `train-2026-*.log` stay in the state file long after
         # the files are gone.
-        self.max_tracked_files = _setting(None, "MAX_TRACKED_FILES", 512)
+        self.max_tracked_files = int(
+            os.getenv("GPU_FAULT_NODE_LOG_MAX_TRACKED_FILES", "512")
+        )
         if self.max_tracked_files < 1:
             raise ValueError("node log tracked file limit must be at least 1")
         self.excluded_units = excluded_journal_units()
@@ -424,8 +438,8 @@ class NodeLogCollector:
         # the cursor pinned while journalctl is down is what stops silent loss,
         # but an unbounded window is its own failure: this caps it and says in
         # `collection_errors` exactly which span was given up on.
-        self.max_journal_window_seconds = _setting(
-            None, "MAX_JOURNAL_WINDOW_SECONDS", 900
+        self.max_journal_window_seconds = int(
+            os.getenv("GPU_FAULT_NODE_LOG_MAX_JOURNAL_WINDOW_SECONDS", "900")
         )
         if self.max_journal_window_seconds < 60:
             raise ValueError("node log journal window must be at least 60 seconds")
@@ -439,7 +453,9 @@ class NodeLogCollector:
             record_error=self._record_collection_error,
         )
         self._load_state()
-        self.health_summary_seconds = _setting(None, "HEALTH_SUMMARY_SECONDS", 300)
+        self.health_summary_seconds = int(
+            os.getenv("GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS", "300")
+        )
         self._next_health_summary = next_stable_phase(
             self.now(),
             cluster_id=self.context.cluster_id,
