@@ -10,7 +10,6 @@
   "tests/app_services/test_periodic_reconciliation_jobs.py:runner._JOBS": 1,
   "tests/app_services/test_periodic_reconciliation_jobs.py:runner._run_counter_drift": 3,
   "tests/app_services/test_periodic_reconciliation_jobs.py:runner._run_lease_reclaim": 3,
-  "tests/app_services/test_periodic_reconciliation_jobs.py:runner._run_pending_triage": 2,
   "tests/app_services/test_periodic_runner_isolation.py:runner._due": 1,
   "tests/app_services/test_request_deadline_clamp.py:AdmissionRuntimeFactory._bounded_endpoint": 1,
   "tests/app_services/test_request_deadline_clamp.py:batcher._expire_locked": 1,

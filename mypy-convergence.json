@@ -1,6 +1,6 @@
 {
   "src/gpu_fault/store": {
-    "ceiling": 286,
+    "ceiling": 284,
     "priority": 1,
     "why": "store mixins: dict-shaped rows read back as Any; the _get()->Any design relies on caller casts that never spread"
   },
@@ -10,7 +10,7 @@
     "why": "plan/family builders: type-arg on nested dicts is where a wrong plan shape hides"
   },
   "src/gpu_fault/app": {
-    "ceiling": 312,
+    "ceiling": 310,
     "priority": 3,
     "why": "route handlers and ingest: no-any-return on request bodies is the boundary that swallows bad payloads"
   },
