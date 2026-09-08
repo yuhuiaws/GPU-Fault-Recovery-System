@@ -48,6 +48,39 @@ def is_retryable_delivery_status(status_code: int | None) -> bool:
 #: token is per workflow, not per cluster.
 AUTH_TRANSIENT_STATUSES = frozenset({401, 403})
 
+#: Upper bound on a ``Retry-After`` the client will honour. Any proxy or load
+#: balancer between a node and the control plane can answer 429 with an hour,
+#: and a collector that sleeps that long inside ``post()`` stops reading its
+#: source (a live 429 with ``Retry-After: 3600`` made ``post`` sleep 3600 s).
+#: Past the cap the record is buffered and replayed instead of held in memory.
+RETRY_AFTER_CAP_SECONDS = 30.0
+
+#: Payload fields that already identify one event, in preference order. The
+#: value becomes the ``Idempotency-Key`` the control plane dedupes on, and it
+#: is also what makes a request safe for the transport pool to retry on a
+#: stale keep-alive connection. A payload with none of them gets one attempt.
+IDEMPOTENCY_ID_FIELDS = (
+    "event_id",
+    "request_id",
+    "batch_id",
+    "observation_id",
+    "summary_id",
+    "record_id",
+    # gpu-inventory snapshots and CloudWatch HMA log events used to fall
+    # through to the single-attempt path, so every idle-closed connection
+    # sent them straight to the outbox with no server-side dedup key.
+    "snapshot_id",
+    "log_event_id",
+)
+
+#: Timestamp fields that make an ``attempt_id`` unique for one observation.
+_IDEMPOTENCY_TIME_FIELDS = ("observed_at", "detected_at", "ended_at")
+
+#: Body headers a bodiless receipt GET must not carry.
+_RECEIPT_GET_STRIPPED_HEADERS = frozenset(
+    {"content-type", "content-encoding", "idempotency-key"}
+)
+
 
 def is_retryable_collector_status(status_code: int | None) -> bool:
     """Whether a collector may try the same event again later.
@@ -79,6 +112,57 @@ class CollectorError(RuntimeError):
 
 class EventSink(Protocol):
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+def event_idempotency_key(payload: dict[str, Any]) -> str | None:
+    """The stable id of one event, or ``None`` if the payload carries none.
+
+    One derivation shared by the request header and the operator-facing log
+    line, so a record named in a warning is the record the control plane
+    deduped on.
+    """
+
+    for name in IDEMPOTENCY_ID_FIELDS:
+        if payload.get(name):
+            return str(payload[name])
+    if payload.get("attempt_id"):
+        event_time = next(
+            (payload[name] for name in _IDEMPOTENCY_TIME_FIELDS if payload.get(name)),
+            None,
+        )
+        if event_time is not None:
+            return f"{payload['attempt_id']}/{event_time}"
+    # An HMA node event carries no id field of its own; the Kubernetes object's
+    # name plus its ``resourceVersion`` names exactly one observed revision.
+    node = payload.get("node")
+    metadata = node.get("metadata") if isinstance(node, dict) else None
+    if isinstance(metadata, dict):
+        node_name = metadata.get("name")
+        resource_version = metadata.get("resourceVersion")
+        if node_name and resource_version:
+            return f"node/{node_name}/{resource_version}"
+    return None
+
+
+def _parse_json_body(body: bytes, status: int) -> Any:
+    """Decode a control-plane body, or fail as a delivery verdict.
+
+    A proxy that answers 2xx with an HTML maintenance page used to raise
+    ``json.JSONDecodeError`` -- a ``ValueError``, not a ``CollectorError``, so
+    it escaped :func:`deliver_event` and tore the kernel collector's
+    ``/dev/kmsg`` reader down mid-batch (ARCH-G4).
+    """
+
+    if not body:
+        return {}
+    try:
+        return json.loads(body)
+    except ValueError as exc:
+        excerpt = body[:120].decode("utf-8", errors="replace")
+        raise CollectorError(
+            f"control-plane returned a non-JSON body with HTTP {status}: {excerpt!r}",
+            status_code=status,
+        ) from exc
 
 
 class DeliveryStatus(StrEnum):
@@ -154,6 +238,36 @@ def deliver_event(
     except CollectorError as exc:
         return _result_for_error(exc)
     return DeliveryResult(DeliveryStatus.DELIVERED, response=response)
+
+
+def deliver_or_raise(
+    sink: EventSink,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    logger: logging.Logger,
+    what: str,
+) -> DeliveryResult:
+    """:func:`deliver_event` plus the one reaction every collector shares.
+
+    ``FAILED`` re-raises the sink's error, so a caller that pins a cursor on
+    an exception keeps doing so. ``BUFFERED`` is a delivery for the caller's
+    purposes but not silent: it logs one warning naming ``what``, the event's
+    id and the transport error, which is the only place an operator learns
+    that a node is running on its durable outbox.
+    """
+
+    result = deliver_event(sink, path, payload)
+    result.raise_for_failure()
+    if result.buffered:
+        logger.warning(
+            "%s could not be delivered live and was persisted to the collector "
+            "outbox (id=%s): %s",
+            what,
+            event_idempotency_key(payload) or "unkeyed",
+            result.error,
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -248,6 +362,58 @@ class _OutboxReplayResult:
     attempted: int = 0
     delivered: int = 0
     replayable_remaining: int = 0
+
+
+#: Identity of one buffered record: path, when it was buffered and its payload.
+#: Used to reconcile a replay's outcome with a file another writer may have
+#: appended to while the replay's requests were in flight, because a record's
+#: position is not stable across a concurrent append or eviction.
+_OutboxRecordKey = tuple[str, str, str]
+
+
+def _outbox_record_key(record: dict[str, Any]) -> _OutboxRecordKey:
+    return (
+        str(record.get("path")),
+        str(record.get("failed_at")),
+        json.dumps(
+            record.get("payload"),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
+def _apply_replay_outcome(
+    records: list[dict[str, Any]],
+    removals: list[_OutboxRecordKey],
+    updates: list[tuple[_OutboxRecordKey, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Drop the delivered records and re-stamp the failed ones, in file order.
+
+    Anything not named by ``removals``/``updates`` is kept verbatim, which is
+    how a record buffered while the replay was in flight survives the rewrite.
+    Counts are honoured rather than keys alone so two identical records are
+    not both dropped for one delivery.
+    """
+
+    remaining_removals: dict[_OutboxRecordKey, int] = {}
+    for key in removals:
+        remaining_removals[key] = remaining_removals.get(key, 0) + 1
+    pending_updates: dict[_OutboxRecordKey, list[dict[str, Any]]] = {}
+    for key, update in updates:
+        pending_updates.setdefault(key, []).append(update)
+    kept: list[dict[str, Any]] = []
+    for record in records:
+        key = _outbox_record_key(record)
+        if remaining_removals.get(key):
+            remaining_removals[key] -= 1
+            continue
+        queued = pending_updates.get(key)
+        if queued:
+            record.update(queued.pop(0))
+        kept.append(record)
+    return kept
 
 
 class HttpEventSink:
@@ -406,6 +572,21 @@ class HttpEventSink:
             self._outbox_replay_requested = False
         try:
             outcome = self._replay_outbox()
+        except OSError:
+            # Catch-up work that could not be persisted is not a verdict on
+            # the event that just went out: the live post already succeeded.
+            # A full ``/var/lib`` used to raise ``OSError`` out of ``post()``
+            # and ``deliver()``, which reopened ``/dev/kmsg`` and dropped
+            # everything written in between (ARCH-G4). The next successful
+            # post kicks a fresh replay.
+            LOGGER.exception(
+                "cannot rewrite the collector outbox after replay (path=%s)",
+                self.outbox_path,
+            )
+            with self._outbox_replay_state_lock:
+                self._outbox_replay_active = False
+                self._outbox_replay_thread = None
+            return
         except Exception:
             with self._outbox_replay_state_lock:
                 self._outbox_replay_active = False
@@ -465,36 +646,7 @@ class HttpEventSink:
             "Content-Type": "application/json",
             "User-Agent": f"gpu-fault-collector/{__version__}",
         }
-        idempotency_key = next(
-            (
-                str(payload[name])
-                for name in (
-                    "event_id",
-                    "request_id",
-                    "batch_id",
-                    "observation_id",
-                    "summary_id",
-                    "record_id",
-                )
-                if payload.get(name)
-            ),
-            None,
-        )
-        if idempotency_key is None and payload.get("attempt_id"):
-            event_time = next(
-                (
-                    payload[name]
-                    for name in (
-                        "observed_at",
-                        "detected_at",
-                        "ended_at",
-                    )
-                    if payload.get(name)
-                ),
-                None,
-            )
-            if event_time is not None:
-                idempotency_key = f"{payload['attempt_id']}/{event_time}"
+        idempotency_key = event_idempotency_key(payload)
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         if len(body) >= self.gzip_min_bytes:
@@ -521,9 +673,10 @@ class HttpEventSink:
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     result = response.read()
-                    parsed = json.loads(result) if result else {}
+                    status = int(getattr(response, "status", 200))
+                    parsed: dict[str, Any] = _parse_json_body(result, status)
                     if (
-                        getattr(response, "status", 200) == 202
+                        status == 202
                         and isinstance(parsed, dict)
                         and parsed.get("processor_request_id")
                         and self._requires_processor_receipt(path)
@@ -560,7 +713,12 @@ class HttpEventSink:
             if attempt < attempts:
                 backoff = min(2 ** (attempt - 1), 8)
                 if retry_after > 0:
-                    delay = retry_after + self.jitter(0.0, min(backoff, 1.0))
+                    # Cap first, then jitter: the cap bounds how long a
+                    # collector stops reading its source, and the jitter still
+                    # spreads a fleet-wide 429 across nodes.
+                    delay = min(retry_after, RETRY_AFTER_CAP_SECONDS) + self.jitter(
+                        0.0, min(backoff, 1.0)
+                    )
                 else:
                     delay = self.jitter(0.0, backoff)
                 self.sleep(delay)
@@ -595,24 +753,42 @@ class HttpEventSink:
         status_url = accepted.get("status_url")
         if not isinstance(status_url, str) or not status_url:
             status_url = f"/v1/processor/requests/{accepted['processor_request_id']}"
+        # The GET carries no body, so the POST's ``Content-Type``,
+        # ``Content-Encoding: gzip`` and ``Idempotency-Key`` describe nothing:
+        # authentication and cluster routing headers are all it needs.
+        get_headers = {
+            name: value
+            for name, value in headers.items()
+            if name.lower() not in _RECEIPT_GET_STRIPPED_HEADERS
+        }
         deadline = time.monotonic() + self.processor_receipt_timeout_seconds
         delay = self.processor_receipt_poll_seconds
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             request = Request(
                 f"{self.base_url}{status_url}",
-                headers=headers,
+                headers=get_headers,
                 method="GET",
             )
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     payload = response.read()
-                    if getattr(response, "status", 200) == 202:
+                    status = int(getattr(response, "status", 200))
+                    if status == 202:
                         self.sleep(delay)
                         delay = min(delay * 2, 2.0)
                         continue
-                    return json.loads(payload) if payload else {}
+                    receipt: dict[str, Any] = _parse_json_body(payload, status)
+                    return receipt
             except HTTPError as exc:
+                if is_retryable_collector_status(exc.code):
+                    # The 202 was accepted; a 503 from the store or a 429 on
+                    # the status route says "ask again", not that the request
+                    # failed. Polling stays bounded by the same deadline.
+                    last_error = exc
+                    self.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+                    continue
                 detail = exc.read().decode(errors="replace")
                 raise CollectorError(
                     f"processor request completed with HTTP {exc.code}: {detail}",
@@ -679,62 +855,85 @@ class HttpEventSink:
         OutboxFile(self.outbox_path).write(records)
 
     def _replay_outbox(self) -> _OutboxReplayResult:
+        """Deliver one batch of buffered records, then reconcile the file.
+
+        The file is read under ``_outbox_lock``, every request is made with
+        the lock released, and the outcome is applied to a *fresh* read under
+        the lock again. Holding the lock across the network meant a live post
+        that failed in the collector thread waited for the whole replay budget
+        plus one in-flight client timeout before it could buffer (F13); the
+        re-read is what keeps that concurrent ``_buffer_event`` from being
+        overwritten by a rewrite built from a stale snapshot.
+        """
+
         if self.outbox_path is None:
             return _OutboxReplayResult()
         with self._outbox_lock:
             records = self._read_outbox()
-            if not records:
-                return _OutboxReplayResult()
-            kept = []
-            attempted = 0
-            delivered = 0
-            deadline = time.monotonic() + self.outbox_replay_budget_seconds
-            for record in records:
+        if not records:
+            return _OutboxReplayResult()
+        attempted = 0
+        delivered = 0
+        removals: list[_OutboxRecordKey] = []
+        updates: list[tuple[_OutboxRecordKey, dict[str, Any]]] = []
+        deadline = time.monotonic() + self.outbox_replay_budget_seconds
+        for record in records:
+            if (
+                not record.get("replayable")
+                or attempted >= self.outbox_replay_batch_size
+                or time.monotonic() >= deadline
+            ):
+                continue
+            key = _outbox_record_key(record)
+            try:
+                # One attempt and no receipt poll: a record that
+                # cannot go through right now stays in the outbox
+                # for the next cycle, which is cheaper than
+                # spending the retry ladder plus a 120s receipt
+                # wait on it while fresh events pile up behind.
+                self._post_with_retry(
+                    str(record["path"]),
+                    dict(record["payload"]),
+                    buffer_failure=False,
+                    max_attempts=1,
+                    poll_receipt=False,
+                )
+            except Exception as exc:
+                update: dict[str, Any] = {"error": f"{type(exc).__name__}: {exc}"[:500]}
+                status = getattr(exc, "status_code", None)
                 if (
-                    not record.get("replayable")
-                    or attempted >= self.outbox_replay_batch_size
-                    or time.monotonic() >= deadline
+                    isinstance(exc, CollectorError)
+                    and isinstance(status, int)
+                    and 400 <= status < 500
+                    and not is_retryable_collector_status(status)
                 ):
-                    kept.append(record)
-                    continue
-                try:
-                    # One attempt and no receipt poll: a record that
-                    # cannot go through right now stays in the outbox
-                    # for the next cycle, which is cheaper than
-                    # spending the retry ladder plus a 120s receipt
-                    # wait on it while fresh events pile up behind.
-                    self._post_with_retry(
-                        str(record["path"]),
-                        dict(record["payload"]),
-                        buffer_failure=False,
-                        max_attempts=1,
-                        poll_receipt=False,
+                    # A verdict on the record itself (ARCH-G2): keeping it
+                    # replayable let ten poisoned heads fill every replay
+                    # window forever. It stays in the file, dead, for
+                    # ``gpu-fault-collector outbox`` to inspect or requeue.
+                    update["replayable"] = False
+                    LOGGER.warning(
+                        "collector outbox record dead-lettered at replay: "
+                        "path=%s status=%s failed_at=%s",
+                        record.get("path"),
+                        status,
+                        record.get("failed_at"),
                     )
-                except Exception as exc:
-                    record["error"] = f"{type(exc).__name__}: {exc}"[:500]
-                    status = getattr(exc, "status_code", None)
-                    if (
-                        isinstance(exc, CollectorError)
-                        and isinstance(status, int)
-                        and 400 <= status < 500
-                        and not is_retryable_collector_status(status)
-                    ):
-                        # A verdict on the record itself (ARCH-G2): keeping it
-                        # replayable let ten poisoned heads fill every replay
-                        # window forever. It stays in the file, dead, for
-                        # ``gpu-fault-collector outbox`` to inspect or requeue.
-                        record["replayable"] = False
-                        LOGGER.warning(
-                            "collector outbox record dead-lettered at replay: "
-                            "path=%s status=%s failed_at=%s",
-                            record.get("path"),
-                            status,
-                            record.get("failed_at"),
-                        )
-                    kept.append(record)
-                else:
-                    delivered += 1
-                attempted += 1
+                updates.append((key, update))
+            else:
+                delivered += 1
+                removals.append(key)
+            attempted += 1
+        if not removals and not updates:
+            # Nothing was attempted (all dead, or the budget was already
+            # spent), so the file on disk is still correct as it stands.
+            return _OutboxReplayResult(
+                replayable_remaining=sum(
+                    1 for record in records if record.get("replayable")
+                )
+            )
+        with self._outbox_lock:
+            kept = _apply_replay_outcome(self._read_outbox(), removals, updates)
             replayable_remaining = sum(1 for record in kept if record.get("replayable"))
             if attempted:
                 LOGGER.info(
@@ -746,11 +945,11 @@ class HttpEventSink:
                     len(kept),
                 )
             self._write_outbox(kept)
-            return _OutboxReplayResult(
-                attempted=attempted,
-                delivered=delivered,
-                replayable_remaining=replayable_remaining,
-            )
+        return _OutboxReplayResult(
+            attempted=attempted,
+            delivered=delivered,
+            replayable_remaining=replayable_remaining,
+        )
 
 
 class SqsEventSink:

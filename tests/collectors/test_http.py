@@ -541,3 +541,238 @@ def test_sqs_sink_and_consumer_private_delivery() -> None:
     assert delivered == 1
     assert sink.requests[0][1]["node_id"] == "worker-1"
     assert sqs.deleted == ["receipt-1"]
+
+
+def test_non_json_2xx_is_a_collector_error(monkeypatch) -> None:
+    """F10: a proxy's HTML error page behind a 2xx must be a delivery verdict.
+
+    ``json.JSONDecodeError`` is a ``ValueError``, so it escaped
+    ``deliver_event`` (which only maps ``CollectorError``) and tore down the
+    kernel collector's ``/dev/kmsg`` reader mid-batch.
+    """
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"<html>gateway maintenance</html>"
+
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen", lambda *_args, **_kwargs: Response()
+    )
+    sink = HttpEventSink("https://control", max_attempts=1)
+
+    with pytest.raises(CollectorError) as captured:
+        sink.post("/v1/collector-events/kernel", {"cluster_id": "c", "event_id": "e-1"})
+
+    assert captured.value.status_code == 200, "the 2xx status was not carried"
+    assert not isinstance(captured.value, json.JSONDecodeError), (
+        "a raw JSON decode error still escapes the sink"
+    )
+
+
+def test_http_event_sink_caps_retry_after(monkeypatch) -> None:
+    """F6: an ALB may answer 429 with ``Retry-After: 3600``."""
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"accepted":true}'
+
+    def urlopen_with_throttle(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            from email.message import Message
+            from urllib.error import HTTPError
+
+            headers = Message()
+            headers["Retry-After"] = "3600"
+            raise HTTPError("https://control/collector", 429, "busy", headers, None)
+        return Response()
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_with_throttle)
+    sink = HttpEventSink(
+        "https://control",
+        sleep=sleeps.append,
+        jitter=lambda low, high: (low + high) / 2,
+    )
+
+    result = sink.post(
+        "/v1/collector-events/gpu-metrics",
+        {"cluster_id": "cluster-a", "batch_id": "batch-a"},
+    )
+
+    assert result == {"accepted": True}, result
+    assert sleeps == [30.5], "Retry-After was not capped before the jitter was added"
+    assert sleeps[0] >= 30, "the cap must still back the retry off"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_key"),
+    [
+        ({"snapshot_id": "snap-1"}, "snap-1"),
+        ({"log_event_id": "cw-1"}, "cw-1"),
+        (
+            {"node": {"metadata": {"name": "worker-1", "resourceVersion": "42"}}},
+            "node/worker-1/42",
+        ),
+    ],
+    ids=["gpu-inventory-snapshot", "cloudwatch-log-event", "hma-node-event"],
+)
+def test_http_event_sink_retries_every_keyed_collector_payload(
+    monkeypatch, payload, expected_key
+) -> None:
+    """F5: without a key these paths got one attempt and no pool retry."""
+
+    attempts = 0
+    keys = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"accepted":true}'
+
+    def flaky(request, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        keys.append(request.get_header("Idempotency-key"))
+        if attempts == 1:
+            raise OSError("connection reset by an idle keep-alive peer")
+        return Response()
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", flaky)
+    sink = HttpEventSink(
+        "https://control", sleep=lambda _seconds: None, jitter=lambda _low, _high: 0
+    )
+
+    result = sink.post(
+        "/v1/collector-events/gpu-inventory", {"cluster_id": "cluster-a", **payload}
+    )
+
+    assert result == {"accepted": True}, result
+    assert attempts == 2, "the payload was sent once and dropped into the outbox"
+    assert keys == [expected_key] * 2, "the retry did not carry a stable dedup key"
+
+
+def test_receipt_poll_retries_a_retryable_status_until_it_succeeds(monkeypatch) -> None:
+    """F11: a 503 from the status URL is capacity, not the request's verdict."""
+
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class Response:
+        def __init__(self, status: int, body: bytes) -> None:
+            self.status = status
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.body
+
+    def urlopen_probe(request, **_kwargs):
+        calls.append(request.get_method())
+        if len(calls) == 1:
+            return Response(
+                202,
+                b'{"accepted":true,"processor_request_id":"p-1",'
+                b'"status_url":"/v1/processor/requests/p-1"}',
+            )
+        if len(calls) == 2:
+            raise HTTPError(
+                "https://control/v1/processor/requests/p-1",
+                503,
+                "store at capacity",
+                Message(),
+                io.BytesIO(b'{"detail":"store at capacity"}'),
+            )
+        return Response(200, b'{"status":"CONTAINED"}')
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    sink = HttpEventSink("https://control", sleep=sleeps.append)
+
+    result = sink.post(
+        "/v1/attempts/failure-detected", {"cluster_id": "cluster-a", "event_id": "e-1"}
+    )
+
+    assert result == {"status": "CONTAINED"}, result
+    assert calls == ["POST", "GET", "GET"], "the retryable poll failure was terminal"
+    assert sleeps == [0.25], sleeps
+
+
+def test_receipt_poll_get_drops_the_post_body_headers(monkeypatch) -> None:
+    """F12: the bodiless GET reused the POST's body and idempotency headers."""
+
+    seen: list[dict[str, str]] = []
+
+    class Response:
+        def __init__(self, status: int, body: bytes) -> None:
+            self.status = status
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return self.body
+
+    def urlopen_probe(request, **_kwargs):
+        seen.append({key.lower(): value for key, value in request.header_items()})
+        if len(seen) == 1:
+            return Response(
+                202,
+                b'{"accepted":true,"processor_request_id":"p-1",'
+                b'"status_url":"/v1/processor/requests/p-1"}',
+            )
+        return Response(200, b'{"status":"CONTAINED"}')
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", urlopen_probe)
+    sink = HttpEventSink("https://control", bearer_token="token-1", gzip_min_bytes=1)
+
+    result = sink.post(
+        "/v1/attempts/failure-detected", {"cluster_id": "cluster-a", "event_id": "e-1"}
+    )
+
+    assert result == {"status": "CONTAINED"}, result
+    post_headers, get_headers = seen
+    assert post_headers["content-encoding"] == "gzip", post_headers
+    assert post_headers["idempotency-key"] == "e-1", post_headers
+    assert "content-type" not in get_headers, get_headers
+    assert "content-encoding" not in get_headers, get_headers
+    assert "idempotency-key" not in get_headers, get_headers
+    assert get_headers["authorization"] == "Bearer token-1", (
+        "the receipt GET lost its bearer token"
+    )
+    assert get_headers["x-gpu-fault-cluster-id"] == "cluster-a", (
+        "the receipt GET lost the cluster id header"
+    )

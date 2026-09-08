@@ -9,7 +9,12 @@ now answers with a result whose status the collectors branch on.
 
 from __future__ import annotations
 
-from gpu_fault.collectors.sinks import DeliveryStatus, HttpEventSink, deliver_event
+from gpu_fault.collectors.sinks import (
+    DeliveryStatus,
+    HttpEventSink,
+    deliver_event,
+    deliver_or_raise,
+)
 
 from ._support import (
     NOW,
@@ -22,8 +27,62 @@ from ._support import (
     RejectingSink,
     context,
     json,
+    logging,
+    pytest,
     subprocess,
 )
+
+_HELPER_LOGGER = logging.getLogger("tests.collectors.deliver_or_raise")
+
+
+def test_deliver_or_raise_logs_one_warning_for_a_buffered_record(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger=_HELPER_LOGGER.name):
+        result = deliver_or_raise(
+            BufferingSink(),
+            "/events",
+            {"event_id": "e-1"},
+            logger=_HELPER_LOGGER,
+            what="XID 79 for worker-1",
+        )
+
+    assert result.status is DeliveryStatus.BUFFERED, result
+    warnings = [item for item in caplog.records if item.levelno == logging.WARNING]
+    assert len(warnings) == 1, "a buffered record must log exactly one warning"
+    message = warnings[0].getMessage()
+    assert message.startswith("XID 79 for worker-1"), message
+    assert "persisted to the collector outbox" in message, message
+    assert "e-1" in message, "the warning does not name the event"
+    assert "network unavailable" in message, "the sink's error was dropped"
+
+
+def test_deliver_or_raise_raises_the_sink_error_on_a_rejection(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger=_HELPER_LOGGER.name):
+        with pytest.raises(CollectorError) as captured:
+            deliver_or_raise(
+                RejectingSink(),
+                "/events",
+                {"event_id": "e-1"},
+                logger=_HELPER_LOGGER,
+                what="XID 79 for worker-1",
+            )
+
+    assert captured.value.status_code == 422, "the sink's verdict was not re-raised"
+    assert not caplog.records, "a failed delivery must not log a buffered warning"
+
+
+def test_deliver_or_raise_returns_the_delivered_result_quietly(caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger=_HELPER_LOGGER.name):
+        result = deliver_or_raise(
+            RecordingSink(),
+            "/events",
+            {"event_id": "e-1"},
+            logger=_HELPER_LOGGER,
+            what="XID 79 for worker-1",
+        )
+
+    assert result.status is DeliveryStatus.DELIVERED, result
+    assert result.response == {"accepted": True}, "response body was dropped"
+    assert not caplog.records, "a live delivery must not log"
 
 
 def test_deliver_event_maps_a_buffered_replayable_failure_to_buffered() -> None:
