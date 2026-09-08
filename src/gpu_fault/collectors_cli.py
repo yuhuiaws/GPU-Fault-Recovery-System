@@ -19,7 +19,7 @@ from gpu_fault.collectors import (
     sink_from_environment,
 )
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import EventSink, OutboxFile
+from gpu_fault.collectors.sinks import EventSink, OutboxFile, OutboxLockUnavailable
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 
@@ -41,8 +41,11 @@ def _add_outbox_parser(
     ``requeue-dead`` runs its read-modify-write under the outbox's
     ``fcntl.flock`` (``<outbox>.lock``), so it waits for a collector that is
     buffering or replaying instead of racing it and losing one side's update
-    (F7). It leaves records whose payload was truncated to a digest dead: only
-    a 4 KB excerpt of those bodies exists, so they cannot be replayed.
+    (F7). The lock is mandatory here -- unlike the collector, this process has
+    no in-process lock to fall back on -- so a lock it cannot take exits
+    non-zero and changes nothing; ``--force`` overrides that explicitly. It
+    leaves records whose payload was truncated to a digest dead: only a 4 KB
+    excerpt of those bodies exists, so they cannot be replayed.
     """
 
     outbox = subcommands.add_parser(
@@ -77,6 +80,14 @@ def _add_outbox_parser(
         default=None,
         help="only requeue records for this control-plane path",
     )
+    requeue.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "requeue even when the outbox lock cannot be taken; a collector "
+            "writing at the same time can then lose either side's update"
+        ),
+    )
 
 
 def _outbox_path(args: argparse.Namespace) -> Path:
@@ -101,7 +112,20 @@ def run_outbox_command(args: argparse.Namespace) -> None:
             "requeue-dead replays records the control plane already rejected; "
             "pass --yes to confirm"
         )
-    requeued = outbox.requeue_dead(path_filter=args.path)
+    try:
+        requeued = outbox.requeue_dead(
+            path_filter=args.path, require_lock=not args.force
+        )
+    except OutboxLockUnavailable as exc:
+        # Without the lock this is the F7 race, and this process has no
+        # in-process lock to fall back on: refuse rather than half-apply.
+        raise SystemExit(
+            f"{exc}. A collector may be buffering or replaying right now; retry, "
+            "or pass --force to rewrite the outbox without the lock and accept "
+            "that one side's update can be lost"
+        ) from exc
+    except OSError as exc:
+        raise SystemExit(f"cannot rewrite the collector outbox {outbox.path}: {exc}")
     print(f"requeued {requeued} dead record(s) in {outbox.path}")
 
 

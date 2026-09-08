@@ -11,6 +11,7 @@ outbox evicted its oldest records silently.
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 from email.message import Message
 from threading import Event, Thread
@@ -154,23 +155,29 @@ def test_outbox_eviction_is_logged_and_counted(monkeypatch, tmp_path, caplog):
     )
     outbox = tmp_path / "outbox.ndjson"
     sink = HttpEventSink(
-        "https://control", max_attempts=1, outbox_path=str(outbox), outbox_max_records=2
+        "https://control", max_attempts=1, outbox_path=str(outbox), outbox_max_records=3
     )
 
     with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
-        for sequence in range(3):
+        for sequence in range(5):
             with pytest.raises(CollectorError):
                 sink.post("/events", {"event_id": f"e-{sequence}"})
 
+    # Passing the ceiling on the fourth record compacts down to 90% of it (two
+    # records), so the fifth is a free append rather than another rewrite.
     remaining = [json.loads(line) for line in outbox.read_text().splitlines() if line]
-    assert [item["payload"]["event_id"] for item in remaining] == ["e-1", "e-2"]
-    assert sink.outbox_evictions_total == 1, "eviction was not counted"
+    assert [item["payload"]["event_id"] for item in remaining] == ["e-2", "e-3", "e-4"]
+    assert sink.outbox_evictions_total == 2, "eviction was not counted"
     assert "evict" in caplog.text.lower(), "eviction was not logged"
+    assert len([line for line in caplog.text.splitlines() if "evict" in line]) == 1, (
+        f"eviction logged one line per record instead of one per compaction: "
+        f"{caplog.text!r}"
+    )
     stats = sink.outbox_stats()
-    assert stats["depth"] == 2, stats
-    assert stats["replayable"] == 2, stats
+    assert stats["depth"] == 3, stats
+    assert stats["replayable"] == 3, stats
     assert stats["dead"] == 0, stats
-    assert stats["evictions_total"] == 1, stats
+    assert stats["evictions_total"] == 2, stats
     assert stats["oldest_failed_at"] is not None, stats
 
 
@@ -270,6 +277,9 @@ def test_an_oversize_413_dead_record_keeps_a_digest_not_the_body(
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     assert stored["payload_sha256"] == hashlib.sha256(body).hexdigest(), stored
     assert stored["payload_bytes"] == len(body), stored
+    assert stored["payload_event_key"] == "e-1", (
+        f"the truncated record lost the event's identity: {stored}"
+    )
     assert len(stored["payload_excerpt"]) <= 4096, (
         f"the excerpt is {len(stored['payload_excerpt'])} characters, not bounded"
     )
@@ -349,6 +359,7 @@ def test_the_requeue_command_waits_for_the_outbox_lock_and_loses_no_record(
         outbox_action="requeue-dead",
         yes=True,
         path=None,
+        force=False,
     )
 
     def requeue() -> None:
@@ -375,3 +386,73 @@ def test_the_requeue_command_waits_for_the_outbox_lock_and_loses_no_record(
     assert all(item["replayable"] for item in remaining), (
         f"the requeue was overwritten by the sink's rewrite: {remaining}"
     )
+
+
+def _requeue_arguments(outbox_path, *, force: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        outbox_path=str(outbox_path),
+        collector=None,
+        outbox_action="requeue-dead",
+        yes=True,
+        path=None,
+        force=force,
+    )
+
+
+def test_requeue_dead_refuses_to_run_when_the_outbox_lock_cannot_be_taken(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """I-2: the operator process has no in-process lock to fall back to.
+
+    A ``.lock`` the unprivileged operator cannot open (the collector created it
+    as root) must stop the command, not silently reinstate the F7 lost update.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    real_open = os.open
+
+    def refuse_lock_files(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_lock_files)
+
+    with pytest.raises(SystemExit) as refused:
+        collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
+
+    assert refused.value.code not in {0, None}, "requeue-dead exited successfully"
+    message = str(refused.value)
+    assert "lock" in message.lower(), f"the refusal did not name the lock: {message!r}"
+    assert "--force" in message, f"the refusal did not offer a way through: {message!r}"
+    record = json.loads(outbox_path.read_text())
+    assert record["replayable"] is False, (
+        "requeue-dead changed the outbox although it could not take the lock"
+    )
+    capsys.readouterr()
+
+
+def test_requeue_dead_force_proceeds_without_the_lock_and_says_so(
+    monkeypatch, tmp_path, capsys, caplog
+) -> None:
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    real_open = os.open
+
+    def refuse_lock_files(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_lock_files)
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        collectors_cli.run_outbox_command(_requeue_arguments(outbox_path, force=True))
+
+    record = json.loads(outbox_path.read_text())
+    assert record["replayable"] is True, "--force did not requeue the dead record"
+    assert "lock" in caplog.text.lower(), (
+        f"an unlocked requeue was not warned about: {caplog.text!r}"
+    )
+    capsys.readouterr()

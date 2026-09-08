@@ -328,10 +328,48 @@ def deliver_or_raise(
 #: says how far over it was, and the excerpt is what an operator reads.
 OVERSIZE_PAYLOAD_EXCERPT_BYTES = 4096
 
-#: Outbox paths whose filesystem refused ``flock``, so the degradation warning
-#: is logged once per path instead of once per buffered event.
-_FLOCK_UNSUPPORTED: set[str] = set()
-_FLOCK_UNSUPPORTED_LOCK = Lock()
+#: What a compaction leaves behind, as a fraction of ``outbox_max_records``.
+#: Compacting back to exactly the ceiling made every append past it rewrite the
+#: whole file, which is F4's headline scenario (a saturated 1000-record
+#: backlog) and was slower than the code it replaced. Dropping to 90% buys
+#: ``max/10`` free appends per rewrite.
+OUTBOX_COMPACTION_FLOOR_RATIO = 0.9
+
+#: One WARNING per this many writes that ran without the cross-process lock.
+#: A single warning per path hid every later unlocked write, including a
+#: transient failure that has since become permanent.
+UNLOCKED_WRITE_WARN_INTERVAL = 100
+
+#: Writes per outbox lock path that ran without the lock, and outbox paths whose
+#: write failed, both counted so the logs stay bounded and an operator can see
+#: how long a degradation has lasted.
+_UNLOCKED_WRITES: dict[str, int] = {}
+_OUTBOX_WRITE_FAILURES: dict[str, int] = {}
+_OUTBOX_COUNTER_LOCK = Lock()
+
+
+def _bump(counters: dict[str, int], key: str) -> int:
+    with _OUTBOX_COUNTER_LOCK:
+        total = counters.get(key, 0) + 1
+        counters[key] = total
+        return total
+
+
+def unlocked_outbox_writes(lock_path: Path) -> int:
+    """How many writes to ``lock_path``'s outbox ran without the flock."""
+
+    with _OUTBOX_COUNTER_LOCK:
+        return _UNLOCKED_WRITES.get(str(lock_path), 0)
+
+
+class OutboxLockUnavailable(OSError):
+    """The cross-process outbox lock could not be taken.
+
+    Raised only for callers that asked for ``required=True``: a collector
+    degrades to its in-process lock rather than dropping an event, but an
+    operator command has no in-process lock to degrade to, so for it the
+    missing lock is the F7 race itself and must stop the command.
+    """
 
 
 def digest_oversize_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -346,6 +384,9 @@ def digest_oversize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()
     return {
+        # The event's own id, kept so a truncated record is still identifiable
+        # in the control plane's logs even though its body is gone.
+        "payload_event_key": event_idempotency_key(payload),
         "payload_sha256": hashlib.sha256(body).hexdigest(),
         "payload_bytes": len(body),
         "payload_excerpt": body[:OVERSIZE_PAYLOAD_EXCERPT_BYTES].decode(
@@ -373,22 +414,32 @@ class OutboxFile:
         return self.path.with_name(self.path.name + ".lock")
 
     @contextlib.contextmanager
-    def locked(self) -> Iterator[None]:
+    def locked(self, *, required: bool = False) -> Iterator[None]:
         """Hold the cross-process outbox lock for one read-modify-write.
 
         Not re-entrant: ``flock`` is held per open file description, so two
         nested :meth:`locked` blocks in one process would deadlock. Callers
         take it once around the whole read-modify-write.
 
-        A filesystem with no ``flock`` support (or an outbox directory this
-        process cannot open) must not fail a post: the body runs anyway,
-        serialised by the caller's in-process lock alone, with one warning per
-        path.
+        With ``required=False`` (the collector's write path) a filesystem with
+        no ``flock`` support, or a ``.lock`` this process cannot open, must not
+        fail a post: the body runs anyway, serialised by the caller's
+        in-process lock alone, counted in :func:`unlocked_outbox_writes` and
+        warned about every :data:`UNLOCKED_WRITE_WARN_INTERVAL` writes.
+
+        With ``required=True`` (an operator command, which has no in-process
+        lock to fall back on) the same failure raises
+        :class:`OutboxLockUnavailable` and the body never runs.
+
+        A failure to create the outbox *directory* is not a lock problem and is
+        left to the caller: the append or rewrite that follows would fail with
+        the same error, and reporting it as a missing lock hid a full or
+        read-only volume behind a warning about concurrency.
         """
 
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         handle: int | None = None
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             handle = os.open(
                 self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
             )
@@ -398,7 +449,12 @@ class OutboxFile:
                 with contextlib.suppress(OSError):
                     os.close(handle)
                 handle = None
-            self._warn_flock_unsupported(exc)
+            if required:
+                raise OutboxLockUnavailable(
+                    exc.errno or 0,
+                    f"cannot take the collector outbox lock {self.lock_path}: {exc}",
+                ) from exc
+            self._warn_unlocked_write(exc)
         try:
             yield
         finally:
@@ -408,18 +464,17 @@ class OutboxFile:
                 with contextlib.suppress(OSError):
                     os.close(handle)
 
-    def _warn_flock_unsupported(self, exc: OSError) -> None:
-        key = str(self.lock_path)
-        with _FLOCK_UNSUPPORTED_LOCK:
-            if key in _FLOCK_UNSUPPORTED:
-                return
-            _FLOCK_UNSUPPORTED.add(key)
+    def _warn_unlocked_write(self, exc: OSError) -> None:
+        total = _bump(_UNLOCKED_WRITES, str(self.lock_path))
+        if total > 1 and total % UNLOCKED_WRITE_WARN_INTERVAL:
+            return
         LOGGER.warning(
-            "collector outbox lock %s is unavailable (%s); falling back to the "
-            "in-process lock, so a concurrent 'outbox requeue-dead' can lose an "
-            "update",
-            key,
+            "collector outbox lock %s is unavailable (%s); %d write(s) so far have "
+            "run on the in-process lock alone, so a concurrent 'outbox "
+            "requeue-dead' can lose an update",
+            self.lock_path,
             exc,
+            total,
         )
 
     def read(self) -> list[dict[str, Any]]:
@@ -469,6 +524,19 @@ class OutboxFile:
                 total += chunk.count(b"\n")
         return total
 
+    def ends_mid_line(self) -> bool:
+        """Whether the file ends in a fragment with no newline of its own."""
+
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    return False
+                handle.seek(-1, os.SEEK_END)
+                return handle.read(1) != b"\n"
+        except FileNotFoundError:
+            return False
+
     def append(self, record: dict[str, Any]) -> None:
         """Add one record with a single append and one ``fsync``.
 
@@ -477,11 +545,25 @@ class OutboxFile:
         and the ``fsync`` may lose at most this record, and a torn line is
         skipped by :meth:`read`; the whole backlog behind it survives, which a
         rewrite of the entire file could not promise.
+
+        "At most this record" is why the torn tail gets a newline of its own
+        first: appending straight onto a fragment left by an unclean shutdown
+        concatenated the two into one unparseable line, so ``read()`` dropped
+        the *new* record too while the collector had already been told it was
+        buffered and had advanced its cursor past a real event.
         """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
         with open(self.path, "a", encoding="utf-8") as handle:
+            if self.ends_mid_line():
+                LOGGER.warning(
+                    "collector outbox %s ends in a partial record; closing that "
+                    "line so the record appended now is readable (the fragment "
+                    "itself is skipped)",
+                    self.path,
+                )
+                handle.write("\n")
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
@@ -533,7 +615,10 @@ class OutboxFile:
 
     @staticmethod
     def summarize(
-        records: list[dict[str, Any]], *, evictions_total: int = 0
+        records: list[dict[str, Any]],
+        *,
+        evictions_total: int = 0,
+        unlocked_writes_total: int = 0,
     ) -> dict[str, Any]:
         replayable = sum(1 for record in records if record.get("replayable"))
         failed_at = sorted(
@@ -546,11 +631,18 @@ class OutboxFile:
             "replayable": replayable,
             "dead": len(records) - replayable,
             "evictions_total": evictions_total,
+            # Non-zero means this outbox has been written without the
+            # cross-process lock, so an 'outbox requeue-dead' can lose an
+            # update (F7 degraded).
+            "unlocked_writes_total": unlocked_writes_total,
             "oldest_failed_at": failed_at[0] if failed_at else None,
         }
 
     def stats(self) -> dict[str, Any]:
-        return self.summarize(self.read())
+        return self.summarize(
+            self.read(),
+            unlocked_writes_total=unlocked_outbox_writes(self.lock_path),
+        )
 
     @staticmethod
     def describe(index: int, record: dict[str, Any]) -> str:
@@ -563,15 +655,20 @@ class OutboxFile:
             f"{record.get('failed_at')}\t{error}"
         )
 
-    def requeue_dead(self, *, path_filter: str | None = None) -> int:
+    def requeue_dead(
+        self, *, path_filter: str | None = None, require_lock: bool = True
+    ) -> int:
         """Mark dead-lettered records replayable again; returns how many.
 
         The whole read-modify-write runs under :meth:`locked` so an operator
         running this against a live collector's outbox cannot lose the sink's
         appends, and the sink's next rewrite cannot lose this requeue (F7).
+        The lock is *required* by default: without it this is the F7 race, and
+        an operator process has no in-process lock to fall back on.
+        ``require_lock=False`` is the ``--force`` escape hatch.
         """
 
-        with self.locked():
+        with self.locked(required=require_lock):
             records = self.read()
             requeued = 0
             skipped_truncated = 0
@@ -787,7 +884,9 @@ class HttpEventSink:
             return OutboxFile.summarize([], evictions_total=self.outbox_evictions_total)
         with self._outbox_lock:
             return OutboxFile.summarize(
-                self._read_outbox(), evictions_total=self.outbox_evictions_total
+                self._read_outbox(),
+                evictions_total=self.outbox_evictions_total,
+                unlocked_writes_total=self.outbox_unlocked_writes_total,
             )
 
     def wait_for_outbox_replay(self, timeout_seconds: float = 5) -> bool:
@@ -1138,18 +1237,40 @@ class HttpEventSink:
                     self._compact_outbox_locked(outbox)
             return True
         except OSError:
-            LOGGER.exception("cannot persist collector outbox event")
+            failures = _bump(_OUTBOX_WRITE_FAILURES, str(self.outbox_path))
+            if failures == 1:
+                LOGGER.exception("cannot persist collector outbox event")
+            else:
+                # A full or read-only volume fails for every record; one
+                # traceback per outbox is diagnosis, thousands are noise.
+                LOGGER.warning(
+                    "cannot persist collector outbox event (%d failure(s) for %s)",
+                    failures,
+                    self.outbox_path,
+                )
             return False
 
+    @property
+    def outbox_unlocked_writes_total(self) -> int:
+        """Writes that ran without the cross-process lock (F7 degraded)."""
+
+        if self.outbox_path is None:
+            return 0
+        return unlocked_outbox_writes(OutboxFile(self.outbox_path).lock_path)
+
     def _compact_outbox_locked(self, outbox: OutboxFile) -> None:
-        """Rewrite the outbox down to ``outbox_max_records``, newest kept.
+        """Rewrite the outbox down to 90% of ``outbox_max_records``.
 
         The only place a buffered event pays for the whole file, and only once
-        the append pushed it past the ceiling. Callers hold both locks.
+        the append pushed it past the ceiling. Compacting back to exactly the
+        ceiling meant a saturated outbox -- F4's own scenario -- rewrote itself
+        on every append; leaving 90% behind makes the next ``max/10`` appends
+        free. Callers hold both locks.
         """
 
         records = outbox.read()
-        evicted = len(records) - self.outbox_max_records
+        floor = max(1, int(self.outbox_max_records * OUTBOX_COMPACTION_FLOOR_RATIO))
+        evicted = len(records) - floor
         if evicted > 0:
             # The oldest records go first; they are the least likely to still
             # be wanted, but they are still loss and used to be dropped
@@ -1157,13 +1278,14 @@ class HttpEventSink:
             self.outbox_evictions_total += evicted
             LOGGER.warning(
                 "collector outbox is full; evicted %d oldest record(s) "
-                "(max_records=%d, evictions_total=%d, path=%s)",
+                "(max_records=%d, kept=%d, evictions_total=%d, path=%s)",
                 evicted,
                 self.outbox_max_records,
+                floor,
                 self.outbox_evictions_total,
                 self.outbox_path,
             )
-        kept = records[-self.outbox_max_records :]
+        kept = records[-floor:]
         outbox.write(kept)
         self._outbox_line_count = len(kept)
 

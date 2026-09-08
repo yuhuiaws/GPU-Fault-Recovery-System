@@ -475,6 +475,156 @@ def test_buffer_for_replay_without_an_outbox_reports_that_it_did_not_persist() -
     )
 
 
+def test_a_torn_tail_does_not_swallow_the_next_buffered_record(
+    tmp_path, caplog
+) -> None:
+    """C-1: appending onto a fragment would concatenate two records into one.
+
+    An unclean shutdown -- this product hard-resets nodes -- can leave a
+    partial last line. The next append must not land on the same line, or the
+    combined line is unparseable, ``read()`` drops it, and the collector that
+    was told ``buffered=True`` has already advanced its cursor past a real
+    event.
+    """
+
+    outbox = tmp_path / "outbox.ndjson"
+    intact = json.dumps(
+        {
+            "path": "/events",
+            "payload": {"sequence": 0},
+            "replayable": True,
+            "error": "seeded",
+            "failed_at": "2026-08-30T00:00:00+00:00",
+        }
+    )
+    outbox.write_text(
+        intact + "\n" + '{"path":"/events","payload":{"sequence":1', encoding="utf-8"
+    )
+    sink = HttpEventSink("https://control", outbox_path=str(outbox))
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        assert sink.buffer_for_replay("/events", {"sequence": 2}) is True, (
+            "the record after a torn tail was not persisted"
+        )
+        records = OutboxFile(outbox).read()
+
+    assert [item["payload"]["sequence"] for item in records] == [0, 2], (
+        f"the torn tail swallowed the record appended after it: {records}"
+    )
+
+
+def test_a_saturated_outbox_compacts_once_not_on_every_append(
+    monkeypatch, tmp_path
+) -> None:
+    """I-1: without hysteresis a full outbox rewrote itself on every append.
+
+    F4's scenario is exactly the saturated backlog, so compaction drops the
+    depth to 90% of the ceiling and the appends after it are free again.
+    """
+
+    rewrites: list[int] = []
+    original_write = OutboxFile.write
+
+    def counting_write(self: OutboxFile, records: list[dict]) -> None:
+        rewrites.append(len(records))
+        original_write(self, records)
+
+    monkeypatch.setattr(OutboxFile, "write", counting_write)
+    outbox = tmp_path / "outbox.ndjson"
+    sink = HttpEventSink(
+        "https://control", outbox_path=str(outbox), outbox_max_records=100
+    )
+
+    for sequence in range(100):
+        assert sink.buffer_for_replay("/events", {"sequence": sequence}) is True, (
+            f"record {sequence} was not persisted while filling the outbox"
+        )
+
+    assert rewrites == [], f"compaction ran before the ceiling was passed: {rewrites}"
+
+    for sequence in range(100, 108):
+        assert sink.buffer_for_replay("/events", {"sequence": sequence}) is True, (
+            f"record {sequence} was not persisted past the ceiling"
+        )
+
+    assert rewrites == [90], (
+        f"a saturated outbox rewrote itself {len(rewrites)} time(s): {rewrites}"
+    )
+    assert sink.outbox_evictions_total == 11, (
+        f"compaction did not count its evictions: {sink.outbox_evictions_total}"
+    )
+    remaining = [json.loads(line) for line in outbox.read_text().splitlines() if line]
+    assert [item["payload"]["sequence"] for item in remaining] == list(
+        range(11, 108)
+    ), f"compaction did not keep the newest records: {len(remaining)}"
+
+
+def test_unlocked_outbox_writes_are_counted_and_rewarned(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """I-3: one warning per path forever hid every later unlocked write."""
+
+    real_open = os.open
+
+    def refuse_lock_files(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".lock"):
+            raise OSError(95, "Operation not supported")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_lock_files)
+    outbox = tmp_path / "no-flock.ndjson"
+    sink = HttpEventSink("https://control", outbox_path=str(outbox))
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        for sequence in range(101):
+            assert sink.buffer_for_replay("/events", {"sequence": sequence}) is True, (
+                f"record {sequence} was not persisted without the lock"
+            )
+
+    assert sink.outbox_unlocked_writes_total == 101, (
+        f"unlocked writes were not counted: {sink.outbox_unlocked_writes_total}"
+    )
+    warnings = [
+        record for record in caplog.records if "lock" in record.getMessage().lower()
+    ]
+    assert len(warnings) == 2, (
+        f"101 unlocked writes warned {len(warnings)} time(s), not periodically"
+    )
+    assert sink.outbox_stats()["unlocked_writes_total"] == 101, sink.outbox_stats()
+
+
+def test_an_undirectory_outbox_is_not_reported_as_a_lock_problem(
+    tmp_path, caplog
+) -> None:
+    """I-3: ``mkdir`` failing is a write failure, not a missing lock."""
+
+    read_only = tmp_path / "read-only"
+    read_only.mkdir()
+    read_only.chmod(0o500)
+    sink = HttpEventSink(
+        "https://control", outbox_path=str(read_only / "nested" / "outbox.ndjson")
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+            assert sink.buffer_for_replay("/events", {"sequence": 0}) is False, (
+                "a record that could not be written was reported as persisted"
+            )
+            assert sink.buffer_for_replay("/events", {"sequence": 1}) is False, (
+                "a record that could not be written was reported as persisted"
+            )
+    finally:
+        read_only.chmod(0o700)
+
+    assert not [
+        record for record in caplog.records if "lock" in record.getMessage().lower()
+    ], f"a directory that cannot be created was blamed on the lock: {caplog.text}"
+    with_traceback = [record for record in caplog.records if record.exc_info]
+    assert len(with_traceback) == 1, (
+        f"the write failure logged {len(with_traceback)} traceback(s), not one per path"
+    )
+
+
 def test_a_filesystem_without_flock_still_buffers_and_warns_once(
     monkeypatch, tmp_path, caplog
 ) -> None:
