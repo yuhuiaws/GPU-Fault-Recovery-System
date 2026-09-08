@@ -400,7 +400,7 @@ def test_the_operator_reason_names_the_cause_of_each_unknown_outcome():
 
 
 def test_an_unknown_outcome_support_escalation_spawns_no_second_ticket():
-    """Outside the classifiable operations the short-circuit does not apply.
+    """Only the three escalation-class operations escape the short-circuit.
 
     ESCALATE_SUPPORT, FREEZE_EVIDENCE and CHECKPOINT_WORKLOADS carry the
     unknown-outcome flags when the executor abandons them, but a
