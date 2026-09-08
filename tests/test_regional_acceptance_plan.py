@@ -59,9 +59,10 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
     assert plan.collect_all is False
     assert plan.read_only is False
     assert plan.repair_allowed is False
-    # 183 catalogued cases; 9 are DO_NOT_RUN (two retired earlier, seven folded
-    # into their supersets on 2026-09-07), so 174 run.
+    # 183 catalogued cases; 10 are DO_NOT_RUN (two retired earlier, seven folded
+    # into their supersets on 2026-09-07, plus BOOT-006 deleted), so 173 run.
     retired = (
+        "GF-REGIONAL-BOOT-006",
         "GF-REGIONAL-DESTR-004",
         "GF-REGIONAL-AUTH-012",
         "GF-REGIONAL-AUTH-010",
@@ -72,7 +73,7 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 174
+    assert len(plan.execution_order) == 173
     assert len(plan.cases) == 183
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-011", "GF-REGIONAL-BOOT-012")
     assert plan.execution_order[-1] == "GF-REGIONAL-COLLECT-015"
@@ -249,8 +250,9 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     # PREEMPT-013/023/034 (pytest wrappers) and AUTH-010/NOTIFY-002/DESTR-011
     # (local-proxy manual cases) were folded into the cases that already ran
     # their assertions and are DO_NOT_RUN; HA-007 and CMD-011 moved from
-    # local-proxy manual to command, which is count-neutral.
-    assert len(automated) == 106
+    # local-proxy manual to command, which is count-neutral. 106 -> 105 when
+    # BOOT-006 (automated guard) was deleted with quick diagnostics.
+    assert len(automated) == 105
     assert all(
         case.risk == "non-destructive" or case.local_proxy for case in automated
     ), [case.id for case in automated]

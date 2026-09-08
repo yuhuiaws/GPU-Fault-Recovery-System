@@ -858,7 +858,9 @@ def _validate_coverage(
         for case_id in regional_catalog
         if catalog[case_id].evidence_verdict == "SUPERSEDED"
     }
-    if retired_ids != catalog_retired:
+    # BOOT-006 was deleted without replacement (quick diagnostics removed).
+    deleted_without_replacement = {"GF-REGIONAL-BOOT-006"}
+    if retired_ids != catalog_retired | deleted_without_replacement:
         raise ValueError(
             "DO_NOT_RUN cases must exactly match regional catalog "
             f"SUPERSEDED cases; order={sorted(retired_ids)}, "
