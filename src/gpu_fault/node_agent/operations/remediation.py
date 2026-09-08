@@ -64,7 +64,13 @@ class RemediationOperationsMixin:
     def _assert_remediation_quiesced(self, incident_id: str) -> None:
         if not self.service_quiesce_enabled or self.quiesce_manager is None:
             raise RuntimeError("driver/firmware remediation requires service quiesce")
-        self.quiesce_manager.assert_quiesced(incident_id=incident_id)
+        # for_reset=False: remediation runs *under* the quiesce but is not a
+        # GPU reset, so it must not consume the window's single reset slot
+        # (driver then firmware in one window is legitimate).
+        self.quiesce_manager.assert_quiesced(
+            incident_id=incident_id,
+            for_reset=False,
+        )
 
     def _remediate_driver(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.driver_remediation_enabled:

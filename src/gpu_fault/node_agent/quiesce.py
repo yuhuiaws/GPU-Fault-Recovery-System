@@ -8,6 +8,7 @@ import re
 import subprocess
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -250,39 +251,47 @@ class GpuServiceQuiesceManager:
             self.sleeper(0.5)
         return False
 
+    def _kill_task(self, container_id: str, signal_name: str) -> None:
+        """Signal a container task, letting ``ctr``'s exit status be advisory.
+
+        A target task can exit on its own between ``_running_container_ids``
+        and the kill -- kubelet is already stopped, so nothing restarts it --
+        and ``ctr`` then answers "process already finished" with a non-zero
+        status. Failing the whole quiesce on that would leave the node with
+        kubelet/FM/DCGM down for nothing. ``_wait_task_stopped`` is the
+        authority on whether the task is gone.
+        """
+
+        completed = self._run(
+            [
+                "ctr",
+                "-n",
+                "k8s.io",
+                "tasks",
+                "kill",
+                "--signal",
+                signal_name,
+                "--all",
+                container_id,
+            ],
+            check=False,
+        )
+        if completed.returncode:
+            LOGGER.info(
+                "ctr tasks kill %s for %s exited with status %s: %s",
+                signal_name,
+                container_id,
+                completed.returncode,
+                (completed.stderr or "").strip()[-200:],
+            )
+
     def _stop_containers(self, targets: list[dict[str, str]]) -> None:
         for target in targets:
             container_id = target["container_id"]
-            self._run(
-                [
-                    "ctr",
-                    "-n",
-                    "k8s.io",
-                    "tasks",
-                    "kill",
-                    "--signal",
-                    "SIGTERM",
-                    "--all",
-                    container_id,
-                ],
-                check=True,
-            )
+            self._kill_task(container_id, "SIGTERM")
             if self._wait_task_stopped(container_id):
                 continue
-            self._run(
-                [
-                    "ctr",
-                    "-n",
-                    "k8s.io",
-                    "tasks",
-                    "kill",
-                    "--signal",
-                    "SIGKILL",
-                    "--all",
-                    container_id,
-                ],
-                check=True,
-            )
+            self._kill_task(container_id, "SIGKILL")
             if not self._wait_task_stopped(container_id):
                 raise RuntimeError(f"container task {container_id} did not stop")
 
@@ -499,6 +508,50 @@ class GpuServiceQuiesceManager:
             self._run(["kill", "--signal", "KILL", pid], check=False)
         return swept, skipped
 
+    def _restore_failed_window(
+        self,
+        state_path: Path,
+        existing: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Clear a failed quiesce window so the same command can retry.
+
+        A stop, container kill or sweep that raises leaves ``QUIESCE_FAILED``
+        behind, and a restore that cannot start a service leaves
+        ``RESTORE_FAILED``. Both used to make every retry raise "quiesce is
+        incomplete" until the fail-safe timer fired minutes later, by which
+        time the workflow was already dead with kubelet/FM/DCGM down. Restore
+        inline instead (idempotent: it starts what the file names and cancels
+        the timer) and return None so the caller quiesces from scratch. A
+        restore that itself fails keeps the window closed.
+
+        Returns the state unchanged when it is a healthy ``QUIESCED`` window.
+        """
+
+        phase = existing.get("phase")
+        if phase == "QUIESCED":
+            return existing
+        if phase not in {"QUIESCE_FAILED", "RESTORE_FAILED"}:
+            # ARMING/QUIESCING/RESTORING means the writer died mid-step, so
+            # the node state is unknown: leave it to the fail-safe timer and
+            # the boot reconciler rather than stopping services again.
+            raise RuntimeError(
+                "GPU service quiesce is incomplete; fail-safe restore remains armed"
+            )
+        try:
+            restored = self._restore_locked(state_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"the previous {phase} GPU service quiesce could not be restored, "
+                f"so a fresh quiesce is refused: {exc}"
+            ) from exc
+        LOGGER.warning(
+            "restored a %s quiesce window before re-quiescing %s: %s",
+            phase,
+            existing.get("incident_id"),
+            restored.get("restored_services"),
+        )
+        return None
+
     def quiesce(
         self,
         *,
@@ -525,11 +578,8 @@ class GpuServiceQuiesceManager:
                     or existing.get("workflow_request_id") != workflow_request_id
                 ):
                     raise RuntimeError("quiesce state belongs to another workflow")
-                if existing.get("phase") != "QUIESCED":
-                    raise RuntimeError(
-                        "GPU service quiesce is incomplete; "
-                        "fail-safe restore remains armed"
-                    )
+                existing = self._restore_failed_window(state_path, existing)
+            if existing is not None:
                 if existing.get("target_device_paths", []) != (normalized_target_paths):
                     raise RuntimeError("quiesce target GPU scope changed after quiesce")
                 return {
@@ -556,6 +606,10 @@ class GpuServiceQuiesceManager:
                 "workload_cgroup_paths": sorted(workload_cgroup_paths),
                 "timer_unit": timer_unit,
                 "boot_id": self.boot_id_reader(),
+                # One quiesce window buys one reset: assert_quiesced claims
+                # this slot before nvidia-smi runs. A file written before this
+                # key existed has no claim, so it reads as "not yet reset".
+                "reset_issued": None,
             }
             self._write_state(state_path, state)
             try:
@@ -618,12 +672,43 @@ class GpuServiceQuiesceManager:
                 "state_path": str(state_path),
             }
 
-    def assert_quiesced(self, *, incident_id: str) -> None:
+    def assert_quiesced(
+        self,
+        *,
+        incident_id: str,
+        command_id: str | None = None,
+        for_reset: bool = True,
+    ) -> None:
+        """Fence a reset on the quiesce state and claim the window for it.
+
+        ``for_reset`` defaults to True because every caller is a reset path:
+        the claim is recorded under the same flock as the phase check and
+        before nvidia-smi is spawned, so a resubmit of a reset whose outcome
+        is unknown -- and any other command_id for the same incident -- is
+        refused instead of resetting the GPU a second time. A new window
+        needs a real restore plus a fresh quiesce, which clears the claim.
+        """
+
         state_path = self._state_path(incident_id)
         with self._locked(state_path):
             state = self._read_state(state_path)
             if state is None or state.get("phase") != "QUIESCED":
                 raise RuntimeError("GPU reset requires an active service quiesce state")
+            if not for_reset:
+                return
+            issued = state.get("reset_issued")
+            if isinstance(issued, dict):
+                owner = issued.get("command_id") or "an earlier command"
+                raise RuntimeError(
+                    "a GPU reset was already issued in this quiesce window by "
+                    f"{owner} at {issued.get('issued_at')}; refusing a second "
+                    "reset until the services are restored and re-quiesced"
+                )
+            state["reset_issued"] = {
+                "command_id": command_id,
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._write_state(state_path, state)
 
     def reconcile_after_boot(self) -> dict[str, Any]:
         """Restore quiesce state files that a reboot orphaned.
@@ -713,77 +798,90 @@ class GpuServiceQuiesceManager:
             container_restore_timeout_seconds=(container_restore_timeout_seconds),
         )
         with manager._locked(state_path):
-            state = manager._read_state(state_path)
-            if state is None:
-                return {
-                    "restored": True,
-                    "already_restored": True,
-                    "state_path": str(state_path),
-                }
-            services = state.get("active_services")
-            container_targets = state.get("container_targets", [])
-            timer_unit = state.get("timer_unit")
-            if (
-                not isinstance(services, list)
-                or not all(
-                    isinstance(item, str) and SYSTEMD_NAME_PATTERN.fullmatch(item)
-                    for item in services
-                )
-                or not isinstance(timer_unit, str)
-                or not SYSTEMD_NAME_PATTERN.fullmatch(timer_unit)
-                or not isinstance(container_targets, list)
-                or not all(
-                    isinstance(item, dict)
-                    and isinstance(item.get("selector"), str)
-                    and len(item["selector"].split("/")) == 2
-                    and all(
-                        SYSTEMD_NAME_PATTERN.fullmatch(part)
-                        for part in item["selector"].split("/")
-                    )
-                    and isinstance(item.get("container_id"), str)
-                    and re.fullmatch(r"[a-f0-9]{64}", item["container_id"])
-                    for item in container_targets
-                )
-            ):
-                raise RuntimeError("invalid quiesce restore state")
-            state["phase"] = "RESTORING"
-            manager._write_state(state_path, state)
-            for service in services:
-                manager._run(
-                    ["systemctl", "start", service],
-                    check=True,
-                    timeout=120,
-                )
-            inactive = [
-                service for service in services if not manager._service_active(service)
-            ]
-            if inactive:
-                state["phase"] = "RESTORE_FAILED"
-                manager._write_state(state_path, state)
-                raise RuntimeError(
-                    "restored services are not active: " + ", ".join(inactive)
-                )
-            pending_containers = manager._wait_containers_restored(container_targets)
-            manager._run(
-                ["systemctl", "stop", timer_unit + ".timer"],
-                check=False,
-            )
-            manager._run(
-                ["systemctl", "reset-failed", timer_unit + ".service"],
-                check=False,
-            )
-            state_path.unlink()
-            result = {
+            return manager._restore_locked(state_path)
+
+    def _restore_locked(self, state_path: Path) -> dict[str, Any]:
+        """Restore one state file with its per-incident flock already held.
+
+        ``quiesce`` restores a failed window inline, and flock is owned by the
+        open file description: re-entering :meth:`_locked` in the same process
+        would deadlock against the lock this thread already holds.
+        """
+
+        state = self._read_state(state_path)
+        if state is None:
+            return {
                 "restored": True,
-                "restored_services": services,
-                "timer_cancelled": timer_unit + ".timer",
+                "already_restored": True,
                 "state_path": str(state_path),
             }
-            if pending_containers:
-                result.update(
-                    {
-                        "container_restore_warning": True,
-                        "pending_container_selectors": (pending_containers),
-                    }
+        services = state.get("active_services")
+        container_targets = state.get("container_targets", [])
+        timer_unit = state.get("timer_unit")
+        if (
+            not isinstance(services, list)
+            or not all(
+                isinstance(item, str) and SYSTEMD_NAME_PATTERN.fullmatch(item)
+                for item in services
+            )
+            or not isinstance(timer_unit, str)
+            or not SYSTEMD_NAME_PATTERN.fullmatch(timer_unit)
+            or not isinstance(container_targets, list)
+            or not all(
+                isinstance(item, dict)
+                and isinstance(item.get("selector"), str)
+                and len(item["selector"].split("/")) == 2
+                and all(
+                    SYSTEMD_NAME_PATTERN.fullmatch(part)
+                    for part in item["selector"].split("/")
                 )
-            return result
+                and isinstance(item.get("container_id"), str)
+                and re.fullmatch(r"[a-f0-9]{64}", item["container_id"])
+                for item in container_targets
+            )
+        ):
+            raise RuntimeError("invalid quiesce restore state")
+        state["phase"] = "RESTORING"
+        # The window is over: a later quiesce of the same incident starts
+        # with a clean claim even if this restore fails and keeps the file.
+        state["reset_issued"] = None
+        self._write_state(state_path, state)
+        for service in services:
+            self._run(
+                ["systemctl", "start", service],
+                check=True,
+                timeout=120,
+            )
+        inactive = [
+            service for service in services if not self._service_active(service)
+        ]
+        if inactive:
+            state["phase"] = "RESTORE_FAILED"
+            self._write_state(state_path, state)
+            raise RuntimeError(
+                "restored services are not active: " + ", ".join(inactive)
+            )
+        pending_containers = self._wait_containers_restored(container_targets)
+        self._run(
+            ["systemctl", "stop", timer_unit + ".timer"],
+            check=False,
+        )
+        self._run(
+            ["systemctl", "reset-failed", timer_unit + ".service"],
+            check=False,
+        )
+        state_path.unlink()
+        result = {
+            "restored": True,
+            "restored_services": services,
+            "timer_cancelled": timer_unit + ".timer",
+            "state_path": str(state_path),
+        }
+        if pending_containers:
+            result.update(
+                {
+                    "container_restore_warning": True,
+                    "pending_container_selectors": (pending_containers),
+                }
+            )
+        return result
