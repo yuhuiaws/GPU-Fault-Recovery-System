@@ -778,3 +778,128 @@ def test_sync_node_action_route_is_gone(tmp_path, monkeypatch) -> None:
     assert agent.ledger.attempt_history(signed.command.command_id) == [], (
         "the removed route must not have run anything"
     )
+
+
+def test_a_ledger_that_recovers_never_reruns_a_dispatched_reset(
+    tmp_path, monkeypatch
+) -> None:
+    """Both ledger writes broken, then working, must still reset once.
+
+    The ledger holds no result and no INTERRUPTED marker, so a resubmit landed
+    in the pool wrapper's ``except``. That wrapper wrote FAILED
+    ``retryable=True`` over the IN_PROGRESS row -- an UPSERT -- and the next
+    resubmit read that row, asked for attempt 2 and reset the GPU again.
+
+    While nothing is on disk the poll answers 404 -- the finished result lives
+    only in a future the done-callback has already dropped -- and that is what
+    makes the control plane resubmit until the ledger can close the attempt.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_NODE_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_CLUSTER_ID", raising=False)
+    runner = FakeRunner()
+    agent = reset_agent(tmp_path, "recovering-ledger.db", runner, sleep=lambda _s: None)
+    real_mark_interrupted = agent.ledger.mark_interrupted
+    writes_fail = {"value": True}
+
+    def unwritable_save(result, **_kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    def flaky_mark_interrupted(command_id: str, attempt: int, error: str):
+        if writes_fail["value"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark_interrupted(command_id, attempt, error)
+
+    monkeypatch.setattr(agent.ledger, "save", unwritable_save)
+    monkeypatch.setattr(agent.ledger, "mark_interrupted", flaky_mark_interrupted)
+    signed = envelope(command(WorkflowOperation.RESET_GPU))
+    answers = []
+
+    with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
+        submit_action(client, signed)
+        answers.append(wait_for_result(client, signed.command.command_id))
+        submit_action(client, signed)
+        answers.append(wait_for_result(client, signed.command.command_id))
+        writes_fail["value"] = False
+        submit_action(client, signed)
+        answers.append(wait_for_result(client, signed.command.command_id))
+
+    assert reset_invocations(runner) == 1, (
+        f"the GPU was reset more than once: {runner.commands}"
+    )
+    payloads = [
+        answer.json() if answer.status_code == 200 else None for answer in answers
+    ]
+    for payload in payloads:
+        if payload is None:
+            # Nothing is on disk yet, so 404 is honest and the control plane
+            # resubmits. What must never happen is a retryable answer.
+            continue
+        assert payload["state"] != NodeActionExecutionState.FAILED.value, (
+            f"a dispatched attempt must not be answered as a failure: {payload}"
+        )
+        assert payload["result"]["retryable"] is False, (
+            f"a dispatched attempt must never be answered as retryable: {payload}"
+        )
+    assert payloads[-1] is not None, (
+        f"the recovered ledger must answer the last poll: {answers[-1].text}"
+    )
+    assert payloads[-1]["state"] == NodeActionExecutionState.INTERRUPTED.value, (
+        payloads[-1]
+    )
+    history = agent.ledger.attempt_history(signed.command.command_id)
+    assert [(row["attempt"], row["state"]) for row in history] == [
+        (1, "INTERRUPTED")
+    ], f"the recovered write must close attempt 1, not open attempt 2: {history}"
+
+
+def test_a_lost_in_progress_write_reply_leaves_no_stuck_waiter(
+    tmp_path, monkeypatch
+) -> None:
+    """The marker landed but the call failed: release the in-flight Event.
+
+    ``mark_in_progress`` ran outside the ``try/finally``, so the per-command
+    Event stayed registered and unset. Every later submit for that command_id
+    then parked a pool worker in the in-flight wait -- 2100 s in production,
+    four such answers and the agent accepts nothing else.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_NODE_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_CLUSTER_ID", raising=False)
+    runner = FakeRunner()
+    agent = reset_agent(
+        tmp_path, "lost-marker-reply.db", runner, inflight_wait_timeout_seconds=10
+    )
+    real_mark_in_progress = agent.ledger.mark_in_progress
+    marked: list[int] = []
+
+    def lossy_mark_in_progress(value, attempt: int, **kwargs):
+        real_mark_in_progress(value, attempt, **kwargs)
+        marked.append(attempt)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(agent.ledger, "mark_in_progress", lossy_mark_in_progress)
+    signed = envelope(command(WorkflowOperation.RESET_GPU))
+
+    with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
+        submit_action(client, signed)
+        first = wait_for_result(client, signed.command.command_id)
+        started = time.monotonic()
+        submit_action(client, signed)
+        second = wait_for_result(client, signed.command.command_id)
+        elapsed = time.monotonic() - started
+
+    assert marked == [1], f"only attempt 1 may be dispatched: {marked}"
+    assert reset_invocations(runner) == 0, (
+        f"the handler never ran, so nothing may have reset: {runner.commands}"
+    )
+    for answer in (first, second):
+        payload = answer.json()
+        assert answer.status_code == 200, f"the poll must answer: {answer.text}"
+        assert payload["state"] == NodeActionExecutionState.INTERRUPTED.value, payload
+        assert payload["result"]["retryable"] is False, (
+            f"a marked attempt cannot be replayed automatically: {payload}"
+        )
+    assert elapsed < 3.0, (
+        f"the resubmit waited on a leaked in-flight Event: {elapsed:.1f}s"
+    )

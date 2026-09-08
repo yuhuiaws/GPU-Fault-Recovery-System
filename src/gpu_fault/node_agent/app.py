@@ -17,7 +17,10 @@ from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.node_agent.config import executor_from_environment
-from gpu_fault.node_agent.executor import NodeActionExecutor
+from gpu_fault.node_agent.executor import (
+    UNPERSISTED_RESULT_ERROR,
+    NodeActionExecutor,
+)
 from gpu_fault.node_agent.heartbeat import (
     AgentHeartbeatReporter,
     heartbeat_reporter_from_environment,
@@ -265,27 +268,51 @@ def create_node_agent_app(
             return None
         except Exception as exc:
             # Not the action failing -- ``execute`` reports that as a FAILED
-            # result -- but the pool wrapper around it, most often the marker
-            # write itself. The answer stays retryable: the ledger now refuses
-            # to re-run an attempt that was already dispatched, so a resubmit
-            # can only read the recorded outcome, never repeat the action.
+            # result -- but the pool wrapper around it, most often a ledger
+            # write. What may be written depends on whether an attempt was
+            # dispatched, so the newest row decides.
             row = agent.ledger.latest_row(command_id)
-            if row is None:
-                attempt = 1
-            elif row[2] is None:
-                # The marker of this attempt is already on disk; reusing its
-                # number keeps one row per attempt instead of writing a second
-                # row for the attempt that is being reported.
-                attempt = row[1]
-            else:
-                attempt = row[1] + 1
+            if row is not None and row[2] is None:
+                # An attempt is on disk with no result: its handler ran. A
+                # retryable failure here asks for attempt+1, and that is how a
+                # completed reset used to run a second time. It can only close
+                # as manual confirmation, and only by UPDATE -- ``save`` would
+                # upsert a retryable row over the marker.
+                error = f"{UNPERSISTED_RESULT_ERROR}: {type(exc).__name__}: {exc}"
+                LOGGER.error(
+                    "node action attempt closed without a result command_id=%s "
+                    "operation=%s attempt=%d reason=%s",
+                    command_id,
+                    command.operation.value,
+                    row[1],
+                    exc,
+                )
+                try:
+                    closed = agent.ledger.mark_interrupted(command_id, row[1], error)
+                except Exception:
+                    LOGGER.exception(
+                        "failed to close an asynchronous node action attempt "
+                        "command_id=%s",
+                        command_id,
+                    )
+                    closed = None
+                return closed or NodeActionResult(
+                    command_id=command_id,
+                    operation=command.operation,
+                    status=NodeActionStatus.INTERRUPTED,
+                    error=error,
+                    retryable=False,
+                    attempt=row[1],
+                )
+            # Nothing was dispatched under a new attempt number, so this is
+            # safe to retry: the ledger refuses to re-run a dispatched attempt.
             result = NodeActionResult(
                 command_id=command_id,
                 operation=command.operation,
                 status=NodeActionStatus.FAILED,
                 error=f"{type(exc).__name__}: {exc}",
                 retryable=True,
-                attempt=attempt,
+                attempt=row[1] + 1 if row is not None else 1,
             )
             try:
                 agent.ledger.save(result)
@@ -296,7 +323,7 @@ def create_node_agent_app(
                 )
             return result
 
-    def drop_future(command_id: str, future: Any = None) -> None:
+    def drop_future(command_id: str, future: Any) -> None:
         """Forget one command's future, unless a newer attempt replaced it.
 
         A future is done a moment before its callback runs, so a resubmit can
@@ -306,7 +333,7 @@ def create_node_agent_app(
         """
 
         with action_lock:
-            if future is not None and action_futures.get(command_id) is not future:
+            if action_futures.get(command_id) is not future:
                 return
             action_futures.pop(command_id, None)
             action_commands.pop(command_id, None)
@@ -338,7 +365,8 @@ def create_node_agent_app(
         result = agent.ledger.get(command_id)
         if result is None:
             return None
-        drop_future(command_id, future)
+        if future is not None:
+            drop_future(command_id, future)
         return NodeActionSubmission(
             command_id=command_id,
             state=NodeActionExecutionState(result.status.value),

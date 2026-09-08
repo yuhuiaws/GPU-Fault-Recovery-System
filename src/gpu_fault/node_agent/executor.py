@@ -377,14 +377,7 @@ class NodeActionExecutor(
                 if command.command_id in self._inflight:
                     # A live thread owns this attempt; the caller waits on it.
                     return None, attempt
-                result = self.ledger.mark_interrupted(
-                    command.command_id, attempt, UNPERSISTED_RESULT_ERROR
-                )
-            if result is None:
-                # The row was rewritten while we were looking at it.
-                result = self.ledger.get(command.command_id)
-            if result is None:
-                return None, attempt
+                result = self._close_dispatched_attempt(command, attempt)
             LOGGER.error(
                 "node action attempt was closed without a persisted result %s state=%s",
                 _command_log_fields(command, attempt),
@@ -393,6 +386,43 @@ class NodeActionExecutor(
         if not result.retryable:
             return result, attempt
         return None, result.attempt + 1
+
+    def _close_dispatched_attempt(
+        self, command: NodeActionCommand, attempt: int
+    ) -> NodeActionResult:
+        """Close a dispatched attempt that has no result, without ever raising.
+
+        Callers reach this from the submit path, where an exception escapes into
+        the pool wrapper -- and that wrapper used to answer with a *retryable*
+        failure, which asks for attempt+1 and re-runs the destructive handler.
+        A ledger that refuses both the UPDATE and the read still has to fail
+        closed, so the last resort is an unwritten INTERRUPTED answer: manual
+        confirmation, never a repeat.
+        """
+
+        closed: NodeActionResult | None = None
+        try:
+            closed = self.ledger.mark_interrupted(
+                command.command_id, attempt, UNPERSISTED_RESULT_ERROR
+            )
+            if closed is None:
+                # The row was rewritten while we were looking at it.
+                closed = self.ledger.get(command.command_id)
+        except Exception:  # noqa: BLE001 - a broken ledger must not re-run actions
+            LOGGER.exception(
+                "node action attempt could not be closed in the ledger %s",
+                _command_log_fields(command, attempt),
+            )
+        if closed is not None:
+            return closed
+        return NodeActionResult(
+            command_id=command.command_id,
+            operation=command.operation,
+            status=NodeActionStatus.INTERRUPTED,
+            error=UNPERSISTED_RESULT_ERROR,
+            retryable=False,
+            attempt=attempt,
+        )
 
     def execute(self, envelope: SignedNodeAction) -> NodeActionResult:
         command = self.validate_submission(envelope)
@@ -425,7 +455,17 @@ class NodeActionExecutor(
         fields = _command_log_fields(command, attempt)
         self._count("accepted")
         LOGGER.info("node action accepted %s", fields)
-        self.ledger.mark_in_progress(command, attempt, signature=envelope.signature)
+        try:
+            self.ledger.mark_in_progress(command, attempt, signature=envelope.signature)
+        except Exception:
+            # Nothing has been dispatched, but the Event is already registered.
+            # Leaving it unset turns every later submit for this command_id into
+            # a waiter that blocks for inflight_wait_timeout_seconds, so release
+            # it before the failure travels back to the caller.
+            with self._inflight_lock:
+                self._inflight.pop(command.command_id, None)
+                inflight.set()
+            raise
         LOGGER.info("node action started %s", fields)
         started = time.monotonic()
         exit_code: int | None = None
@@ -518,10 +558,10 @@ class NodeActionExecutor(
         try:
             self.ledger.mark_interrupted(result.command_id, result.attempt, error)
         except Exception:
-            # Even the marker could not be written. The in-memory result is all
-            # that is left: the caller keeps it (``/submit`` holds it in the
-            # future) so the poll answers INTERRUPTED instead of 404, and a
-            # resubmit finds the IN_PROGRESS row and closes it there.
+            # Even the marker could not be written, so nothing on disk shows
+            # this attempt finished and the poll answers 404. The IN_PROGRESS
+            # row is what protects the node: a resubmit closes it as INTERRUPTED
+            # instead of running the action again.
             LOGGER.exception(
                 "node action interrupted marker could not be written %s", fields
             )
