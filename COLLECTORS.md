@@ -308,10 +308,12 @@ exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样
 - power/thermal violation duration。
 - `DCGM_FI_DEV_XID_ERRORS`。
 
-DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段。Kubernetes collector 模板
-位于 `deploy/dataplane/gpu-metrics-collector.yaml`，默认访问节点
-`http://<host-ip>:9400/metrics`；若 exporter 没有 hostPort，应改为对应 Pod IP、Service
-或将 collector 作为 exporter sidecar。
+DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，两条启动路径
+（`deploy/dataplane/hyperpod-dcgm-exporter.yaml` 与 `deploy/systemd/gpu-fault-dcgm-exporter.service`）
+都以 `-c 15000` 采样并只绑定 `127.0.0.1:9400`；GPU metrics collector 由节点 systemd 单元
+`gpu-fault-metrics-collector.service` 在本机访问 `http://127.0.0.1:9400/metrics`。历史的
+in-cluster DaemonSet 模板 `gpu-metrics-collector.yaml` 已删除，不得重新引入同类 DaemonSet，
+否则同一节点会出现双 producer。
 
 不同 DCGM/GPU 代际可能同时暴露旧字段和 aggregate 字段。当前兼容契约为：
 
