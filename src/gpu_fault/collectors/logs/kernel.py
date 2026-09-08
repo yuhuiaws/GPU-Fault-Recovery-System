@@ -300,7 +300,8 @@ class KernelLogCollector:
         return reasons
 
     def _send_health_summary(self, observed_at: datetime) -> None:
-        self.sink.post(
+        result = deliver_event(
+            self.sink,
             COLLECTOR_HEALTH_PATH,
             {
                 "summary_id": (
@@ -313,6 +314,9 @@ class KernelLogCollector:
                 "edge_filter_reasons": self.health_summary_reasons(),
             },
         )
+        # A summary the outbox took is on its way; only one that went nowhere
+        # is reported by the caller's guard (ARCH-G3).
+        result.raise_for_failure()
 
     @staticmethod
     def _seek_to_live_tail(stream: Any) -> None:

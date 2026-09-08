@@ -4,11 +4,13 @@ from tests._builders import asgi_client, build_context, copy_model
 
 from ._support import (
     NOW,
+    BufferingSink,
     CollectorError,
     FabricManagerLogCollector,
     KernelLogCollector,
     NodeLogCollector,
     RecordingSink,
+    StopTheLoop,
     context,
     io,
     json,
@@ -1012,3 +1014,40 @@ def test_fabric_manager_bounds_the_tracked_file_table(tmp_path, caplog) -> None:
     assert len(files) <= 3, files
     assert str(live) in files, "the live file was evicted instead of a stale one"
     assert "tracked" in caplog.text.lower(), "the eviction was not logged"
+
+
+def test_fabric_manager_buffered_health_summary_is_not_a_failed_round(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A health summary the outbox took must not fail the collection round.
+
+    The summary was posted with a bare ``sink.post`` after the batch loop, so
+    the ``CollectorError`` it raises once the outbox has taken the record
+    escaped ``collect_once`` and the run loop logged the whole round as
+    "Fabric Manager log collection failed" -- although every record committed
+    and the summary schedule had already advanced.
+    """
+
+    from gpu_fault.collectors.logs import fabric_manager as module
+
+    sink = BufferingSink()
+    collector = FabricManagerLogCollector(
+        sink, context(), node_id="worker-1", journal_enabled=False, now=lambda: NOW
+    )
+    collector.now = lambda: NOW + timedelta(seconds=600)
+    monkeypatch.setattr(
+        module.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopTheLoop())
+    )
+
+    with caplog.at_level(
+        logging.ERROR, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        with pytest.raises(StopTheLoop):
+            collector.run()
+
+    assert [path for path, _payload in sink.requests] == [
+        "/v1/collector-events/collector-health"
+    ], "the health summary was not handed to the sink"
+    assert "log collection failed" not in caplog.text, (
+        "a buffered health summary was reported as a failed collection round"
+    )

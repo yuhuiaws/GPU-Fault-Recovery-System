@@ -150,8 +150,29 @@ class FabricManagerLogCollector:
                 self._commit_record(record)
         finally:
             self._flush_state()
-        self._maybe_health_summary(collected_at)
+        self._deliver_health_summary_without_failing_the_round(collected_at)
         return stats
+
+    def _deliver_health_summary_without_failing_the_round(
+        self, observed_at: datetime
+    ) -> None:
+        """A lost health summary is not a failed collection round.
+
+        The summary used to be posted with a bare ``sink.post`` whose
+        ``CollectorError`` escaped ``collect_once``, so the run loop logged
+        "Fabric Manager log collection failed" for a round in which every SXID
+        committed and the summary schedule had already advanced. The kernel
+        collector answers the same way for its own summary.
+        """
+
+        try:
+            self._maybe_health_summary(observed_at)
+        except CollectorError as exc:
+            LOGGER.warning(
+                "Fabric Manager health summary delivery failed; "
+                "the collection round is unaffected: %s",
+                exc,
+            )
 
     def _maybe_health_summary(self, observed_at: datetime) -> None:
         if observed_at < self._next_health_summary:
@@ -163,7 +184,8 @@ class FabricManagerLogCollector:
             channel=CollectorKind.FABRIC_MANAGER_LOG.value,
             interval_seconds=self.health_summary_seconds,
         )
-        self.sink.post(
+        result = deliver_event(
+            self.sink,
             COLLECTOR_HEALTH_PATH,
             {
                 "summary_id": (
@@ -176,6 +198,9 @@ class FabricManagerLogCollector:
                 "edge_filter_reasons": ["health-summary"],
             },
         )
+        # A summary the outbox took is on its way; only one that went nowhere
+        # is reported (ARCH-G3).
+        result.raise_for_failure()
 
     def run(self) -> None:
         while True:
