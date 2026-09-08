@@ -452,3 +452,77 @@ def test_a_resume_offset_inside_an_unfinished_line_holds_and_says_so(
     assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
         resume
     ), "the offset moved past a line that was never complete"
+
+
+def test_a_new_training_log_with_an_unfinished_tail_records_its_position(
+    tmp_path, monkeypatch
+) -> None:
+    """A file that yields nothing this poll must still be remembered.
+
+    With ``initial_tail_bytes=0`` a newly discovered log resumes at its size,
+    which is normally inside the line the job is still writing: the read
+    correctly delivers nothing, but it also used to persist nothing, so the next
+    poll saw the file as new again and re-baselined at the *larger* size --
+    everything appended in between was skipped, with no discard counted and no
+    collection error, only a rate-limited warning. Recording the position is
+    what makes "nothing readable yet" different from "nothing there".
+    """
+
+    _absent_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text(f"{MATCHING} first\nhalf a li", encoding="utf-8")
+    held = log.stat().st_size
+    collector = _collector(state, training_log_paths=[str(log)])
+
+    first = collector.collect_once()
+
+    assert first.entries == [], (
+        f"an unfinished line must not be delivered half: {first.entries}"
+    )
+    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
+        held
+    ), "the position of a file that yielded nothing was not recorded"
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"ne finished\n{MATCHING} second\n")
+
+    second = collector.collect_once()
+
+    assert any("second" in entry.message for entry in second.entries), (
+        f"the entry written after the unfinished line was skipped: {second.entries}"
+    )
+
+
+def test_an_unreadable_training_log_does_not_lose_the_journal_entries(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A file this collector may not open costs its own lines, nothing else.
+
+    ``stat`` was guarded and ``open`` was not, so a 0600 training log -- or one
+    rotated away between the stat and the open -- raised ``OSError`` out of
+    ``collect_once``, which rolls the cursor back: the journal entries of the
+    same poll were dropped and the next poll failed on the same file, for ever.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text(f"{MATCHING} unreadable\n", encoding="utf-8")
+    _write_file_state(state, log, offset=0)
+    log.chmod(0o000)
+    runner = _Journalctl(stdout=_journal_line("c-1", MATCHING, NOW) + "\n")
+    collector = _collector(state, runner=runner, training_log_paths=[str(log)])
+
+    with caplog.at_level(logging.WARNING, logger=node_module.LOGGER.name):
+        batch = collector.collect_once()
+
+    assert [entry.source for entry in batch.entries] == ["journal"], (
+        f"one unreadable file cost the poll its journal entries: {batch.entries}"
+    )
+    assert any("unreadable-training-logs=1" in item for item in batch.collection_errors), (
+        f"a file that could not be read must be counted: {batch.collection_errors}"
+    )
+    assert any(str(log) in record.message for record in caplog.records), (
+        "the unreadable path was never named in the log"
+    )

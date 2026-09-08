@@ -203,7 +203,7 @@ def test_an_overflowing_window_takes_the_oldest_and_leaves_the_rest(
         "journalctl must not be the one dropping entries"
     )
     assert len(batch.collection_errors) == 1, "one report for one truncated window"
-    assert "took the oldest 2" in batch.collection_errors[0], (
+    assert "read the oldest 2" in batch.collection_errors[0], (
         "the batch says how the window was cut"
     )
     assert json.loads(state.read_text())["journal_since"] == second.isoformat(), (

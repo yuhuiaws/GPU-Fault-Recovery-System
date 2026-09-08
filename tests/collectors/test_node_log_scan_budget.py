@@ -76,7 +76,9 @@ class _StreamingJournalctl:
         for line in self._pending:
             self.consumed += 1
             yield line
-        self.returncode = self._final_returncode
+        # No `returncode` here on purpose: a real child that has closed its
+        # stdout has not been waited for yet, so `poll()` is still None. A fake
+        # that exits at EOF would hide a reap that signals a healthy child.
 
     def poll(self) -> int | None:
         return self.returncode
@@ -298,7 +300,156 @@ def test_the_journal_child_is_reaped_when_the_scan_reads_the_whole_window(
 
     assert len(batch.entries) == 1, f"the match was not batched: {batch.entries}"
     assert runner.communicated == 1, "the child was never waited for"
-    assert runner.terminated == 0, "a child that already exited must not be signalled"
+    assert runner.terminated == 0, (
+        "a child that finished the window must be waited for, not signalled: "
+        "SIGTERM makes it exit -15, which reads as a failed poll"
+    )
+    assert json.loads(state.read_text())["journal_since"] == NOW.isoformat(), (
+        "the whole window was read, so the cursor must reach its end"
+    )
+    assert not any("journalctl exited" in item for item in batch.collection_errors), (
+        f"a complete read reported as a failure: {batch.collection_errors}"
+    )
+
+
+class _Clock:
+    """A monotonic clock that only the test moves."""
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+
+    def now(self) -> float:
+        return self.seconds
+
+
+class _SlowStartJournalctl(_StreamingJournalctl):
+    """A child whose first line arrives ``startup`` seconds after it is spawned."""
+
+    def __init__(
+        self, lines: Iterable[str], *, clock: _Clock, startup: float
+    ) -> None:
+        super().__init__(lines)
+        self._clock = clock
+        self._startup = startup
+
+    def _stream(self) -> Iterator[str]:
+        # journalctl opening the journal files on a cold page cache: 332 ms
+        # measured on a busy node, more than the whole 200 ms scan budget.
+        self._clock.advance(self._startup)
+        yield from super()._stream()
+
+
+def test_journalctl_start_up_does_not_consume_the_wall_clock_budget(
+    tmp_path, monkeypatch
+) -> None:
+    """The 200 ms budget bounds the scan, not the time before it can start.
+
+    The deadline used to start when ``Popen`` returned, so journalctl's own
+    start-up had already spent it before the first line arrived: `spent()`
+    returned after a single entry, the cursor advanced one entry per 10 s poll,
+    and the window grew to the 900 s cap -- which is loss, reported as
+    `journal-window-capped-seconds`, on a node whose journal is merely cold.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    clock = _Clock()
+    first = NOW - timedelta(seconds=50)
+    runner = _SlowStartJournalctl(
+        [
+            _journal_line(
+                f"c-{index}",
+                f"{MATCHING} {index}",
+                first + timedelta(seconds=index * 10),
+            )
+            for index in range(5)
+        ],
+        clock=clock,
+        startup=1.0,
+    )
+    collector = _collector(state, runner=runner, monotonic=clock.now, scan_seconds=0.2)
+
+    batch = collector.collect_once()
+
+    assert runner.consumed == 5, (
+        f"start-up spent the scan budget: only {runner.consumed} lines were read"
+    )
+    assert len(batch.entries) == 5, f"the window was not batched: {batch.entries}"
+    assert not any("wall-clock" in item for item in batch.collection_errors), (
+        f"a cold journal reported as a budget stop: {batch.collection_errors}"
+    )
+    assert json.loads(state.read_text())["journal_since"] == NOW.isoformat(), (
+        "a poll that read the whole window must leave the cursor at its end"
+    )
+
+
+class _JournalctlSequence:
+    """A fresh child per poll, the way ``Popen`` hands one back per invocation."""
+
+    def __init__(self, polls: list[list[str]]) -> None:
+        self._polls = list(polls)
+        self.children: list[_StreamingJournalctl] = []
+
+    def __call__(self, command: Iterable[str], **kwargs: object) -> Any:
+        lines = self._polls.pop(0) if self._polls else []
+        child = _StreamingJournalctl(lines)
+        self.children.append(child)
+        return child(command, **kwargs)
+
+
+def test_two_busy_sources_share_one_entry_budget(tmp_path, monkeypatch) -> None:
+    """The cursor may only pass what the batch can carry, across both sources.
+
+    The entry budget was per source while ``_limit_entries`` caps the whole
+    batch, so a poll with a busy journal and a busy training log read up to 2x
+    the cap and dropped the excess (`batch-limit-entries`) *after* both cursors
+    had moved past it. The dropped half was the training log's, and it was gone:
+    its offset had already advanced.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text("starting up\n", encoding="utf-8")
+    flood = [
+        _journal_line(f"c-{index}", f"{MATCHING} journal {index}", NOW)
+        for index in range(10)
+    ]
+    runner = _JournalctlSequence([[], flood, []])
+    collector = _collector(
+        state,
+        runner=runner,
+        training_log_paths=[str(log)],
+        max_entries_per_batch=4,
+        context_lines=0,
+    )
+
+    collector.collect_once()
+    baseline = json.loads(state.read_text())["training_log_files"][str(log)]["offset"]
+    with log.open("a", encoding="utf-8") as handle:
+        for index in range(10):
+            handle.write(f"{MATCHING} appended {index}\n")
+
+    busy = collector.collect_once()
+
+    assert [entry.source for entry in busy.entries] == ["journal"] * 4, (
+        f"the shared cap was overrun: {[entry.source for entry in busy.entries]}"
+    )
+    assert not any("batch-limit-entries" in item for item in busy.collection_errors), (
+        f"entries were read past the batch cap and dropped: {busy.collection_errors}"
+    )
+    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
+        baseline
+    ), "the training log's offset moved past lines the batch never carried"
+
+    quiet = collector.collect_once()
+
+    assert any("appended 0" in entry.message for entry in quiet.entries), (
+        f"the deferred training lines were lost, not deferred: {quiet.entries}"
+    )
 
 
 def test_a_scan_that_runs_out_of_time_stops_at_the_last_entry_it_read(

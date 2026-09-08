@@ -13,10 +13,17 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, Callable
 
 from gpu_fault.channel_registry import NODE_LOG_PATH
 from gpu_fault.collector_requirements import COLLECTOR_SYSTEMD_UNITS
+from gpu_fault.collectors.logs.node_sources import (
+    SOURCE_SCAN_BYTE_BUDGET,
+    SOURCE_SCAN_SECONDS_BUDGET,
+    _bounded_message,
+    _ScanBudget,
+    _TrainingLogs,
+)
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import EventSink, deliver_event
@@ -25,26 +32,12 @@ from gpu_fault.log_rules import log_signal_priority, matching_log_rules
 
 LOGGER = logging.getLogger(__name__)
 
-#: How many bytes one poll may read from one source: the journal is one, the
-#: training logs together are the other. What is left unread stays behind the
-#: cursor, so the bound costs latency and never evidence.
-SOURCE_SCAN_BYTE_BUDGET = 4 * 1024 * 1024
-
-#: How long one poll may spend reading one source. The interval is 10 s and
-#: there are two sources, so 200 ms each keeps the poll far inside it while
-#: still covering thousands of lines.
-SOURCE_SCAN_SECONDS_BUDGET = 0.2
-
 #: How long a streamed ``journalctl`` may take to finish its window before it
 #: is killed: what ``subprocess.run(timeout=30)`` used to bound.
 JOURNAL_READ_TIMEOUT_SECONDS = 30.0
 
 #: How long to wait for a signalled ``journalctl`` to exit before killing it.
 JOURNAL_REAP_SECONDS = 5.0
-
-#: How often to repeat the warning that a resume offset sits inside a line the
-#: writer has not finished: the condition recurs every poll while it lasts.
-PARTIAL_RESUME_WARN_INTERVAL_SECONDS = 300.0
 
 
 def excluded_journal_units() -> frozenset[str]:
@@ -112,18 +105,6 @@ def _stderr_detail(stderr: str | None) -> str:
 
 def _entry_size(entry: NodeLogEntry) -> int:
     return len(entry.model_dump_json().encode("utf-8"))
-
-
-def _bounded_message(message: str, max_bytes: int) -> str:
-    raw = message.encode("utf-8", errors="replace")
-    if len(raw) <= max_bytes:
-        return message
-    marker = b"\n...[node-log-entry-truncated]...\n"
-    available = max(0, max_bytes - len(marker))
-    prefix = available // 2
-    suffix = available - prefix
-    bounded = raw[:prefix] + marker + raw[-suffix:]
-    return bounded.decode("utf-8", errors="replace")
 
 
 def _decode_files(stored: dict[str, Any]) -> dict[str, dict[str, int]]:
@@ -254,7 +235,7 @@ def _budget_error(
         # loss that looked like a quiet node. The boundary entry is read
         # again next poll and de-duplicated by its cursor id.
         return (
-            f"{window} filled the batch, took the oldest {kept} entries and "
+            f"{window} filled the batch, read the oldest {kept} entries and "
             "left the rest for the next poll"
         )
     return (
@@ -264,12 +245,20 @@ def _budget_error(
     )
 
 
-def _reap_journal(child: Any, scan: _JournalScan, *, streamed: bool) -> None:
+def _reap_journal(
+    child: Any, scan: _JournalScan, *, streamed: bool, stopped_early: bool
+) -> None:
     """Leave nothing running, and read how the child ended.
 
     A scan that stopped at its budget leaves journalctl writing into a pipe
     nobody reads: it has to be signalled and then drained by ``communicate``, or
     it blocks on its own write and never exits.
+
+    A scan that read the window to its end must *not* be signalled. Closing
+    stdout is not exiting: the child is still un-waited, so ``poll()`` is None,
+    and a SIGTERM there made a healthy poll exit -15 -- reported as
+    ``journalctl exited -15``, counted as a `journalctl-failures`, and the cursor
+    held on a window that had in fact been read completely.
     """
 
     if not streamed:
@@ -277,7 +266,7 @@ def _reap_journal(child: Any, scan: _JournalScan, *, streamed: bool) -> None:
         scan.stderr = str(getattr(child, "stderr", "") or "")
         return
     try:
-        if child.poll() is None:
+        if stopped_early and child.poll() is None:
             child.terminate()
         _, stderr = child.communicate(timeout=JOURNAL_REAP_SECONDS)
     except subprocess.TimeoutExpired:
@@ -285,74 +274,6 @@ def _reap_journal(child: Any, scan: _JournalScan, *, streamed: bool) -> None:
         _, stderr = child.communicate()
     scan.stderr = str(stderr or "")
     scan.returncode = int(child.returncode or 0)
-
-
-class _ScanBudget:
-    """How much of one source one poll may read, and how much it would keep.
-
-    The entry cap used to be applied to raw lines, which is not what a batch
-    carries: 1000 lines of kubelet chatter filled it on their own and were then
-    dropped by ``_with_context``, so at a 10 s interval a source could not
-    deliver more than 100 lines/s of anything and the machine check behind the
-    chatter waited for the 900 s window cap.
-
-    ``kept`` counts what would survive ``_with_context`` instead: a matched
-    line, the uncounted ``context_lines`` before it and the ones after it, with
-    the overlap of two neighbours counted once.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_bytes: int,
-        max_seconds: float,
-        max_entries: int,
-        context_lines: int,
-    ) -> None:
-        self.max_bytes = max_bytes
-        self.max_seconds = max_seconds
-        self.max_entries = max_entries
-        self.context_lines = context_lines
-        self.bytes_read = 0
-        self.kept = 0
-        self.stop_reason: str | None = None
-        self._deadline = time.monotonic() + max_seconds
-        self._leading = 0
-        self._trailing = 0
-
-    def account(self, raw_bytes: int, *, matched: bool) -> None:
-        """Count one raw line that has been read, and what it costs the batch."""
-
-        self.bytes_read += raw_bytes
-        if matched:
-            self.kept += 1 + min(self._leading, self.context_lines)
-            self._leading = 0
-            self._trailing = self.context_lines
-        elif self._trailing:
-            # Trailing context of an earlier match: already kept, so it cannot
-            # also be counted as leading context of a later one.
-            self._trailing -= 1
-            self.kept += 1
-            self._leading = 0
-        else:
-            self._leading = min(self._leading + 1, self.context_lines)
-
-    def spent(self) -> str | None:
-        """Why the scan must stop, or ``None``.
-
-        Checked after a line has been read, never before: a budget that stopped
-        a poll before its first line would leave the cursor where it was and the
-        collector would make no progress at all, for ever.
-        """
-
-        if self.stop_reason is None:
-            if self.kept >= self.max_entries:
-                self.stop_reason = "entries"
-            elif self.bytes_read >= self.max_bytes:
-                self.stop_reason = "byte"
-            elif time.monotonic() >= self._deadline:
-                self.stop_reason = "wall-clock"
-        return self.stop_reason
 
 
 @dataclass(frozen=True)
@@ -387,433 +308,6 @@ class _JournalScan:
     stderr: str = ""
 
 
-@dataclass(frozen=True)
-class _TrainingRead:
-    """One training log, its identity this poll, and where to resume reading."""
-
-    key: str
-    stat: os.stat_result
-    offset: int
-
-
-class _TrainingLogs:
-    """Which training logs are read, and where the reading resumes in each.
-
-    The whole of one source: the offset table, the rotation rules that decide
-    whether a name still holds the file it held, and the byte-accurate reader that
-    will not deliver half a line. The two reporting channels and the entry
-    identity are not this reader's to define, so the collector hands them over.
-    """
-
-    def __init__(
-        self,
-        *,
-        paths: list[str],
-        initial_tail_bytes: int,
-        max_tracked_files: int,
-        max_entry_bytes: int,
-        entry_identity: Callable[..., str],
-        record_discard: Callable[..., None],
-        record_error: Callable[[str], None],
-    ) -> None:
-        self.paths = paths
-        self.initial_tail_bytes = initial_tail_bytes
-        self.max_tracked_files = max_tracked_files
-        self.max_entry_bytes = max_entry_bytes
-        self.entry_identity = entry_identity
-        self.record_discard = record_discard
-        self.record_error = record_error
-        # Per training log: `device`, `inode` and `offset` in bytes. The offset
-        # alone was not enough -- a rotated file kept the old offset and the
-        # collector read from the middle of the new one.
-        self.files: dict[str, dict[str, int]] = {}
-        # Which expanded path the last poll stopped on, so the next one resumes
-        # after it instead of starting from the front of the list.
-        self.resume_after: str | None = None
-        self._resync_warned = False
-        self._partial_resume_warned: tuple[str, int, float] | None = None
-
-    def _ordered_paths(self) -> list[str]:
-        """Every configured training log that exists now, in a fair order.
-
-        The list is rotated to start after the path the previous poll stopped on.
-        A poll that spent its whole budget on the first path used to return there
-        and the next poll started at the front again, so with one busy log first in
-        the configuration every path after it was never read at all -- not late,
-        never -- for as long as the busy one stayed busy. Rotating costs nothing
-        when the budget is not exhausted, because then every path is visited
-        either way.
-        """
-
-        ordered = list(
-            dict.fromkeys(
-                str(path)
-                for configured in self.paths
-                for path in sorted(Path("/").glob(configured.lstrip("/")))
-                if path.is_file()
-            )
-        )
-        if self.resume_after is None or self.resume_after not in ordered:
-            return ordered
-        cut = ordered.index(self.resume_after) + 1
-        return ordered[cut:] + ordered[:cut]
-
-    def _resume_plan(self, ordered: list[str]) -> list[_TrainingRead]:
-        """Where every training log resumes, decided before any of them is read.
-
-        The offsets are all resolved first because one rotation makes two names
-        share one inode for one poll: the glob sorts ``training.log`` before
-        ``training.log.1``, so reading in order would commit the replacement's
-        identity under the old name and the renamed file could not inherit it.
-        """
-
-        live: list[tuple[str, os.stat_result]] = []
-        for key in ordered:
-            try:
-                live.append((key, Path(key).stat()))
-            except OSError:
-                # There when the glob ran and gone now: a rotation that landed in
-                # between. `_bound_tracked_files` drops what it left behind.
-                continue
-        identities = {key: (stat.st_dev, stat.st_ino) for key, stat in live}
-        return [
-            _TrainingRead(key, stat, self._offset_for(key, stat, identities))
-            for key, stat in live
-        ]
-
-    def _offset_for(
-        self,
-        key: str,
-        stat: os.stat_result,
-        identities: dict[str, tuple[int, int]],
-    ) -> int:
-        """Where to resume reading one training log, in bytes.
-
-        The offset alone cannot tell "the file grew" from "the file was
-        replaced": both leave a name at a byte count. The recorded device and
-        inode are what catch a rotation, whose old offset would otherwise land
-        in the middle of the new file.
-        """
-
-        previous = self.files.get(key)
-        if previous is None:
-            inherited = self._inherit_rotated_offset(key, stat, identities=identities)
-            if inherited is not None:
-                return inherited
-            return max(0, stat.st_size - self.initial_tail_bytes)
-        recorded = int(previous.get("offset", 0))
-        device = previous.get("device")
-        if device is not None and (
-            device != stat.st_dev or previous.get("inode") != stat.st_ino
-        ):
-            self._report_rotation(key, previous, recorded, identities)
-            return 0
-        if stat.st_size < recorded:
-            self.record_discard("truncated-training-logs")
-            self.record_error(
-                f"{key} was truncated to {stat.st_size} bytes below the {recorded} "
-                "already read, reading it from the start"
-            )
-            return 0
-        return min(recorded, stat.st_size)
-
-    def _report_rotation(
-        self,
-        key: str,
-        previous: dict[str, int],
-        recorded: int,
-        identities: dict[str, tuple[int, int]],
-    ) -> None:
-        """Say that this name holds a different file now, and whether that is loss.
-
-        It is not loss when the file it held is still on disk under another
-        name: a rename, whose tail is read there. Counting that as loss made
-        every logrotate cycle look like dropped evidence.
-
-        A matching inode number is not proof of a rename: unlinking a file frees
-        its inode and the next file created in that directory can be given the
-        same number. A name already tracked under an identity of its own is
-        therefore rejected (see ``_identity_is_free``), or a lost tail would be
-        reported as readable elsewhere.
-        """
-
-        identity = (previous.get("device"), previous.get("inode"))
-        successor = next(
-            (
-                other
-                for other, item in identities.items()
-                if other != key
-                and item == identity
-                and self._identity_is_free(other, identity)
-            ),
-            None,
-        )
-        if successor is not None:
-            self.record_error(
-                f"{key} was rotated to {successor} with {recorded} bytes read; its "
-                "tail is read under that name and the replacement from the start"
-            )
-            return
-        self.record_discard("rotated-training-logs")
-        self.record_error(
-            f"{key} was rotated (device/inode changed) with {recorded} bytes "
-            "read, reading the replacement from the start"
-        )
-
-    def _identity_is_free(self, key: str, identity: tuple[Any, Any]) -> bool:
-        """Whether ``key`` could be a name this identity moved to.
-
-        It could not if ``key`` was already being read as a file of its own: then
-        both names changed inode and the match is a recycled number.
-        """
-
-        tracked = self.files.get(key)
-        if tracked is None:
-            return True
-        return (tracked.get("device"), tracked.get("inode")) == identity
-
-    def _inherit_rotated_offset(
-        self,
-        key: str,
-        stat: os.stat_result,
-        *,
-        identities: dict[str, tuple[int, int]],
-    ) -> int | None:
-        """The offset of this inode under the name it had before the rotation.
-
-        logrotate renames ``training.log`` to ``training.log.1``, so the same
-        inode reappears under a name with no offset of its own. Baselining it at
-        EOF discarded every line written between the last poll and the rename --
-        the lines that made the log rotate. The old name keeps an offset at the
-        start of its replacement, or loses it when nothing is there any more.
-        """
-
-        identity = (stat.st_dev, stat.st_ino)
-        for other, record in list(self.files.items()):
-            if other == key:
-                continue
-            if (record.get("device"), record.get("inode")) != identity:
-                continue
-            if identities.get(other) == identity:
-                # Two names for one inode (a hard link, or two globs matching the
-                # same file): its offset is not this key's to take.
-                continue
-            if stat.st_size < int(record.get("offset", 0)):
-                # A renamed file still holds everything that was read from it, so
-                # one that is now shorter than the offset is a different file that
-                # was given a recycled inode number. Inheriting would seek past
-                # its first lines.
-                continue
-            offset = min(int(record.get("offset", 0)), stat.st_size)
-            replacement = identities.get(other)
-            if replacement is None:
-                del self.files[other]
-            else:
-                self.files[other] = {
-                    "device": replacement[0],
-                    "inode": replacement[1],
-                    "offset": 0,
-                }
-            self.files[key] = {
-                "device": stat.st_dev,
-                "inode": stat.st_ino,
-                "offset": offset,
-            }
-            LOGGER.warning(
-                "training log %s was rotated to %s; resuming its tail at byte %d "
-                "instead of baselining at the end",
-                other,
-                key,
-                offset,
-            )
-            return offset
-        return None
-
-    def _bound_tracked_files(self, visited: set[str]) -> None:
-        """Keeps the persisted offset table from growing without end.
-
-        A glob over dated filenames -- ``train-2026-*.log`` -- adds a record per
-        file and nothing ever removed one, so months of vanished files stayed in
-        the state file and in memory.
-
-        A path is only dropped on identity when it is actually gone. One that
-        exists but was not visited this poll still holds a real offset, and that is
-        what the rotation above depends on: forgetting those would make every
-        skipped file look new and tail it, losing whatever was written meanwhile.
-        Past the cap the earliest recorded paths go first and that is reported,
-        because forgetting an offset while the file is still there is loss.
-        """
-
-        for key in [
-            key for key in self.files if key not in visited and not Path(key).exists()
-        ]:
-            del self.files[key]
-        surplus = len(self.files) - self.max_tracked_files
-        if surplus <= 0:
-            return
-        stale = [key for key in self.files if key not in visited][:surplus]
-        for key in stale:
-            del self.files[key]
-        self.record_discard("forgotten-training-log-offsets", len(stale))
-        self.record_error(
-            f"tracking {len(self.files) + len(stale)} training logs over the "
-            f"{self.max_tracked_files} limit, forgot the offsets of {len(stale)}: "
-            "they will be tailed rather than resumed if they are read again"
-        )
-
-    def read(self, observed_at: datetime, *, budget: _ScanBudget) -> list[NodeLogEntry]:
-        """Read the configured training logs under one shared scan budget.
-
-        The budget is shared across the paths on purpose: that is what makes the
-        fair rotation mean anything, because a poll stops at the path where the
-        budget ran out and the next one starts after it.
-        """
-
-        entries: list[NodeLogEntry] = []
-        ordered = self._ordered_paths()
-        visited: list[str] = []
-        for read in self._resume_plan(ordered):
-            visited.append(read.key)
-            entries.extend(self._entries_from_file(read, observed_at, budget))
-            if budget.spent():
-                # Stopping here rather than trying the remaining paths with an
-                # empty budget is what makes the rotation fair: the next poll
-                # starts at the path after this one.
-                break
-        self.resume_after = visited[-1] if visited else None
-        unread = len(ordered) - len(visited)
-        if unread:
-            stopped = visited[-1] if visited else "no readable path"
-            self.record_discard("deferred-training-log-reads", unread)
-            self.record_error(
-                f"{unread} of {len(ordered)} training logs were not read this poll "
-                f"(batch limits reached at {stopped}), the next poll resumes "
-                "after that one"
-            )
-        self._bound_tracked_files(set(visited))
-        return entries
-
-    def _entries_from_file(
-        self, read: _TrainingRead, observed_at: datetime, budget: _ScanBudget
-    ) -> list[NodeLogEntry]:
-        """Read one training log from its byte offset, line by whole line.
-
-        The file is opened in binary because the offsets are byte counts: a
-        ``TextIOWrapper.tell()`` cookie cannot be compared with ``st_size`` and
-        can point inside a multibyte character.
-        """
-
-        entries: list[NodeLogEntry] = []
-        with Path(read.key).open("rb") as stream:
-            if not self._seek_to_a_line(read, stream):
-                return entries
-            while True:
-                start = stream.tell()
-                raw = stream.readline()
-                if not raw:
-                    break
-                if not raw.endswith(b"\n"):
-                    # The job has not finished writing this line: the offset goes
-                    # back to `start` so the next poll reads it whole rather than
-                    # committing a position inside it and losing the half that
-                    # says which rank aborted.
-                    stream.seek(start)
-                    break
-                message = _bounded_message(
-                    raw.decode("utf-8", errors="replace").rstrip("\n"),
-                    self.max_entry_bytes,
-                )
-                entries.append(
-                    NodeLogEntry(
-                        entry_id=self.entry_identity(
-                            read.stat.st_dev, read.stat.st_ino, read.key, start
-                        ),
-                        source="training-log",
-                        observed_at=observed_at,
-                        message=message,
-                        fields={"path": read.key},
-                    )
-                )
-                budget.account(len(raw), matched=bool(matching_log_rules(message)))
-                if budget.spent():
-                    break
-            self.files[read.key] = {
-                "device": read.stat.st_dev,
-                "inode": read.stat.st_ino,
-                "offset": stream.tell(),
-            }
-        return entries
-
-    def _seek_to_a_line(self, read: _TrainingRead, stream: BinaryIO) -> bool:
-        """Position the stream on a line boundary, or report that it cannot be.
-
-        Returns ``False`` when the offset sits inside a line with no terminator
-        yet: nothing can be read from the file until it has one.
-        """
-
-        offset = read.offset
-        stream.seek(offset)
-        if offset <= 0:
-            return True
-        stream.seek(offset - 1)
-        boundary = stream.read(1)
-        if boundary == b"\n":
-            return True
-        skipped = stream.readline()
-        if not skipped.endswith(b"\n"):
-            self._warn_resume_inside_an_unfinished_line(read.key, offset)
-            return False
-        self._warn_resumed_inside_a_line(read.key, offset)
-        return True
-
-    def _warn_resumed_inside_a_line(self, key: str, offset: int) -> None:
-        """Say once that an offset did not land on a line boundary.
-
-        An offset written by an older agent is a text cookie, and one written by
-        a crash mid-append can point anywhere. Either way the read re-syncs to
-        the next newline, which is worth one warning per process, not one per
-        line.
-        """
-
-        if self._resync_warned:
-            return
-        self._resync_warned = True
-        LOGGER.warning(
-            "training log %s resumed at byte %d, which is not a line boundary; "
-            "re-syncing to the next line (an offset from before the offsets were "
-            "byte counts, or a torn append)",
-            key,
-            offset,
-        )
-
-    def _warn_resume_inside_an_unfinished_line(self, key: str, offset: int) -> None:
-        """Say that the resume offset sits inside a line nobody has finished.
-
-        The read makes no progress until the line has its terminator, which is
-        the point -- but in silence that is indistinguishable from a quiet file,
-        and a log whose last line never completes would never be read again with
-        nothing said. Rate limited per file and offset: the condition repeats.
-        """
-
-        now = time.monotonic()
-        last = self._partial_resume_warned
-        if (
-            last is not None
-            and last[0] == key
-            and last[1] == offset
-            and now - last[2] < PARTIAL_RESUME_WARN_INTERVAL_SECONDS
-        ):
-            return
-        self._partial_resume_warned = (key, offset, now)
-        LOGGER.warning(
-            "training log %s resumed at byte %d, inside a line the job has not "
-            "finished writing; holding the offset there until the line is "
-            "complete (nothing is read from this file meanwhile)",
-            key,
-            offset,
-        )
-
-
 class NodeLogCollector:
     """Polls journald/dmesg and configured training logs with stable IDs."""
 
@@ -836,6 +330,7 @@ class NodeLogCollector:
         scan_seconds: float | None = None,
         journal_timeout_seconds: float | None = None,
         now: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         runner: Callable[..., Any] = subprocess.Popen,
     ) -> None:
         self.sink = sink
@@ -845,6 +340,9 @@ class NodeLogCollector:
         self.interval_seconds = interval_seconds
         self.training_log_paths = training_log_paths or []
         self.now = now or (lambda: datetime.now(timezone.utc))
+        # The scan budgets read the clock through this, so a test can show that
+        # a child's start-up latency does not consume the budget.
+        self.monotonic = monotonic
         self.runner = runner
         self._journal_since: datetime | None = None
         self._collection_errors: list[str] = []
@@ -958,8 +456,16 @@ class NodeLogCollector:
             # Each source keeps its own context: neighbouring lines only mean
             # anything within the stream they were written to.
             entries = _with_context(journal.entries, self.context_lines)
+            # What the journal already put in the batch is what the training
+            # logs may no longer read: one entry allowance, one batch.
             entries.extend(
-                _with_context(self._training_logs(collected_at), self.context_lines)
+                _with_context(
+                    self._training_logs(
+                        collected_at,
+                        allowance=max(0, self.max_entries_per_batch - len(entries)),
+                    ),
+                    self.context_lines,
+                )
             )
             candidates = len(entries)
             entries = _limit_entries(
@@ -1050,15 +556,21 @@ class NodeLogCollector:
                 LOGGER.exception("node log collection failed")
             time.sleep(self.interval_seconds)
 
-    def _training_logs(self, observed_at: datetime) -> list[NodeLogEntry]:
+    def _training_logs(
+        self, observed_at: datetime, *, allowance: int | None = None
+    ) -> list[NodeLogEntry]:
         """Read the configured training logs under one shared scan budget.
 
         The budget is shared across the paths on purpose: that is what makes the
         fair rotation mean anything, because a poll stops at the path where the
-        budget ran out and the next one starts after it.
+        budget ran out and the next one starts after it. ``allowance`` is how
+        many entries the batch has left after the journal, so the offsets cannot
+        move past lines this batch has no room for.
         """
 
-        return self._training.read(observed_at, budget=self._scan_budget())
+        return self._training.read(
+            observed_at, budget=self._scan_budget(max_entries=allowance)
+        )
 
     def _snapshot(self) -> dict[str, Any]:
         """Everything a poll that goes nowhere has to put back.
@@ -1147,12 +659,23 @@ class NodeLogCollector:
             errors.append(f"cumulative loss since collector start: {totals}")
         return errors
 
-    def _scan_budget(self) -> _ScanBudget:
+    def _scan_budget(self, *, max_entries: int | None = None) -> _ScanBudget:
+        """One source's budget for one poll.
+
+        The bytes and the wall clock are per source -- a busy journal must not
+        take the training logs' turn away entirely -- but the entry allowance is
+        shared, because ``_limit_entries`` caps the *batch* and anything read
+        past that cap is dropped after the cursor has already moved past it.
+        """
+
         return _ScanBudget(
             max_bytes=self.scan_bytes,
             max_seconds=self.scan_seconds,
-            max_entries=self.max_entries_per_batch,
+            max_entries=(
+                self.max_entries_per_batch if max_entries is None else max_entries
+            ),
             context_lines=self.context_lines,
+            monotonic=self.monotonic,
         )
 
     def _journal_window(self, until: datetime) -> tuple[datetime, list[str]]:
@@ -1240,15 +763,19 @@ class NodeLogCollector:
                 watchdog.cancel()
             # Every exit path, including a raise out of the scan: a child left
             # running holds a pipe nobody reads and accumulates as a zombie.
-            _reap_journal(child, scan, streamed=streamed)
+            _reap_journal(
+                child,
+                scan,
+                streamed=streamed,
+                # Only a scan that walked away from a child still writing may
+                # signal it. Anything else is a complete read.
+                stopped_early=(
+                    budget.stop_reason is not None or self._journal_timed_out
+                ),
+            )
         entries = sorted(scan.entries, key=lambda entry: entry.observed_at)
         self.self_unit_entries_total += scan.excluded
-        if scan.unparseable:
-            self._record_discard("unparseable-journal-entries", scan.unparseable)
-            errors.append(
-                f"{scan.unparseable} journal entries could not be parsed and were "
-                "skipped, so the cursor moved past them"
-            )
+        consumed_until: datetime | None
         if self._journal_timed_out:
             self._record_discard("journal-read-timeouts")
             errors.append(
@@ -1256,11 +783,11 @@ class NodeLogCollector:
                 f"{self.journal_timeout_seconds}s and was killed (read timeout); "
                 f"kept the {len(entries)} entries it had produced"
             )
-            return _JournalRead(entries, errors, consumed_until=scan.consumed_at)
-        if budget.stop_reason is not None:
+            consumed_until = scan.consumed_at
+        elif budget.stop_reason is not None:
             errors.append(_budget_error(budget, since, until, kept=len(entries)))
-            return _JournalRead(entries, errors, consumed_until=scan.consumed_at)
-        if scan.returncode != 0:
+            consumed_until = scan.consumed_at
+        elif scan.returncode != 0:
             # Whatever it printed before failing is still worth posting, but the
             # window was not read: leaving `consumed_until` unset holds the cursor
             # so the next poll asks for the same span instead of stepping over it.
@@ -1268,12 +795,27 @@ class NodeLogCollector:
                 f"journalctl exited {scan.returncode}: {_stderr_detail(scan.stderr)}"
             )
             self._record_discard("journalctl-failures")
-            return _JournalRead(entries=entries, errors=errors)
-        if scan.stderr.strip():
-            # A zero exit read the window, so the cursor may advance; the
-            # complaint still belongs in the batch.
-            errors.append(f"journalctl warned: {_stderr_detail(scan.stderr)}")
-        return _JournalRead(entries=entries, errors=errors, consumed_until=until)
+            consumed_until = None
+        else:
+            if scan.stderr.strip():
+                # A zero exit read the window, so the cursor may advance; the
+                # complaint still belongs in the batch.
+                errors.append(f"journalctl warned: {_stderr_detail(scan.stderr)}")
+            consumed_until = until
+        if scan.unparseable:
+            # Whether they are gone depends on the branch above: a held cursor
+            # asks for the same window again, and saying they were stepped over
+            # when they were not is how an operator stops looking.
+            self._record_discard("unparseable-journal-entries", scan.unparseable)
+            errors.append(
+                f"{scan.unparseable} journal entries could not be parsed and were "
+                + (
+                    "skipped, so the cursor moved past them"
+                    if consumed_until is not None
+                    else "skipped; the cursor holds, so they are read again"
+                )
+            )
+        return _JournalRead(entries, errors, consumed_until=consumed_until)
 
     def _scan_journal(
         self, scan: _JournalScan, lines: Iterator[str], budget: _ScanBudget
