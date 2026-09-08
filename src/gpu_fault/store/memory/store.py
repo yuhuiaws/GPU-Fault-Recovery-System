@@ -6,7 +6,6 @@ from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
-    DiagnosticRequest,
     EfaTrafficAdminDecision,
     EfaTrafficState,
     EffectiveRuntimeProfile,
@@ -19,7 +18,6 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
     WorkflowRequest,
     XidMetricBaseline,
 )
@@ -81,8 +79,6 @@ class InMemoryStore(
         self._decisions: dict[str, CompletionDecision] = {}
         self._attempt_event_keys: dict[tuple[str, str], str] = {}
         self._markers: dict[str, NodeMarker] = {}
-        self._diagnostics: dict[str, DiagnosticRequest] = {}
-        self._triage_reports: dict[str, TriageReport] = {}
         self._plans: dict[str, RecoveryPlan] = {}
         self._profiles: dict[str, EffectiveRuntimeProfile] = {}
         self._installation_resources: dict[str, InstallationResource] = {}
@@ -134,14 +130,3 @@ class InMemoryStore(
         self._xid_correlations = {}
         self._xid74_occurrence_states = {}
         self._xid74_counted_events: set[tuple[str, tuple]] = set()
-
-
-class SimulatedDiagnosticAdapter:
-    def __init__(self, store: InMemoryStore) -> None:
-        self.store = store
-        self.submitted: list[str] = []
-
-    def submit(self, request: DiagnosticRequest) -> str:
-        self.store.save_diagnostic(request)
-        self.submitted.append(request.request_id)
-        return request.request_id

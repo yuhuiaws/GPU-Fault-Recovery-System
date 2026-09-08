@@ -19,7 +19,6 @@ from gpu_fault.adapters import (
 from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
-from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
@@ -86,7 +85,6 @@ from gpu_fault.spare_health import HyperPodSpareHealthController
 from gpu_fault.store import (
     InMemoryStore,
     PostgresStore,
-    SimulatedDiagnosticAdapter,
     SqliteStore,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
@@ -161,7 +159,6 @@ class ApplicationContext:
         barrier_coordinator: BarrierCoordinator | None = None,
     ) -> None:
         self.store: ControlPlaneStore = store if store is not None else InMemoryStore()
-        self.diagnostics = SimulatedDiagnosticAdapter(self.store)
         self.evidence = EvidenceService.from_environment(self.store)
         self.policy = GpuFaultPolicyEngine()
         self.completion = CompletionService(
@@ -525,32 +522,6 @@ class ApplicationContext:
             )
             context.regional_registry_secret_sha256 = regional_registry_config_sha256(
                 configured_regional_registrations(settings.regional_cluster_values)
-            )
-        if settings.quick_diagnostics_enabled:
-            try:
-                from kubernetes import client
-                from kubernetes import config as kube_config
-                from kubernetes.config.config_exception import (
-                    ConfigException,
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "quick diagnostics requires the collectors extra"
-                ) from exc
-            try:
-                kube_config.load_incluster_config()
-            except ConfigException:
-                kube_config.load_kube_config()
-            context.diagnostics = KubernetesDcgmDiagnosticAdapter(
-                context.store,
-                client.CoreV1Api(),
-                dcgm_port=int(os.getenv("GPU_FAULT_DCGM_EXPORTER_PORT", "9400")),
-                timeout_seconds=int(
-                    os.getenv(
-                        "GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS",
-                        "10",
-                    )
-                ),
             )
         context.completion = CompletionService(
             context.store,

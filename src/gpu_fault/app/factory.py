@@ -889,7 +889,6 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         WORKLOAD_OBSERVATIONS_PATH,
         WORKLOAD_COVERAGE_PATH,
         "/v1/attempts/",
-        "/v1/triage-results",
         "/v1/recovery-plans/",
         "/v1/fleet/deployments",
         "/v1/fleet/agents/",

@@ -16,10 +16,6 @@ _EXPORTS = {
         "POSTGRES_SCHEMA_VERSION",
     ),
     "PostgresStore": ("gpu_fault.store.postgres.store", "PostgresStore"),
-    "SimulatedDiagnosticAdapter": (
-        "gpu_fault.store.memory.store",
-        "SimulatedDiagnosticAdapter",
-    ),
     "SqliteStore": ("gpu_fault.store.sqlite.store", "SqliteStore"),
     "WorkflowLeaseError": ("gpu_fault.store.shared.errors", "WorkflowLeaseError"),
     "_PooledPostgresDatabase": (

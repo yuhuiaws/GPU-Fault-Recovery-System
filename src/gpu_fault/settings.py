@@ -221,7 +221,6 @@ class ControlPlaneSettings:
     processor_replay_secret: str | None
     regional_mode: bool
     regional_cluster_values: tuple[dict, ...]
-    quick_diagnostics_enabled: bool
     node_action_adapter_enabled: bool
     kubernetes_adapter_enabled: bool
     hyperpod_adapter_enabled: bool
@@ -245,7 +244,6 @@ class ControlPlaneSettings:
                 processor_replay_secret=None,
                 regional_mode=False,
                 regional_cluster_values=(),
-                quick_diagnostics_enabled=False,
                 node_action_adapter_enabled=False,
                 kubernetes_adapter_enabled=False,
                 hyperpod_adapter_enabled=False,
@@ -335,9 +333,6 @@ class ControlPlaneSettings:
                     "single-cluster executor mode is Canary-only; set "
                     "GPU_FAULT_ALLOW_SINGLE_CLUSTER=true explicitly"
                 )
-        quick_diagnostics = env_bool(
-            "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS", False, environ=values
-        )
         node_action = env_bool(
             "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", False, environ=values
         )
@@ -345,11 +340,6 @@ class ControlPlaneSettings:
             "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER", False, environ=values
         )
         hyperpod = env_bool("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", False, environ=values)
-        if regional_mode and quick_diagnostics:
-            raise RuntimeError(
-                "regional control plane cannot run in-cluster "
-                "quick diagnostics against its own EKS"
-            )
         if regional_mode and kubernetes:
             raise RuntimeError(
                 "regional control plane must not enable the "
@@ -387,7 +377,6 @@ class ControlPlaneSettings:
             ),
             regional_mode=regional_mode,
             regional_cluster_values=cluster_values,
-            quick_diagnostics_enabled=quick_diagnostics,
             node_action_adapter_enabled=node_action,
             kubernetes_adapter_enabled=kubernetes,
             hyperpod_adapter_enabled=hyperpod,

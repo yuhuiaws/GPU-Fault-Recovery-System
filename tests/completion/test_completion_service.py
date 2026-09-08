@@ -399,7 +399,6 @@ def test_missing_allocation_blocks_automatic_restart(
     plan = context.store.get_plan(decision.recovery_plan_id)
 
     assert decision.status is DecisionStatus.PLAN_CREATED
-    assert decision.diagnostic_request_id is None
     assert plan.trigger == "allocation-missing:INCONCLUSIVE"
     assert plan.avoid_node_ids == []
     assert [step.action for step in plan.steps] == [

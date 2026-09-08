@@ -11,7 +11,7 @@ both until its TTL, so the job could not restart automatically for an hour.
 
 Only a marker whose recommended action changes the node (reboot, replace, GPU
 reset, quarantine, ...) may claim the attempt's recovery. Advisory markers are
-skipped and the terminal goes to quick triage as if they were absent. The
+skipped and the terminal is decided as if they were absent. The
 classification is derived from the operation registry, not a second list.
 """
 
@@ -100,7 +100,7 @@ def test_diagnostic_actions_are_derived_from_the_registry() -> None:
 
 
 @pytest.mark.parametrize("action", DIAGNOSTIC, ids=[item.value for item in DIAGNOSTIC])
-def test_a_diagnostic_marker_sends_the_terminal_to_quick_triage(
+def test_a_diagnostic_marker_does_not_claim_the_terminal(
     context: ApplicationContext,
     failed_event: TerminalEvent,
     ended_at: datetime,
@@ -116,10 +116,11 @@ def test_a_diagnostic_marker_sends_the_terminal_to_quick_triage(
 
     decision = context.completion.handle_terminal(failed_event)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE, decision
+    assert decision.status is DecisionStatus.PLAN_CREATED, decision
     assert decision.matched_marker_ids == []
-    assert decision.diagnostic_request_id, "quick triage was not requested"
-    assert decision.recovery_plan_id is None
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.trigger == "no-hardware-evidence:RESTART", plan
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
     (stored,) = context.store.list_markers()
     assert stored.active is True, "an observation is not retired by a terminal"
 

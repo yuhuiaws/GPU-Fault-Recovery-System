@@ -9,7 +9,6 @@ from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     EffectiveRuntimeProfile,
     FaultIncident,
     NodeMarker,
@@ -17,7 +16,6 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
     WorkflowRequest,
     WorkflowStatus,
 )
@@ -39,7 +37,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _decisions: Any
     _incident_by_event: Any
-    _diagnostics: Any
     _hyperpod_node_identities: Any
     _hyperpod_submissions: Any
     _installation_resources: dict[str, InstallationResource]
@@ -47,7 +44,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     _profiles: Any
     _raw_evidence: Any
     _restart_budgets: Any
-    _triage_reports: Any
 
     _attempt_event_keys: Any
     _events: Any
@@ -205,8 +201,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             }
             candidates = []
             for decision in self._decisions.values():
-                if decision.status is DecisionStatus.PENDING_TRIAGE:
-                    continue
                 event = self._events.get(decision.event_key)
                 if event is None or event.ended_at > older_than:
                     continue
@@ -230,9 +224,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                 self._decisions.pop(key, None)
                 self._events.pop(key, None)
                 self._attempt_event_keys.pop((event.cluster_id, event.attempt_id), None)
-                if decision.diagnostic_request_id:
-                    self._diagnostics.pop(decision.diagnostic_request_id, None)
-                    self._triage_reports.pop(decision.diagnostic_request_id, None)
                 if plan is not None:
                     self._plans.pop(plan.plan_id, None)
                 removed.append(key)
@@ -347,45 +338,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     def get_decision_by_event(self, event_key: str) -> CompletionDecision | None:
         with self._lock:
             return self._decisions.get(event_key)
-
-    def _decision_age_key(self, decision: CompletionDecision) -> datetime | None:
-        # Diagnostic ``created_at``, else the terminal event's ``ended_at``;
-        # ``None`` (neither row) is never older than a cutoff (F-7).
-        if decision.diagnostic_request_id:
-            request = self._diagnostics.get(decision.diagnostic_request_id)
-            if request is not None:
-                created_at: datetime | None = request.created_at
-                return created_at
-        event = self._events.get(decision.event_key)
-        ended_at: datetime | None = event.ended_at if event is not None else None
-        return ended_at
-
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        with self._lock:
-            candidates = [
-                (self._decision_age_key(decision), decision)
-                for decision in self._decisions.values()
-                if decision.status is status
-            ]
-        if older_than is not None:
-            candidates = [
-                (created_at, decision)
-                for created_at, decision in candidates
-                if created_at is not None and created_at <= older_than
-            ]
-        floor = datetime.min.replace(tzinfo=timezone.utc)
-        candidates.sort(
-            key=lambda item: (item[0] or floor, item[1].event_key),
-        )
-        return [decision for _created_at, decision in candidates[:limit]]
 
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         with self._lock:
@@ -520,21 +472,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                 key=lambda marker: marker.observed_at,
                 reverse=True,
             )
-
-    def save_diagnostic(self, request: DiagnosticRequest) -> None:
-        with self._lock:
-            self._diagnostics[request.request_id] = request
-
-    def get_diagnostic(self, request_id: str) -> DiagnosticRequest:
-        with self._lock:
-            request = self._diagnostics.get(request_id)
-            if request is None:
-                raise NotFoundError(request_id)
-            return request
-
-    def save_triage_report(self, report: TriageReport) -> None:
-        with self._lock:
-            self._triage_reports[report.request_id] = report
 
     def save_plan(
         self,

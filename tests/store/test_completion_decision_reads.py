@@ -1,6 +1,5 @@
-"""Store side of F-G2 (4)(6): decisions by status with an age bound, the two
-completion gauges, and -- on PostgreSQL -- the atomicity of the completion
-transaction.
+"""Store side of F-G2 (6): the two completion gauges, and -- on PostgreSQL --
+the atomicity of the completion transaction.
 
 The PostgreSQL cases need ``GPU_FAULT_TEST_POSTGRES_URL``.
 """
@@ -8,7 +7,7 @@ The PostgreSQL cases need ``GPU_FAULT_TEST_POSTGRES_URL``.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -16,7 +15,6 @@ from gpu_fault.app.context import default_simulated_profile
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     EffectiveRuntimeProfile,
     Environment,
     TerminalEvent,
@@ -63,113 +61,32 @@ def _event(attempt_id: str, *, ended_at: datetime = NOW) -> TerminalEvent:
     )
 
 
-def _decision(
-    event: TerminalEvent,
-    status: DecisionStatus,
-    *,
-    diagnostic_request_id: str | None = None,
-) -> CompletionDecision:
+def _decision(event: TerminalEvent, status: DecisionStatus) -> CompletionDecision:
     return CompletionDecision(
         cluster_id=event.cluster_id,
         attempt_id=event.attempt_id,
         event_key=event.event_key,
         status=status,
         reason="test",
-        diagnostic_request_id=diagnostic_request_id,
     )
-
-
-def _diagnostic(event: TerminalEvent, created_at: datetime) -> DiagnosticRequest:
-    return DiagnosticRequest(
-        request_id=f"diag-{event.attempt_id}",
-        cluster_id=event.cluster_id,
-        attempt_id=event.attempt_id,
-        node_ids=["node-a"],
-        checks=["gpu-enumeration"],
-        created_at=created_at,
-    )
-
-
-def test_decisions_by_status_respect_the_diagnostic_age_bound(store) -> None:
-    old = _event("attempt-old")
-    fresh = _event("attempt-fresh")
-    # Diagnostic row never persisted: the decision's age falls back to its
-    # terminal event's ``ended_at`` (control-plane review 2026-09-08, F-7).
-    orphan = _event("attempt-orphan", ended_at=NOW - timedelta(hours=3))
-    orphan_fresh = _event("attempt-orphan-fresh", ended_at=NOW - timedelta(minutes=1))
-    planned = _event("attempt-planned")
-    for event in (old, fresh, orphan, orphan_fresh, planned):
-        assert store.save_event_if_absent(event), f"{event.attempt_id} not inserted"
-    store.save_diagnostic(_diagnostic(old, NOW - timedelta(hours=2)))
-    store.save_diagnostic(_diagnostic(fresh, NOW - timedelta(minutes=1)))
-    store.save_decision(
-        _decision(
-            old, DecisionStatus.PENDING_TRIAGE, diagnostic_request_id="diag-attempt-old"
-        )
-    )
-    store.save_decision(
-        _decision(
-            fresh,
-            DecisionStatus.PENDING_TRIAGE,
-            diagnostic_request_id="diag-attempt-fresh",
-        )
-    )
-    store.save_decision(
-        _decision(
-            orphan,
-            DecisionStatus.PENDING_TRIAGE,
-            diagnostic_request_id="diag-never-persisted",
-        )
-    )
-    store.save_decision(
-        _decision(
-            orphan_fresh,
-            DecisionStatus.PENDING_TRIAGE,
-            diagnostic_request_id="diag-never-persisted-either",
-        )
-    )
-    store.save_decision(_decision(planned, DecisionStatus.PLAN_CREATED))
-
-    everything = store.list_decisions_by_status(DecisionStatus.PENDING_TRIAGE)
-    assert sorted(item.attempt_id for item in everything) == [
-        "attempt-fresh",
-        "attempt-old",
-        "attempt-orphan",
-        "attempt-orphan-fresh",
-    ]
-
-    stale = store.list_decisions_by_status(
-        DecisionStatus.PENDING_TRIAGE, older_than=NOW - timedelta(hours=1)
-    )
-    # A decision whose diagnostic request cannot be found ages by its event:
-    # the one that ended three hours ago is stale, the one from a minute ago
-    # is not -- "no diagnostic row" used to mean "infinitely old" and expired
-    # a fresh decision on the first scan (F-7). Oldest first.
-    assert [item.attempt_id for item in stale] == ["attempt-orphan", "attempt-old"]
-
-    assert store.list_decisions_by_status(
-        DecisionStatus.PENDING_TRIAGE, older_than=NOW - timedelta(hours=1), limit=1
-    ) == [stale[0]]
-    assert store.list_decisions_by_status(DecisionStatus.NO_ACTION) == []
 
 
 def test_decision_status_counts_and_orphan_events(store) -> None:
     decided = _event("attempt-decided")
-    pending = _event("attempt-pending")
+    planned = _event("attempt-planned")
     undecided = _event("attempt-undecided")
-    for event in (decided, pending, undecided):
+    for event in (decided, planned, undecided):
         assert store.save_event_if_absent(event), f"{event.attempt_id} not inserted"
     store.save_decision(_decision(decided, DecisionStatus.NO_ACTION))
-    store.save_decision(_decision(pending, DecisionStatus.PENDING_TRIAGE))
+    store.save_decision(_decision(planned, DecisionStatus.PLAN_CREATED))
 
     assert store.decision_status_counts() == {
         DecisionStatus.NO_ACTION: 1,
-        DecisionStatus.PENDING_TRIAGE: 1,
-        DecisionStatus.PLAN_CREATED: 0,
+        DecisionStatus.PLAN_CREATED: 1,
     }
     assert store.count_completion_events_without_decision() == 1
 
-    store.save_decision(_decision(undecided, DecisionStatus.PLAN_CREATED))
+    store.save_decision(_decision(undecided, DecisionStatus.NO_ACTION))
     assert store.count_completion_events_without_decision() == 0
 
 

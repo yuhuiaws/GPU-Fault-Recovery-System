@@ -82,7 +82,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_barrier",
         "save_collector_metrics_snapshot",
         "save_decision",
-        "save_diagnostic",
         "save_fleet_deployment",
         "save_hyperpod_node_identity",
         "save_hyperpod_submission",
@@ -92,7 +91,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_regional_cluster",
         "save_regional_registry_member",
         "save_workload_coverage",
-        "save_triage_report",
         "save_xid_policy_decision",
     }
 )

@@ -26,8 +26,6 @@ from gpu_fault.models import (
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
     WorkflowOperation,
 )
 from gpu_fault.passive import ACTION_OPERATION, PassiveWorkflowCompiler
@@ -183,37 +181,6 @@ def test_missing_workload_stop_falls_back_to_containment(
         RecoveryAction.ESCALATE_OPERATOR,
     ]
     assert plan.steps[-1].parameters["blocked_action"] == "REBOOT_NODE"
-
-
-def test_triage_failure_scopes_each_node_to_its_own_gpus_and_action(
-    failed_event: TerminalEvent,
-) -> None:
-    """Two failed nodes used to share one action and every GPU of both."""
-    event = copy_model(failed_event, workload_ids=["training/pytorchjob/train"])
-    findings = [
-        TriageFinding(
-            node_id="node-a",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.RESET_GPU,
-        ),
-        TriageFinding(
-            node_id="node-b",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.REBOOT_NODE,
-        ),
-    ]
-
-    plan = PlanBuilder().from_triage(event, findings, default_simulated_profile())
-
-    by_action = {step.action: step for step in plan.steps}
-    assert by_action[RecoveryAction.RESET_GPU].node_ids == ["node-a"]
-    assert by_action[RecoveryAction.RESET_GPU].gpu_uuids == ["GPU-a"]
-    assert by_action[RecoveryAction.REBOOT_NODE].node_ids == ["node-b"]
-    assert by_action[RecoveryAction.REBOOT_NODE].gpu_uuids == ["GPU-b"]
-    restarts = [s for s in plan.steps if s.action is RecoveryAction.RESTART_WORKLOAD]
-    assert len(restarts) == 1
-    assert plan.steps[-1] is restarts[0]
-    assert plan.avoid_node_ids == ["node-a", "node-b"]
 
 
 def test_after_incident_defers_avoidance_and_reuse_to_execution(

@@ -7,7 +7,6 @@ from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
-    CompletionDecision,
     DecisionStatus,
     NodeMarker,
     RecoveryAction,
@@ -954,13 +953,12 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             return log_cleanup("marker", keys)
 
     def cleanup_completion_records(self, *, older_than: datetime, limit: int) -> int:
-        """Drop settled completion decisions with their event, diagnostic and
-        triage rows once the terminal event is past retention (F-8).
+        """Drop settled completion decisions with their event row once the
+        terminal event is past retention (F-8).
 
-        Kept: decisions still PENDING_TRIAGE (the watchdog owns them), and
-        any decision whose event or plan is referenced by an incident that
-        still exists -- the archiver takes those with the incident. The plan
-        goes with the decision only when no incident references it.
+        Kept: any decision whose event or plan is referenced by an incident
+        that still exists -- the archiver takes those with the incident. The
+        plan goes with the decision only when no incident references it.
         """
 
         with self._state_transaction("completion/cleanup"):
@@ -968,7 +966,6 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 cursor.execute(
                     """
                     SELECT decision.key,
-                           decision.payload->>'diagnostic_request_id',
                            decision.payload->>'recovery_plan_id',
                            event.payload->>'cluster_id',
                            event.payload->>'attempt_id'
@@ -977,7 +974,6 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                       ON event.kind='event'
                      AND event.key=decision.key
                     WHERE decision.kind='decision'
-                      AND decision.payload->>'status' <> 'PENDING_TRIAGE'
                       AND event.payload->>'ended_at' <= %s
                       AND NOT EXISTS (
                           SELECT 1
@@ -1014,12 +1010,9 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     return 0
                 pairs: list[tuple[str, str]] = []
                 link_keys: list[str] = []
-                for key, diagnostic_id, plan_id, cluster_id, attempt_id in rows:
+                for key, plan_id, cluster_id, attempt_id in rows:
                     pairs.append(("decision", key))
                     pairs.append(("event", key))
-                    if diagnostic_id:
-                        pairs.append(("diagnostic", diagnostic_id))
-                        pairs.append(("triage", diagnostic_id))
                     if plan_id:
                         pairs.append(("plan", plan_id))
                     link_keys.append(self._state_key((cluster_id, attempt_id)))
@@ -1050,53 +1043,6 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             AbstractContextManager[None],
             self._state_transaction(f"completion/{event_key}"),
         )
-
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        clauses = ["decision.kind='decision'", "decision.payload->>'status'=%s"]
-        parameters: list[object] = [status.value]
-        # The decision's age is its diagnostic's ``created_at``, or the
-        # terminal event's ``ended_at`` when the diagnostic row is missing. A
-        # NULL diagnostic used to satisfy ``older_than`` outright, so a
-        # decision whose diagnostic write was lost was "infinitely old" and
-        # expired on the first scan; a decision with neither row is never a
-        # candidate (control-plane review 2026-09-08, F-7).
-        age = "COALESCE(diagnostic.payload->>'created_at', event.payload->>'ended_at')"
-        if older_than is not None:
-            clauses.append(f"{age} <= %s")
-            parameters.append(_utc_text(older_than))
-        parameters.append(limit)
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT decision.payload
-                FROM gpu_fault_objects AS decision
-                LEFT JOIN gpu_fault_objects AS diagnostic
-                  ON diagnostic.kind='diagnostic'
-                 AND diagnostic.key=decision.payload->>'diagnostic_request_id'
-                LEFT JOIN gpu_fault_objects AS event
-                  ON event.kind='event'
-                 AND event.key=decision.key
-                WHERE """
-                + " AND ".join(clauses)
-                + f"""
-                ORDER BY {age} NULLS FIRST,
-                         decision.key
-                LIMIT %s
-                """,
-                parameters,
-            )
-            rows = cursor.fetchall()
-        return [
-            cast(CompletionDecision, self._decode("decision", row[0])) for row in rows
-        ]
 
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         # Per-value counts on ``gpu_fault_decision_status_count`` rather than a

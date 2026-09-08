@@ -3,7 +3,7 @@
 A marker is written before ingestion picks its incident, so it must not guess
 the pointer; a repaired incident retires its markers (``active=False``) on the
 two production paths that learn about the repair; a marker whose incident was
-repaired for a *different* attempt does not plan a blind restart for this one;
+repaired for a *different* attempt does not claim this one's recovery;
 and the correlation window can never outlive the marker TTL.
 """
 
@@ -188,15 +188,19 @@ def test_terminal_skips_a_marker_whose_incident_was_repaired_for_another_attempt
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
     """A repaired incident about a different attempt says nothing about why
-    *this* attempt died; matching it planned a blind same-allocation restart
-    inside the TTL. The marker is retired so nothing matches it again."""
+    *this* attempt died, so the marker must not pin this attempt's restart to
+    it. The terminal is decided as if no marker existed -- one budgeted restart
+    -- and the marker is retired so nothing matches it again."""
     _repaired_incident(context, attempt_id="train-other")
     context.completion.add_marker(_marker(ended_at, incident_id="inc-existing"))
 
     decision = context.completion.handle_terminal(failed_event)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
     assert decision.matched_marker_ids == []
+    assert context.store.get_plan(decision.recovery_plan_id).trigger == (
+        "no-hardware-evidence:RESTART"
+    )
     (marker,) = context.store.list_markers()
     assert marker.active is False
 
@@ -222,10 +226,7 @@ def test_marker_window_must_not_exceed_the_marker_ttl() -> None:
 
     with pytest.raises(ValueError, match="marker_window"):
         CompletionService(
-            context.store,
-            context.diagnostics,
-            marker_window=timedelta(hours=2),
-            marker_ttl_seconds=3600,
+            context.store, marker_window=timedelta(hours=2), marker_ttl_seconds=3600
         )
 
 

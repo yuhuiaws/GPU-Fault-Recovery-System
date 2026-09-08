@@ -573,7 +573,6 @@ def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:
         "/v1/provider-events/hyperpod-hma/node",
         "/v1/attempts/terminal",
         "/v1/training-progress",
-        "/v1/triage-results",
     ):
         results[f"AUTH-009 {path}"] = post(
             arguments.url,

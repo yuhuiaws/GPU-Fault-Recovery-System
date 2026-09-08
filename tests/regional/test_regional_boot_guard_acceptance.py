@@ -165,23 +165,6 @@ def test_boot005_regional_mode_refuses_the_central_hyperpod_adapter(
         ApplicationContext.from_environment()
 
 
-def test_boot006_regional_mode_refuses_in_cluster_quick_diagnostics(
-    monkeypatch, tmp_path
-) -> None:
-    """In-cluster diagnostics would run against the wrong EKS entirely.
-
-    The adapter execs into DCGM pods in *its own* cluster. On a regional control
-    plane that is the CPU cluster, which has no GPUs: the diagnosis would either
-    fail or, worse, return a healthy verdict about nodes it never looked at.
-    """
-
-    regional_environment(monkeypatch, tmp_path)
-    monkeypatch.setenv("GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS", "true")
-
-    with pytest.raises(RuntimeError, match="in-cluster quick diagnostics"):
-        ApplicationContext.from_environment()
-
-
 def test_boot007_a_cluster_token_shorter_than_32_characters_stops_startup(
     monkeypatch, tmp_path
 ) -> None:

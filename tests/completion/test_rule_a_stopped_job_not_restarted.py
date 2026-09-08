@@ -86,7 +86,6 @@ def test_a_job_stopped_by_rule_a_is_not_restarted(
 
     assert decision.status is DecisionStatus.NO_ACTION, decision
     assert decision.recovery_plan_id is None, decision
-    assert decision.diagnostic_request_id is None, decision
     assert JOB_INCIDENT in decision.reason, decision.reason
     assert _counts(context) == before, "no new incident or workflow may be planned"
     assert context.store.get_workflow("wf-job").status is WorkflowStatus.FAILED

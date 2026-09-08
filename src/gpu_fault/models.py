@@ -159,15 +159,8 @@ def recovery_action_sort_key(
     return RECOVERY_ACTION_RANK[action], action.value
 
 
-class TriageOutcome(StrEnum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-    INCONCLUSIVE = "INCONCLUSIVE"
-
-
 class DecisionStatus(StrEnum):
     NO_ACTION = "NO_ACTION"
-    PENDING_TRIAGE = "PENDING_TRIAGE"
     PLAN_CREATED = "PLAN_CREATED"
 
 
@@ -581,33 +574,6 @@ class NodeMarker(StrictModel):
         return self
 
 
-class DiagnosticRequest(StrictModel):
-    request_id: str = Field(default_factory=lambda: f"diag-{uuid4()}")
-    cluster_id: str | None = None
-    attempt_id: str
-    node_ids: list[str]
-    checks: list[str]
-    deadline_seconds: int = Field(default=60, ge=1, le=600)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class TriageFinding(StrictModel):
-    node_id: str
-    outcome: TriageOutcome
-    failed_checks: list[str] = Field(default_factory=list)
-    proposed_action: RecoveryAction | None = None
-    evidence_refs: list[str] = Field(default_factory=list)
-    reason: str | None = None
-
-
-class TriageReport(StrictModel):
-    request_id: str
-    cluster_id: str | None = None
-    attempt_id: str
-    findings: list[TriageFinding] = Field(min_length=1)
-    completed_at: datetime
-
-
 class PlanStep(StrictModel):
     action: RecoveryAction
     node_ids: list[str] = Field(default_factory=list)
@@ -647,7 +613,6 @@ class CompletionDecision(StrictModel):
     reason: str
     duplicate: bool = False
     matched_marker_ids: list[str] = Field(default_factory=list)
-    diagnostic_request_id: str | None = None
     recovery_plan_id: str | None = None
 
 

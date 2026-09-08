@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from uuid import uuid4
 
 from gpu_fault.models import (
@@ -13,9 +12,6 @@ from gpu_fault.models import (
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
-    recovery_action_sort_key,
 )
 
 ACTION_CAPABILITY = {
@@ -417,154 +413,6 @@ class PlanBuilder:
             if restart is not None:
                 steps.append(restart)
         return steps
-
-    def from_triage(
-        self,
-        event: TerminalEvent,
-        findings: list[TriageFinding],
-        profile: EffectiveRuntimeProfile,
-    ) -> RecoveryPlan:
-        outcomes = {finding.outcome for finding in findings}
-        failed = [
-            finding for finding in findings if finding.outcome is TriageOutcome.FAIL
-        ]
-        inconclusive = [
-            finding
-            for finding in findings
-            if finding.outcome is TriageOutcome.INCONCLUSIVE
-        ]
-        incident_id = f"inc-{uuid4()}"
-
-        if failed:
-            # Each failed node gets its own most-severe action and its own
-            # GPUs. One marker for all failed nodes applied the single most
-            # severe action, and every GPU of every failed node, to each of
-            # them (F-G5).
-            actions_by_node: dict[str, RecoveryAction] = {}
-            for finding in failed:
-                proposed = finding.proposed_action or RecoveryAction.QUARANTINE
-                current = actions_by_node.get(finding.node_id)
-                if current is None or recovery_action_sort_key(
-                    proposed
-                ) > recovery_action_sort_key(current):
-                    actions_by_node[finding.node_id] = proposed
-            plans = [
-                self.from_marker(
-                    event,
-                    NodeMarker(
-                        cluster_id=event.cluster_id,
-                        source="quick-triage",
-                        trusted=True,
-                        incident_id=incident_id,
-                        observed_at=event.ended_at,
-                        expires_at=event.ended_at + timedelta(days=365),
-                        scope={
-                            "node_ids": [node_id],
-                            "gpu_uuids": sorted(
-                                {
-                                    gpu
-                                    for allocation in event.allocation
-                                    if allocation.node_id == node_id
-                                    for gpu in allocation.gpu_uuids
-                                }
-                            ),
-                        },
-                        severity="critical",
-                        recommended_action=action,
-                        action_owner="core-policy",
-                        mapping_version="quick-triage-v1",
-                    ),
-                    profile,
-                )
-                for node_id, action in sorted(actions_by_node.items())
-            ]
-            if len(plans) == 1:
-                return plans[0]
-            return self._merge_node_plans(event, incident_id, plans)
-
-        node_ids = sorted({item.node_id for item in event.allocation})
-        if inconclusive:
-            suspect_nodes = sorted({finding.node_id for finding in inconclusive})
-            return RecoveryPlan(
-                incident_id=incident_id,
-                attempt_id=event.attempt_id,
-                trigger="quick-triage:INCONCLUSIVE",
-                runtime_profile_version=profile.profile_version,
-                steps=[
-                    self._step(
-                        profile,
-                        RecoveryAction.MARK_UNSCHEDULABLE,
-                        suspect_nodes,
-                    ),
-                    self._step(
-                        profile,
-                        RecoveryAction.QUARANTINE,
-                        suspect_nodes,
-                    ),
-                    self._step(
-                        profile,
-                        RecoveryAction.RESTART_WORKLOAD,
-                        node_ids,
-                        parameters={"reuse_allocation": False},
-                    ),
-                ],
-                avoid_node_ids=suspect_nodes,
-                checkpoint_manifest_ref=event.checkpoint_manifest_ref,
-            )
-
-        if outcomes != {TriageOutcome.PASS}:
-            raise ValueError("triage report has no usable outcome")
-        return RecoveryPlan(
-            incident_id=incident_id,
-            attempt_id=event.attempt_id,
-            trigger="quick-triage:PASS",
-            runtime_profile_version=profile.profile_version,
-            steps=[
-                self._step(
-                    profile,
-                    RecoveryAction.RESTART_WORKLOAD,
-                    node_ids,
-                    parameters={"reuse_allocation": True},
-                )
-            ],
-            checkpoint_manifest_ref=event.checkpoint_manifest_ref,
-        )
-
-    def _merge_node_plans(
-        self,
-        event: TerminalEvent,
-        incident_id: str,
-        plans: list[RecoveryPlan],
-    ) -> RecoveryPlan:
-        """One plan from per-node plans: node steps in order, one restart last."""
-        steps: list[PlanStep] = []
-        restart: PlanStep | None = None
-        for plan in plans:
-            for step in plan.steps:
-                if step.action is RecoveryAction.RESTART_WORKLOAD:
-                    restart = restart or step
-                    continue
-                steps.append(step)
-        avoid = sorted({node for plan in plans for node in plan.avoid_node_ids})
-        if restart is not None:
-            steps.append(
-                restart.model_copy(
-                    update={
-                        "node_ids": sorted(
-                            {node for plan in plans for node in plan.steps[0].node_ids}
-                        )
-                    }
-                )
-            )
-        return RecoveryPlan(
-            incident_id=incident_id,
-            attempt_id=event.attempt_id,
-            trigger="quick-triage:FAIL",
-            runtime_profile_version=plans[0].runtime_profile_version,
-            steps=steps,
-            avoid_node_ids=avoid,
-            checkpoint_manifest_ref=event.checkpoint_manifest_ref,
-        )
 
     def after_incident(
         self,

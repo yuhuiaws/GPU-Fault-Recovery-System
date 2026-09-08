@@ -24,7 +24,6 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
 )
 from gpu_fault.service import CompletionPendingError
 from gpu_fault.watcher import (
@@ -139,25 +138,6 @@ async def terminal(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post(
-    "/v1/triage-results",
-    response_model=CompletionDecision,
-)
-@authorization_bucket("cluster-token")
-async def triage(
-    report: TriageReport,
-    dependencies: CompletionRouterDependencies = Depends(get_completion_dependencies),
-) -> CompletionDecision:
-    try:
-        return await _store_call(
-            dependencies,
-            dependencies.context.completion.handle_triage,
-            report,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
 @router.get(
     "/v1/attempts/{cluster_id}/{attempt_id}/decision",
     response_model=CompletionDecision,
@@ -191,19 +171,6 @@ async def get_restart_budget(
         dependencies.context.store.get_restart_budget,
         cluster_id,
         job_id,
-    )
-
-
-@router.get("/v1/diagnostic-requests/{request_id}")
-@authorization_bucket("execution-token")
-async def get_diagnostic(
-    request_id: str,
-    dependencies: CompletionRouterDependencies = Depends(get_completion_dependencies),
-):
-    return await _store_call(
-        dependencies,
-        dependencies.context.store.get_diagnostic,
-        request_id,
     )
 
 

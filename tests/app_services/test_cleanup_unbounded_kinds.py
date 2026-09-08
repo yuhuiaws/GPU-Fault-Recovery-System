@@ -4,8 +4,7 @@ records and registry heartbeat rows.
 Control-plane review 2026-09-08, F-8 / G-9 (and F-5 for the registry rows).
 ``grep "DELETE FROM gpu_fault_objects"`` never touched ``marker``,
 ``notification``, ``notification_delivery``, ``notification_result``,
-``decision``, ``event``, ``diagnostic``, ``triage`` or
-``regional_registry_member``; every provider event scanned the whole marker
+``decision``, ``event`` or ``regional_registry_member``; every provider event scanned the whole marker
 kind and every scrape aggregated the whole notification kind. Each sweep here
 takes only settled rows past retention and keeps anything an incident that
 still exists references -- the archiver bundles those with the incident (F-I1).
@@ -26,7 +25,6 @@ from gpu_fault.models import (
     AllocationEntry,
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     Environment,
     IncidentState,
     MarkerScope,
@@ -39,9 +37,6 @@ from gpu_fault.models import (
     Severity,
     TerminalEvent,
     TerminalStatus,
-    TriageFinding,
-    TriageOutcome,
-    TriageReport,
 )
 from gpu_fault.regional import RegionalRegistryMember
 from gpu_fault.store import NotFoundError, SqliteStore
@@ -286,33 +281,10 @@ def _decision(
     *,
     ended_at: datetime,
     status: DecisionStatus = DecisionStatus.NO_ACTION,
-    with_diagnostic: bool = False,
     plan_incident_id: str | None = None,
 ) -> CompletionDecision:
     event = _event(attempt_id, ended_at=ended_at)
     store.save_event_if_absent(event)
-    diagnostic_id = None
-    if with_diagnostic:
-        diagnostic_id = f"diag-{attempt_id}"
-        store.save_diagnostic(
-            DiagnosticRequest(
-                request_id=diagnostic_id,
-                cluster_id="cluster-a",
-                attempt_id=attempt_id,
-                node_ids=["node-a"],
-                checks=["dcgm"],
-                created_at=ended_at,
-            )
-        )
-        store.save_triage_report(
-            TriageReport(
-                request_id=diagnostic_id,
-                cluster_id="cluster-a",
-                attempt_id=attempt_id,
-                findings=[TriageFinding(node_id="node-a", outcome=TriageOutcome.PASS)],
-                completed_at=ended_at,
-            )
-        )
     plan_id = None
     if plan_incident_id is not None:
         from gpu_fault.models import PlanStep, RecoveryPlan
@@ -339,7 +311,6 @@ def _decision(
         event_key=event.event_key,
         status=status,
         reason="test",
-        diagnostic_request_id=diagnostic_id,
         recovery_plan_id=plan_id,
     )
     store.save_decision(decision)
@@ -348,10 +319,7 @@ def _decision(
 
 def test_settled_completion_records_past_retention_are_removed_together(store) -> None:
     store.save_incident(fault_incident("inc-live", "event-live"))
-    old = _decision(store, "a-old", ended_at=OLD, with_diagnostic=True)
-    pending = _decision(
-        store, "a-pending", ended_at=OLD, status=DecisionStatus.PENDING_TRIAGE
-    )
+    old = _decision(store, "a-old", ended_at=OLD)
     owned = _decision(
         store,
         "a-owned",
@@ -376,10 +344,8 @@ def test_settled_completion_records_past_retention_are_removed_together(store) -
         with pytest.raises(NotFoundError):
             store.get_event_by_attempt("cluster-a", gone.attempt_id)
     with pytest.raises(NotFoundError):
-        store.get_diagnostic(old.diagnostic_request_id)
-    with pytest.raises(NotFoundError):
         store.get_plan(orphan_plan.recovery_plan_id)
-    for kept in (pending, owned, fresh):
+    for kept in (owned, fresh):
         assert store.get_decision_by_event(kept.event_key) is not None
         assert store.get_event_by_attempt("cluster-a", kept.attempt_id).attempt_id == (
             kept.attempt_id

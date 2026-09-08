@@ -27,7 +27,6 @@ if TYPE_CHECKING:
         AdvisoryNotification,
         CompletionDecision,
         DecisionStatus,
-        DiagnosticRequest,
         EfaTrafficState,
         EffectiveRuntimeProfile,
         FaultIncident,
@@ -39,7 +38,6 @@ if TYPE_CHECKING:
         NotificationStatus,
         RecoveryPlan,
         TerminalEvent,
-        TriageReport,
         WorkflowEvent,
         WorkflowRequest,
         WorkflowStatus,
@@ -812,32 +810,12 @@ class CompletionStore(Protocol):
         self, cluster_id: str, attempt_id: str
     ) -> CompletionDecision: ...
 
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        """Decisions in ``status``, oldest first.
-
-        A decision carries no timestamp of its own, so its age is that of the
-        diagnostic request it points at (``diagnostic_request_id`` ->
-        ``DiagnosticRequest.created_at``). With ``older_than`` only decisions
-        whose request was created at or before it are returned; a decision
-        whose request cannot be found is returned too -- nothing can ever
-        report on it, so it is stale by definition (F-G2 (4)).
-        """
-        ...
-
     def decision_status_counts(self) -> dict[DecisionStatus, int]: ...
 
     def count_completion_events_without_decision(self) -> int:
         """Terminal event rows with no decision row: the poisoned shape of
         P0-48B, exported as a gauge (F-G2 (6))."""
         ...
-
-    def save_diagnostic(self, request: DiagnosticRequest) -> None: ...
 
     def save_plan(
         self,
@@ -856,10 +834,6 @@ class CompletionStore(Protocol):
         ...
 
     def get_plan(self, plan_id: str) -> RecoveryPlan: ...
-
-    def save_triage_report(self, report: TriageReport) -> None: ...
-
-    def get_diagnostic(self, request_id: str) -> DiagnosticRequest: ...
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile: ...
 

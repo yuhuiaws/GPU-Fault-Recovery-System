@@ -6,9 +6,7 @@ from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
-    CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     FaultIncident,
     NodeMarker,
     RecoveryAction,
@@ -224,55 +222,6 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
             self._state_transaction(f"completion/{event_key}"),
         )
 
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        rows = self._db.execute(
-            """
-            SELECT decision.payload, diagnostic.payload, event.payload
-            FROM objects AS decision
-            LEFT JOIN objects AS diagnostic
-              ON diagnostic.kind='diagnostic'
-             AND diagnostic.key=json_extract(
-                 decision.payload, '$.diagnostic_request_id'
-             )
-            LEFT JOIN objects AS event
-              ON event.kind='event'
-             AND event.key=decision.key
-            WHERE decision.kind='decision'
-              AND json_extract(decision.payload, '$.status')=?
-            """,
-            (status.value,),
-        ).fetchall()
-        floor = datetime.min.replace(tzinfo=timezone.utc)
-        candidates: list[tuple[datetime | None, CompletionDecision]] = []
-        for decision_payload, diagnostic_payload, event_payload in rows:
-            # Diagnostic ``created_at``, else the event's ``ended_at``; a
-            # decision with neither is never older than the cutoff (F-7).
-            created_at = (
-                DiagnosticRequest.model_validate_json(diagnostic_payload).created_at
-                if diagnostic_payload is not None
-                else (
-                    TerminalEvent.model_validate_json(event_payload).ended_at
-                    if event_payload is not None
-                    else None
-                )
-            )
-            if older_than is not None:
-                if created_at is None or created_at > older_than:
-                    continue
-            candidates.append(
-                (created_at, CompletionDecision.model_validate_json(decision_payload))
-            )
-        candidates.sort(key=lambda item: (item[0] or floor, item[1].event_key))
-        return [decision for _created_at, decision in candidates[:limit]]
-
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         rows = self._db.execute(
             """
@@ -342,8 +291,6 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
             live_event_ids = {incident.event_id for incident in incidents}
             candidates = []
             for decision in self._list("decision"):
-                if decision.status is DecisionStatus.PENDING_TRIAGE:
-                    continue
                 event = events.get(decision.event_key)
                 if event is None or event.ended_at > older_than:
                     continue
@@ -370,9 +317,6 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                     "DELETE FROM links WHERE kind='attempt_event' AND key=?",
                     (self._state_key((event.cluster_id, event.attempt_id)),),
                 )
-                if decision.diagnostic_request_id:
-                    self._delete("diagnostic", decision.diagnostic_request_id)
-                    self._delete("triage", decision.diagnostic_request_id)
                 if plan is not None:
                     self._delete("plan", plan.plan_id)
                 removed.append(key)

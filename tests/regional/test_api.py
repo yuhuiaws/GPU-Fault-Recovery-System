@@ -249,7 +249,7 @@ def test_http_failure_detection_creates_one_containment_workflow(
     asyncio.run(run_scenario())
 
 
-def test_http_terminal_to_triage_to_simulated_execution(
+def test_http_terminal_to_plan_to_simulated_execution(
     context: ApplicationContext, failed_event: TerminalEvent
 ) -> None:
     async def run_scenario() -> None:
@@ -258,27 +258,14 @@ def test_http_terminal_to_triage_to_simulated_execution(
                 "/v1/attempts/terminal", json=failed_event.model_dump(mode="json")
             )
             assert response.status_code == 200
-            pending = response.json()
-            assert pending["status"] == "PENDING_TRIAGE"
-
-            triage = await client.post(
-                "/v1/triage-results",
-                json={
-                    "request_id": pending["diagnostic_request_id"],
-                    "attempt_id": failed_event.attempt_id,
-                    "completed_at": failed_event.ended_at.isoformat(),
-                    "findings": [
-                        {"node_id": "node-a", "outcome": "PASS"},
-                        {"node_id": "node-b", "outcome": "PASS"},
-                    ],
-                },
-            )
-            assert triage.status_code == 200
-            plan_id = triage.json()["recovery_plan_id"]
+            decided = response.json()
+            assert decided["status"] == "PLAN_CREATED"
+            plan_id = decided["recovery_plan_id"]
 
             plan = await client.get(f"/v1/recovery-plans/{plan_id}")
             assert plan.status_code == 200
             assert plan.json()["status"] == "PENDING"
+            assert plan.json()["trigger"] == "no-hardware-evidence:RESTART"
 
             operation = await client.post(f"/v1/recovery-plans/{plan_id}/simulate")
             assert operation.status_code == 200

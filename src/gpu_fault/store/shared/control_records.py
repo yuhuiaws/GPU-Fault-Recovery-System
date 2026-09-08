@@ -12,13 +12,11 @@ from datetime import datetime, timezone
 
 from gpu_fault.models import (
     CompletionDecision,
-    DiagnosticRequest,
     EffectiveRuntimeProfile,
     NodeMarker,
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
 )
 from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
 from gpu_fault.store.shared.primitives import (
@@ -137,17 +135,6 @@ class SharedControlRecordMixin:
     def add_marker(self, marker: NodeMarker) -> None:
         with self._statement_guard():
             self._put("marker", marker.marker_id, marker)
-
-    def save_diagnostic(self, request: DiagnosticRequest) -> None:
-        with self._statement_guard():
-            self._put("diagnostic", request.request_id, request)
-
-    def get_diagnostic(self, request_id: str) -> DiagnosticRequest:
-        return self._get("diagnostic", request_id)
-
-    def save_triage_report(self, report: TriageReport) -> None:
-        with self._statement_guard():
-            self._put("triage", report.request_id, report)
 
     def save_plan(
         self,
