@@ -21,14 +21,42 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        node.kubernetes.io/instance-type: ml.p5en.48xlarge
+      # The exporter is what makes a GPU node gradable: the node installer's
+      # dcgm_ready check fails without it, the install Job fails, and the
+      # reconciler recreates it every 300 s forever. A single-value
+      # nodeSelector pinned that to one instance type, so every other
+      # supported GPU type got zero Pods while `rollout status` passed
+      # trivially. The list below is rendered by
+      # regional_gpu_bootstrap._render_gpu_dcgm_exporter from
+      # node_installer_reconciler._INVENTORY -- the same table the installer
+      # sizes GPU/EFA counts from -- with and without the `ml.` prefix,
+      # because HyperPod labels nodes `ml.<type>` and self-managed EKS does
+      # not. It stays fail-closed: an unsupported instance type still gets no
+      # exporter Pod at all.
+      priorityClassName: system-node-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: [REPLACE_WITH_SUPPORTED_INSTANCE_TYPES]
       tolerations:
         - operator: Exists
       containers:
         - name: exporter
           image: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04
-          args: ["-a", "0.0.0.0:9400"]
+          # -a 127.0.0.1:9400: hostNetwork puts this bind in the node's own
+          # namespace, and the only consumer is the node's collector, which
+          # dials loopback. Binding 0.0.0.0 published GPU UUIDs and hostnames
+          # to the VPC unauthenticated.
+          # -c 15000: DCGM's default collection interval is 30 s while the
+          # collector scrapes every 15 s, so half of every throttling episode
+          # was a repeat of the previous sample and could not be graded. Kept
+          # in step with -c 15000 in
+          # deploy/systemd/gpu-fault-dcgm-exporter.service.
+          args: ["-a", "127.0.0.1:9400", "-c", "15000"]
           env:
             - name: DCGM_REMOTE_HOSTENGINE_INFO
               value: "127.0.0.1:5555"

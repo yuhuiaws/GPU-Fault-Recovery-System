@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.node_installer_reconciler import _INVENTORY as INSTANCE_TYPES
 from gpu_fault_release import regional_deployment_inventory as inventory
 import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
@@ -18,6 +19,25 @@ ROOT = Path(__file__).resolve().parents[2]
 ENDPOINT_CHECK_POLL_SECONDS = 5.0
 INSTALLER_JOB_SELECTOR = "gpu-fault.io/node-installer=true"
 TERMINAL_JOB_CONDITIONS = frozenset({"Complete", "Failed"})
+#: What the checked-in DaemonSet carries in place of the instance-type list.
+SUPPORTED_INSTANCE_TYPES_PLACEHOLDER = "REPLACE_WITH_SUPPORTED_INSTANCE_TYPES"
+
+
+def _supported_instance_types() -> str:
+    """The exporter's node-affinity list, as a YAML flow sequence.
+
+    Read from the node installer's own inventory rather than copied: the two
+    must never disagree, because a GPU type the installer supports but the
+    exporter does not schedule on can never finish an install (its
+    ``dcgm_ready`` check has nothing to scrape), and the reconciler retries the
+    Job every 300 s forever. Each type is emitted twice, with and without the
+    ``ml.`` prefix, because HyperPod labels its nodes ``ml.<type>`` while a
+    self-managed node pool carries the bare EC2 type; ``_inventory()`` accepts
+    both for the same reason.
+    """
+
+    names = sorted(INSTANCE_TYPES)
+    return ", ".join(f'"ml.{name}", "{name}"' for name in names)
 
 
 def _render_gpu_dcgm_exporter(
@@ -45,13 +65,25 @@ def _render_gpu_dcgm_exporter(
     manifest = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
         encoding="utf-8"
     )
-    manifest = manifest.replace(
-        "namespace: gpu-fault-system",
-        f"namespace: {release.config.namespace}",
-    ).replace(
-        DEFAULT_DCGM_EXPORTER_IMAGE,
-        image or release.dcgm_exporter_image,
+    manifest = (
+        manifest.replace(
+            "namespace: gpu-fault-system",
+            f"namespace: {release.config.namespace}",
+        )
+        .replace(
+            DEFAULT_DCGM_EXPORTER_IMAGE,
+            image or release.dcgm_exporter_image,
+        )
+        .replace(
+            SUPPORTED_INSTANCE_TYPES_PLACEHOLDER,
+            _supported_instance_types(),
+        )
     )
+    if SUPPORTED_INSTANCE_TYPES_PLACEHOLDER in manifest:
+        raise ReleaseError(
+            "DCGM exporter manifest still carries "
+            f"{SUPPORTED_INSTANCE_TYPES_PLACEHOLDER}"
+        )
     return rendered_config_map, manifest
 
 
