@@ -531,7 +531,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
             lifetime_seconds=env["node_lifetime_seconds"],
         )
     )
-    if not predecessor.get("pass"):
+    if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} evidence is not PASS")
     if not tests["passed"]:
         errors.append("focused tests did not pass")

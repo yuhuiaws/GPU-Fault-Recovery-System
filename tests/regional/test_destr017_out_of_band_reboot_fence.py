@@ -276,11 +276,10 @@ def agent_before(**overrides: Any) -> dict[str, Any]:
     record = {
         "node_id": NODE,
         "generation": GENERATION,
-        "incarnation_id": "inc-a",
+        "agent_incarnation_id": "inc-a",
         "boot_id": BOOT_BEFORE,
         "lifecycle_state": "ACTIVE",
-        "capability_mode": "OWN",
-        "supported_operations": list(verdicts.AGENT_OPERATIONS),
+        "allowed_operations": list(verdicts.AGENT_OPERATIONS),
         "retired_incarnation_ids": [],
     }
     record.update(overrides)
@@ -290,7 +289,7 @@ def agent_before(**overrides: Any) -> dict[str, Any]:
 def agent_after(**overrides: Any) -> dict[str, Any]:
     record = agent_before(
         generation=GENERATION + 1,
-        incarnation_id="inc-b",
+        agent_incarnation_id="inc-b",
         boot_id=BOOT_AFTER,
         retired_incarnation_ids=["inc-a"],
     )
@@ -994,7 +993,18 @@ def _preflight(**overrides: Any) -> dict[str, Any]:
             "ownership_annotations": {},
         },
         "agent": agent_before(),
-        "profile": {"profile_version": "p1", "warnings": []},
+        "profile": {
+            "profile_version": "p1",
+            "warnings": [],
+            "capabilities": [
+                {
+                    "capability": "gpuReset",
+                    "mode": "OWN",
+                    "owner": "gpu-fault-node-agent",
+                    "adapter": "node-action",
+                }
+            ],
+        },
         "business_workloads": [],
         "queue": {"depth": 0},
         "remote_commands": {"pending": 0, "leased": 0, "in_progress": 0},
@@ -1037,7 +1047,7 @@ def test_the_preflight_needs_every_maintenance_operation_advertised() -> None:
     errors = verdicts.preflight_errors(
         **_preflight(
             agent=agent_before(
-                supported_operations=["QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS"]
+                allowed_operations=["QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS"]
             )
         )
     )

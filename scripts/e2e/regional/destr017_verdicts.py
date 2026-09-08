@@ -61,6 +61,8 @@ AGENT_OPERATIONS = (
     "RESET_GPU",
     "RESTORE_GPU_SERVICES",
 )
+# The runtime profile must hand gpuReset to this owner in OWN mode.
+AGENT_OWNER = "gpu-fault-node-agent"
 
 # Fail-closed literals. Every one is a substring of a real error the product
 # raises; none is reconstructed from a format string here.
@@ -404,6 +406,12 @@ def successor_errors(
     return errors
 
 
+def _incarnation(agent: dict[str, Any]) -> str:
+    """The live AgentRecord calls it ``agent_incarnation_id``."""
+
+    return str(agent.get("agent_incarnation_id") or agent.get("incarnation_id") or "")
+
+
 def agent_errors(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -440,7 +448,7 @@ def agent_errors(
         errors.append(
             f"the reboot did not retire exactly one incarnation: {len(added)}"
         )
-    elif before.get("incarnation_id") and added[0] != before.get("incarnation_id"):
+    elif _incarnation(before) and added[0] != _incarnation(before):
         errors.append("the retired incarnation is not the pre-reboot one")
     return errors
 
@@ -752,16 +760,27 @@ def preflight_errors(
         )
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append(f"{node} agent is not ACTIVE: {agent.get('lifecycle_state')}")
-    if agent.get("capability_mode") != "OWN":
+    # The capability mode lives on the runtime profile, not on the Agent record:
+    # the reset the fence protects must be OWNed by the Node Agent.
+    reset = next(
+        (
+            item
+            for item in profile.get("capabilities") or []
+            if item.get("capability") == "gpuReset"
+        ),
+        None,
+    )
+    if reset is None or reset.get("mode") != "OWN" or reset.get("owner") != AGENT_OWNER:
         errors.append(
-            f"{node} agent capability mode is not OWN: {agent.get('capability_mode')}"
+            f"{node} gpuReset capability is not OWN by the Node Agent: {reset!r}"
         )
     if not isinstance(agent.get("generation"), int):
         errors.append(f"{node} agent has no generation to fence on: {agent!r}")
+    advertised = (
+        agent.get("allowed_operations") or agent.get("supported_operations") or []
+    )
     missing = [
-        operation
-        for operation in AGENT_OPERATIONS
-        if operation not in (agent.get("supported_operations") or [])
+        operation for operation in AGENT_OPERATIONS if operation not in advertised
     ]
     if missing:
         errors.append(f"{node} agent does not advertise {missing}")
