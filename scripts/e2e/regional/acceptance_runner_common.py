@@ -104,3 +104,28 @@ def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
     if "fault_backlog_depth" in values:
         return int(values.get("fault_backlog_depth") or 0)
     return int(values.get("depth") or 0)
+
+
+# What ``kubectl exec`` prints when its target stopped being a running replica
+# between a ``ready_pods`` listing and the exec: a deleted Pod (NotFound), a
+# Pod whose process already exited 0 on SIGTERM (phase Succeeded), or the
+# kubelet's other wordings for the same moment. Every env window rolls its
+# Deployment, so a survey taken during the roll meets these routinely
+# (control-worker 2026-09-08 attempts 7/8, cluster-executor 2026-09-08
+# DESTR-014 attempt 3).
+VANISHED_REPLICA_MARKERS = (
+    "not found",
+    "notfound",
+    "completed pod",
+    "is not running",
+    "not running",
+    "terminating",
+)
+
+
+def replica_vanished(error: BaseException) -> bool:
+    """Whether an exec failed because its Pod is no longer a running replica,
+    as opposed to the read itself failing."""
+
+    text = str(error).lower()
+    return any(marker in text for marker in VANISHED_REPLICA_MARKERS)

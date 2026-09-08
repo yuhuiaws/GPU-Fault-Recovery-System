@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -202,16 +203,24 @@ def replica_values(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     names = ",".join(repr(name) for name in ALLOWED_VARIABLES)
     for pod in regional.ready_pods("gpu", DEPLOYMENT):
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{names}]}}))",
-            timeout=60,
-        )
+        try:
+            output = regional.kubectl(
+                "gpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{names}]}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            # The window rolls the executor Deployment; a replica terminated
+            # between the listing and this exec is no longer a ready replica.
+            # Drop it and let ``converge`` re-poll (DESTR-014, 2026-09-08).
+            if replica_vanished(error):
+                continue
+            raise
         result.append(
             {
                 "pod": str(pod["name"]),

@@ -38,6 +38,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
@@ -493,21 +494,26 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
 def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     values: dict[str, Any] = {"poll_interval_seconds": 5.0}
     for pod in regional.ready_pods("gpu", env_window.DEPLOYMENT):
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os;"
-                "print(json.dumps({"
-                "'max_rungs':os.getenv('GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS'),"
-                "'poll':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS')}))"
-            ),
-            timeout=60,
-        )
+        try:
+            output = regional.kubectl(
+                "gpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                (
+                    "import json,os;"
+                    "print(json.dumps({"
+                    "'max_rungs':os.getenv('GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS'),"
+                    "'poll':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS')}))"
+                ),
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            if replica_vanished(error):
+                continue
+            raise
         parsed = json.loads(output.splitlines()[-1])
         values["max_rungs"] = int(parsed.get("max_rungs") or 2)
         if parsed.get("poll"):
@@ -531,23 +537,28 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
 def executor_env_snapshot(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for pod in regional.ready_pods("gpu", env_window.DEPLOYMENT):
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os;"
-                "print(json.dumps({"
-                "'spare_failover':os.getenv('GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER'),"
-                "'remote_state':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE'),"
-                "'allow_replace':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REPLACE'),"
-                "'allow_reboot':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REBOOT')}))"
-            ),
-            timeout=60,
-        )
+        try:
+            output = regional.kubectl(
+                "gpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                (
+                    "import json,os;"
+                    "print(json.dumps({"
+                    "'spare_failover':os.getenv('GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER'),"
+                    "'remote_state':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE'),"
+                    "'allow_replace':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REPLACE'),"
+                    "'allow_reboot':os.getenv('GPU_FAULT_ALLOW_HYPERPOD_REBOOT')}))"
+                ),
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            if replica_vanished(error):
+                continue
+            raise
         result.append({"pod": str(pod["name"]), **json.loads(output.splitlines()[-1])})
     return result
 

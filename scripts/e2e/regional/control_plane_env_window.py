@@ -61,6 +61,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -466,7 +467,7 @@ def replica_env(
             # let the caller (``converge``) re-poll the settling set instead of
             # failing the whole survey on a transient. Any other exec failure
             # is a real error and still propagates.
-            if _pod_vanished(error):
+            if replica_vanished(error):
                 continue
             raise
         result.append(
@@ -476,29 +477,6 @@ def replica_env(
             }
         )
     return result
-
-
-# What ``kubectl exec`` prints when its target stopped being a running replica
-# between our ``ready_pods`` listing and the exec. Seen live on 2026-09-08:
-# a deleted Pod (attempt 7) and a Pod whose worker had already exited 0 on
-# SIGTERM, phase Succeeded (attempt 8). The rest are the kubelet's wordings
-# for the same moment (container gone, or not running yet/any more).
-VANISHED_REPLICA_MARKERS = (
-    "not found",
-    "notfound",
-    "completed pod",
-    "is not running",
-    "not running",
-    "terminating",
-)
-
-
-def _pod_vanished(error: RegionalFixtureError) -> bool:
-    """Whether an exec failed because its target Pod is no longer a running
-    replica, as opposed to the read itself failing."""
-
-    text = str(error).lower()
-    return any(marker in text for marker in VANISHED_REPLICA_MARKERS)
 
 
 def replica_values(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
