@@ -23,7 +23,7 @@ from gpu_fault.hma import (
     HMA_HEALTH_STATUS,
     UNPARSED_SXID_REASON,
     UNPARSED_XID_REASON,
-    UNRESOLVED_HEALTH_STATUS_REASON,
+    UNSCHEDULABLE_WITHOUT_CODE_REASON,
     FabricManagerLogEvent,
     HmaCloudWatchLogEvent,
     HmaNodeSnapshot,
@@ -126,7 +126,7 @@ def test_unschedulable_node_without_a_code_is_named_unresolved() -> None:
         )
         reasons = result.provider_signals[0].unresolved_reasons
         assert any(
-            reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON) for reason in reasons
+            reason.startswith(UNSCHEDULABLE_WITHOUT_CODE_REASON) for reason in reasons
         ), reasons
 
 
@@ -155,7 +155,7 @@ def test_unschedulable_node_without_a_taint_or_label_still_counts() -> None:
     )
 
     assert any(
-        reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON)
+        reason.startswith(UNSCHEDULABLE_WITHOUT_CODE_REASON)
         for reason in taint_only.provider_signals[0].unresolved_reasons
     ), "an HMA NoSchedule taint without the health label was swallowed"
     assert healthy.provider_signals[0].unresolved_reasons == [], (

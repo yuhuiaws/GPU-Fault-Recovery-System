@@ -46,17 +46,25 @@ UNCLASSIFIED_SXID_REASON = "unclassified_sxid"
 # HMA cordons a node for faults that never name an XID/SXID (``EfaError``,
 # ``InstanceUnreachable``). The provider signal used to carry the cordon with
 # no reason at all, so the route answered 200 and nothing downstream saw it.
-# The reason prefix names the cause without inventing a code; it deliberately
-# maps to the ``UNCLASSIFIED_SXID_REASON`` *kind* (the catch-all bucket
-# ``unresolved_reason_kind`` already returns) because that kind is the one the
-# episode clear path and the operator-review notification list both know.
-UNRESOLVED_HEALTH_STATUS_REASON = "unresolved_hma_health_status"
+# It is its own kind, not the ``UNCLASSIFIED_SXID_REASON`` catch-all: the kind
+# is what the metric label and the finding's ``metric_name`` carry, so filing
+# an EFA/reachability cordon under an SXID name would be wrong recovery input,
+# and it would share one health-signal key with a real unclassified SXID
+# episode on the same node -- hiding a genuine fabric fault behind a cordon
+# (or the reverse). Every table that enumerates the kinds must carry it:
+# ``UNRESOLVED_SIGNAL_KINDS`` (episode clear) and ``OPERATOR_REVIEW_METRICS``
+# (the notification), both in ``gpu_fault.app.ingest``.
+UNSCHEDULABLE_WITHOUT_CODE_REASON = "hma_unschedulable_without_code"
 
 
 def unresolved_reason_kind(reason: str) -> str:
     """The finding kind an unresolved provider-signal reason maps to."""
 
-    for kind in (UNPARSED_XID_REASON, UNPARSED_SXID_REASON):
+    for kind in (
+        UNPARSED_XID_REASON,
+        UNPARSED_SXID_REASON,
+        UNSCHEDULABLE_WITHOUT_CODE_REASON,
+    ):
         if reason.startswith(kind):
             return kind
     return UNCLASSIFIED_SXID_REASON
@@ -106,7 +114,7 @@ def _unresolved_health_status_reason(
     types = ", ".join(dict.fromkeys(fault_types)) or "none"
     reasons = ", ".join(dict.fromkeys(fault_reasons)) or "none"
     return (
-        f"{UNRESOLVED_HEALTH_STATUS_REASON}: HMA marked the node "
+        f"{UNSCHEDULABLE_WITHOUT_CODE_REASON}: HMA marked the node "
         f"Unschedulable (health_status={health_status or 'absent'}, "
         f"taint={'present' if unschedulable_taint else 'absent'}, "
         f"fault_types=[{types}], fault_reasons=[{reasons}]) but no "

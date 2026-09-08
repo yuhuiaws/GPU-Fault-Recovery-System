@@ -15,8 +15,7 @@ from gpu_fault.hma import (
     HMA_FAULT_REASONS,
     HMA_FAULT_TYPES,
     HMA_HEALTH_STATUS,
-    UNCLASSIFIED_SXID_REASON,
-    UNRESOLVED_HEALTH_STATUS_REASON,
+    UNSCHEDULABLE_WITHOUT_CODE_REASON,
     HmaCloudWatchLogEvent,
     HmaCondition,
     HmaNodeSnapshot,
@@ -1138,14 +1137,14 @@ def test_hma_unschedulable_node_without_code_opens_warning_finding() -> None:
         )
         signal = body["normalized"]["provider_signals"][0]
         assert any(
-            reason.startswith(UNRESOLVED_HEALTH_STATUS_REASON)
+            reason.startswith(UNSCHEDULABLE_WITHOUT_CODE_REASON)
             for reason in signal["unresolved_reasons"]
         ), signal["unresolved_reasons"]
         assert context.fault_ingestion.unresolved_signal_totals == {
-            UNCLASSIFIED_SXID_REASON: 1
+            UNSCHEDULABLE_WITHOUT_CODE_REASON: 1
         }, "the route did not hand the unresolved HMA signal to the ingestion service"
         state = context.store.get_health_signal_state(
-            f"hp-cluster/worker-7/{UNCLASSIFIED_SXID_REASON}/node"
+            f"hp-cluster/worker-7/{UNSCHEDULABLE_WITHOUT_CODE_REASON}/node"
         )
         assert state is not None and state.active, (
             "no operator-review episode opened for the cordoned node"
@@ -1239,9 +1238,117 @@ def test_hma_node_with_a_parsed_xid_does_not_double_count_as_unresolved() -> Non
         )
         assert (
             context.store.get_health_signal_state(
-                f"hp-cluster/worker-8/{UNCLASSIFIED_SXID_REASON}/node"
+                f"hp-cluster/worker-8/{UNSCHEDULABLE_WITHOUT_CODE_REASON}/node"
             )
             is None
         ), "a parsed XID opened an operator-review episode"
+
+    asyncio.run(scenario())
+
+
+def _hma_node_payload(
+    node_id: str, *, observed_at: datetime, cordoned: bool
+) -> dict[str, object]:
+    """A kubernetes-node record for a node HMA did (or no longer) cordon."""
+
+    labels = (
+        {
+            HMA_HEALTH_STATUS: "Unschedulable",
+            HMA_FAULT_TYPES: "EfaError",
+            HMA_FAULT_REASONS: "InstanceUnreachable",
+        }
+        if cordoned
+        else {HMA_HEALTH_STATUS: "Schedulable"}
+    )
+    spec: dict[str, object] = (
+        {
+            "taints": [
+                {
+                    "key": HMA_HEALTH_STATUS,
+                    "value": "Unschedulable",
+                    "effect": "NoSchedule",
+                }
+            ]
+        }
+        if cordoned
+        else {}
+    )
+    return {
+        "cluster_id": "hp-cluster",
+        "observed_at": observed_at.isoformat(),
+        "runtime_profile_version": "simulated-v1",
+        "product": "H100",
+        "node": {"metadata": {"name": node_id, "labels": labels}, "spec": spec},
+    }
+
+
+def test_hma_unschedulable_without_code_notifies_then_clears_and_reopens() -> None:
+    """The new kind behaves like the other unresolved kinds end to end (F4).
+
+    A dedicated kind is only worth its label if it takes the whole path: the
+    cordon notifies operator review, a node HMA no longer cordons ends the
+    episode, and a later cordon on the same node is reported again instead of
+    being deduped away forever.
+    """
+
+    context = build_context()
+    signal_key = f"hp-cluster/worker-9/{UNSCHEDULABLE_WITHOUT_CODE_REASON}/node"
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            cordon = await client.post(
+                "/v1/provider-events/hyperpod-hma/kubernetes-node",
+                json=_hma_node_payload("worker-9", observed_at=NOW, cordoned=True),
+            )
+            assert cordon.status_code == 200, cordon.text
+            state = context.store.get_health_signal_state(signal_key)
+            assert state is not None and state.active, (
+                "the cordon did not open an episode under the dedicated kind"
+            )
+            (marker,) = context.store.list_markers()
+            notifications = context.store.list_notifications()
+            assert [item.incident_id for item in notifications] == [
+                marker.incident_id
+            ], f"operator review was not notified for the new kind: {notifications}"
+
+            healed = await client.post(
+                "/v1/provider-events/hyperpod-hma/kubernetes-node",
+                json=_hma_node_payload(
+                    "worker-9", observed_at=NOW + timedelta(minutes=5), cordoned=False
+                ),
+            )
+            assert healed.status_code == 200, healed.text
+            assert healed.json()["unresolved"] == 0, (
+                f"an uncordoned node was still unresolved: {healed.json()}"
+            )
+            cleared = context.store.get_health_signal_state(signal_key)
+            assert cleared is not None and not cleared.active, (
+                "the episode did not clear when HMA released the node"
+            )
+
+            again = await client.post(
+                "/v1/provider-events/hyperpod-hma/kubernetes-node",
+                json=_hma_node_payload(
+                    "worker-9", observed_at=NOW + timedelta(minutes=10), cordoned=True
+                ),
+            )
+            assert again.status_code == 200, again.text
+            reopened = context.store.get_health_signal_state(signal_key)
+            assert reopened is not None and reopened.active, (
+                "a second cordon after a clear was swallowed"
+            )
+            # The marker id is derived from node + kind, so a reopened
+            # episode refreshes the one marker instead of piling up a second
+            # one; the newer observation time is what proves it was re-emitted
+            # rather than deduped away.
+            (refreshed,) = context.store.list_markers()
+            assert refreshed.observed_at == NOW + timedelta(minutes=10), (
+                "the reopened cordon did not refresh the finding: "
+                f"{refreshed.observed_at}"
+            )
+            assert refreshed.active, f"the refreshed marker was retired: {refreshed}"
+            assert context.fault_ingestion.unresolved_signal_totals == {
+                UNSCHEDULABLE_WITHOUT_CODE_REASON: 2
+            }, "the counter did not follow both cordons under the one kind"
 
     asyncio.run(scenario())

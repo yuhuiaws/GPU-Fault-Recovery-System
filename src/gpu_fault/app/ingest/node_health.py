@@ -19,6 +19,10 @@ OPERATOR_REVIEW_METRICS = frozenset(
         "unparsed_xid_line",
         "unparsed_sxid_line",
         "unclassified_sxid",
+        # gpu_fault.hma.UNSCHEDULABLE_WITHOUT_CODE_REASON: HMA cordoned the
+        # node for a fault that names no XID/SXID, so only a human can say
+        # what it was.
+        "hma_unschedulable_without_code",
         "gpu_inventory_identity_changed",
         "gpu_expected_count_unknown",
     }

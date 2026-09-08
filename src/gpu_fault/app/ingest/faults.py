@@ -10,6 +10,7 @@ from gpu_fault.hma import (
     UNCLASSIFIED_SXID_REASON,
     UNPARSED_SXID_REASON,
     UNPARSED_XID_REASON,
+    UNSCHEDULABLE_WITHOUT_CODE_REASON,
     HmaNormalizedBatch,
     HmaProviderSignal,
     unresolved_reason_kind,
@@ -31,10 +32,14 @@ from gpu_fault.store.shared.health_signals import finding_health_signal_key
 
 LOGGER = logging.getLogger(__name__)
 
+#: Every kind ``unresolved_reason_kind`` can return. A provider signal that
+#: carries no unresolved reason clears the episode of each one, so a kind that
+#: is missing here would open a WARNING finding that never closes.
 UNRESOLVED_SIGNAL_KINDS = (
     UNPARSED_XID_REASON,
     UNPARSED_SXID_REASON,
     UNCLASSIFIED_SXID_REASON,
+    UNSCHEDULABLE_WITHOUT_CODE_REASON,
 )
 
 

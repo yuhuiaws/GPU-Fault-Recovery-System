@@ -14,6 +14,7 @@ from ._hma_cases_1 import (
     test_hma_node_contract_preserves_state_and_deduplicates_fault,
     test_hma_node_with_a_parsed_xid_does_not_double_count_as_unresolved,
     test_hma_unschedulable_node_without_code_opens_warning_finding,
+    test_hma_unschedulable_without_code_notifies_then_clears_and_reopens,
     test_kernel_always_fatal_sxid_uses_local_gpu_inventory,
     test_kernel_drill_id_is_parsed_out_of_raw_message,
     test_kernel_event_identity_is_scoped_by_cluster,
