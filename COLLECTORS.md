@@ -16,6 +16,18 @@ kernel collector 只发送包含 `NVRM ... Xid` 或 `SXid` 的行，不发送完
 HMA watcher 只发送包含 `sagemaker.amazonaws.com/node-health-status`、
 `fault-types`、`fault-reasons` 或 `fault-details` 的 Node。
 
+上表的幂等 ID 会作为 HTTP `Idempotency-Key` 头随请求发出，控制面按它去重。sink 只对
+**带**这个头的请求重试：默认 4 次尝试并退避，尊重 `Retry-After` 但最多等 30 秒；
+一个拿不出幂等 ID 的 payload 只发一次，失败即写 outbox。`snapshot_id`（gpu-inventory
+快照）、`log_event_id`（CloudWatch HMA）和 HMA Node 事件（用
+`node/<name>/<resourceVersion>`）此前都落在单次发送的分支上，一次 idle-closed 的
+keep-alive 连接就把它们推进 outbox；现在三者都有幂等 ID。代价是控制面不可达时
+`post()` 阻塞更久（4 次尝试加退避），调用方不能假设它很快返回。
+
+HTTP 2xx 但 body 不是 JSON object 的响应按**结果未知**处理，走与网络失败相同的重试
+阶梯，始终无法解析就作为可重放记录进 outbox。重试与重放带同一个 `Idempotency-Key`，
+所以确实已被接收的请求会在控制面侧被去重，而不是重复入库。
+
 默认HyperPod生产拓扑启用：
 
 - kernel、fabric-manager、dcgm、host节点采集器；
@@ -184,6 +196,24 @@ Kubernetes/HyperPod 安装应优先使用
 `--enable-node-log-collector`显式启用。启用后collector只发送命中共享
 `NODE_LOG_RULES`的行，并每300秒发送空健康摘要，不上传整段journal。
 
+journal 是流式读取并受每轮预算约束，不会把整个窗口读进内存：单次 poll 在"批次要保留
+的条数"、4 MiB 和 200 ms 三个上限中的第一个处停下，cursor 留在真正读到的最后一条
+（历史实现用 `capture_output=True` 一次收完整窗口，高日志量节点会先被 OOM kill，
+cursor 未保存，下一次启动重读同一窗口）。批次条数上限（`MAX_ENTRIES_PER_BATCH`，
+默认 1000）与 4 MiB 由 journal 与训练日志**共享**：配置了训练日志时先为它保留
+`max(1, 上限//4)` 的条目与字节，journal 只用其余额度；没配置时 journal 拿全部额度。被
+预算挡下的部分全部计入 discard 计数，不静默丢：
+
+| discard key | 含义 |
+| --- | --- |
+| `journal-window-capped-seconds` | cursor 比 `MAX_JOURNAL_WINDOW_SECONDS`（默认 900）更旧时放弃的时间跨度（秒），这段 journal 不会再读 |
+| `unparseable-journal-entries` | 读到但无法解析的 journal 记录数；cursor 前移时它们已丢失，cursor 保持时下一轮会再读一次 |
+| `deferred-training-log-reads` | 本轮因额度耗尽而未读的训练日志文件数；offset 已记录，下一轮从上次停下的文件之后继续 |
+| `unreadable-training-logs` | 打开或读取失败（权限、轮转）的训练日志文件数；该文件的 offset 仍被记录，不会被当成新文件重新基线 |
+
+连续第 3 轮训练日志仍只剩推迟（保底份额之外一直拿不到额度）才在批次里额外报一条错误：offset 没丢，但
+积压超过一次日志轮转就会真的丢内容。
+
 `training-progress` reporter默认关闭。Host collector从procfs生成的rank
 liveness是默认无侵入进展信号；只有需要step/loss/numerical-error语义时
 才接入training-progress reporter。
@@ -314,6 +344,14 @@ DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，�
 `gpu-fault-metrics-collector.service` 在本机访问 `http://127.0.0.1:9400/metrics`。历史的
 in-cluster DaemonSet 模板 `gpu-metrics-collector.yaml` 已删除，不得重新引入同类 DaemonSet，
 否则同一节点会出现双 producer。
+
+只绑定 `127.0.0.1` 的直接后果是：集群外、跨节点或 Prometheus 侧对 `:9400` 的抓取
+不再可用，这些计数器只能经 `/v1/collector-events/gpu-metrics` 进入控制面。DaemonSet
+不用 nodeSelector，而是用 `nodeAffinity` 按 `node.kubernetes.io/instance-type`
+精确列出受支持的 GPU 实例类型（带与不带 `ml.` 前缀各一份），清单由
+`regional_release_rendering.render_dcgm_exporter_manifest` 从 `node_installer_reconciler`
+的实例类型表渲染；占位符未被替换时渲染报错失败关闭，因此未知实例类型上不会起一个
+采不到数的 exporter。
 
 不同 DCGM/GPU 代际可能同时暴露旧字段和 aggregate 字段。当前兼容契约为：
 
