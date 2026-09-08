@@ -19,6 +19,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.app import process_counters
 from gpu_fault.store.contracts import ControlPlaneStore
 
 
@@ -317,10 +318,13 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
 
     ctx = runtime.context
     dispatcher = getattr(ctx, "dispatcher", None)
-    executor = getattr(ctx, "workflow_executor", None)
-    orchestrator = getattr(ctx, "orchestrator", None)
-    merger = getattr(orchestrator, "_workflow_merger", None) if orchestrator else None
     periodic = getattr(ctx, "periodic_runner", None)
+    # Summed over every live process of this Pod (F-L1): the worker runs
+    # several uvicorn processes and the one that counted is rarely the one
+    # answering the scrape. See ``process_counters``.
+    counters = process_counters.coherent_counters(
+        process_counters.control_loop_counter_snapshot(ctx)
+    )
     lines: list[str] = []
     dispatch_counters = (
         (
@@ -345,14 +349,14 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             [
                 f"# HELP gpu_fault_workflow_dispatch_{name} {help_text}",
                 f"# TYPE gpu_fault_workflow_dispatch_{name} counter",
-                f"gpu_fault_workflow_dispatch_{name} {getattr(dispatcher, name, 0) if dispatcher else 0}",
+                f"gpu_fault_workflow_dispatch_{name} {counters['dispatch_' + name]}",
             ]
         )
     lines.extend(
         [
             "# HELP gpu_fault_workflow_lifetime_exceeded_total Workflows failed because their hard lifetime passed (F-N1).",
             "# TYPE gpu_fault_workflow_lifetime_exceeded_total counter",
-            f"gpu_fault_workflow_lifetime_exceeded_total {getattr(executor, 'lifetime_exceeded_total', 0) if executor else 0}",
+            f"gpu_fault_workflow_lifetime_exceeded_total {counters['lifetime_exceeded_total']}",
             "# HELP gpu_fault_workflow_merge_record_only_total Events recorded on an incident with no new steps, by reason (F-N1).",
             "# TYPE gpu_fault_workflow_merge_record_only_total counter",
         ]
@@ -362,54 +366,54 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         ("lifetime_exceeded", "lifetime_record_only_total"),
         ("workload_withdrawn", "withdrawn_record_only_total"),
     ):
-        value = getattr(merger, attribute, 0) if merger is not None else 0
+        value = counters[attribute]
         lines.append(
             f'gpu_fault_workflow_merge_record_only_total{{reason="{reason}"}} {value}'
         )
-    escalation = getattr(orchestrator, "_escalation", None) if orchestrator else None
     lines.extend(
         [
             "# HELP gpu_fault_hardware_escalation_chain_terminated_total Failed support-after workflows that were NOT escalated into another support workflow; the incident stayed ESCALATED for an operator (escalation chain bound, ARCH-ESCALATION-BOUND).",
             "# TYPE gpu_fault_hardware_escalation_chain_terminated_total counter",
-            f"gpu_fault_hardware_escalation_chain_terminated_total {getattr(escalation, 'escalation_chain_terminated_total', 0) if escalation else 0}",
+            f"gpu_fault_hardware_escalation_chain_terminated_total {counters['escalation_chain_terminated_total']}",
             "# HELP gpu_fault_hardware_escalation_containment_refused_total Escalations whose containment steps all failed with a safety rejection, so the support workflow was compiled without any isolation step (ARCH-ESCALATION-BOUND).",
             "# TYPE gpu_fault_hardware_escalation_containment_refused_total counter",
-            f"gpu_fault_hardware_escalation_containment_refused_total {getattr(escalation, 'containment_refused_escalations_total', 0) if escalation else 0}",
+            f"gpu_fault_hardware_escalation_containment_refused_total {counters['containment_refused_escalations_total']}",
         ]
     )
     store = getattr(ctx, "store", None)
-    archiver = getattr(ctx, "control_record_archiver", None)
     lines.extend(
         [
             "# HELP gpu_fault_workflow_placement_holds_opened_total Job workflows opened because a running attempt was observed on a node under another remediation (rule A, case 2).",
             "# TYPE gpu_fault_workflow_placement_holds_opened_total counter",
-            f"gpu_fault_workflow_placement_holds_opened_total {getattr(orchestrator, 'placement_holds_opened_total', 0) if orchestrator else 0}",
+            f"gpu_fault_workflow_placement_holds_opened_total {counters['placement_holds_opened_total']}",
             "# HELP gpu_fault_workflow_placement_holds_dissolved_total Placement holds ended without executing because their nodes were freed inside the window (rule A, case 2).",
             "# TYPE gpu_fault_workflow_placement_holds_dissolved_total counter",
-            f"gpu_fault_workflow_placement_holds_dissolved_total {getattr(dispatcher, 'placement_holds_dissolved_total', 0) if dispatcher else 0}",
+            f"gpu_fault_workflow_placement_holds_dissolved_total {counters['placement_holds_dissolved_total']}",
             "# HELP gpu_fault_workflow_placement_holds_failed_total Workload observations whose placement hold could not be opened; the observation itself was still accepted (rule A, case 2).",
             "# TYPE gpu_fault_workflow_placement_holds_failed_total counter",
-            f"gpu_fault_workflow_placement_holds_failed_total {getattr(orchestrator, 'placement_holds_failed_total', 0) if orchestrator else 0}",
+            f"gpu_fault_workflow_placement_holds_failed_total {counters['placement_holds_failed_total']}",
             "# HELP gpu_fault_workflow_dispatch_deferred_total Rows a dispatch cycle scanned but never started because its deadline passed; they stayed PENDING (F-C7).",
             "# TYPE gpu_fault_workflow_dispatch_deferred_total counter",
-            f"gpu_fault_workflow_dispatch_deferred_total {getattr(dispatcher, 'deferred_total', 0) if dispatcher else 0}",
+            f"gpu_fault_workflow_dispatch_deferred_total {counters['dispatch_deferred_total']}",
             "# HELP gpu_fault_workflow_branch_escalation_budget_refusals_total Node branches retired to an operator because the cluster remediation budget could not take the next rung (F-N1).",
             "# TYPE gpu_fault_workflow_branch_escalation_budget_refusals_total counter",
-            f"gpu_fault_workflow_branch_escalation_budget_refusals_total {getattr(executor, 'branch_escalation_budget_refusals_total', 0) if executor else 0}",
+            f"gpu_fault_workflow_branch_escalation_budget_refusals_total {counters['branch_escalation_budget_refusals_total']}",
             "# HELP gpu_fault_health_signal_clock_regressions_total Host-health samples whose node timestamp went backwards while the control plane's clock moved on; judged on control-plane time (F-M2).",
             "# TYPE gpu_fault_health_signal_clock_regressions_total counter",
-            f"gpu_fault_health_signal_clock_regressions_total {getattr(store, 'health_signal_clock_regressions_total', 0) if store is not None else 0}",
+            f"gpu_fault_health_signal_clock_regressions_total {counters['health_signal_clock_regressions_total']}",
             "# HELP gpu_fault_ingest_stale_event_link_repairs_total Duplicate-event fast paths that found a dangling incident or workflow pointer and rebuilt the chain instead of failing the event (F-B7).",
             "# TYPE gpu_fault_ingest_stale_event_link_repairs_total counter",
-            f"gpu_fault_ingest_stale_event_link_repairs_total {getattr(store, 'stale_event_link_repairs', 0) if store is not None else 0}",
+            f"gpu_fault_ingest_stale_event_link_repairs_total {counters['stale_event_link_repairs']}",
             "# HELP gpu_fault_control_record_archive_withheld_total Incidents the archiver refused to archive, by safety reason (F-I1).",
             "# TYPE gpu_fault_control_record_archive_withheld_total counter",
         ]
     )
-    withheld = (
-        getattr(archiver, "withheld_total", None) if archiver is not None else None
-    )
-    for reason, count in sorted((withheld or {}).items()):
+    withheld = {
+        key[len(process_counters.ARCHIVE_WITHHELD_PREFIX) :]: count
+        for key, count in counters.items()
+        if key.startswith(process_counters.ARCHIVE_WITHHELD_PREFIX)
+    }
+    for reason, count in sorted(withheld.items()):
         lines.append(
             "gpu_fault_control_record_archive_withheld_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
