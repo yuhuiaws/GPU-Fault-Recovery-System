@@ -393,3 +393,65 @@ def test_configure_requires_a_baseline_path(tmp_path: Path) -> None:
     assert settings.rollout_timeout_seconds == 300
     with pytest.raises(env_window.RegionalFixtureError):
         env_window.configure(parser.parse_args([]))
+
+
+class _RollingRegional:
+    """A control-worker mid-rollout: ``ready_pods`` lists a replica that is
+    then terminated, so its exec 404s while a surviving replica answers."""
+
+    def __init__(self, vanished: str, survivor_values: dict[str, str]) -> None:
+        self._vanished = vanished
+        self._survivor_values = survivor_values
+        self.exec_targets: list[str] = []
+
+    def ready_pods(self, plane: str, app: str) -> list[dict[str, Any]]:
+        return [{"name": self._vanished}, {"name": "survivor"}]
+
+    def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+        assert arguments[0] == "exec"
+        target = arguments[1]
+        self.exec_targets.append(target)
+        if target == self._vanished:
+            raise env_window.RegionalFixtureError(
+                f'command failed (1): kubectl ... exec {target} ...; '
+                f'stderr=Error from server (NotFound): pods "{target}" not found'
+            )
+        return json.dumps(self._survivor_values)
+
+
+def test_replica_env_skips_a_replica_that_rolled_away_mid_survey() -> None:
+    values = {LIFETIME: "180", TIMEOUT: "180"}
+    regional = _RollingRegional("gone-9b7cl", values)
+
+    replicas = env_window.replica_env(
+        regional,
+        plane=env_window.PLANE,
+        deployment=env_window.DEPLOYMENT,
+        names=(LIFETIME, TIMEOUT),
+    )
+
+    assert regional.exec_targets == ["gone-9b7cl", "survivor"], (
+        "the vanished replica must be attempted before being dropped"
+    )
+    assert replicas == [{"pod": "survivor", "values": values}], (
+        "a NotFound on one replica during a rollout must not fail the survey"
+    )
+
+
+def test_replica_env_still_raises_a_real_exec_failure() -> None:
+    class _Broken(_RollingRegional):
+        def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+            self.exec_targets.append(arguments[1])
+            raise env_window.RegionalFixtureError(
+                "command failed (1): kubectl ... exec ...; stderr=OCI runtime exec "
+                "failed: exec failed: unable to start container process"
+            )
+
+    regional = _Broken("a", {LIFETIME: "180"})
+    with pytest.raises(env_window.RegionalFixtureError, match="OCI runtime"):
+        env_window.replica_env(
+            regional,
+            plane=env_window.PLANE,
+            deployment=env_window.DEPLOYMENT,
+            names=(LIFETIME,),
+        )

@@ -446,23 +446,48 @@ def replica_env(
     result: list[dict[str, Any]] = []
     literal = ",".join(repr(str(name)) for name in names)
     for pod in regional.ready_pods(plane, deployment):
-        output = regional.kubectl(
-            plane,
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{literal}]}}))",
-            timeout=60,
-        )
+        name = str(pod["name"])
+        try:
+            output = regional.kubectl(
+                plane,
+                "exec",
+                name,
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{literal}]}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            # Every window open and close rolls the control-worker Deployment,
+            # so a replica can be terminated between ``ready_pods`` listing it
+            # and this exec (observed live 2026-09-08: the pod was NotFound at
+            # exec time). Such a pod is no longer a ready replica; drop it and
+            # let the caller (``converge``) re-poll the settling set instead of
+            # failing the whole survey on a transient. Any other exec failure
+            # is a real error and still propagates.
+            if _pod_vanished(error):
+                continue
+            raise
         result.append(
             {
-                "pod": str(pod["name"]),
+                "pod": name,
                 "values": json.loads(output.splitlines()[-1]),
             }
         )
     return result
+
+
+def _pod_vanished(error: RegionalFixtureError) -> bool:
+    """Whether an exec failed because its target Pod no longer exists.
+
+    ``kubectl exec`` against a deleted Pod prints ``Error from server
+    (NotFound): pods "..." not found``; a terminating Pod can also report it
+    is not running. Both mean the replica is gone, not that the read is wrong.
+    """
+
+    text = str(error).lower()
+    return "not found" in text or "notfound" in text
 
 
 def replica_values(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
