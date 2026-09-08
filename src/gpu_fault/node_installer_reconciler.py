@@ -9,7 +9,7 @@ import os
 import re
 import socket
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +37,11 @@ INSTALLER_BOOT_ID_ANNOTATION = "gpu-fault.io/installer-boot-id"
 # (rollout, eviction, OOM), so it cannot live in process memory.
 INSTALLER_ATTEMPTS_ANNOTATION = "gpu-fault.io/installer-attempts"
 INSTALLER_REASON_ANNOTATION = "gpu-fault.io/installer-reason"
+# The earliest time a node classified Unsupported may be given another Job.
+# The classification deletes the Job to release the install slot at once, so
+# without this the very next pass would recreate it and the slot would churn
+# every 5 s instead of being held for 840 s.
+INSTALLER_RETRY_AFTER_ANNOTATION = "gpu-fault.io/installer-retry-after"
 DEFAULT_AGENT_PORT = 9099
 DEFAULT_REBOOT_GRACE_SECONDS = 600
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
@@ -65,6 +70,10 @@ POD_NEVER_STARTED_REASONS = frozenset(
         "RunContainerError",
     }
 )
+# How long a Pod may sit in one of those reasons before the reconciler calls it.
+# Image pulls and container creation are not instant, and a verdict that fires
+# on a transient reason would delete a Job that was about to start.
+POD_NEVER_STARTED_GRACE_SECONDS = 120
 
 _INVENTORY = {
     "p5.4xlarge": (1, 1),
@@ -502,6 +511,16 @@ class NodeInstallerReconciler:
         except Exception as error:
             if _api_status(error) != 404:
                 raise
+            if identity_matches:
+                # A node classified Unsupported holds no Job any more, so this
+                # annotation is the only thing keeping the create path from
+                # handing it a fresh one on the very next pass. Ignored once the
+                # identity has moved on: a new release may be the fix.
+                retry_after = _as_datetime(
+                    annotations.get(INSTALLER_RETRY_AFTER_ANNOTATION)
+                )
+                if retry_after is not None and self.now() < retry_after:
+                    return "unsupported"
             if not budget.allows_create:
                 return "deferred"
             try:
@@ -558,39 +577,43 @@ class NodeInstallerReconciler:
                     attempts + 1,
                 )
                 return "failed"
-            recorded_reason = annotations.get(INSTALLER_REASON_ANNOTATION)
-            if installer_state == "Unsupported" and recorded_reason:
-                # Already classified for this Job: reuse the recorded reason
-                # rather than listing its Pods again every 5 s. Any retry clears
-                # the annotation, so the next failure is classified afresh.
-                never_started = recorded_reason
-            else:
-                never_started = self._pod_never_started_reason(name)
-            if never_started is not None:
-                # Nothing ran on the node, so there is nothing to retry until
-                # whatever the Pod is waiting for changes -- most often a
-                # missing key in the node-action Secret, which this identity
-                # cannot read. Report it and let the backoff curve hold the
-                # install slot open for the rest of the fleet.
-                LOGGER.error(
-                    "node %s installer Pod never started (%s); next retry in %ss",
-                    node_name,
-                    never_started,
-                    self._retry_delay_seconds(attempts),
-                )
-                self._mark_node(
-                    node_name,
-                    node_uid,
-                    "Unsupported",
-                    boot_id,
-                    annotations=annotations,
-                    reason=never_started,
-                )
-                return "unsupported"
+            # No Pod lookup here: the Job controller deletes the active Pod in
+            # the same action that records DeadlineExceeded, so a Failed Job has
+            # nothing left to read -- and the number of simultaneously Failed
+            # nodes is not bounded by max_unavailable.
             self._mark_node(
                 node_name, node_uid, "Failed", boot_id, annotations=annotations
             )
             return "failed"
+
+        never_started = self._never_started_reason(job, name)
+        if never_started is not None:
+            # Nothing ran on the node, and nothing will: backoffLimit is 0 and
+            # restartPolicy is Never, so this Pod sits here until
+            # activeDeadlineSeconds kills it -- 840 s of the fleet's install
+            # budget spent on a node that cannot install (most often a node with
+            # no key in the node-action Secret, which this identity cannot
+            # read). Release the slot now, report why, and back off.
+            attempts = _attempt_count(annotations)
+            delay = self._retry_delay_seconds(attempts)
+            self._delete_job(name)
+            LOGGER.error(
+                "node %s installer Pod never started (%s); next attempt in %ss",
+                node_name,
+                never_started,
+                delay,
+            )
+            self._mark_node(
+                node_name,
+                node_uid,
+                "Unsupported",
+                boot_id,
+                annotations=annotations,
+                attempts=attempts + 1,
+                reason=never_started,
+                retry_after=self.now() + timedelta(seconds=delay),
+            )
+            return "unsupported"
         return "running"
 
     def _delete_job(self, name: str) -> None:
@@ -614,18 +637,41 @@ class NodeInstallerReconciler:
             created = _value(_metadata(job), "creation_timestamp")
             reference = _as_datetime(created)
         if reference is None:
-            return True
+            # No Failed condition, no completion time, no creation timestamp:
+            # nothing says the delay has elapsed, so treat it as just failed.
+            # Returning True here retried such a Job on every 5 s pass.
+            return False
         elapsed = (self.now() - reference).total_seconds()
         return elapsed >= self._retry_delay_seconds(attempts)
 
-    def _pod_never_started_reason(self, job_name: str) -> str | None:
-        """The waiting reason of a Job Pod that never ran a container, if any.
+    def _never_started_reason(self, job: Any, job_name: str) -> str | None:
+        """The waiting reason of an *active* Job whose Pod never ran, if any.
+
+        Only an active Job can answer this. The installer Job is
+        ``backoffLimit: 0`` + ``restartPolicy: Never``, so a Pod stuck in
+        CreateContainerConfigError never fails the Job; it is killed by
+        activeDeadlineSeconds, and the Job controller deletes the Pod in the
+        same action. Asking after the Job is Failed always reads back an empty
+        list.
+
+        The grace period is checked before the LIST, so a healthy slow start
+        (image pull, container creation) costs no extra apiserver call at all.
 
         Diagnostics: a reconciler without ``pods`` read access simply learns
         nothing here and keeps the plain backoff, so this can never make a
         failure look like a success.
         """
 
+        status = _value(job, "status", {})
+        started = _as_datetime(_value(status, "start_time"))
+        if started is None:
+            started = _as_datetime(_value(status, "startTime"))
+        if started is None:
+            started = _as_datetime(_value(_metadata(job), "creation_timestamp"))
+        if started is None:
+            return None
+        if (self.now() - started).total_seconds() < POD_NEVER_STARTED_GRACE_SECONDS:
+            return None
         try:
             response = self.core.list_namespaced_pod(
                 self.namespace,
@@ -666,6 +712,7 @@ class NodeInstallerReconciler:
         annotations: dict[str, str],
         attempts: int | None = None,
         reason: str | None = None,
+        retry_after: datetime | None = None,
     ) -> None:
         """Patch the Node's installer annotations unless they already say this.
 
@@ -699,6 +746,12 @@ class NodeInstallerReconciler:
             desired[INSTALLER_REASON_ANNOTATION] = reason
         elif INSTALLER_REASON_ANNOTATION in annotations:
             desired[INSTALLER_REASON_ANNOTATION] = None
+        if retry_after is not None:
+            desired[INSTALLER_RETRY_AFTER_ANNOTATION] = (
+                retry_after.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            )
+        elif INSTALLER_RETRY_AFTER_ANNOTATION in annotations:
+            desired[INSTALLER_RETRY_AFTER_ANNOTATION] = None
         if _annotations_match(annotations, desired):
             return
         self.core.patch_node(

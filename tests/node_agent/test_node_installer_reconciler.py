@@ -18,9 +18,11 @@ from gpu_fault.node_installer_reconciler import (
     INSTALLER_JOB_LABEL,
     INSTALLER_NODE_UID_ANNOTATION,
     INSTALLER_REASON_ANNOTATION,
+    INSTALLER_RETRY_AFTER_ANNOTATION,
     INSTALLER_STATE_ANNOTATION,
     INSTALLER_TEMPLATE_ANNOTATION,
     INSTALLER_VERSION_ANNOTATION,
+    POD_NEVER_STARTED_GRACE_SECONDS,
     RECONCILER_HEARTBEAT_PATH,
     REQUEST_TIMEOUT,
     TEMPLATE_CONTENT_SHA256_ENV,
@@ -827,13 +829,13 @@ def test_reconcile_passes_request_timeouts():
             node(name="hyperpod-i-002", uid="node-2"),
             node(name="hyperpod-i-003", uid="node-3"),
         ],
-        wave_data={"allowed-nodes": "*", "max-unavailable": "1"},
+        wave_data={"allowed-nodes": "*", "max-unavailable": "2"},
         pods={"hyperpod-i-003": installer_pod(reason="CreateContainerConfigError")},
     )
     batch = BatchApi(
         jobs={
             "hyperpod-i-002": job(condition="Failed", age_seconds=301),
-            "hyperpod-i-003": job(condition="Failed", age_seconds=900, failed_at=NOW),
+            "hyperpod-i-003": job(age_seconds=300),
         }
     )
     active = reconciler(core, batch)
@@ -880,6 +882,12 @@ def test_failed_node_is_not_repatched_every_pass():
         "a node already annotated Failed must not be patched again"
     )
     assert batch.deleted == [], "the retry delay had not elapsed"
+    assert not [
+        name for name, _timeout in core.calls if name == "list_namespaced_pod"
+    ], (
+        "a Failed Job has no Pods left to read (the Job controller deleted them), "
+        "so listing them every 5 s per failed node is pure load"
+    )
 
 
 def test_node_without_action_key_is_reported_not_retried():
@@ -887,8 +895,14 @@ def test_node_without_action_key_is_reported_not_retried():
     slot for ~14 of every 14.5 minutes (F8): CreateContainerConfigError until
     activeDeadlineSeconds, Failed, recreated on the next pass, forever.
 
-    The reconciler has no ``secrets`` RBAC, so it classifies on the Job Pod's
-    waiting reason and backs off on the same curve as any other failure.
+    The Job is ``backoffLimit: 0`` + ``restartPolicy: Never``, so a Pod stuck in
+    CreateContainerConfigError never fails the Job -- it is only killed by
+    activeDeadlineSeconds, and the Job controller deletes the Pod in the same
+    action. So the only state in which the waiting reason is readable is the one
+    tested here: an *active* Job whose Pod is still Pending. The reconciler has
+    no ``secrets`` RBAC, so it classifies on that reason, releases the slot at
+    once instead of holding it for the full deadline, and backs off on the same
+    curve as any other failure.
     """
 
     current = node()
@@ -902,25 +916,60 @@ def test_node_without_action_key_is_reported_not_retried():
             )
         },
     )
-    batch = BatchApi(job(condition="Failed", age_seconds=900, failed_at=NOW))
-    active = reconciler(core, batch)
+    batch = BatchApi(job(age_seconds=60))
+    clock = [NOW]
+    active = reconciler(core, batch, now=lambda: clock[0])
 
+    # 1. Inside the grace period a Pending Pod is just a slow start: no verdict,
+    #    and not one pod LIST either.
+    early = active.reconcile_once()
+
+    assert early["running"] == 1, early
+    assert early["unsupported"] == 0, early
+    assert batch.deleted == [], "a Pod inside the start grace must not be judged"
+    assert not [
+        name for name, _timeout in core.calls if name == "list_namespaced_pod"
+    ], f"{POD_NEVER_STARTED_GRACE_SECONDS}s of grace must cost no pod LIST"
+
+    # 2. Past the grace period: classified, and the slot is released early.
+    clock[0] = NOW + timedelta(seconds=POD_NEVER_STARTED_GRACE_SECONDS + 1)
     result = active.reconcile_once()
 
     assert result["unsupported"] == 1, result
-    assert result["failed"] == 0, result
-    assert batch.deleted == [], "a Pod that never started must not be retried at once"
-    assert batch.created == [], "no second install slot may be burned"
+    assert result["running"] == 0, result
+    assert len(batch.deleted) == 1, (
+        "the install slot must be released now, not after activeDeadlineSeconds"
+    )
     marked = core.patches[-1][1]["metadata"]["annotations"]
     assert marked[INSTALLER_STATE_ANNOTATION] == "Unsupported", marked
     assert "CreateContainerConfigError" in marked[INSTALLER_REASON_ANNOTATION], marked
     assert "hyperpod-i-123" in marked[INSTALLER_REASON_ANNOTATION], marked
+    assert marked[INSTALLER_ATTEMPTS_ANNOTATION] == "1", marked
+    assert marked[INSTALLER_RETRY_AFTER_ANNOTATION], marked
     apply_patches(current, core)
 
+    # 3. The Job is gone, so the create path owns the node now -- and it must
+    #    not hand out a new Job until the backoff has elapsed.
+    batch.existing = None
     again = active.reconcile_once()
 
     assert again["unsupported"] == 1, again
+    assert batch.created == [], "no second install slot may be burned during backoff"
     assert len(core.patches) == 1, "the Unsupported annotation must not be rewritten"
+
+    # 4. After the delay one more attempt is allowed: the missing key may have
+    #    been added, and only a Job can find out.
+    clock[0] = NOW + timedelta(seconds=POD_NEVER_STARTED_GRACE_SECONDS + 302)
+    retried = active.reconcile_once()
+
+    assert retried["created"] == 1, retried
+    assert len(batch.created) == 1, batch.created
+    retry_marked = core.patches[-1][1]["metadata"]["annotations"]
+    assert retry_marked[INSTALLER_STATE_ANNOTATION] == "Installing", retry_marked
+    assert retry_marked[INSTALLER_RETRY_AFTER_ANNOTATION] is None, retry_marked
+    assert retry_marked[INSTALLER_ATTEMPTS_ANNOTATION] == "1", (
+        "the attempt count must survive the retry, or the curve resets"
+    )
 
 
 def test_repeated_failures_back_off_on_a_doubling_curve():
