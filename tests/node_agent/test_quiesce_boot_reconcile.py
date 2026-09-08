@@ -273,6 +273,12 @@ def test_boot_reconcile_does_not_wait_for_containers(tmp_path: Path) -> None:
     assert [item for item in runner.commands if item[:1] == ["ctr"]] == [], (
         f"the boot reconcile must not poll containerd: {runner.commands}"
     )
+    # The skip is a decision about workload readiness, so it has to be visible
+    # somewhere: ``restore_state_file`` recorded it in a return value the boot
+    # sweep throws away, which meant nowhere.
+    assert report["restored"][0]["container_restore_wait_skipped"] == [
+        CONTAINER_SELECTOR
+    ], f"the sweep must name the containers nobody waited for: {report}"
 
 
 def test_a_restore_command_still_waits_for_the_containers_it_stopped(

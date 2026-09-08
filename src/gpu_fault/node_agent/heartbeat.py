@@ -54,9 +54,12 @@ class CollectorServiceStates:
     ``is-active`` is the live signal and is still asked every tick.
     ``is-enabled`` changes only when a unit is installed or removed, and the
     installer restarts this agent when it does, so a process-lifetime cache
-    would already be correct; it is refreshed anyway when the unit set changes
-    and every ``refresh_every`` ticks, so a hand-run ``systemctl disable`` is
-    reported within one refresh window. A call that fails is never cached.
+    would already be correct; it is refreshed anyway every ``refresh_every``
+    ticks, so a hand-run ``systemctl disable`` is reported within one refresh
+    window. A call that fails is never cached, and a unit the cache has no
+    answer for -- a failed call, or a unit the installer just added -- is
+    asked about on its own: one slow ``systemctl`` must not put the whole
+    node's enablement back on the tick that is already running late.
     """
 
     def __init__(
@@ -74,9 +77,7 @@ class CollectorServiceStates:
 
     def __call__(self) -> dict[str, CollectorServiceState]:
         units = self._units()
-        refresh = self._ticks % self._refresh_every == 0 or set(units) != set(
-            self._enabled
-        )
+        refresh = self._ticks % self._refresh_every == 0
         self._ticks += 1
         result: dict[str, CollectorServiceState] = {}
         cached: dict[str, str] = {}
@@ -85,8 +86,7 @@ class CollectorServiceStates:
             enabled = None if refresh else self._enabled.get(unit)
             if enabled is None:
                 # A unit systemd knows nothing about answers "unknown" and
-                # that is cached too: leaving it out would make the unit set
-                # differ every tick and refresh the whole node every time.
+                # that is cached too, so it is not re-queried every tick.
                 enabled = self._query(["systemctl", "is-enabled", unit])
             if enabled is not None:
                 cached[unit] = enabled
@@ -111,12 +111,6 @@ class CollectorServiceStates:
         except (OSError, subprocess.TimeoutExpired):
             return None
         return (completed.stdout or "").strip() or "unknown"
-
-
-def collector_service_states() -> dict[str, CollectorServiceState]:
-    """One uncached reading of every collector unit's state."""
-
-    return CollectorServiceStates()()
 
 
 class XidPolicyVersion:

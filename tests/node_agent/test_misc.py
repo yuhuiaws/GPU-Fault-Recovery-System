@@ -8,6 +8,7 @@ from tests._builders import copy_model, node_action_result
 from ._support import (
     NOW,
     CompletedProcess,
+    ThreadPoolExecutor,
     FakeRunner,
     NodeActionExecutionState,
     NodeActionStatus,
@@ -934,8 +935,9 @@ NO_MINOR_NUMBER_XML = """<?xml version="1.0" ?>
 class DevicePathRunner:
     """nvidia-smi on a node whose PCI order is not its device-minor order."""
 
-    def __init__(self, xml: str) -> None:
+    def __init__(self, xml: str, index: str = "GPU-a, 0\nGPU-b, 1\n") -> None:
         self.xml = xml
+        self.index = index
         self.commands: list[list[str]] = []
 
     def __call__(self, argv, **_):
@@ -945,10 +947,13 @@ class DevicePathRunner:
         if "--query-compute-apps=gpu_uuid,pid,process_name" in argv:
             return CompletedProcess(argv, 0, stdout="", stderr="")
         if "--query-gpu=uuid,index" in argv:
-            return CompletedProcess(argv, 0, stdout="GPU-a, 0\nGPU-b, 1\n", stderr="")
+            return CompletedProcess(argv, 0, stdout=self.index, stderr="")
         if "--query-gpu=uuid" in argv:
             return CompletedProcess(argv, 0, stdout="GPU-a\nGPU-b\n", stderr="")
         return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def index_queries(self) -> int:
+        return len([item for item in self.commands if "--query-gpu=uuid,index" in item])
 
     def xml_queries(self) -> int:
         return len(
@@ -1044,6 +1049,249 @@ def test_verify_queries_the_device_map_once_per_verification(tmp_path) -> None:
 
     assert result.status is NodeActionStatus.SUCCEEDED, result.error
     assert runner.xml_queries() == 1, runner.commands
+
+
+MIXED_MINOR_INDEX = "".join(f"GPU-{index}, {index}\n" for index in range(8))
+
+DUPLICATE_MINOR_XML = """<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <gpu id="00000000:53:00.0">
+    <uuid>GPU-a</uuid>
+    <minor_number>0</minor_number>
+  </gpu>
+  <gpu id="00000000:64:00.0">
+    <uuid>GPU-b</uuid>
+    <minor_number>0</minor_number>
+  </gpu>
+</nvidia_smi_log>
+"""
+
+
+def _mixed_minor_xml(eighth_minor: str) -> str:
+    """Eight GPUs, seven with a minor number and one that fell off the bus.
+
+    The seven run their minor numbers opposite to their PCI order, so the index
+    map and the minor map disagree about every one of them. ``eighth_minor`` is
+    what the eighth GPU reports: ``N/A`` is what nvidia-smi prints for a card
+    the driver can no longer reach, and an empty string leaves the element out.
+    """
+
+    entries = []
+    for index in range(7):
+        entries.append(
+            f'  <gpu id="00000000:0{index}:00.0">\n'
+            f"    <uuid>GPU-{index}</uuid>\n"
+            f"    <minor_number>{7 - index}</minor_number>\n"
+            "  </gpu>"
+        )
+    minor = f"    <minor_number>{eighth_minor}</minor_number>\n" if eighth_minor else ""
+    entries.append(
+        '  <gpu id="00000000:07:00.0">\n    <uuid>GPU-7</uuid>\n' + minor + "  </gpu>"
+    )
+    return (
+        '<?xml version="1.0" ?>\n<nvidia_smi_log>\n'
+        + "\n".join(entries)
+        + "\n</nvidia_smi_log>\n"
+    )
+
+
+@pytest.mark.parametrize("eighth_minor", ["N/A", ""])
+def test_one_unreported_minor_does_not_reindex_its_healthy_siblings(
+    tmp_path, eighth_minor: str
+) -> None:
+    """One GPU off the bus must not move the other seven onto index paths.
+
+    Falling back to the index map for the whole node whenever a single GPU
+    answers "N/A" throws away seven correct minor numbers and remaps every
+    healthy GPU by PCI order -- the exact mapping that points a UUID at another
+    GPU's device node. On this node GPU-0's node is /dev/nvidia7, so the index
+    map would have inspected /dev/nvidia0 and passed the reset with a live
+    holder on the target.
+    """
+
+    runner = DevicePathRunner(_mixed_minor_xml(eighth_minor), index=MIXED_MINOR_INDEX)
+    proc = _proc_root_holding(tmp_path, "/dev/nvidia7")
+    agent = _verify_agent(tmp_path, "mixed-minor.db", runner, proc)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, gpu_uuids=["GPU-0"]))
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "GPU-0:222:python" in (result.error or ""), result.error
+    assert runner.index_queries() == 0, (
+        f"seven usable minor numbers must not fall back to the index: {runner.commands}"
+    )
+
+
+@pytest.mark.parametrize("eighth_minor", ["N/A", ""])
+def test_a_target_without_a_minor_number_fails_the_verification_closed(
+    tmp_path, eighth_minor: str
+) -> None:
+    """An unresolvable target is refused, not quietly dropped from the scan.
+
+    ``_verify_no_clients`` filtered a target the device map could not resolve
+    out of the scan and then reported "verified": the one gate the destructive
+    reset has passed without ever looking at that GPU's device node. Quiesce
+    already refuses a target it cannot map; this says the same thing.
+    """
+
+    runner = DevicePathRunner(_mixed_minor_xml(eighth_minor), index=MIXED_MINOR_INDEX)
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    agent = _verify_agent(tmp_path, "unresolvable.db", runner, proc)
+
+    result = agent.execute(
+        envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, gpu_uuids=["GPU-7"]))
+    )
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "cannot resolve device node for GPU-7" in (result.error or ""), result.error
+
+
+def test_two_uuids_on_one_device_node_resolve_to_neither(tmp_path) -> None:
+    """A report that gives two GPUs the same minor cannot be trusted for either.
+
+    Keeping the last writer would hand one UUID a device node that provably
+    belongs to another GPU, which is the failure this whole map exists to stop.
+    """
+
+    runner = DevicePathRunner(DUPLICATE_MINOR_XML)
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    agent = _verify_agent(tmp_path, "duplicate-minor.db", runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS)))
+
+    assert result.status is NodeActionStatus.FAILED, result.details
+    assert "cannot resolve device node for GPU-a" in (result.error or ""), result.error
+
+
+def test_the_device_map_cache_is_per_command_not_per_executor(tmp_path) -> None:
+    """A second command must resolve the map itself, not inherit the first's.
+
+    The window's cache used to live on the executor instance, and the action
+    pool runs four commands on that one instance: a command that opens its
+    window while another one is still inside answers from the older command's
+    table, and the ``depth += 1`` / ``-= 1`` counter that was meant to bound
+    that is a read-modify-write with no lock -- one lost update pins the depth
+    above zero and the table is never dropped again. A driver reload renumbers
+    the device nodes, so an inherited table points a UUID at another GPU.
+
+    The first command is held inside its window while the second one resolves,
+    which is the interleaving itself.
+    """
+
+    runner = DevicePathRunner(MINOR_NUMBER_XML)
+    proc = tmp_path / "empty-proc"
+    proc.mkdir()
+    first_map_resolved = Event()
+    second_map_resolved = Event()
+
+    def hold_the_first_command_inside_its_window(_targets):
+        if first_map_resolved.is_set():
+            second_map_resolved.set()
+        else:
+            first_map_resolved.set()
+            second_map_resolved.wait(timeout=15)
+        return []
+
+    agent = _verify_agent(
+        tmp_path,
+        "cache-scope.db",
+        runner,
+        proc,
+        device_client_finder=hold_the_first_command_inside_its_window,
+    )
+
+    def verify(command_id: str):
+        return agent.execute(
+            envelope(
+                command(WorkflowOperation.VERIFY_NO_GPU_CLIENTS, command_id=command_id)
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(verify, "workflow/v1/node-a")
+        assert first_map_resolved.wait(timeout=15), (
+            "the first command never reached its device-client scan"
+        )
+        second = pool.submit(verify, "workflow/v2/node-a")
+        answers = [future.result(timeout=20) for future in (first, second)]
+
+    for answer in answers:
+        assert answer.status is NodeActionStatus.SUCCEEDED, answer.error
+    assert runner.xml_queries() == 2, (
+        f"each command must resolve its own device map: {runner.commands}"
+    )
+
+
+def test_a_second_close_cannot_reopen_a_manual_confirmation(
+    tmp_path, monkeypatch
+) -> None:
+    """Two callers close one attempt: the second must not make it retryable.
+
+    Both the poll and the pool's done-callback close a finished future, so the
+    same attempt goes through the wrapper twice. The first close writes the
+    INTERRUPTED marker that means "manual confirmation, never replay"; the
+    second one then saw a row that already carried a result, fell to the branch
+    for an attempt that was never dispatched, and saved a *retryable* FAILED row
+    at attempt+1 over the marker. The control plane resubmits a retryable
+    failure, so the destructive handler runs a second time -- which is exactly
+    what the marker exists to prevent.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_NODE_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_CLUSTER_ID", raising=False)
+    runner = FakeRunner()
+    agent = reset_agent(tmp_path, "double-close.db", runner)
+    real_mark_interrupted = agent.ledger.mark_interrupted
+    submit_returned = Event()
+    attempt_closed = Event()
+    poll_answered = Event()
+
+    def dispatch_then_crash(value: SignedNodeAction):
+        # An attempt on disk with no result: the handler ran and the wrapper
+        # around it failed, which is the only state that closes as INTERRUPTED.
+        agent.ledger.mark_in_progress(value.command, 1, signature=value.signature)
+        submit_returned.wait(timeout=5)
+        raise sqlite3.OperationalError("database is locked")
+
+    def close_then_wait_for_the_poll(command_id: str, attempt: int, error: str):
+        closed = real_mark_interrupted(command_id, attempt, error)
+        attempt_closed.set()
+        # Hold the done-callback before it forgets the future, so the poll has
+        # to close the same attempt a second time.
+        poll_answered.wait(timeout=5)
+        return closed
+
+    monkeypatch.setattr(agent, "execute", dispatch_then_crash)
+    monkeypatch.setattr(agent.ledger, "mark_interrupted", close_then_wait_for_the_poll)
+    signed = envelope(command(WorkflowOperation.RESET_GPU))
+
+    with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
+        submit_action(client, signed)
+        submit_returned.set()
+        assert attempt_closed.wait(timeout=5), "the attempt was never closed"
+        polled = client.get(
+            "/v1/node-actions/result", params=result_params(signed.command.command_id)
+        )
+        poll_answered.set()
+
+    assert polled.status_code == 200, f"the poll must answer: {polled.text}"
+    payload = polled.json()
+    assert payload["state"] == NodeActionExecutionState.INTERRUPTED.value, payload
+    assert payload["result"]["retryable"] is False, (
+        f"a closed attempt must not be reopened as retryable: {payload}"
+    )
+    assert payload["result"]["attempt"] == 1, (
+        f"no second attempt was dispatched: {payload}"
+    )
+    stored = agent.ledger.get(signed.command.command_id)
+    assert stored is not None and stored.retryable is False, (
+        f"the manual-confirmation marker must survive on disk: {stored}"
+    )
+    assert reset_invocations(runner) == 0, f"nothing may have reset: {runner.commands}"
 
 
 def test_a_poll_answers_a_persisted_result_over_a_fabricated_interrupt(

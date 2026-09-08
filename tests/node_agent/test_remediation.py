@@ -345,6 +345,7 @@ def test_driver_remediation_is_pinned_and_target_verified(tmp_path) -> None:
         quiesce_manager=Quiesced(),
         runner=runner,
         device_client_finder=no_device_clients,
+        gpu_device_path_finder=lambda: {"GPU-a": "/dev/nvidia0"},
         sleep=lambda _: None,
     )
 
@@ -609,6 +610,7 @@ def test_firmware_update_requires_exact_verified_version(tmp_path) -> None:
         quiesce_manager=Quiesced(),
         runner=runner,
         device_client_finder=no_device_clients,
+        gpu_device_path_finder=lambda: {"GPU-a": "/dev/nvidia0"},
         sleep=lambda _: None,
     )
 

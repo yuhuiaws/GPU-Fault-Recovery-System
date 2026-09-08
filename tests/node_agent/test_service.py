@@ -464,7 +464,12 @@ def test_heartbeat_caches_unit_enablement_between_ticks() -> None:
 
 
 def test_heartbeat_refreshes_unit_enablement_when_the_unit_set_changes() -> None:
-    """A newly installed unit has no cached answer, so it is asked for."""
+    """A newly installed unit is asked for -- and only that unit.
+
+    A changed unit set used to re-query the whole node's enablement, which is
+    the very burst the cache exists to avoid; the unit that is missing from the
+    cache is the only one whose answer is unknown.
+    """
 
     calls: list[list[str]] = []
     units = [["gpu-fault-host-collector.service"]]
@@ -486,7 +491,9 @@ def test_heartbeat_refreshes_unit_enablement_when_the_unit_set_changes() -> None
     second = states()
 
     assert sorted(second) == units[0], second
-    assert [argv[1] for argv in calls].count("is-enabled") == 2, calls
+    assert [argv for argv in calls if argv[1] == "is-enabled"] == [
+        ["systemctl", "is-enabled", "gpu-fault-metrics-collector.service"]
+    ], calls
 
 
 def test_heartbeat_refreshes_unit_enablement_every_refresh_interval() -> None:
@@ -534,6 +541,40 @@ def test_heartbeat_unit_enablement_failure_is_not_cached() -> None:
 
     assert first["gpu-fault-host-collector.service"].enabled == "unknown", first
     assert second["gpu-fault-host-collector.service"].enabled == "enabled", second
+
+
+def test_heartbeat_enablement_failure_re_asks_only_the_failed_unit() -> None:
+    """One slow ``systemctl`` must not put the whole node back on the next tick.
+
+    A failed ``is-enabled`` is not cached, and the unit set was then compared
+    with the cache: one timeout on a loaded node re-queried every collector
+    unit on the following tick -- eight extra 5 s calls on the tick that was
+    already running late, which is what pushed the heartbeat interval out.
+    """
+
+    calls: list[list[str]] = []
+    units = ["gpu-fault-host-collector.service", "gpu-fault-metrics-collector.service"]
+    timeouts = [TimeoutExpired(["systemctl"], 5)]
+
+    def runner(argv, **_):
+        calls.append(list(argv))
+        if argv[1] == "is-enabled" and argv[2] == units[0] and timeouts:
+            raise timeouts.pop()
+        return CompletedProcess(argv, 0, stdout="enabled\n", stderr="")
+
+    states = CollectorServiceStates(
+        units=lambda: units, runner=runner, refresh_every=30
+    )
+
+    first = states()
+    calls.clear()
+    second = states()
+
+    assert first[units[0]].enabled == "unknown", first
+    assert second[units[0]].enabled == "enabled", second
+    assert [argv for argv in calls if argv[1] == "is-enabled"] == [
+        ["systemctl", "is-enabled", units[0]]
+    ], calls
 
 
 def test_heartbeat_reloads_the_xid_policy_only_when_its_mtime_changes(tmp_path) -> None:

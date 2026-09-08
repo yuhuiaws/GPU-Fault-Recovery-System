@@ -484,6 +484,7 @@ class HungProcessOperationsMixin:
             "interval_seconds": sample_interval,
             "started_at": started_at.isoformat(),
         }
+        trace_files: list[str] = []
         try:
             completed = self.runner(
                 argv,
@@ -493,21 +494,25 @@ class HungProcessOperationsMixin:
                 timeout=duration + 5,
             )
             capture["returncode"] = completed.returncode
+            # A fixed-duration sample is *supposed* to end by being
+            # killed: timeout(1) exits 124 and strace exits 130 on
+            # SIGINT. Reporting that as a failed capture made every
+            # healthy bundle report one failure per sample, so the
+            # summary's failed_capture_count was useless. Only count
+            # it as a failure when no trace file was produced.
+            #
+            # Listed inside the guard because this now runs in one thread per
+            # rank: anything that escapes here comes back out of
+            # ``future.result()`` and takes every other rank's sample with it.
+            trace_files = sorted(
+                item.name for item in work_dir.glob(f"{trace_prefix.name}*")
+            )
         except (
             OSError,
             subprocess.TimeoutExpired,
         ) as exc:
-            capture["returncode"] = None
+            capture.setdefault("returncode", None)
             capture["error"] = f"{type(exc).__name__}: {exc}"
-        # A fixed-duration sample is *supposed* to end by being
-        # killed: timeout(1) exits 124 and strace exits 130 on
-        # SIGINT. Reporting that as a failed capture made every
-        # healthy bundle report one failure per sample, so the
-        # summary's failed_capture_count was useless. Only count
-        # it as a failure when no trace file was produced.
-        trace_files = sorted(
-            item.name for item in work_dir.glob(f"{trace_prefix.name}*")
-        )
         capture["trace_file_count"] = len(trace_files)
         if capture["returncode"] in {124, 130} and trace_files:
             capture["terminated_by"] = "sample_duration"

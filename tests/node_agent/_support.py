@@ -132,6 +132,14 @@ def executor(tmp_path, runner: FakeRunner) -> NodeActionExecutor:
         ledger=NodeActionLedger(str(tmp_path / "actions.db")),
         runner=runner,
         device_client_finder=no_device_clients,
+        # The three GPUs the reset tests target. A target the device map cannot
+        # resolve now fails the client verification closed instead of being
+        # dropped from the scan, so the fixture has to declare the whole node.
+        gpu_device_path_finder=lambda: {
+            "GPU-a": "/dev/nvidia0",
+            "GPU-b": "/dev/nvidia1",
+            "GPU-c": "/dev/nvidia2",
+        },
         now=lambda: NOW,
         sleep=lambda _: None,
     )

@@ -769,7 +769,7 @@ class GpuServiceQuiesceManager:
                 report["kept"].append(entry)
                 continue
             try:
-                self.restore_state_file(
+                restored = self.restore_state_file(
                     state_path,
                     runner=self.runner,
                     container_restore_timeout_seconds=(
@@ -786,6 +786,11 @@ class GpuServiceQuiesceManager:
                     {**entry, "error": f"{type(exc).__name__}: {exc}"}
                 )
                 continue
+            skipped = restored.get("container_restore_wait_skipped")
+            if skipped:
+                # The only place the skip is visible: whoever reads the
+                # start-up report has to know these are not workload-ready.
+                entry["container_restore_wait_skipped"] = skipped
             report["restored"].append(entry)
         return report
 

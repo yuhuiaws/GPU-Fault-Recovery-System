@@ -465,22 +465,24 @@ class DiagnosticOperationsMixin:
         return removed
 
     def _prune_diagnostic_family(self, pattern: str, cutoff: float) -> list[str]:
-        archives = sorted(
-            self.diagnostic_output_dir.glob(pattern),
-            key=lambda path: (
-                path.stat().st_mtime,
-                path.name,
-            ),
-            reverse=True,
-        )
+        # A file can be gone between the glob and the stat: a concurrent triage
+        # sweeps the same 0700 directory, and evidence is pulled off the node
+        # with tools that remove the source. It needs no pruning, and it must
+        # not raise out of the sweep -- that used to fail the diagnostic step
+        # over the archive it had just written, and prune nothing at all.
+        candidates: list[tuple[float, str, Path]] = []
+        for archive in self.diagnostic_output_dir.glob(pattern):
+            try:
+                modified = archive.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((modified, archive.name, archive))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
         removed = []
-        for index, archive in enumerate(archives):
-            if (
-                index >= self.diagnostic_max_archives
-                or archive.stat().st_mtime < cutoff
-            ):
+        for index, (modified, name, archive) in enumerate(candidates):
+            if index >= self.diagnostic_max_archives or modified < cutoff:
                 archive.unlink(missing_ok=True)
-                removed.append(archive.name)
+                removed.append(name)
         return removed
 
     @staticmethod

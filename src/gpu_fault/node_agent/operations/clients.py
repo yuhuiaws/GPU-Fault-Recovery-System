@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -24,10 +25,11 @@ class ClientOperationsMixin:
     proc_root: Any
     sleep: Callable[..., Any]
 
-    # Owned by ``_device_path_cache_window``.  Class defaults so the mixin
-    # needs nothing from the concrete executor's ``__init__``.
-    _device_path_cache: dict[str, str] | None = None
-    _device_path_cache_depth: int = 0
+    # Owned by ``_device_path_cache_window``. Per thread, because the action
+    # pool runs four commands on one executor instance and an instance counter
+    # is a read-modify-write nobody holds a lock for. A plain assignment, not a
+    # slot the concrete executor has to build.
+    _device_path_state = threading.local()
 
     def _compute_clients(self) -> list[dict[str, str]]:
         completed = self._run_checked(
@@ -60,30 +62,38 @@ class ClientOperationsMixin:
         rebuilt it for every sample: with three samples on an 8-GPU node, one
         busy-retrying reset spent up to 96 ``nvidia-smi`` invocations learning
         the same answer -- and each one is a driver round trip that competes
-        with the very reset it is waiting for.  The window is reference counted
-        so two actions running side by side cannot clear each other's cache,
-        and it is always dropped on the way out: nothing is cached across
-        commands, where a driver reload really can renumber the devices.
+        with the very reset it is waiting for.
+
+        The window lives in thread-local state and restores whatever it found,
+        so the four action-pool workers neither share a table nor need a lock,
+        and nothing survives the block: across commands a driver reload really
+        can renumber the devices.
         """
 
-        self._device_path_cache_depth += 1
+        state = self._device_path_state
+        outer_entry = getattr(state, "entry", None)
+        outer_caching = getattr(state, "caching", False)
+        state.entry = None
+        state.caching = True
         try:
             yield
         finally:
-            self._device_path_cache_depth -= 1
-            if self._device_path_cache_depth <= 0:
-                self._device_path_cache_depth = 0
-                self._device_path_cache = None
+            state.entry = outer_entry
+            state.caching = outer_caching
 
     def _gpu_device_paths(self) -> dict[str, str]:
-        cached = self._device_path_cache
-        if cached is not None:
+        state = self._device_path_state
+        entry = getattr(state, "entry", None)
+        # The table belongs to one executor: the id keeps a window opened by one
+        # from answering another's question.
+        if entry is not None and entry[0] == id(self):
+            cached: dict[str, str] = entry[1]
             return cached
         paths = self._minor_number_device_paths()
         if paths is None:
             paths = self._index_device_paths()
-        if self._device_path_cache_depth:
-            self._device_path_cache = paths
+        if getattr(state, "caching", False):
+            state.entry = (id(self), paths)
         return paths
 
     def _minor_number_device_paths(self) -> dict[str, str] | None:
@@ -97,10 +107,13 @@ class ClientOperationsMixin:
         on the target GPU, and blocked on a holder of a GPU nobody was
         resetting.
 
-        Answers ``None`` -- never a partial map -- when the XML does not give a
-        usable minor number for every GPU, so the caller falls back to the
-        index map as a whole.  A half-and-half map is the one outcome that
-        could hide a holder.
+        Answers ``None`` only when the report carries no usable minor number at
+        all -- a driver that does not report them -- and the caller then falls
+        back to the index map as a whole. A single GPU that answers ``N/A``,
+        which is what a card that fell off the bus reports, is left out of the
+        map instead: degrading its seven healthy siblings to the index map is
+        exactly the mapping that can point a UUID at another GPU's device node.
+        An unresolved target fails the verification closed instead.
         """
 
         try:
@@ -112,14 +125,31 @@ class ClientOperationsMixin:
         except ET.ParseError:
             return None
         paths: dict[str, str] = {}
+        claimed: set[str] = set()
+        duplicated: set[str] = set()
         for gpu in root.findall(".//gpu"):
             gpu_uuid = (gpu.findtext("uuid") or "").strip()
             minor = (gpu.findtext("minor_number") or "").strip()
             if not gpu_uuid or not minor.isdigit():
-                return None
-            paths[gpu_uuid] = f"/dev/nvidia{minor}"
-        if not paths or len(set(paths.values())) != len(paths):
+                continue
+            device = f"/dev/nvidia{minor}"
+            if device in claimed:
+                duplicated.add(device)
+            claimed.add(device)
+            paths[gpu_uuid] = device
+        if not paths:
+            # No GPU reported a usable minor number: this driver does not give
+            # them, so the index map is all there is.
             return None
+        # Two UUIDs on one device node is a report that cannot be trusted for
+        # either of them, so neither is resolved and both fail closed. The
+        # answer stays a (possibly empty) map, never ``None``: minor numbers
+        # were reported, so falling back to the index would hand exactly those
+        # UUIDs the device node this report already proved is ambiguous.
+        for gpu_uuid in [
+            uuid for uuid, device in paths.items() if device in duplicated
+        ]:
+            del paths[gpu_uuid]
         return paths
 
     def _index_device_paths(self) -> dict[str, str]:
@@ -195,7 +225,7 @@ class ClientOperationsMixin:
             return "unknown"
 
     def _device_clients(self, gpu_uuids: set[str]) -> list[dict[str, str]]:
-        device_paths = self._gpu_device_paths()
+        device_paths = self.gpu_device_path_finder()
         targets = {
             uuid: path
             for uuid, path in device_paths.items()
@@ -236,6 +266,25 @@ class ClientOperationsMixin:
                 int(item["pid"]),
             ),
         )
+
+    def _require_resolvable_targets(self, gpu_uuids: list[str]) -> None:
+        """Refuse to scan when a target GPU has no device node of its own.
+
+        ``_quiesce_scope`` already refuses a target it cannot map; the
+        verification that gates the reset did not, and dropped such a target
+        from the scan instead -- so a GPU whose minor number the driver no
+        longer reports passed the only gate the reset has.
+
+        Reads the same finder ``_device_clients`` scans with, so the map that
+        answers "resolvable" is the map the scan actually walks.
+        """
+
+        if not gpu_uuids:
+            return
+        device_paths = self.gpu_device_path_finder()
+        missing = sorted(set(gpu_uuids) - set(device_paths))
+        if missing:
+            raise RuntimeError("cannot resolve device node for " + ", ".join(missing))
 
     def _persistent_device_clients(
         self, target: set[str]
@@ -308,6 +357,11 @@ class ClientOperationsMixin:
         transient_device_clients: list[dict[str, str]] = []
         if include_device_clients:
             with self._device_path_cache_window():
+                # A target the device map cannot resolve used to be filtered out
+                # of the scan and the verification passed with a live holder on
+                # it. Say so instead, the way ``_quiesce_scope`` does: the reset
+                # that follows is destructive and this is its only gate.
+                self._require_resolvable_targets(gpu_uuids)
                 (
                     device_clients,
                     transient_device_clients,

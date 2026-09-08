@@ -457,3 +457,50 @@ def test_a_quick_diagnostic_sweeps_the_evidence_it_leaves_behind(tmp_path) -> No
     assert not stale_json.exists(), "the stale quick diagnostic must be swept"
     fresh = result.details["evidence_ref"].removeprefix("file://")
     assert Path(fresh).exists(), f"the evidence it just wrote must survive: {fresh}"
+
+
+def test_a_vanished_archive_does_not_abort_the_retention_sweep(
+    tmp_path, monkeypatch
+) -> None:
+    """One file that disappears mid-sweep must not stop the rest of the prune.
+
+    The sweep stats every candidate twice -- once to sort, once to judge its
+    age -- and the directory is written by every diagnostic this node runs. A
+    file removed between the glob and the stat (a concurrent triage, or an
+    operator pulling evidence off the node) raised out of the sweep, out of the
+    diagnostic step, and out of the command: the archive it had just written
+    was reported as a failure, and nothing was pruned. The sweep is the only
+    thing keeping ``/var/lib/gpu-fault`` from filling the root filesystem.
+    """
+
+    output_dir = tmp_path / "diagnostics"
+    output_dir.mkdir()
+    vanished = output_dir / "dcgm-quick-diagnostic-vanished.json"
+    stale = output_dir / "dcgm-quick-diagnostic-stale.json"
+    for path in (vanished, stale):
+        path.write_text("{}", encoding="utf-8")
+        long_ago = (NOW - timedelta(days=3)).timestamp()
+        os.utime(path, (long_ago, long_ago))
+    real_stat = Path.stat
+
+    def stat_a_file_that_is_already_gone(self, *args, **kwargs):
+        if self.name == vanished.name:
+            raise FileNotFoundError(str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_a_file_that_is_already_gone)
+    agent = node_action_executor(
+        tmp_path,
+        "vanished-sweep.db",
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_output_dir=str(output_dir),
+        diagnostic_retention_seconds=3600,
+        diagnostic_max_archives=5,
+        runner=lambda argv, **_: CompletedProcess(argv, 0, stdout="{}", stderr=""),
+        now=lambda: NOW,
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.RUN_DCGM_DIAGNOSTIC)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert not stale.exists(), "the file the sweep can stat must still be pruned"

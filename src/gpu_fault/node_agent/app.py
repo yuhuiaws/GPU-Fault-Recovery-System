@@ -309,6 +309,11 @@ def create_node_agent_app(
                     retryable=False,
                     attempt=row[1],
                 )
+            if row is not None and row[2] is not None and not row[2].retryable:
+                # The poll and the done-callback both close the same future, so
+                # the other caller may have just written the INTERRUPTED marker.
+                # A retryable row over it asks for a destructive replay.
+                return row[2]
             # Nothing was dispatched under a new attempt number, so this is
             # safe to retry: the ledger refuses to re-run a dispatched attempt.
             result = NodeActionResult(
