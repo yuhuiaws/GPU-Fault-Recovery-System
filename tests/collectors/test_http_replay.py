@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import os
 from threading import Event
 
+from gpu_fault.collectors import sinks as collector_sinks
 from gpu_fault.collectors.sinks import DeliveryStatus, OutboxFile
 
 from ._support import CollectorError, HttpEventSink, json, logging, pytest
@@ -735,4 +737,61 @@ def test_a_filesystem_without_flock_still_buffers_and_warns_once(
     ]
     assert len(warnings) == 1, (
         f"the flock fallback warned {len(warnings)} times, not once per path"
+    )
+
+
+def test_replay_failures_that_differ_only_in_their_text_are_reported_once(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """The rate limit keyed on ``str(exc)``, which is rarely repeatable.
+
+    An ``HTTPError`` carries a request id and a ``JSONDecodeError`` a line and
+    column, so the same permanent failure produced a new key -- and a new
+    traceback -- per delivered event, which is exactly what N-4 set out to
+    stop, while churning the bounded table until nothing else fitted. Keyed on
+    the failure instead: path, type and, for an ``OSError``, errno.
+    """
+
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen", lambda _request, **_kwargs: _Response()
+    )
+    attempts: list[int] = []
+
+    def failing_read(self):
+        attempts.append(len(attempts))
+        code = errno.ENOSPC if len(attempts) <= 3 else errno.EROFS
+        # A varying message for one unchanging fault, as a server body or a
+        # decode position would be.
+        raise OSError(
+            code, "cannot read the outbox", f"{tmp_path}/attempt-{len(attempts)}"
+        )
+
+    monkeypatch.setattr(collector_sinks.OutboxFile, "read", failing_read)
+    sink = HttpEventSink(
+        "https://control",
+        outbox_path=str(tmp_path / "outbox.ndjson"),
+        outbox_replay_background_interval_seconds=0,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gpu_fault.collectors.sinks"):
+        for sequence in range(4):
+            result = sink.deliver(
+                "/events", {"sequence": sequence, "event_id": f"e-{sequence}"}
+            )
+            assert result.status is DeliveryStatus.DELIVERED, (
+                f"a replay that cannot run failed the delivered post: {result}"
+            )
+
+    tracebacks = [
+        record
+        for record in caplog.records
+        if record.exc_info and "replay" in record.getMessage().lower()
+    ]
+    assert len(tracebacks) == 2, (
+        "one unchanging replay failure with a varying message logged "
+        f"{len(tracebacks)} traceback(s); only a second errno earns another: "
+        f"{[record.getMessage() for record in tracebacks]}"
+    )
+    assert f"Errno {errno.EROFS}" in tracebacks[1].getMessage(), (
+        f"the second traceback is not the second fault: {tracebacks[1].getMessage()!r}"
     )

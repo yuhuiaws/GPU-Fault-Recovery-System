@@ -198,7 +198,17 @@ def _configured_exporter_interval_seconds() -> float | None:
     configured = os.getenv("GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS")
     if not configured or not configured.strip():
         return None
-    return float(configured)
+    try:
+        return float(configured)
+    except ValueError as exc:
+        # A unit trap worth naming: the exporter's own ``-c`` is MILLISECONDS
+        # and this is SECONDS, so both "15s" and "15000" look plausible on the
+        # way in. A bare ``float()`` answered either with "could not convert
+        # string to float", in a systemd restart loop, naming nothing.
+        raise ValueError(
+            "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS must be the exporter's "
+            f"collect period in seconds, not {configured!r}"
+        ) from exc
 
 
 def _check_exporter_interval(

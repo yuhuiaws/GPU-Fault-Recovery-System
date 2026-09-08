@@ -118,12 +118,17 @@ def run_outbox_command(args: argparse.Namespace) -> None:
         )
     except OutboxLockUnavailable as exc:
         # Without the lock this is the F7 race, and this process has no
-        # in-process lock to fall back on: refuse rather than half-apply.
-        raise SystemExit(
-            f"{exc}. A collector may be buffering or replaying right now; retry, "
+        # in-process lock to fall back on: refuse rather than half-apply. The
+        # sink names --force itself when --force is the way through, so this
+        # line adds it only when the refusal does not carry it already.
+        advice = (
+            ""
+            if "--force" in str(exc)
+            else ". A collector may be buffering or replaying right now; retry, "
             "or pass --force to rewrite the outbox without the lock and accept "
             "that one side's update can be lost"
-        ) from exc
+        )
+        raise SystemExit(f"{exc}{advice}") from exc
     except OSError as exc:
         raise SystemExit(f"cannot rewrite the collector outbox {outbox.path}: {exc}")
     print(f"requeued {requeued} dead record(s) in {outbox.path}")

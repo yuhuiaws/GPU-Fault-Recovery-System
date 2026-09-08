@@ -772,3 +772,25 @@ def test_the_implausible_counter_write_off_is_bounded(
         "whose GPU UUIDs change grows one entry per broken counter for the "
         f"life of the process: {written_off}"
     )
+
+
+def test_a_non_numeric_exporter_interval_is_refused_by_name(monkeypatch) -> None:
+    """A bad exporter period must say which variable to fix.
+
+    ``-c`` is milliseconds and this variable is seconds, so "15000" and "15s"
+    are both plausible mistakes; a bare ``float()`` answered either with
+    ``could not convert string to float: '15s'`` in a systemd restart loop,
+    naming neither the variable nor the unit.
+    """
+
+    monkeypatch.setenv("GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS", "15s")
+
+    with pytest.raises(ValueError) as refusal:
+        DcgmMetricsCollector(RecordingSink(), context(), node_id="worker-1")
+
+    assert "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS" in str(refusal.value), (
+        f"the refusal did not name the variable to fix: {refusal.value}"
+    )
+    assert "15s" in str(refusal.value), (
+        f"the refusal did not quote the value it could not read: {refusal.value}"
+    )

@@ -336,25 +336,25 @@ OVERSIZE_PAYLOAD_EXCERPT_BYTES = 4096
 #: ``max/10`` free appends per rewrite.
 OUTBOX_COMPACTION_FLOOR_RATIO = 0.9
 
-#: One WARNING per this many writes that ran without the cross-process lock.
-#: A single warning per path hid every later unlocked write, including a
-#: transient failure that has since become permanent.
+#: One WARNING per this many writes that ran without the cross-process lock:
+#: one per path hid every later unlocked write, including a failure that has
+#: since become permanent.
 UNLOCKED_WRITE_WARN_INTERVAL = 100
 
-#: Writes per outbox lock path that ran without the lock, and outbox paths whose
-#: write failed, both counted so the logs stay bounded and an operator can see
-#: how long a degradation has lasted.
+#: Writes per lock path that ran without the lock, and outbox paths whose write
+#: failed: counted so the logs stay bounded and an operator can see how long a
+#: degradation has lasted.
 _UNLOCKED_WRITES: dict[str, int] = {}
 _OUTBOX_WRITE_FAILURES: dict[str, int] = {}
 _OUTBOX_COUNTER_LOCK = Lock()
 
 #: How long an operator command polls for the outbox lock before giving up: a
-#: blocking ``flock`` behind a live collector's replay left ``requeue-dead`` with
-#: no output and no timeout, which reads as a wedged command.
+#: blocking ``flock`` behind a live replay reads as a wedged command.
 OUTBOX_LOCK_ATTEMPTS = 10
 OUTBOX_LOCK_RETRY_SECONDS = 0.5
 
-#: Distinct replay failures already reported; bounded, the text carries a path.
+#: Distinct replay failures already reported. Past this many the oldest is
+#: forgotten and reported in full again: a rate limiter, not a record.
 REPLAY_FAILURE_TEXTS_REMEMBERED = 32
 _REPLAY_FAILURES: dict[str, int] = {}
 
@@ -363,14 +363,18 @@ def _report_replay_failure(what: str, path: object, exc: BaseException) -> None:
     """One traceback per distinct replay failure, then DEBUG for its repeats.
 
     A replay failure cannot fail the post that already succeeded, so one that
-    repeats for ever costs only log volume -- but that volume was a traceback
-    per delivered event on a node whose outbox directory cannot be created.
+    repeats for ever costs only log volume -- but that volume was a traceback per
+    delivered event on a node whose outbox directory cannot be created. Keyed on
+    the failure, not on its text: an ``HTTPError`` carries a request id and a
+    ``JSONDecodeError`` a line and column, so ``str(exc)`` varies per occurrence
+    and every repeat would report in full. Errno separates ENOSPC from EROFS.
     """
 
     text = f"{path}: {type(exc).__name__}: {exc}"
+    key = f"{path}/{type(exc).__name__}/{exc.errno if isinstance(exc, OSError) else ''}"
     with _OUTBOX_COUNTER_LOCK:
-        repeats = _REPLAY_FAILURES.get(text, 0)
-        _REPLAY_FAILURES[text] = repeats + 1
+        repeats = _REPLAY_FAILURES.get(key, 0)
+        _REPLAY_FAILURES[key] = repeats + 1
         if not repeats and len(_REPLAY_FAILURES) > REPLAY_FAILURE_TEXTS_REMEMBERED:
             del _REPLAY_FAILURES[next(iter(_REPLAY_FAILURES))]
     if repeats:
@@ -396,10 +400,8 @@ def unlocked_outbox_writes(lock_path: Path) -> int:
 class OutboxLockUnavailable(OSError):
     """The cross-process outbox lock could not be taken.
 
-    Raised only for callers that asked for ``required=True``: a collector
-    degrades to its in-process lock rather than dropping an event, but an
-    operator command has no in-process lock to degrade to, so for it the
-    missing lock is the F7 race itself and must stop the command.
+    Raised only for ``required=True``: for an operator command, which has no
+    in-process lock to degrade to, this is the F7 race itself.
     """
 
 
@@ -445,38 +447,36 @@ class OutboxFile:
         return self.path.with_name(self.path.name + ".lock")
 
     @contextlib.contextmanager
-    def locked(self, *, required: bool = False) -> Iterator[None]:
+    def locked(self, *, required: bool = False, forced: bool = False) -> Iterator[None]:
         """Hold the cross-process outbox lock for one read-modify-write.
 
-        Not re-entrant: ``flock`` is held per open file description, so two
-        nested :meth:`locked` blocks in one process would deadlock. Callers
-        take it once around the whole read-modify-write.
+        Not re-entrant (``flock`` is held per open file description, so two
+        nested blocks deadlock): take it once around the whole rewrite.
 
-        With ``required=False`` (the collector's write path) a filesystem with
-        no ``flock`` support, or a ``.lock`` this process cannot open, must not
-        fail a post: the body runs anyway, serialised by the caller's
-        in-process lock alone, counted in :func:`unlocked_outbox_writes` and
-        warned about every :data:`UNLOCKED_WRITE_WARN_INTERVAL` writes.
-
-        With ``required=True`` (an operator command, which has no in-process
-        lock to fall back on) that failure, and a lock another holder still has
-        after :meth:`_take_lock`'s bounded wait, raise
-        :class:`OutboxLockUnavailable` and the body never runs.
+        ``required=False`` is the collector's write path: a filesystem without
+        ``flock``, or a ``.lock`` it cannot open, must not fail a post, so the
+        body runs on the in-process lock alone, counted and warned about. For
+        ``required=True`` -- an operator command with no in-process lock -- that
+        failure and a lock still held after the bounded poll both raise
+        :class:`OutboxLockUnavailable`, and the body never runs. ``forced=True``
+        is ``--force``: the same bounded poll, then the body *without* the lock,
+        never ``required=False``'s blocking wait -- the very block ``--force``
+        exists to escape.
 
         A failure to create the outbox *directory* is not a lock problem and is
-        left to the caller: the append or rewrite that follows would fail with
-        the same error, and reporting it as a missing lock hid a full or
-        read-only volume behind a warning about concurrency.
+        left to the caller: the append that follows fails with the same error,
+        and reporting it as a missing lock hid a full or read-only volume.
         """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle: int | None = None
         try:
-            handle = self._take_lock(required=required)
-        except OutboxLockUnavailable:
-            raise
+            handle = self._take_lock(required=required or forced)
+        except OutboxLockUnavailable as exc:
+            if not forced:
+                raise
+            self._warn_unlocked_write(exc, forced=True)
         except OSError as exc:
-            handle = None
             if required:
                 raise OutboxLockUnavailable(
                     exc.errno or 0,
@@ -495,14 +495,15 @@ class OutboxFile:
     def _take_lock(self, *, required: bool) -> int:
         """Open ``<outbox>.lock`` and hold ``flock`` on it, or raise ``OSError``.
 
-        A collector waits: the other holder is one short read-modify-write and
-        its own writes must not fail. An operator command polls instead, so a
+        A collector waits: the holder is one short read-modify-write and its
+        own writes must not fail. An operator command polls, so a
         ``requeue-dead`` behind a saturated replay gets an answer, not a block.
         """
 
         handle = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if required else 0)
         attempts = OUTBOX_LOCK_ATTEMPTS if required else 1
+        waited = (attempts - 1) * OUTBOX_LOCK_RETRY_SECONDS  # sleeps go between
         try:
             while True:
                 try:
@@ -515,12 +516,12 @@ class OutboxFile:
                     if attempts <= 0:
                         raise OutboxLockUnavailable(
                             exc.errno or 0,
-                            f"another process still holds the collector outbox "
-                            f"lock {self.lock_path} after "
-                            f"{OUTBOX_LOCK_ATTEMPTS * OUTBOX_LOCK_RETRY_SECONDS:.0f}s "
-                            "(a live collector's outbox replay): retry, stop the "
-                            "collector, or pass --force to work without the "
-                            "lock, which can lose one side's update",
+                            f"another process still holds the collector outbox"
+                            f" lock {self.lock_path} after"
+                            f" {waited:.1f}s (a live"
+                            " collector's outbox replay): retry, stop the"
+                            " collector, or pass --force to work without the"
+                            " lock, which can lose one side's update",
                         ) from exc
                 time.sleep(OUTBOX_LOCK_RETRY_SECONDS)
         except BaseException:
@@ -528,17 +529,18 @@ class OutboxFile:
                 os.close(handle)
             raise
 
-    def _warn_unlocked_write(self, exc: OSError) -> None:
+    def _warn_unlocked_write(self, exc: OSError, *, forced: bool = False) -> None:
         total = _bump(_UNLOCKED_WRITES, str(self.lock_path))
-        if total > 1 and total % UNLOCKED_WRITE_WARN_INTERVAL:
+        if not forced and total > 1 and total % UNLOCKED_WRITE_WARN_INTERVAL:
             return
         LOGGER.warning(
             "collector outbox lock %s is unavailable (%s); %d write(s) so far have "
-            "run on the in-process lock alone, so a concurrent 'outbox "
-            "requeue-dead' can lose an update",
+            "run without it%s, so a concurrent append or 'outbox requeue-dead' can "
+            "lose one side's update",
             self.lock_path,
             exc,
             total,
+            " because --force was passed" if forced else " on the in-process lock",
         )
 
     def read(self) -> list[dict[str, Any]]:
@@ -696,9 +698,8 @@ class OutboxFile:
             "replayable": replayable,
             "dead": len(records) - replayable,
             "evictions_total": evictions_total,
-            # Non-zero means this outbox has been written without the
-            # cross-process lock, so an 'outbox requeue-dead' can lose an
-            # update (F7 degraded).
+            # Non-zero: written without the cross-process lock at least
+            # once, so an 'outbox requeue-dead' can lose an update (F7).
             "unlocked_writes_total": unlocked_writes_total,
             "oldest_failed_at": failed_at[0] if failed_at else None,
         }
@@ -725,15 +726,14 @@ class OutboxFile:
     ) -> int:
         """Mark dead-lettered records replayable again; returns how many.
 
-        The whole read-modify-write runs under :meth:`locked` so an operator
-        running this against a live collector's outbox cannot lose the sink's
-        appends, and the sink's next rewrite cannot lose this requeue (F7).
-        The lock is *required* by default: without it this is the F7 race, and
-        an operator process has no in-process lock to fall back on.
-        ``require_lock=False`` is the ``--force`` escape hatch.
+        The whole read-modify-write runs under :meth:`locked`, so this cannot
+        lose a live collector's appends and its next rewrite cannot lose this
+        requeue (F7). The lock is *required* by default because this process
+        has none of its own; ``require_lock=False`` is ``--force``, which takes
+        the same bounded poll and only then rewrites without the lock.
         """
 
-        with self.locked(required=require_lock):
+        with self.locked(required=require_lock, forced=not require_lock):
             records = self.read()
             requeued = 0
             skipped_truncated = 0
@@ -743,9 +743,8 @@ class OutboxFile:
                 if path_filter is not None and record.get("path") != path_filter:
                     continue
                 if record.get("payload_truncated"):
-                    # Only a digest and a 4 KB excerpt of this payload were
-                    # kept, so replaying it would post a body that is not the
-                    # event. It stays dead and inspectable.
+                    # Only a digest and a 4 KB excerpt were kept, so this
+                    # would post a body that is not the event.
                     skipped_truncated += 1
                     continue
                 record["replayable"] = True

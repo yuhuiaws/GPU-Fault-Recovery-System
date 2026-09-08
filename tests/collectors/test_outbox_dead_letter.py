@@ -531,3 +531,105 @@ def test_requeue_dead_force_proceeds_without_the_lock_and_says_so(
         f"an unlocked requeue was not warned about: {caplog.text!r}"
     )
     capsys.readouterr()
+
+
+def test_force_does_not_walk_back_into_the_block_it_escapes(
+    monkeypatch, tmp_path, capsys, caplog
+) -> None:
+    """The refusal's own advice must not block the way the refusal did.
+
+    ``--force`` mapped to the collector's ``required=False`` path: a single
+    blocking ``LOCK_EX``. Against the holder an operator actually meets -- a
+    live collector replaying a saturated backlog -- that waits for as long as
+    the control plane stays unreachable, so following the advice printed at the
+    end of the refusal led straight back into the hang it was printed to
+    escape. ``--force`` takes the same bounded poll and then works unlocked.
+    """
+
+    monkeypatch.setattr(
+        collector_sinks, "OUTBOX_LOCK_RETRY_SECONDS", 0.02, raising=False
+    )
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+    outcome: list[BaseException | None] = []
+
+    def requeue() -> None:
+        try:
+            collectors_cli.run_outbox_command(
+                _requeue_arguments(outbox_path, force=True)
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    worker = Thread(target=requeue, daemon=True, name="requeue-dead-forced")
+    try:
+        # A second open file description: what another process's lock looks
+        # like to ``flock``.
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+            worker.start()
+            worker.join(10)
+            blocked = worker.is_alive()
+            warnings = caplog.text
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+        worker.join(10)
+    capsys.readouterr()
+
+    assert not blocked, (
+        "--force was still waiting for the held outbox lock after 10s, which is "
+        "the block the refusal offers --force as the way out of"
+    )
+    assert outcome[0] is None, (
+        f"--force did not get through without the lock: {outcome[0]!r}"
+    )
+    record = json.loads(outbox_path.read_text())
+    assert record["replayable"] is True, (
+        "--force answered but did not requeue the dead record"
+    )
+    assert "--force" in warnings and str(outbox_path) in warnings, (
+        f"a forced unlocked rewrite was not warned about: {warnings!r}"
+    )
+
+
+def test_the_refusal_names_the_wait_it_took_and_offers_force_once(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The poll sleeps *between* attempts, so the promised wait was too long.
+
+    The message said "after 5s" (10 attempts x 0.5 s) but returns after 9
+    sleeps, so an operator timing the command sees it give up half a second
+    early -- with a held lock the one measurement they can take disagreed with
+    the message. The CLI also repeated the sink's own ``--force`` advice in the
+    same line.
+    """
+
+    slept: list[float] = []
+    monkeypatch.setattr(collector_sinks.time, "sleep", slept.append)
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+
+    handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        with pytest.raises(SystemExit) as refusal:
+            collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
+    capsys.readouterr()
+
+    message = str(refusal.value)
+    assert f"{sum(slept):.1f}s" in message, (
+        f"the refusal names a wait it did not take ({sum(slept)}s slept over "
+        f"{len(slept)} sleep(s)): {message!r}"
+    )
+    assert message.count("--force") == 1, (
+        f"the refusal repeats the advice it already carries: {message!r}"
+    )
