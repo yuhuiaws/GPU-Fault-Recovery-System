@@ -35,8 +35,9 @@ def test_every_case_begins_and_ends_with_one_verdict() -> None:
     runner = _runner()
 
     begins = re.findall(r"^\s*begin_case (\d+)$", runner, flags=re.MULTILINE)
-    assert [int(item) for item in begins] == list(range(1, 11))
-    assert runner.count("\n  pass_case\n") + runner.count("\npass_case\n") == 10
+    # BOOT-006 was deleted (quick diagnostics feature removed), so 1-5 and 7-10.
+    assert [int(item) for item in begins] == list(range(1, 6)) + list(range(7, 11))
+    assert runner.count("\n  pass_case\n") + runner.count("\npass_case\n") == 9
     assert "trap on_error ERR" in runner
     assert "VERDICT FAIL" in runner and 'echo "VERDICT PASS"' in runner
 
