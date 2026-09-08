@@ -19,7 +19,10 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
 )
-from gpu_fault.notification_service import AdvisoryNotificationService
+from gpu_fault.notification_service import (
+    PENDING_CONTROL_PLANE_ACTION,
+    AdvisoryNotificationService,
+)
 from gpu_fault.notifications.registry import NotificationKind
 from gpu_fault.regional import RemoteActionCommand, RemoteCommandStatus
 from tests._builders import build_store, fault_incident
@@ -163,6 +166,44 @@ def test_a_passed_regional_dcgm_diagnostic_is_mailed_once():
     assert "PASS" in notification.subject, notification.subject
     assert "COOLDOWN_AND_VALIDATE" in notification.body_text
     assert len(notifier.notifications) == 1
+
+
+def test_a_partial_dcgm_step_does_not_infer_a_control_plane_action():
+    """A step that failed before it judged must not promise a cooldown.
+
+    The node-action step reports the per-node results it already folded when it
+    exits mid-batch, so a FAILED DCGM step can carry node-a's PASS and no
+    ``control_plane_action`` at all -- ``_dcgm_outcome`` never ran for this
+    batch. Inferring from the verdicts that happen to be present mails
+    "cooldown and validate" to the customer administrator while the control
+    plane's own hardware escalation is about to drain and quarantine the node.
+    """
+
+    store = build_store()
+    service, notifier = _service(store)
+    command = _command(
+        store,
+        WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
+        status=RemoteCommandStatus.FAILED,
+        error="node agent node-b: the agent restarted mid-action",
+        result_details={
+            "node_results": {"node-a": {"diagnostic_outcome": "PASS"}},
+            "completed_nodes": ["node-a"],
+        },
+    )
+
+    results = service.dispatch_remote_completion(command)
+
+    assert [item.status for item in results] == [NotificationStatus.SENT], results
+    [notification] = store.list_notifications()
+    assert "COOLDOWN_AND_VALIDATE" not in notification.body_text, (
+        "the mail inferred a cooldown for a step that never reached a verdict"
+    )
+    assert "DRAIN_AND_QUARANTINE" not in notification.body_text, notification.body_text
+    assert PENDING_CONTROL_PLANE_ACTION in notification.body_text, (
+        notification.body_text
+    )
+    assert len(notifier.notifications) == 1, notifier.notifications
 
 
 def test_a_dcgm_result_without_node_results_is_not_mailed():

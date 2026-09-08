@@ -37,7 +37,7 @@ from gpu_fault.regional import (
     RemoteCommandResult,
     RemoteCommandStatus,
 )
-from tests._builders import fault_incident, workflow_request, workflow_step
+from tests._builders import build_store, fault_incident, workflow_request, workflow_step
 
 CLUSTER = "cluster-a"
 EXECUTOR = "executor-a"
@@ -643,7 +643,7 @@ def test_a_retryable_adapter_error_keeps_the_previous_cycles_details() -> None:
     client = FakeExecutorClient([command])
     executor = build_executor(client, [RecordingAdapter(raises=api_exception(503))])
 
-    assert executor.run_once() == 1
+    assert executor.run_once() == 1, "run_once must report the hold, not raise"
     result = client.reported("command-a")
     assert result.status is RemoteCommandStatus.WAITING, result
     assert result.status_source == "executor-retryable-adapter-error", result
@@ -675,7 +675,7 @@ def test_a_retryable_control_plane_hold_keeps_the_previous_cycles_details() -> N
         ],
     )
 
-    assert executor.run_once() == 1
+    assert executor.run_once() == 1, "run_once must report the hold, not raise"
     result = client.reported("command-a")
     assert result.status_source == "executor-retryable-control-plane", result
     assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
@@ -719,7 +719,7 @@ def test_a_fleet_preflight_hold_keeps_the_previous_cycles_details() -> None:
     adapter.registry = FenceRegistry()  # type: ignore[attr-defined]
     executor = build_executor(client, [adapter])
 
-    assert executor.run_once() == 1
+    assert executor.run_once() == 1, "run_once must report the hold, not raise"
     result = client.reported("command-a")
     assert result.status is RemoteCommandStatus.WAITING, result
     assert result.details["fleet_preflight_blocked"] is True, result.details
@@ -744,7 +744,7 @@ def test_a_barrier_hold_keeps_the_previous_cycles_details() -> None:
     client = FakeExecutorClient([command])
     executor = build_executor(client, [RecordingAdapter()])
 
-    assert executor.run_once() == 1
+    assert executor.run_once() == 1, "run_once must report the hold, not raise"
     result = client.reported("command-a")
     assert result.status_source == "executor-barrier-unavailable", result
     assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
@@ -792,7 +792,7 @@ def test_a_terminal_result_does_not_inherit_the_previous_cycles_details(
     client = FakeExecutorClient([command])
     executor = build_executor(client, [adapter])
 
-    assert executor.run_once() == 1
+    assert executor.run_once() == 1, "run_once must report the verdict, not raise"
     result = client.reported("command-a")
     assert result.status is RemoteCommandStatus.FAILED, result
     assert result.status_source == status_source, result
@@ -801,3 +801,54 @@ def test_a_terminal_result_does_not_inherit_the_previous_cycles_details(
     )
     assert "spare_failover_pending" not in result.details, result.details
     assert "gpu_client_quiesce_attempt" not in result.details, result.details
+
+
+def test_a_cancelled_command_keeps_the_merged_details_in_its_terminal_record() -> None:
+    """Accepted: a cancellation turns a merged hold into the FAILED record.
+
+    ``complete_remote_command`` writes FAILED with ``{**result.details,
+    post_cancellation_*}`` when a cancellation was requested while the command
+    was leased, so the continuation state a hold carried forward does land on a
+    terminal row. That is deliberate and stays that way: the row is the only
+    surviving account of what the executor was doing when the control plane
+    pulled the command, ``post_cancellation_status`` says in the same record
+    that the executor itself only ever asked to wait, and nothing replays a
+    FAILED command's ``result_details`` (a re-claim needs a LEASED row).
+    Stripping the keys in the store would delete exactly the evidence the
+    operator who has to finish the action by hand needs.
+    """
+
+    store = build_store()
+    command = remote_command("command-a")
+    store.ensure_remote_command(command)
+    claimed = store.claim_remote_commands(CLUSTER, EXECUTOR, limit=1, lease_seconds=60)[
+        0
+    ]
+    store.cancel_remote_commands_for_workflow(
+        command.workflow_request_id, reason="workflow deadline expired"
+    )
+
+    completed = store.complete_remote_command(
+        CLUSTER,
+        command.command_id,
+        RemoteCommandResult(
+            lease_token=claimed.lease_token,
+            status=RemoteCommandStatus.WAITING,
+            status_source="executor-retryable-transport",
+            details={**CONTINUATION_STATE, "retryable_transport_error": True},
+        ),
+    )
+
+    assert completed.status is RemoteCommandStatus.FAILED, completed
+    assert completed.error == "workflow deadline expired", completed.error
+    assert completed.result_details["post_cancellation_status"] == "WAITING", (
+        "the record must say the executor only asked to wait: "
+        f"{completed.result_details}"
+    )
+    assert (
+        completed.result_details["agent_baselines"]
+        == (CONTINUATION_STATE["agent_baselines"])
+    ), (
+        "the cancelled record keeps the carried-forward state on purpose: "
+        f"{completed.result_details}"
+    )

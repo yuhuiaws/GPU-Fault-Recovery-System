@@ -18,6 +18,7 @@ from ._misc_cases_1 import (
     test_idle_node_equal_rank_widens_unsubmitted_reset,
     test_multi_node_validation_failure_reboots_all_failed_nodes_once,
     test_non_hyperpod_restart_vm_keeps_distinct_operation,
+    test_partial_dcgm_execution_review_still_escalates,
     test_restart_parameters_prioritize_exact_logical_job_id,
     test_running_gpu_recovery_accepts_same_node_rdma_diagnostics,
     test_wide_attempt_hung_triage_samples_representative_nodes,

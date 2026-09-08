@@ -957,14 +957,18 @@ def test_node_action_adapter_loads_node_secret_directory(monkeypatch, tmp_path) 
     assert adapter._secret_for_node("cluster-a", "node-a") == ("a" * 64)
 
 
-def _two_node_outcome(
-    operation: WorkflowOperation, answers: dict[str, dict]
+def _batch_outcome(
+    operation: WorkflowOperation,
+    answers: dict[str, dict | HTTPError],
+    *,
+    node_ids: list[str] | None = None,
 ) -> WorkflowStepOutcome:
     """One non-parallel step over node-a then node-b with canned answers.
 
     ``answers`` maps a node id to the keyword arguments of the
     ``NodeActionResult`` its agent returns, so a case only has to say how the
-    second node answered.
+    second node answered. An ``HTTPError`` value is raised instead, which is
+    how the transport (not the agent) rejects a send.
     """
 
     store = build_store()
@@ -975,6 +979,8 @@ def _two_node_outcome(
 
     def sender(_endpoint, envelope):
         answer = answers[envelope.command.node_id]
+        if isinstance(answer, HTTPError):
+            raise answer
         return node_action_result(
             envelope.command.command_id, envelope.command.operation, **answer
         )
@@ -983,7 +989,7 @@ def _two_node_outcome(
     step = copy_model(
         workflow.official_steps[0],
         execution_owner=adapter.owner,
-        node_ids=["node-a", "node-b"],
+        node_ids=["node-a", "node-b"] if node_ids is None else node_ids,
         gpu_uuids=["GPU-a"],
     )
     return adapter.execute(
@@ -1000,6 +1006,69 @@ def _two_node_outcome(
     )
 
 
+def _rejection(node_id: str) -> HTTPError:
+    """A non-retryable HTTP rejection from ``node_id``'s agent."""
+
+    return HTTPError(
+        f"http://{node_id}:9099/v1/node-actions/submit",
+        403,
+        "Forbidden",
+        {},
+        io.BytesIO(
+            json.dumps(
+                {
+                    "detail": {
+                        "code": "SIGNATURE_INVALID",
+                        "message": "node action signature is invalid",
+                    }
+                }
+            ).encode()
+        ),
+    )
+
+
+def test_a_rejected_second_node_still_reports_the_first_nodes_result() -> None:
+    """A transport rejection must report the same partial state as an agent one.
+
+    Both are the same event for whoever has to clean up -- node-a was acted
+    on, node-b was not -- so a multi-node step must not have two failure
+    shapes depending on which layer said no. The rejection's own keys stay
+    intact, and a single-node step keeps the lean shape: there is no earlier
+    node to report.
+    """
+
+    outcome = _batch_outcome(
+        WorkflowOperation.VALIDATE_GPU,
+        {
+            "node-a": {
+                "status": NodeActionStatus.SUCCEEDED,
+                "details": {"validated": True},
+            },
+            "node-b": _rejection("node-b"),
+        },
+    )
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert outcome.details["node_action_error_code"] == "SIGNATURE_INVALID", (
+        outcome.details
+    )
+    assert outcome.details["node_results"]["node-a"] == {"validated": True}, (
+        "the rejected step dropped the node that already succeeded"
+    )
+    assert outcome.details["completed_nodes"] == ["node-a"], outcome.details
+
+    alone = _batch_outcome(
+        WorkflowOperation.VALIDATE_GPU,
+        {"node-b": _rejection("node-b")},
+        node_ids=["node-b"],
+    )
+
+    assert alone.status is WorkflowStepStatus.FAILED, alone
+    assert "node_results" not in alone.details, (
+        "a single-node rejection has no earlier node to report"
+    )
+
+
 def test_a_failed_second_node_still_reports_the_first_nodes_result() -> None:
     """A terminal FAILED must still name the nodes the step already changed.
 
@@ -1009,7 +1078,7 @@ def test_a_failed_second_node_still_reports_the_first_nodes_result() -> None:
     from any later step that has to undo what node-a already did.
     """
 
-    outcome = _two_node_outcome(
+    outcome = _batch_outcome(
         WorkflowOperation.VALIDATE_GPU,
         {
             "node-a": {
@@ -1062,7 +1131,7 @@ def test_an_early_held_or_interrupted_node_keeps_the_earlier_node_results(
     hand needs to know node-a was already acted on.
     """
 
-    outcome = _two_node_outcome(
+    outcome = _batch_outcome(
         WorkflowOperation.VALIDATE_GPU,
         {
             "node-a": {
@@ -1088,7 +1157,7 @@ def test_a_quiesce_wait_on_the_second_node_keeps_the_first_nodes_result() -> Non
     nodes are already clear while the step keeps waiting on the rest.
     """
 
-    outcome = _two_node_outcome(
+    outcome = _batch_outcome(
         WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
         {
             "node-a": {

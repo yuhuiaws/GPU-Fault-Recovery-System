@@ -49,6 +49,7 @@ from gpu_fault.regional import (
 )
 from tests.execution.test_cluster_executor_lease_and_report import (
     CLUSTER,
+    CONTINUATION_STATE,
     EXECUTOR,
     FakeExecutorClient,
     RecordingAdapter,
@@ -468,6 +469,49 @@ def test_a_control_plane_transport_failure_keeps_the_command_retryable(
         f"{result.details}"
     )
     assert executor.unexpected_failures == 0, "a timeout is not an executor defect"
+
+
+def test_a_transport_hold_keeps_the_previous_cycles_details(
+    tmp_path, monkeypatch
+) -> None:
+    """The transport hold is manufactured by the executor, so it owes the merge.
+
+    ``complete_remote_command`` *replaces* ``result_details``, so this WAITING
+    result becomes the whole record of the step: whatever the adapter parked
+    there on an earlier cycle (the agent generations it validated against, a
+    pending spare failover, the quiesce attempt counter) is gone unless the
+    hold carries it forward. The hold's own keys still win -- ``reason`` must
+    name the transport failure, not the stale wait.
+    """
+
+    proxy = RegionalFleetRegistry(
+        raising_client(monkeypatch, URLError(socket.timeout("timed out")))
+    )
+
+    class ProxyReadingAdapter(RecordingAdapter):
+        def execute(self, context: Any) -> Any:
+            self.contexts.append(context)
+            proxy.list_agents(CLUSTER)
+            raise AssertionError("the proxy read must have failed")
+
+    client = FakeExecutorClient(
+        [remote_command("command-a", result_details=dict(CONTINUATION_STATE))]
+    )
+    executor = build(client, [ProxyReadingAdapter()], tmp_path)
+
+    assert executor.run_once() == 1, "run_once must return, not raise"
+    result = client.reported("command-a")
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.status_source == "executor-retryable-transport", result
+    assert result.details["agent_baselines"] == CONTINUATION_STATE["agent_baselines"], (
+        f"the transport hold dropped the adapter's continuation state: {result.details}"
+    )
+    assert result.details["spare_failover_pending"] is True, result.details
+    assert result.details["gpu_client_quiesce_attempt"] == 12, result.details
+    assert result.details["retryable_transport_error"] is True, result.details
+    assert result.details["reason"] != CONTINUATION_STATE["reason"], (
+        f"the hold's own reason must win over the replayed one: {result.details}"
+    )
 
 
 def test_a_missing_agent_is_still_reported_as_a_missing_key(monkeypatch) -> None:

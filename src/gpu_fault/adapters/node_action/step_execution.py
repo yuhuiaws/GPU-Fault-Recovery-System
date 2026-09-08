@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -329,6 +329,19 @@ class NodeActionExecutionService:
             )
             target[node_id] = reason
             return None
+        if len(context.step.node_ids) > 1 and state.node_results:
+            # The transport (not the agent) answered for this node -- a
+            # rejection, a hold, a lost lease. The step still exits mid-batch,
+            # so it owes the same accounting as the outcomes built above, or a
+            # multi-node failure would have two shapes depending on which
+            # layer said no. A single-node step keeps the lean shape.
+            return replace(
+                result,
+                details={
+                    **(result.details or {}),
+                    **NodeActionExecutionService._partial_progress(state),
+                },
+            )
         return result
 
     def _finalize(

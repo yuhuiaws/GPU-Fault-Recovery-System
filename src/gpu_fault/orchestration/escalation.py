@@ -290,6 +290,16 @@ class HardwareEscalationService:
             results = execution.details.get("node_results")
             if not isinstance(results, dict) or not results:
                 return False
+            # A step that gave up mid-batch reports only the nodes it folded.
+            # The nodes with no verdict at all cannot be waved through on
+            # their siblings' "rerun the diagnostic", so demand full coverage
+            # of the step's targets, and escalate when the targets cannot be
+            # resolved.
+            if not 0 <= execution.step_index < len(workflow.official_steps):
+                return False
+            targeted = workflow.official_steps[execution.step_index].node_ids
+            if any(node_id not in results for node_id in targeted):
+                return False
             for result in results.values():
                 if not isinstance(result, dict):
                     return False

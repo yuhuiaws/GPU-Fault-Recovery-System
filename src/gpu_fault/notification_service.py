@@ -55,6 +55,10 @@ def _onoff(value: bool) -> str:
 
 
 DEFAULT_NOTIFICATION_TTL_SECONDS = 6 * 3600
+# What the DCGM mail says when the step failed before the control plane
+# decided anything: the escalation is still choosing between a cooldown and a
+# drain, and telling the administrator either one would be a guess.
+PENDING_CONTROL_PLANE_ACTION = "待控制面升级判定（诊断步骤未完成）"
 CATEGORY_TTL_SECONDS = {
     # A trend sample is restated by the next cooldown bucket, so an
     # undelivered one is worth less than the mail it would cost.
@@ -210,11 +214,22 @@ def _dcgm_control_plane_action(
     The adapter persists ``control_plane_action`` in the step details (and so
     in ``result_details``); an older executor that did not is judged the way
     the adapter judges: any FAIL or INCONCLUSIVE node drains and quarantines.
+
+    A FAILED step is the one case where judging is wrong. It can have exited
+    before ``_dcgm_outcome`` ran at all -- a later node in the batch failed or
+    was interrupted -- and still carry the per-node verdicts it had already
+    folded. Inferring from those would mail a cooldown built on the nodes that
+    passed while the control plane's own hardware escalation drains the node
+    that did not, so this says the action is still pending instead.
     """
 
     recorded = command.result_details.get("control_plane_action")
     if isinstance(recorded, str) and recorded:
         return recorded
+    from gpu_fault.regional import RemoteCommandStatus
+
+    if command.status is RemoteCommandStatus.FAILED:
+        return PENDING_CONTROL_PLANE_ACTION
     destructive = any(
         value.get("diagnostic_outcome") in {"FAIL", "INCONCLUSIVE"}
         for value in node_results.values()

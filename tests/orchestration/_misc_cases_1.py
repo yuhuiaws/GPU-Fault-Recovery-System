@@ -816,6 +816,86 @@ def test_active_workload_dcgm_execution_review_does_not_drain(
     )
 
 
+def test_partial_dcgm_execution_review_still_escalates(
+    context: ApplicationContext,
+) -> None:
+    """A two-node DCGM step that only folded node-a is not a review-only verdict.
+
+    The node-action adapter reports the per-node results it already collected
+    when it exits mid-batch, so a step that failed hard on node-b can carry
+    node-a's benign "rerun the diagnostic" verdict and nothing else. Reading
+    that partial set as "review only" would suppress the escalation for the
+    node that actually failed, so the criterion demands a result for every
+    node the step targeted.
+    """
+    finding = node_health_finding(
+        "finding-busy-dcgm-pair",
+        "busy-dcgm-pair",
+        observed_at=NOW,
+        category=NodeHealthCategory.GPU,
+        severity="warning",
+        reason="GPU utilization remained near zero",
+        recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
+        gpu_uuids=["GPU-a"],
+        runtime_profile_version="simulated-v1",
+        workload_state=WorkloadState.ACTIVE,
+        affected_workload_ids=["training/pytorchjob/job-a"],
+    )
+    _, diagnostic = context.orchestrator.ingest_node_health(finding)
+    diagnostic_index = next(
+        index
+        for index, step in enumerate(diagnostic.official_steps)
+        if step.operation is WorkflowOperation.RUN_DCGM_DIAGNOSTIC
+    )
+    failed = copy_model(
+        diagnostic,
+        status=WorkflowStatus.FAILED,
+        official_steps=[
+            copy_model(step, node_ids=["node-a", "node-b"])
+            if index == diagnostic_index
+            else step
+            for index, step in enumerate(diagnostic.official_steps)
+        ],
+        step_executions=[
+            workflow_step_execution(
+                diagnostic_index,
+                WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
+                WorkflowStepStatus.FAILED,
+                error="DCGM diagnostic failed on node-b",
+                details={
+                    "failed_nodes": ["node-b"],
+                    "node_failures": {"node-b": ["dcgm_diagnostic_fail"]},
+                    # Only node-a folded before the batch gave up, and its
+                    # verdict is the benign one.
+                    "node_results": {
+                        "node-a": {
+                            "diagnostic_findings": [],
+                            "failed_checks": [],
+                            "warning_checks": [],
+                            "returncode": 222,
+                            "recommended_actions": [
+                                {
+                                    "action_code": "DCGM_EXECUTION_REVIEW",
+                                    "instruction": "rerun during a maintenance window",
+                                }
+                            ],
+                        }
+                    },
+                    "completed_nodes": ["node-a"],
+                },
+            )
+        ],
+    )
+    context.store.save_workflow(failed)
+
+    result = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert result is not None, (
+        "expected node-b's hard failure to escalate even though node-a only "
+        "asked for a diagnostic rerun"
+    )
+
+
 def test_wide_attempt_hung_triage_samples_representative_nodes(
     context: ApplicationContext, monkeypatch
 ) -> None:

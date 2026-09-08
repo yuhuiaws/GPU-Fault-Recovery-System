@@ -1700,8 +1700,8 @@ class ClusterActionExecutor:
             ),
         )
 
+    @staticmethod
     def _hold_details(
-        self,
         command: RemoteActionCommand,
         details: dict[str, Any],
     ) -> dict[str, Any]:

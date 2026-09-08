@@ -23,6 +23,7 @@ from ._node_action_cases_1 import (
 from ._node_action_cases_2 import (
     test_a_failed_second_node_still_reports_the_first_nodes_result,
     test_a_quiesce_wait_on_the_second_node_keeps_the_first_nodes_result,
+    test_a_rejected_second_node_still_reports_the_first_nodes_result,
     test_an_early_held_or_interrupted_node_keeps_the_earlier_node_results,
     test_busy_spare_client_check_fails_instead_of_waiting,
     test_completed_spare_failover_keeps_old_node_safety_hold,
