@@ -794,3 +794,155 @@ def test_a_non_numeric_exporter_interval_is_refused_by_name(monkeypatch) -> None
     assert "15s" in str(refusal.value), (
         f"the refusal did not quote the value it could not read: {refusal.value}"
     )
+
+
+def _fallback_mode_runner(gpu_count: int, *, limits_xml: str | None):
+    """``nvidia-smi`` for the fallback collector: inventory, metrics and limits.
+
+    ``--query-gpu`` calls answer one CSV row per GPU with a value for every
+    requested column, so the same runner serves the inventory query and the
+    merged metrics query. ``-q -x`` answers ``limits_xml`` (or a non-zero exit
+    when it is ``None``) and is recorded so a test can count the probes.
+    """
+
+    probes: list[list[str]] = []
+
+    def runner(argv, **_kwargs) -> subprocess.CompletedProcess[str]:
+        if "-q" in argv:
+            probes.append(list(argv))
+            if limits_xml is None:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no xml")
+            return subprocess.CompletedProcess(argv, 0, stdout=limits_xml, stderr="")
+        fields = next(
+            item for item in argv if item.startswith("--query-gpu=")
+        ).removeprefix("--query-gpu=")
+        rows = []
+        for index in range(gpu_count):
+            identity = {
+                "index": str(index),
+                "uuid": f"GPU-{index}",
+                "pci.bus_id": f"00000000:{index:02x}:00.0",
+                "name": "NVIDIA H100",
+            }
+            rows.append(
+                ", ".join(identity.get(field, "0") for field in fields.split(","))
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="\n".join(rows) + "\n", stderr=""
+        )
+
+    runner.probes = probes  # type: ignore[attr-defined]
+    return runner
+
+
+def test_nvidia_smi_metrics_survive_inventory_validation_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Fallback mode: a wrong ``GPU_FAULT_EXPECTED_GPU_COUNT`` must not silence GPU_METRICS.
+
+    DCGM mode guards its inventory delivery (F3); the nvidia-smi collector ran
+    ``deliver_gpu_inventory`` outside any guard, so a misconfigured expected
+    count made every round raise, ``run()`` only ever posted sample-less error
+    batches, and the node never emitted one real GPU_METRICS sample. The
+    failure also has to back off to the inventory cadence, as in DCGM mode.
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("GPU_FAULT_EXPECTED_GPU_COUNT", "4")
+    sink = RecordingSink()
+    attempts: list[list[str]] = []
+    fallback_runner = _fallback_mode_runner(8, limits_xml=None)
+
+    def runner(argv, **kwargs) -> subprocess.CompletedProcess[str]:
+        if any(item.startswith("--query-gpu=index,uuid,pci.bus_id") for item in argv):
+            attempts.append(list(argv))
+        return fallback_runner(argv, **kwargs)
+
+    clock = [NOW]
+    collector = NvidiaSmiMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=30,
+        inventory_interval_seconds=120,
+        now=lambda: clock[0],
+        runner=runner,
+    )
+
+    def rounds(count: int) -> None:
+        for _ in range(count):
+            collector.collect_once()
+            clock[0] += timedelta(seconds=30)
+
+    rounds(3)
+
+    assert len(attempts) == 3, "the first three rounds each retry the inventory"
+
+    rounds(3)
+
+    assert len(attempts) == 3, (
+        "a permanently unusable inventory must back off to the inventory "
+        f"interval instead of paying a subprocess every round: {len(attempts)}"
+    )
+
+    rounds(1)
+
+    assert len(attempts) == 4, "the inventory retry resumes after the interval"
+    paths = [path for path, _payload in sink.requests]
+    assert paths.count(GPU_METRICS_PATH) == 7, (
+        "an unusable expected GPU count blocked the fallback collector's metrics "
+        f"rounds: {paths}"
+    )
+    assert paths.count(GPU_INVENTORY_PATH) == 0, (
+        "an invalid inventory snapshot must not be delivered"
+    )
+    assert all(
+        payload["samples"]
+        for path, payload in sink.requests
+        if path == GPU_METRICS_PATH
+    ), "a round whose inventory failed must still carry its real samples"
+
+
+def test_nvidia_smi_temperature_limit_query_stops_probing_when_no_thresholds_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Fallback mode on vGPU/MIG: an empty limits answer must back off, as in DCGM mode.
+
+    Valid XML with no threshold tags left the cached samples unset, so the
+    nvidia-smi collector re-ran ``nvidia-smi -q -x`` on every round for the
+    process's whole lifetime (the DCGM side was fixed as I3 of Task 12).
+    """
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    runner = _fallback_mode_runner(
+        1,
+        limits_xml=(
+            "<?xml version='1.0' ?><nvidia_smi_log><gpu>"
+            "<minor_number>0</minor_number></gpu></nvidia_smi_log>"
+        ),
+    )
+    clock = [NOW]
+    collector = NvidiaSmiMetricsCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        interval_seconds=30,
+        inventory_interval_seconds=120,
+        now=lambda: clock[0],
+        runner=runner,
+    )
+
+    for _ in range(6):
+        collector.collect_once()
+        clock[0] += timedelta(seconds=30)
+
+    assert len(runner.probes) == 3, (
+        "a limits query that reports no thresholds must count as a failure and "
+        f"back off, not run on every round: {len(runner.probes)} probes"
+    )
+
+    collector.collect_once()
+
+    assert len(runner.probes) == 4, (
+        "the probe resumes once the inventory interval elapses"
+    )

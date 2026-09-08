@@ -24,6 +24,7 @@ from gpu_fault.gpu_metrics import (
 
 
 from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
@@ -31,6 +32,22 @@ from gpu_fault.collectors.sinks import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _bounded(runner: Runner | None) -> Runner:
+    """The caller's runner, or one a D-state ``nvidia-smi`` cannot outlive.
+
+    ``subprocess.run`` was the default here: it kills a child that misses its
+    timeout and then waits for it without a bound, and a child in
+    uninterruptible sleep in the driver -- the very GPU fault these probes
+    exist to report -- never dies on SIGKILL, so ``TimeoutExpired`` never
+    reached a caller and every guard around these calls was bypassed.
+    """
+
+    return runner if runner is not None else BoundedProcessRunner()
+
 
 INSTANCE_ACCELERATOR_COUNTS = {
     "p5.4xlarge": {"gpu": 1, "efa": 1},
@@ -89,7 +106,7 @@ CUDA_VERSION_PATTERN = re.compile(r"\bCUDA Version:\s*(\d+(?:\.\d+)*)", re.IGNOR
 
 
 def query_nvidia_temperature_limits(
-    runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+    runner: Runner | None = None,
 ) -> list[GpuMetricSample]:
     """Read firmware/driver temperature limits from nvidia-smi XML.
 
@@ -100,6 +117,7 @@ def query_nvidia_temperature_limits(
     the DCGM scrape had already succeeded, discarding the whole tick.
     """
 
+    runner = _bounded(runner)
     try:
         result = runner(
             ["nvidia-smi", "-q", "-x"],
@@ -181,9 +199,8 @@ def normalize_gpu_product(name: str) -> str:
     return f"{match.group(1).upper()}{match.group(2)}"
 
 
-def discover_gpu_product(
-    runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
-) -> str:
+def discover_gpu_product(runner: Runner | None = None) -> str:
+    runner = _bounded(runner)
     command = [
         "nvidia-smi",
         "--query-gpu=index,uuid,name",
@@ -239,8 +256,9 @@ def discover_gpu_product(
 
 
 def discover_gpu_software_versions(
-    runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+    runner: Runner | None = None,
 ) -> tuple[int, str | None]:
+    runner = _bounded(runner)
     command = [
         "nvidia-smi",
         "--query-gpu=driver_version",
@@ -318,9 +336,8 @@ def read_host_boot_id() -> str:
     return value
 
 
-def query_gpu_inventory(
-    runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
-) -> list[GpuInventoryDevice]:
+def query_gpu_inventory(runner: Runner | None = None) -> list[GpuInventoryDevice]:
+    runner = _bounded(runner)
     command = [
         "nvidia-smi",
         "--query-gpu=index,uuid,pci.bus_id,name",

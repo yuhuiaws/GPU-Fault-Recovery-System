@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -21,12 +21,13 @@ from gpu_fault.gpu_metrics import (
 )
 
 
-from gpu_fault.collectors.gpu.discovery import (
-    deliver_gpu_inventory,
-    query_nvidia_temperature_limits,
+from gpu_fault.collectors.gpu.inventory_cadence import (
+    GpuInventoryCadence,
+    TemperatureLimitProbe,
 )
 from gpu_fault.transport.http_client import urlopen
 from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -63,13 +64,6 @@ DUTY_CYCLE_IMPLAUSIBLE_EXPIRY_INTERVALS = 10
 # ``GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS``), because DCGM does not publish
 # its own collect interval.
 DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS = 8
-# Consecutive inventory failures after which the delivery drops to the inventory
-# cadence: a permanent expected-count mismatch or a wedged driver otherwise
-# costs every tick one nvidia-smi subprocess and one traceback.
-INVENTORY_FAILURE_BACKOFF_THRESHOLD = 3
-# Consecutive temperature-limit failures after which the query drops to the
-# inventory cadence instead of costing every tick a 15 s subprocess timeout.
-TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD = 3
 DCGM_NANOSECOND_DURATION_FIELDS = {
     "power_violation_total_us",
     "thermal_violation_total_us",
@@ -311,7 +305,7 @@ class DcgmMetricsCollector:
         interval_seconds: float = 15,
         exporter_interval_seconds: float | None = None,
         now: Callable[[], datetime] | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         edge_filter_enabled: bool | None = None,
         health_summary_seconds: int | None = None,
         edge_confirmation_samples: int | None = None,
@@ -329,7 +323,11 @@ class DcgmMetricsCollector:
         self.metrics_url = metrics_url
         self.interval_seconds = interval_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
-        self.runner = runner
+        # Never ``subprocess.run``: on a GPU that fell off the bus nvidia-smi
+        # sits in uninterruptible sleep, ``run(timeout=15)`` kills it and then
+        # waits for ever, and ``collect_once`` never returns -- with no watchdog
+        # on the metrics unit, the node that matters most goes silent.
+        self.runner = runner if runner is not None else BoundedProcessRunner()
         self.edge_filter_enabled = (
             edge_filter_enabled
             if edge_filter_enabled is not None
@@ -427,14 +425,13 @@ class DcgmMetricsCollector:
         self._candidate_streaks: dict[str, int] = {}
         self._implausible_duty_cycle_keys: OrderedDict[str, datetime] = OrderedDict()
         self._last_delivered_at: datetime | None = None
-        self._last_inventory_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
-        self._next_inventory_at: datetime | None = None
-        self._inventory_failures = 0
-        self._next_inventory_attempt_at: datetime | None = None
-        self._temperature_limit_samples: list[GpuMetricSample] | None = None
-        self._temperature_limit_failures = 0
-        self._next_temperature_limit_attempt_at: datetime | None = None
+        self._inventory = GpuInventoryCadence(
+            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
+        self._temperature_limits = TemperatureLimitProbe(
+            retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
         self._previous_devices: set[str] | None = None
         self._consecutive_failures = 0
 
@@ -868,78 +865,22 @@ class DcgmMetricsCollector:
             self._previous_values.popitem(last=False)
         return None if previous is None else previous[0]
 
-    def _inventory_is_due(self, observed_at: datetime) -> bool:
-        """Whether this tick owes an inventory delivery.
+    def collect_once(self) -> GpuMetricBatch:
+        """One tick: the inventory when due, the scrape, the cached limits.
 
-        A failing delivery used to be due again on the very next tick forever:
-        a permanent ``--expected-gpu-count`` mismatch or a wedged driver cost
-        every tick one nvidia-smi subprocess (up to its 15 s timeout) plus a
-        full traceback. After ``INVENTORY_FAILURE_BACKOFF_THRESHOLD`` failures
-        the retry drops to the inventory cadence, the way the temperature-limit
-        probe does.
+        The inventory delivery and the temperature-limit probe are guarded and
+        backed off by :mod:`inventory_cadence`, shared with the nvidia-smi
+        collector: neither may cost the scrape its tick (F1/F3).
         """
 
-        if (
-            self._next_inventory_attempt_at is not None
-            and observed_at < self._next_inventory_attempt_at
-        ):
-            return False
-        if self._last_inventory_delivered_at is None:
-            return True
-        if self._next_inventory_at is not None:
-            return observed_at >= self._next_inventory_at
-        return (
-            observed_at - self._last_inventory_delivered_at
-        ).total_seconds() >= self.inventory_interval_seconds
-
-    def collect_once(self) -> GpuMetricBatch:
         observed_at = self.now()
-        if self._inventory_is_due(observed_at):
-            try:
-                snapshot = deliver_gpu_inventory(
-                    self.sink,
-                    self.context,
-                    node_id=self.node_id,
-                    observed_at=observed_at,
-                    runner=self.runner,
-                )
-                self._last_inventory_delivered_at = observed_at
-                self._inventory_failures = 0
-                self._next_inventory_attempt_at = None
-                self._next_inventory_at = next_stable_phase(
-                    observed_at,
-                    cluster_id=self.context.cluster_id,
-                    node_id=self.node_id,
-                    channel="gpu-inventory",
-                    interval_seconds=self.inventory_interval_seconds,
-                )
-                LOGGER.info(
-                    "delivered GPU inventory %s with %d devices",
-                    snapshot.snapshot_id,
-                    len(snapshot.devices),
-                )
-            # Every inventory failure mode is a CollectorError by contract
-            # (`query_gpu_inventory`, `read_host_boot_id`, and the snapshot's own
-            # pydantic validation), and none of them may cost the scrape its
-            # tick: an operator `--expected-gpu-count` below the real device
-            # count used to silence GPU_METRICS on the node entirely (F3). The
-            # subprocess exceptions are caught as well so a future runner cannot
-            # reopen that path.
-            except (CollectorError, OSError, subprocess.TimeoutExpired) as exc:
-                self._inventory_failures += 1
-                if self._inventory_failures >= INVENTORY_FAILURE_BACKOFF_THRESHOLD:
-                    self._next_inventory_attempt_at = observed_at + timedelta(
-                        seconds=self.inventory_interval_seconds
-                    )
-                if self._inventory_failures == 1:
-                    LOGGER.exception("mandatory GPU inventory delivery failed")
-                else:
-                    # One traceback is diagnosis; a traceback per tick is noise.
-                    LOGGER.warning(
-                        "mandatory GPU inventory delivery failed (%d consecutive): %s",
-                        self._inventory_failures,
-                        exc,
-                    )
+        self._inventory.deliver_if_due(
+            self.sink,
+            self.context,
+            node_id=self.node_id,
+            observed_at=observed_at,
+            runner=self.runner,
+        )
         try:
             with urlopen(self.metrics_url, timeout=10) as response:
                 text = response.read().decode("utf-8", errors="replace")
@@ -947,67 +888,8 @@ class DcgmMetricsCollector:
             raise CollectorError(
                 f"cannot scrape DCGM exporter: {self.metrics_url}"
             ) from exc
-        self._refresh_temperature_limits(observed_at)
-        return self.collect_text(
-            text,
-            observed_at=observed_at,
-            extra_samples=self._temperature_limit_samples,
-        )
-
-    def _refresh_temperature_limits(self, observed_at: datetime) -> None:
-        """Read the firmware temperature limits once, and never at the tick's cost.
-
-        A wedged driver hangs ``nvidia-smi -q -x`` for its full 15 s timeout and
-        then raises ``TimeoutExpired``, which is not a ``CollectorError``: it
-        escaped the guard here *after* the DCGM scrape had already succeeded, so
-        the node's telemetry went silent for the whole hang (F1). After
-        ``TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD`` consecutive failures the
-        retry drops to the inventory cadence, so a driver that stays wedged
-        costs one probe per inventory interval instead of one per tick.
-        """
-
-        if self._temperature_limit_samples is not None:
-            return
-        if (
-            self._next_temperature_limit_attempt_at is not None
-            and observed_at < self._next_temperature_limit_attempt_at
-        ):
-            return
-        try:
-            discovered = query_nvidia_temperature_limits(self.runner)
-        except (CollectorError, OSError, subprocess.TimeoutExpired) as exc:
-            self._temperature_limit_unavailable(observed_at, str(exc))
-            return
-        if not discovered:
-            # Valid XML that carries no threshold tags -- a vGPU or MIG device --
-            # is not a success: treating it as one left the samples unset and
-            # cleared the failure counter, so the probe ran on every tick for the
-            # process's whole lifetime and no backoff could ever engage.
-            self._temperature_limit_unavailable(
-                observed_at, "nvidia-smi reported no temperature thresholds"
-            )
-            return
-        self._temperature_limit_failures = 0
-        self._next_temperature_limit_attempt_at = None
-        self._temperature_limit_samples = discovered
-
-    def _temperature_limit_unavailable(
-        self, observed_at: datetime, detail: str
-    ) -> None:
-        self._temperature_limit_failures += 1
-        if (
-            self._temperature_limit_failures
-            >= TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD
-        ):
-            self._next_temperature_limit_attempt_at = observed_at + timedelta(
-                seconds=self.inventory_interval_seconds
-            )
-        LOGGER.warning(
-            "NVIDIA temperature limits unavailable (%d consecutive); "
-            "using configured fallback thresholds: %s",
-            self._temperature_limit_failures,
-            detail,
-        )
+        limits = self._temperature_limits.refresh(observed_at, self.runner)
+        return self.collect_text(text, observed_at=observed_at, extra_samples=limits)
 
     def _report_collection_error(self, exc: BaseException) -> None:
         """Deliver an erroring, sample-less batch so the node is not silent.

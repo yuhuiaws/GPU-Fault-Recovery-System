@@ -20,11 +20,12 @@ from gpu_fault.gpu_metrics import (
 )
 
 
-from gpu_fault.collectors.gpu.discovery import (
-    deliver_gpu_inventory,
-    query_nvidia_temperature_limits,
+from gpu_fault.collectors.gpu.inventory_cadence import (
+    GpuInventoryCadence,
+    TemperatureLimitProbe,
 )
 from gpu_fault.collectors.models import CollectorContext
+from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -102,7 +103,7 @@ class NvidiaSmiMetricsCollector:
         startup_spread_seconds: int | None = None,
         force_snapshot_path: str | None = None,
         now: Callable[[], datetime] | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         failure_backoff_threshold: int = 3,
     ) -> None:
         self.sink = sink
@@ -110,7 +111,11 @@ class NvidiaSmiMetricsCollector:
         self.node_id = node_id
         self.interval_seconds = interval_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
-        self.runner = runner
+        # Never ``subprocess.run``: fallback mode has nothing but nvidia-smi,
+        # and on a GPU that fell off the bus it sits in uninterruptible sleep;
+        # ``run(timeout=15)`` kills it and then waits for ever, so the round
+        # never ends and ``run()`` never gets to report the failure.
+        self.runner = runner if runner is not None else BoundedProcessRunner()
         self.inventory_interval_seconds = (
             inventory_interval_seconds
             if inventory_interval_seconds is not None
@@ -145,55 +150,31 @@ class NvidiaSmiMetricsCollector:
         self.failure_backoff_threshold = failure_backoff_threshold
         if self.failure_backoff_threshold <= 0:
             raise ValueError("nvidia-smi failure backoff threshold must be positive")
-        self._last_inventory_delivered_at: datetime | None = None
-        self._next_inventory_at: datetime | None = None
-        self._temperature_limit_samples: list[GpuMetricSample] | None = None
+        # Shared with DCGM mode (inventory_cadence.py): the inventory delivery
+        # used to run here outside any guard, so a wrong
+        # GPU_FAULT_EXPECTED_GPU_COUNT made every round raise and the node never
+        # emitted one real GPU_METRICS sample in fallback mode; the limits probe
+        # re-ran on every round on a vGPU/MIG device with no threshold tags.
+        self._inventory = GpuInventoryCadence(
+            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
+        self._temperature_limits = TemperatureLimitProbe(
+            retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
         self._consecutive_failures = 0
         self._merged_query_refusals = 0
 
     def collect_once(self) -> GpuMetricBatch:
         started_at = self.now()
-        if (
-            self._last_inventory_delivered_at is None
-            or (
-                self._next_inventory_at is not None
-                and started_at >= self._next_inventory_at
-            )
-            or (
-                self._next_inventory_at is None
-                and self._last_inventory_delivered_at is not None
-                and (started_at - self._last_inventory_delivered_at).total_seconds()
-                >= self.inventory_interval_seconds
-            )
-        ):
-            deliver_gpu_inventory(
-                self.sink,
-                self.context,
-                node_id=self.node_id,
-                observed_at=started_at,
-                runner=self.runner,
-            )
-            self._last_inventory_delivered_at = started_at
-            self._next_inventory_at = next_stable_phase(
-                started_at,
-                cluster_id=self.context.cluster_id,
-                node_id=self.node_id,
-                channel="gpu-inventory",
-                interval_seconds=self.inventory_interval_seconds,
-            )
+        self._inventory.deliver_if_due(
+            self.sink,
+            self.context,
+            node_id=self.node_id,
+            observed_at=started_at,
+            runner=self.runner,
+        )
         samples = self._collect_samples()
-        if self._temperature_limit_samples is None:
-            try:
-                discovered = query_nvidia_temperature_limits(self.runner)
-                if discovered:
-                    self._temperature_limit_samples = discovered
-            except CollectorError as exc:
-                LOGGER.warning(
-                    "NVIDIA temperature limits unavailable; "
-                    "using configured fallback thresholds: %s",
-                    exc,
-                )
-        samples.extend(self._temperature_limit_samples or [])
+        samples.extend(self._temperature_limits.refresh(started_at, self.runner))
         # Stamped only now: with a slow driver the queries above can take most
         # of a minute, and an ``observed_at`` from the top of the round is the
         # spacing the control plane divides its counter rates by (F6).

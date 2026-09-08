@@ -611,6 +611,11 @@ def test_dcgm_inventory_delivery_is_independent_of_edge_filter(
     monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
 
     def runner(command, **_kwargs):
+        if "-q" in command:
+            # No threshold tags: the limits probe fails softly and backs off.
+            return subprocess.CompletedProcess(
+                command, 0, stdout="<nvidia_smi_log></nvidia_smi_log>", stderr=""
+            )
         assert "--query-gpu=index,uuid,pci.bus_id,name" in command
         return subprocess.CompletedProcess(
             command, 0, stdout=("0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n"), stderr=""
@@ -627,7 +632,6 @@ def test_dcgm_inventory_delivery_is_independent_of_edge_filter(
         health_summary_seconds=300,
         inventory_interval_seconds=60,
     )
-    collector._temperature_limit_samples = []
 
     collector.collect_once()
     collector.collect_once()
