@@ -1437,28 +1437,33 @@ test_cases:
   pytest_nodeid: tests/host_health/test_host_health.py::test_node_log_endpoint_classifies_mce_and_nccl
 
 - id: GF-TRAIN-001
-  title: 【已作废】快速诊断通过后单次重启
+  title: 无硬件证据的训练失败按 restart_budget 原地重启一次
   category: training-recovery
   level: integration
   risk: non-destructive
-  problem: 本用例已整条作废，不得执行。它测试的 in-cluster quick diagnostics adapter (KubernetesDcgmDiagnosticAdapter) 随 quick diagnostics 路径一起删除，无 marker 的快速 triage 不再存在。
-  injection: 不执行。
+  problem: 训练 attempt 失败且无 marker，allocation 完整。
+  injection: 提交失败 terminal event，无关联 marker。
   expected:
-  - 本用例作废，不产生执行结论
-  automation: manual
-  procedure: "README.md#license"
+  - 生成 `no-hardware-evidence:RESTART` 计划
+  - 一步 RESTART_WORKLOAD，编译后的步骤携带 restart_budget 和 job_id
+  - 复用原 allocation
+  - restart_budget 在执行期限制重启次数
+  automation: pytest
+  pytest_nodeid: tests/completion/test_completion_service.py::test_no_marker_restarts_once_within_budget
 
 - id: GF-TRAIN-002
-  title: 【已作废】快速诊断失败转硬件恢复
+  title: 可信 marker 命中时复用既有 incident 的硬件恢复计划并幂等
   category: training-recovery
   level: integration
   risk: non-destructive
-  problem: 本用例已整条作废，不得执行。它测试的 in-cluster quick diagnostics adapter (KubernetesDcgmDiagnosticAdapter) 随 quick diagnostics 路径一起删除，无 marker 的快速 triage 不再存在。
-  injection: 不执行。
+  problem: 训练 attempt 失败时存在可信、active 且 scope 匹配的 marker。
+  injection: 先创建 marker 和对应 incident + workflow，再提交失败 terminal event。
   expected:
-  - 本用例作废，不产生执行结论
-  automation: manual
-  procedure: "README.md#license"
+  - 复用既有 incident（相同 incident_id）
+  - 不创建重复的恢复 workflow
+  - 决策返回既有计划的 plan_id
+  automation: pytest
+  pytest_nodeid: tests/completion/test_completion_service.py::test_matching_marker_reuses_incident_and_is_idempotent
 
 - id: GF-TRAIN-003
   title: 【已作废】诊断不确定时隔离并迁移

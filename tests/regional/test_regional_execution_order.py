@@ -119,7 +119,8 @@ def test_do_not_run_matches_regional_superseded_cases() -> None:
         "GF-REGIONAL-PREEMPT-023": "GF-REGIONAL-PREEMPT-024",
         "GF-REGIONAL-PREEMPT-034": "GF-REGIONAL-PREEMPT-035",
     }
-    assert retired == superseded | deleted_without_replacement == set(expected_replacements) | deleted_without_replacement
+    assert retired == superseded | deleted_without_replacement
+    assert retired == set(expected_replacements) | deleted_without_replacement
     ordered = set(_ordered_cases(order))
     for case_id, replacement in expected_replacements.items():
         case = cases[case_id]
