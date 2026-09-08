@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
-"""Declare or release one operator-provided warm spare GPU node.
+"""Acceptance wrapper over ``gpu-fault-admin config spare``.
 
-`GF-REGIONAL-DESTR-003` refuses to mutate anything until a spare is labeled,
-cordoned, monitored and unreserved, and its `read_only_preflight` already names
-every condition that fails. What had no supported command was the *declaration*
-itself, so that precondition was satisfied by hand `kubectl label` plus
-`kubectl cordon` -- the manual step the acceptance standard forbids, and one
-that leaves nothing to restore from if the operator forgets what the node
-looked like beforehand.
+The supported operator lever for declaring or releasing a warm spare is the
+admin CLI (``gpu_fault.admin.warm_spare``). This script keeps the acceptance
+site-profile interface the DESTR-003/008 runbooks were written against --
+``--site-profile``, ``--spare-node``, ``--baseline`` -- and binds that profile
+to the same refusals, the same two-field mutation (spare label and cordon) and
+the same baseline record. It holds no logic of its own: every check runs in the
+admin module, so the two entry points cannot drift.
 
-This is a helper, not a case entry point, and it deliberately performs the
-smallest mutation that a declaration can be: the spare label and the cordon.
-
-* It does not write `gpu-fault.io/spare-pool-state`. That annotation belongs to
-  the control plane, and DESTR-003 accepts it absent. Writing `AVAILABLE` by
-  hand would fabricate the very state the case exists to observe.
-* It does not make the case self-provisioning. DESTR-003 grades the site;
-  `preflight_errors` asserts the declared spare set is *exactly* the requested
-  node in order to catch a site with a stray label elsewhere, and a case that
-  created its own spare would be grading its own setup -- the assertion would
-  hold by construction even if the coordinator's filter had drifted away from
-  it.
-
-So the checks below are refusals to declare something that cannot honestly be a
-spare. They are not a substitute for the case's own preflight, which still runs
-against the site afterwards and is still the authority.
+Why a wrapper still exists: the acceptance runners read the profile, not a
+managed state directory, and DESTR-003 grades the site with a spare that was
+declared *outside* the case (its ``preflight_errors`` asserts the declared
+spare set is exactly the requested node, which a self-provisioning case would
+satisfy by construction). The wrapper keeps that separation without keeping a
+second implementation.
 """
 
 from __future__ import annotations
@@ -34,7 +24,6 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +31,15 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
-    write_json_atomic,
+from gpu_fault.admin import warm_spare  # noqa: E402
+from gpu_fault.admin.atomic_json import write_json_atomic  # noqa: E402
+from gpu_fault.admin.warm_spare import (  # noqa: E402
+    DECLARE_CONFIRMATION,
+    RELEASE_CONFIRMATION,
+    AgentState,
+    KubectlNodeApi,
+    WarmSpareRequest,
+    perform_warm_spare,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -58,22 +54,17 @@ from scripts.e2e.regional.site_profile import (  # noqa: E402
     install_site_profile,
 )
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
-    HYPERPOD_HEALTH_LABEL,
-    INSTANCE_GROUP_LABEL,
-    OWNERSHIP_ANNOTATIONS,
-    QUARANTINE_TAINT,
-    SPARE_LABEL,
-    SPARE_POOL_STATE_ANNOTATION,
-    SPARE_RESERVATION_ANNOTATION,
-    NodeMutationFixture,
-    NodePatch,
     WarmSpareLiveFixture,
     agent_by_node,
-    instance_type,
 )
 
-DECLARE_CONFIRMATION = "DECLARE_WARM_SPARE_CORDON"
-RELEASE_CONFIRMATION = "RELEASE_WARM_SPARE_UNCORDON"
+# The logic lives in the admin module; these names stay bound here so a reader
+# of the runbooks finds the checks where the runbooks say they are.
+declare_refusals = warm_spare.declare_refusals
+release_refusals = warm_spare.release_refusals
+declare = warm_spare.declare
+release = warm_spare.release
+without_survey = warm_spare.without_survey
 
 
 @dataclass(frozen=True)
@@ -103,191 +94,68 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
 
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def agent_state(state: dict[str, Any], node: str) -> AgentState:
+    """The profile-side Agent check: exactly one row for the node, or absent."""
+
+    agent = agent_by_node(state, node)
+    if agent is None:
+        return AgentState(lifecycle_state=None)
+    return AgentState(lifecycle_state=str(agent.get("lifecycle_state")))
 
 
-def topology(snapshot: dict[str, Any]) -> dict[str, str | None]:
-    return {
-        "instance_group": snapshot["labels"].get(INSTANCE_GROUP_LABEL),
-        "instance_type": instance_type(snapshot),
-    }
+def store_agent_lookup(warm: WarmSpareLiveFixture) -> warm_spare.AgentLookup:
+    def lookup(_cluster_id: str, node: str) -> AgentState:
+        try:
+            state = warm.store_snapshot()
+        except RegionalFixtureError as exc:
+            # Unreadable is a refusal, never a pass.
+            return AgentState(lifecycle_state=None, error=str(exc))
+        return agent_state(state, node)
+
+    return lookup
 
 
-def declare_refusals(
-    settings: Settings,
-    *,
-    spare: dict[str, Any],
-    fault: dict[str, Any] | None,
-    declared: list[str],
-    workloads: list[dict[str, Any]],
-    state: dict[str, Any],
-) -> list[str]:
-    refusals = []
-    if spare["ready"] != "True":
-        refusals.append("node is not Ready")
-    if spare["labels"].get(SPARE_LABEL) == "true" and spare["unschedulable"]:
-        # Already labeled *and* cordoned: nothing to declare. Labeled but
-        # schedulable is a half-declared spare -- a validated restore that
-        # released a quarantine uncordons the node (DESTR-003 cleanup,
-        # 2026-09-08) -- and re-declaring completes the cordon the pool needs
-        # ("unreserved spare is schedulable" fails its health check otherwise).
-        refusals.append("node is already declared as a spare and cordoned")
-    if spare["labels"].get(HYPERPOD_HEALTH_LABEL) != "Schedulable":
-        refusals.append("HyperPod health label is not Schedulable")
-    if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
-        refusals.append("node already carries a spare reservation")
-    if spare["annotations"].get(SPARE_POOL_STATE_ANNOTATION) not in {
-        None,
-        "AVAILABLE",
-    }:
-        refusals.append("spare pool state is not AVAILABLE")
-    if any(item.get("key") == QUARANTINE_TAINT for item in spare["taints"]) or any(
-        spare["annotations"].get(key) for key in OWNERSHIP_ANNOTATIONS
-    ):
-        refusals.append("node carries quarantine ownership from an earlier incident")
-    if [item for item in workloads if item.get("node") == settings.node]:
-        # Cordoning does not evict, so a spare declared under a live job stays
-        # busy and the case would allocate a node that is already working.
-        refusals.append("node still has an active GPU workload")
-    agent = agent_by_node(state, settings.node)
-    if agent is None or agent.get("lifecycle_state") != "ACTIVE":
-        refusals.append("node does not have exactly one ACTIVE Agent")
-    if settings.node in declared and spare["unschedulable"]:
-        refusals.append("node is already in the declared spare set")
-    if fault is not None:
-        if settings.node == settings.fault_node:
-            refusals.append("spare and fault node are identical")
-        if topology(fault) != topology(spare):
-            refusals.append(
-                "topology does not match the fault node: "
-                f"{topology(fault)} vs {topology(spare)}"
-            )
-    return refusals
-
-
-def release_refusals(spare: dict[str, Any]) -> list[str]:
-    refusals = []
-    if spare["annotations"].get(SPARE_RESERVATION_ANNOTATION):
-        # The pool allocated this node to an incident. Uncordoning it now would
-        # hand a reserved spare back to the scheduler while a workflow is still
-        # counting on it.
-        refusals.append("node is reserved by an incident; release it through the case")
-    if any(item.get("key") == QUARANTINE_TAINT for item in spare["taints"]):
-        refusals.append(
-            "node is quarantined; use restore_validated_quarantine.py instead"
-        )
-    return refusals
-
-
-def survey(settings: Settings, warm: WarmSpareLiveFixture, regional) -> dict[str, Any]:
-    spare = warm.node_snapshot(settings.node)
-    fault = warm.node_snapshot(settings.fault_node) if settings.fault_node else None
-    declared = warm.spare_nodes()
-    result: dict[str, Any] = {
-        "observed_at": now(),
-        "cluster_id": regional.settings.cluster_id,
-        "node": spare,
-        "topology": topology(spare),
-        "declared_spares": declared,
-        "gpu_workloads": [
-            item for item in regional.gpu_workloads() if item.get("node")
-        ],
-        "agents": warm.store_snapshot().get("agents"),
-    }
-    if fault is not None:
-        result["fault_node"] = fault
-        result["fault_topology"] = topology(fault)
-    return result
-
-
-def without_survey(record: dict[str, Any]) -> dict[str, Any]:
-    # The baseline record embeds the survey so it can be read back on its own,
-    # and the survey is also this run's report. Attaching the record to the
-    # report unfiltered therefore makes the report contain itself, and the final
-    # `json.dumps` raises "Circular reference detected" -- after the node has
-    # already been mutated, so the operator sees a traceback for a declaration
-    # that in fact succeeded.
-    return {key: value for key, value in record.items() if not key.endswith("_survey")}
-
-
-def read_baseline(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise RegionalFixtureError(f"no warm-spare baseline record at {path}")
-    return dict(json.loads(path.read_text(encoding="utf-8")))
-
-
-def declare(settings: Settings, warm: WarmSpareLiveFixture, report: dict[str, Any]):
-    if settings.baseline.is_file() and not read_baseline(settings.baseline).get(
-        "released_at"
-    ):
-        raise RegionalFixtureError(
-            f"{settings.baseline} still records an unreleased declaration; "
-            "release it before declaring again"
-        )
-    mutation = NodeMutationFixture(
-        warm,
-        settings.node,
-        label_keys=(SPARE_LABEL,),
-        track_unschedulable=True,
+def node_api(regional: RegionalLiveFixture) -> KubectlNodeApi:
+    return KubectlNodeApi(
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(regional.settings.gpu_kubeconfig),
+            "--context",
+            regional.settings.gpu_context,
+        ]
     )
-    # Written before the mutation, so an interrupted declaration still leaves an
-    # exact record of what to put back.
-    record = {
-        "node": settings.node,
-        "declared_at": now(),
-        "confirmation": DECLARE_CONFIRMATION,
-        "baseline": mutation.baseline,
-        "pre_declaration_survey": report,
-    }
-    write_json_atomic(settings.baseline, record)
-    mutation.apply(
-        NodePatch(labels={SPARE_LABEL: "true"}, annotations={}, unschedulable=True)
-    )
-    after = warm.node_snapshot(settings.node)
-    if after["labels"].get(SPARE_LABEL) != "true" or not after["unschedulable"]:
-        raise RegionalFixtureError(
-            "declaration did not take effect: the node is not labeled and cordoned"
-        )
-    record["declared_state"] = after
-    record["declared_spares"] = warm.spare_nodes()
-    write_json_atomic(settings.baseline, record)
-    return record
 
 
-def release(settings: Settings, warm: WarmSpareLiveFixture, report: dict[str, Any]):
-    record = read_baseline(settings.baseline)
-    if record.get("released_at"):
-        raise RegionalFixtureError(
-            f"{settings.baseline} was already released at {record['released_at']}"
-        )
-    if record.get("node") != settings.node:
-        raise RegionalFixtureError(
-            f"{settings.baseline} records node {record.get('node')}, not {settings.node}"
-        )
-    mutation = NodeMutationFixture(
-        warm,
-        settings.node,
-        label_keys=(SPARE_LABEL,),
-        track_unschedulable=True,
+def mode(arguments: argparse.Namespace) -> str:
+    if arguments.declare:
+        return "declare"
+    if arguments.release:
+        return "release"
+    return "check"
+
+
+def request(settings: Settings, arguments: argparse.Namespace) -> WarmSpareRequest:
+    return WarmSpareRequest(
+        state_dir=settings.baseline.parent,
+        node=settings.node,
+        fault_node=settings.fault_node,
+        cluster_id=None,
+        # The profile has no change reference; the wrapper records the case it
+        # is running for so the baseline still says who declared and why.
+        reference=arguments.reference or "acceptance-warm-spare",
+        mode=mode(arguments),
+        confirmation=arguments.confirm,
     )
-    # Restore against the recorded baseline rather than the node as it is now,
-    # so a node that was already cordoned before the declaration stays cordoned.
-    mutation.baseline = record["baseline"]
-    restored = mutation.restore()
-    record["released_at"] = now()
-    record["release_survey"] = report
-    record["restored_state"] = restored
-    write_json_atomic(settings.baseline, record)
-    return record
 
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
             "Declare or release one warm spare GPU node for "
-            "GF-REGIONAL-DESTR-003/008. Read-only unless --declare or "
-            "--release is given."
+            "GF-REGIONAL-DESTR-003/008 through the admin module. Read-only "
+            "unless --declare or --release is given. Operators should use "
+            "`gpu-fault-admin config spare` instead."
         )
     )
     value.add_argument("--site-profile", default="")
@@ -315,10 +183,15 @@ def parser() -> argparse.ArgumentParser:
         default="",
         help="file recording the node's pre-declaration labels and cordon state",
     )
+    value.add_argument(
+        "--reference",
+        default="",
+        help="change or case reference recorded on the baseline",
+    )
     value.add_argument("--report", type=Path, default=None)
-    mode = value.add_mutually_exclusive_group()
-    mode.add_argument("--declare", action="store_true")
-    mode.add_argument("--release", action="store_true")
+    mode_group = value.add_mutually_exclusive_group()
+    mode_group.add_argument("--declare", action="store_true")
+    mode_group.add_argument("--release", action="store_true")
     value.add_argument(
         "--confirm",
         default="",
@@ -338,50 +211,16 @@ def main() -> int:
     settings = configure(arguments)
     regional = RegionalLiveFixture(settings_from_arguments(arguments))
     warm = WarmSpareLiveFixture(regional, settings.hyperpod_cluster)
-    report = survey(settings, warm, regional)
-
-    if arguments.declare:
-        if arguments.confirm != DECLARE_CONFIRMATION:
-            raise RegionalFixtureError(
-                f"--declare requires --confirm {DECLARE_CONFIRMATION}"
-            )
-        refusals = declare_refusals(
-            settings,
-            spare=report["node"],
-            fault=report.get("fault_node"),
-            declared=report["declared_spares"],
-            workloads=report["gpu_workloads"],
-            state={"agents": report["agents"]},
+    try:
+        report = perform_warm_spare(
+            node_api(regional),
+            request(settings, arguments),
+            cluster_id=regional.settings.cluster_id,
+            record=settings.baseline,
+            agent_lookup=store_agent_lookup(warm),
         )
-        report["refusals"] = refusals
-        if refusals:
-            raise RegionalFixtureError(
-                "node cannot be declared a warm spare: " + "; ".join(refusals)
-            )
-        report["declaration"] = without_survey(declare(settings, warm, report))
-    elif arguments.release:
-        if arguments.confirm != RELEASE_CONFIRMATION:
-            raise RegionalFixtureError(
-                f"--release requires --confirm {RELEASE_CONFIRMATION}"
-            )
-        refusals = release_refusals(report["node"])
-        report["refusals"] = refusals
-        if refusals:
-            raise RegionalFixtureError(
-                "node cannot be released: " + "; ".join(refusals)
-            )
-        report["release"] = without_survey(release(settings, warm, report))
-    else:
-        report["refusals"] = declare_refusals(
-            settings,
-            spare=report["node"],
-            fault=report.get("fault_node"),
-            declared=report["declared_spares"],
-            workloads=report["gpu_workloads"],
-            state={"agents": report["agents"]},
-        )
-        report["mode"] = "read-only"
-
+    except warm_spare.WarmSpareError as exc:
+        raise RegionalFixtureError(str(exc)) from exc
     if arguments.report is not None:
         write_json_atomic(arguments.report, report)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
