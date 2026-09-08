@@ -1059,7 +1059,142 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             die "ethtool is required for hung EFA/RDMA diagnostics"
     fi
 fi
-nvidia-smi -L >/dev/null || die "nvidia-smi cannot enumerate GPUs"
+# GPU 健康降级只记录，不阻断安装（owner decision 6）。
+# The Node Agent is what repairs a sick GPU, so a sick GPU must never be the
+# reason the Agent cannot be installed: record what was observed and let
+# `verify` report it as WARN. Nothing consumes this marker yet -- surfacing it
+# through the host collector is WP-C follow-up work.
+DEGRADED_GPU_RECORDED="false"
+DEGRADED_GPU_MARKER="/var/lib/gpu-fault/installer-degraded-gpu.json"
+record_degraded_gpu_marker() {
+    local reason="$1"
+    local rows
+    local marker_tmp="${DEGRADED_GPU_MARKER}.tmp"
+    install -d -m 0755 "$(dirname "${DEGRADED_GPU_MARKER}")"
+    rows="$(nvidia-smi --query-gpu=index,uuid,persistence_mode \
+        --format=csv,noheader,nounits 2>/dev/null || true)"
+    printf '%s\n' "${rows}" |
+        "${PYTHON_COMMAND}" -c '
+import datetime
+import json
+import sys
+
+reason = sys.argv[1]
+gpus = []
+for raw in sys.stdin.read().splitlines():
+    line = raw.strip()
+    if not line:
+        continue
+    fields = [field.strip() for field in line.split(",")]
+    if len(fields) != 3:
+        gpus.append({"index": "", "uuid": "", "persistence_mode": "", "error": line})
+        continue
+    index, uuid, mode = fields
+    gpus.append(
+        {
+            "index": index,
+            "uuid": uuid,
+            "persistence_mode": mode,
+            "error": "" if mode == "Enabled" else reason,
+        }
+    )
+if not gpus:
+    gpus.append({"index": "", "uuid": "", "persistence_mode": "", "error": reason})
+json.dump(
+    {
+        "observed_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "gpus": gpus,
+    },
+    sys.stdout,
+)
+' "${reason}" > "${marker_tmp}" || {
+        rm -f "${marker_tmp}"
+        printf 'WARN  degraded GPU marker could not be written\n'
+        return 0
+    }
+    chmod 0644 "${marker_tmp}"
+    mv -f "${marker_tmp}" "${DEGRADED_GPU_MARKER}"
+    DEGRADED_GPU_RECORDED="true"
+}
+clear_degraded_gpu_marker() {
+    rm -f "${DEGRADED_GPU_MARKER}"
+}
+
+# 升级期间重启 Agent 之前必须排空在途动作。
+# `lifespan` shuts the action pool down without waiting, so a stop or restart
+# in the middle of a handler lets systemd SIGKILL the cgroup -- the running
+# `nvidia-smi --gpu-reset` or driver install dies with it and the ledger row is
+# left INTERRUPTED, which then needs manual confirmation.
+NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
+# Keep in step with TimeoutStopSec= in
+# deploy/systemd/gpu-fault-node-agent.service: the installer must not give up
+# on an in-flight command earlier than systemd itself would.
+NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"
+NODE_AGENT_LEDGER_POLL_SECONDS="5"
+SQLITE_COMMAND="$(command -v sqlite3 2>/dev/null || true)"
+in_progress_node_action_ids() {
+    [[ -f "${NODE_ACTION_DB}" ]] || return 0
+    if [[ -n "${SQLITE_COMMAND}" ]]; then
+        "${SQLITE_COMMAND}" -readonly "${NODE_ACTION_DB}" \
+            "SELECT command_id FROM results WHERE state = 'IN_PROGRESS';" \
+            2>/dev/null || true
+    else
+        "${PYTHON_COMMAND}" -c '
+import sqlite3
+import sys
+
+try:
+    connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    rows = connection.execute(
+        "SELECT command_id FROM results WHERE state = ?", ("IN_PROGRESS",)
+    ).fetchall()
+except sqlite3.Error:
+    raise SystemExit(0)
+for row in rows:
+    print(row[0])
+' "${NODE_ACTION_DB}" 2>/dev/null || true
+    fi
+}
+wait_for_node_action_ledger_idle() {
+    local deadline
+    local pending
+    deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
+    while :; do
+        pending="$(in_progress_node_action_ids | tr '\n' ' ')"
+        pending="${pending% }"
+        if [[ -z "${pending}" ]]; then
+            return 0
+        fi
+        if (( $(date +%s) >= deadline )); then
+            break
+        fi
+        printf 'waiting for in-flight node actions: %s\n' "${pending}"
+        sleep "${NODE_AGENT_LEDGER_POLL_SECONDS}"
+    done
+    die "node action agent has in-flight commands: ${pending}"
+}
+drain_node_agent_before_restart() {
+    systemctl is-active --quiet gpu-fault-node-agent.service || return 0
+    wait_for_node_action_ledger_idle
+}
+
+# 一块 GPU 掉线不能让整台机器装不上 Agent。
+# `nvidia-smi -L` exits non-zero as soon as one GPU is unreadable even though
+# it still lists the healthy ones, so only an empty enumeration is fatal.
+GPU_ENUMERATION_FAILED="false"
+GPU_ENUMERATION="$(nvidia-smi -L 2>/dev/null)" || GPU_ENUMERATION_FAILED="true"
+ENUMERATED_GPU_COUNT="$(
+    printf '%s\n' "${GPU_ENUMERATION}" | grep -c '^GPU [0-9]' || true
+)"
+(( ENUMERATED_GPU_COUNT > 0 )) || die "nvidia-smi enumerated zero GPUs"
+if [[ "${GPU_ENUMERATION_FAILED}" == "true" ]]; then
+    printf 'WARN  NVIDIA GPU enumeration (only %s GPU(s) are enumerable)\n' \
+        "${ENUMERATED_GPU_COUNT}"
+    record_degraded_gpu_marker \
+        "nvidia-smi could not enumerate every GPU during install"
+fi
 NVIDIA_SMI="$(command -v nvidia-smi)"
 sed "s|@NVIDIA_SMI@|${NVIDIA_SMI}|g" \
     "${REPO_DIR}/deploy/systemd/gpu-fault-gpu-persistence.service" \
@@ -1575,8 +1710,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         write_env GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT \
             "${NODE_AGENT_ALLOW_PLAINTEXT}"
         write_env GPU_FAULT_NODE_INSTANCE_ID "${NODE_INSTANCE_ID}"
-        write_env GPU_FAULT_NODE_ACTION_DB \
-            "/var/lib/gpu-fault/node-actions.db"
+        write_env GPU_FAULT_NODE_ACTION_DB "${NODE_ACTION_DB}"
         write_env NODE_NAME "${NODE_ID}"
     } > /etc/gpu-fault/node-agent.env
     chmod 0600 /etc/gpu-fault/node-agent.env
@@ -1604,6 +1738,7 @@ chmod 0644 /opt/gpu-fault/installed-units.txt
     die "no installed gpu-fault systemd units were recorded"
 
 if [[ "${NO_START}" == "false" ]]; then
+    drain_node_agent_before_restart
     for runtime_unit in \
         gpu-fault-node-agent.service \
         gpu-fault-metrics-collector.service \
@@ -1638,7 +1773,11 @@ if [[ "${NO_START}" == "false" ]]; then
     if nvidia-smi --query-gpu=persistence_mode \
         --format=csv,noheader |
         grep -Fvx "Enabled" >/dev/null; then
-        die "not every GPU entered persistence mode"
+        printf 'WARN  GPU persistence mode (not enabled on every GPU)\n'
+        record_degraded_gpu_marker \
+            "persistence mode was not Enabled after the persistence unit restart"
+    elif [[ "${DEGRADED_GPU_RECORDED}" == "false" ]]; then
+        clear_degraded_gpu_marker
     fi
 fi
 if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
@@ -1719,6 +1858,7 @@ if [[ "${NO_START}" == "false" ]]; then
         systemctl restart gpu-fault-kernel-collector.service
     fi
     if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
+        drain_node_agent_before_restart
         systemctl restart gpu-fault-node-agent.service
         NODE_AGENT_HEALTH_URL="${NODE_AGENT_ADVERTISE_URL%/}/healthz"
         NODE_AGENT_HEALTH_ARGS=(--fail --silent)

@@ -61,18 +61,66 @@ GPU_FAULT_CERTIFICATE_MIN_VALIDITY_SECONDS="${config_values[11]:-2592000}"
 }
 
 failed=0
+passes=0
+warns=0
+fails=0
+
+# 责任分界（owner decision 6）：GPU 健康只上报，软件完整性才拦截。
+# A node whose GPU fell off the bus is exactly the node the Node Agent has to
+# reach, so a GPU-health gate only warns and the install stands, while every
+# software-integrity gate (units, readiness, wheel digest, delivery) still
+# fails the run and lets the installer roll back.
+ok() {
+    printf 'PASS  %s\n' "$1"
+    passes=$(( passes + 1 ))
+}
+warn() {
+    if [[ -n "${2:-}" ]]; then
+        printf 'WARN  %s (%s)\n' "$1" "$2"
+    else
+        printf 'WARN  %s\n' "$1"
+    fi
+    warns=$(( warns + 1 ))
+}
+fail() {
+    if [[ -n "${2:-}" ]]; then
+        printf 'FAIL  %s (%s)\n' "$1" "$2"
+    else
+        printf 'FAIL  %s\n' "$1"
+    fi
+    fails=$(( fails + 1 ))
+    failed=1
+}
+skip() {
+    printf 'SKIP  %s (%s)\n' "$1" "$2"
+}
 check() {
     local name="$1"
     shift
     if "$@" >/dev/null 2>&1; then
-        printf 'PASS  %s\n' "${name}"
+        ok "${name}"
     else
-        printf 'FAIL  %s\n' "${name}"
-        failed=1
+        fail "${name}"
     fi
 }
 
-check "NVIDIA GPU enumeration" nvidia-smi -L
+# `nvidia-smi -L` exits non-zero as soon as a single GPU is unreadable, even
+# though it still lists the healthy ones. Zero enumerated GPUs is a host that
+# cannot run the product at all; a partial list is the degraded host the
+# collectors and the Agent must still cover.
+gpu_enumeration_failed="false"
+gpu_enumeration="$(nvidia-smi -L 2>/dev/null)" || gpu_enumeration_failed="true"
+enumerated_gpus="$(
+    printf '%s\n' "${gpu_enumeration}" | grep -c '^GPU [0-9]' || true
+)"
+if (( enumerated_gpus == 0 )); then
+    fail "NVIDIA GPU enumeration" "no GPU was enumerated"
+elif [[ "${gpu_enumeration_failed}" == "true" ]]; then
+    warn "NVIDIA GPU enumeration" \
+        "only ${enumerated_gpus} GPU(s) are enumerable"
+else
+    ok "NVIDIA GPU enumeration"
+fi
 CURL_TLS=()
 if [[ -n "${SSL_CERT_FILE}" ]]; then
     [[ "${SSL_CERT_FILE}" == /* && -r "${SSL_CERT_FILE}" ]] || {
@@ -106,10 +154,10 @@ else
         >/dev/null 2>&1 ||
         systemctl is-active --quiet gpu-fault-log-collector.service \
         >/dev/null 2>&1; then
-        printf 'FAIL  system/training log collector service (must be disabled)\n'
-        failed=1
+        fail "system/training log collector service" "must be disabled"
     else
-        printf 'SKIP  system/training log collector service (disabled by deployment policy)\n'
+        skip "system/training log collector service" \
+            "disabled by deployment policy"
     fi
 fi
 check "Fabric Manager SXID collector service" systemctl is-active --quiet \
@@ -118,10 +166,9 @@ check "GPU persistence service" systemctl is-active --quiet \
     gpu-fault-gpu-persistence.service
 if nvidia-smi --query-gpu=persistence_mode --format=csv,noheader |
     grep -Fvx "Enabled" >/dev/null; then
-    printf 'FAIL  GPU persistence mode (not enabled on every GPU)\n'
-    failed=1
+    warn "GPU persistence mode" "not enabled on every GPU"
 else
-    printf 'PASS  GPU persistence mode\n'
+    ok "GPU persistence mode"
 fi
 
 if systemctl is-enabled --quiet gpu-fault-kernel-collector.service \
@@ -129,7 +176,7 @@ if systemctl is-enabled --quiet gpu-fault-kernel-collector.service \
     check "kernel XID/SXID collector service" systemctl is-active --quiet \
         gpu-fault-kernel-collector.service
 else
-    printf 'SKIP  kernel XID/SXID collector service (disabled)\n'
+    skip "kernel XID/SXID collector service" "disabled"
 fi
 
 if systemctl is-enabled --quiet gpu-fault-node-agent.service \
@@ -148,24 +195,25 @@ if systemctl is-enabled --quiet gpu-fault-node-agent.service \
         curl "${node_agent_curl[@]}" \
         "${node_agent_url%/}/healthz"
 else
-    printf 'SKIP  signed node action agent service (disabled)\n'
+    skip "signed node action agent service" "disabled"
 fi
 
 if [[ "${GPU_FAULT_METRICS_MODE}" == "dcgm" ]]; then
-    [[ -n "${GPU_FAULT_DCGM_METRICS_URL}" ]] || {
-        printf 'FAIL  DCGM metrics URL is not configured\n'
-        exit 1
-    }
-    dcgm_output="$(mktemp)"
-    if curl --fail --silent --show-error --output "${dcgm_output}" \
-        "${GPU_FAULT_DCGM_METRICS_URL}" &&
-        grep -q "DCGM_FI_DEV_" "${dcgm_output}"; then
-        printf 'PASS  DCGM exporter supported metrics\n'
+    if [[ -z "${GPU_FAULT_DCGM_METRICS_URL}" ]]; then
+        # A missing URL is a configuration defect, not GPU health.
+        fail "DCGM metrics URL" "not configured"
     else
-        printf 'FAIL  DCGM exporter supported metrics\n'
-        failed=1
+        dcgm_output="$(mktemp)"
+        if curl --fail --silent --show-error --output "${dcgm_output}" \
+            "${GPU_FAULT_DCGM_METRICS_URL}" &&
+            grep -q "DCGM_FI_DEV_" "${dcgm_output}"; then
+            ok "DCGM exporter supported metrics"
+        else
+            warn "DCGM exporter supported metrics" \
+                "the exporter published no DCGM_FI_DEV_ metric"
+        fi
+        rm -f "${dcgm_output}"
     fi
-    rm -f "${dcgm_output}"
 else
     check "nvidia-smi metrics query" nvidia-smi \
         --query-gpu=index,uuid,temperature.gpu,power.draw \
@@ -225,10 +273,10 @@ raise SystemExit(not recent)
 done
 rm -f "${latest_output}"
 if [[ "${delivered}" == "true" ]]; then
-    printf 'PASS  metrics delivered to control plane\n'
+    ok "metrics delivered to control plane"
 else
-    printf 'FAIL  metrics delivered to control plane\n'
-    failed=1
+    fail "metrics delivered to control plane"
 fi
 
+printf 'SUMMARY pass=%d warn=%d fail=%d\n' "${passes}" "${warns}" "${fails}"
 exit "${failed}"
