@@ -636,3 +636,58 @@ class PlanBuilder:
             ],
             checkpoint_manifest_ref=event.checkpoint_manifest_ref,
         )
+
+    def without_hardware_evidence(
+        self,
+        event: TerminalEvent,
+        profile: EffectiveRuntimeProfile,
+    ) -> RecoveryPlan:
+        """No trusted marker matched: restart once on the same allocation.
+
+        A failed attempt with an allocation but no hardware evidence is, until
+        proven otherwise, the workload's own fault. The job's restart budget
+        (reserved at execution) is the only lever that bounds it; a profile
+        that cannot restart gets the conservative evidence-and-escalate shape.
+        """
+
+        node_ids = sorted({item.node_id for item in event.allocation})
+        restart = self._optional_step(
+            profile, RecoveryAction.RESTART_WORKLOAD, node_ids
+        )
+        if restart is None:
+            reason = (
+                "no trusted marker matched and profile "
+                f"{profile.profile_version} has no executable WORKLOAD_RESTART"
+            )
+            return RecoveryPlan(
+                incident_id=f"inc-{uuid4()}",
+                attempt_id=event.attempt_id,
+                trigger="no-hardware-evidence:ESCALATE",
+                runtime_profile_version=profile.profile_version,
+                steps=[
+                    self._step(
+                        profile,
+                        RecoveryAction.COLLECT_EVIDENCE,
+                        [],
+                        parameters={"reason": reason},
+                    ),
+                    self._step(
+                        profile,
+                        RecoveryAction.ESCALATE_OPERATOR,
+                        [],
+                        parameters={
+                            "automatic_restart_blocked": True,
+                            "reason": reason,
+                        },
+                    ),
+                ],
+                checkpoint_manifest_ref=event.checkpoint_manifest_ref,
+            )
+        return RecoveryPlan(
+            incident_id=f"inc-{uuid4()}",
+            attempt_id=event.attempt_id,
+            trigger="no-hardware-evidence:RESTART",
+            runtime_profile_version=profile.profile_version,
+            steps=[restart],
+            checkpoint_manifest_ref=event.checkpoint_manifest_ref,
+        )
