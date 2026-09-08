@@ -8,11 +8,13 @@ import logging
 import os
 import re
 import select
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from gpu_fault.channel_registry import (
     COLLECTOR_HEALTH_PATH,
@@ -38,7 +40,25 @@ HEALTH_COUNTER_NAMES = (
     "delivery_failures",
     "kmsg_overflow",
     "boot_time_reestimates",
+    "delivery_queue_drops",
 )
+
+#: How many records may wait for the sink before the oldest is dropped. The
+#: reader must never wait on delivery -- ``HttpEventSink`` spends up to ~47 s per
+#: record on retries before its outbox takes over, and the kernel ring keeps
+#: overwriting records the whole time -- so the queue is the only place where
+#: back pressure can land. Dropping the oldest keeps the newest, which is what
+#: an operator needs during a storm, and every drop is counted and reported in
+#: the health summary: delivered, buffered by the sink's outbox, or counted.
+DEFAULT_DELIVERY_QUEUE_SIZE = 2048
+
+#: One log line per drop would itself be a load source during a storm, so the
+#: first drop is logged and then every ``n``-th, always with the running total.
+DELIVERY_DROP_LOG_INTERVAL = 256
+
+#: How long ``stop_delivery`` waits for the in-flight record before it drains
+#: what is left in the caller's own thread.
+DELIVERY_JOIN_TIMEOUT_SECONDS = 5.0
 
 #: How far a monotonic-derived ``observed_at`` may sit from the collection time
 #: before the boot-time estimate is suspected of being stale (ARCH-G9). Records
@@ -73,9 +93,12 @@ class KernelLogCollector:
         reopen_delay_seconds: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         uptime_path: str = "/proc/uptime",
+        delivery_queue_size: int = DEFAULT_DELIVERY_QUEUE_SIZE,
     ) -> None:
         if reopen_delay_seconds <= 0:
             raise ValueError("kernel log reopen delay must be positive")
+        if delivery_queue_size < 1:
+            raise ValueError("kernel delivery queue size must be at least 1")
         self.sink = sink
         self.context = context
         self.node_id = node_id
@@ -104,78 +127,230 @@ class KernelLogCollector:
             interval_seconds=self.health_summary_seconds,
         )
         self._last_read_at: datetime | None = None
+        self.delivery_queue_size = delivery_queue_size
+        self._delivery_queue: deque[tuple[str, dict[str, Any]]] = deque()
+        self._delivery_wakeup = threading.Condition()
+        self._delivery_thread: threading.Thread | None = None
+        self._delivery_stopping = False
 
     def collect_lines(
         self, lines: Iterable[str], *, limit: int | None = None
     ) -> CollectorStats:
-        stats = CollectorStats()
+        """Read kmsg records and hand the NVIDIA ones on for delivery.
+
+        The counters are plain integers and the model is built once at the end:
+        over 99 % of kmsg lines are not NVIDIA events, and each of them used to
+        allocate two ``CollectorStats`` copies on the hot read path.
+
+        ``delivered`` counts only what this call saw accepted. With a delivery
+        thread running (``start_delivery``) the outcome is not known yet, so
+        records are counted as observed and the delivery counters in the health
+        summary are what say whether they arrived.
+        """
+
+        observed = 0
+        skipped = 0
+        duplicates = 0
+        delivered = 0
         for line in lines:
-            if limit is not None and stats.observed >= limit:
+            if limit is not None and observed >= limit:
                 break
-            stats = stats.model_copy(update={"observed": stats.observed + 1})
+            observed += 1
             parsed = self._parse_record(line.rstrip("\n"))
             message = parsed["message"] or ""
             if not NVIDIA_EVENT_PATTERN.search(message):
-                stats = stats.model_copy(update={"skipped": stats.skipped + 1})
+                skipped += 1
                 continue
             if SXID_PATTERN.search(message) and not SXID_SUMMARY_PATTERN.search(
                 message
             ):
-                stats = stats.model_copy(update={"skipped": stats.skipped + 1})
+                skipped += 1
                 continue
             record_id = self._record_id(parsed)
             if record_id in self._seen:
-                stats = stats.model_copy(update={"duplicates": stats.duplicates + 1})
+                duplicates += 1
                 continue
             collected_at = self.now()
             monotonic = parsed.get("monotonic_us")
             observed_at = self._observed_at(parsed, collected_at=collected_at)
-            result = deliver_event(
-                self.sink,
-                NVIDIA_KERNEL_PATH,
-                {
-                    **self.context.model_dump(mode="json"),
-                    "node_id": self.node_id,
-                    "record_id": record_id,
-                    "observed_at": observed_at.isoformat(),
-                    "source_monotonic_us": (int(monotonic) if monotonic else None),
-                    "source_boot_id": self.boot_id,
-                    "collected_at": collected_at.isoformat(),
-                    "message": message,
-                    "evidence_ref": (
-                        f"kmsg://{self.node_id}/{self.boot_id}/"
-                        f"{parsed.get('sequence') or record_id}"
-                    ),
-                },
-            )
-            # Every outcome remembers the record: the stream will not show
-            # it again, and re-posting a duplicate would help nobody.
+            payload: dict[str, Any] = {
+                **self.context.model_dump(mode="json"),
+                "node_id": self.node_id,
+                "record_id": record_id,
+                "observed_at": observed_at.isoformat(),
+                "source_monotonic_us": (int(monotonic) if monotonic else None),
+                "source_boot_id": self.boot_id,
+                "collected_at": collected_at.isoformat(),
+                "message": message,
+                "evidence_ref": (
+                    f"kmsg://{self.node_id}/{self.boot_id}/"
+                    f"{parsed.get('sequence') or record_id}"
+                ),
+            }
+            # Remembered before delivery, not after: the stream will not show
+            # the record again, re-posting a duplicate would help nobody, and a
+            # record still waiting in the delivery queue must not be queued a
+            # second time.
             self._remember(record_id)
-            if result.buffered:
-                LOGGER.warning(
-                    "kernel event persisted to the collector outbox; "
-                    "continuing live kmsg collection: record=%s error=%s",
-                    record_id,
-                    result.error,
-                )
+            if self._submit(record_id, payload):
                 continue
-            if result.failed:
-                # A rejected or unbuffered event is lost, and used to take
-                # the stream with it: the exception reopened /dev/kmsg at
-                # the live tail and dropped everything written in between
-                # (ARCH-G4). It is counted and the stream keeps reading.
-                self.health_counters["delivery_failures"] += 1
+            if self._deliver_one(record_id, payload):
+                delivered += 1
+        return CollectorStats(
+            observed=observed,
+            skipped=skipped,
+            duplicates=duplicates,
+            delivered=delivered,
+        )
+
+    def start_delivery(self) -> None:
+        """Move delivery off the read loop into one daemon thread.
+
+        ``run`` starts it for the live stream. Without it ``collect_lines``
+        delivers inline and returns the outcome, which is what a caller that
+        feeds a fixed list of lines wants.
+        """
+
+        with self._delivery_wakeup:
+            if self._delivery_thread is not None and self._delivery_thread.is_alive():
+                return
+            self._delivery_stopping = False
+            thread = threading.Thread(
+                target=self._delivery_loop,
+                name="kernel-collector-delivery",
+                daemon=True,
+            )
+            self._delivery_thread = thread
+            thread.start()
+
+    def stop_delivery(
+        self, timeout_seconds: float = DELIVERY_JOIN_TIMEOUT_SECONDS
+    ) -> None:
+        """Drain the queue and join the delivery thread.
+
+        A daemon thread is killed with the process, so the join is what keeps
+        the records read just before shutdown from disappearing without a
+        verdict. Whatever the thread could not take within the timeout is
+        delivered here, in the caller's thread, rather than dropped silently.
+        """
+
+        with self._delivery_wakeup:
+            thread = self._delivery_thread
+            self._delivery_stopping = True
+            self._delivery_wakeup.notify_all()
+        if thread is not None:
+            thread.join(timeout=timeout_seconds)
+            if thread.is_alive():
                 LOGGER.warning(
-                    "kernel event delivery failed and was not buffered; "
-                    "continuing live kmsg collection: record=%s error=%s",
-                    record_id,
-                    result.error,
+                    "kernel delivery thread is still posting after %.1fs; "
+                    "draining %d queued record(s) in the reader",
+                    timeout_seconds,
+                    len(self._delivery_queue),
                 )
-                continue
-            stats = stats.model_copy(update={"delivered": stats.delivered + 1})
-        return stats
+        with self._delivery_wakeup:
+            self._delivery_thread = None
+            self._delivery_stopping = False
+            pending = list(self._delivery_queue)
+            self._delivery_queue.clear()
+        for record_id, payload in pending:
+            self._deliver_one(record_id, payload)
+
+    def _delivery_loop(self) -> None:
+        while True:
+            with self._delivery_wakeup:
+                while not self._delivery_queue and not self._delivery_stopping:
+                    self._delivery_wakeup.wait(1.0)
+                if not self._delivery_queue:
+                    if self._delivery_stopping:
+                        return
+                    continue
+                record_id, payload = self._delivery_queue.popleft()
+            # Posted outside the lock: the reader keeps queueing while this
+            # record is in flight, which is the whole point of the thread.
+            self._deliver_one(record_id, payload)
+
+    def _submit(self, record_id: str, payload: dict[str, Any]) -> bool:
+        """Queue one record for the delivery thread; False when there is none.
+
+        Never blocks: a full queue drops its oldest record, counts it and says
+        so. A dead thread falls back to inline delivery rather than queueing
+        into a queue nobody reads.
+        """
+
+        with self._delivery_wakeup:
+            thread = self._delivery_thread
+            if thread is None or not thread.is_alive():
+                return False
+            if len(self._delivery_queue) >= self.delivery_queue_size:
+                dropped_id, _dropped = self._delivery_queue.popleft()
+                self.health_counters["delivery_queue_drops"] += 1
+                drops = self.health_counters["delivery_queue_drops"]
+                if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
+                    LOGGER.warning(
+                        "kernel delivery queue is full at %d records; dropped "
+                        "the oldest record=%s (dropped=%d). The control plane "
+                        "is not keeping up and these records are lost.",
+                        self.delivery_queue_size,
+                        dropped_id,
+                        drops,
+                    )
+            self._delivery_queue.append((record_id, payload))
+            self._delivery_wakeup.notify()
+            return True
+
+    def _deliver_one(self, record_id: str, payload: dict[str, Any]) -> bool:
+        """Post one record and say whether the control plane took it.
+
+        Nothing raises out of here. ``deliver_event`` converts
+        ``CollectorError`` only, so any other exception -- a proxy answering 200
+        with an HTML body, say -- used to leave ``collect_lines`` and reopen
+        ``/dev/kmsg`` at the live tail, losing every record written in between
+        (ARCH-G4). It is counted and the stream keeps reading.
+        """
+
+        try:
+            result = deliver_event(self.sink, NVIDIA_KERNEL_PATH, payload)
+        except Exception:
+            self.health_counters["delivery_failures"] += 1
+            LOGGER.exception(
+                "kernel event delivery raised an unexpected error; "
+                "continuing live kmsg collection: record=%s",
+                record_id,
+            )
+            return False
+        if result.buffered:
+            LOGGER.warning(
+                "kernel event persisted to the collector outbox; "
+                "continuing live kmsg collection: record=%s error=%s",
+                record_id,
+                result.error,
+            )
+            return False
+        if result.failed:
+            # A rejected or unbuffered event is lost, and used to take the
+            # stream with it: the exception reopened /dev/kmsg at the live tail
+            # and dropped everything written in between (ARCH-G4). It is
+            # counted and the stream keeps reading.
+            self.health_counters["delivery_failures"] += 1
+            LOGGER.warning(
+                "kernel event delivery failed and was not buffered; "
+                "continuing live kmsg collection: record=%s error=%s",
+                record_id,
+                result.error,
+            )
+            return False
+        return True
 
     def run(self) -> None:
+        self.start_delivery()
+        try:
+            self._run_forever()
+        finally:
+            # The reader is leaving: whatever is still queued is delivered or
+            # counted before the process goes away.
+            self.stop_delivery()
+
+    def _run_forever(self) -> None:
         while True:
             try:
                 with open(
@@ -450,14 +625,26 @@ class KernelLogCollector:
 
     @staticmethod
     def _read_boot_id() -> str:
+        """The kernel's boot id, or a marker unique to this collector.
+
+        The fallback used to be the constant ``unknown-boot``. kmsg sequence
+        numbers restart at boot and the control plane's ``event_id`` is scoped
+        to the cluster, so ``kmsg-unknown-boot-42`` recurred after every reboot
+        and the first XID of the new boot was dropped as a duplicate of the last
+        one before it. One random marker per collector -- so one per process,
+        since the unit runs a single collector -- keeps the ids apart across
+        reboots and across nodes; it is read once, in ``__init__``, so the ids
+        of one process stay stable.
+        """
+
         try:
             return (
                 Path("/proc/sys/kernel/random/boot_id")
                 .read_text(encoding="ascii")
                 .strip()
-            )
+            ) or f"unknown-{uuid4().hex[:12]}"
         except OSError:
-            return "unknown-boot"
+            return f"unknown-{uuid4().hex[:12]}"
 
 
 def build_from_environment(
