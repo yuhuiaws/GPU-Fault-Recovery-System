@@ -35,6 +35,7 @@ from gpu_fault.completion_observation import (
     reconcile_attempt_observation,
 )
 from gpu_fault.completion_outbox import (
+    completion_delivery_deferred,
     completion_sink_from_environment,
     replay_completion_outbox,
 )
@@ -596,6 +597,17 @@ class KubernetesCompletionController:
                 "cannot restore persisted Completion Watcher attempt state"
             ) from exc
 
+    @property
+    def outbox_append_failures_total(self) -> int:
+        """Write-ahead failures counted by the outbox sink (F1/F12).
+
+        The sink owns the counter, but ``/metrics`` scrapes the controller, so
+        it is republished here. A sink without an outbox (a plain HTTP sink, a
+        test double) reports zero.
+        """
+
+        return int(getattr(self.sink, "append_failures_total", 0))
+
     def run_once(self) -> list[dict[str, Any]]:
         pods, _ = list_completion_pods(
             self.core_api,
@@ -784,6 +796,17 @@ class KubernetesCompletionController:
                 )
                 return
             self._terminal_sent.add(result.terminal_event.event_key)
+            if completion_delivery_deferred(response):
+                # An earlier pass buffered this terminal and never delivered
+                # it; the outbox replay owns it from here, so posting it live
+                # again would only double the load (F8). Marking it sent is
+                # safe because the buffered record is what carries it.
+                LOGGER.warning(
+                    "training terminal for attempt %s is buffered in the "
+                    "outbox; its delivery is owned by the replay",
+                    attempt_id,
+                )
+                return
             LOGGER.info(
                 "training terminal submitted: attempt=%s status=%s event_key=%s",
                 attempt_id,
@@ -801,7 +824,7 @@ class KubernetesCompletionController:
             return
         event = self._failure_events[attempt_id]
         try:
-            self.sink.post(
+            response = self.sink.post(
                 "/v1/attempts/failure-detected",
                 event.model_dump(mode="json"),
             )
@@ -830,62 +853,22 @@ class KubernetesCompletionController:
                     "control-plane workflow will be retried",
                     attempt_id,
                 )
-            if (
-                self.emergency_fallback_seconds is None
-                or self.workload_stopper is None
-                or attempt_id in self._workloads_stopped
-                or (self.now() - started).total_seconds()
-                < self.emergency_fallback_seconds
-            ):
-                return
-            spec = self._attempt_specs.get(attempt_id)
-            if spec is None:
-                LOGGER.error(
-                    "emergency workload stop skipped: attempt %s has no spec",
-                    attempt_id,
-                )
-                return
-            if not spec.workload_ids:
-                return
-            try:
-                incident_id, _ = failure_containment_ids(event.event_key)
-                existing_snapshots = list(event.workload_log_snapshots)
-                if existing_snapshots and hasattr(
-                    self.workload_stopper, "capture_logs"
-                ):
-                    self.workload_stopper.stop(
-                        spec.workload_ids,
-                        attempt_id,
-                        incident_id,
-                        capture_logs=False,
-                    )
-                    snapshots = existing_snapshots
-                else:
-                    snapshots = self.workload_stopper.stop(
-                        spec.workload_ids,
-                        attempt_id,
-                        incident_id,
-                    )
-            except Exception:
-                LOGGER.exception(
-                    "emergency workload stop failed for attempt %s; will retry",
-                    attempt_id,
-                )
-                return
-            event = event.model_copy(update={"workload_log_snapshots": snapshots or []})
-            self._failure_events[attempt_id] = event
-            self._attempt_specs[attempt_id] = replace(
-                spec,
-                termination_initiator_incident_id=incident_id,
-            )
-            self._emergency_incident_ids[attempt_id] = incident_id
-            self._workloads_stopped.add(attempt_id)
-            LOGGER.error(
-                "control plane unavailable; emergency fallback "
-                "suspended attempt=%s workloads=%s",
+            self._emergency_stop_if_overdue(attempt_id, event, started)
+            return
+        if completion_delivery_deferred(response):
+            # The outbox still holds an undelivered copy of this event, so it
+            # owns the retry (F8) and we must not post it a second time this
+            # pass. It is *not* delivered though: the control plane has not
+            # accepted anything, so the containment clock keeps running and
+            # the emergency stop stays armed exactly as if the POST failed.
+            started = self._failure_delivery_started.setdefault(attempt_id, self.now())
+            LOGGER.warning(
+                "failure containment for attempt %s is buffered in the outbox; "
+                "its delivery is owned by the replay and the emergency "
+                "fallback stays armed",
                 attempt_id,
-                ",".join(spec.workload_ids),
             )
+            self._emergency_stop_if_overdue(attempt_id, event, started)
             return
         self._failure_sent.add(attempt_id)
         self._failure_delivery_started.pop(attempt_id, None)
@@ -893,6 +876,76 @@ class KubernetesCompletionController:
             "failure containment submitted to control plane: attempt=%s event=%s",
             attempt_id,
             event.event_key,
+        )
+
+    def _emergency_stop_if_overdue(
+        self,
+        attempt_id: str,
+        event: Any,
+        started: datetime,
+    ) -> None:
+        """Suspend the workload ourselves once containment is overdue.
+
+        Reached from every path on which the control plane has not accepted the
+        failure event: a failed POST, and a POST that was left to the outbox
+        replay because an earlier copy is still buffered. Both mean the same
+        thing operationally -- no workflow exists -- so both keep this last
+        line of defence armed.
+        """
+
+        if (
+            self.emergency_fallback_seconds is None
+            or self.workload_stopper is None
+            or attempt_id in self._workloads_stopped
+            or (self.now() - started).total_seconds() < self.emergency_fallback_seconds
+        ):
+            return
+        spec = self._attempt_specs.get(attempt_id)
+        if spec is None:
+            LOGGER.error(
+                "emergency workload stop skipped: attempt %s has no spec",
+                attempt_id,
+            )
+            return
+        if not spec.workload_ids:
+            return
+        try:
+            incident_id, _ = failure_containment_ids(event.event_key)
+            existing_snapshots = list(event.workload_log_snapshots)
+            if existing_snapshots and hasattr(self.workload_stopper, "capture_logs"):
+                self.workload_stopper.stop(
+                    spec.workload_ids,
+                    attempt_id,
+                    incident_id,
+                    capture_logs=False,
+                )
+                snapshots = existing_snapshots
+            else:
+                snapshots = self.workload_stopper.stop(
+                    spec.workload_ids,
+                    attempt_id,
+                    incident_id,
+                )
+        except Exception:
+            LOGGER.exception(
+                "emergency workload stop failed for attempt %s; will retry",
+                attempt_id,
+            )
+            return
+        self._failure_events[attempt_id] = event.model_copy(
+            update={"workload_log_snapshots": snapshots or []}
+        )
+        self._attempt_specs[attempt_id] = replace(
+            spec,
+            termination_initiator_incident_id=incident_id,
+        )
+        self._emergency_incident_ids[attempt_id] = incident_id
+        self._workloads_stopped.add(attempt_id)
+        LOGGER.error(
+            "control plane unavailable; emergency fallback "
+            "suspended attempt=%s workloads=%s",
+            attempt_id,
+            ",".join(spec.workload_ids),
         )
 
     def run(self) -> None:

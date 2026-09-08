@@ -2,7 +2,8 @@
 
 The completion controller is a watch/poll loop with no HTTP server of its own,
 so the counters it keeps (``reconcile_failures_total``,
-``evicted_attempts_total``, ``restore_skipped_total``) were only reachable from
+``evicted_attempts_total``, ``restore_skipped_total``,
+``outbox_append_failures_total``) were only reachable from
 a debugger. This module exposes them in Prometheus text exposition on a
 daemon thread so the Pod can carry the same ``prometheus.io/scrape``
 annotations as every other GPU-fault workload.
@@ -47,6 +48,13 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
         "restore_skipped_total",
         "Persisted attempt records skipped at start-up because they could not "
         "be restored.",
+    ),
+    (
+        "gpu_fault_completion_outbox_append_failures_total",
+        "outbox_append_failures_total",
+        "Critical completion events whose write-ahead ConfigMap copy could "
+        "not be written; they were delivered live without a buffered copy, so "
+        "any value above zero means a restart can lose an event.",
     ),
 )
 

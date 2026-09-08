@@ -29,6 +29,7 @@ class FakeController:
     reconcile_failures_total = 3
     evicted_attempts_total = 5
     restore_skipped_total = 7
+    outbox_append_failures_total = 9
 
 
 def _ephemeral(controller: object) -> CompletionMetricsServer:
@@ -66,6 +67,23 @@ def test_metrics_endpoint_exposes_the_three_controller_counters() -> None:
         assert f"# HELP {name} " in body, f"{name} has no HELP line"
         assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
         assert f"{name} {value}" in lines, f"{name} sample missing from {body!r}"
+
+
+def test_metrics_endpoint_exposes_the_outbox_write_ahead_failure_counter() -> None:
+    """F1(b)/F12: a WAL write that fails no longer vetoes delivery, so the
+    only way an operator learns the outbox is unwritable is this counter."""
+
+    server = _ephemeral(FakeController())
+    try:
+        _, _, body = _get(f"http://127.0.0.1:{server.port}/metrics")
+    finally:
+        server.stop()
+
+    name = "gpu_fault_completion_outbox_append_failures_total"
+    lines = body.splitlines()
+    assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
+    assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
+    assert f"{name} 9" in lines, f"{name} sample missing from {body!r}"
 
 
 def test_metrics_endpoint_reads_live_counter_values_on_each_scrape() -> None:

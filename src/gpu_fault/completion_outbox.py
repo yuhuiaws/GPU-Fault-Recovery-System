@@ -23,10 +23,92 @@ CRITICAL_COMPLETION_PATHS = frozenset(
 )
 WORKLOAD_OBSERVATION_PATH = "/v1/workload-observations"
 LOGGER = logging.getLogger(__name__)
+#: Per-snapshot cap on the log tail kept in the write-ahead record. A live
+#: failure event carries up to ``workload_log_max_bytes`` (262 144) per rank,
+#: so four ranks alone exceed ``max_bytes`` (900 000) and used to make the
+#: whole event undeliverable (F1).
+DEFAULT_BUFFERED_TAIL_BYTES = 8192
+#: Bound on the per-key "already reported" set behind the log-once rule.
+_MAX_LOGGED_APPEND_FAILURES = 1024
+
+
+#: Marker in the ``post`` result: nothing was delivered live because the record
+#: is still buffered, so ``replay`` owns it (F8).
+DEFERRED_TO_REPLAY = "deferred_to_replay"
 
 
 class CompletionOutboxFull(RuntimeError):
     pass
+
+
+def completion_delivery_deferred(response: Any) -> bool:
+    """``True`` when ``post`` left this event to the outbox replay.
+
+    The caller has *not* had the event accepted by the control plane: any
+    protection that depends on delivery (the watcher's emergency workload
+    stop) has to stay armed.
+    """
+
+    return isinstance(response, dict) and bool(response.get(DEFERRED_TO_REPLAY))
+
+
+def pointer_sized_completion_payload(
+    payload: dict[str, Any],
+    *,
+    max_tail_bytes: int = DEFAULT_BUFFERED_TAIL_BYTES,
+) -> dict[str, Any]:
+    """The write-ahead copy of a critical event: pointers, not log tails.
+
+    The live POST carries the full ``workload_log_snapshots`` -- the control
+    plane is what archives the tails -- but the ConfigMap copy only has to be
+    enough to *identify* the evidence after a watcher restart, so each
+    snapshot keeps its ``record_id`` / ``s3_uri`` / ``sha256`` / ``truncated``
+    pointers and at most ``max_tail_bytes`` of tail (measured on the encoded
+    bytes, per snapshot). Without this a 4-rank attempt with ordinary logs is
+    ~1 MB, ``_write_data`` raises ``CompletionOutboxFull`` before the POST is
+    ever attempted, and the failure never reaches the control plane at all.
+
+    Consequence to know about: what ``replay`` re-sends is this pointer-sized
+    record, so an event delivered by replay (rather than live) reaches the
+    control plane with truncated tails and ``buffered_tail_truncated`` set on
+    each trimmed snapshot. That is deliberate -- the full tail is in the S3
+    archive named by ``s3_uri`` and in the Pod annotation written at capture
+    time -- and it is the reason the field is not simply dropped.
+
+    The argument is never mutated; a payload with nothing to trim is returned
+    as-is.
+    """
+
+    snapshots = payload.get("workload_log_snapshots")
+    if not isinstance(snapshots, list):
+        return payload
+    trimmed: list[Any] = []
+    changed = False
+    for snapshot in snapshots:
+        tail = snapshot.get("tail") if isinstance(snapshot, dict) else None
+        if not isinstance(tail, str):
+            trimmed.append(snapshot)
+            continue
+        raw = tail.encode("utf-8", errors="replace")
+        if len(raw) <= max_tail_bytes:
+            trimmed.append(snapshot)
+            continue
+        kept = raw[-max_tail_bytes:]
+        # Cut forward to a character boundary: a slice starting inside a
+        # multi-byte character would decode to U+FFFD (3 bytes each) and could
+        # push the record back over the cap it is here to respect.
+        start = 0
+        while start < len(kept) and kept[start] & 0xC0 == 0x80:
+            start += 1
+        record = dict(snapshot)
+        record["tail"] = kept[start:].decode("utf-8", errors="replace")
+        record["buffered_tail_bytes"] = len(kept) - start
+        record["buffered_tail_truncated"] = True
+        trimmed.append(record)
+        changed = True
+    if not changed:
+        return payload
+    return {**payload, "workload_log_snapshots": trimmed}
 
 
 def completion_delivery_disposition(exc: BaseException) -> str:
@@ -52,7 +134,16 @@ def completion_delivery_disposition(exc: BaseException) -> str:
 
 
 class KubernetesCompletionOutbox:
-    """ConfigMap-backed write-ahead delivery for critical watcher events."""
+    """ConfigMap-backed write-ahead delivery for critical watcher events.
+
+    The write-ahead record is durability, not permission to deliver: it is
+    pointer-sized (see ``pointer_sized_completion_payload``) and a write that
+    fails is counted in ``append_failures_total`` and logged once per key,
+    after which the live POST is attempted anyway. Only when both the buffer
+    and the delivery fail does ``post`` raise, and then it raises the buffer
+    error -- an unwritable outbox is the actionable cause -- with the delivery
+    error chained onto it.
+    """
 
     DATA_KEY = "events.json"
     ATTEMPTS_KEY = "active-attempts.json"
@@ -66,6 +157,7 @@ class KubernetesCompletionOutbox:
         name: str = "gpu-fault-completion-watcher-outbox",
         max_records: int = 256,
         max_bytes: int = 900_000,
+        max_buffered_tail_bytes: int = DEFAULT_BUFFERED_TAIL_BYTES,
         replay_batch_size: int = 32,
         replay_budget_seconds: float = 10.0,
         max_replay_attempts: int = 20,
@@ -74,6 +166,8 @@ class KubernetesCompletionOutbox:
     ) -> None:
         if max_records < 1 or max_bytes < 1024 or replay_batch_size < 1:
             raise ValueError("completion outbox bounds must be positive")
+        if max_buffered_tail_bytes < 1:
+            raise ValueError("completion outbox buffered tail bound must be positive")
         if replay_budget_seconds <= 0 or max_replay_attempts < 1:
             raise ValueError("completion outbox replay bounds must be positive")
         self.core_api = core_api
@@ -82,6 +176,7 @@ class KubernetesCompletionOutbox:
         self.name = name
         self.max_records = max_records
         self.max_bytes = max_bytes
+        self.max_buffered_tail_bytes = max_buffered_tail_bytes
         self.replay_batch_size = replay_batch_size
         self.replay_budget_seconds = replay_budget_seconds
         self.max_replay_attempts = max_replay_attempts
@@ -93,6 +188,12 @@ class KubernetesCompletionOutbox:
             "quarantined": 0,
         }
         self._attempt_digests: dict[str, str] = {}
+        # Critical events whose write-ahead copy could not be written. Exported
+        # as ``gpu_fault_completion_outbox_append_failures_total``: since a
+        # failed buffer no longer vetoes the POST, this counter is the only
+        # signal that the outbox ConfigMap is full or unwritable (F1/F12).
+        self.append_failures_total = 0
+        self._append_failures_logged: set[str] = set()
 
     @staticmethod
     def _record_key(path: str, payload: dict[str, Any]) -> str:
@@ -183,8 +284,14 @@ class KubernetesCompletionOutbox:
     ) -> None:
         for attempt in range(3):
             data, resource_version = self._read_data()
+            updated = function(data)
+            if updated is data:
+                # A mutation that changes nothing (a key that is already
+                # buffered, a removal of a key that is gone) must not spend a
+                # whole-document replace on this hot path.
+                return
             try:
-                self._write_data(function(data), resource_version)
+                self._write_data(updated, resource_version)
                 return
             except Exception as exc:
                 if getattr(exc, "status", None) != 409 or attempt == 2:
@@ -198,27 +305,70 @@ class KubernetesCompletionOutbox:
         ],
     ) -> None:
         def update(data: dict[str, str]) -> dict[str, str]:
-            result = dict(data)
-            result[self.DATA_KEY] = json.dumps(
+            document = json.dumps(
                 function(self._events(data)),
                 sort_keys=True,
                 separators=(",", ":"),
                 default=str,
             )
+            if document == data.get(self.DATA_KEY):
+                return data
+            result = dict(data)
+            result[self.DATA_KEY] = document
             return result
 
         self._mutate_data(update)
 
-    def _append(self, path: str, payload: dict[str, Any]) -> str:
-        key = self._record_key(path, payload)
+    def _append(self, key: str, path: str, payload: dict[str, Any]) -> bool:
+        """Buffer the pointer-sized copy; ``False`` when already buffered.
+
+        A key that is already in the ConfigMap is a record an earlier pass
+        failed to deliver. ``replay`` owns it from then on, so the caller must
+        not post it live a second time in the same pass (F8).
+        """
+
+        buffered = pointer_sized_completion_payload(
+            payload, max_tail_bytes=self.max_buffered_tail_bytes
+        )
+        already_buffered = False
 
         def append(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            if any(item.get("key") == key for item in records):
+            nonlocal already_buffered
+            already_buffered = any(item.get("key") == key for item in records)
+            if already_buffered:
                 return records
-            return [*records, self._record(key, path, payload)]
+            return [*records, self._record(key, path, buffered)]
 
         self._mutate(append)
-        return key
+        return not already_buffered
+
+    def _count_append_failure(self, key: str, exc: BaseException) -> None:
+        """Count every write-ahead failure; log the first one per key.
+
+        The watcher reconciles every 30 s, so logging each pass would bury the
+        cause under its own repetition (the same rule as F9).
+        """
+
+        self.append_failures_total += 1
+        if key in self._append_failures_logged:
+            LOGGER.debug(
+                "completion outbox write-ahead still failing: key=%s (%s: %s)",
+                key,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        if len(self._append_failures_logged) >= _MAX_LOGGED_APPEND_FAILURES:
+            self._append_failures_logged.clear()
+        self._append_failures_logged.add(key)
+        LOGGER.error(
+            "cannot write ahead critical completion event key=%s (%s: %s); "
+            "delivering it live without a buffered copy -- a watcher restart "
+            "before the control plane accepts it would lose the event",
+            key,
+            type(exc).__name__,
+            exc,
+        )
 
     def _record(self, key: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -334,7 +484,27 @@ class KubernetesCompletionOutbox:
                 raise
         if path not in CRITICAL_COMPLETION_PATHS:
             return self.sink.post(path, payload)
-        key = self._append(path, payload)
+        # A malformed payload has no key and is a caller bug, not a durability
+        # problem: it still fails hard, before anything is attempted.
+        key = self._record_key(path, payload)
+        try:
+            appended = self._append(key, path, payload)
+        except Exception as append_error:
+            self._count_append_failure(key, append_error)
+            try:
+                return self.sink.post(path, payload)
+            except Exception as delivery_error:
+                # Nothing buffered and nothing delivered: stay fail-closed and
+                # name the buffer failure, which is what has to be fixed.
+                raise append_error from delivery_error
+        self._append_failures_logged.discard(key)
+        if not appended:
+            LOGGER.info(
+                "critical completion event already buffered; leaving delivery "
+                "to the outbox replay: key=%s",
+                key,
+            )
+            return {DEFERRED_TO_REPLAY: True}
         result = self.sink.post(path, payload)
         self._remove(key)
         return result
@@ -349,6 +519,11 @@ class KubernetesCompletionOutbox:
         is set, which is how an operator retries them after fixing the cause
         (for example registering the runtime profile the control plane did
         not know). The whole pass is bounded by ``replay_budget_seconds``.
+
+        What is re-sent is the buffered, pointer-sized record: its log tails
+        are capped at ``max_buffered_tail_bytes`` per snapshot and flagged
+        ``buffered_tail_truncated``. See
+        ``pointer_sized_completion_payload``.
         """
 
         records, _resource_version = self._read()
@@ -461,6 +636,10 @@ def completion_sink_from_environment(core_api: Any) -> KubernetesCompletionOutbo
         namespace=os.getenv("GPU_FAULT_NAMESPACE", "gpu-fault-system"),
         max_records=int(os.getenv("GPU_FAULT_COMPLETION_OUTBOX_MAX_RECORDS", "256")),
         max_bytes=int(os.getenv("GPU_FAULT_COMPLETION_OUTBOX_MAX_BYTES", "900000")),
+        # ``max_buffered_tail_bytes`` is deliberately not an environment knob:
+        # the write-ahead copy has to fit whatever ``max_bytes`` allows, and an
+        # operator raising it would re-create F1.
+        max_buffered_tail_bytes=DEFAULT_BUFFERED_TAIL_BYTES,
         replay_batch_size=int(
             os.getenv("GPU_FAULT_COMPLETION_OUTBOX_REPLAY_BATCH_SIZE", "32")
         ),
