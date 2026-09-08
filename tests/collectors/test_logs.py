@@ -1416,3 +1416,50 @@ def test_fabric_manager_decodes_a_binary_journal_message(tmp_path) -> None:
     assert text in sink.requests[0][1]["message"], (
         f"the MESSAGE byte array was stringified instead of decoded: {sink.requests}"
     )
+
+
+def test_fabric_manager_reports_a_stall_inside_an_unfinished_record(
+    tmp_path, caplog
+) -> None:
+    """Holding the offset must not look like a healthy collector.
+
+    Nothing is read from the file until the daemon terminates the line, and a
+    daemon killed mid-append never will. The hold was silent, so an operator saw
+    a collector reporting success and no SXIDs; it now says so once per file and
+    offset instead of every round.
+    """
+
+    opening = "Fabric Manager daemon started, build 550.90.07\n"
+    torn = "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22013, Fatal, Link 12 SAW_MVB"
+    log = tmp_path / "fabricmanager.log"
+    log.write_bytes((opening + torn).encode("utf-8"))
+    state = tmp_path / "state.json"
+    offset = len(opening.encode("utf-8")) + 10
+    _write_fabric_file_state(state, log, offset=offset)
+    sink = RecordingSink()
+    collector = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        journal_enabled=False,
+        log_paths=[str(log)],
+        state_path=str(state),
+        now=lambda: NOW,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        first = collector.collect_once()
+        second = collector.collect_once()
+
+    assert (first.delivered, second.delivered) == (0, 0), (
+        f"an unfinished record was delivered: {sink.requests}"
+    )
+    assert caplog.text.count("has not finished writing") == 1, (
+        f"the stalled read was reported {caplog.text.count('has not finished writing')}"
+        f" time(s) instead of once: {caplog.text}"
+    )
+    assert str(log) in caplog.text and str(offset) in caplog.text, (
+        f"the warning does not say which file and offset are stuck: {caplog.text}"
+    )

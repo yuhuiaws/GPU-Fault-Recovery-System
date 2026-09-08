@@ -42,6 +42,7 @@ HEALTH_COUNTER_NAMES = (
     "kmsg_overflow",
     "boot_time_reestimates",
     "delivery_queue_drops",
+    "health_summary_queue_drops",
     "delivery_buffered_at_shutdown",
     "delivery_dropped_at_shutdown",
     "delivery_thread_deaths",
@@ -154,6 +155,10 @@ class KernelLogCollector:
         # leaves two consumers on one queue and only joins the newer.
         self._delivery_stop: threading.Event | None = None
         self._retired_delivery_threads: list[threading.Thread] = []
+        # The record the delivery thread is posting right now. It has left the
+        # queue, so without this the shutdown drain cannot see it and the thread
+        # is killed with the process in the middle of a ~47 s retry ladder.
+        self._delivery_inflight: tuple[str, str, dict[str, Any]] | None = None
         self._shutdown = threading.Event()
 
     def collect_lines(
@@ -271,7 +276,10 @@ class KernelLogCollector:
         drain is single-shot and bounded: what the sink can buffer for replay is
         buffered, what is left gets one delivery attempt inside
         ``drain_budget_seconds``, and the remainder is counted and logged as
-        lost. Delivered, buffered or counted -- there is no fourth state.
+        lost. Delivered, buffered or counted -- there is no fourth state. That
+        includes the record the thread was posting when the join timed out: it
+        is drained here too, because a duplicate the control plane dedupes on
+        ``event_id`` is better than a record nobody accounted for.
         """
 
         with self._delivery_wakeup:
@@ -297,6 +305,14 @@ class KernelLogCollector:
             self._delivery_stop = None
             pending = list(self._delivery_queue)
             self._delivery_queue.clear()
+            inflight = self._delivery_inflight
+            self._delivery_inflight = None
+        if inflight is not None:
+            # It is first in the queue again. A thread that is still posting it
+            # may yet succeed, and then the control plane sees the same
+            # ``event_id`` twice and dedupes it; the alternative is a record
+            # with no verdict at all.
+            pending.insert(0, inflight)
         self._drain_pending(pending, drain_budget_seconds)
 
     def _delivery_loop(self, stop: threading.Event) -> None:
@@ -308,10 +324,19 @@ class KernelLogCollector:
                     # Whatever is left belongs to ``stop_delivery``'s drain, in
                     # the caller's thread. Taking one more here would race it.
                     return
-                record_id, path, payload = self._delivery_queue.popleft()
+                item = self._delivery_queue.popleft()
+                self._delivery_inflight = item
+            record_id, path, payload = item
             # Posted outside the lock: the reader keeps queueing while this
             # record is in flight, which is the whole point of the thread.
-            self._deliver_one(record_id, path, payload)
+            try:
+                self._deliver_one(record_id, path, payload)
+            finally:
+                with self._delivery_wakeup:
+                    # Identity, not equality: a retired thread finishing its
+                    # last post must not clear the new thread's record.
+                    if self._delivery_inflight is item:
+                        self._delivery_inflight = None
 
     def _drain_pending(
         self,
@@ -326,25 +351,31 @@ class KernelLogCollector:
         deadline = time.monotonic() + max(0.0, budget_seconds)
         lost: list[str] = []
         for index, (record_id, path, payload) in enumerate(pending):
+            if time.monotonic() >= deadline:
+                # One attempt each, and 2048 of them at ~47 s of retries -- or
+                # 2048 waits on an outbox lock the sink's own replay thread
+                # holds -- fits inside no stop timeout, so the rest is reported
+                # as lost rather than retried past the point systemd sends
+                # SIGKILL.
+                lost.extend(item[0] for item in pending[index:])
+                break
             if buffer_for_replay is not None:
                 try:
-                    buffer_for_replay(path, payload)
+                    buffered = bool(buffer_for_replay(path, payload))
                 except Exception:
                     LOGGER.exception(
                         "kernel record could not be buffered for replay at "
                         "shutdown: record=%s",
                         record_id,
                     )
-                    lost.append(record_id)
+                    buffered = False
+                if buffered:
+                    self.health_counters["delivery_buffered_at_shutdown"] += 1
                     continue
-                self.health_counters["delivery_buffered_at_shutdown"] += 1
-                continue
-            if time.monotonic() >= deadline:
-                # One attempt each, and 2048 of them at ~47 s of retries fits
-                # inside no stop timeout, so the rest is reported as lost
-                # rather than retried past the point systemd sends SIGKILL.
-                lost.extend(item[0] for item in pending[index:])
-                break
+                # ``False`` means no outbox is configured, or the write failed
+                # on a read-only or full volume. The record is still ours, so it
+                # gets the one delivery attempt it would have got without an
+                # outbox at all.
             self._deliver_one(record_id, path, payload)
         if lost:
             self.health_counters["delivery_dropped_at_shutdown"] += len(lost)
@@ -374,24 +405,50 @@ class KernelLogCollector:
                     return False
                 if thread.is_alive():
                     if len(self._delivery_queue) >= self.delivery_queue_size:
-                        dropped_id, _path, _payload = self._delivery_queue.popleft()
-                        self.health_counters["delivery_queue_drops"] += 1
-                        drops = self.health_counters["delivery_queue_drops"]
+                        dropped_id, dropped_path, _payload = (
+                            self._delivery_queue.popleft()
+                        )
+                        # A dropped health summary is a lost liveness report,
+                        # not lost fault evidence; counting it as an XID drop
+                        # would make the counter operators page on untrue.
+                        counter = (
+                            "health_summary_queue_drops"
+                            if dropped_path == COLLECTOR_HEALTH_PATH
+                            else "delivery_queue_drops"
+                        )
+                        self.health_counters[counter] += 1
+                        drops = self.health_counters[counter]
                         if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
                             LOGGER.warning(
                                 "kernel delivery queue is full at %d records; "
-                                "dropped the oldest record=%s (dropped=%d). The "
-                                "control plane is not keeping up and these "
-                                "records are lost.",
+                                "dropped the oldest entry=%s (%s, dropped=%d). "
+                                "The control plane is not keeping up and these "
+                                "%s are lost.",
                                 self.delivery_queue_size,
                                 dropped_id,
+                                (
+                                    "health summary"
+                                    if counter == "health_summary_queue_drops"
+                                    else "kmsg record"
+                                ),
                                 drops,
+                                (
+                                    "health summaries"
+                                    if counter == "health_summary_queue_drops"
+                                    else "records"
+                                ),
                             )
                     self._delivery_queue.append((record_id, path, payload))
                     self._delivery_wakeup.notify()
                     return True
                 self._delivery_thread = None
                 self._delivery_stop = None
+                inflight = self._delivery_inflight
+                self._delivery_inflight = None
+                if inflight is not None:
+                    # It died holding this record: nobody else has it, so it
+                    # goes back to the front for whoever drains the queue next.
+                    self._delivery_queue.appendleft(inflight)
                 self.health_counters["delivery_thread_deaths"] += 1
                 deaths = self.health_counters["delivery_thread_deaths"]
                 queued = len(self._delivery_queue)
@@ -464,10 +521,16 @@ class KernelLogCollector:
         try:
             self._run_forever()
         finally:
-            restore_signals()
-            # The reader is leaving: whatever is still queued is delivered,
-            # buffered for replay or counted before the process goes away.
-            self.stop_delivery()
+            try:
+                # The reader is leaving: whatever is still queued is delivered,
+                # buffered for replay or counted before the process goes away.
+                # The handlers stay installed for this: the drain may take
+                # seconds, and systemd repeats SIGTERM on a slow stop -- with
+                # the default disposition back in place that second signal
+                # killed the process mid-drain.
+                self.stop_delivery()
+            finally:
+                restore_signals()
 
     def _install_stop_signals(self) -> Callable[[], None]:
         """Turn SIGTERM/SIGINT into a stop request; return how to undo it.
@@ -499,6 +562,11 @@ class KernelLogCollector:
         for number in (signal.SIGTERM, signal.SIGINT):
             try:
                 previous = signal.getsignal(number)
+                if previous is signal.SIG_IGN:
+                    # Whoever started this process asked for the signal to be
+                    # swallowed (a supervisor that stops its children itself).
+                    # Arming it would turn that into a shutdown.
+                    continue
                 signal.signal(number, make_handler(previous))
             except (OSError, ValueError):
                 continue

@@ -26,6 +26,11 @@ from gpu_fault.telemetry import CollectorKind
 
 LOGGER = logging.getLogger(__name__)
 
+#: How often to repeat the warning that a resume offset sits inside a record the
+#: daemon has not finished writing. The condition recurs every round while it
+#: lasts, so it is reported on a schedule rather than once per line or never.
+PARTIAL_RESUME_WARN_INTERVAL_SECONDS = 300.0
+
 #: How many log files the collector keeps offsets for. A glob over rotated
 #: files grows the persisted table forever otherwise (ARCH-G9).
 DEFAULT_MAX_TRACKED_FILES = 256
@@ -101,6 +106,9 @@ class FabricManagerLogCollector:
         self._files: dict[str, dict[str, int]] = {}
         self._state_dirty = False
         self._resync_warned = False
+        # (path, offset, monotonic) of the last "still being written" warning,
+        # so a daemon that stalls mid-line says so once instead of every round.
+        self._partial_resume_warned: tuple[str, int, float] | None = None
         self.health_summary_seconds = int(
             os.getenv(
                 "GPU_FAULT_FABRIC_MANAGER_HEALTH_SUMMARY_SECONDS",
@@ -533,6 +541,7 @@ class FabricManagerLogCollector:
                 if boundary != b"\n":
                     skipped = stream.readline()
                     if not skipped.endswith(b"\n"):
+                        self._warn_resume_inside_an_unfinished_line(key, offset)
                         # The daemon is still writing that line. Consuming its
                         # tail would commit a checkpoint inside an incomplete
                         # record, and the next round would skip the completed
@@ -635,6 +644,35 @@ class FabricManagerLogCollector:
             "Fabric Manager log %s resumed at byte %d, which is not a line "
             "boundary; re-syncing to the next line (an offset from before the "
             "checkpoints were byte counts, or a torn append)",
+            key,
+            offset,
+        )
+
+    def _warn_resume_inside_an_unfinished_line(self, key: str, offset: int) -> None:
+        """Say that the resume offset sits inside a line nobody has finished.
+
+        The read makes no progress until the line has its terminator, which is
+        the point -- but doing that in silence is indistinguishable from a
+        healthy collector, and a log whose last line never completes (a killed
+        daemon, a truncated file) would never be read again with nothing said.
+        Rate limited to one line per file and offset per interval, because the
+        condition repeats every collection round while it lasts.
+        """
+
+        now = time.monotonic()
+        last = self._partial_resume_warned
+        if (
+            last is not None
+            and last[0] == key
+            and last[1] == offset
+            and now - last[2] < PARTIAL_RESUME_WARN_INTERVAL_SECONDS
+        ):
+            return
+        self._partial_resume_warned = (key, offset, now)
+        LOGGER.warning(
+            "Fabric Manager log %s resumed at byte %d, inside a record the "
+            "daemon has not finished writing; holding the offset there until "
+            "the record is complete (nothing is read from this file meanwhile)",
             key,
             offset,
         )

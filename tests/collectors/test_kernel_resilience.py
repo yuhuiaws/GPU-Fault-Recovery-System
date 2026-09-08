@@ -430,6 +430,7 @@ class _ReplayBufferingSink(_SlowSink):
 
     def buffer_for_replay(self, path, payload):
         self.buffered.append((path, payload))
+        return True
 
 
 def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
@@ -709,3 +710,312 @@ def test_the_health_summary_is_not_posted_from_the_read_loop(monkeypatch) -> Non
         "kernel-collector-delivery",
         "kernel-collector-delivery",
     ], f"the kmsg records did not go through the delivery thread: {sink.posts}"
+
+
+class _UnwritableOutboxSink(_SlowSink):
+    """The outbox write fails: a read-only volume, a full disk, or none configured.
+
+    ``HttpEventSink.buffer_for_replay`` returns ``False`` and never raises in
+    that case (``sinks.py``), which is exactly the case the drain has to notice.
+    """
+
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__(delay_seconds)
+        self.buffer_attempts: list[str] = []
+
+    def buffer_for_replay(self, path, payload):
+        self.buffer_attempts.append(payload["record_id"])
+        return False
+
+
+def test_a_failed_outbox_write_is_not_reported_as_buffered(caplog) -> None:
+    """``False`` from ``buffer_for_replay`` means the record is still ours.
+
+    The return value was ignored, so a full disk or a read-only volume -- the
+    case the sink's own comment names -- lost the whole queue while the health
+    summary said it had been buffered. Each unwritten record gets one delivery
+    attempt inside the remaining budget, and what the budget leaves is counted.
+    """
+
+    sink = _UnwritableOutboxSink(delay_seconds=0.2)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.collectors.logs.kernel"):
+        collector.stop_delivery(drain_budget_seconds=0.05)
+
+    assert sink.buffer_attempts, "the drain never tried the outbox at all"
+    assert collector.health_counters["delivery_buffered_at_shutdown"] == 0, (
+        f"a failed outbox write was counted as buffered: {collector.health_counters}"
+    )
+    assert [payload["record_id"] for _path, payload in sink.requests] == [
+        "kmsg-boot-123-42",
+        "kmsg-boot-123-43",
+    ], f"the record the outbox refused was never posted either: {sink.requests}"
+    assert collector.health_counters["delivery_dropped_at_shutdown"] == 2, (
+        f"the records neither buffered nor delivered were not counted: "
+        f"{collector.health_counters}"
+    )
+    assert "kmsg-boot-123-45" in caplog.text, (
+        f"the records lost at shutdown were not named in the log: {caplog.text}"
+    )
+
+
+class _SlowOutboxSink(_SlowSink):
+    """Buffering itself blocks: the outbox flock is held by the replay thread."""
+
+    def __init__(self, delay_seconds: float, buffer_delay_seconds: float) -> None:
+        super().__init__(delay_seconds)
+        self.buffered: list[str] = []
+        self.buffer_delay_seconds = buffer_delay_seconds
+
+    def buffer_for_replay(self, path, payload):
+        time.sleep(self.buffer_delay_seconds)
+        self.buffered.append(payload["record_id"])
+        return True
+
+
+def test_the_shutdown_drain_stops_buffering_when_the_budget_is_gone() -> None:
+    """The buffer branch ignored the deadline entirely.
+
+    ``buffer_for_replay`` takes the outbox lock, which the sink's own replay
+    thread may hold, so a queue of 2048 records could sit past the stop timeout
+    and be SIGKILLed with no verdict at all.
+    """
+
+    sink = _SlowOutboxSink(delay_seconds=0.2, buffer_delay_seconds=0.2)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    collector.stop_delivery(drain_budget_seconds=0.05)
+
+    assert sink.buffered == ["kmsg-boot-123-43"], (
+        f"the drain kept buffering past its budget: {sink.buffered}"
+    )
+    assert collector.health_counters["delivery_buffered_at_shutdown"] == 1, (
+        f"the buffered record was not counted: {collector.health_counters}"
+    )
+    assert collector.health_counters["delivery_dropped_at_shutdown"] == 2, (
+        f"the records the budget left were not counted: {collector.health_counters}"
+    )
+
+
+class _WedgedSink:
+    """Blocks inside ``post`` until it is released, then buffers on request."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.requests: list[str] = []
+        self.buffered: list[str] = []
+
+    def post(self, path, payload):
+        self.requests.append(payload["record_id"])
+        self.entered.set()
+        assert self.release.wait(10), "the wedged sink was never released"
+        return {"accepted": True}
+
+    def buffer_for_replay(self, path, payload):
+        self.buffered.append(payload["record_id"])
+        return True
+
+
+def test_the_record_in_flight_at_a_join_timeout_still_gets_a_verdict() -> None:
+    """The in-flight record was the one record nobody accounted for.
+
+    It had been popped, so the drain never saw it, and its thread was retired
+    after the join and killed with the process mid-``deliver_event`` -- ~47 s of
+    retries that a stopping process does not have. It goes back into the drain,
+    where a duplicate delivery is deduped by ``event_id`` and a loss is not.
+    """
+
+    sink = _WedgedSink()
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    try:
+        collector.collect_lines([FIRST])
+        assert sink.entered.wait(5), "the delivery thread never reached the sink"
+        collector.collect_lines([SECOND])
+
+        collector.stop_delivery(timeout_seconds=0.05, drain_budget_seconds=1.0)
+    finally:
+        sink.release.set()
+
+    assert sorted(sink.buffered) == ["kmsg-boot-123-42", "kmsg-boot-123-43"], (
+        f"the record in flight at the join timeout was lost: {sink.buffered}"
+    )
+    assert collector.health_counters["delivery_buffered_at_shutdown"] == 2, (
+        f"the in-flight record was not counted either: {collector.health_counters}"
+    )
+
+
+class _SignalWatchingSink(_SlowSink):
+    """Records the process's SIGTERM disposition at each shutdown buffer call."""
+
+    def __init__(self) -> None:
+        super().__init__(delay_seconds=0.0)
+        self.handlers_during_drain: list[object] = []
+        self.buffered: list[str] = []
+
+    def buffer_for_replay(self, path, payload):
+        self.handlers_during_drain.append(signal.getsignal(signal.SIGTERM))
+        self.buffered.append(payload["record_id"])
+        return True
+
+
+def test_a_second_stop_signal_does_not_kill_the_drain(monkeypatch) -> None:
+    """The handlers were restored before the drain ran.
+
+    The drain can take ~10 s; systemd sends SIGTERM again on a slow stop, and
+    with the default disposition back in place that second signal killed the
+    process in the middle of handing records to the outbox.
+    """
+
+    def fake_open(*_args, **_kwargs):
+        return io.StringIO(FIRST + SECOND + THIRD)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    sink = _SignalWatchingSink()
+
+    def stop(_seconds: float) -> None:
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), f"no SIGTERM handler was installed: {handler}"
+        handler(signal.SIGTERM, None)
+
+    before = signal.getsignal(signal.SIGTERM)
+    collector = KernelLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: NOW,
+        start_at_end=False,
+        sleep=stop,
+    )
+
+    collector.run()
+
+    assert sink.buffered, "the drain never reached the outbox, so nothing is proven"
+    assert all(callable(item) for item in sink.handlers_during_drain), (
+        f"the stop handler was restored before the drain finished: "
+        f"{sink.handlers_during_drain}"
+    )
+    assert signal.getsignal(signal.SIGTERM) is before, (
+        "the collector kept the process's SIGTERM handler after run() returned"
+    )
+
+
+def test_an_ignored_stop_signal_stays_ignored(monkeypatch) -> None:
+    """A signal the parent set to ``SIG_IGN`` must not be re-armed.
+
+    Installing a handler over an inherited ``SIG_IGN`` overrides a deliberate
+    decision of whoever started the process (a supervisor that stops its
+    children itself), and turns a signal it expects to be swallowed into a
+    shutdown.
+    """
+
+    def fake_open(*_args, **_kwargs):
+        return io.StringIO(FIRST)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    seen: list[object] = []
+
+    def stop(_seconds: float) -> None:
+        seen.append(signal.getsignal(signal.SIGINT))
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), f"no SIGTERM handler was installed: {handler}"
+        handler(signal.SIGTERM, None)
+
+    collector = KernelLogCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: NOW,
+        start_at_end=False,
+        sleep=stop,
+    )
+    previous_int = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        collector.run()
+    finally:
+        signal.signal(signal.SIGINT, previous_int)
+
+    assert seen == [signal.SIG_IGN], (
+        f"an inherited SIG_IGN was replaced by the collector's handler: {seen}"
+    )
+
+
+def test_a_dropped_health_summary_is_not_counted_as_a_lost_record(
+    monkeypatch, caplog
+) -> None:
+    """``delivery_queue_drops`` says XID records are lost, so it must be true.
+
+    The summary shares the queue with the records, and the oldest entry is the
+    one dropped when the queue is full. Counting a dropped summary there says
+    the node lost fault evidence when it lost one liveness report.
+    """
+
+    streams = [io.StringIO(FIRST), io.StringIO(""), io.StringIO(SECOND)]
+
+    def fake_open(*_args, **_kwargs):
+        return streams.pop(0) if streams else io.StringIO("")
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    sink = _WedgedSink()
+    clock = [NOW]
+    rounds: list[int] = []
+
+    def stop(_seconds: float) -> None:
+        rounds.append(len(rounds))
+        if len(rounds) == 1:
+            # The delivery thread is inside the wedged post, so the queue keeps
+            # everything the reader hands it from here on.
+            assert sink.entered.wait(5), "the delivery thread never reached the sink"
+            clock[0] = NOW + timedelta(seconds=600)
+            return
+        if len(rounds) == 2:
+            # Round 2 read nothing and queued the health summary, which is now
+            # the oldest entry in a queue of one.
+            return
+        sink.release.set()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), f"no SIGTERM handler was installed: {handler}"
+        handler(signal.SIGTERM, None)
+
+    collector = KernelLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: clock[0],
+        start_at_end=False,
+        sleep=stop,
+        delivery_queue_size=1,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.kernel"):
+        collector.run()
+
+    assert collector.health_counters["health_summary_queue_drops"] == 1, (
+        f"the dropped health summary was not counted anywhere: "
+        f"{collector.health_counters}"
+    )
+    assert collector.health_counters["delivery_queue_drops"] == 0, (
+        f"a dropped health summary was reported as lost XID records: "
+        f"{collector.health_counters}"
+    )
+    assert "health summary" in caplog.text.lower(), (
+        f"the dropped health summary was not logged as one: {caplog.text}"
+    )
