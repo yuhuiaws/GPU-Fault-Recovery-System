@@ -946,6 +946,11 @@ def _data_plane_errors(
     settings, run_id = run.settings, run.run_id
     errors: list[str] = []
     run.regional.wait_node_ready(settings.fault_node, timeout_seconds=1800)
+    run.regional.wait_node_ready(settings.sibling_node, timeout_seconds=1800)
+    # Both branches may have rebooted their node; a reboot leaves the host
+    # probe Pod Failed and exec into it is refused (attempt 5, 2026-09-08).
+    recreate_probe(run.fault_probe)
+    recreate_probe(run.sibling_probe)
     holder = run.fault_probe.execute("holder-status", "--run-id", run_id)
     fault_after = run.fault_probe.execute("snapshot", "--run-id", run_id)
     sibling_after = run.sibling_probe.execute("snapshot", "--run-id", run_id)
@@ -1085,6 +1090,19 @@ def _ledger(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
 
+def recreate_probe(probe: HostProbeFixture) -> None:
+    """Replace a host probe Pod after the node it ran on rebooted.
+
+    A RESTART_NODE takes the probe down with its node and leaves it Failed;
+    ``kubectl exec`` into a Failed Pod is refused, so deleting and re-applying
+    is the only way back to a Pod that can still read and restore the host
+    (same rule as ``CollectorAcceptanceFixture.recreate``).
+    """
+
+    probe.cleanup()
+    probe.create()
+
+
 def _cleanup(
     *,
     regional: RegionalLiveFixture,
@@ -1113,11 +1131,13 @@ def _cleanup(
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
     if holder_armed:
+        guard("fault_probe_recreate", lambda: recreate_probe(fault_probe))
         guard(
             "holder_disarm",
             lambda: fault_probe.execute("disarm-holder", "--run-id", run_id),
         )
     if agent_disabled:
+        guard("sibling_probe_recreate", lambda: recreate_probe(sibling_probe))
         guard(
             "agent_restore",
             lambda: sibling_probe.execute("restore-agent", "--run-id", run_id),

@@ -1105,3 +1105,20 @@ def test_the_budget_probe_reads_the_control_plane_not_a_placeholder() -> None:
     failed = destr014.budget_headroom(_Failing(), settings)
     assert failed["readable"] is False and "exec failed" in failed["error"], failed
     assert destr014.budget_headroom_errors(failed), "an unreadable budget must refuse"
+
+
+def test_a_rebooted_probe_is_deleted_and_reapplied_before_it_is_used_again() -> None:
+    """Attempt 5 (2026-09-08): the fault node's real reboot left its probe Pod
+    Failed and the first exec after the workflow ended was refused."""
+    calls: list[str] = []
+
+    class _Probe:
+        def cleanup(self) -> dict[str, bool]:
+            calls.append("cleanup")
+            return {}
+
+        def create(self) -> None:
+            calls.append("create")
+
+    destr014.recreate_probe(_Probe())
+    assert calls == ["cleanup", "create"], calls
