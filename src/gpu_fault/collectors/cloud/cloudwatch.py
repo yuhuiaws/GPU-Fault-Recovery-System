@@ -117,7 +117,6 @@ class CloudWatchHmaCollector:
                     event_id,
                     result.error,
                 )
-                continue
             stats = stats.model_copy(update={"delivered": stats.delivered + 1})
         return stats
 
@@ -190,14 +189,27 @@ class SqsHmaConsumer:
                     "/v1/provider-events/hyperpod-hma/"
                 ) or not isinstance(payload, dict):
                     raise CollectorError("invalid queued HMA event")
-                # A forward the outbox took is durable: keeping the message
-                # made the queue redeliver the same HMA event every visibility
-                # timeout for the whole outage while the outbox replayed it too.
-                deliver_event(self.sink, path, payload).raise_for_failure()
-                self.client.delete_message(
-                    QueueUrl=self.queue_url,
-                    ReceiptHandle=message["ReceiptHandle"],
-                )
+                result = deliver_event(self.sink, path, payload)
+                result.raise_for_failure()
+                if result.buffered:
+                    # The queue is the stronger durability layer: it retains the
+                    # message for 14 days, while the collector outbox is an
+                    # emptyDir the optional HMA manifests do not even configure.
+                    # So a buffered forward keeps the message and lets SQS
+                    # redeliver it after the visibility timeout; the control
+                    # plane dedupes by CloudWatch log event id, so the outbox
+                    # replay and the redelivery collapse into one record.
+                    LOGGER.warning(
+                        "queued HMA event %s persisted to the collector outbox; "
+                        "leaving it on the queue for redelivery: %s",
+                        message.get("MessageId", "<unknown>"),
+                        result.error,
+                    )
+                else:
+                    self.client.delete_message(
+                        QueueUrl=self.queue_url,
+                        ReceiptHandle=message["ReceiptHandle"],
+                    )
                 delivered += 1
             except Exception:
                 LOGGER.exception("queued HMA event delivery failed")

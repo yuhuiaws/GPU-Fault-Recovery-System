@@ -127,7 +127,7 @@ class KubernetesHmaNodeCollector:
             try:
                 listing = api.list_node()
                 for item in listing.items:
-                    self.collect_node(serializer(item))
+                    self._collect_node_without_ending_the_pass(serializer(item))
                 resource_version = listing.metadata.resource_version
                 watcher = watch.Watch()
                 for event in watcher.stream(
@@ -143,13 +143,30 @@ class KubernetesHmaNodeCollector:
                     if event.get("type") == "DELETED":
                         self.forget_node(str(metadata.get("name") or ""))
                         continue
-                    self.collect_node(node)
+                    self._collect_node_without_ending_the_pass(node)
             except Exception:
                 LOGGER.exception("Kubernetes HMA watch failed; relisting nodes")
                 time.sleep(2)
             finally:
                 if watcher is not None:
                     watcher.stop()
+
+    def _collect_node_without_ending_the_pass(self, node: dict[str, Any]) -> None:
+        """Post one node; a node that cannot be delivered is not fatal.
+
+        A rejected record (a non-retryable 4xx, or any delivery failure when the
+        collector has no outbox to fall back on) used to unwind into ``run``'s
+        guard: every node after it in LIST order went unposted and the loop
+        relisted every two seconds stuck on the same node, so the fleet lost
+        HMA coverage quietly instead of CrashLooping visibly.
+        """
+
+        try:
+            self.collect_node(node)
+        except Exception:
+            LOGGER.exception(
+                "Kubernetes HMA node delivery failed; continuing with the next node"
+            )
 
 
 class KubernetesNodeResourceCollector:

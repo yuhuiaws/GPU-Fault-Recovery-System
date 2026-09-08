@@ -479,10 +479,10 @@ class _FakeNodeApi:
         )
 
 
-def _hma_node(resource_version: str) -> dict[str, Any]:
+def _hma_node(resource_version: str, name: str = "gpu-worker") -> dict[str, Any]:
     return {
         "metadata": {
-            "name": "gpu-worker",
+            "name": name,
             "resourceVersion": resource_version,
             "labels": {HMA_HEALTH_STATUS: "Unschedulable"},
         }
@@ -535,6 +535,60 @@ def test_kubernetes_hma_run_survives_sink_failure_during_relist(
     )
 
 
+class _HmaNodeRejectingSink:
+    """The control plane rejects one node's record and accepts every other."""
+
+    def __init__(self, node_id: str) -> None:
+        self.node_id = node_id
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((path, payload))
+        if payload["node"]["metadata"]["name"] == self.node_id:
+            raise CollectorError("rejected (422)", status_code=422)
+        return {"accepted": True}
+
+
+def test_kubernetes_hma_rejected_node_does_not_skip_the_rest_of_the_fleet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One undeliverable node must not cost the fleet its HMA coverage.
+
+    Neither the LIST loop nor the watch loop guarded ``collect_node``, so a
+    poison record (a non-retryable 4xx, or any failure when the collector has no
+    outbox) unwound into the relist guard: every node after it in LIST order went
+    unposted, the watch was never reached, and the loop relisted every two
+    seconds stuck on the same node -- a quiet partial outage where the old code
+    at least CrashLooped visibly.
+    """
+
+    sink = _HmaNodeRejectingSink("gpu-worker-2")
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    api = _FakeNodeApi(
+        [
+            [
+                _hma_node("42", "gpu-worker-1"),
+                _hma_node("42", "gpu-worker-2"),
+                _hma_node("42", "gpu-worker-3"),
+            ]
+        ]
+    )
+    watch = _FakeNodeWatch(
+        [{"type": "MODIFIED", "object": _hma_node("43", "gpu-worker-4")}]
+    )
+    _patch_kubernetes(monkeypatch, api, [watch])
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert [
+        payload["node"]["metadata"]["name"] for _path, payload in sink.requests
+    ] == ["gpu-worker-1", "gpu-worker-2", "gpu-worker-3", "gpu-worker-4"], (
+        "the rejected node ended the LIST pass and the watch was never reached"
+    )
+    assert watch.stop_calls == 1, "the watch was not stopped before relisting"
+
+
 def test_kubernetes_collector_ignores_deleted_node_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -583,45 +637,71 @@ def test_cloudwatch_subscription_continues_after_a_buffered_event() -> None:
         "event-2",
     ], "the first buffered event stopped the subscription batch"
     assert stats.observed == 2, "both log events must be observed"
+    assert stats.delivered == 2, (
+        "an event the outbox owns must count as delivered, like every other collector"
+    )
 
 
-def test_sqs_consumer_deletes_a_message_the_outbox_took() -> None:
-    """A buffered forward is durable, so the SQS message must be deleted.
+class _SqsClient:
+    """One scripted HMA message, then an empty queue once it is deleted."""
 
-    Keeping it made the queue redeliver the same HMA event every visibility
-    timeout for the whole outage, and the outbox replayed it as well.
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+        self.receives = 0
+
+    def receive_message(self, **_kwargs):
+        self.receives += 1
+        if self.deleted or self.receives > 1:
+            return {}
+        return {
+            "Messages": [
+                {
+                    "MessageId": "message-1",
+                    "Body": json.dumps(
+                        {
+                            "path": "/v1/provider-events/hyperpod-hma/cloudwatch",
+                            "payload": {"node_id": "worker-1"},
+                        }
+                    ),
+                    "ReceiptHandle": "receipt-1",
+                }
+            ]
+        }
+
+    def delete_message(self, **kwargs):
+        self.deleted.append(kwargs["ReceiptHandle"])
+
+
+def test_sqs_consumer_keeps_a_buffered_message_on_the_queue() -> None:
+    """The queue outlives the outbox, so a buffered forward keeps the message.
+
+    SQS retains the message for 14 days; the collector outbox is an emptyDir the
+    optional HMA manifests do not even configure, so deleting the message on a
+    buffered forward would drop the event with the Pod. The control plane dedupes
+    by CloudWatch log event id, so the redelivery costs nothing.
     """
 
-    class Client:
-        def __init__(self) -> None:
-            self.deleted: list[str] = []
-
-        def receive_message(self, **_kwargs):
-            if self.deleted:
-                return {}
-            return {
-                "Messages": [
-                    {
-                        "Body": json.dumps(
-                            {
-                                "path": ("/v1/provider-events/hyperpod-hma/cloudwatch"),
-                                "payload": {"node_id": "worker-1"},
-                            }
-                        ),
-                        "ReceiptHandle": "receipt-1",
-                    }
-                ]
-            }
-
-        def delete_message(self, **kwargs):
-            self.deleted.append(kwargs["ReceiptHandle"])
-
-    client = Client()
+    client = _SqsClient()
     consumer = SqsHmaConsumer(BufferingSink(), "https://sqs/queue", client=client)
 
     delivered = consumer.run_once(wait_time_seconds=0)
 
-    assert client.deleted == ["receipt-1"], (
-        "a buffered forward left the message on the queue to be redelivered"
+    assert client.deleted == [], (
+        "a buffered forward deleted the message, leaving the emptyDir outbox "
+        "as the only copy of the HMA event"
     )
-    assert delivered == 1, "the buffered forward was not counted as handled"
+    assert delivered == 1, "the forward the outbox owns was not counted as handled"
+
+
+def test_sqs_consumer_deletes_a_delivered_message() -> None:
+    """A forward the control plane accepted must leave the queue."""
+
+    client = _SqsClient()
+    consumer = SqsHmaConsumer(RecordingSink(), "https://sqs/queue", client=client)
+
+    delivered = consumer.run_once(wait_time_seconds=0)
+
+    assert client.deleted == ["receipt-1"], (
+        "an accepted forward left the message for SQS to redeliver"
+    )
+    assert delivered == 1, "the accepted forward was not counted as handled"
