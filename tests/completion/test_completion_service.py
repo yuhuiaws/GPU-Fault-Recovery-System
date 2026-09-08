@@ -17,7 +17,8 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStatus,
 )
-from gpu_fault.service import CompletionPendingError
+from gpu_fault.passive import PassiveWorkflowCompiler
+from gpu_fault.service import CompletionPendingError, CompletionService
 from gpu_fault.telemetry import EvidenceKind
 from gpu_fault.watcher import (
     AllocationCompleteness,
@@ -286,19 +287,22 @@ def test_matching_marker_reuses_incident_and_is_idempotent(
 def test_no_marker_restarts_once_within_budget(
     context: ApplicationContext, failed_event: TerminalEvent
 ) -> None:
-    decision = context.completion.handle_terminal(failed_event)
-    plan = context.store.get_plan(decision.recovery_plan_id)
+    service = CompletionService(
+        context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
+    )
+
+    decision = service.handle_terminal(failed_event)
 
     assert decision.status is DecisionStatus.PLAN_CREATED
     assert "restart budget" in decision.reason
+    plan = context.store.get_plan(decision.recovery_plan_id)
     assert plan.trigger == "no-hardware-evidence:RESTART"
     assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
-    # The plan has steps; if a workflow_compiler is configured, it will
-    # have compiled them into a workflow, but the test context does not
-    # provide one, so we check the plan directly.
-    assert len(plan.steps) == 1
-    restart_step = plan.steps[0]
-    assert restart_step.action == RecoveryAction.RESTART_WORKLOAD
+    workflow = context.store.get_workflow(plan.workflow_request_id)
+    restart = workflow.official_steps[-1]
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD
+    assert restart.parameters["restart_budget"] == failed_event.restart_budget
+    assert restart.parameters["job_id"] == failed_event.job_id
 
 
 def test_stopped_attempt_does_not_restart(

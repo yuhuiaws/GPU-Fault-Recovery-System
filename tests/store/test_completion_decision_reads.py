@@ -24,7 +24,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.service import CompletionService
 from gpu_fault.store import InMemoryStore, NotFoundError, SqliteStore
-from gpu_fault.store.memory.store import SimulatedDiagnosticAdapter
 from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
@@ -203,9 +202,7 @@ def test_postgres_terminal_event_and_decision_are_one_transaction() -> None:
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
     for store in postgres_store_instance():
         store.save_profile(default_simulated_profile())
-        service = CompletionService(
-            store, SimulatedDiagnosticAdapter(store), planner=_RaisingPlanner()
-        )
+        service = CompletionService(store, planner=_RaisingPlanner())
         event = _event("attempt-atomic")
 
         with pytest.raises(RuntimeError, match="planner exploded"):
