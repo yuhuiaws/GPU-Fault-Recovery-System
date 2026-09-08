@@ -64,6 +64,7 @@ from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     preflight_errors,
     reboot_window_errors,
     recent_unresolved_xid_events,
+    recovery_errors,
     reconcile_plan_errors,
     reset_journal_errors,
     schedulability_errors,
@@ -671,6 +672,11 @@ class _LiveRun:
     incident_id: str = ""
     successor_incident_id: str = ""
     workflow_request_id: str = ""
+    # The RESET_GPU workflow whose VERIFY_NO_GPU_CLIENTS the reboot interrupts.
+    # Captured the moment that step is WAITING, so the verdict grades the fenced
+    # workflow itself and not whatever successor the incident pointer moves to
+    # once the node self-heals.
+    fenced_request_id: str = ""
 
 
 def _prepare_live_run(
@@ -860,8 +866,10 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
             if item.get("operation") == FENCE_STEP_OPERATION
         ]
         if waiting:
+            run.fenced_request_id = str(workflow.get("request_id") or "")
             write_json_atomic(
-                run.case_dir / "waiting-verify.json", {"executions": waiting}
+                run.case_dir / "waiting-verify.json",
+                {"executions": waiting, "fenced_request_id": run.fenced_request_id},
             )
             return state
         if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}:
@@ -955,11 +963,83 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
         write_json_atomic(
             run.case_dir / "step-timeline.json", {"transitions": timeline}
         )
-        if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}:
+        incident = state.get("incident") or {}
+        # Wait for the incident itself to settle, not just for the currently
+        # pointed-at workflow to be terminal: the fenced reset terminalizes
+        # first, then the incident either quarantines or re-plans and recovers,
+        # and the verdict needs the settled aftermath.
+        if (
+            workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
+            and incident.get("state") in SETTLED_INCIDENT_STATES
+        ):
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "workflow-state.json", state)
     return state
+
+
+# The incident states that mean the aftermath is decided: held for an operator,
+# self-healed, or escalated. ACTION_PENDING / SAFETY_PENDING mean a re-plan is
+# still in flight.
+SETTLED_INCIDENT_STATES = frozenset({"QUARANTINED", "RECOVERED", "ESCALATED"})
+
+# Fetch the fenced RESET_GPU workflow, its origin incident, that incident's
+# recovery successors (workflows that descend from the fenced one and are not
+# the operator support escalation), and the fenced workflow's own remote
+# commands -- all keyed off the request id captured at WAITING, so the verdict
+# never has to follow the incident pointer to a self-heal successor.
+AFTERMATH_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+
+fenced_id = sys.argv[1]
+store = ApplicationContext.from_environment().store
+
+fenced = None
+try:
+    fenced = store.get_workflow(fenced_id)
+except NotFoundError:
+    fenced = None
+
+incident = None
+if fenced is not None and getattr(fenced, "incident_id", None):
+    try:
+        incident = store.get_incident(fenced.incident_id)
+    except NotFoundError:
+        incident = None
+
+successors = []
+for workflow in store.list_workflows(None, limit=500, newest_first=True):
+    if (
+        getattr(workflow, "predecessor_workflow_id", None) == fenced_id
+        and not str(workflow.request_id).startswith("workflow-support-after-")
+    ):
+        successors.append(workflow.model_dump(mode="json"))
+
+commands = [
+    item.model_dump(mode="json")
+    for item in store.list_remote_commands()
+    if item.workflow_request_id == fenced_id
+]
+
+print(json.dumps({
+    "fenced": fenced.model_dump(mode="json") if fenced is not None else None,
+    "incident": incident.model_dump(mode="json") if incident is not None else None,
+    "recovery_successors": successors,
+    "commands": commands,
+}, sort_keys=True, default=str))
+"""
+
+
+def _aftermath(run: _LiveRun) -> dict[str, Any]:
+    """Read the fenced workflow and its settled aftermath by request id."""
+
+    result = run.regional.cpu_python(AFTERMATH_PROBE, run.fenced_request_id)
+    write_json_atomic(run.case_dir / "aftermath.json", result)
+    return result
 
 
 def _escalations(run: _LiveRun, request_id: str) -> dict[str, Any]:
@@ -1051,14 +1131,26 @@ def execute_case(
         _, reboot_record = _arm_out_of_band_reboot(run)
         agent_after = _wait_for_new_generation(run)
         state = _observe_until_terminal(run)
-        workflow = state.get("workflow") or {}
-        incident = state.get("incident") or {}
+        # Grade the fenced RESET_GPU workflow captured at WAITING, not whatever
+        # the incident pointer resolves to: once the node self-heals the pointer
+        # moves to the recovery successor, which is not the workflow the case is
+        # about. The aftermath probe reads the fenced workflow, its incident and
+        # any recovery successors by that pinned request id.
+        aftermath = _aftermath(run)
+        workflow = aftermath.get("fenced") or {}
+        incident = aftermath.get("incident") or state.get("incident") or {}
+        recovery_successors = aftermath.get("recovery_successors") or []
         run.incident_id = str(incident.get("incident_id") or "")
-        run.workflow_request_id = str(workflow.get("request_id") or "")
+        run.workflow_request_id = run.fenced_request_id or str(
+            workflow.get("request_id") or ""
+        )
+        recovered = incident.get("state") == "RECOVERED"
         evidence = fence_evidence(workflow)
         write_json_atomic(run.case_dir / "fence-evidence.json", evidence)
         errors = workflow_errors(workflow, incident, node=settings.node)
-        errors.extend(command_errors(state.get("commands") or [], node=settings.node))
+        errors.extend(
+            command_errors(aftermath.get("commands") or [], node=settings.node)
+        )
         errors.extend(agent_errors(run.baseline_agent, agent_after, node=settings.node))
         escalations = _escalations(run, run.workflow_request_id)
         support = escalations.get("support") or {}
@@ -1077,8 +1169,18 @@ def execute_case(
                 },
                 compensation_failed="FAILED"
                 in (evidence.get("compensation_statuses") or []),
+                incident_recovered=recovered,
             )
         )
+        if recovered:
+            errors.extend(
+                recovery_errors(
+                    recovery_successors,
+                    incident,
+                    node=settings.node,
+                    predecessor_request_id=run.workflow_request_id,
+                )
+            )
         data_errors, hosts = _data_plane_errors(run)
         errors.extend(data_errors)
         reconcile = _reconcile_plan(run)
@@ -1096,6 +1198,7 @@ def execute_case(
             "workflow": workflow,
             "incident": incident,
             "support": support,
+            "recovery_successors": recovery_successors,
             "fence_evidence": evidence,
             "hosts": hosts,
         }

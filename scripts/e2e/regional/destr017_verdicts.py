@@ -104,6 +104,20 @@ RETIRED_GENERATION_PLAN_MODE = "retired-generation-plan"
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 EXPECTED_XID = 46
 
+# The two aftermaths the case accepts for the origin incident. The fence itself
+# is terminal for the *reset*; what happens to the incident afterwards may be
+# either of two safe outcomes:
+#   QUARANTINED -- the node was cordoned and held for an operator (the escalation
+#     path, policed by ``successor_errors``); or
+#   RECOVERED   -- the out-of-band reboot self-healed the node onto a fresh boot
+#     and generation, and a lighter, fence-respecting re-plan validated it
+#     healthy and released it (policed by ``recovery_errors``).
+# Both are acceptable only because the reset was never executed; the difference
+# is whether the product chose to release a demonstrably-healthy node or hold it.
+QUARANTINED_STATE = "QUARANTINED"
+RECOVERED_STATE = "RECOVERED"
+ACCEPTED_AFTERMATH_STATES = frozenset({QUARANTINED_STATE, RECOVERED_STATE})
+
 # Wall-clock allowances (seconds) for the lifetime arithmetic. Deliberately
 # generous so a passing estimate is a real safety margin: containment, the
 # waiting window the holder buys, the reboot and re-registration, the terminal
@@ -219,10 +233,11 @@ def workflow_errors(
             f"workflow status is not FAILED: {status}; an out-of-band reboot "
             "inside a maintenance window must fail the workflow closed"
         )
-    if incident.get("state") != "QUARANTINED":
+    if incident.get("state") not in ACCEPTED_AFTERMATH_STATES:
         errors.append(
-            f"incident state is not QUARANTINED: {incident.get('state')}; the "
-            "node was cordoned and never released"
+            f"incident state is neither QUARANTINED nor RECOVERED: "
+            f"{incident.get('state')}; the fenced reset left the node in an "
+            "unsafe in-between state"
         )
 
     steps = workflow.get("official_steps") or []
@@ -351,12 +366,19 @@ def successor_errors(
     predecessor_request_id: str,
     forbidden_escalations: dict[str, Any],
     compensation_failed: bool,
+    incident_recovered: bool = False,
 ) -> list[str]:
     """The escalation the fenced workflow is allowed to open.
 
     A failed containment/release step classifies to ``containment_or_release``,
     whose rung is an operator, not hardware: exactly one support escalation, and
     never a reboot or replacement of a node the product did not reboot.
+
+    A hardware rung (reboot/replace/drain) is forbidden in *every* aftermath. The
+    operator support escalation is only *required* when the incident was held
+    (QUARANTINED). If the node self-healed and the incident RECOVERED, an
+    operator escalation is not owed -- and one that raced the recovery and failed
+    is not a case failure -- so once the forbidden rungs are cleared this returns.
     """
 
     errors: list[str] = []
@@ -365,6 +387,8 @@ def successor_errors(
         errors.append(
             f"a hardware escalation was opened for an out-of-band reboot: {opened}"
         )
+    if incident_recovered:
+        return errors
     if not compensation_failed:
         if successor_workflow or successor_incident:
             errors.append(
@@ -402,6 +426,77 @@ def successor_errors(
     if successor_workflow.get("status") not in {"SUCCEEDED", "PENDING", "RUNNING"}:
         errors.append(
             f"the support escalation did not run: {successor_workflow.get('status')}"
+        )
+    return errors
+
+
+def recovery_errors(
+    recovery_successors: list[dict[str, Any]],
+    incident: dict[str, Any],
+    *,
+    node: str,
+    predecessor_request_id: str,
+) -> list[str]:
+    """The re-plan that is allowed to release the node after the fence.
+
+    Only reached when the incident RECOVERED (``QUARANTINED`` is policed by
+    ``successor_errors`` instead). A node that came back on a fresh boot and a
+    higher generation is healthy again, so a lighter, non-reset remediation is
+    allowed to validate and release it -- but only a *legitimate* one: it has to
+    descend from the fenced workflow (not preempt it), execute no GPU reset and
+    no forbidden node mutation, name only this node, and actually succeed. This
+    is what keeps View B from accepting a reset smuggled in behind the fence.
+    """
+
+    if incident.get("state") != RECOVERED_STATE:
+        return []
+
+    errors: list[str] = []
+    descended = [
+        workflow
+        for workflow in recovery_successors
+        if workflow.get("predecessor_workflow_id") == predecessor_request_id
+    ]
+    if not descended:
+        errors.append(
+            "the incident RECOVERED but no recovery successor descends from the "
+            f"fenced workflow {predecessor_request_id}; the node was released by "
+            "something other than a fence-respecting re-plan"
+        )
+    for workflow in recovery_successors:
+        request_id = workflow.get("request_id")
+        executed = {
+            str(item.get("operation"))
+            for item in workflow.get("step_executions") or []
+        }
+        forbidden = sorted(FORBIDDEN_EXECUTIONS.intersection(executed))
+        if forbidden:
+            errors.append(
+                f"a recovery successor executed a node mutation the fence "
+                f"forbids: {forbidden} ({request_id})"
+            )
+        if RESET_OPERATIONS.intersection(workflow.get("completed_operations") or []):
+            errors.append(
+                f"a recovery successor recorded a completed GPU reset: {request_id}"
+            )
+        if workflow.get("preempt_predecessor"):
+            errors.append(
+                "a recovery successor preempted the fenced workflow instead of "
+                f"following its terminal fence: {request_id}"
+            )
+        for step in workflow.get("official_steps") or []:
+            nodes = list(step.get("node_ids") or [])
+            if nodes not in ([], [node]):
+                errors.append(
+                    f"a recovery successor addresses another node: "
+                    f"{step.get('operation')} ({request_id})"
+                )
+    if descended and not any(
+        workflow.get("status") == "SUCCEEDED" for workflow in descended
+    ):
+        errors.append(
+            "no recovery successor of the fenced workflow SUCCEEDED, yet the "
+            f"incident is RECOVERED: {[w.get('status') for w in descended]}"
         )
     return errors
 

@@ -499,11 +499,21 @@ def test_an_unresolved_quiesce_must_be_compensated() -> None:
     assert any("compensation never ran" in item for item in errors), errors
 
 
-def test_the_incident_must_end_quarantined() -> None:
+def test_the_incident_must_settle_quarantined_or_recovered() -> None:
+    # An in-between state (still re-planning) is unsafe and fails the case.
     errors = verdicts.workflow_errors(
-        fenced_workflow(), fenced_incident(state="RESOLVED"), node=NODE
+        fenced_workflow(), fenced_incident(state="ACTION_PENDING"), node=NODE
     )
-    assert any("not QUARANTINED" in item for item in errors), errors
+    assert any("neither QUARANTINED nor RECOVERED" in item for item in errors), errors
+
+
+def test_a_recovered_incident_is_an_accepted_aftermath() -> None:
+    # View B: the reboot self-healed the node; a fence-respecting re-plan is
+    # allowed to release it, so a RECOVERED incident is not, by itself, an error.
+    errors = verdicts.workflow_errors(
+        fenced_workflow(), fenced_incident(state="RECOVERED"), node=NODE
+    )
+    assert errors == [], errors
 
 
 def test_a_step_addressing_another_node_is_refused() -> None:
@@ -650,6 +660,144 @@ def test_the_support_escalation_must_be_the_operator_plan() -> None:
     )
     assert any("not the support plan" in item for item in errors), errors
     assert any("not ESCALATE_OPERATOR" in item for item in errors), errors
+
+
+def test_a_recovered_incident_owes_no_support_escalation() -> None:
+    # On the self-heal path the operator escalation is not required, so a run
+    # with no support workflow and a failed compensation is not a case failure.
+    assert (
+        verdicts.successor_errors(
+            {},
+            {},
+            node=NODE,
+            predecessor_request_id=REQUEST,
+            forbidden_escalations=_forbidden(),
+            compensation_failed=True,
+            incident_recovered=True,
+        )
+        == []
+    )
+
+
+def test_a_recovered_incident_still_forbids_a_hardware_rung() -> None:
+    # Self-heal never excuses a reboot/replace/drain of a node the product did
+    # not itself reboot.
+    errors = verdicts.successor_errors(
+        {},
+        {},
+        node=NODE,
+        predecessor_request_id=REQUEST,
+        forbidden_escalations=_forbidden(replace={"incident": {}}),
+        compensation_failed=True,
+        incident_recovered=True,
+    )
+    assert any("hardware escalation was opened" in item for item in errors), errors
+
+
+# --------------------------------------------------------------------------- #
+# Recovery successor (View B)
+# --------------------------------------------------------------------------- #
+def recovery_successor(**overrides: Any) -> dict[str, Any]:
+    workflow = {
+        "request_id": "workflow-recover-after-reboot",
+        "predecessor_workflow_id": REQUEST,
+        "preempt_predecessor": False,
+        "status": "SUCCEEDED",
+        "step_executions": [
+            {"operation": "FREEZE_EVIDENCE", "status": "SUCCEEDED"},
+            {"operation": "RESTART_GPU_DEVICE_PLUGIN", "status": "SUCCEEDED"},
+            {"operation": "VALIDATE_GPU", "status": "SUCCEEDED"},
+        ],
+        "completed_operations": ["RESTART_GPU_DEVICE_PLUGIN", "VALIDATE_GPU"],
+        "official_steps": [
+            _step("FREEZE_EVIDENCE"),
+            _step("RESTART_GPU_DEVICE_PLUGIN"),
+            _step("VALIDATE_GPU"),
+        ],
+    }
+    workflow.update(overrides)
+    return workflow
+
+
+def test_a_legitimate_self_heal_re_plan_is_accepted() -> None:
+    assert (
+        verdicts.recovery_errors(
+            [recovery_successor()],
+            fenced_incident(state="RECOVERED"),
+            node=NODE,
+            predecessor_request_id=REQUEST,
+        )
+        == []
+    )
+
+
+def test_recovery_is_not_policed_when_the_incident_was_quarantined() -> None:
+    # QUARANTINED is the escalation path; there is nothing to release, so the
+    # recovery verdict is vacuous even if stray successors are passed.
+    assert (
+        verdicts.recovery_errors(
+            [recovery_successor(status="FAILED")],
+            fenced_incident(state="QUARANTINED"),
+            node=NODE,
+            predecessor_request_id=REQUEST,
+        )
+        == []
+    )
+
+
+def test_a_recovered_incident_needs_a_successor_of_the_fenced_workflow() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(predecessor_workflow_id="workflow-someone-else")],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("descends from the fenced workflow" in item for item in errors), errors
+
+
+def test_a_recovery_that_reset_the_gpu_fails_the_case() -> None:
+    execution = recovery_successor(
+        step_executions=[{"operation": "RESET_GPU", "status": "SUCCEEDED"}],
+        completed_operations=["RESET_GPU"],
+    )
+    errors = verdicts.recovery_errors(
+        [execution],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("node mutation the fence forbids" in item for item in errors), errors
+    assert any("completed GPU reset" in item for item in errors), errors
+
+
+def test_a_recovery_that_preempted_the_fence_fails_the_case() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(preempt_predecessor=True)],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("preempted the fenced workflow" in item for item in errors), errors
+
+
+def test_a_recovery_addressing_another_node_fails_the_case() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(official_steps=[_step("VALIDATE_GPU", nodes=[OTHER])])],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("addresses another node" in item for item in errors), errors
+
+
+def test_a_recovered_incident_whose_successor_never_succeeded_fails() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(status="FAILED")],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("no recovery successor" in item.lower() for item in errors), errors
 
 
 # --------------------------------------------------------------------------- #
