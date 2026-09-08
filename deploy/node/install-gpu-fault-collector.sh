@@ -649,6 +649,12 @@ fi
 [[ "${GPU_INVENTORY_INTERVAL_SECONDS}" =~ ^[1-9][0-9]*$ ]] ||
     die "GPU inventory interval must be a positive integer"
 [[ "${METRICS_INTERVAL}" != "0" ]] || die "--metrics-interval must be positive"
+# Whole milliseconds, and at least a second: the collector's own window is
+# derived by integer division, so 500 would hand it 0 seconds and it would
+# refuse to start after the exporter had already been installed.
+{ [[ "${DCGM_EXPORTER_COLLECT_INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] &&
+    ((DCGM_EXPORTER_COLLECT_INTERVAL_MS >= 1000)); } ||
+    die "GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS must be whole milliseconds >= 1000"
 [[ "${DCGM_EDGE_FILTER_ENABLED}" =~ ^(true|false)$ ]] ||
     die "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED must be true or false"
 for dcgm_filter_count in \

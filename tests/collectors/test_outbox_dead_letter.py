@@ -595,6 +595,90 @@ def test_force_does_not_walk_back_into_the_block_it_escapes(
     assert "--force" in warnings and str(outbox_path) in warnings, (
         f"a forced unlocked rewrite was not warned about: {warnings!r}"
     )
+    assert "pass --force to work without the lock" not in warnings, (
+        "the forced warning embeds the strict refusal verbatim, so it still "
+        f"advises passing --force after --force was passed: {warnings!r}"
+    )
+
+
+def test_force_over_an_unopenable_lock_does_not_claim_an_in_process_lock(
+    tmp_path, capsys, caplog
+) -> None:
+    """An operator command has no in-process lock, so it must not name one.
+
+    ``--force`` also covers the case where ``.lock`` cannot be opened at all --
+    a directory in its place, a read-only volume -- and the rewrite still runs.
+    That path went through the collector's own wording, which told the operator
+    the write had run "on the in-process lock": for a CLI process that lock
+    does not exist, and it reads as a guarantee nothing is providing.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    # EISDIR from os.open(O_RDWR): a lock that cannot be taken at all, not one
+    # somebody else is holding.
+    OutboxFile(outbox_path).lock_path.mkdir()
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        collectors_cli.run_outbox_command(_requeue_arguments(outbox_path, force=True))
+    warnings = caplog.text
+    capsys.readouterr()
+
+    assert json.loads(outbox_path.read_text())["replayable"] is True, (
+        "--force must still requeue when the lock file cannot be opened"
+    )
+    assert "because --force was passed" in warnings, (
+        f"the warning does not say why the write ran unlocked: {warnings!r}"
+    )
+    assert "on the in-process lock" not in warnings, (
+        "the CLI has no in-process lock to fall back to, so claiming one "
+        f"overstates what protected this rewrite: {warnings!r}"
+    )
+
+
+def test_a_concurrent_rewrite_does_not_take_this_ones_temporary_file(
+    monkeypatch, tmp_path
+) -> None:
+    """Two writers, one ``.tmp`` inode: the second ``os.replace`` found nothing.
+
+    ``--force`` rewrites without the lock, so an operator's ``requeue-dead``
+    can now land inside the collector's own compaction or replay rewrite. Both
+    truncated the same ``outbox.ndjson.tmp``, so whichever renamed second raised
+    FileNotFoundError -- the collector reporting as failed an event it had
+    really buffered -- and the file that survived could hold a blend of the two.
+    """
+
+    outbox = OutboxFile(tmp_path / "outbox.ndjson")
+    entered: list[str] = []
+    monkeypatch.setattr(os, "getpid", lambda: 4243 if entered else 4242)
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        real_fsync(descriptor)
+        if entered:
+            return
+        entered.append("nested")
+        # The forced operator rewrite, arriving between this writer's data and
+        # its rename -- the window the lock used to close.
+        OutboxFile(outbox.path).write([_record(99)])
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    try:
+        outbox.write([_record(0)])
+    except OSError as exc:
+        pytest.fail(
+            "a concurrent rewrite took this one's temporary file, so a buffered "
+            f"event would be reported as failed: {exc!r}"
+        )
+    finally:
+        monkeypatch.undo()
+
+    sequences = [record["payload"]["sequence"] for record in outbox.read()]
+    assert sequences == [0], (
+        f"the writer that renamed last must own the file, got {sequences}"
+    )
+    leftovers = sorted(path.name for path in tmp_path.glob("*.tmp"))
+    assert not leftovers, f"a temporary file outlived its rewrite: {leftovers}"
 
 
 def test_the_refusal_names_the_wait_it_took_and_offers_force_once(

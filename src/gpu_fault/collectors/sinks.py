@@ -337,13 +337,11 @@ OVERSIZE_PAYLOAD_EXCERPT_BYTES = 4096
 OUTBOX_COMPACTION_FLOOR_RATIO = 0.9
 
 #: One WARNING per this many writes that ran without the cross-process lock:
-#: one per path hid every later unlocked write, including a failure that has
-#: since become permanent.
+#: one per path hid every later unlocked write, including a permanent failure.
 UNLOCKED_WRITE_WARN_INTERVAL = 100
 
 #: Writes per lock path that ran without the lock, and outbox paths whose write
-#: failed: counted so the logs stay bounded and an operator can see how long a
-#: degradation has lasted.
+#: failed: bounded logs, plus how long a degradation has lasted.
 _UNLOCKED_WRITES: dict[str, int] = {}
 _OUTBOX_WRITE_FAILURES: dict[str, int] = {}
 _OUTBOX_COUNTER_LOCK = Lock()
@@ -351,6 +349,12 @@ _OUTBOX_COUNTER_LOCK = Lock()
 #: How long an operator command polls for the outbox lock before giving up: a
 #: blocking ``flock`` behind a live replay reads as a wedged command.
 OUTBOX_LOCK_ATTEMPTS = 10
+#: The strict refusal's tail, named so the forced warning -- which embeds that
+#: refusal -- can strip the flag the operator has already passed.
+OUTBOX_LOCK_FORCE_ADVICE = (
+    ": retry, stop the collector, or pass --force to work without the lock,"
+    " which can lose one side's update"
+)
 OUTBOX_LOCK_RETRY_SECONDS = 0.5
 
 #: Distinct replay failures already reported. Past this many the oldest is
@@ -365,9 +369,9 @@ def _report_replay_failure(what: str, path: object, exc: BaseException) -> None:
     A replay failure cannot fail the post that already succeeded, so one that
     repeats for ever costs only log volume -- but that volume was a traceback per
     delivered event on a node whose outbox directory cannot be created. Keyed on
-    the failure, not on its text: an ``HTTPError`` carries a request id and a
-    ``JSONDecodeError`` a line and column, so ``str(exc)`` varies per occurrence
-    and every repeat would report in full. Errno separates ENOSPC from EROFS.
+    the failure, not its text: an ``HTTPError`` request id or a ``JSONDecodeError``
+    position varies per occurrence, so every repeat reported in full. Errno still
+    separates ENOSPC from EROFS.
     """
 
     text = f"{path}: {type(exc).__name__}: {exc}"
@@ -398,19 +402,14 @@ def unlocked_outbox_writes(lock_path: Path) -> int:
 
 
 class OutboxLockUnavailable(OSError):
-    """The cross-process outbox lock could not be taken.
-
-    Raised only for ``required=True``: for an operator command, which has no
-    in-process lock to degrade to, this is the F7 race itself.
-    """
+    """Raised for ``required=True`` only: a command with no lock to degrade to."""
 
 
 def digest_oversize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """A bounded stand-in for a payload the control plane refused as too large.
 
-    Never the whole body: a digest an operator can correlate with the source,
-    the size that was rejected, and the first
-    :data:`OVERSIZE_PAYLOAD_EXCERPT_BYTES` bytes of it.
+    Never the whole body: a digest an operator can correlate with the source, the
+    rejected size, and the first :data:`OVERSIZE_PAYLOAD_EXCERPT_BYTES` bytes.
     """
 
     body = json.dumps(
@@ -450,18 +449,16 @@ class OutboxFile:
     def locked(self, *, required: bool = False, forced: bool = False) -> Iterator[None]:
         """Hold the cross-process outbox lock for one read-modify-write.
 
-        Not re-entrant (``flock`` is held per open file description, so two
-        nested blocks deadlock): take it once around the whole rewrite.
-
-        ``required=False`` is the collector's write path: a filesystem without
+        Not re-entrant (``flock`` is per open file description, so two nested
+        blocks deadlock): take it once around the whole rewrite. ``required=False``
+        is the collector's write path: a filesystem without
         ``flock``, or a ``.lock`` it cannot open, must not fail a post, so the
-        body runs on the in-process lock alone, counted and warned about. For
-        ``required=True`` -- an operator command with no in-process lock -- that
-        failure and a lock still held after the bounded poll both raise
-        :class:`OutboxLockUnavailable`, and the body never runs. ``forced=True``
+        body runs on the in-process lock alone, counted and warned about.
+        ``required=True`` is an operator command, which has no in-process lock:
+        that failure and a lock still held after the bounded poll both raise
+        :class:`OutboxLockUnavailable` and the body never runs. ``forced=True``
         is ``--force``: the same bounded poll, then the body *without* the lock,
-        never ``required=False``'s blocking wait -- the very block ``--force``
-        exists to escape.
+        never ``required=False``'s blocking wait -- the block it exists to escape.
 
         A failure to create the outbox *directory* is not a lock problem and is
         left to the caller: the append that follows fails with the same error,
@@ -482,7 +479,7 @@ class OutboxFile:
                     exc.errno or 0,
                     f"cannot take the collector outbox lock {self.lock_path}: {exc}",
                 ) from exc
-            self._warn_unlocked_write(exc)
+            self._warn_unlocked_write(exc, forced=forced)
         try:
             yield
         finally:
@@ -495,9 +492,9 @@ class OutboxFile:
     def _take_lock(self, *, required: bool) -> int:
         """Open ``<outbox>.lock`` and hold ``flock`` on it, or raise ``OSError``.
 
-        A collector waits: the holder is one short read-modify-write and its
-        own writes must not fail. An operator command polls, so a
-        ``requeue-dead`` behind a saturated replay gets an answer, not a block.
+        A collector waits (the holder is one short read-modify-write and its own
+        writes must not fail); an operator command polls, so a ``requeue-dead``
+        behind a saturated replay gets an answer rather than a block.
         """
 
         handle = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
@@ -516,12 +513,10 @@ class OutboxFile:
                     if attempts <= 0:
                         raise OutboxLockUnavailable(
                             exc.errno or 0,
-                            f"another process still holds the collector outbox"
-                            f" lock {self.lock_path} after"
-                            f" {waited:.1f}s (a live"
-                            " collector's outbox replay): retry, stop the"
-                            " collector, or pass --force to work without the"
-                            " lock, which can lose one side's update",
+                            f"another process still holds the collector"
+                            f" outbox lock {self.lock_path} after {waited:.1f}s"
+                            " (a live collector's outbox replay)"
+                            f"{OUTBOX_LOCK_FORCE_ADVICE}",
                         ) from exc
                 time.sleep(OUTBOX_LOCK_RETRY_SECONDS)
         except BaseException:
@@ -538,7 +533,7 @@ class OutboxFile:
             "run without it%s, so a concurrent append or 'outbox requeue-dead' can "
             "lose one side's update",
             self.lock_path,
-            exc,
+            str(exc).replace(OUTBOX_LOCK_FORCE_ADVICE, "") if forced else exc,
             total,
             " because --force was passed" if forced else " on the in-process lock",
         )
@@ -555,10 +550,9 @@ class OutboxFile:
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
-                # A crash between an append and its fsync can leave a torn
-                # last line; one merely missing its newline still parses, so
-                # only a fragment torn mid-JSON lands here. Skipping it loses
-                # that record; crashing would take the whole outbox with it.
+                # A crash between an append and its fsync can tear the last
+                # line (one merely missing its newline still parses). Skipping
+                # it loses that record; crashing loses the whole outbox.
                 unparseable += 1
                 continue
             if isinstance(value, dict):
@@ -577,11 +571,10 @@ class OutboxFile:
     def count_lines(self) -> int:
         """How many lines the file holds, without parsing any of them.
 
-        The append path needs a depth to compare against
-        ``outbox_max_records``, and counting newlines is what keeps a buffered
-        event from re-parsing the whole backlog (F4). A final line with no
-        newline of its own is not counted, so this can read one short of
-        :meth:`read`, which revives a *complete* but unterminated record.
+        The append path needs a depth to compare against ``outbox_max_records``
+        without re-parsing the whole backlog per buffered event (F4). A final
+        line with no newline of its own is not counted, so this can read one
+        short of :meth:`read`, which revives a complete but unterminated record.
         """
 
         if not self.path.exists():
@@ -613,11 +606,10 @@ class OutboxFile:
         the ``fsync`` may lose at most this record, and only if it was torn
         mid-JSON (see :meth:`read`).
 
-        "At most this record" is why the torn tail gets a newline of its own
-        first: appending straight onto a fragment left by an unclean shutdown
-        concatenated the two into one unparseable line, so ``read()`` dropped
-        the *new* record too while the collector had already been told it was
-        buffered and had advanced its cursor past a real event.
+        The torn tail gets a newline of its own first: appending straight onto a
+        fragment concatenated the two into one unparseable line, so ``read()``
+        dropped the *new* record too -- after the collector had been told it was
+        buffered and had moved its cursor past a real event.
         """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,20 +633,30 @@ class OutboxFile:
         ``os.replace`` is atomic against a kill, but without the two ``fsync``
         calls a hard node reset -- an action this product performs -- can
         persist the rename before the data and leave an empty outbox.
+
+        The temporary carries the pid because ``--force`` rewrites unlocked: on
+        one shared name an operator's ``requeue-dead`` inside the collector's own
+        compaction left the second rename with ``FileNotFoundError``.
         """
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write(
-                "".join(
-                    json.dumps(item, separators=(",", ":"), default=str) + "\n"
-                    for item in records
+        temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "".join(
+                        json.dumps(item, separators=(",", ":"), default=str) + "\n"
+                        for item in records
+                    )
                 )
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.path)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            # Nobody else can, now that the name is this process's alone.
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            raise
         self._fsync_directory()
 
     def _fsync_directory(self) -> None:
@@ -726,11 +728,11 @@ class OutboxFile:
     ) -> int:
         """Mark dead-lettered records replayable again; returns how many.
 
-        The whole read-modify-write runs under :meth:`locked`, so this cannot
-        lose a live collector's appends and its next rewrite cannot lose this
-        requeue (F7). The lock is *required* by default because this process
-        has none of its own; ``require_lock=False`` is ``--force``, which takes
-        the same bounded poll and only then rewrites without the lock.
+        The whole read-modify-write runs under :meth:`locked`, so a live
+        collector's appends and this requeue cannot lose each other (F7). The lock
+        is *required* by default because this process has none of its own;
+        ``require_lock=False`` is ``--force``: the same poll, then an unlocked
+        rewrite.
         """
 
         with self.locked(required=require_lock, forced=not require_lock):

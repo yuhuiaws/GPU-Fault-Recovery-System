@@ -6,6 +6,10 @@ Requires=docker.service
 
 [Service]
 Type=simple
+# A default for a unit copied by hand: the installer always writes the same
+# value into the environment file below, which overrides this one. Without it a
+# missing file would expand -c to nothing and the exporter would refuse to start.
+Environment=GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS=15000
 EnvironmentFile=/etc/gpu-fault/dcgm-exporter.env
 ExecStartPre=-@CONTAINER_RUNTIME@ rm -f gpu-fault-dcgm-exporter
 ExecStart=@CONTAINER_RUNTIME@ run --rm --name gpu-fault-dcgm-exporter --gpus all --network host --cap-add SYS_ADMIN --security-opt no-new-privileges --cpus 2 --cpu-shares 128 --memory 2g --memory-reservation 1g --pids-limit 512 -e DCGM_EXPORTER_COLLECTORS=/etc/dcgm-exporter/gpu-fault-counters.csv -v /etc/gpu-fault/dcgm-counters.csv:/etc/dcgm-exporter/gpu-fault-counters.csv:ro ${GPU_FAULT_DCGM_EXPORTER_IMAGE} -a 127.0.0.1:9400 -c ${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS}

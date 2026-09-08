@@ -256,6 +256,33 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
         "the collector's seconds must be derived from the exporter's "
         "milliseconds, not written twice"
     )
+    environment_file = re.search(r"(?m)^EnvironmentFile=(\S+)$", unit)
+    assert environment_file is not None, (
+        "the unit's -c expands from an environment file it must name"
+    )
+    assert f"> {environment_file.group(1)}" in installer, (
+        "the unit reads its collect interval from a file the installer never "
+        f"writes: {environment_file.group(1)}"
+    )
+    assert (
+        f"Environment=GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS={default.group(1)}"
+        in unit.split("EnvironmentFile=")[0]
+    ), (
+        "a hand-copied unit has no environment file, and an empty -c argument "
+        "makes the exporter refuse to start: the unit must carry the same "
+        "default above EnvironmentFile=, which overrides it"
+    )
+    assert re.search(
+        r'\[\[ "\$\{DCGM_EXPORTER_COLLECT_INTERVAL_MS\}" =~ \^\[1-9\]\[0-9\]\*\$ \]\]',
+        installer,
+    ), (
+        "an unvalidated collect interval reaches bash arithmetic in the env "
+        "block, where '15s' aborts the install with a raw shell error"
+    )
+    assert "DCGM_EXPORTER_COLLECT_INTERVAL_MS >= 1000" in installer, (
+        "below 1000 ms the derived GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS "
+        "truncates to 0 and the collector refuses to start"
+    )
 
 
 def test_exporter_binds_loopback(tmp_path: Path) -> None:
