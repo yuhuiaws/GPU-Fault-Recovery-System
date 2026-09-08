@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import select
+import signal
 import threading
 import time
 from collections import deque
@@ -41,6 +42,9 @@ HEALTH_COUNTER_NAMES = (
     "kmsg_overflow",
     "boot_time_reestimates",
     "delivery_queue_drops",
+    "delivery_buffered_at_shutdown",
+    "delivery_dropped_at_shutdown",
+    "delivery_thread_deaths",
 )
 
 #: How many records may wait for the sink before the oldest is dropped. The
@@ -59,6 +63,18 @@ DELIVERY_DROP_LOG_INTERVAL = 256
 #: How long ``stop_delivery`` waits for the in-flight record before it drains
 #: what is left in the caller's own thread.
 DELIVERY_JOIN_TIMEOUT_SECONDS = 5.0
+
+#: How long the shutdown drain may spend in total when the sink has no durable
+#: outbox to hand records to. A full queue of 2048 records at ~47 s of retries
+#: each fits inside no stop timeout, so the drain is single-shot and bounded;
+#: what does not fit is counted as lost, never dropped in silence.
+DELIVERY_DRAIN_BUDGET_SECONDS = 5.0
+
+#: How many times a delivery thread that died on its own may be replaced before
+#: the collector gives up on it and delivers inline. The loop swallows every
+#: ``Exception``, so a death means something worse; restarting for ever would
+#: hide it.
+DELIVERY_THREAD_MAX_RESTARTS = 3
 
 #: How far a monotonic-derived ``observed_at`` may sit from the collection time
 #: before the boot-time estimate is suspected of being stale (ARCH-G9). Records
@@ -128,10 +144,17 @@ class KernelLogCollector:
         )
         self._last_read_at: datetime | None = None
         self.delivery_queue_size = delivery_queue_size
-        self._delivery_queue: deque[tuple[str, dict[str, Any]]] = deque()
+        # (record_id, path, payload): the health summary goes to its own
+        # channel, and it must not block the reader either.
+        self._delivery_queue: deque[tuple[str, str, dict[str, Any]]] = deque()
         self._delivery_wakeup = threading.Condition()
         self._delivery_thread: threading.Thread | None = None
-        self._delivery_stopping = False
+        # One stop Event per thread, never a shared flag: a thread that outlived
+        # its join must stay stopped for ever, or a later ``start_delivery``
+        # leaves two consumers on one queue and only joins the newer.
+        self._delivery_stop: threading.Event | None = None
+        self._retired_delivery_threads: list[threading.Thread] = []
+        self._shutdown = threading.Event()
 
     def collect_lines(
         self, lines: Iterable[str], *, limit: int | None = None
@@ -192,9 +215,9 @@ class KernelLogCollector:
             # record still waiting in the delivery queue must not be queued a
             # second time.
             self._remember(record_id)
-            if self._submit(record_id, payload):
+            if self._submit(record_id, NVIDIA_KERNEL_PATH, payload):
                 continue
-            if self._deliver_one(record_id, payload):
+            if self._deliver_one(record_id, NVIDIA_KERNEL_PATH, payload):
                 delivered += 1
         return CollectorStats(
             observed=observed,
@@ -212,93 +235,186 @@ class KernelLogCollector:
         """
 
         with self._delivery_wakeup:
-            if self._delivery_thread is not None and self._delivery_thread.is_alive():
+            running = self._delivery_thread
+            if running is not None and running.is_alive():
                 return
-            self._delivery_stopping = False
+            self._retired_delivery_threads = [
+                item for item in self._retired_delivery_threads if item.is_alive()
+            ]
+            if self._retired_delivery_threads:
+                LOGGER.warning(
+                    "%d earlier kernel delivery thread(s) are still finishing a "
+                    "post; their stop is set, so they will not take records from "
+                    "the new one",
+                    len(self._retired_delivery_threads),
+                )
+            stop = threading.Event()
             thread = threading.Thread(
                 target=self._delivery_loop,
+                args=(stop,),
                 name="kernel-collector-delivery",
                 daemon=True,
             )
+            self._delivery_stop = stop
             self._delivery_thread = thread
             thread.start()
 
     def stop_delivery(
-        self, timeout_seconds: float = DELIVERY_JOIN_TIMEOUT_SECONDS
+        self,
+        timeout_seconds: float = DELIVERY_JOIN_TIMEOUT_SECONDS,
+        drain_budget_seconds: float = DELIVERY_DRAIN_BUDGET_SECONDS,
     ) -> None:
-        """Drain the queue and join the delivery thread.
+        """Stop the delivery thread and give every queued record a verdict.
 
-        A daemon thread is killed with the process, so the join is what keeps
-        the records read just before shutdown from disappearing without a
-        verdict. Whatever the thread could not take within the timeout is
-        delivered here, in the caller's thread, rather than dropped silently.
+        A daemon thread is killed with the process, so this is what keeps the
+        records read just before shutdown from disappearing without one. The
+        drain is single-shot and bounded: what the sink can buffer for replay is
+        buffered, what is left gets one delivery attempt inside
+        ``drain_budget_seconds``, and the remainder is counted and logged as
+        lost. Delivered, buffered or counted -- there is no fourth state.
         """
 
         with self._delivery_wakeup:
             thread = self._delivery_thread
-            self._delivery_stopping = True
+            stop = self._delivery_stop
+            if stop is not None:
+                stop.set()
             self._delivery_wakeup.notify_all()
         if thread is not None:
             thread.join(timeout=timeout_seconds)
-            if thread.is_alive():
+        with self._delivery_wakeup:
+            if thread is not None and thread.is_alive():
+                # Its own stop Event stays set, so it delivers the record it is
+                # holding and then exits without touching the queue again.
+                self._retired_delivery_threads.append(thread)
                 LOGGER.warning(
-                    "kernel delivery thread is still posting after %.1fs; "
-                    "draining %d queued record(s) in the reader",
+                    "kernel delivery thread is still posting after %.1fs; it is "
+                    "stopped and %d queued record(s) are drained here",
                     timeout_seconds,
                     len(self._delivery_queue),
                 )
-        with self._delivery_wakeup:
             self._delivery_thread = None
-            self._delivery_stopping = False
+            self._delivery_stop = None
             pending = list(self._delivery_queue)
             self._delivery_queue.clear()
-        for record_id, payload in pending:
-            self._deliver_one(record_id, payload)
+        self._drain_pending(pending, drain_budget_seconds)
 
-    def _delivery_loop(self) -> None:
-        while True:
+    def _delivery_loop(self, stop: threading.Event) -> None:
+        while not stop.is_set():
             with self._delivery_wakeup:
-                while not self._delivery_queue and not self._delivery_stopping:
+                while not self._delivery_queue and not stop.is_set():
                     self._delivery_wakeup.wait(1.0)
-                if not self._delivery_queue:
-                    if self._delivery_stopping:
-                        return
-                    continue
-                record_id, payload = self._delivery_queue.popleft()
+                if stop.is_set():
+                    # Whatever is left belongs to ``stop_delivery``'s drain, in
+                    # the caller's thread. Taking one more here would race it.
+                    return
+                record_id, path, payload = self._delivery_queue.popleft()
             # Posted outside the lock: the reader keeps queueing while this
             # record is in flight, which is the whole point of the thread.
-            self._deliver_one(record_id, payload)
+            self._deliver_one(record_id, path, payload)
 
-    def _submit(self, record_id: str, payload: dict[str, Any]) -> bool:
+    def _drain_pending(
+        self,
+        pending: list[tuple[str, str, dict[str, Any]]],
+        budget_seconds: float,
+    ) -> None:
+        """Give every record left in the queue a verdict, once, inside a budget."""
+
+        if not pending:
+            return
+        buffer_for_replay = getattr(self.sink, "buffer_for_replay", None)
+        deadline = time.monotonic() + max(0.0, budget_seconds)
+        lost: list[str] = []
+        for index, (record_id, path, payload) in enumerate(pending):
+            if buffer_for_replay is not None:
+                try:
+                    buffer_for_replay(path, payload)
+                except Exception:
+                    LOGGER.exception(
+                        "kernel record could not be buffered for replay at "
+                        "shutdown: record=%s",
+                        record_id,
+                    )
+                    lost.append(record_id)
+                    continue
+                self.health_counters["delivery_buffered_at_shutdown"] += 1
+                continue
+            if time.monotonic() >= deadline:
+                # One attempt each, and 2048 of them at ~47 s of retries fits
+                # inside no stop timeout, so the rest is reported as lost
+                # rather than retried past the point systemd sends SIGKILL.
+                lost.extend(item[0] for item in pending[index:])
+                break
+            self._deliver_one(record_id, path, payload)
+        if lost:
+            self.health_counters["delivery_dropped_at_shutdown"] += len(lost)
+            LOGGER.error(
+                "kernel collector stopped with %d record(s) it could neither "
+                "deliver nor buffer within %.1fs; they are lost: %s",
+                len(lost),
+                budget_seconds,
+                ", ".join(lost[:10]),
+            )
+
+    def _submit(self, record_id: str, path: str, payload: dict[str, Any]) -> bool:
         """Queue one record for the delivery thread; False when there is none.
 
         Never blocks: a full queue drops its oldest record, counts it and says
-        so. A dead thread falls back to inline delivery rather than queueing
-        into a queue nobody reads.
+        so. A thread that died on its own is counted, reported and replaced --
+        it used to fall back to inline delivery in silence, leaving everything
+        already queued waiting on nobody until the process exited.
         """
 
-        with self._delivery_wakeup:
-            thread = self._delivery_thread
-            if thread is None or not thread.is_alive():
+        for _attempt in (0, 1):
+            with self._delivery_wakeup:
+                thread = self._delivery_thread
+                if thread is None:
+                    # Delivery was never started (or has been stopped): the
+                    # caller delivers inline and reports the outcome.
+                    return False
+                if thread.is_alive():
+                    if len(self._delivery_queue) >= self.delivery_queue_size:
+                        dropped_id, _path, _payload = self._delivery_queue.popleft()
+                        self.health_counters["delivery_queue_drops"] += 1
+                        drops = self.health_counters["delivery_queue_drops"]
+                        if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
+                            LOGGER.warning(
+                                "kernel delivery queue is full at %d records; "
+                                "dropped the oldest record=%s (dropped=%d). The "
+                                "control plane is not keeping up and these "
+                                "records are lost.",
+                                self.delivery_queue_size,
+                                dropped_id,
+                                drops,
+                            )
+                    self._delivery_queue.append((record_id, path, payload))
+                    self._delivery_wakeup.notify()
+                    return True
+                self._delivery_thread = None
+                self._delivery_stop = None
+                self.health_counters["delivery_thread_deaths"] += 1
+                deaths = self.health_counters["delivery_thread_deaths"]
+                queued = len(self._delivery_queue)
+                recover = deaths <= DELIVERY_THREAD_MAX_RESTARTS
+                # A replacement drains what is already queued; without one the
+                # queue has no consumer at all, so it is drained here.
+                stranded: list[tuple[str, str, dict[str, Any]]] = []
+                if not recover:
+                    stranded = list(self._delivery_queue)
+                    self._delivery_queue.clear()
+            LOGGER.error(
+                "kernel delivery thread died with %d record(s) queued (deaths=%d); %s",
+                queued,
+                deaths,
+                "restarting it" if recover else "delivering inline from now on",
+            )
+            if not recover:
+                self._drain_pending(stranded, DELIVERY_DRAIN_BUDGET_SECONDS)
                 return False
-            if len(self._delivery_queue) >= self.delivery_queue_size:
-                dropped_id, _dropped = self._delivery_queue.popleft()
-                self.health_counters["delivery_queue_drops"] += 1
-                drops = self.health_counters["delivery_queue_drops"]
-                if drops == 1 or drops % DELIVERY_DROP_LOG_INTERVAL == 0:
-                    LOGGER.warning(
-                        "kernel delivery queue is full at %d records; dropped "
-                        "the oldest record=%s (dropped=%d). The control plane "
-                        "is not keeping up and these records are lost.",
-                        self.delivery_queue_size,
-                        dropped_id,
-                        drops,
-                    )
-            self._delivery_queue.append((record_id, payload))
-            self._delivery_wakeup.notify()
-            return True
+            self.start_delivery()
+        return False
 
-    def _deliver_one(self, record_id: str, payload: dict[str, Any]) -> bool:
+    def _deliver_one(self, record_id: str, path: str, payload: dict[str, Any]) -> bool:
         """Post one record and say whether the control plane took it.
 
         Nothing raises out of here. ``deliver_event`` converts
@@ -309,7 +425,7 @@ class KernelLogCollector:
         """
 
         try:
-            result = deliver_event(self.sink, NVIDIA_KERNEL_PATH, payload)
+            result = deliver_event(self.sink, path, payload)
         except Exception:
             self.health_counters["delivery_failures"] += 1
             LOGGER.exception(
@@ -342,16 +458,66 @@ class KernelLogCollector:
         return True
 
     def run(self) -> None:
+        self._shutdown.clear()
         self.start_delivery()
+        restore_signals = self._install_stop_signals()
         try:
             self._run_forever()
         finally:
-            # The reader is leaving: whatever is still queued is delivered or
-            # counted before the process goes away.
+            restore_signals()
+            # The reader is leaving: whatever is still queued is delivered,
+            # buffered for replay or counted before the process goes away.
             self.stop_delivery()
 
+    def _install_stop_signals(self) -> Callable[[], None]:
+        """Turn SIGTERM/SIGINT into a stop request; return how to undo it.
+
+        systemd stops the unit with SIGTERM (no ``KillSignal=``), and CPython's
+        default action for it terminates the process without unwinding, so the
+        ``finally`` that drains the delivery queue never ran: every deploy, and
+        every OOM-kill-adjacent restart, dropped up to ``delivery_queue_size``
+        queued XID/SXID payloads with no post, no outbox record and no counter.
+        The handler only sets a flag -- the drain happens on the way out of
+        ``run`` -- and whatever handler was installed before still runs, so a
+        Ctrl-C keeps raising ``KeyboardInterrupt``.
+        """
+
+        if threading.current_thread() is not threading.main_thread():
+            # Only the main thread may install handlers, and a collector driven
+            # from a worker thread is not the process's owner anyway.
+            return lambda: None
+
+        def make_handler(previous: Any) -> Callable[[int, Any], None]:
+            def handler(signum: int, frame: Any) -> None:
+                self._shutdown.set()
+                if callable(previous):
+                    previous(signum, frame)
+
+            return handler
+
+        installed: list[tuple[int, Any]] = []
+        for number in (signal.SIGTERM, signal.SIGINT):
+            try:
+                previous = signal.getsignal(number)
+                signal.signal(number, make_handler(previous))
+            except (OSError, ValueError):
+                continue
+            installed.append((number, previous))
+
+        def restore() -> None:
+            for number, previous in installed:
+                try:
+                    signal.signal(
+                        number,
+                        previous if previous is not None else signal.SIG_DFL,
+                    )
+                except (OSError, ValueError):
+                    continue
+
+        return restore
+
     def _run_forever(self) -> None:
-        while True:
+        while not self._shutdown.is_set():
             try:
                 with open(
                     self.kmsg_path,
@@ -371,10 +537,11 @@ class KernelLogCollector:
                             ) from exc
                     self.refresh_boot_time()
                     self._collect_live_stream(stream)
-                    LOGGER.warning(
-                        "kernel message stream ended; reopening %s",
-                        self.kmsg_path,
-                    )
+                    if not self._shutdown.is_set():
+                        LOGGER.warning(
+                            "kernel message stream ended; reopening %s",
+                            self.kmsg_path,
+                        )
             except PermissionError as exc:
                 raise CollectorError(
                     f"cannot read {self.kmsg_path}; CAP_SYSLOG or an "
@@ -389,6 +556,8 @@ class KernelLogCollector:
                     "kernel log collection failed; reopening %s",
                     self.kmsg_path,
                 )
+            if self._shutdown.is_set():
+                return
             self.sleep(self.reopen_delay_seconds)
 
     def _collect_live_stream(self, stream: Any) -> None:
@@ -399,7 +568,7 @@ class KernelLogCollector:
             self._last_read_at = self.now()
             self._maybe_health_summary_without_interrupting_stream(self._last_read_at)
             return
-        while True:
+        while not self._shutdown.is_set():
             now = self.now()
             timeout = min(
                 1.0,
@@ -475,20 +644,25 @@ class KernelLogCollector:
         return reasons
 
     def _send_health_summary(self, observed_at: datetime) -> None:
-        result = deliver_event(
-            self.sink,
-            COLLECTOR_HEALTH_PATH,
-            {
-                "summary_id": (
-                    f"kernel-health-{self.node_id}-{int(observed_at.timestamp())}"
-                ),
-                "cluster_id": self.context.cluster_id,
-                "node_id": self.node_id,
-                "collector": CollectorKind.NVIDIA_KERNEL.value,
-                "observed_at": observed_at.isoformat(),
-                "edge_filter_reasons": self.health_summary_reasons(),
-            },
-        )
+        """Queue the summary behind the delivery thread, or post it inline.
+
+        This used to post from the read loop, so an unreachable control plane
+        stalled the kmsg reader for ~47 s once every 300 s while the kernel ring
+        kept overwriting records.
+        """
+
+        summary_id = f"kernel-health-{self.node_id}-{int(observed_at.timestamp())}"
+        payload: dict[str, Any] = {
+            "summary_id": summary_id,
+            "cluster_id": self.context.cluster_id,
+            "node_id": self.node_id,
+            "collector": CollectorKind.NVIDIA_KERNEL.value,
+            "observed_at": observed_at.isoformat(),
+            "edge_filter_reasons": self.health_summary_reasons(),
+        }
+        if self._submit(summary_id, COLLECTOR_HEALTH_PATH, payload):
+            return
+        result = deliver_event(self.sink, COLLECTOR_HEALTH_PATH, payload)
         # A summary the outbox took is on its way; only one that went nowhere
         # is reported by the caller's guard (ARCH-G3).
         result.raise_for_failure()

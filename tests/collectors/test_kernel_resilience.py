@@ -10,9 +10,13 @@ open, so an NTP step after that skewed every ``observed_at``.
 from __future__ import annotations
 
 import errno
+import signal
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
+
+from gpu_fault.channel_registry import COLLECTOR_HEALTH_PATH
 
 from ._support import (
     NOW,
@@ -379,3 +383,329 @@ def test_collectors_without_a_readable_boot_id_do_not_share_record_ids(
     assert record_ids[0] != record_ids[1], (
         f"the same kmsg sequence after a reboot kept one record id: {record_ids}"
     )
+
+
+def _live_delivery_threads() -> list[threading.Thread]:
+    """Every live delivery thread, by the name the collector gives it."""
+
+    return [
+        item
+        for item in threading.enumerate()
+        if item.name == "kernel-collector-delivery" and item.is_alive()
+    ]
+
+
+def _wait_until_no_new_delivery_thread(
+    known: set[threading.Thread], timeout_seconds: float = 5.0
+) -> list[threading.Thread]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        extra = [item for item in _live_delivery_threads() if item not in known]
+        if not extra or time.monotonic() >= deadline:
+            return extra
+        time.sleep(0.02)
+
+
+class _SlowSink:
+    """A control plane that takes its time, the way a retrying one does."""
+
+    def __init__(self, delay_seconds: float) -> None:
+        self.requests: list[tuple[str, dict]] = []
+        self.delay_seconds = delay_seconds
+        self.entered = threading.Event()
+
+    def post(self, path, payload):
+        self.requests.append((path, payload))
+        self.entered.set()
+        time.sleep(self.delay_seconds)
+        return {"accepted": True}
+
+
+class _ReplayBufferingSink(_SlowSink):
+    """A sink that can persist a record without posting it (Task 20's method)."""
+
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__(delay_seconds)
+        self.buffered: list[tuple[str, dict]] = []
+
+    def buffer_for_replay(self, path, payload):
+        self.buffered.append((path, payload))
+
+
+def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
+    monkeypatch,
+) -> None:
+    """systemd stops the unit with SIGTERM on every deploy.
+
+    Nothing installed a handler, so CPython died on the OS default and the
+    ``finally`` that drains the delivery queue never ran: up to 2048 queued
+    XID/SXID payloads went away with no post, no outbox record and no counter.
+    """
+
+    def fake_open(*_args, **_kwargs):
+        return io.StringIO(FIRST + SECOND + THIRD)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    sink = _ReplayBufferingSink(delay_seconds=0.3)
+
+    def stop(_seconds: float) -> None:
+        # Deliver the signal the way systemd does, through whatever handler the
+        # collector installed. Raising instead of calling an absent handler
+        # keeps a red run from killing the test process.
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), (
+            f"no SIGTERM handler was installed, so systemd's stop kills the "
+            f"process with records still queued: {handler}"
+        )
+        handler(signal.SIGTERM, None)
+
+    before = signal.getsignal(signal.SIGTERM)
+    collector = KernelLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: NOW,
+        start_at_end=False,
+        sleep=stop,
+    )
+
+    collector.run()
+
+    posted = [payload["record_id"] for _path, payload in sink.requests]
+    buffered = [payload["record_id"] for _path, payload in sink.buffered]
+    assert sorted(posted + buffered) == [
+        "kmsg-boot-123-42",
+        "kmsg-boot-123-43",
+        "kmsg-boot-123-44",
+    ], f"the stop signal lost records: posted={posted} buffered={buffered}"
+    # Each post takes 0.3 s and the reader gets through the stream in
+    # microseconds, so at most one record can have been posted already.
+    assert len(buffered) >= 2, (
+        f"the stop signal did not hand the queue to the outbox: {buffered}"
+    )
+    assert collector.health_counters["delivery_buffered_at_shutdown"] == len(
+        buffered
+    ), f"the records handed to the outbox were not counted: {collector.health_counters}"
+    assert signal.getsignal(signal.SIGTERM) is before, (
+        "the collector kept the process's SIGTERM handler after run() returned"
+    )
+
+
+def test_queued_records_are_buffered_for_replay_at_shutdown() -> None:
+    """The drain is a single-shot buffer, not a retry storm.
+
+    2048 records times ~47 s of retries fits no stop timeout, so the drain hands
+    each record to the sink's durable outbox once. Delivered, buffered or
+    counted -- there is no fourth state (ARCH-G3).
+    """
+
+    sink = _ReplayBufferingSink(delay_seconds=0.3)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    collector.stop_delivery()
+
+    assert [payload["record_id"] for _path, payload in sink.buffered] == [
+        "kmsg-boot-123-43",
+        "kmsg-boot-123-44",
+        "kmsg-boot-123-45",
+    ], f"the queue was not handed to the outbox on shutdown: {sink.buffered}"
+    assert collector.health_counters["delivery_buffered_at_shutdown"] == 3, (
+        f"the buffered records were not counted: {collector.health_counters}"
+    )
+    assert "delivery-buffered-at-shutdown:3" in collector.health_summary_reasons(), (
+        f"the shutdown buffer is invisible in the health summary: "
+        f"{collector.health_summary_reasons()}"
+    )
+
+
+def test_a_shutdown_without_a_replay_buffer_counts_what_the_budget_left(caplog) -> None:
+    """A sink with no outbox gets one attempt per record inside a budget."""
+
+    sink = _SlowSink(delay_seconds=0.2)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD, FOURTH])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.kernel"):
+        collector.stop_delivery(drain_budget_seconds=0.05)
+
+    assert [payload["record_id"] for _path, payload in sink.requests] == [
+        "kmsg-boot-123-42",
+        "kmsg-boot-123-43",
+    ], f"the drain kept retrying past its budget: {sink.requests}"
+    assert collector.health_counters["delivery_dropped_at_shutdown"] == 2, (
+        f"the records the budget left were not counted: {collector.health_counters}"
+    )
+    assert "delivery-dropped-at-shutdown:2" in collector.health_summary_reasons(), (
+        f"records dropped at shutdown are invisible: "
+        f"{collector.health_summary_reasons()}"
+    )
+    assert "kmsg-boot-123-45" in caplog.text, (
+        f"the records lost at shutdown were not named in the log: {caplog.text}"
+    )
+
+
+def test_a_delivery_thread_that_outlived_its_join_stops_consuming() -> None:
+    """A join timeout must not resurrect the thread it gave up on.
+
+    ``stop_delivery`` reset the shared stop flag and the thread handle while the
+    old thread was still inside ``post``, so that thread looped forever and a
+    later ``start_delivery`` left two consumers on one queue -- the second of
+    which nothing ever joins.
+    """
+
+    known = set(_live_delivery_threads())
+    sink = _SlowSink(delay_seconds=0.4)
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+
+    # The join gives up while that post is still in flight.
+    collector.stop_delivery(timeout_seconds=0.02, drain_budget_seconds=0.0)
+    stranded = _wait_until_no_new_delivery_thread(known)
+    assert stranded == [], (
+        f"the thread the join gave up on is still consuming the queue: {stranded}"
+    )
+
+    collector.start_delivery()
+    collector.collect_lines([SECOND])
+    collector.stop_delivery()
+
+    assert [payload["record_id"] for _path, payload in sink.requests] == [
+        "kmsg-boot-123-42",
+        "kmsg-boot-123-43",
+    ], f"a record was delivered twice or not at all: {sink.requests}"
+    assert _wait_until_no_new_delivery_thread(known) == [], (
+        "a delivery thread outlived the collector"
+    )
+
+
+class _ThreadKillingSink:
+    """The first post raises a ``BaseException``, which kills its thread.
+
+    ``_deliver_one`` converts every ``Exception``, so only something worse can
+    end the delivery loop -- and then the queue has no consumer at all.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict]] = []
+        self.entered = threading.Event()
+
+    def post(self, path, payload):
+        self.requests.append((path, payload))
+        self.entered.set()
+        if len(self.requests) == 1:
+            raise SystemExit("the delivery thread dies here")
+        return {"accepted": True}
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_dead_delivery_thread_is_reported_and_replaced(caplog) -> None:
+    """A queue nobody drains is a fourth state.
+
+    ``_submit`` fell back to inline delivery without a counter, a warning or a
+    restart, and everything already queued stayed there until the process
+    exited.
+    """
+
+    known = set(_live_delivery_threads())
+    sink = _ThreadKillingSink()
+    collector = KernelLogCollector(
+        sink, context(), node_id="worker-1", boot_id="boot-123", now=lambda: NOW
+    )
+    collector.start_delivery()
+    collector.collect_lines([FIRST, SECOND, THIRD])
+    assert sink.entered.wait(5), "the delivery thread never reached the sink"
+    assert _wait_until_no_new_delivery_thread(known) == [], (
+        "the sink did not kill the delivery thread, so the case is untested"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.kernel"):
+        collector.collect_lines([FOURTH])
+        collector.stop_delivery()
+
+    assert collector.health_counters["delivery_thread_deaths"] == 1, (
+        f"the dead delivery thread was not counted: {collector.health_counters}"
+    )
+    assert [payload["record_id"] for _path, payload in sink.requests] == [
+        "kmsg-boot-123-42",
+        "kmsg-boot-123-43",
+        "kmsg-boot-123-44",
+        "kmsg-boot-123-45",
+    ], f"the records stranded in the queue were never delivered: {sink.requests}"
+    assert "delivery thread" in caplog.text.lower(), (
+        "the delivery thread died without a word"
+    )
+
+
+class _ThreadNamingSink:
+    """Records which thread each post came from."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, str]] = []
+        self.summary_posted = threading.Event()
+
+    def post(self, path, payload):
+        self.posts.append((path, threading.current_thread().name))
+        if path == COLLECTOR_HEALTH_PATH:
+            self.summary_posted.set()
+        return {"accepted": True}
+
+
+def test_the_health_summary_is_not_posted_from_the_read_loop(monkeypatch) -> None:
+    """The summary posted synchronously from the reader.
+
+    An unreachable control plane costs ~47 s per post, so once every 300 s the
+    kmsg reader stopped reading for that long while the kernel ring kept
+    overwriting records -- the loss the queue exists to prevent. The summary
+    carries its own channel, so it goes through the same queue.
+    """
+
+    def fake_open(*_args, **_kwargs):
+        return io.StringIO(FIRST + SECOND)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    sink = _ThreadNamingSink()
+    # The health summary is due: the collector phased it from NOW, and the read
+    # loop reaches it ten minutes later.
+    clock = [NOW]
+
+    def stop(_seconds: float) -> None:
+        assert sink.summary_posted.wait(5), "the health summary never reached the sink"
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), f"no SIGTERM handler was installed: {handler}"
+        handler(signal.SIGTERM, None)
+
+    collector = KernelLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        boot_id="boot-123",
+        now=lambda: clock[0],
+        start_at_end=False,
+        sleep=stop,
+    )
+    clock[0] = NOW + timedelta(seconds=600)
+
+    collector.run()
+
+    summary_posts = [name for path, name in sink.posts if path == COLLECTOR_HEALTH_PATH]
+    assert summary_posts == ["kernel-collector-delivery"], (
+        f"the health summary was posted from the read loop: {sink.posts}"
+    )
+    assert [name for path, name in sink.posts if path != COLLECTOR_HEALTH_PATH] == [
+        "kernel-collector-delivery",
+        "kernel-collector-delivery",
+    ], f"the kmsg records did not go through the delivery thread: {sink.posts}"

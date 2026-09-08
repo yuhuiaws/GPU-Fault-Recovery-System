@@ -263,7 +263,7 @@ class FabricManagerLogCollector:
             unit = str(item.get("_SYSTEMD_UNIT") or "")
             identifier = str(item.get("SYSLOG_IDENTIFIER") or item.get("_COMM") or "")
             eligible = self._is_fabric_manager(unit, identifier)
-            message = str(item.get("MESSAGE") or "")
+            message = self._message_text(item.get("MESSAGE"))
             timestamp = self._journal_timestamp(item, collected_at)
             stable = cursor or hashlib.sha256(line.encode()).hexdigest()
             records.append(
@@ -286,6 +286,23 @@ class FabricManagerLogCollector:
                 }
             )
         return records
+
+    @staticmethod
+    def _message_text(value: object) -> str:
+        """The MESSAGE field as text.
+
+        ``journalctl --output=json`` emits a JSON array of byte values for any
+        field that is not valid UTF-8, and ``--all`` makes that reachable for
+        the long lines it used to null out instead. ``str()`` of that list is
+        ``"[110, 118, ...]"``, which matches no SXID pattern, so the line was
+        dropped without a trace (mirrors ``node.py:_message_text``).
+        """
+
+        if isinstance(value, list) and all(
+            isinstance(item, int) and 0 <= item <= 255 for item in value
+        ):
+            return bytes(value).decode("utf-8", errors="replace")
+        return str(value or "")
 
     def _run_journal(
         self, collected_at: datetime, *, cursor: str | None
@@ -515,17 +532,25 @@ class FabricManagerLogCollector:
                 stream.seek(offset)
                 if boundary != b"\n":
                     skipped = stream.readline()
-                    if skipped:
-                        self._warn_resumed_inside_a_line(key, offset)
-                        records.append(
-                            {
-                                "message": "",
-                                "_eligible": False,
-                                "_checkpoint": self._file_checkpoint(
-                                    key, stat, stream.tell()
-                                ),
-                            }
-                        )
+                    if not skipped.endswith(b"\n"):
+                        # The daemon is still writing that line. Consuming its
+                        # tail would commit a checkpoint inside an incomplete
+                        # record, and the next round would skip the completed
+                        # line as "another" partial one -- silently, since the
+                        # warning fires once per collector. The offset stays
+                        # where it is until the line has a terminator, which is
+                        # the invariant the read loop below already holds.
+                        return records
+                    self._warn_resumed_inside_a_line(key, offset)
+                    records.append(
+                        {
+                            "message": "",
+                            "_eligible": False,
+                            "_checkpoint": self._file_checkpoint(
+                                key, stat, stream.tell()
+                            ),
+                        }
+                    )
             while True:
                 start = stream.tell()
                 raw = stream.readline()

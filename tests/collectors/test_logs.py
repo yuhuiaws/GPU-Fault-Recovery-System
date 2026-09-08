@@ -1304,3 +1304,115 @@ def test_fabric_manager_file_offsets_are_bytes_and_resync_to_a_line_boundary(
         "resuming inside a line was not reported once"
     )
     assert resumed.observed == 0, "the same line was read twice"
+
+
+def test_fabric_manager_keeps_its_offset_at_a_line_the_daemon_is_still_writing(
+    tmp_path, caplog
+) -> None:
+    """A resume boundary inside an unterminated line must not be consumed.
+
+    The resync branch skipped to the next newline and committed
+    ``stream.tell()`` even when the "line" it skipped had no newline at all --
+    it was the tail of a record the daemon was still writing. The bytes were
+    consumed while the line was still incomplete, so the completed line was
+    skipped a second time on the next round, and the one-per-collector warning
+    never said so again. Only a complete line may advance the checkpoint, which
+    is the invariant the main read loop already holds.
+    """
+
+    from pathlib import Path
+
+    opening = "Fabric Manager daemon started, build 550.90.07\n"
+    fatal = (
+        "nvidia-nvswitch0: SXid (PCI:0000:ab:00.0): 22013, Fatal, Link 12 SAW_MVB error"
+    )
+    log = tmp_path / "fabricmanager.log"
+    log.write_bytes((opening + fatal).encode("utf-8"))
+    state = tmp_path / "state.json"
+    # A legacy cookie that landed inside the line still being written.
+    _write_fabric_file_state(state, log, offset=len(opening.encode("utf-8")) + 10)
+    sink = RecordingSink()
+
+    def build() -> FabricManagerLogCollector:
+        return FabricManagerLogCollector(
+            sink,
+            context(),
+            node_id="worker-1",
+            journal_enabled=False,
+            log_paths=[str(log)],
+            state_path=str(state),
+            now=lambda: NOW,
+        )
+
+    with caplog.at_level(
+        logging.WARNING, logger="gpu_fault.collectors.logs.fabric_manager"
+    ):
+        first_round = build().collect_once()
+        held = json.loads(state.read_text())["files"][str(log)]["offset"]
+        # The daemon finishes the fatal line and logs the next one.
+        with Path(log).open("ab") as stream:
+            stream.write(
+                b"\nnvidia-nvswitch3: SXid (PCI:0000:c1:00.0): 12020, Fatal, "
+                b"Link 46 egress sequence ID error\n"
+            )
+        second_round = build().collect_once()
+
+    assert first_round.delivered == 0, (
+        f"an incomplete line was delivered as a record: {sink.requests}"
+    )
+    assert held == len(opening.encode("utf-8")) + 10, (
+        "the checkpoint advanced over a line the daemon was still writing, so "
+        f"the completed line is skipped again: {held}"
+    )
+    assert second_round.delivered == 1, (
+        f"the fatal SXID after the completed line was lost: {sink.requests}"
+    )
+    assert "12020" in sink.requests[0][1]["message"], (
+        f"the delivered record is not the fatal SXID: {sink.requests}"
+    )
+    assert caplog.text.count("line boundary") == 1, (
+        f"the skipped line was reported {caplog.text.count('line boundary')} times"
+    )
+
+
+def test_fabric_manager_decodes_a_binary_journal_message(tmp_path) -> None:
+    """``journalctl --output=json`` emits MESSAGE as an array of byte values.
+
+    Any field that is not valid UTF-8 arrives as ``[110, 118, ...]``, and
+    ``str()`` of that list matches no SXID pattern, so the line was dropped
+    without a trace -- the same hole ``node.py:_message_text`` already closed
+    for training logs, and reachable here now that ``--all`` stops journalctl
+    from nulling long fields.
+    """
+
+    text = (
+        "nvidia-nvswitch3: SXid (PCI:0000:c1:00.0): 12020, Fatal, "
+        "Link 46 egress sequence ID error"
+    )
+    entry = json.dumps(
+        {
+            "__CURSOR": "s=binary;i=1",
+            "__REALTIME_TIMESTAMP": "1753012800000000",
+            "_SYSTEMD_UNIT": "nvidia-fabricmanager.service",
+            "MESSAGE": list(text.encode("utf-8")) + [255],
+        }
+    )
+    sink = RecordingSink()
+    stats = FabricManagerLogCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        log_paths=[],
+        state_path=str(tmp_path / "state.json"),
+        now=lambda: NOW,
+        runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=entry + "\n", stderr=""
+        ),
+    ).collect_once()
+
+    assert stats.delivered == 1, (
+        f"a binary MESSAGE field dropped the fatal SXID: {sink.requests}"
+    )
+    assert text in sink.requests[0][1]["message"], (
+        f"the MESSAGE byte array was stringified instead of decoded: {sink.requests}"
+    )
