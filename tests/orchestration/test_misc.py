@@ -37,6 +37,7 @@ from ._misc_cases_2 import (
     test_remediation_failure_chain_ends_in_hardware_offline_support,
     test_reset_failure_is_not_misclassified_by_earlier_dcgm_step,
     test_reset_operation_failure_escalates_to_reboot,
+    test_restart_app_on_an_idle_node_does_not_open_a_workflow,
     test_restart_app_requires_workload_identity,
     test_simulate_refuses_to_overwrite_an_incident_moved_under_it,
     test_unknown_workload_state_blocks_destructive_action,

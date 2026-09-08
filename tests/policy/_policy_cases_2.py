@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import pytest
 
-from gpu_fault.models import RecoveryAction
+from gpu_fault.models import RecoveryAction, Severity, WorkloadState
 from gpu_fault.policy import (
     ActionDisposition,
     ActionSource,
@@ -598,3 +598,53 @@ def test_containment_exceptions_are_pinned() -> None:
 
     ordinary = engine.evaluate_xid(xid(46, event_id="contain-46"))
     assert ordinary.containment is Containment.GPU
+
+
+def test_restart_app_on_an_idle_node_is_monitor_only() -> None:
+    """NVIDIA's RESTART_APP names an application; an IDLE node runs none.
+
+    Fails if ``_direct_resolution`` keeps answering EXECUTABLE /
+    RESTART_WORKLOAD regardless of ``workload_state``: the compiled plan
+    then has nothing to stop or restart and the generic fail-closed path
+    quarantines an idle node for an application-level XID.
+    """
+
+    engine = _engine()
+
+    idle = engine.evaluate_xid(
+        xid(13, event_id="xid13-idle", workload_state=WorkloadState.IDLE)
+    )
+
+    assert idle.disposition is ActionDisposition.MONITOR_ONLY
+    assert idle.action is RecoveryAction.NO_ACTION
+    assert idle.official_action == "RESTART_APP"
+    assert idle.pre_actions == []
+    assert idle.marker.severity == Severity.INFO
+    assert any("no managed application to restart" in item for item in idle.reasons)
+
+    # ACTIVE keeps the restart; UNKNOWN stays on the conservative side and
+    # is refused downstream by the workload-state gate, not here.
+    for state in (WorkloadState.ACTIVE, WorkloadState.UNKNOWN):
+        decision = engine.evaluate_xid(
+            xid(13, event_id=f"xid13-{state.value}", workload_state=state)
+        )
+        assert decision.disposition is ActionDisposition.EXECUTABLE
+        assert decision.action is RecoveryAction.RESTART_WORKLOAD
+
+
+def test_xid_154_restart_app_label_on_an_idle_node_is_monitor_only() -> None:
+    """The driver-reported RESTART_APP label follows the same rule."""
+
+    decision = _engine().evaluate_xid(
+        xid(
+            154,
+            event_id="xid154-restart-app-idle",
+            xid_154_action=DynamicRecoveryAction.RESTART_APP,
+            workload_state=WorkloadState.IDLE,
+        )
+    )
+
+    assert decision.disposition is ActionDisposition.MONITOR_ONLY
+    assert decision.action is RecoveryAction.NO_ACTION
+    assert decision.official_action == "RESTART_APP"
+    assert decision.source is ActionSource.NVIDIA_XID_154
