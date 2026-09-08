@@ -399,9 +399,16 @@ class _RollingRegional:
     """A control-worker mid-rollout: ``ready_pods`` lists a replica that is
     then terminated, so its exec 404s while a surviving replica answers."""
 
-    def __init__(self, vanished: str, survivor_values: dict[str, str]) -> None:
+    def __init__(
+        self,
+        vanished: str,
+        survivor_values: dict[str, str],
+        *,
+        stderr: str = 'Error from server (NotFound): pods "gone" not found',
+    ) -> None:
         self._vanished = vanished
         self._survivor_values = survivor_values
+        self._stderr = stderr
         self.exec_targets: list[str] = []
 
     def ready_pods(self, plane: str, app: str) -> list[dict[str, Any]]:
@@ -413,15 +420,25 @@ class _RollingRegional:
         self.exec_targets.append(target)
         if target == self._vanished:
             raise env_window.RegionalFixtureError(
-                f'command failed (1): kubectl ... exec {target} ...; '
-                f'stderr=Error from server (NotFound): pods "{target}" not found'
+                f"command failed (1): kubectl ... exec {target} ...; stderr={self._stderr}"
             )
         return json.dumps(self._survivor_values)
 
 
-def test_replica_env_skips_a_replica_that_rolled_away_mid_survey() -> None:
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        'Error from server (NotFound): pods "gone-9b7cl" not found',
+        "error: cannot exec into a container in a completed pod; "
+        "current phase is Succeeded",
+        'unable to upgrade connection: container not found ("control-worker")',
+        "error: Internal error occurred: error executing command in container: "
+        "container is not running",
+    ],
+)
+def test_replica_env_skips_a_replica_that_rolled_away_mid_survey(stderr: str) -> None:
     values = {LIFETIME: "180", TIMEOUT: "180"}
-    regional = _RollingRegional("gone-9b7cl", values)
+    regional = _RollingRegional("gone-9b7cl", values, stderr=stderr)
 
     replicas = env_window.replica_env(
         regional,

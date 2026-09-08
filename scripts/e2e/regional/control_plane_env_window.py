@@ -478,16 +478,27 @@ def replica_env(
     return result
 
 
-def _pod_vanished(error: RegionalFixtureError) -> bool:
-    """Whether an exec failed because its target Pod no longer exists.
+# What ``kubectl exec`` prints when its target stopped being a running replica
+# between our ``ready_pods`` listing and the exec. Seen live on 2026-09-08:
+# a deleted Pod (attempt 7) and a Pod whose worker had already exited 0 on
+# SIGTERM, phase Succeeded (attempt 8). The rest are the kubelet's wordings
+# for the same moment (container gone, or not running yet/any more).
+VANISHED_REPLICA_MARKERS = (
+    "not found",
+    "notfound",
+    "completed pod",
+    "is not running",
+    "not running",
+    "terminating",
+)
 
-    ``kubectl exec`` against a deleted Pod prints ``Error from server
-    (NotFound): pods "..." not found``; a terminating Pod can also report it
-    is not running. Both mean the replica is gone, not that the read is wrong.
-    """
+
+def _pod_vanished(error: RegionalFixtureError) -> bool:
+    """Whether an exec failed because its target Pod is no longer a running
+    replica, as opposed to the read itself failing."""
 
     text = str(error).lower()
-    return "not found" in text or "notfound" in text
+    return any(marker in text for marker in VANISHED_REPLICA_MARKERS)
 
 
 def replica_values(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
