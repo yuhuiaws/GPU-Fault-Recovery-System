@@ -3633,9 +3633,9 @@ test_cases:
     verified:
       case_digest: 236e13dc556a3744a39d5761372a3f72c15d348c196605ef546c141c636c0e8d
       components:
-        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
-        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
-        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
+        control_plane: 52b038819f3ec15226a587a0430c9e8e4d4342325763cdf64c4599a6e28e2ee3
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr003_requires_local_warm_spare_rebinding_and_notification
