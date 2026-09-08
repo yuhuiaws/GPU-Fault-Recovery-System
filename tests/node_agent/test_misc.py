@@ -8,7 +8,6 @@ from tests._builders import copy_model, node_action_result
 from ._support import (
     NOW,
     CompletedProcess,
-    ThreadPoolExecutor,
     FakeRunner,
     NodeActionExecutionState,
     NodeActionStatus,
@@ -16,6 +15,7 @@ from ._support import (
     ServiceRunner,
     SignedNodeAction,
     TestClient,
+    ThreadPoolExecutor,
     WorkflowOperation,
     command,
     create_node_agent_app,

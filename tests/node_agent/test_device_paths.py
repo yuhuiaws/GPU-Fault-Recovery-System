@@ -9,7 +9,6 @@ from ._support import (
     node_action_executor,
 )
 
-
 TWO_GPU_XML = """<?xml version="1.0" ?>
 <nvidia_smi_log>
   <gpu id="00000000:53:00.0">

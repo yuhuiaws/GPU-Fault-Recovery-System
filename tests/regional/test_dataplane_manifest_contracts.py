@@ -41,11 +41,10 @@ from typing import Any, Iterator
 
 import yaml
 
-from scripts.release_identity import file_set_identity
-
 from gpu_fault.node_installer_reconciler import _INVENTORY as RECONCILER_INVENTORY
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
+from scripts.release_identity import file_set_identity
 from tests.regional._release_orchestrator_support import RELEASE_MODULE as MODULE
 from tests.regional._release_orchestrator_support import config_file
 

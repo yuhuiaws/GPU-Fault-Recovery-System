@@ -12,7 +12,6 @@ from gpu_fault.completion_outbox import (
     replay_completion_outbox,
 )
 
-
 OUTBOX_NAME = "gpu-fault-completion-watcher-outbox"
 ACTIVE_NAME = f"{OUTBOX_NAME}-active"
 
