@@ -63,7 +63,7 @@ class CollectorServiceStates:
         self,
         *,
         units: Callable[[], list[str]] = _collector_units,
-        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         refresh_every: int = 30,
     ) -> None:
         self._units = units

@@ -381,7 +381,9 @@ class HungProcessOperationsMixin:
                 if sample_index < sample_count and sample_interval > 0:
                     self.sleep(sample_interval)
 
-    def _capture_proc_metadata(self, work_dir, manifest, pid) -> None:
+    def _capture_proc_metadata(
+        self, work_dir: Path, manifest: dict[str, Any], pid: int
+    ) -> None:
         proc_dir = self.proc_root / str(pid)
         for name in ("status", "cmdline"):
             source = proc_dir / name
@@ -407,7 +409,12 @@ class HungProcessOperationsMixin:
                 )
 
     def _capture_proc_stack_sample(
-        self, work_dir, manifest, pid, sample_index, sample_count
+        self,
+        work_dir: Path,
+        manifest: dict[str, Any],
+        pid: int,
+        sample_index: int,
+        sample_count: int,
     ) -> None:
         proc_dir = self.proc_root / str(pid)
         for name in ("stack", "wchan"):
