@@ -328,9 +328,7 @@ class _Clock:
 class _SlowStartJournalctl(_StreamingJournalctl):
     """A child whose first line arrives ``startup`` seconds after it is spawned."""
 
-    def __init__(
-        self, lines: Iterable[str], *, clock: _Clock, startup: float
-    ) -> None:
+    def __init__(self, lines: Iterable[str], *, clock: _Clock, startup: float) -> None:
         super().__init__(lines)
         self._clock = clock
         self._startup = startup
@@ -408,6 +406,10 @@ def test_two_busy_sources_share_one_entry_budget(tmp_path, monkeypatch) -> None:
     the cap and dropped the excess (`batch-limit-entries`) *after* both cursors
     had moved past it. The dropped half was the training log's, and it was gone:
     its offset had already advanced.
+
+    The share is not first-come either: a quarter of the cap is reserved for the
+    training logs before the journal reads anything, so a cap of 4 leaves the
+    journal 3 (see the starvation case below).
     """
 
     _present_journalctl(monkeypatch)
@@ -435,21 +437,177 @@ def test_two_busy_sources_share_one_entry_budget(tmp_path, monkeypatch) -> None:
 
     busy = collector.collect_once()
 
-    assert [entry.source for entry in busy.entries] == ["journal"] * 4, (
-        f"the shared cap was overrun: {[entry.source for entry in busy.entries]}"
-    )
+    assert [entry.source for entry in busy.entries] == (
+        ["journal"] * 3 + ["training-log"]
+    ), f"the shared cap was overrun: {[entry.source for entry in busy.entries]}"
     assert not any("batch-limit-entries" in item for item in busy.collection_errors), (
         f"entries were read past the batch cap and dropped: {busy.collection_errors}"
     )
-    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
+    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] > (
         baseline
-    ), "the training log's offset moved past lines the batch never carried"
+    ), "the reserved share of the cap was taken by the journal"
 
     quiet = collector.collect_once()
 
-    assert any("appended 0" in entry.message for entry in quiet.entries), (
+    assert any("appended 1" in entry.message for entry in quiet.entries), (
         f"the deferred training lines were lost, not deferred: {quiet.entries}"
     )
+
+
+def _long_journal_lines(count: int, *, first: Any) -> list[str]:
+    """Lines long enough that the byte budget, not the entry cap, is what binds."""
+
+    return [
+        _journal_line(
+            f"c-{index}", f"{MATCHING} " + "x" * 400, first + timedelta(seconds=index)
+        )
+        for index in range(count)
+    ]
+
+
+def test_a_journal_that_fills_the_byte_budget_defers_the_training_logs(
+    tmp_path, monkeypatch
+) -> None:
+    """The byte allowance is shared too, not one 4 MiB budget per source.
+
+    Sharing the *entry* cap was only half of it: both sources still got the whole
+    byte budget while ``_limit_entries`` caps the batch at the same 4 MiB, so a
+    poll could read twice that and drop the excess by bytes -- after both cursors
+    had moved past it. Long ``--all`` driver lines reach this on a real node.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text("starting up\n", encoding="utf-8")
+    first = NOW - timedelta(seconds=30)
+    flood = _long_journal_lines(20, first=first)
+    line_bytes = len(flood[0].encode("utf-8"))
+    runner = _JournalctlSequence([[], flood])
+    collector = _collector(
+        state,
+        runner=runner,
+        training_log_paths=[str(log)],
+        scan_bytes=3 * line_bytes,
+        context_lines=0,
+    )
+
+    collector.collect_once()
+    baseline = json.loads(state.read_text())["training_log_files"][str(log)]["offset"]
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"{MATCHING} appended\n")
+
+    busy = collector.collect_once()
+
+    assert [entry.source for entry in busy.entries] == ["journal"] * 3, (
+        f"the shared byte allowance was overrun: {busy.entries}"
+    )
+    assert not any("batch-limit-entries" in item for item in busy.collection_errors), (
+        f"bytes were read past the batch cap and dropped: {busy.collection_errors}"
+    )
+    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
+        baseline
+    ), "the training log's offset moved past a line the batch never carried"
+    assert any(
+        "deferred-training-log-reads=1" in item for item in busy.collection_errors
+    ), (
+        f"a deferred read has to be counted from the first poll: {busy.collection_errors}"
+    )
+
+
+def test_an_always_busy_journal_cannot_starve_the_training_logs(
+    tmp_path, monkeypatch
+) -> None:
+    """A node whose journal is always full still delivers its training logs.
+
+    Sharing the cap journal-first means a node logging faster than one poll can
+    read never reaches the training logs at all -- and a deferred backlog is not
+    safe for ever: the job rotates the file and the old inode is unlinked. So a
+    quarter of the cap is reserved before the journal reads anything.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text(
+        "".join(f"{MATCHING} appended {index}\n" for index in range(30)),
+        encoding="utf-8",
+    )
+    flood = [
+        _journal_line(f"c-{index}", f"{MATCHING} journal {index}", NOW)
+        for index in range(20)
+    ]
+    runner = _JournalctlSequence([list(flood), list(flood), list(flood)])
+    collector = _collector(
+        state,
+        runner=runner,
+        training_log_paths=[str(log)],
+        initial_tail_bytes=1_000_000,
+        max_entries_per_batch=8,
+        context_lines=0,
+    )
+
+    polls = [collector.collect_once() for _ in range(3)]
+
+    for index, batch in enumerate(polls):
+        training = [
+            entry.message for entry in batch.entries if entry.source == "training-log"
+        ]
+        assert len(training) == 2, (
+            f"poll {index} starved the training logs: "
+            f"{[entry.source for entry in batch.entries]}"
+        )
+        assert training == [
+            f"{MATCHING} appended {index * 2}",
+            f"{MATCHING} appended {index * 2 + 1}",
+        ], f"poll {index} did not resume where the last one stopped: {training}"
+    assert not all(
+        any("batch-limit-entries" in item for item in batch.collection_errors)
+        for batch in polls
+    ), "the reserve must come out of the journal's share, not out of the batch"
+
+
+def test_a_journal_that_defers_the_training_logs_once_does_not_alert(
+    tmp_path, monkeypatch
+) -> None:
+    """One busy poll is a poll; three in a row is a node that needs a human.
+
+    ``_defer_reads`` reported a collection error every time, so a single busy
+    poll lit `GpuFaultCollectorCollectionErrors` on a node that had lost
+    nothing. The count is still kept from the first poll -- that is the signal
+    that says how often this happens -- but the error waits for the third.
+    """
+
+    _present_journalctl(monkeypatch)
+    state = _seeded_state(tmp_path)
+    log = tmp_path / "rank0.log"
+    log.write_text(f"{MATCHING} appended\n", encoding="utf-8")
+    first = NOW - timedelta(seconds=30)
+    flood = _long_journal_lines(20, first=first)
+    line_bytes = len(flood[0].encode("utf-8"))
+    runner = _JournalctlSequence([list(flood) for _ in range(3)])
+    collector = _collector(
+        state,
+        runner=runner,
+        training_log_paths=[str(log)],
+        initial_tail_bytes=1_000_000,
+        scan_bytes=3 * line_bytes,
+        context_lines=0,
+    )
+
+    polls = [collector.collect_once() for _ in range(3)]
+
+    for index, batch in enumerate(polls[:2]):
+        assert not any(
+            "were not read this poll" in item for item in batch.collection_errors
+        ), f"poll {index} alerted on a single busy poll: {batch.collection_errors}"
+        assert any(
+            f"deferred-training-log-reads={index + 1}" in item
+            for item in batch.collection_errors
+        ), f"poll {index} did not count the deferral: {batch.collection_errors}"
+    assert any(
+        "were not read this poll" in item for item in polls[2].collection_errors
+    ), f"a deferral that keeps happening has to be reported: {polls[2]}"
 
 
 def test_a_scan_that_runs_out_of_time_stops_at_the_last_entry_it_read(

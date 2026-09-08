@@ -240,7 +240,7 @@ def _budget_error(
         )
     return (
         f"{window} hit the {budget.stop_reason} scan budget after "
-        f"{budget.bytes_read} bytes, took the oldest {kept} entries and left "
+        f"{budget.bytes_read} bytes, read the oldest {kept} entries and left "
         "the rest for the next poll"
     )
 
@@ -284,11 +284,15 @@ class _JournalRead:
     the difference between a quiet node and a broken one: the cursor stays put so
     the next poll asks for the same span. A budget stop sets it to the last entry
     actually read, for the same reason.
+
+    `bytes_read` is what this read took out of the poll's shared byte allowance,
+    so the training logs get what is left rather than a second full budget.
     """
 
     entries: list[NodeLogEntry] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     consumed_until: datetime | None = None
+    bytes_read: int = 0
 
 
 @dataclass
@@ -457,12 +461,16 @@ class NodeLogCollector:
             # anything within the stream they were written to.
             entries = _with_context(journal.entries, self.context_lines)
             # What the journal already put in the batch is what the training
-            # logs may no longer read: one entry allowance, one batch.
+            # logs may no longer read: one entry allowance and one byte
+            # allowance, one batch. Both are shared because `_limit_entries`
+            # caps the batch on both axes and drops whatever is over it -- after
+            # the offsets have moved past it, which is loss.
             entries.extend(
                 _with_context(
                     self._training_logs(
                         collected_at,
                         allowance=max(0, self.max_entries_per_batch - len(entries)),
+                        byte_allowance=max(0, self.scan_bytes - journal.bytes_read),
                     ),
                     self.context_lines,
                 )
@@ -557,19 +565,25 @@ class NodeLogCollector:
             time.sleep(self.interval_seconds)
 
     def _training_logs(
-        self, observed_at: datetime, *, allowance: int | None = None
+        self,
+        observed_at: datetime,
+        *,
+        allowance: int | None = None,
+        byte_allowance: int | None = None,
     ) -> list[NodeLogEntry]:
         """Read the configured training logs under one shared scan budget.
 
         The budget is shared across the paths on purpose: that is what makes the
         fair rotation mean anything, because a poll stops at the path where the
-        budget ran out and the next one starts after it. ``allowance`` is how
-        many entries the batch has left after the journal, so the offsets cannot
-        move past lines this batch has no room for.
+        budget ran out and the next one starts after it. ``allowance`` and
+        ``byte_allowance`` are what the batch has left after the journal, so the
+        offsets cannot move past lines this batch has no room for; at zero the
+        reader records every position without reading a line.
         """
 
         return self._training.read(
-            observed_at, budget=self._scan_budget(max_entries=allowance)
+            observed_at,
+            budget=self._scan_budget(max_entries=allowance, max_bytes=byte_allowance),
         )
 
     def _snapshot(self) -> dict[str, Any]:
@@ -584,6 +598,7 @@ class NodeLogCollector:
             "journal_since": self._journal_since,
             "files": {key: dict(value) for key, value in self._training.files.items()},
             "resume_after": self._training.resume_after,
+            "deferred_rounds": self._training.deferred_rounds,
             "discarded": dict(self._discarded),
             "self_unit_entries_total": self.self_unit_entries_total,
             "binary_messages_total": self.binary_messages_total,
@@ -593,6 +608,7 @@ class NodeLogCollector:
         self._journal_since = snapshot["journal_since"]
         self._training.files = snapshot["files"]
         self._training.resume_after = snapshot["resume_after"]
+        self._training.deferred_rounds = snapshot["deferred_rounds"]
         self._discarded = snapshot["discarded"]
         self.self_unit_entries_total = snapshot["self_unit_entries_total"]
         self.binary_messages_total = snapshot["binary_messages_total"]
@@ -659,17 +675,43 @@ class NodeLogCollector:
             errors.append(f"cumulative loss since collector start: {totals}")
         return errors
 
-    def _scan_budget(self, *, max_entries: int | None = None) -> _ScanBudget:
-        """One source's budget for one poll.
+    def _training_reserve(self) -> tuple[int, int]:
+        """What the training logs keep of the poll before the journal reads.
 
-        The bytes and the wall clock are per source -- a busy journal must not
-        take the training logs' turn away entirely -- but the entry allowance is
-        shared, because ``_limit_entries`` caps the *batch* and anything read
-        past that cap is dropped after the cursor has already moved past it.
+        Sharing the budget journal-first closed one loss and opened another: on a
+        node whose journal always fills the batch the training logs are deferred
+        for ever, and a deferred backlog is not safe indefinitely -- the job
+        rotates the file and the old inode is unlinked with everything still
+        unread in it, which is the evidence of why it rotated.
+
+        A quarter, and it costs the journal nothing but latency: its cursor stops
+        at the last entry it actually read either way, so the rest of the window
+        is read by the next poll.
+        """
+
+        if not self.training_log_paths:
+            # Nothing to reserve for: the journal may have the whole poll.
+            return 0, 0
+        return max(1, self.max_entries_per_batch // 4), max(1, self.scan_bytes // 4)
+
+    def _scan_budget(
+        self, *, max_entries: int | None = None, max_bytes: int | None = None
+    ) -> _ScanBudget:
+        """One source's budget for one poll, out of what the poll has left.
+
+        The entries and the bytes are both shared across the two sources, because
+        ``_limit_entries`` caps the *batch* on both axes and anything read past
+        those caps is dropped after the cursor and the offsets have already moved
+        past it. The wall clock stays per source: it bounds the poll's latency,
+        which is not something one source spends out of the other's share.
+
+        ``0`` is a real allowance and means "read nothing, record where every
+        source stands", which is why these are ``None``-defaulted rather than
+        falsy-defaulted.
         """
 
         return _ScanBudget(
-            max_bytes=self.scan_bytes,
+            max_bytes=self.scan_bytes if max_bytes is None else max_bytes,
             max_seconds=self.scan_seconds,
             max_entries=(
                 self.max_entries_per_batch if max_entries is None else max_entries
@@ -747,7 +789,14 @@ class NodeLogCollector:
         streamed = stdout is not None and not isinstance(stdout, str)
         source: Any = stdout if streamed else (stdout or "").splitlines()
         lines: Iterator[str] = iter(source)
-        budget = self._scan_budget()
+        reserved_entries, reserved_bytes = self._training_reserve()
+        budget = self._scan_budget(
+            # Never below one: a journal with no allowance at all would still
+            # read its first line (the progress guarantee) and that entry would
+            # then be dropped by the batch cap after the cursor had moved.
+            max_entries=max(1, self.max_entries_per_batch - reserved_entries),
+            max_bytes=max(1, self.scan_bytes - reserved_bytes),
+        )
         watchdog: threading.Timer | None = None
         if streamed:
             watchdog = threading.Timer(
@@ -815,7 +864,9 @@ class NodeLogCollector:
                     else "skipped; the cursor holds, so they are read again"
                 )
             )
-        return _JournalRead(entries, errors, consumed_until=consumed_until)
+        return _JournalRead(
+            entries, errors, consumed_until=consumed_until, bytes_read=budget.bytes_read
+        )
 
     def _scan_journal(
         self, scan: _JournalScan, lines: Iterator[str], budget: _ScanBudget

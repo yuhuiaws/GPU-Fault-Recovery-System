@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 import gpu_fault.collectors.logs.node as node_module
+import gpu_fault.collectors.logs.node_sources as node_sources_module
 from gpu_fault.collectors.logs.node import NodeLogCollector
 
 from ._support import (
@@ -372,7 +373,7 @@ def test_a_stored_offset_inside_a_character_resyncs_to_the_next_line(
     _write_file_state(state, log, offset=2)
     paths = [str(log)]
 
-    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.node"):
+    with caplog.at_level(logging.WARNING, logger=node_sources_module.LOGGER.name):
         batch = _collector(state, training_log_paths=paths).collect_once()
     repeated = _collector(state, training_log_paths=paths).collect_once()
 
@@ -442,7 +443,7 @@ def test_a_resume_offset_inside_an_unfinished_line_holds_and_says_so(
     _write_file_state(state, log, offset=resume)
     paths = [str(log)]
 
-    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.node"):
+    with caplog.at_level(logging.WARNING, logger=node_sources_module.LOGGER.name):
         batch = _collector(state, training_log_paths=paths).collect_once()
 
     assert batch.entries == [], f"half a line is not evidence: {batch.entries}"
@@ -494,6 +495,42 @@ def test_a_new_training_log_with_an_unfinished_tail_records_its_position(
     )
 
 
+def test_a_training_log_that_could_not_be_opened_is_not_baselined_at_its_end(
+    tmp_path, monkeypatch
+) -> None:
+    """An unreadable file that is not in the offset table yet must still be placed.
+
+    The read error left the position alone, which is right for a file already
+    tracked and silent loss for one that is not: with no entry in the table the
+    next poll calls it new and baselines it at its *current* size, so everything
+    appended while it could not be read (0600 until the job fixes its umask, an
+    SELinux denial, an NFS EIO) is skipped and never counted. The stat succeeded,
+    so where it stood is known and is recorded.
+    """
+
+    _absent_journalctl(monkeypatch)
+    log = tmp_path / "rank0.log"
+    log.write_text("starting up\n", encoding="utf-8")
+    state = tmp_path / "state.json"
+    paths = [str(log)]
+    log.chmod(0o000)
+
+    blocked = _collector(state, training_log_paths=paths).collect_once()
+
+    log.chmod(0o644)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"{MATCHING} appended after the denial\n")
+
+    recovered = _collector(state, training_log_paths=paths).collect_once()
+
+    assert any("could not be read" in item for item in blocked.collection_errors), (
+        f"the unreadable file was not reported: {blocked.collection_errors}"
+    )
+    assert [item.message for item in recovered.entries] == [
+        f"{MATCHING} appended after the denial"
+    ], f"the lines appended while the file was unreadable were skipped: {recovered}"
+
+
 def test_an_unreadable_training_log_does_not_lose_the_journal_entries(
     tmp_path, monkeypatch, caplog
 ) -> None:
@@ -514,15 +551,15 @@ def test_an_unreadable_training_log_does_not_lose_the_journal_entries(
     runner = _Journalctl(stdout=_journal_line("c-1", MATCHING, NOW) + "\n")
     collector = _collector(state, runner=runner, training_log_paths=[str(log)])
 
-    with caplog.at_level(logging.WARNING, logger=node_module.LOGGER.name):
+    with caplog.at_level(logging.WARNING, logger=node_sources_module.LOGGER.name):
         batch = collector.collect_once()
 
     assert [entry.source for entry in batch.entries] == ["journal"], (
         f"one unreadable file cost the poll its journal entries: {batch.entries}"
     )
-    assert any("unreadable-training-logs=1" in item for item in batch.collection_errors), (
-        f"a file that could not be read must be counted: {batch.collection_errors}"
-    )
+    assert any(
+        "unreadable-training-logs=1" in item for item in batch.collection_errors
+    ), f"a file that could not be read must be counted: {batch.collection_errors}"
     assert any(str(log) in record.message for record in caplog.records), (
         "the unreadable path was never named in the log"
     )

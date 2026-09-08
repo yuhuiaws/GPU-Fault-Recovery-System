@@ -41,6 +41,13 @@ SOURCE_SCAN_SECONDS_BUDGET = 0.2
 #: writer has not finished: the condition recurs every poll while it lasts.
 PARTIAL_RESUME_WARN_INTERVAL_SECONDS = 300.0
 
+#: How many consecutive polls may defer the training logs before it is reported.
+#: One busy poll loses nothing -- the positions are recorded and the next poll
+#: resumes -- so reporting it lit `GpuFaultCollectorCollectionErrors` on a node
+#: that was merely busy. Three in a row is a node that is not keeping up, where
+#: the backlog can outlive the file it is waiting in.
+DEFERRED_ROUNDS_BEFORE_ERROR = 3
+
 
 def _bounded_message(message: str, max_bytes: int) -> str:
     raw = message.encode("utf-8", errors="replace")
@@ -177,6 +184,10 @@ class _TrainingLogs:
         # Which expanded path the last poll stopped on, so the next one resumes
         # after it instead of starting from the front of the list.
         self.resume_after: str | None = None
+        # Consecutive polls that read nothing here because the journal spent the
+        # shared budget. Counted so the report waits for a pattern (see
+        # `DEFERRED_ROUNDS_BEFORE_ERROR`); reset by any poll that reads.
+        self.deferred_rounds = 0
         self._resync_warned = False
         self._partial_resume_warned: tuple[str, int, float] | None = None
 
@@ -420,13 +431,16 @@ class _TrainingLogs:
         ordered = self._ordered_paths()
         plan = self._resume_plan(ordered)
         if budget.spent() is not None:
-            # The journal used the whole entry allowance. Reading a line here
-            # would move an offset past an entry `_limit_entries` then drops, so
-            # nothing is read -- but every position is still recorded, or a file
-            # not yet in the table would look new next poll and be baselined at
-            # its larger size, skipping everything appended in between.
+            # The journal used what this poll had, on the entry axis or the
+            # byte axis. Reading a line here would move an offset past an entry
+            # `_limit_entries` then drops, so nothing is read -- but every
+            # position is still recorded, or a file not yet in the table would
+            # look new next poll and be baselined at its larger size, skipping
+            # everything appended in between.
             self._defer_reads(plan)
             return entries
+        # This poll reads, so whatever streak of deferrals came before it ended.
+        self.deferred_rounds = 0
         visited: list[str] = []
         for read in plan:
             visited.append(read.key)
@@ -453,7 +467,9 @@ class _TrainingLogs:
         """Record where every training log stands without reading any of it.
 
         ``resume_after`` is deliberately left alone: no path took its turn, so
-        the next poll starts where this one would have.
+        the next poll starts where this one would have. The streak is counted
+        here because one deferral is not a fault and a run of them is: see
+        ``DEFERRED_ROUNDS_BEFORE_ERROR``.
         """
 
         if not plan:
@@ -463,12 +479,18 @@ class _TrainingLogs:
             return
         for read in plan:
             self._remember(read, read.offset)
+        self.deferred_rounds += 1
+        # Counted every time, reported only when it persists: the count is what
+        # says how often a node runs out of budget, and one poll of it is not a
+        # loss -- the positions above are recorded, so nothing is skipped.
         self.record_discard("deferred-training-log-reads", len(plan))
-        self.record_error(
-            f"{len(plan)} training logs were not read this poll (the journal "
-            "filled the batch); their positions are recorded, so the next poll "
-            "resumes where they stand"
-        )
+        if self.deferred_rounds >= DEFERRED_ROUNDS_BEFORE_ERROR:
+            self.record_error(
+                f"{len(plan)} training logs were not read this poll for the "
+                f"{self.deferred_rounds}th poll in a row (the journal spends the "
+                "shared budget); their positions are recorded, but a backlog this "
+                "long can outlive a rotation"
+            )
         self._bound_tracked_files({read.key for read in plan})
 
     def _remember(self, read: _TrainingRead, offset: int) -> None:
@@ -502,12 +524,20 @@ class _TrainingLogs:
             # A 0600 log, or one rotated away between the stat and the open.
             # This used to leave `collect_once`, which rolls the cursor back, so
             # one unreadable file cost the poll its journal entries as well --
-            # and did so again every poll, for a permissions error for ever.
+            # and did so again every poll, for a permissions error for ever. A
+            # rotation that happens while it is unreadable is still caught: the
+            # device and inode recorded here are compared on the next poll.
             LOGGER.warning("training log %s could not be read: %s", read.key, error)
             self.record_discard("unreadable-training-logs")
+            # The stat succeeded, so where this file stands is known -- and
+            # recording it is what keeps the next poll from calling an untracked
+            # file new and baselining it at its larger size, which silently
+            # skipped everything appended while it could not be read.
+            self._remember(read, read.offset)
             self.record_error(
                 f"{read.key} could not be read ({error}); its lines are not in "
-                "this batch and its position is unchanged"
+                "this batch and the next poll resumes at byte "
+                f"{read.offset}, where it stands now"
             )
             return entries
 
