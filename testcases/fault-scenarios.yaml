@@ -4069,7 +4069,13 @@ test_cases:
   - 清理后：持有者单元已解除、隔离只经 validated-restore 工作流解除、环境窗口回到记录的基线、
     探针零残留、control-worker 模板摘要回到开窗前的值（只允许 generation 前进两次写入）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f72375e49f507092bc4a5035200679229855826ba6be87a0eb75ee7141ed5761
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-018
   related_pytest: tests/regional/test_destr018_lifetime_deadline.py::test_the_lifetime_contract_passes_on_the_intended_terminal_state
