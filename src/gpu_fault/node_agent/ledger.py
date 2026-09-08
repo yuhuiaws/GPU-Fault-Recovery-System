@@ -23,6 +23,13 @@ LOGGER = logging.getLogger(__name__)
 LEDGER_SCHEMA_VERSION = 2
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 3600
 
+# ``state`` of a row whose handler has been dispatched but whose result has not
+# been written yet.
+IN_PROGRESS_STATE = "IN_PROGRESS"
+RESTART_INTERRUPTED_ERROR = (
+    "agent restarted while the action was in progress; manual confirmation is required"
+)
+
 _RESULTS_TABLE = """
 CREATE TABLE IF NOT EXISTS results (
     command_id TEXT NOT NULL,
@@ -173,19 +180,36 @@ class NodeActionLedger:
     def get(self, command_id: str) -> NodeActionResult | None:
         """The latest attempt's result, or None while it is still running."""
 
+        row = self.latest_row(command_id)
+        return row[2] if row else None
+
+    def latest_row(
+        self, command_id: str
+    ) -> tuple[str, int, NodeActionResult | None] | None:
+        """State, attempt and result of the latest attempt, IN_PROGRESS included.
+
+        ``get`` answers ``None`` for an IN_PROGRESS row, which reads exactly
+        like "this command was never run" -- and a caller that believes that
+        runs the destructive handler a second time. This is the raw row: the
+        result is ``None`` only while the attempt is still marked in progress.
+        """
+
         with self._lock:
             row = self._db.execute(
                 """
-                SELECT state, payload FROM results
+                SELECT state, attempt, payload FROM results
                 WHERE command_id=?
                 ORDER BY attempt DESC
                 LIMIT 1
                 """,
                 (command_id,),
             ).fetchone()
-        if row and row[0] == "IN_PROGRESS":
+        if row is None:
             return None
-        return NodeActionResult.model_validate_json(row[1]) if row else None
+        state, attempt, payload = row
+        if state == IN_PROGRESS_STATE:
+            return str(state), int(attempt), None
+        return str(state), int(attempt), NodeActionResult.model_validate_json(payload)
 
     def attempt_history(self, command_id: str) -> list[dict[str, Any]]:
         """Every attempt of one command, oldest first: the audit view."""
@@ -265,41 +289,56 @@ class NodeActionLedger:
                 ),
             )
 
+    def mark_interrupted(
+        self, command_id: str, attempt: int, error: str
+    ) -> NodeActionResult | None:
+        """Rewrite one IN_PROGRESS row as INTERRUPTED and return the marker.
+
+        This is a plain UPDATE of a row that already exists, not the
+        ``INSERT .. ON CONFLICT`` ``save`` performs, so it stays available as
+        the last resort when writing the result is exactly what failed.
+        Answers ``None`` when the row is gone or already carries a result.
+        """
+
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT payload FROM results
+                WHERE command_id=? AND attempt=? AND state=?
+                """,
+                (command_id, attempt, IN_PROGRESS_STATE),
+            ).fetchone()
+            if row is None:
+                return None
+            marker = NodeActionResult.model_validate_json(row[0]).model_copy(
+                update={
+                    "status": NodeActionStatus.INTERRUPTED,
+                    "error": error,
+                    "retryable": False,
+                    "attempt": attempt,
+                    "completed_at": now,
+                }
+            )
+            self._db.execute(
+                """
+                UPDATE results
+                SET payload=?, completed_at=?, state='INTERRUPTED'
+                WHERE command_id=? AND attempt=?
+                """,
+                (marker.model_dump_json(), now.isoformat(), command_id, attempt),
+            )
+        return marker
+
     def _interrupt_in_progress(self) -> None:
         with self._lock:
             rows = self._db.execute(
-                """
-                SELECT command_id, attempt, payload
-                FROM results
-                WHERE state='IN_PROGRESS'
-                """
+                "SELECT command_id, attempt FROM results WHERE state=?",
+                (IN_PROGRESS_STATE,),
             ).fetchall()
-            for command_id, attempt, payload in rows:
-                marker = NodeActionResult.model_validate_json(payload)
-                interrupted = marker.model_copy(
-                    update={
-                        "status": NodeActionStatus.INTERRUPTED,
-                        "error": (
-                            "agent restarted while the action was in "
-                            "progress; manual confirmation is required"
-                        ),
-                        "retryable": False,
-                        "attempt": attempt,
-                        "completed_at": datetime.now(timezone.utc),
-                    }
-                )
-                self._db.execute(
-                    """
-                    UPDATE results
-                    SET payload=?, completed_at=?, state='INTERRUPTED'
-                    WHERE command_id=? AND attempt=?
-                    """,
-                    (
-                        interrupted.model_dump_json(),
-                        interrupted.completed_at.isoformat(),
-                        command_id,
-                        attempt,
-                    ),
+            for command_id, attempt in rows:
+                self.mark_interrupted(
+                    str(command_id), int(attempt), RESTART_INTERRUPTED_ERROR
                 )
 
     def save(self, result: NodeActionResult, *, exit_code: int | None = None) -> None:

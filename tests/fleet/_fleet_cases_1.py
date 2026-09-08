@@ -194,7 +194,7 @@ def test_agent_endpoint_cannot_point_the_control_plane_elsewhere() -> None:
         "http://127.0.0.1:9099": "does not address node",
         "http://node-a:80": "port 80 is not one of",
         "http://node-a": "port 80 is not one of",
-        "http://node-a:9099/v1/node-actions": "bare scheme",
+        "http://node-a:9099/v1/node-actions/submit": "bare scheme",
         "http://node-a:9099?x=1": "bare scheme",
         "http://attacker@node-a:9099": "must not carry credentials",
     }

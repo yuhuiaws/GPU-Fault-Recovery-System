@@ -27,8 +27,10 @@ from ._support import (
     print_config_digest,
     pytest,
     result_params,
+    submit_action,
     timedelta,
     timezone,
+    wait_for_result,
 )
 
 EXPECTED_NODE_ACTION_OPERATIONS = {
@@ -83,8 +85,13 @@ def test_node_agent_result_query_requires_a_signature(tmp_path, monkeypatch) -> 
     command_id = signed.command.command_id
 
     with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
-        submitted = client.post("/v1/node-actions", json=signed.model_dump(mode="json"))
-        assert submitted.status_code == 200
+        submitted = submit_action(client, signed)
+        assert submitted.status_code == 200, submitted.text
+        answered = wait_for_result(client, command_id)
+        assert answered.status_code == 200, (
+            f"the action must be readable before the query auth is judged: "
+            f"{answered.text}"
+        )
 
         unsigned = client.get(
             "/v1/node-actions/result", params={"command_id": command_id}
@@ -264,6 +271,14 @@ def test_node_action_ledger_prunes_old_results_and_fencing(tmp_path) -> None:
 def test_ledger_save_failure_releases_all_inflight_waiters(
     tmp_path, monkeypatch
 ) -> None:
+    """A result that cannot be written closes the attempt for every caller.
+
+    ``execute`` used to let the write error escape, which left the IN_PROGRESS
+    marker on disk with nobody to close it: the waiter got a bare RuntimeError
+    and the next resubmit re-ran the reset. Both callers now get the same
+    INTERRUPTED answer, and the reset runs once.
+    """
+
     waiter_started = Event()
 
     class TrackingEvent:
@@ -307,11 +322,23 @@ def test_ledger_save_failure_releases_all_inflight_waiters(
             "second node action did not enter the in-flight wait path"
         )
         runner.release.set()
-        with pytest.raises(OSError, match="ledger is full"):
-            first.result(timeout=2)
-        with pytest.raises(RuntimeError, match="completed without a ledger result"):
-            second.result(timeout=5)
+        owner = first.result(timeout=5)
+        waiter = second.result(timeout=5)
 
+    assert owner.status is NodeActionStatus.INTERRUPTED, (
+        f"an unwritable result must not read as SUCCEEDED: {owner}"
+    )
+    assert "result could not be persisted" in (owner.error or ""), owner
+    assert owner.retryable is False, (
+        f"a dispatched destructive action must not be retried blindly: {owner}"
+    )
+    assert waiter.status is NodeActionStatus.INTERRUPTED, (
+        f"the waiter must be released with the owner's outcome: {waiter}"
+    )
+    assert (waiter.attempt, owner.attempt) == (1, 1), (owner, waiter)
+    assert len([item for item in runner.commands if "--gpu-reset" in item]) == 1, (
+        f"the waiter re-ran the reset: {runner.commands}"
+    )
     assert agent._inflight == {}
 
 

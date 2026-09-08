@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from threading import Event
-from typing import Callable
+from typing import Any, Callable
 from unittest import mock
 from urllib.error import HTTPError
 
@@ -155,6 +155,31 @@ def result_params(command_id: str, *, issued_at: str | None = None) -> dict[str,
         "issued_at": stamp,
         "signature": sign_result_query(command_id, stamp, SECRET),
     }
+
+
+def submit_action(client: TestClient, signed: SignedNodeAction) -> Any:
+    """POST one signed envelope to the asynchronous submit route."""
+
+    return client.post("/v1/node-actions/submit", json=signed.model_dump(mode="json"))
+
+
+def wait_for_result(client: TestClient, command_id: str, *, tries: int = 200) -> Any:
+    """Poll ``/result`` until the pool stops answering PENDING.
+
+    There is no synchronous route, so every HTTP test that needs a finished
+    action polls exactly like the control plane's transport does. A 404 or a
+    non-PENDING state is an answer and is returned as-is.
+    """
+
+    for _ in range(tries):
+        polled = client.get("/v1/node-actions/result", params=result_params(command_id))
+        if (
+            polled.status_code != 200
+            or polled.json()["state"] != NodeActionExecutionState.PENDING.value
+        ):
+            return polled
+        time.sleep(0.02)
+    raise AssertionError(f"node action {command_id} never left PENDING")
 
 
 class Quiesced:

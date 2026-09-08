@@ -36,6 +36,8 @@ from ._support import (
     envelope,
     executor,
     result_params,
+    submit_action,
+    wait_for_result,
 )
 
 EXECUTOR_LOGGER = "gpu_fault.node_agent.executor"
@@ -135,7 +137,8 @@ def test_healthz_reports_the_ledger_counters_and_heartbeat(tmp_path) -> None:
 
     with TestClient(create_node_agent_app(agent, heartbeat_reporter=None)) as client:
         before = client.get("/healthz")
-        executed = client.post("/v1/node-actions", json=signed.model_dump(mode="json"))
+        submit_action(client, signed)
+        executed = wait_for_result(client, signed.command.command_id)
         after = client.get("/healthz")
 
     assert before.status_code == 200
@@ -148,7 +151,7 @@ def test_healthz_reports_the_ledger_counters_and_heartbeat(tmp_path) -> None:
         "failed": 0,
         "rejected": 0,
     }
-    assert executed.status_code == 200
+    assert executed.status_code == 200, executed.text
     assert after.json()["counters"] == {
         "accepted": 1,
         "completed": 1,
@@ -172,13 +175,13 @@ def test_healthz_counts_rejections_and_failures(tmp_path) -> None:
         rejected = client.post(
             "/v1/node-actions/submit", json=forged.model_dump(mode="json")
         )
-        failed = client.post(
-            "/v1/node-actions", json=envelope(valid).model_dump(mode="json")
-        )
+        signed = envelope(valid)
+        submit_action(client, signed)
+        failed = wait_for_result(client, signed.command.command_id)
         health = client.get("/healthz").json()
 
     assert rejected.status_code == 401
-    assert failed.json()["status"] == "FAILED"
+    assert failed.json()["state"] == "FAILED", failed.text
     assert health["counters"] == {
         "accepted": 1,
         "completed": 0,

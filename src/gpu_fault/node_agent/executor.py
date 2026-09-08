@@ -18,7 +18,7 @@ from gpu_fault.fleet import (
     NODE_ACTION_KEY_VERSION_SHARED,
 )
 from gpu_fault.models import WorkflowOperation
-from gpu_fault.node_agent.ledger import NodeActionLedger
+from gpu_fault.node_agent.ledger import NodeActionLedger, canonical_digest
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
     NodeActionResult,
@@ -46,6 +46,13 @@ from gpu_fault.node_agent.operations.registry import (
 LOGGER = logging.getLogger(__name__)
 
 COUNTER_NAMES = ("accepted", "completed", "failed", "rejected")
+
+# How hard the executor tries to write a finished result before it gives up and
+# closes the attempt as INTERRUPTED. The handler has already run at this point,
+# so giving up quietly is the one thing that must not happen.
+LEDGER_SAVE_RETRIES = 3
+LEDGER_SAVE_RETRY_SECONDS = 0.2
+UNPERSISTED_RESULT_ERROR = "result could not be persisted"
 
 
 def _command_log_fields(command: NodeActionCommand, attempt: int) -> str:
@@ -309,29 +316,97 @@ class NodeActionExecutor(
             raise ValueError("node action command has expired")
         if command.expires_at - command.issued_at > timedelta(minutes=5):
             raise ValueError("node action TTL exceeds five minutes")
-        if self.ledger.get(command.command_id) is not None:
-            return command
+        self._reject_command_id_reuse(command)
         return command
+
+    def _reject_command_id_reuse(self, command: NodeActionCommand) -> None:
+        """One command_id is one command; a different body is not a replay.
+
+        Replay protection compared the command_id alone, so a validly signed
+        command with the same id and different targets was answered with the
+        first command's result -- a SUCCEEDED reset reported for GPUs that
+        were never reset. The ledger has kept the operation, the GPU UUIDs and
+        a digest of the parameters per attempt all along; this compares them.
+        Columns a row does not carry (rows written before this schema, or by
+        ``save`` alone) are not evidence of a mismatch.
+        """
+
+        history = self.ledger.attempt_history(command.command_id)
+        if not history:
+            return
+        row = history[-1]
+        recorded_uuids = row.get("gpu_uuids")
+        recorded_digest = row.get("parameters_digest")
+        recorded_operation = row.get("operation")
+        reused = (
+            (
+                recorded_operation is not None
+                and recorded_operation != command.operation.value
+            )
+            or (
+                recorded_uuids is not None
+                and sorted(recorded_uuids) != sorted(command.gpu_uuids)
+            )
+            or (
+                recorded_digest is not None
+                and recorded_digest != canonical_digest(command.parameters)
+            )
+        )
+        if reused:
+            raise ValueError("node action command_id reused for a different command")
+
+    def _replay_or_attempt(
+        self, command: NodeActionCommand
+    ) -> tuple[NodeActionResult | None, int]:
+        """Answer a replay from the ledger, or say which attempt number is next.
+
+        An IN_PROGRESS row is not "no result": the handler for that attempt has
+        already been dispatched. ``ledger.get`` hid such a row behind ``None``,
+        so a resubmit took attempt 1 again and ran the destructive handler a
+        second time. With no in-flight Event for the command there is no thread
+        left to write that result either, so the attempt is closed as
+        INTERRUPTED and returned -- manual confirmation, never a re-run.
+        """
+
+        row = self.ledger.latest_row(command.command_id)
+        if row is None:
+            return None, 1
+        state, attempt, result = row
+        if result is None:
+            with self._inflight_lock:
+                if command.command_id in self._inflight:
+                    # A live thread owns this attempt; the caller waits on it.
+                    return None, attempt
+                result = self.ledger.mark_interrupted(
+                    command.command_id, attempt, UNPERSISTED_RESULT_ERROR
+                )
+            if result is None:
+                # The row was rewritten while we were looking at it.
+                result = self.ledger.get(command.command_id)
+            if result is None:
+                return None, attempt
+            LOGGER.error(
+                "node action attempt was closed without a persisted result %s state=%s",
+                _command_log_fields(command, attempt),
+                state,
+            )
+        if not result.retryable:
+            return result, attempt
+        return None, result.attempt + 1
 
     def execute(self, envelope: SignedNodeAction) -> NodeActionResult:
         command = self.validate_submission(envelope)
-        existing = self.ledger.get(command.command_id)
-        if existing is not None:
-            if not existing.retryable:
-                return existing
-            attempt = existing.attempt + 1
-        else:
-            attempt = 1
+        replayed, attempt = self._replay_or_attempt(command)
+        if replayed is not None:
+            return replayed
         if not self.ledger.accept_fencing(command.incident_id, command.fencing_token):
             raise ValueError("stale node action fencing token")
         with self._inflight_lock:
             inflight = self._inflight.get(command.command_id)
             if inflight is None:
-                completed = self.ledger.get(command.command_id)
-                if completed is not None and not completed.retryable:
-                    return completed
-                if completed is not None:
-                    attempt = completed.attempt + 1
+                replayed, attempt = self._replay_or_attempt(command)
+                if replayed is not None:
+                    return replayed
                 inflight = Event()
                 self._inflight[command.command_id] = inflight
                 owns_execution = True
@@ -392,12 +467,65 @@ class NodeActionExecutor(
                 int((time.monotonic() - started) * 1000),
             )
         try:
-            self.ledger.save(result, exit_code=exit_code)
+            result = self._persist_result(result, exit_code=exit_code, fields=fields)
         finally:
             with self._inflight_lock:
                 self._inflight.pop(command.command_id, None)
                 inflight.set()
         return result
+
+    def _persist_result(
+        self,
+        result: NodeActionResult,
+        *,
+        exit_code: int | None,
+        fields: str,
+    ) -> NodeActionResult:
+        """Write one finished attempt, and close it if the write cannot happen.
+
+        The handler has run by now, so raising here would leave the IN_PROGRESS
+        marker on disk for a resubmit to overwrite -- and the destructive action
+        would run again. A full or locked ledger is often momentary, so the
+        write is retried; if it still fails the attempt is closed as INTERRUPTED
+        (non-retryable, manual confirmation) and that marker is what the caller
+        and the poll see.
+        """
+
+        failure: Exception | None = None
+        for remaining in range(LEDGER_SAVE_RETRIES, -1, -1):
+            try:
+                self.ledger.save(result, exit_code=exit_code)
+                return result
+            except Exception as exc:  # noqa: BLE001 - any write failure is the same
+                failure = exc
+                if remaining:
+                    self.sleep(LEDGER_SAVE_RETRY_SECONDS)
+        error = f"{UNPERSISTED_RESULT_ERROR}: {type(failure).__name__}: {failure}"
+        LOGGER.error(
+            "node action result could not be written to the ledger %s "
+            "status=%s error_class=%s",
+            fields,
+            result.status.value,
+            type(failure).__name__,
+        )
+        unpersisted = result.model_copy(
+            update={
+                "status": NodeActionStatus.INTERRUPTED,
+                "error": error,
+                "retryable": False,
+            }
+        )
+        try:
+            self.ledger.mark_interrupted(result.command_id, result.attempt, error)
+        except Exception:
+            # Even the marker could not be written. The in-memory result is all
+            # that is left: the caller keeps it (``/submit`` holds it in the
+            # future) so the poll answers INTERRUPTED instead of 404, and a
+            # resubmit finds the IN_PROGRESS row and closes it there.
+            LOGGER.exception(
+                "node action interrupted marker could not be written %s", fields
+            )
+        return unpersisted
 
     def _execute_quiesce(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.reset_enabled:

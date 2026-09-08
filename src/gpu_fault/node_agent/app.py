@@ -144,6 +144,15 @@ def _node_action_rejection(
             True,
             True,
         )
+    elif "command_id reused" in normalized:
+        # The id already names a different command, so retrying this body can
+        # only collide again; the control plane has to mint a new command_id.
+        status, code, retryable, new_command = (
+            409,
+            "COMMAND_ID_REUSED",
+            False,
+            True,
+        )
     else:
         status, code, retryable, new_command = (
             409,
@@ -228,63 +237,55 @@ def create_node_agent_app(
             "control plane signs its polls"
         )
 
-    def submission_state(
-        command_id: str,
-    ) -> NodeActionSubmission | None:
-        result = agent.ledger.get(command_id)
-        if result is not None:
-            with action_lock:
-                action_futures.pop(command_id, None)
-                action_commands.pop(command_id, None)
-            return NodeActionSubmission(
-                command_id=command_id,
-                state=NodeActionExecutionState(result.status.value),
-                result=result,
-            )
-        with action_lock:
-            future = action_futures.get(command_id)
-            command = action_commands.get(command_id)
-        if future is None or command is None:
-            return None
-        if not future.done():
-            return NodeActionSubmission(
-                command_id=command_id,
-                state=NodeActionExecutionState.PENDING,
-            )
-        try:
-            result = future.result()
-        except Exception as exc:
-            result = NodeActionResult(
-                command_id=command_id,
-                operation=command.operation,
-                status=NodeActionStatus.FAILED,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            agent.ledger.save(result)
-        with action_lock:
-            action_futures.pop(command_id, None)
-            action_commands.pop(command_id, None)
-        return NodeActionSubmission(
-            command_id=command_id,
-            state=NodeActionExecutionState(result.status.value),
-            result=result,
-        )
-
-    def finalize_action(
+    def finished_result(
         command_id: str,
         command: NodeActionCommand,
         future: Any,
-    ) -> None:
+    ) -> NodeActionResult | None:
+        """The outcome of a finished pooled execute, or None if it was rejected.
+
+        A ``ValueError`` out of ``execute`` is a rejection -- expired while
+        queued, stale fencing token, command_id reused -- not an outcome. The
+        command_id is deterministic, so persisting it as a permanent FAILED row
+        answered every later, freshly signed envelope with that stale row. It
+        is dropped instead: the next poll 404s and the transport resubmits.
+        """
+
         try:
-            result = future.result()
+            completed: NodeActionResult = future.result()
+            return completed
+        except ValueError as exc:
+            LOGGER.warning(
+                "node action rejected inside the action pool command_id=%s "
+                "operation=%s reason=%s",
+                command_id,
+                command.operation.value,
+                exc,
+            )
+            return None
         except Exception as exc:
-            previous = agent.ledger.get(command_id)
+            # Not the action failing -- ``execute`` reports that as a FAILED
+            # result -- but the pool wrapper around it, most often the marker
+            # write itself. The answer stays retryable: the ledger now refuses
+            # to re-run an attempt that was already dispatched, so a resubmit
+            # can only read the recorded outcome, never repeat the action.
+            row = agent.ledger.latest_row(command_id)
+            if row is None:
+                attempt = 1
+            elif row[2] is None:
+                # The marker of this attempt is already on disk; reusing its
+                # number keeps one row per attempt instead of writing a second
+                # row for the attempt that is being reported.
+                attempt = row[1]
+            else:
+                attempt = row[1] + 1
             result = NodeActionResult(
                 command_id=command_id,
                 operation=command.operation,
                 status=NodeActionStatus.FAILED,
                 error=f"{type(exc).__name__}: {exc}",
-                attempt=(previous.attempt + 1 if previous else 1),
+                retryable=True,
+                attempt=attempt,
             )
             try:
                 agent.ledger.save(result)
@@ -293,10 +294,76 @@ def create_node_agent_app(
                     "failed to persist asynchronous node action failure command_id=%s",
                     command_id,
                 )
+            return result
+
+    def drop_future(command_id: str, future: Any = None) -> None:
+        """Forget one command's future, unless a newer attempt replaced it.
+
+        A future is done a moment before its callback runs, so a resubmit can
+        register the next attempt in between; popping by command_id alone would
+        then throw away the running attempt and answer the poll from the
+        previous attempt's row.
+        """
+
+        with action_lock:
+            if future is not None and action_futures.get(command_id) is not future:
+                return
+            action_futures.pop(command_id, None)
+            action_commands.pop(command_id, None)
+
+    def submission_state(
+        command_id: str,
+    ) -> NodeActionSubmission | None:
+        # The future is read before the ledger: a resubmitted retryable failure
+        # runs as a new attempt while the previous attempt's row is still the
+        # newest one on disk, and answering with that row would look like the
+        # resubmit had been refused.
+        with action_lock:
+            future = action_futures.get(command_id)
+            command = action_commands.get(command_id)
+        if future is not None and command is not None:
+            if not future.done():
+                return NodeActionSubmission(
+                    command_id=command_id,
+                    state=NodeActionExecutionState.PENDING,
+                )
+            result = finished_result(command_id, command, future)
+            drop_future(command_id, future)
+            if result is not None:
+                return NodeActionSubmission(
+                    command_id=command_id,
+                    state=NodeActionExecutionState(result.status.value),
+                    result=result,
+                )
+        result = agent.ledger.get(command_id)
+        if result is None:
+            return None
+        drop_future(command_id, future)
+        return NodeActionSubmission(
+            command_id=command_id,
+            state=NodeActionExecutionState(result.status.value),
+            result=result,
+        )
+
+    def awaiting_retry(state: NodeActionSubmission) -> bool:
+        """A retryable failure is not an answer; the resubmit runs attempt+1."""
+
+        result = state.result
+        return (
+            result is not None
+            and result.status is NodeActionStatus.FAILED
+            and result.retryable
+        )
+
+    def finalize_action(
+        command_id: str,
+        command: NodeActionCommand,
+        future: Any,
+    ) -> None:
+        try:
+            finished_result(command_id, command, future)
         finally:
-            with action_lock:
-                action_futures.pop(command_id, None)
-                action_commands.pop(command_id, None)
+            drop_future(command_id, future)
 
     @asynccontextmanager
     async def lifespan(_):
@@ -356,16 +423,6 @@ def create_node_agent_app(
         payload["counters"] = counters() if callable(counters) else {}
         return JSONResponse(status_code=status_code, content=payload)
 
-    @app.post("/v1/node-actions", response_model=NodeActionResult)
-    def execute_action(
-        envelope: SignedNodeAction,
-    ) -> NodeActionResult:
-        try:
-            return agent.execute(envelope)
-        except ValueError as exc:
-            status_code, detail = _node_action_rejection(exc)
-            raise HTTPException(status_code=status_code, detail=detail) from exc
-
     @app.post(
         "/v1/node-actions/submit",
         response_model=NodeActionSubmission,
@@ -379,7 +436,7 @@ def create_node_agent_app(
             status_code, detail = _node_action_rejection(exc)
             raise HTTPException(status_code=status_code, detail=detail) from exc
         existing = submission_state(command.command_id)
-        if existing is not None:
+        if existing is not None and not awaiting_retry(existing):
             return existing
         with action_lock:
             future = action_futures.get(command.command_id)
@@ -392,10 +449,15 @@ def create_node_agent_app(
                     command_id=command.command_id,
                     submitted=command: finalize_action(command_id, submitted, completed)
                 )
-        return submission_state(command.command_id) or NodeActionSubmission(
+        pending = NodeActionSubmission(
             command_id=command.command_id,
             state=NodeActionExecutionState.PENDING,
         )
+        if existing is not None:
+            # A retryable failure was just handed back to the pool as the next
+            # attempt; the row it left behind is not the answer to this submit.
+            return pending
+        return submission_state(command.command_id) or pending
 
     @app.get(
         "/v1/node-actions/result",
