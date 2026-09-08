@@ -727,6 +727,21 @@ def _start_probes(run: _LiveRun) -> None:
     write_json_atomic(run.case_dir / "host-before.json", run.baseline)
     run.baseline_boot_id = str(run.baseline.get("boot_id") or "")
     run.baseline_agent = dict(run.preflight["store"].get("agent") or {})
+    # Pre-validate and hand the reboot to the on-node watcher. quiesce stops
+    # kubelet, so the runner can never exec ``arm-reboot`` after the fence is
+    # WAITING (live: arm-reboot "dial tcp :10250 connect: connection refused",
+    # and the node was left quarantined). The watcher arms the reboot on-node
+    # the moment quiesce lands, which is the window start; validate the delay
+    # against the full pinned window (its length is a control-plane constant)
+    # here, before injection, while the exec channel is still up.
+    control_env = run.preflight["control_env"]
+    window_errors = reboot_window_errors(
+        delay_seconds=settings.reboot_delay_seconds,
+        window_remaining_seconds=float(control_env["agent_maintenance_window_seconds"]),
+        step_waiting_limit_seconds=int(control_env["verify_waiting_limit_seconds"]),
+    )
+    if window_errors:
+        raise RegionalFixtureError("; ".join(window_errors))
     armed = run.fence.execute(
         "arm-holder",
         "--device",
@@ -739,6 +754,8 @@ def _start_probes(run: _LiveRun) -> None:
         str(settings.max_hold_seconds),
         "--run-id",
         run.run_id,
+        "--reboot-delay-seconds",
+        str(settings.reboot_delay_seconds),
         "--probe-script",
         # The host path: the transient unit runs on the node, where /host does
         # not exist (live: "can't open file '/host/run/...'" and no holder).
@@ -746,6 +763,9 @@ def _start_probes(run: _LiveRun) -> None:
         timeout=180,
     )
     run.holder_armed = True
+    # The watcher will place the reboot timer on-node once quiesce lands; from
+    # here on cleanup must be prepared to cancel an unfired reboot.
+    run.reboot_armed = True
     write_json_atomic(run.case_dir / "holder-armed.json", armed)
 
 
@@ -851,7 +871,16 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
 
 
 def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
-    """Arm the reboot, refusing a placement that would prove another fence."""
+    """Record the reboot placement; the timer itself is armed on-node.
+
+    quiesce has already stopped kubelet by the time verify is WAITING, so the
+    reboot cannot be exec'd from here -- the on-node watcher (``arm-holder
+    --reboot-delay-seconds``) placed the transient timer the moment quiesce
+    landed, which is the window start. Confirm the placement against the actual
+    pinned window (defence in depth over the static pre-injection check) and
+    record it; the fired timer and boot-id change are read back through
+    ``reboot-status`` once the node returns and the exec channel is up again.
+    """
 
     now = datetime.now(timezone.utc)
     remaining = window_remaining_seconds(run.pin, now=now)
@@ -864,17 +893,9 @@ def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     )
     if errors:
         raise RegionalFixtureError("; ".join(errors))
-    armed = run.fence.execute(
-        "arm-reboot",
-        "--run-id",
-        run.run_id,
-        "--delay-seconds",
-        str(run.settings.reboot_delay_seconds),
-        timeout=120,
-    )
-    run.reboot_armed = True
     record = {
-        "armed": armed,
+        "armed_on_node_by": "arm-holder --reboot-delay-seconds (watch-ledger)",
+        "reboot_delay_seconds": run.settings.reboot_delay_seconds,
         "window_remaining_seconds": remaining,
         "expected_fence": expected_fence_text(run.pin, node=run.settings.node),
     }

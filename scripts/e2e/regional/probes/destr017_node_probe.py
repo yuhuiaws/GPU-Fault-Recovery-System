@@ -436,6 +436,13 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             "holder_unit": unit + ".service",
         },
     )
+    # The holder now has VERIFY_NO_GPU_CLIENTS WAITING. quiesce has already
+    # stopped kubelet, so the runner can no longer exec ``arm-reboot`` -- arm the
+    # out-of-band reboot here, on-node, the moment the fence is holding. The
+    # runner pre-validated the delay against the pinned window before injection.
+    reboot_delay = state.get("reboot_delay_seconds")
+    if reboot_delay is not None:
+        _place_reboot_timer(run_id, int(reboot_delay), path)
 
 
 def arm_holder(arguments: argparse.Namespace) -> None:
@@ -452,6 +459,9 @@ def arm_holder(arguments: argparse.Namespace) -> None:
         for row in ledger_rows()
         if row["operation"] == arguments.after_ledger_op
     ]
+    reboot_delay: int | None = None
+    if getattr(arguments, "reboot_delay_seconds", None) is not None:
+        reboot_delay = checked_reboot_delay(arguments.reboot_delay_seconds)
     path = state_path(run_id)
     armed_at = datetime.now(timezone.utc).isoformat()
     state = update_state(
@@ -464,6 +474,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "after_ledger_op": arguments.after_ledger_op,
             "baseline_command_ids": baseline_ids,
             "armed_at": armed_at,
+            "reboot_delay_seconds": reboot_delay,
         },
     )
     write_state(path, record_boot_observation(state, boot_id(), observed_at=armed_at))
@@ -490,6 +501,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "after_ledger_op": arguments.after_ledger_op,
             "baseline_command_ids": baseline_ids,
             "armed_at": armed_at,
+            "reboot_delay_seconds": reboot_delay,
         }
     )
 
@@ -527,16 +539,16 @@ def holder_status(arguments: argparse.Namespace) -> None:
     )
 
 
-def arm_reboot(arguments: argparse.Namespace) -> None:
-    """Arm a bounded transient timer that runs ``systemctl reboot``.
+def _place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
+    """Write the durable boot-id marker, then arm the transient reboot timer.
 
-    The marker file is written *before* the timer exists, so a reboot can never
-    fire without a durable record of the boot id it replaced.
+    Shared by ``arm-reboot`` (runner-driven, before this drill's quiesce stops
+    kubelet) and ``watch-ledger`` (on-node, the moment quiesce lands). The
+    marker file is written *before* the timer exists, so a reboot can never fire
+    without a durable record of the boot id it replaced.
     """
 
-    run_id = safe_id(arguments.run_id, "run ID")
-    delay = checked_reboot_delay(arguments.delay_seconds)
-    path = state_path(run_id)
+    delay = checked_reboot_delay(delay)
     armed_at = datetime.now(timezone.utc)
     current = boot_id()
     unit = reboot_unit(run_id)
@@ -569,17 +581,27 @@ def arm_reboot(arguments: argparse.Namespace) -> None:
             *reboot_command(),
         ]
     )
-    emit(
-        {
-            "run_id": run_id,
-            "reboot_unit": unit + ".timer",
-            "reboot_armed_at": armed_at.isoformat(),
-            "reboot_fire_at": (armed_at + timedelta(seconds=delay)).isoformat(),
-            "reboot_delay_seconds": delay,
-            "boot_id_before_reboot": current,
-            "units": _reboot_unit_state(run_id),
-        }
-    )
+    return {
+        "run_id": run_id,
+        "reboot_unit": unit + ".timer",
+        "reboot_armed_at": armed_at.isoformat(),
+        "reboot_fire_at": (armed_at + timedelta(seconds=delay)).isoformat(),
+        "reboot_delay_seconds": delay,
+        "boot_id_before_reboot": current,
+        "units": _reboot_unit_state(run_id),
+    }
+
+
+def arm_reboot(arguments: argparse.Namespace) -> None:
+    """Arm a bounded transient timer that runs ``systemctl reboot``.
+
+    Kept for direct/off-drill use; on this drill the reboot is armed on-node by
+    ``watch-ledger`` because quiesce stops kubelet before the runner could exec
+    an ``arm-reboot`` (the exec channel is gone by the time verify is WAITING).
+    """
+
+    run_id = safe_id(arguments.run_id, "run ID")
+    emit(_place_reboot_timer(run_id, arguments.delay_seconds, state_path(run_id)))
 
 
 def reboot_status(arguments: argparse.Namespace) -> None:
@@ -669,6 +691,17 @@ def parser() -> argparse.ArgumentParser:
     arm.add_argument("--max-hold-seconds", type=int, default=900)
     arm.add_argument("--run-id", required=True)
     arm.add_argument("--probe-script", required=True)
+    arm.add_argument(
+        "--reboot-delay-seconds",
+        type=int,
+        default=None,
+        help=(
+            "if set, the on-node watcher arms the out-of-band reboot this many "
+            "seconds after quiesce lands, once the fence is holding; the reboot "
+            f"delay must be within {MIN_REBOOT_DELAY_SECONDS}.."
+            f"{MAX_REBOOT_DELAY_SECONDS} seconds"
+        ),
+    )
     arm.set_defaults(handler=arm_holder)
 
     watch = commands.add_parser("watch-ledger")

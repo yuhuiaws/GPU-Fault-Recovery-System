@@ -334,6 +334,36 @@ def test_the_reboot_delay_is_bounded_at_both_ends() -> None:
             probe.checked_reboot_delay(value)
 
 
+def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """quiesce stops kubelet, so the reboot cannot be exec'd from the runner
+    after the fence is WAITING. ``_place_reboot_timer`` is the shared path the
+    on-node watcher takes: it must write the pre-reboot boot id durably *before*
+    the systemd timer that will run ``systemctl reboot`` exists."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        probe, "run", lambda command, **kwargs: calls.append(list(command))
+    )
+    monkeypatch.setattr(probe, "boot_id", lambda: BOOT_A)
+    monkeypatch.setattr(probe, "_reboot_unit_state", lambda run_id: {})
+    path = tmp_path / "state.json"
+
+    record = probe._place_reboot_timer(RUN_ID, 45, path)
+
+    assert record["reboot_delay_seconds"] == 45
+    assert record["boot_id_before_reboot"] == BOOT_A
+    state = json.loads(path.read_text())
+    assert state["boot_id_before_reboot"] == BOOT_A, "durable marker before timer"
+    assert state["reboot_delay_seconds"] == 45
+    timer = probe.reboot_unit(RUN_ID)
+    armed = [c for c in calls if "systemd-run" in c and f"--on-active=45s" in c]
+    assert len(armed) == 1, calls
+    assert f"--unit={timer}" in armed[0]
+    assert armed[0][-2:] == ["/bin/systemctl", "reboot"], "only an ordinary reboot"
+
+
 # --------------------------------------------------------------------------- #
 # Durable state
 # --------------------------------------------------------------------------- #
@@ -421,6 +451,23 @@ def test_parser_accepts_every_documented_subcommand() -> None:
     )
     assert arm.command == "arm-holder"
     assert arm.after_ledger_op == QUIESCE, "the holder arms on quiesce by default"
+    assert arm.reboot_delay_seconds is None, "no on-node reboot unless asked"
+    armed_reboot = parser.parse_args(
+        [
+            "arm-holder",
+            "--device",
+            "/dev/nvidia3",
+            "--drill-id",
+            RUN_ID,
+            "--run-id",
+            RUN_ID,
+            "--probe-script",
+            "/run/probe.py",
+            "--reboot-delay-seconds",
+            "30",
+        ]
+    )
+    assert armed_reboot.reboot_delay_seconds == 30
     reboot = parser.parse_args(
         ["arm-reboot", "--run-id", RUN_ID, "--delay-seconds", "45"]
     )
