@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -62,12 +63,30 @@ def test_the_confirmation_token_names_this_case_and_its_predecessor() -> None:
     assert metadata.risk == "live-service-action"
 
 
-def test_the_case_declares_the_two_variables_the_env_window_may_manage() -> None:
+def test_the_case_declares_the_six_variables_the_env_window_may_manage() -> None:
     assert env_window.ALLOWED_VARIABLES == (
         "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS",
         "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS",
+        "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS",
+        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
+        "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS",
+        "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS",
     )
     assert env_window.DEPLOYMENT == "gpu-fault-control-worker"
+
+
+def test_the_runner_opens_the_window_with_a_consistent_full_set(
+    tmp_path: Path,
+) -> None:
+    """The runner emits every allow-listed variable in one internally
+    consistent set, and the helper accepts it. Compressing the lifetime alone
+    is what CrashLoopBackOff'd the live control plane; the full set is bootable.
+    """
+
+    assignments = _settings(tmp_path).assignments()
+
+    assert set(assignments) == set(env_window.ALLOWED_VARIABLES)
+    assert env_window.assignment_errors(assignments) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +99,10 @@ def test_the_shipped_window_leaves_the_attempt_margin_it_promises() -> None:
     )
     assert attempts == 18
     assert attempts + verdicts.ATTEMPT_MARGIN <= verdicts.VERIFY_MAX_ATTEMPTS
-    assert verdicts.LIFETIME_SECONDS < verdicts.STEP_WAITING_CAP_SECONDS
+    # The window compresses the per-step waiting cap down to the lifetime: the
+    # control plane refuses a step cap *above* the lifetime, and a cap *below*
+    # it would let the step fire first, so equal is the only value that works.
+    assert verdicts.STEP_WAITING_CAP_SECONDS == verdicts.LIFETIME_SECONDS
     assert (
         verdicts.lifetime_margin_errors(
             lifetime_seconds=verdicts.LIFETIME_SECONDS,
@@ -126,14 +148,22 @@ def test_a_lifetime_long_enough_to_burn_the_attempt_budget_is_refused() -> None:
     assert "attempt budget" in _text(errors)
 
 
-def test_a_lifetime_at_or_above_the_step_waiting_cap_is_refused() -> None:
-    errors = verdicts.lifetime_margin_errors(
-        lifetime_seconds=600, execution_timeout_seconds=600, cadence_seconds=5.0
+def test_a_step_cap_equal_to_the_lifetime_carries_no_step_cap_error() -> None:
+    """The window sets the step cap to the lifetime, so equal is the drill's own
+    config and must not be flagged; only a cap *below* the lifetime is refused."""
+
+    assert (
+        verdicts.lifetime_margin_errors(
+            lifetime_seconds=180,
+            execution_timeout_seconds=180,
+            cadence_seconds=5.0,
+            step_waiting_cap_seconds=180,
+        )
+        == []
     )
-    assert "per-step waiting cap" in _text(errors)
 
 
-def test_a_site_that_lowered_the_step_cap_under_the_lifetime_is_refused() -> None:
+def test_a_step_cap_under_the_lifetime_lets_the_step_fire_first_and_is_refused() -> None:
     errors = verdicts.lifetime_margin_errors(
         lifetime_seconds=180,
         execution_timeout_seconds=180,
@@ -992,6 +1022,10 @@ def _settings(tmp_path: Path) -> destr018.Settings:
         predecessor_path=tmp_path / "predecessor.json",
         lifetime_seconds=verdicts.LIFETIME_SECONDS,
         execution_timeout_seconds=verdicts.EXECUTION_TIMEOUT_SECONDS,
+        step_timeout_seconds=verdicts.STEP_TIMEOUT_SECONDS,
+        managed_recovery_seconds=verdicts.MANAGED_RECOVERY_SECONDS,
+        step_warning_seconds=verdicts.STEP_WARNING_SECONDS,
+        lease_duration_seconds=verdicts.LEASE_DURATION_SECONDS,
         hold_seconds=1200,
     )
 
@@ -1103,11 +1137,24 @@ def test_the_preflight_reads_an_unset_variable_as_the_shipped_default() -> None:
     assert destr018.observed_cadence({"replicas": []}) is None
 
 
-def test_the_preflight_refuses_a_site_whose_step_cap_is_under_the_lifetime(
+def test_the_preflight_refuses_a_run_configured_to_leave_the_step_cap_low(
     tmp_path: Path,
 ) -> None:
-    survey = _survey(**{destr018.STEP_TIMEOUT_VARIABLE: "120"})
-    errors = _preflight_errors(tmp_path, survey=survey)
+    """The margin is judged against the in-window cap the run *will set*, not the
+    pre-window survey value (the window compresses the step timeout to the
+    lifetime). A run misconfigured to leave the step timeout at 120s while the
+    lifetime is 180s would let the step's own bound end the wait first, so the
+    preflight refuses it."""
+
+    settings = replace(_settings(tmp_path), step_timeout_seconds=120)
+    errors = destr018.preflight_errors(
+        settings,
+        _state(),
+        _node(),
+        [],
+        {"passed": True},
+        _survey(),
+    )
     assert "per-step waiting cap 120s" in _text(errors)
 
 
@@ -1281,6 +1328,10 @@ def test_the_runner_is_plan_by_default_and_needs_an_exact_confirmation() -> None
     assert plan.execute is False
     assert plan.lifetime_seconds == verdicts.LIFETIME_SECONDS
     assert plan.execution_timeout_seconds == verdicts.EXECUTION_TIMEOUT_SECONDS
+    assert plan.step_timeout_seconds == verdicts.STEP_TIMEOUT_SECONDS
+    assert plan.managed_recovery_seconds == verdicts.MANAGED_RECOVERY_SECONDS
+    assert plan.step_warning_seconds == verdicts.STEP_WARNING_SECONDS
+    assert plan.lease_duration_seconds == verdicts.LEASE_DURATION_SECONDS
     execute = parser.parse_args(
         [
             "--run-dir",

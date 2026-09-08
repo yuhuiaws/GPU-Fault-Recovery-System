@@ -174,6 +174,10 @@ class Settings:
     predecessor_path: Path
     lifetime_seconds: int
     execution_timeout_seconds: int
+    step_timeout_seconds: int
+    managed_recovery_seconds: int
+    step_warning_seconds: int
+    lease_duration_seconds: int
     hold_seconds: int
 
     def environment(self) -> dict[str, str]:
@@ -189,9 +193,21 @@ class Settings:
         }
 
     def assignments(self) -> dict[str, str]:
+        """The full compressed knob set the window opens with.
+
+        The node lifetime alone is not a bootable config: the control plane
+        refuses a lifetime below the step ceilings, the managed-recovery window
+        or the lease (execution/config.py), so all six are lowered together.
+        ``env_window.assignment_errors`` re-checks the ordering.
+        """
+
         return {
             env_window.LIFETIME_VARIABLE: str(self.lifetime_seconds),
             env_window.EXECUTION_TIMEOUT_VARIABLE: str(self.execution_timeout_seconds),
+            env_window.STEP_TIMEOUT_VARIABLE: str(self.step_timeout_seconds),
+            env_window.MANAGED_RECOVERY_VARIABLE: str(self.managed_recovery_seconds),
+            env_window.STEP_WARNING_VARIABLE: str(self.step_warning_seconds),
+            env_window.LEASE_DURATION_VARIABLE: str(self.lease_duration_seconds),
         }
 
 
@@ -219,6 +235,10 @@ def configure(arguments: argparse.Namespace) -> Settings:
         predecessor_path=predecessor,
         lifetime_seconds=int(arguments.lifetime_seconds),
         execution_timeout_seconds=int(arguments.execution_timeout_seconds),
+        step_timeout_seconds=int(arguments.step_timeout_seconds),
+        managed_recovery_seconds=int(arguments.managed_recovery_seconds),
+        step_warning_seconds=int(arguments.step_warning_seconds),
+        lease_duration_seconds=int(arguments.lease_duration_seconds),
         hold_seconds=int(arguments.hold_seconds),
     )
 
@@ -297,11 +317,14 @@ def observed_cadence(survey: dict[str, Any]) -> float | None:
 
 
 def observed_step_cap(survey: dict[str, Any]) -> int | None:
-    """The waiting ceiling the deployed control plane puts on the WAITING step.
+    """The pre-window waiting ceiling the deployed control plane reads.
 
-    It has to stay *above* the compressed lifetime: a step that is capped first
-    fails the step, not the workflow, and the case would be measuring the wrong
-    bound.
+    Recorded as evidence of the state the drill borrowed. It is *not* the cap
+    the margin arithmetic is judged against: the env window compresses the step
+    timeout to the lifetime for the run, so the margin is computed against
+    ``settings.step_timeout_seconds``. This survey runs before the window opens,
+    so on a clean deployment the variable is unset and this returns the shipped
+    600s default; a ``None`` means ready replicas disagree, i.e. a half-rollout.
     """
 
     value = agreed_number(survey, STEP_TIMEOUT_VARIABLE, DEFAULT_STEP_CAP_SECONDS)
@@ -438,7 +461,9 @@ def preflight_errors(
                 "is open that this run did not record"
             )
     # The arithmetic that decides whether the drill can prove anything, judged
-    # against the cadence the deployed control plane actually reads.
+    # against the cadence the deployed control plane actually reads and the
+    # in-window step cap the drill will run under (the window compresses the
+    # step timeout to the lifetime), not the pre-window default.
     cap = observed_step_cap(survey)
     if cap is None:
         errors.append(
@@ -450,9 +475,7 @@ def preflight_errors(
             lifetime_seconds=settings.lifetime_seconds,
             execution_timeout_seconds=settings.execution_timeout_seconds,
             cadence_seconds=observed_cadence(survey),
-            step_waiting_cap_seconds=cap
-            if cap is not None
-            else verdicts.STEP_WAITING_CAP_SECONDS,
+            step_waiting_cap_seconds=settings.step_timeout_seconds,
         )
     )
     return errors
@@ -513,11 +536,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "target_node": settings.node,
         "mutation": (
             "open a temporary env window on the CPU-plane "
-            f"{env_window.DEPLOYMENT} Deployment "
-            f"({env_window.LIFETIME_VARIABLE}="
-            f"{settings.lifetime_seconds}, "
-            f"{env_window.EXECUTION_TIMEOUT_VARIABLE}="
-            f"{settings.execution_timeout_seconds}); hold one GPU device open "
+            f"{env_window.DEPLOYMENT} Deployment, compressing the workflow "
+            f"lifetime to {settings.lifetime_seconds}s and lowering the "
+            "execution timeout, step timeout, managed-recovery window, step "
+            "warning and lease in lockstep so the control plane still boots "
+            f"({json.dumps(settings.assignments(), sort_keys=True)}); "
+            "hold one GPU device open "
             "with a transient systemd unit; write one synthetic XID 46 and one "
             "XID 79 to the real host /dev/kmsg; let the workflow quiesce GPU "
             "services and lose its lifetime while verifying clients"
@@ -865,10 +889,7 @@ def _data_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
                 lifetime_seconds=run.settings.lifetime_seconds,
                 execution_timeout_seconds=run.settings.execution_timeout_seconds,
                 cadence_seconds=float(run.cadence_sample["min_gap_seconds"]),
-                step_waiting_cap_seconds=int(
-                    run.preflight["observed_step_cap_seconds"]
-                    or verdicts.STEP_WAITING_CAP_SECONDS
-                ),
+                step_waiting_cap_seconds=run.settings.step_timeout_seconds,
             )
         )
     return errors
@@ -1169,8 +1190,47 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=verdicts.EXECUTION_TIMEOUT_SECONDS,
         help=(
-            "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS; must be at or above "
-            "the lifetime, or the execution deadline fires first"
+            "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS; must equal the "
+            "lifetime -- below it the execution deadline fires first, above it "
+            "claim_deadlines truncates it to the lifetime"
+        ),
+    )
+    value.add_argument(
+        "--step-timeout-seconds",
+        type=int,
+        default=verdicts.STEP_TIMEOUT_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS; the control plane refuses "
+            "a step waiting ceiling above the lifetime, so this is compressed to "
+            "the lifetime so the step's own cap cannot fire before the lifetime"
+        ),
+    )
+    value.add_argument(
+        "--managed-recovery-seconds",
+        type=int,
+        default=verdicts.MANAGED_RECOVERY_SECONDS,
+        help=(
+            "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS; pinned to the "
+            "step timeout (from_mapping forbids it below the step timeout, "
+            "validate_timing forbids it above the lifetime)"
+        ),
+    )
+    value.add_argument(
+        "--step-warning-seconds",
+        type=int,
+        default=verdicts.STEP_WARNING_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS; must stay below the step "
+            "timeout (from_mapping)"
+        ),
+    )
+    value.add_argument(
+        "--lease-duration-seconds",
+        type=int,
+        default=verdicts.LEASE_DURATION_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS; must stay below the "
+            "execution timeout (validate_timing_relationships)"
         ),
     )
     value.add_argument(

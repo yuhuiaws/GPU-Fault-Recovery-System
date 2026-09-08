@@ -95,18 +95,47 @@ RECORD_ONLY_METRIC = (
 # ---------------------------------------------------------------------------
 # Timing arithmetic
 # ---------------------------------------------------------------------------
-# The compressed window written into the control worker for the drill. Both
-# variables are set: the execution timeout must not be the deadline that
-# fires, or the failure would not carry workflow_lifetime_exceeded.
+# The compressed window written into the control worker for the drill. The
+# node lifetime is the deadline the case exists to prove, and every other knob
+# is set in lockstep so the control plane will actually boot with it (its
+# start-up guard in execution/config.py refuses a lifetime below the step
+# ceilings, the managed-recovery window, or at/below the lease):
+#
+# * execution timeout == lifetime -- claim_deadlines stamps
+#   ``min(execution, lifetime)``; below the lifetime the execution deadline
+#   fires first and the failure would not carry workflow_lifetime_exceeded,
+#   above it the value is silently truncated to the lifetime.
+# * step timeout == lifetime -- validate_timing_relationships forbids a step
+#   waiting ceiling *above* the node lifetime, so this is the largest value the
+#   control plane will accept; keeping it *at* the lifetime (rather than below)
+#   means the WAITING step's own cap cannot fire before the lifetime does,
+#   because executor._execute_step checks the workflow deadline before it
+#   dispatches the step and the step's wait only starts after containment.
+# * managed recovery == lifetime -- a per-operation override may not sit below
+#   the default step timeout (from_mapping) and may not exceed the lifetime
+#   (validate_timing_relationships), so with the step timeout compressed to the
+#   lifetime the managed-recovery window is pinned to the same value.
+# * step warning < step timeout, and lease < execution timeout -- the two
+#   ordering rules from_mapping and validate_timing_relationships impose that
+#   the equal knobs above would otherwise violate.
 LIFETIME_SECONDS = 180
 EXECUTION_TIMEOUT_SECONDS = 180
+STEP_TIMEOUT_SECONDS = 180
+MANAGED_RECOVERY_SECONDS = 180
+STEP_WARNING_SECONDS = 150
+LEASE_DURATION_SECONDS = 120
 # The env-window helper's own bounds; repeated here so the arithmetic refuses
 # a value the window would refuse anyway.
 MINIMUM_WINDOW_SECONDS = 60
 MAXIMUM_WINDOW_SECONDS = 3600
 # Deployed defaults the arithmetic is judged against.
 VERIFY_MAX_ATTEMPTS = 60
-STEP_WAITING_CAP_SECONDS = 600
+# The per-step waiting cap the drill actually runs under: the window compresses
+# it to the lifetime (see STEP_TIMEOUT_SECONDS above), so the margin arithmetic
+# is judged against the lifetime, not the shipped 600s default.
+STEP_WAITING_CAP_SECONDS = STEP_TIMEOUT_SECONDS
+# The shipped default step waiting cap, recorded as pre-window evidence.
+SHIPPED_STEP_WAITING_CAP_SECONDS = 600
 # The dispatch poll interval of the deployed control worker: the fastest
 # cadence a WAITING step can be redispatched at. A measured cadence below it
 # means the site is not the one this arithmetic was computed for.
@@ -197,11 +226,11 @@ def lifetime_margin_errors(
             f"lifetime {lifetime_seconds}s; the execution deadline would fire "
             "first and the failure would not carry workflow_lifetime_exceeded"
         )
-    if lifetime_seconds >= step_waiting_cap_seconds:
+    if step_waiting_cap_seconds < lifetime_seconds:
         errors.append(
-            f"lifetime {lifetime_seconds}s is not below the per-step waiting "
-            f"cap {step_waiting_cap_seconds}s; the step's own bound could end "
-            "the wait before the workflow lifetime does"
+            f"the per-step waiting cap {step_waiting_cap_seconds}s is below the "
+            f"lifetime {lifetime_seconds}s; the step's own bound could end the "
+            "wait before the workflow lifetime does"
         )
     if cadence_seconds is None:
         errors.append(

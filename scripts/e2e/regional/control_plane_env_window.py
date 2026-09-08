@@ -7,14 +7,24 @@ maintenance window and then restored exactly:
 * ``GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS`` -- lowered so a node
   workflow held WAITING reaches its hard lifetime inside the window instead of
   an hour later.
-* ``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`` -- pinned at or above the
-  lifetime, because ``restart_budget_preflight.claim_deadlines`` stamps
+* ``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`` -- pinned at the lifetime,
+  because ``restart_budget_preflight.claim_deadlines`` stamps
   ``min(execution, lifetime)``: an execution timeout *below* the lifetime makes
   the workflow fail as a plain execution-deadline miss with
   ``details.workflow_lifetime_exceeded=false``, which is the opposite of what
-  the case exists to prove.
+  the case exists to prove, and one *above* the lifetime is truncated to it.
+* ``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS``,
+  ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS``,
+  ``GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS`` and
+  ``GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS`` -- lowered *with* the lifetime.
+  The control plane's boot-time timing guard (``execution/config.py``) refuses
+  to construct a config whose step waiting ceilings or managed-recovery window
+  sit above the node lifetime, or whose lease sits at/above the execution
+  timeout, so compressing the lifetime alone CrashLoopBackOffs every worker
+  replica. ``assignment_errors`` encodes the full ordering these four have to
+  keep, and rejects an inconsistent ``--set`` on the command line.
 
-Both live on the CPU-plane ``gpu-fault-control-worker`` Deployment, which is
+All six live on the CPU-plane ``gpu-fault-control-worker`` Deployment, which is
 where the workflow executor and the single-instance dispatch lease run
 (``execution/dispatcher.py``: ``DISPATCH_LEASE_KEY = "workflow-dispatch"``).
 Changing the Deployment template rolls every worker replica, so the lease moves
@@ -71,12 +81,49 @@ DEPLOYMENT = "gpu-fault-control-worker"
 CONTAINER = "control-worker"
 LIFETIME_VARIABLE = "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS"
 EXECUTION_TIMEOUT_VARIABLE = "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS"
-ALLOWED_VARIABLES = (LIFETIME_VARIABLE, EXECUTION_TIMEOUT_VARIABLE)
+# Compressing the node lifetime alone is not a bootable config: the control
+# plane's own start-up guard (``execution/config.py``
+# ``validate_timing_relationships`` / ``ProductionExecutorConfig.from_mapping``)
+# refuses a lifetime that sits below the step waiting ceilings, the managed
+# recovery window, or at/below the lease -- so the compressed window has to move
+# those in lockstep or every worker replica CrashLoopBackOffs and the rollout
+# never converges. These four are lowered with the lifetime for exactly that
+# reason; ``assignment_errors`` encodes the whole ordering.
+STEP_TIMEOUT_VARIABLE = "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS"
+MANAGED_RECOVERY_VARIABLE = "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS"
+STEP_WARNING_VARIABLE = "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS"
+LEASE_DURATION_VARIABLE = "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS"
+ALLOWED_VARIABLES = (
+    LIFETIME_VARIABLE,
+    EXECUTION_TIMEOUT_VARIABLE,
+    STEP_TIMEOUT_VARIABLE,
+    MANAGED_RECOVERY_VARIABLE,
+    STEP_WARNING_VARIABLE,
+    LEASE_DURATION_VARIABLE,
+)
+# The shipped default each managed variable takes when the Deployment does not
+# carry it, read from ``execution/config.py``. ``assignment_errors`` merges a
+# partial ``--set`` onto these so it can reject a set that would only be found
+# inconsistent once the control plane tried to boot it.
+SHIPPED_DEFAULTS = {
+    LIFETIME_VARIABLE: 3600,
+    EXECUTION_TIMEOUT_VARIABLE: 1800,
+    STEP_TIMEOUT_VARIABLE: 600,
+    MANAGED_RECOVERY_VARIABLE: 1800,
+    STEP_WARNING_VARIABLE: 300,
+    LEASE_DURATION_VARIABLE: 180,
+}
+# Not window-settable, but the ordering rules are judged against them. The case
+# runs on a control worker whose other timing knobs are at their shipped
+# defaults (the preflight refuses any window variable that is already set); a
+# deployment that overrode the job lifetime or the branch rung count separately
+# would need these revisited.
+JOB_LIFETIME_SECONDS = 3600
+BRANCH_ESCALATION_MAX_RUNGS = 2
 # Reported alongside the window so a case can do its timing arithmetic against
 # what the deployed control plane actually reads. Never written by this helper.
 OBSERVED_VARIABLES = (
     "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
-    "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS",
     "GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS",
 )
 SURVEYED_VARIABLES = ALLOWED_VARIABLES + OBSERVED_VARIABLES
@@ -133,29 +180,130 @@ def parse_assignments(pairs: list[str]) -> dict[str, str]:
 
 
 def assignment_errors(assignments: dict[str, str]) -> list[str]:
-    """Cross-variable rules the two names cannot be checked apart from.
+    """Every cross-variable rule a ``--set`` combination has to satisfy.
 
-    ``claim_deadlines`` returns ``min(now + execution_timeout, lifetime)`` as
-    the execution deadline and the lifetime separately, and
-    ``step_bounds.workflow_deadline_failure`` only sets
-    ``workflow_lifetime_exceeded`` when ``now >= lifetime``. An execution
-    timeout below the lifetime therefore fires first and reports a plain
-    execution-deadline miss, so a window that compresses the lifetime without
-    keeping the execution timeout at or above it silently changes which
-    contract the run proves.
+    Compressing the node lifetime is not a one-variable change. The control
+    plane re-derives the whole timing envelope at boot in
+    ``execution/config.py``: ``ProductionExecutorConfig.from_mapping`` and
+    ``validate_timing_relationships`` refuse to construct a config -- so every
+    worker replica CrashLoopBackOffs and the rollout never converges -- unless
+    the compressed knobs stay internally ordered. That refusal used to surface
+    as an opaque rollout timeout in the middle of a live case; encoding the rules
+    here rejects the bad combination on the command line instead.
+
+    The partial ``--set`` is merged onto the shipped defaults (the preflight
+    guarantees the Deployment carries none of these variables yet), then judged:
+
+    Product-validity rules (a violation CrashLoopBackOffs the control plane):
+
+    * step timeout and managed-recovery ceilings must not exceed the node
+      lifetime -- ``validate_timing_relationships`` requires every non-ack step
+      waiting ceiling ``<= node_workflow_max_lifetime``.
+    * managed-recovery must not sit below the default step timeout -- a
+      per-operation override below the base step timeout is rejected by
+      ``from_mapping``.
+    * the step warning threshold must not exceed the step timeout
+      (``from_mapping``).
+    * the execution timeout must not exceed the node lifetime -- above it,
+      ``claim_deadlines`` silently truncates to the lifetime.
+    * the lease duration must stay strictly below the execution timeout, or a
+      dead executor holds the workflow record past its own deadline
+      (``validate_timing_relationships``).
+    * twice the managed-recovery ceiling must fit inside the job workflow
+      lifetime, so a reboot-then-delegate branch is not failed by the job bound
+      (``validate_timing_relationships``).
+
+    Drill-correctness rules (only when this window is compressing the lifetime,
+    i.e. the lifetime variable is being set):
+
+    * the execution timeout must not fall below the lifetime, or
+      ``claim_deadlines`` stamps ``min(execution, lifetime) = execution`` and the
+      failure carries ``workflow_lifetime_exceeded=false`` -- the opposite of
+      what the case proves. ``step_bounds.workflow_deadline_failure`` only sets
+      the flag when ``now >= lifetime``.
+    * the step timeout must not fall below the lifetime, or the WAITING step's
+      own bound ends the wait before the workflow lifetime does and the run
+      proves the step cap rather than the lifetime.
     """
 
-    lifetime = assignments.get(LIFETIME_VARIABLE)
-    timeout = assignments.get(EXECUTION_TIMEOUT_VARIABLE)
-    if lifetime is None or timeout is None:
-        return []
-    if int(timeout) < int(lifetime):
-        return [
-            f"{EXECUTION_TIMEOUT_VARIABLE}={timeout} is below "
-            f"{LIFETIME_VARIABLE}={lifetime}; the execution deadline would fire "
-            "first and the failure would not carry workflow_lifetime_exceeded"
-        ]
-    return []
+    merged = {
+        name: int(assignments.get(name, SHIPPED_DEFAULTS[name]))
+        for name in ALLOWED_VARIABLES
+    }
+    lifetime = merged[LIFETIME_VARIABLE]
+    execution = merged[EXECUTION_TIMEOUT_VARIABLE]
+    step_timeout = merged[STEP_TIMEOUT_VARIABLE]
+    managed = merged[MANAGED_RECOVERY_VARIABLE]
+    warning = merged[STEP_WARNING_VARIABLE]
+    lease = merged[LEASE_DURATION_VARIABLE]
+
+    errors: list[str] = []
+
+    # ---- product-validity: any violation refuses the control-plane boot ----
+    if step_timeout > lifetime:
+        errors.append(
+            f"{STEP_TIMEOUT_VARIABLE}={step_timeout} exceeds "
+            f"{LIFETIME_VARIABLE}={lifetime}; a step waiting ceiling above the "
+            "node lifetime makes the control plane refuse to boot "
+            "(config.validate_timing_relationships)"
+        )
+    if managed > lifetime:
+        errors.append(
+            f"{MANAGED_RECOVERY_VARIABLE}={managed} exceeds "
+            f"{LIFETIME_VARIABLE}={lifetime}; the managed-recovery ceiling is a "
+            "step waiting ceiling and must not exceed the node lifetime "
+            "(config.validate_timing_relationships)"
+        )
+    if managed < step_timeout:
+        errors.append(
+            f"{MANAGED_RECOVERY_VARIABLE}={managed} is below "
+            f"{STEP_TIMEOUT_VARIABLE}={step_timeout}; a per-operation override "
+            "may not sit below the default step timeout (config.from_mapping)"
+        )
+    if warning > step_timeout:
+        errors.append(
+            f"{STEP_WARNING_VARIABLE}={warning} exceeds "
+            f"{STEP_TIMEOUT_VARIABLE}={step_timeout}; the step warning threshold "
+            "may not exceed the step timeout (config.from_mapping)"
+        )
+    if execution > lifetime:
+        errors.append(
+            f"{EXECUTION_TIMEOUT_VARIABLE}={execution} exceeds "
+            f"{LIFETIME_VARIABLE}={lifetime}; an execution timeout above the node "
+            "lifetime is silently truncated to the lifetime by claim_deadlines"
+        )
+    if lease >= execution:
+        errors.append(
+            f"{LEASE_DURATION_VARIABLE}={lease} is not below "
+            f"{EXECUTION_TIMEOUT_VARIABLE}={execution}; a lease at or above the "
+            "execution timeout lets a dead executor hold the record past its "
+            "deadline (config.validate_timing_relationships)"
+        )
+    if BRANCH_ESCALATION_MAX_RUNGS * managed > JOB_LIFETIME_SECONDS:
+        errors.append(
+            f"{BRANCH_ESCALATION_MAX_RUNGS}x {MANAGED_RECOVERY_VARIABLE}="
+            f"{managed} exceeds the job workflow lifetime {JOB_LIFETIME_SECONDS}s; "
+            "a reboot-then-delegate branch would be failed by the job lifetime "
+            "(config.validate_timing_relationships)"
+        )
+
+    # ---- drill-correctness: only when the lifetime is being compressed ----
+    if LIFETIME_VARIABLE in assignments:
+        if execution < lifetime:
+            errors.append(
+                f"{EXECUTION_TIMEOUT_VARIABLE}={execution} is below "
+                f"{LIFETIME_VARIABLE}={lifetime}; the execution deadline would "
+                "fire first and the failure would not carry "
+                "workflow_lifetime_exceeded"
+            )
+        if step_timeout < lifetime:
+            errors.append(
+                f"{STEP_TIMEOUT_VARIABLE}={step_timeout} is below "
+                f"{LIFETIME_VARIABLE}={lifetime}; the WAITING step's own cap "
+                "could end the wait before the workflow lifetime does"
+            )
+
+    return errors
 
 
 def open_arguments(assignments: dict[str, str]) -> list[str]:
