@@ -608,8 +608,11 @@ def test_every_delivery_in_one_attempt_counts_as_progress() -> None:
         "/v1/workload-observations",
         "/v1/attempts/failure-detected",
         "/v1/attempts/terminal",
+        # The completed pass closes with its coverage heartbeat, which is a
+        # delivery like any other and must stamp progress too.
+        "/v1/attempts/coverage",
     ], f"the shipped configuration delivers three events per failing attempt: {paths}"
-    assert [status for _, status, _ in sink.health] == [200, 200, 200], (
+    assert [status for _, status, _ in sink.health] == [200, 200, 200, 200], (
         f"each returned delivery is progress: {sink.health}"
     )
 

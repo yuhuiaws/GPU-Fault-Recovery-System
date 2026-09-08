@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -22,6 +23,7 @@ from gpu_fault.completion_attempt_state import (
     AttemptSpec,
     cache_terminal_attempt_observation,
     publish_attempt_observation,
+    publish_coverage_heartbeat,
     restore_persisted_attempt_observations,
 )
 from gpu_fault.completion_metrics_server import start_completion_metrics_server
@@ -637,6 +639,7 @@ class KubernetesCompletionController:
         gpu_uuid_resolver: (Callable[[dict[str, Any], str], list[str]] | None) = None,
         terminal_retention_seconds: int = 3600,
         watcher_max_attempts: int = 10000,
+        watcher_instance: str | None = None,
     ) -> None:
         if not cluster_id:
             raise CompletionControllerError("cluster_id is required")
@@ -674,6 +677,10 @@ class KubernetesCompletionController:
         self.emergency_fallback_seconds = emergency_fallback_seconds
         self.reconcile_debounce_seconds = reconcile_debounce_seconds
         self.publish_observations = publish_observations
+        # Names the process in its coverage heartbeats so an operator can
+        # tell a heartbeat from a watcher a rollout has replaced from a
+        # current one. Never read by the resolver.
+        self.watcher_instance = watcher_instance or socket.gethostname()
         self.observation_only = ObservationOnlyTracker(
             observe_unmanaged_workloads,
             observation_runtime_profile_version,
@@ -737,6 +744,17 @@ class KubernetesCompletionController:
         self.started_at: datetime = self.now()
         self.last_progress_at: datetime = self.started_at
         self.last_cycle_completed_at: datetime | None = None
+        # Coverage heartbeats (F4): an idle cluster publishes no observation,
+        # so a completed full pass says so explicitly and the control plane can
+        # answer IDLE instead of UNKNOWN. Weak evidence by design: it rides the
+        # ordinary sink, never the critical outbox, and a lost one is counted
+        # and forgotten because the next pass restates it.
+        self.coverage_heartbeats_total = 0
+        self.coverage_heartbeat_failures_total = 0
+        self.last_coverage_heartbeat_at: datetime | None = None
+        # The list revision the most recent relist started from; operator
+        # context carried in the heartbeat, not an input to any decision.
+        self._last_resource_version: str | None = None
         # One reconcile at a time per process (F5). The lock used to be a
         # per-cycle local, so a debounce timer still inside ``_reconcile`` ran
         # concurrently with the next cycle's full pass. It is an ``RLock`` so
@@ -841,11 +859,12 @@ class KubernetesCompletionController:
         self.last_progress_at = self.now()
 
     def run_once(self) -> list[dict[str, Any]]:
-        pods, _ = list_completion_pods(
+        pods, resource_version = list_completion_pods(
             self.core_api,
             self.namespace,
             self.observation_only.enabled,
         )
+        self._last_resource_version = resource_version
         self.note_progress()
         return self._reconcile(pods)
 
@@ -923,6 +942,12 @@ class KubernetesCompletionController:
             # value humans alert on, and only a pass that relisted every Pod
             # moves it.
             self.last_cycle_completed_at = self.now()
+            publish_coverage_heartbeat(
+                self,
+                watched_pods=len(pods),
+                watched_attempts=len(grouped),
+                resource_version=self._last_resource_version,
+            )
         return results
 
     def _evict_pruned_attempts(self, grouped: dict[str, list[dict[str, Any]]]) -> None:
@@ -1287,6 +1312,7 @@ class KubernetesCompletionController:
             self.namespace,
             self.observation_only.enabled,
         )
+        self._last_resource_version = resource_version
         self.note_progress()
         serialized = [self.serializer(item) for item in pods]
         cache = {self._pod_key(pod): pod for pod in serialized}

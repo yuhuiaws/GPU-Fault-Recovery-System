@@ -97,6 +97,22 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
         "terminal was published for an attempt that was still alive.",
     ),
     (
+        "gpu_fault_completion_watcher_coverage_heartbeats_total",
+        "coverage_heartbeats_total",
+        "Coverage heartbeats the control plane accepted: one per completed "
+        "full pass, the statement that lets an idle cluster read IDLE instead "
+        "of UNKNOWN. A flat line while passes keep completing means every "
+        "node-mutating plan on this cluster will be BLOCKED.",
+    ),
+    (
+        "gpu_fault_completion_watcher_coverage_heartbeat_failures_total",
+        "coverage_heartbeat_failures_total",
+        "Coverage heartbeats that could not be delivered. Each one is dropped "
+        "rather than retried -- the next pass restates coverage -- so a low "
+        "rate is harmless and a rate near one per pass is the same outage as "
+        "a flat accepted counter.",
+    ),
+    (
         "gpu_fault_completion_outbox_append_failures_total",
         "outbox_append_failures_total",
         "Critical completion events whose write-ahead ConfigMap copy could "
@@ -126,7 +142,7 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-# (metric name, controller attribute, help text) for the two timestamps.
+# (metric name, controller attribute, help text) for the loop's timestamps.
 TIMESTAMPS: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_watcher_last_cycle_completed_timestamp",
@@ -135,6 +151,13 @@ TIMESTAMPS: tuple[tuple[str, str, str], ...] = (
         "before the first one. Only a pass that relisted every Pod moves it. "
         "This is the value humans alert on -- it can legitimately lag by more "
         "than one watch timeout, so it is not what /healthz judges.",
+    ),
+    (
+        "gpu_fault_completion_watcher_last_coverage_heartbeat_timestamp",
+        "last_coverage_heartbeat_at",
+        "Unix seconds at which the control plane last accepted a coverage "
+        "heartbeat; 0 before the first one. Older than the resolver's coverage "
+        "window means this cluster now reads UNKNOWN.",
     ),
     (
         "gpu_fault_completion_watcher_last_progress_timestamp",

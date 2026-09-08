@@ -12,6 +12,10 @@ from gpu_fault.completion_observation import (
     TERMINAL_ORIGIN_OBSERVED,
 )
 from gpu_fault.models import Environment, TerminalEvent
+from gpu_fault.telemetry import (
+    ATTEMPT_COVERAGE_PATH,
+    WorkloadCoverageHeartbeat,
+)
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
@@ -142,6 +146,51 @@ def cache_terminal_attempt_observation(
             origin,
         ),
     )
+
+
+def publish_coverage_heartbeat(
+    controller: Any,
+    *,
+    watched_pods: int,
+    watched_attempts: int,
+    resource_version: str | None,
+) -> None:
+    """Tell the control plane this pass watched the whole cluster (F4).
+
+    Only a completed full pass calls this, which is what makes the
+    statement true: a pass that raised never reaches it, and a debounced
+    pass over one attempt looked at one attempt. A watcher that does not
+    publish observations stays silent as well -- claiming coverage while
+    the control plane cannot see the attempts that *are* running would turn
+    a busy node into an IDLE one, which is the fail-open direction.
+
+    Delivery failures are counted and dropped: the heartbeat is weak
+    evidence with a natural retry (the next pass), and a control plane that
+    is refusing writes must not also fail the reconcile.
+    """
+
+    if not controller.publish_observations:
+        return
+    heartbeat = WorkloadCoverageHeartbeat(
+        cluster_id=controller.cluster_id,
+        observed_at=controller.now(),
+        watched_pods=watched_pods,
+        watched_attempts=watched_attempts,
+        resource_version=resource_version,
+        watcher_instance=controller.watcher_instance,
+    )
+    try:
+        controller.sink.post(ATTEMPT_COVERAGE_PATH, heartbeat.model_dump(mode="json"))
+    except Exception:
+        controller.coverage_heartbeat_failures_total += 1
+        LOGGER.warning(
+            "cannot publish coverage heartbeat for cluster %s",
+            controller.cluster_id,
+            exc_info=True,
+        )
+        return
+    controller.coverage_heartbeats_total += 1
+    controller.last_coverage_heartbeat_at = heartbeat.observed_at
 
 
 def publish_attempt_observation(
