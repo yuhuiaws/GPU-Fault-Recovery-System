@@ -39,6 +39,13 @@ from gpu_fault.adapters.kubernetes.primitives import (
     patch_node_with_retry,
 )
 
+# The warm-spare pool's declaration (``hyperpod_spares``): a labeled node whose
+# pool state is not ALLOCATED is an unreserved spare and must stay cordoned.
+SPARE_LABEL = "gpu-fault.io/spare"
+SPARE_LABEL_VALUE = "true"
+SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
+SPARE_POOL_STATE_ALLOCATED = "ALLOCATED"
+
 LOGGER = logging.getLogger(__name__)
 
 ANNOTATION_EFA_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/efa-plugin-restart-incident"
@@ -496,6 +503,16 @@ class KubernetesNodeOperationsMixin:
             },
         )
 
+    def _unreserved_spare(self, node: Any) -> bool:
+        """A node declared as a warm spare that no incident currently holds
+        (pool state anything but ALLOCATED)."""
+
+        if self._labels(node).get(SPARE_LABEL) != SPARE_LABEL_VALUE:
+            return False
+        return self._annotations(node).get(SPARE_POOL_STATE_ANNOTATION) != (
+            SPARE_POOL_STATE_ALLOCATED
+        )
+
     def _gpu_fault_isolated(self, node: Any) -> bool:
         annotations = self._annotations(node)
         return (
@@ -536,6 +553,16 @@ class KubernetesNodeOperationsMixin:
             ).lower()
             == "true"
         )
+        if self._unreserved_spare(node):
+            # A declared warm spare that no incident holds must stay cordoned:
+            # "unreserved spare is schedulable" fails the pool's health check
+            # and nothing else re-cordons it. Live 2026-09-08 (DESTR-003): the
+            # spare was uncordoned by its failover, then quarantined by the
+            # escalation, then released to the pool while still quarantined;
+            # the validated restore that cleared the quarantine read
+            # previous-unschedulable=false and uncordoned it, leaving a
+            # labeled, schedulable spare no supported path would cordon again.
+            was_unschedulable = True
         return {
             "metadata": {
                 "resourceVersion": self._resource_version(node),

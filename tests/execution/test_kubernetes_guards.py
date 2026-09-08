@@ -661,3 +661,53 @@ def test_isolate_and_restore_record_the_node_scheduling_baseline() -> None:
     assert "gpu-fault.io/quarantined" in baseline["before"]["taint_keys"]
     assert baseline["after"]["unschedulable"] is False
     assert "gpu-fault.io/quarantined" not in baseline["after"]["taint_keys"]
+
+
+def test_restore_keeps_an_unreserved_warm_spare_cordoned() -> None:
+    """Live 2026-09-08 (DESTR-003): a declared spare, uncordoned by its
+    failover and later quarantined, was restored with previous-unschedulable
+    false and left labeled but schedulable -- a state the pool health check
+    refuses and no supported path re-cordons. An unreserved spare stays
+    cordoned; only the quarantine and ownership come off."""
+    store = build_store()
+    context = _context(store, WorkflowOperation.RESTORE_SCHEDULING)
+    core = _isolated_node(context.incident.incident_id)
+    core.node["metadata"]["labels"] = {"gpu-fault.io/spare": "true"}
+    core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] = "AVAILABLE"
+
+    outcome = _adapter(core).execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED
+    assert core.node["spec"]["unschedulable"] is True, (
+        "an unreserved spare stays cordoned"
+    )
+    assert "gpu-fault.io/incident-id" not in core.node["metadata"]["annotations"]
+    assert not any(
+        item["key"] == "gpu-fault.io/quarantined"
+        for item in core.node["spec"]["taints"]
+    ), "the quarantine still comes off"
+    assert core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] == (
+        "AVAILABLE"
+    ), "the pool state is the pool's to change, not the restore's"
+
+
+def test_restore_uncordons_an_allocated_spare_and_an_ordinary_node() -> None:
+    """A spare ALLOCATED to an incident is serving as the replacement node and
+    is uncordoned like any other node; so is a node without the spare label."""
+    for labels, pool_state in (
+        ({"gpu-fault.io/spare": "true"}, "ALLOCATED"),
+        ({}, None),
+    ):
+        store = build_store()
+        context = _context(store, WorkflowOperation.RESTORE_SCHEDULING)
+        core = _isolated_node(context.incident.incident_id)
+        core.node["metadata"]["labels"] = labels
+        if pool_state:
+            core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] = (
+                pool_state
+            )
+
+        outcome = _adapter(core).execute(context)
+
+        assert outcome.status is WorkflowStepStatus.SUCCEEDED
+        assert core.node["spec"]["unschedulable"] is False, (labels, pool_state)
