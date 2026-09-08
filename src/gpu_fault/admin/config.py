@@ -1121,6 +1121,10 @@ def prepare_admin_config_apply(
     normalized_reference = reference.strip()
     if not SHA256_PATTERN.fullmatch(normalized_digest):
         raise AdminConfigError("reviewed admin config plan SHA-256 is invalid")
+    if not normalized_reference:
+        # ``--reference`` is optional at parse time only so the read-only
+        # ``config spare`` check needs none; an apply is refused without it.
+        raise AdminConfigError("admin config apply requires --reference")
     if not APPROVAL_PATTERN.fullmatch(normalized_reference):
         raise AdminConfigError("admin config approval reference has an invalid format")
     with admin_config_lock(state_dir):

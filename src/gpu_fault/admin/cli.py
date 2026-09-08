@@ -93,6 +93,7 @@ from gpu_fault.admin.grafana import (
 from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.models import BlockedKind
+from gpu_fault.admin import warm_spare
 from gpu_fault.admin.workflow_reconcile import (
     RECONCILE_MODES,
     run_workflow_reconcile_mode,
@@ -352,12 +353,7 @@ def _add_admin_config_command(commands: Any) -> None:
         ),
         help="validate and apply an audited administrator configuration",
     )
-    config.add_argument(
-        "--state-dir",
-        required=True,
-        type=Path,
-        metavar="STATE_DIR",
-    )
+    config.add_argument("--state-dir", type=Path, metavar="STATE_DIR")
     config.add_argument(
         "--file",
         dest="admin_config_file",
@@ -368,7 +364,6 @@ def _add_admin_config_command(commands: Any) -> None:
     _add_capacity_options(config)
     config.add_argument(
         "--reference",
-        required=True,
         metavar="REFERENCE",
         help="approved change or maintenance-window reference",
     )
@@ -377,6 +372,7 @@ def _add_admin_config_command(commands: Any) -> None:
         action="store_true",
         help="validate and print the internal change plan without applying it",
     )
+    warm_spare.add_config_spare_command(config)
 
 
 def _add_workflow_reconcile_command(commands: Any) -> None:
@@ -1225,6 +1221,8 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="config")
     assert site_file is not None
     site = load_site(site_file)
+    if getattr(arguments, "config_action", None) == "spare":
+        return warm_spare.run_config_spare_command(arguments, site=site)
     release_identity = _current_release_metadata(site.repository_root)
     site_identity = _admin_config_site_identity(site)
     current = load_desired_admin_config(
@@ -1286,7 +1284,7 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     prepared = prepare_admin_config_apply(
         arguments.state_dir,
         expected_plan_sha256=plan_sha256,
-        reference=arguments.reference,
+        reference=arguments.reference or "",
         current_release_identity=release_identity,
     )
     write_admin_config_file(
