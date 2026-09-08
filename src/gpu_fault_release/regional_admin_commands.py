@@ -520,6 +520,12 @@ def stage_noop_release(release: Any) -> None:
         )
     release._ensure_contexts()
     release._require_cpu_secrets()
+    # The admin `deploy` fast path lands here for an unchanged release, so this
+    # is where GpuFaultCompletionActiveStateUnavailable is recovered from: the
+    # watcher's missing state ConfigMap and its ClusterRole come back without
+    # anyone applying the unrendered manifest by hand.
+    for target in release.config.clusters:
+        release._reassert_completion_watcher_state(target)
     release.state = dict(state)
     release._save_state(
         "complete",

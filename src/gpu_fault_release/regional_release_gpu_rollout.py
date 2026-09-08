@@ -495,6 +495,47 @@ def preserve_completion_watcher_state(
     return yaml.safe_dump_all(documents, sort_keys=False)
 
 
+#: The Completion Watcher objects a NOOP release re-asserts: its state
+#: ConfigMaps (only the missing ones survive ``preserve_completion_watcher_state``)
+#: and the ClusterRole/ClusterRoleBinding whose ``resourceNames`` grant it access
+#: to them. Never the Deployment: that is what a component rollout owns.
+COMPLETION_WATCHER_STATE_KINDS = frozenset(
+    {"ConfigMap", "ClusterRole", "ClusterRoleBinding"}
+)
+
+
+def reassert_completion_watcher_state(release: Any, target: ClusterTarget) -> None:
+    """Re-create the watcher's missing state objects without touching its Pod.
+
+    ``GpuFaultCompletionActiveStateUnavailable`` means the ``-active`` ConfigMap
+    or the ClusterRole naming it is gone (the watcher has no ``create``, by
+    design). The component digest gate only re-applies the watcher manifest
+    when its inputs changed, so an unchanged release had no sanctioned way to
+    put the two objects back -- and ``kubectl apply`` of the unrendered file
+    would recreate the Deployment on the placeholder image. This renders the
+    manifest exactly as a rollout would, keeps the state objects and the RBAC
+    pair, and applies them; ConfigMaps that exist are stripped first, so live
+    records are never overwritten with the manifest's empty defaults.
+    """
+    manifests = _gpu_deployment_manifests(
+        release,
+        target,
+        release.executor_wheel_cm,
+        deployment_names=frozenset({inventory.GPU_WATCHER_DEPLOYMENT}),
+        require_live_pin=False,
+    )
+    documents = [
+        document
+        for document in yaml.safe_load_all(manifests[inventory.GPU_WATCHER_DEPLOYMENT])
+        if isinstance(document, dict)
+        and document.get("kind") in COMPLETION_WATCHER_STATE_KINDS
+    ]
+    release.runner.run(
+        release._gpu(target, "apply", "-f", "-"),
+        input_text=yaml.safe_dump_all(documents, sort_keys=False),
+    )
+
+
 def agents_converged(
     items: list[dict[str, Any]],
     target: ClusterTarget,

@@ -92,6 +92,7 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     apply_gpu_deployments,
     join_target,
     preflight_gpu_deployments,
+    reassert_completion_watcher_state,
     upgrade_gpu_target,
 )
 from gpu_fault_release.regional_release_gpu_rollout import (
@@ -493,6 +494,7 @@ class RegionalRelease:
     _cancel_active_installer_jobs = cancel_active_installer_jobs
     _apply_gpu_deployments = apply_gpu_deployments
     _preflight_gpu_deployments = preflight_gpu_deployments
+    _reassert_completion_watcher_state = reassert_completion_watcher_state
     _apply_nlb = apply_control_plane_nlb
     _bootstrap_cpu_is_current = bootstrap_cpu_is_current
     _capture_previous = capture_previous
@@ -765,6 +767,7 @@ class RegionalRelease:
         if diff.kind is ReleaseChangeKind.NOOP:
             execution = [
                 "run read-only CPU/GPU verifiers",
+                "re-assert the Completion Watcher state objects on every GPU cluster",
                 "skip artifact upload, schema, endpoint, DCGM and rollouts",
             ]
         elif diff.kind is ReleaseChangeKind.CONTROL_PLANE_ONLY:
@@ -1004,6 +1007,11 @@ class RegionalRelease:
     def noop(self, diff: ReleaseDiff) -> None:
         self._ensure_contexts()
         self._require_cpu_secrets()
+        # The only sanctioned way to put a deleted watcher state ConfigMap or
+        # ClusterRole back on an unchanged release (the component digest gate
+        # would otherwise never touch the watcher again).
+        for target in self.config.clusters:
+            self._reassert_completion_watcher_state(target)
         self._validate_release()
         self._save_state("complete", release_diff=diff.as_dict())
 
@@ -1018,14 +1026,7 @@ class RegionalRelease:
         preferred_key: str,
     ) -> str:
         value = self._get_json(
-            kubectl
-            + [
-                "-n",
-                self.config.namespace,
-                "get",
-                "configmap",
-                name,
-            ]
+            kubectl + ["-n", self.config.namespace, "get", "configmap", name]
         )
         found = artifact_binary_sha(value.get("binaryData") or {}, preferred_key)
         if found is None:

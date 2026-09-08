@@ -156,11 +156,17 @@ groups:
             restart in this window re-derives its attempts from live Pods only:
             a fault on an attempt whose Pods are already gone then resolves the
             node as IDLE instead of ACTIVE, and the reset plan built from that
-            would skip STOP_WORKLOADS. Apply
-            deploy/dataplane/completion-watcher.yaml -- both its ConfigMap and
-            its Role -- and nothing else; the watcher retries once a minute by
-            itself, so no restart is needed and the gauge clears on the first
-            call that succeeds.
+            would skip STOP_WORKLOADS. Recover with the deploy command, not
+            kubectl: from the deployed release checkout with no pending
+            changes run `gpu-fault-admin deploy --state-dir STATE_DIR`; its
+            NOOP release re-creates the missing state ConfigMap and re-applies
+            the ClusterRole on every GPU cluster and touches nothing else.
+            Never `kubectl apply` deploy/dataplane/completion-watcher.yaml on
+            a live cluster: the unrendered Deployment recreates the watcher on
+            the placeholder image and loses the very attempt memory this alert
+            protects. The watcher retries once a minute by itself, so no
+            restart is needed and the gauge clears on the first call that
+            succeeds.
       # Same scrape dependency as the rule above: nothing scrapes port 9109
       # yet, so this one is inert until a data-plane scrape path exists.
       # The write-ahead copy is what lets a critical completion event survive a

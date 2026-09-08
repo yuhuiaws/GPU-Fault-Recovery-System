@@ -713,3 +713,30 @@ def test_the_keep_list_admits_the_completion_incident_and_finding_families() -> 
     ]
 
     assert MODULE.keep_filter_defects(scrapes, probe) == []
+
+
+def test_the_active_state_alert_names_the_sanctioned_recovery() -> None:
+    """The description must not send the operator to ``kubectl apply`` the manifest.
+
+    ``deploy/dataplane/completion-watcher.yaml`` is unrendered: applying it on a
+    production cluster puts the Deployment back on the placeholder image and
+    wheel volume (regional rendering substitutes both), which recreates the
+    watcher into a CrashLoop and loses the attempt memory the alert is about.
+    The sanctioned path is the admin deploy command: its NOOP release re-asserts
+    the state ConfigMaps and the ClusterRole and touches nothing else.
+    """
+    description = str(
+        _rule("GpuFaultCompletionActiveStateUnavailable")["annotations"]["description"]
+    )
+
+    assert "kubectl apply -f deploy/dataplane" not in description, (
+        "the alert tells the operator to apply the unrendered manifest: " + description
+    )
+    assert "gpu-fault-admin deploy" in description, (
+        "the alert must name the sanctioned recovery command: " + description
+    )
+    for rule in amp_rules():
+        text = str((rule.get("annotations") or {}).get("description") or "")
+        assert "kubectl apply -f deploy/" not in text, (
+            f"{rule['alert']} tells the operator to apply an unrendered manifest"
+        )
