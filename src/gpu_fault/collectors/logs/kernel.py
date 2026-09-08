@@ -73,8 +73,9 @@ DELIVERY_JOIN_TIMEOUT_SECONDS = 5.0
 #: The budget is checked between records, so the drain's upper bound is this
 #: budget plus ONE single-attempt post (``HttpEventSink.deliver_once``, bounded
 #: by ``GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS``, 10 s by default), plus the
-#: ``DELIVERY_JOIN_TIMEOUT_SECONDS`` join before it: 5 + 10 + 5 = 20 s at the
-#: defaults. ``deploy/systemd/gpu-fault-kernel-collector.service`` states its
+#: ``DELIVERY_JOIN_TIMEOUT_SECONDS`` join before it, plus the ≤ 1 s ``select``
+#: and ≤ 1 s reopen sleep the main loop may be inside when SIGTERM lands:
+#: 2 + 5 + 5 + 10 = 22 s at the defaults. ``deploy/systemd/gpu-fault-kernel-collector.service`` states its
 #: ``TimeoutStopSec`` from this sum; change one and the other.
 DELIVERY_DRAIN_BUDGET_SECONDS = 5.0
 

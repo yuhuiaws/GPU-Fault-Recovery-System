@@ -194,7 +194,8 @@ def dcgm_collector(sink: RecordingSink) -> DcgmMetricsCollector:
         node_id=NODE_ID,
         metrics_url=MOCK_URL,
     )
-    collector._temperature_limit_samples = []
+    # The test endpoint validates exporter parsing; the bounded temperature-limit
+    # probe runs against the host's nvidia-smi and yields no samples without it.
     return collector
 
 

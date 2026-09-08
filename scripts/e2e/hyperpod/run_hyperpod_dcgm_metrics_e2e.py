@@ -151,9 +151,8 @@ def collect(
         node_id=node_id,
         metrics_url=MOCK_URL,
     )
-    # The test endpoint validates exporter parsing; device limits require
-    # nvidia-smi and are covered by node-side integration separately.
-    collector._temperature_limit_samples = []
+    # The test endpoint validates exporter parsing; the bounded temperature-limit
+    # probe runs against the host's nvidia-smi and yields no samples without it.
     batch = collector.collect_once()
     result = sink.last_response
     result["collector_batch_id"] = batch.batch_id
