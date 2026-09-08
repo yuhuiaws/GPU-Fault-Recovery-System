@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import socket
 import ssl
 import time
@@ -10,9 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 from typing import Any, Callable
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
+
+from pydantic import ValidationError
 
 from gpu_fault.adapters import (
     HyperPodLifecycleStepAdapter,
@@ -92,6 +95,83 @@ class ClusterExecutorError(RuntimeError):
         self.status_code = status_code
 
 
+class ClusterExecutorClaimError(ClusterExecutorError):
+    """The claim round trip itself failed, so no command was executed.
+
+    ``run()`` used to log every ``run_once`` exception as "claim failed",
+    including a result that could not be posted and a claim response the
+    executor could not use -- which pointed the operator at the wrong side of
+    the wire. Everything else that can still leave ``run_once`` is a defect
+    after the claim, and says so.
+    """
+
+
+# Reporting a result is not a fire-once operation: the action has already run
+# on the cluster, so a dropped connection on the result post costs a whole
+# lease of latency and then a second execution after the command is re-claimed.
+# Three attempts is enough for the baseline "Remote end closed connection"
+# (~1/min) and for a control-plane rollout's 503 window, and short enough that
+# the lease (>= 10 s, 120 s in production) is still ours while retrying.
+_RESULT_REPORT_ATTEMPTS = 3
+_RESULT_REPORT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+_RETRYABLE_REPORT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# Transport failures reach the caller as several unrelated families, and only
+# HTTPError used to be converted. ``socket.timeout`` is an alias of
+# ``TimeoutError`` on 3.12 and is named here for readers, not for coverage.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    URLError,
+    TimeoutError,
+    socket.timeout,
+    ssl.SSLError,
+    ConnectionError,
+)
+
+
+def _retryable_report_failure(exc: BaseException) -> bool:
+    """Whether re-posting a result could plausibly land.
+
+    Retry only failures that carry no verdict about the result: no HTTP status
+    at all (the request never got an answer), or one of the statuses that means
+    "not now". A 403, 409 or 422 is the control plane's decision -- re-sending
+    it would just be refused again.
+    """
+
+    if isinstance(exc, ClusterExecutorError):
+        return (
+            exc.status_code is None or exc.status_code in _RETRYABLE_REPORT_STATUS_CODES
+        )
+    return isinstance(exc, _TRANSPORT_ERRORS)
+
+
+def _report_backoff_seconds(attempt: int) -> float:
+    """Jittered delay before report attempt ``attempt + 1``.
+
+    Jitter matters here because both replicas can be reporting into the same
+    control-plane rollout window; an un-jittered 0.5/1/2 retries in lockstep.
+    """
+
+    base = _RESULT_REPORT_BACKOFF_SECONDS[
+        min(attempt, len(_RESULT_REPORT_BACKOFF_SECONDS)) - 1
+    ]
+    return base + random.random() * (base / 2)
+
+
+def _validation_summary(exc: ValidationError) -> str:
+    """A bounded, operator-readable summary of why a payload did not parse.
+
+    ``str(ValidationError)`` for a rejected enum value prints every accepted
+    member, which is far too long for a result the control plane stores and an
+    operator reads in a step's error field.
+    """
+
+    parts: list[str] = []
+    for error in exc.errors()[:3]:
+        location = ".".join(str(item) for item in error.get("loc", ())) or "<root>"
+        parts.append(f"{location}: {str(error.get('msg', ''))[:120]}")
+    detail = "; ".join(parts) or "no field-level detail"
+    return ("this executor could not parse the claimed command: " + detail)[:500]
+
+
 def _persistent_store_from_environment():
     store_url = os.getenv("GPU_FAULT_STORE_URL", "").strip()
     if not store_url:
@@ -162,6 +242,38 @@ class RegionalExecutorClient:
             raise ClusterExecutorError(f"{name} must not contain control characters")
         return cleaned
 
+    def _send(self, request: Request) -> bytes:
+        """One control-plane round trip; every failure becomes one exception type.
+
+        Only ``HTTPError`` used to be converted, so every caller of this client
+        and of the regional proxies built on it had a second, unhandled
+        exception family to know about: a ``URLError``, a read timeout or a TLS
+        error propagated raw. That is how a timeout on the result post escaped
+        the command worker thread, failed ``run_once``, and left the command
+        LEASED until it expired and was executed a second time. A failure with
+        no answer at all carries ``status_code=None``, which is what callers
+        read as "no verdict from the control plane, safe to retry".
+        """
+
+        try:
+            with urlopen(
+                request,
+                timeout=self.timeout_seconds,
+                ssl_context=self.ssl_context,
+            ) as response:
+                body: bytes = response.read()
+                return body
+        except HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise ClusterExecutorError(
+                f"regional control plane rejected request ({exc.code}): {detail}",
+                status_code=exc.code,
+            ) from exc
+        except _TRANSPORT_ERRORS as exc:
+            raise ClusterExecutorError(
+                f"regional control plane request failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
     def _post(self, path: str, payload: dict) -> dict:
         request = Request(
             self.base_url + path,
@@ -173,19 +285,7 @@ class RegionalExecutorClient:
             },
             method="POST",
         )
-        try:
-            with urlopen(
-                request,
-                timeout=self.timeout_seconds,
-                ssl_context=self.ssl_context,
-            ) as response:
-                return json.loads(response.read() or b"{}")
-        except HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise ClusterExecutorError(
-                f"regional control plane rejected request ({exc.code}): {detail}",
-                status_code=exc.code,
-            ) from exc
+        return json.loads(self._send(request) or b"{}")
 
     def _get(self, path: str) -> Any:
         request = Request(
@@ -196,19 +296,7 @@ class RegionalExecutorClient:
             },
             method="GET",
         )
-        try:
-            with urlopen(
-                request,
-                timeout=self.timeout_seconds,
-                ssl_context=self.ssl_context,
-            ) as response:
-                return json.loads(response.read() or b"null")
-        except HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise ClusterExecutorError(
-                f"regional control plane rejected request ({exc.code}): {detail}",
-                status_code=exc.code,
-            ) from exc
+        return json.loads(self._send(request) or b"null")
 
     def claim(
         self,
@@ -231,7 +319,82 @@ class RegionalExecutorClient:
             "/v1/regional/executors/claim",
             payload.model_dump(mode="json"),
         )
-        return RemoteCommandClaim.model_validate(response).commands
+        return self._claimed_commands(response)
+
+    def _claimed_commands(self, response: dict[str, Any]) -> list[RemoteActionCommand]:
+        """Parse each claimed command on its own, failing only the unparseable.
+
+        The control plane commits the leases before this executor validates
+        anything, so validating the batch as one document made a single command
+        this build cannot parse (a value added to an enum, a
+        control-plane-only field, a hotfix build past the compatibility digest)
+        drop every command leased alongside it. Those commands then expired
+        together, were re-claimed together with the poison command, and failed
+        again -- with no verdict ever reaching the workflow that owns it.
+
+        A response that is not even shaped like a claim is a different failure
+        and still raises: claiming nothing would be indistinguishable from an
+        empty queue.
+        """
+
+        raw_commands = response.get("commands")
+        if not isinstance(raw_commands, list):
+            return list(RemoteCommandClaim.model_validate(response).commands)
+        commands: list[RemoteActionCommand] = []
+        for item in raw_commands:
+            try:
+                commands.append(RemoteActionCommand.model_validate(item))
+            except ValidationError as exc:
+                self._reject_unparseable_command(item, exc)
+        return commands
+
+    def _reject_unparseable_command(self, item: Any, exc: ValidationError) -> None:
+        """Fail one command this executor cannot parse, on its own lease."""
+
+        command_id = item.get("command_id") if isinstance(item, dict) else None
+        lease_token = item.get("lease_token") if isinstance(item, dict) else None
+        summary = _validation_summary(exc)
+        if not isinstance(command_id, str) or not command_id:
+            LOGGER.error(
+                "regional claim returned a command this executor cannot even "
+                "identify, so it cannot be failed either: %s",
+                summary,
+            )
+            return
+        LOGGER.error(
+            "regional cluster executor cannot parse a claimed command; "
+            "failing it instead of dropping its batch: command=%s: %s",
+            command_id,
+            summary,
+        )
+        if not isinstance(lease_token, str) or not lease_token:
+            # Without the lease token the control plane must reject the
+            # result, so the command is left to expire rather than posted.
+            LOGGER.error(
+                "the unparseable command carried no lease token, so it can "
+                "only expire: command=%s",
+                command_id,
+            )
+            return
+        try:
+            self._post(
+                "/v1/regional/executors/" + quote(command_id, safe="") + "/result",
+                RemoteCommandResult(
+                    lease_token=lease_token,
+                    status=RemoteCommandStatus.FAILED,
+                    status_source="executor-rejected",
+                    error=summary,
+                ).model_dump(mode="json"),
+            )
+        except Exception:
+            # The command keeps its lease and expires; the next claim tries
+            # again. Never let this fail the rest of the batch -- the whole
+            # point of this method is that the siblings' leases were already
+            # committed by the control plane.
+            LOGGER.exception(
+                "could not report the unparseable command as failed: command=%s",
+                command_id,
+            )
 
     def readiness(
         self,
@@ -350,7 +513,11 @@ class RegionalFleetRegistry:
                 + quote(node_id, safe="")
             )
         except ClusterExecutorError as exc:
-            if "(404)" in str(exc):
+            # By status, not by message text: any error body that happened to
+            # quote "(404)" -- an upstream's own status, a proxy's detail
+            # string -- used to read as "this node has no agent record", which
+            # is a permanent verdict built out of a transient failure.
+            if exc.status_code == 404:
                 raise KeyError((cluster_id, node_id)) from exc
             raise
         return AgentRecord.model_validate(response)
@@ -755,6 +922,7 @@ class ClusterActionExecutor:
         claim_state_path: str | None = None,
         lease_renewal_failure_limit: int = 3,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
         spare_reservation_sweep: SpareReservationSweep | None = None,
     ) -> None:
         if poll_seconds <= 0:
@@ -781,6 +949,10 @@ class ClusterActionExecutor:
             )
         self.lease_renewal_failure_limit = lease_renewal_failure_limit
         self.clock = clock
+        # Only the report backoff sleeps inside a command's own thread, so it
+        # is injectable: a test must not really wait half a second to prove the
+        # retry happened.
+        self.sleep = sleep
         self.spare_reservation_sweep = spare_reservation_sweep
         self.client = client
         self.adapters = adapters
@@ -809,6 +981,14 @@ class ClusterActionExecutor:
         # Liveness and observability counters. A regional executor can be
         # Ready and claiming nothing at all, so operators need a signal
         # that is tied to actual work rather than to process startup.
+        #
+        # Every one of them is written from more than one thread -- the claim
+        # loop, one worker per claimed command, one lease renewer per command
+        # -- and ``x += 1`` is a read and a write with a bytecode boundary in
+        # between, so concurrent increments were silently lost and the
+        # breadcrumb under-reported exactly when the executor was busiest.
+        # ``_increment`` is the only way they change.
+        self._counter_lock = Lock()
         self.claimed_total = 0
         self.reported_failures = 0
         self.unexpected_failures = 0
@@ -847,15 +1027,26 @@ class ClusterActionExecutor:
             None,
         )
 
+    def _increment(self, counter: str, amount: int = 1) -> None:
+        """Add to one shared counter under the counter lock."""
+
+        with self._counter_lock:
+            setattr(self, counter, getattr(self, counter) + amount)
+
     def metrics_snapshot(self) -> dict[str, Any]:
         """Every executor counter, for the claim breadcrumb and operators.
 
         The executor Pod has no /metrics listener of its own; the readiness
         probe already reads the claim-state breadcrumb out of process, so the
         counters ride along in that file (``kubectl exec ... cat``) until a
-        scrape endpoint exists.
+        scrape endpoint exists. Read under the counter lock so the breadcrumb
+        cannot catch a half-applied increment.
         """
 
+        with self._counter_lock:
+            return self._counters()
+
+    def _counters(self) -> dict[str, Any]:
         return {
             "claimed_total": self.claimed_total,
             "reported_failures": self.reported_failures,
@@ -904,18 +1095,27 @@ class ClusterActionExecutor:
             )
 
     def run_once(self) -> int:
-        commands = self.client.claim(
-            self.executor_id,
-            execution_owners=self.execution_owners,
-            max_commands=self.batch_size,
-            lease_seconds=self.lease_seconds,
-        )
+        try:
+            commands = self.client.claim(
+                self.executor_id,
+                execution_owners=self.execution_owners,
+                max_commands=self.batch_size,
+                lease_seconds=self.lease_seconds,
+            )
+        except Exception as exc:
+            # Tag the phase for run()'s log. Everything after this point either
+            # handles its own failures or is an executor defect, and both used
+            # to be reported to the operator as "claim failed".
+            raise ClusterExecutorClaimError(
+                f"{type(exc).__name__}: {exc}",
+                status_code=getattr(exc, "status_code", None),
+            ) from exc
         # A successful claim round-trip proves the token, the TLS trust
         # chain and the control-plane route all work, even when the
         # queue is empty. That is the only useful executor liveness
         # signal; the readiness marker file only proves pip install ran.
         self.last_successful_claim_at = datetime.now(timezone.utc)
-        self.claimed_total += len(commands)
+        self._increment("claimed_total", len(commands))
         self._record_successful_claim(self.last_successful_claim_at)
         self.last_cycle_advanced = True
         if commands:
@@ -943,6 +1143,31 @@ class ClusterActionExecutor:
         return len(commands)
 
     def _execute_and_report(self, command: RemoteActionCommand) -> RemoteCommandStatus:
+        """One command, start to reported: never raises into ``run_once``.
+
+        Anything that leaves this method comes back out of ``future.result()``
+        in ``run_once``, which loses every *sibling* command's report and sends
+        ``run()`` into claim backoff while this command sits LEASED until it
+        expires and is executed again. ``_execute`` answers its own failures
+        with a result, so whatever arrives here -- a claimed command with no
+        lease token, a thread that could not be started, a defect in the
+        withhold or report path -- is an executor-side defect, counted as one
+        and held WAITING for the next lease holder.
+        """
+
+        try:
+            return self._execute_under_lease(command)
+        except Exception:
+            self._increment("unexpected_failures")
+            LOGGER.exception(
+                "regional cluster executor raised outside command execution: "
+                "command=%s cluster=%s",
+                command.command_id,
+                command.cluster_id,
+            )
+            return RemoteCommandStatus.WAITING
+
+    def _execute_under_lease(self, command: RemoteActionCommand) -> RemoteCommandStatus:
         stop = Event()
         watch = CommandLeaseWatch(
             lease_seconds=self.lease_seconds,
@@ -969,8 +1194,8 @@ class ClusterActionExecutor:
                 if watch.lost_reason is None:
                     # Expired on the local clock without the renewer ever
                     # declaring it lost; count it here, once.
-                    self.lease_lost_total += 1
-                self.results_withheld_total += 1
+                    self._increment("lease_lost_total")
+                self._increment("results_withheld_total")
                 LOGGER.warning(
                     "regional cluster executor withheld a result under a lost "
                     "lease: command=%s cluster=%s operation=%s status=%s "
@@ -982,26 +1207,86 @@ class ClusterActionExecutor:
                     watch.hold_reason(),
                 )
                 return RemoteCommandStatus.WAITING
-            try:
-                self.client.complete(command, result)
-            except ClusterExecutorError:
-                # A rejected result (stale lease, stale fencing token,
-                # already terminal) must not discard the results of the
-                # remaining commands in this batch.
-                LOGGER.exception(
-                    "regional cluster executor could not report result: "
-                    "command=%s cluster=%s operation=%s status=%s",
-                    command.command_id,
-                    command.cluster_id,
-                    command.step.operation.value,
-                    result.status.value,
-                )
-                self.reported_failures += 1
+            if not self._report_result(command, result, watch):
+                # The action ran but its verdict never landed. WAITING keeps
+                # this cycle off the fast path (the command is still open on
+                # the control plane) instead of claiming that it advanced.
+                return RemoteCommandStatus.WAITING
             return result.status
         finally:
             active_lease_guard.reset(guard_token)
             stop.set()
             renewer.join(timeout=2)
+
+    def _report_result(
+        self,
+        command: RemoteActionCommand,
+        result: RemoteCommandResult,
+        watch: CommandLeaseWatch,
+    ) -> bool:
+        """Post one result, retrying a transport failure under a live lease.
+
+        The action has already happened on the cluster, so this post is the
+        only place its verdict exists. Dropping it on the first ``URLError``
+        left the command LEASED until expiry and then re-executed by whichever
+        replica re-claimed it -- a second RESET_GPU or STOP_WORKLOADS for one
+        workflow step. Retrying is safe because ``complete_remote_command`` is
+        idempotent: a command that is already terminal is returned unchanged.
+
+        The retry is bounded three ways, because a report that keeps failing
+        must not become a spin: at most ``_RESULT_REPORT_ATTEMPTS`` attempts,
+        only for failures with no verdict in them (no HTTP status, or one of
+        the transient statuses), and only while the lease is still ours -- past
+        that, another executor may already own the command and this result
+        would race its result, which is exactly what the withhold rule above
+        exists to prevent.
+        """
+
+        for attempt in range(1, _RESULT_REPORT_ATTEMPTS + 1):
+            try:
+                self.client.complete(command, result)
+                return True
+            except Exception as exc:
+                hold_reason = watch.hold_reason()
+                last_attempt = attempt >= _RESULT_REPORT_ATTEMPTS
+                if (
+                    not _retryable_report_failure(exc)
+                    or last_attempt
+                    or hold_reason is not None
+                ):
+                    # A rejected result (stale lease, stale fencing token,
+                    # already terminal) and an unreachable control plane both
+                    # end here, and neither may discard the results of the
+                    # remaining commands in this batch.
+                    LOGGER.exception(
+                        "regional cluster executor could not report result: "
+                        "command=%s cluster=%s operation=%s status=%s "
+                        "attempts=%d lease_hold=%s",
+                        command.command_id,
+                        command.cluster_id,
+                        command.step.operation.value,
+                        result.status.value,
+                        attempt,
+                        hold_reason,
+                    )
+                    self._increment("reported_failures")
+                    return False
+                delay = _report_backoff_seconds(attempt)
+                LOGGER.warning(
+                    "regional cluster executor could not report result; "
+                    "retrying in %.2fs: command=%s cluster=%s operation=%s "
+                    "status=%s attempt=%d: %s: %s",
+                    delay,
+                    command.command_id,
+                    command.cluster_id,
+                    command.step.operation.value,
+                    result.status.value,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+                self.sleep(delay)
+        return False
 
     def _renew_lease(
         self,
@@ -1021,14 +1306,14 @@ class ClusterActionExecutor:
                     self.lease_seconds,
                 )
             except Exception as exc:
-                self.lease_renewal_failures += 1
+                self._increment("lease_renewal_failures")
                 LOGGER.exception(
                     "regional command lease renewal failed: command=%s cluster=%s",
                     command.command_id,
                     command.cluster_id,
                 )
                 if watch is not None and watch.renewal_failed(exc):
-                    self.lease_lost_total += 1
+                    self._increment("lease_lost_total")
                     LOGGER.error(
                         "regional command lease treated as lost; no further "
                         "node actions will start and the result will not be "
@@ -1043,7 +1328,7 @@ class ClusterActionExecutor:
                 continue
             cancellation = watch.renewed(renewed)
             if cancellation is not None:
-                self.cancellations_observed_total += 1
+                self._increment("cancellations_observed_total")
                 LOGGER.warning(
                     "regional command cancellation requested during execution; "
                     "no further node actions will start: command=%s cluster=%s "
@@ -1077,21 +1362,32 @@ class ClusterActionExecutor:
                     self.claim_backoff_max_seconds,
                     self.poll_seconds * (2 ** min(consecutive_failures - 1, 8)),
                 )
+                # A result that could not be posted no longer reaches here at
+                # all, but a defect after the claim still can, and calling it
+                # "claim failed" sent the operator to the wrong side of the
+                # wire (F11).
+                phase = (
+                    "claim failed"
+                    if isinstance(exc, ClusterExecutorClaimError)
+                    else "cycle failed after a successful claim"
+                )
                 if (
                     consecutive_failures == 1
                     or consecutive_failures & (consecutive_failures - 1) == 0
                 ):
                     LOGGER.exception(
-                        "regional cluster executor claim failed; "
+                        "regional cluster executor %s; "
                         "retrying in %.1fs (consecutive=%d)",
+                        phase,
                         delay,
                         consecutive_failures,
                     )
                 else:
                     LOGGER.warning(
-                        "regional cluster executor claim still failing: "
+                        "regional cluster executor %s, still failing: "
                         "%s: %s; retrying in %.1fs "
                         "(consecutive=%d)",
+                        phase,
                         type(exc).__name__,
                         exc,
                         delay,
@@ -1207,6 +1503,16 @@ class ClusterActionExecutor:
             retryable = self._retryable_control_plane_result(exc, command, lease_token)
             if retryable is not None:
                 return retryable
+            # A control-plane request that never got an answer now arrives here
+            # as a ClusterExecutorError with no status code instead of a raw
+            # URLError, so the transport classification has to be consulted on
+            # this branch too. Without it, wrapping the transport error would
+            # have turned every proxy timeout inside an adapter from a WAITING
+            # hold into a FAILED step -- a healthy GPU declared unrecoverable
+            # because a read timed out.
+            retryable = self._retryable_result(exc, command, lease_token)
+            if retryable is not None:
+                return retryable
             # Rejections the executor raises on purpose: cluster
             # mismatch, stale fencing token, no or ambiguous adapter.
             # These are legitimate FAILED results, not executor bugs.
@@ -1267,7 +1573,7 @@ class ClusterActionExecutor:
             # difference between "the action was refused" and "the
             # executor is broken", so record a stack trace, tag the
             # result, and count it for alerting.
-            self.unexpected_failures += 1
+            self._increment("unexpected_failures")
             LOGGER.exception(
                 "regional cluster executor raised while executing: "
                 "command=%s cluster=%s operation=%s owner=%s nodes=%s",
@@ -1324,7 +1630,7 @@ class ClusterActionExecutor:
             return retryable
         if not retryable_adapter_error(exc):
             return None
-        self.retryable_adapter_errors_total += 1
+        self._increment("retryable_adapter_errors_total")
         LOGGER.warning(
             "regional cluster executor adapter raised a retryable "
             "error; command remains retryable: command=%s cluster=%s "
@@ -1373,7 +1679,7 @@ class ClusterActionExecutor:
             return None
         if getattr(adapter, "barriers", None) is not None:
             return None
-        self.barrier_unavailable_holds_total += 1
+        self._increment("barrier_unavailable_holds_total")
         reason = (
             f"{command.step.operation.value} across {len(command.step.node_ids)} "
             "nodes needs a multi-node barrier coordinator, and this regional "
