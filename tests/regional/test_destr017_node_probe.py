@@ -338,7 +338,7 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """quiesce stops kubelet, so the reboot cannot be exec'd from the runner
-    after the fence is WAITING. ``_place_reboot_timer`` is the shared path the
+    after the fence is WAITING. ``place_reboot_timer`` is the shared path the
     on-node watcher takes: it must write the pre-reboot boot id durably *before*
     the systemd timer that will run ``systemctl reboot`` exists."""
 
@@ -350,7 +350,7 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     monkeypatch.setattr(probe, "_reboot_unit_state", lambda run_id: {})
     path = tmp_path / "state.json"
 
-    record = probe._place_reboot_timer(RUN_ID, 45, path)
+    record = probe.place_reboot_timer(RUN_ID, 45, path)
 
     assert record["reboot_delay_seconds"] == 45
     assert record["boot_id_before_reboot"] == BOOT_A
@@ -358,7 +358,7 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     assert state["boot_id_before_reboot"] == BOOT_A, "durable marker before timer"
     assert state["reboot_delay_seconds"] == 45
     timer = probe.reboot_unit(RUN_ID)
-    armed = [c for c in calls if "systemd-run" in c and f"--on-active=45s" in c]
+    armed = [c for c in calls if "systemd-run" in c and "--on-active=45s" in c]
     assert len(armed) == 1, calls
     assert f"--unit={timer}" in armed[0]
     assert armed[0][-2:] == ["/bin/systemctl", "reboot"], "only an ordinary reboot"

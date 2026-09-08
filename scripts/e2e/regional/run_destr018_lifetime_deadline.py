@@ -675,7 +675,7 @@ def _open_window(run: _LiveRun) -> dict[str, Any]:
     return record
 
 
-def _arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
+def arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
     armed = run.holder.execute(
         "arm-holder",
         "--device",
@@ -824,7 +824,7 @@ def _open_and_arm(run: _LiveRun) -> None:
         )
     run.in_window_identity = in_window_identity
     run.metrics_before = worker_metrics(run.regional)
-    _arm_holder(run, run.device)
+    arm_holder(run, run.device)
 
 
 def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:

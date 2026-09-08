@@ -466,8 +466,7 @@ def recovery_errors(
     for workflow in recovery_successors:
         request_id = workflow.get("request_id")
         executed = {
-            str(item.get("operation"))
-            for item in workflow.get("step_executions") or []
+            str(item.get("operation")) for item in workflow.get("step_executions") or []
         }
         forbidden = sorted(FORBIDDEN_EXECUTIONS.intersection(executed))
         if forbidden:

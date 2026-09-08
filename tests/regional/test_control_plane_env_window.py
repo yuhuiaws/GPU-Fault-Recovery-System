@@ -152,9 +152,7 @@ def test_execution_timeout_below_the_lifetime_is_refused() -> None:
 
     # A set consistent in every other rule (lease 120 < execution 150), so the
     # only violation is the execution timeout sitting below the lifetime.
-    errors = env_window.assignment_errors(
-        {**FULL_SET, TIMEOUT: "150", LEASE: "120"}
-    )
+    errors = env_window.assignment_errors({**FULL_SET, TIMEOUT: "150", LEASE: "120"})
 
     assert len(errors) == 1, errors
     assert "workflow_lifetime_exceeded" in errors[0]
@@ -495,9 +493,12 @@ def test_the_close_expects_what_replicas_read_before_the_window_not_none() -> No
     assert expected == pre
     restored = [{"pod": "c", "values": pre}, {"pod": "d", "values": pre}]
     assert env_window.converged(restored, expected) is True
-    assert env_window.converged(
-        restored, {LIFETIME: None, TIMEOUT: None, MANAGED: None, LEASE: None}
-    ) is False, "the old None expectation is exactly what could never converge"
+    assert (
+        env_window.converged(
+            restored, {LIFETIME: None, TIMEOUT: None, MANAGED: None, LEASE: None}
+        )
+        is False
+    ), "the old None expectation is exactly what could never converge"
 
 
 def test_the_close_falls_back_to_the_inline_baseline_without_a_survey() -> None:

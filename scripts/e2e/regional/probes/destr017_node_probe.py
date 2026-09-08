@@ -442,7 +442,7 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
     # runner pre-validated the delay against the pinned window before injection.
     reboot_delay = state.get("reboot_delay_seconds")
     if reboot_delay is not None:
-        _place_reboot_timer(run_id, int(reboot_delay), path)
+        place_reboot_timer(run_id, int(reboot_delay), path)
 
 
 def arm_holder(arguments: argparse.Namespace) -> None:
@@ -539,7 +539,7 @@ def holder_status(arguments: argparse.Namespace) -> None:
     )
 
 
-def _place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
+def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
     """Write the durable boot-id marker, then arm the transient reboot timer.
 
     Shared by ``arm-reboot`` (runner-driven, before this drill's quiesce stops
@@ -601,7 +601,7 @@ def arm_reboot(arguments: argparse.Namespace) -> None:
     """
 
     run_id = safe_id(arguments.run_id, "run ID")
-    emit(_place_reboot_timer(run_id, arguments.delay_seconds, state_path(run_id)))
+    emit(place_reboot_timer(run_id, arguments.delay_seconds, state_path(run_id)))
 
 
 def reboot_status(arguments: argparse.Namespace) -> None:

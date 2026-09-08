@@ -75,9 +75,7 @@ def test_the_case_declares_the_six_variables_the_env_window_may_manage() -> None
     assert env_window.DEPLOYMENT == "gpu-fault-control-worker"
 
 
-def test_the_runner_opens_the_window_with_a_consistent_full_set(
-    tmp_path: Path,
-) -> None:
+def test_the_runner_opens_the_window_with_a_consistent_full_set(tmp_path: Path) -> None:
     """The runner emits every allow-listed variable in one internally
     consistent set, and the helper accepts it. Compressing the lifetime alone
     is what CrashLoopBackOff'd the live control plane; the full set is bootable.
@@ -163,7 +161,9 @@ def test_a_step_cap_equal_to_the_lifetime_carries_no_step_cap_error() -> None:
     )
 
 
-def test_a_step_cap_under_the_lifetime_lets_the_step_fire_first_and_is_refused() -> None:
+def test_a_step_cap_under_the_lifetime_lets_the_step_fire_first_and_is_refused() -> (
+    None
+):
     errors = verdicts.lifetime_margin_errors(
         lifetime_seconds=180,
         execution_timeout_seconds=180,
@@ -1148,12 +1148,7 @@ def test_the_preflight_refuses_a_run_configured_to_leave_the_step_cap_low(
 
     settings = replace(_settings(tmp_path), step_timeout_seconds=120)
     errors = destr018.preflight_errors(
-        settings,
-        _state(),
-        _node(),
-        [],
-        {"passed": True},
-        _survey(),
+        settings, _state(), _node(), [], {"passed": True}, _survey()
     )
     assert "per-step waiting cap 120s" in _text(errors)
 
@@ -1281,10 +1276,7 @@ def test_the_open_window_may_change_the_worker_template() -> None:
     after = _identity(generation=8, template="sha-in-window")
     assert (
         destr018.identity_errors(
-            before,
-            after,
-            worker_generation_delta=1,
-            allow_worker_template_change=True,
+            before, after, worker_generation_delta=1, allow_worker_template_change=True
         )
         == []
     )
@@ -1496,7 +1488,7 @@ def test_arm_holder_only_sends_flags_the_node_probe_actually_accepts(
         holder_armed=False,
     )
 
-    destr018._arm_holder(run, "/dev/nvidia0")
+    destr018.arm_holder(run, "/dev/nvidia0")
 
     assert calls, "arm-holder was never invoked"
     subcommands = {call[0] for call in calls}
