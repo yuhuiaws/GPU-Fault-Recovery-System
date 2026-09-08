@@ -388,8 +388,8 @@ class KubernetesCompletionOutbox:
             LOGGER.error(
                 "cannot clear the delivered critical completion event key=%s "
                 "(%s: %s); the control plane has already accepted it, so the "
-                "record stays buffered and the replay will re-send it (the "
-                "control plane deduplicates by event_key)",
+                "record is flagged as delivered for the next replay pass to "
+                "drop without re-sending it",
                 key,
                 type(exc).__name__,
                 exc,
@@ -437,6 +437,34 @@ class KubernetesCompletionOutbox:
             ]
 
         self._mutate(update)
+
+    def _reclaim_delivered(self, key: str, removal_error: BaseException) -> None:
+        """Hand a delivered-but-unremovable record back to ``replay``.
+
+        The control plane has accepted the event and the removal that should
+        have cleared the record failed. Leaving it as it is would strand it:
+        a quarantined record is one ``replay`` skips for ever, and the live
+        path is finished with the key, so nothing would ever drop it and
+        ``..._quarantined_depth`` would never come back down. Flagging it
+        ``delivered`` (and lifting the quarantine) makes the next replay pass
+        remove it without re-sending it -- a smaller write than the removal,
+        so it usually survives whatever broke the removal.
+        """
+
+        try:
+            self._update(key, delivered=True, quarantined=False, attempts=0)
+        except Exception as flag_error:
+            LOGGER.error(
+                "a delivered completion record could not be cleared (%s: %s) "
+                "nor flagged as delivered (%s: %s): key=%s stays buffered "
+                "until a pass that can write the ConfigMap picks it up, or "
+                "until an operator removes it",
+                type(removal_error).__name__,
+                removal_error,
+                type(flag_error).__name__,
+                flag_error,
+                key,
+            )
 
     @staticmethod
     def _attempt_key(payload: dict[str, Any]) -> str:
@@ -546,9 +574,10 @@ class KubernetesCompletionOutbox:
             # The control plane has the event; a ConfigMap that cannot be
             # written must not turn that into a failed delivery, or the caller
             # would arm its emergency fallback over an accepted event. The
-            # record stays and replay re-sends it; the control plane
-            # deduplicates by event_key.
+            # record stays, flagged delivered so that replay drops it instead
+            # of sending it again.
             self._count_append_failure(key, removal_error, stage="clear")
+            self._reclaim_delivered(key, removal_error)
         return result
 
     def replay(self, *, include_quarantined: bool = False) -> int:
@@ -566,9 +595,56 @@ class KubernetesCompletionOutbox:
         are capped at ``max_buffered_tail_bytes`` per snapshot and flagged
         ``buffered_tail_truncated``. See
         ``pointer_sized_completion_payload``.
+
+        A record flagged ``delivered`` was already accepted by the control
+        plane and only failed to be cleared, so it is dropped here without
+        being sent again; it is not counted in the returned number, which
+        stays "records this pass delivered".
         """
 
-        records, _resource_version = self._read()
+        try:
+            records, _resource_version = self._read()
+        except Exception:
+            # Nothing was read, so there is no snapshot to publish: stale
+            # gauges are still true of the last pass, a fabricated 0 would not
+            # be true of anything.
+            LOGGER.warning(
+                "completion outbox replay could not read its ConfigMap; the "
+                "depth gauges keep their last known values "
+                "(depth=%d quarantined=%d)",
+                self.last_depth,
+                self.last_quarantined_depth,
+            )
+            raise
+        drained: set[str] = set()
+        isolated: set[str] = set()
+        try:
+            return self._replay_pass(
+                records,
+                include_quarantined=include_quarantined,
+                drained=drained,
+                isolated=isolated,
+            )
+        finally:
+            # Even a pass that died on an unwritable ConfigMap has to leave the
+            # depth behind: that is exactly when an operator needs it.
+            self._publish_depth(records, drained=drained, isolated=isolated)
+
+    def _replay_pass(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        include_quarantined: bool,
+        drained: set[str],
+        isolated: set[str],
+    ) -> int:
+        """One replay pass over an already read snapshot.
+
+        ``drained`` and ``isolated`` are filled in as the pass goes so that
+        ``replay`` can publish the depth gauges even when this raises half way
+        through.
+        """
+
         candidates = [
             record
             for record in records
@@ -577,8 +653,6 @@ class KubernetesCompletionOutbox:
         batch = candidates[: self.replay_batch_size]
         deferred = len(candidates) - len(batch)
         replayed = quarantined = 0
-        drained: set[str] = set()
-        isolated: set[str] = set()
         deadline = self.monotonic() + self.replay_budget_seconds
         for index, record in enumerate(batch):
             if index > 0 and self.monotonic() >= deadline:
@@ -590,6 +664,18 @@ class KubernetesCompletionOutbox:
                 )
                 break
             key = str(record["key"])
+            if record.get("delivered", False):
+                # The control plane accepted this event already; only the
+                # write that should have cleared it failed. Dropping it is the
+                # whole job -- re-sending would be a duplicate.
+                LOGGER.info(
+                    "dropping a delivered completion record whose removal "
+                    "failed earlier: key=%s",
+                    key,
+                )
+                self._remove(key)
+                drained.add(key)
+                continue
             path = str(record["path"])
             payload = dict(record["payload"])
             try:
@@ -638,7 +724,6 @@ class KubernetesCompletionOutbox:
             "deferred": deferred,
             "quarantined": quarantined,
         }
-        self._publish_depth(records, drained=drained, isolated=isolated)
         return replayed
 
     def _publish_depth(

@@ -610,13 +610,17 @@ class KubernetesCompletionController:
 
     @property
     def outbox_depth(self) -> int:
-        """Buffered critical events as of the last replay pass (F12)."""
+        """Buffered completion records as of the last replay pass (F12).
+
+        Every record in the ConfigMap, not only the critical events: the
+        latest undelivered workload observation of an attempt is one too.
+        """
 
         return int(getattr(self.sink, "last_depth", 0))
 
     @property
     def outbox_quarantined_depth(self) -> int:
-        """Buffered events no replay will retry again (F12).
+        """Buffered records no replay will retry again (F12).
 
         ``replay`` skips a quarantined record and no production caller passes
         ``include_quarantined``, so anything above zero here is waiting on the

@@ -464,6 +464,112 @@ def test_a_delivered_event_is_not_undone_by_a_failed_removal() -> None:
         f"failure, got {outbox.append_failures_total}"
     )
     assert outbox.depth() == 1, (
-        "the record necessarily stays buffered; replay re-sends it and the "
-        "control plane deduplicates by event_key"
+        "the record necessarily stays buffered until a later pass can clear it"
+    )
+
+
+class OneBadRemovalCore(ConfigMapCore):
+    """The first removal fails; the ConfigMap is writable again after it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.removal_failures = 0
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        before = len(json.loads(self.data["events.json"]))
+        after = len(json.loads(body["data"]["events.json"]))
+        if after < before and self.removal_failures == 0:
+            self.removal_failures += 1
+            raise FakeApiException(500)
+        return super().replace_namespaced_config_map(name, namespace, body)
+
+
+class UnwritableCore(ConfigMapCore):
+    """Reads and writes can be turned off independently, after set-up."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.readable = True
+        self.writable = True
+
+    def read_namespaced_config_map(self, name, namespace):
+        if not self.readable:
+            raise FakeApiException(500)
+        return super().read_namespaced_config_map(name, namespace)
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        if not self.writable:
+            raise FakeApiException(500)
+        return super().replace_namespaced_config_map(name, namespace, body)
+
+
+def test_a_delivered_record_that_cannot_be_cleared_is_reclaimed_by_replay() -> None:
+    """A delivered record must never be left quarantined.
+
+    ``replay`` skips quarantined records for ever and the live path is done
+    with the key (the controller has recorded it as sent), so a quarantined
+    record whose post-delivery removal failed would be an orphan: buffered
+    for ever and stuck in ``..._quarantined_depth``. Flagging it delivered
+    hands it back to ``replay``, which drops it without re-sending it.
+    """
+
+    core = OneBadRemovalCore()
+    sink = RecordingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, sink, max_replay_attempts=1)
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/failure-detected", payload())
+    assert outbox.replay() == 0, "the control plane is still down"
+    assert outbox.quarantined_depth() == 1, "one failed attempt must quarantine it"
+
+    sink.fail = False
+    result = outbox.post("/v1/attempts/failure-detected", payload())
+
+    assert result == {"accepted": True}, f"the live POST must win, got {result!r}"
+    assert core.removal_failures == 1, "the test must exercise a failed removal"
+    assert outbox.quarantined_depth() == 0, (
+        "a delivered record may not stay quarantined -- nothing would ever "
+        f"clear it: {core.data['events.json']!r}"
+    )
+    posted = len(sink.posts)
+
+    assert outbox.replay() == 0, (
+        "an already delivered record must not be re-sent by replay, "
+        f"{sink.posts[posted:]!r} was"
+    )
+    assert len(sink.posts) == posted, f"no new POST is allowed: {sink.posts!r}"
+    assert outbox.depth() == 0, (
+        f"replay must drop the delivered record: {core.data['events.json']!r}"
+    )
+
+
+def test_depth_gauges_report_the_snapshot_a_failed_replay_pass_read() -> None:
+    """The gauges must not read 0 while records are piling up.
+
+    A pass that reads the ConfigMap and then fails to write it back is
+    exactly when an operator needs the depth, so the numbers are published
+    from whatever snapshot the pass did read. If even the read failed there is
+    nothing to publish and the last known values stay.
+    """
+
+    core = UnwritableCore()
+    outbox = KubernetesCompletionOutbox(core, RecordingSink(fail=True))
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/failure-detected", payload())
+    assert outbox.last_depth == 0, "no replay pass has published a gauge yet"
+
+    core.writable = False
+    with pytest.raises(FakeApiException):
+        outbox.replay()
+
+    assert outbox.last_depth == 1, (
+        "the pass read one buffered record before it failed; the gauge must "
+        f"say so, got {outbox.last_depth}"
+    )
+    core.readable = False
+    with pytest.raises(FakeApiException):
+        outbox.replay()
+
+    assert outbox.last_depth == 1, (
+        "a pass that read nothing must leave the last known depth alone, got "
+        f"{outbox.last_depth}"
     )

@@ -67,13 +67,14 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_outbox_depth",
         "outbox_depth",
-        "Critical completion events buffered in the write-ahead ConfigMap and "
-        "not yet accepted by the control plane.",
+        "Completion records buffered in the write-ahead ConfigMap: critical "
+        "events the control plane has not accepted yet, plus the latest "
+        "undelivered workload observation per attempt.",
     ),
     (
         "gpu_fault_completion_outbox_quarantined_depth",
         "outbox_quarantined_depth",
-        "Buffered events the replay has given up on: it skips them for ever, "
+        "Buffered records the replay has given up on: it skips them for ever, "
         "so they are delivered only by a later live POST or by an operator "
         "replay. Anything above zero needs a look.",
     ),
