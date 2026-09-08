@@ -119,6 +119,34 @@ with urllib.request.urlopen(
     print(json.dumps({"metrics": response.read().decode()}))
 """
 
+OPEN_INCIDENTS = r"""
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+from gpu_fault.app import ApplicationContext
+
+store = ApplicationContext.from_environment().store
+cluster_id, node_id = sys.argv[1:3]
+since = datetime.now(timezone.utc) - timedelta(days=7)
+found = {}
+for event in store.list_xid_events(cluster_id, node_id, observed_after=since):
+    incident = store.get_incident_by_event(event.event_id)
+    if incident is None or incident.state.value == "RECOVERED":
+        continue
+    found.setdefault(
+        incident.incident_id,
+        {
+            "incident_id": incident.incident_id,
+            "state": incident.state.value,
+            "xid": event.xid,
+            "workflow_request_id": incident.workflow_request_id,
+            "observed_at": str(event.observed_at),
+        },
+    )
+print(json.dumps({"open_incidents": sorted(found.values(), key=lambda i: i["incident_id"])}))
+"""
+
 ESCALATION_CHAIN = r"""
 import json
 import sys
@@ -483,6 +511,16 @@ def preflight_errors(
         errors.append("remote command queue is not empty")
     if state.get("event") is not None:
         errors.append("target node has a recent XID event")
+    # A lifetime failure hands its incident to an operator (F-N1) and the
+    # node-scoped merge records every later fault on that incident, planning
+    # nothing, until it is closed. A rerun on a node still carrying one merges
+    # record-only and can prove nothing (attempt 10, 2026-09-08).
+    for item in state.get("open_incidents") or []:
+        errors.append(
+            f"target node carries an open incident {item.get('incident_id')} "
+            f"({item.get('state')}, XID {item.get('xid')}); close it through a "
+            "validated restore first"
+        )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     errors.extend(env_window.assignment_errors(settings.assignments()))
@@ -518,6 +556,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     state = fixture.store_snapshot(
         node=settings.node,
         observed_after=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    state["open_incidents"] = (
+        fixture.cpu_python(
+            OPEN_INCIDENTS, settings.regional.cluster_id, settings.node
+        ).get("open_incidents")
+        or []
     )
     node = fixture.node_snapshot(settings.node)
     workloads = fixture.business_workloads(settings.node)
@@ -1104,6 +1148,50 @@ def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
     )
 
 
+def close_reset_incident(run: _LiveRun) -> dict[str, Any]:
+    """Land the reset incident RECOVERED once the node is restored.
+
+    The lifetime failure hands the incident to an operator (F-N1); from then
+    on the node-scoped merge records every later fault on it and plans nothing
+    until it is closed. Restoring the node through the *support* incident does
+    not close it: attempt 10 (2026-09-08) injected a fresh XID and got merged
+    record-only into attempt 9's incident. The same validated restore, run
+    through the reset incident, is the sanctioned way to close it.
+    """
+
+    if not run.incident_id:
+        return {"closed": False, "reason": "no reset incident recorded"}
+    warm = WarmSpareLiveFixture(run.regional, "")
+    before = warm.incident_by_id(run.incident_id)
+    if before.get("state") == "RECOVERED":
+        return {"closed": False, "state": "RECOVERED"}
+    warm.wait_incident_idle(run.incident_id)
+    created = warm.create_restore_workflow(
+        incident_id=run.incident_id,
+        node=run.settings.node,
+        profile_version=run.profile_version,
+        reason=f"{CASE_ID} close the lifetime-escalated reset incident",
+    )
+    restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+    if restored.get("status") != "SUCCEEDED":
+        raise RegionalFixtureError(
+            f"the restore closing {run.incident_id} did not succeed: "
+            f"{restored.get('status')}"
+        )
+    after = warm.incident_by_id(run.incident_id)
+    if after.get("state") != "RECOVERED":
+        raise RegionalFixtureError(
+            f"{run.incident_id} is still {after.get('state')} after a successful "
+            "validated restore"
+        )
+    return {
+        "closed": True,
+        "previous_state": before.get("state"),
+        "workflow_request_id": created["workflow_request_id"],
+        "state": after.get("state"),
+    }
+
+
 def _close_window(run: _LiveRun) -> dict[str, Any]:
     record = env_window.close_window(
         run.window,
@@ -1135,6 +1223,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             ),
         )
     guard("restore_isolated_node", lambda: _restore_isolated_node(run))
+    guard("close_reset_incident", lambda: close_reset_incident(run))
     # Only now may the Deployment roll again.
     if run.window_opened:
         guard("close_env_window", lambda: _close_window(run))

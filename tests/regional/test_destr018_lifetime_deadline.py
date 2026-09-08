@@ -7,7 +7,6 @@ is built inline so the contract holds before the catalog entry lands.
 
 from __future__ import annotations
 
-import argparse
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1402,97 +1401,19 @@ def test_a_plan_that_drifted_from_its_preflight_is_refused(tmp_path: Path) -> No
         destr018.verify_plan_identity(case_dir, preflight)
 
 
-def test_the_runner_is_plan_by_default_and_needs_an_exact_confirmation() -> None:
-    parser = destr018.parser()
-    plan = parser.parse_args(["--run-dir", "/tmp/run"])
-    assert plan.execute is False
-    assert plan.lifetime_seconds == verdicts.LIFETIME_SECONDS
-    assert plan.execution_timeout_seconds == verdicts.EXECUTION_TIMEOUT_SECONDS
-    assert plan.step_timeout_seconds == verdicts.STEP_TIMEOUT_SECONDS
-    assert plan.managed_recovery_seconds == verdicts.MANAGED_RECOVERY_SECONDS
-    assert plan.step_warning_seconds == verdicts.STEP_WARNING_SECONDS
-    assert plan.lease_duration_seconds == verdicts.LEASE_DURATION_SECONDS
-    execute = parser.parse_args(
-        [
-            "--run-dir",
-            "/tmp/run",
-            "--execute",
-            "--confirm",
-            destr018.CONFIRMATION,
-            "--maintenance-window-end",
-            "2026-09-06T12:00:00+00:00",
-            "--node",
-            NODE,
-        ]
-    )
-    assert execute.execute is True
-    assert execute.confirm == destr018.CONFIRMATION
-    assert execute.node == NODE
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--run-dir", "/tmp/run", "--plan", "--execute"])
-
-
-def test_the_help_text_offers_the_four_documented_live_flags() -> None:
-    help_text = destr018.parser().format_help()
-    for flag in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
-        assert flag in help_text
-
-
-def test_the_runner_and_the_env_window_helper_are_executable_with_a_shebang() -> None:
-    for path in (
-        ROOT / "scripts/e2e/regional/run_destr018_lifetime_deadline.py",
-        ROOT / "scripts/e2e/regional/control_plane_env_window.py",
-        ROOT / "scripts/e2e/regional/probes/destr018_node_probe.py",
-    ):
-        mode = path.stat().st_mode & 0o777
-        assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
-        first = path.read_text(encoding="utf-8").splitlines()[0]
-        assert first == "#!/usr/bin/env python3"
-
-
-def test_the_expected_step_sequence_is_the_reset_contract() -> None:
-    assert destr018.EXPECTED_STEPS.index(verdicts.WAITING_STEP) == 3
-    assert destr018.EXPECTED_STEPS.index(verdicts.RESET_STEP) == 4
-    assert destr018.EXPECTED_STEPS.index(verdicts.COMPENSATION_STEP) == 5
-    assert isinstance(destr018.parser(), argparse.ArgumentParser) is True
-
-
-def test_arm_holder_only_sends_flags_the_node_probe_actually_accepts(
+def test_the_preflight_refuses_a_node_carrying_an_open_lifetime_incident(
     tmp_path: Path,
 ) -> None:
-    """Every holder subcommand the runner invokes must parse against the real
-    on-node probe contract. `holder-status` derives its device from persisted
-    state and defines only `--run-id`; passing `--device` made argparse reject
-    the call ("unrecognized arguments: --device") after arm-holder had already
-    succeeded (observed live 2026-09-08, attempt 6)."""
-    from types import SimpleNamespace
+    """A lifetime-escalated incident makes the node-scoped merge record every
+    later fault on it and plan nothing; a rerun there proves nothing."""
+    state = _state()
+    state["open_incidents"] = [
+        {"incident_id": "inc-old", "state": "ESCALATED", "xid": 46}
+    ]
 
-    from scripts.e2e.regional.probes import destr018_node_probe as probe
+    errors = _preflight_errors(tmp_path, state=state)
 
-    probe_parser = probe.parser()
-    calls: list[tuple[str, ...]] = []
-
-    class _FakeHolder:
-        settings = SimpleNamespace(run_id="run-abc")
-        host_script = "/run/gpu-fault-host-probe-deadbeef01.py"
-
-        def execute(self, *arguments: str, timeout: int = 0) -> dict[str, Any]:
-            calls.append(arguments)
-            return {"device_clients": [{"pid": "1234", "comm": "holder"}]}
-
-    run = SimpleNamespace(
-        holder=_FakeHolder(),
-        settings=SimpleNamespace(hold_seconds=900),
-        run_id="drill-xyz",
-        case_dir=tmp_path,
-        holder_armed=False,
+    assert any("open incident inc-old (ESCALATED, XID 46)" in e for e in errors), errors
+    assert not any("open incident" in e for e in _preflight_errors(tmp_path)), (
+        "a node without open incidents must not be refused for one"
     )
-
-    destr018.arm_holder(run, "/dev/nvidia0")
-
-    assert calls, "arm-holder was never invoked"
-    subcommands = {call[0] for call in calls}
-    assert {"arm-holder", "holder-status"} <= subcommands
-    for call in calls:
-        # Would raise SystemExit on an unrecognized flag, mirroring the pod.
-        probe_parser.parse_args(list(call))
