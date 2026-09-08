@@ -11,6 +11,7 @@ replacement plan lost the per-node GPU mapping the agents insist on.
 
 from __future__ import annotations
 
+from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.models import (
     IncidentState,
@@ -19,6 +20,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.node_agent import NodeActionResult, NodeActionStatus
 from gpu_fault.orchestration.escalation import HardwareEscalationService, next_rung
 from tests._builders import (
     build_store,
@@ -26,6 +28,13 @@ from tests._builders import (
     workflow_request,
     workflow_step,
     workflow_step_execution,
+)
+from tests.execution.test_node_action_transport_retry import (
+    ENDPOINT,
+    SECRET,
+    adapter_raising,
+    http_error,
+    step_context,
 )
 
 RESET = WorkflowOperation.RESET_GPU
@@ -280,6 +289,114 @@ def test_a_reused_command_id_goes_to_an_operator_not_up_the_ladder():
 
     assert classification is not None
     assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
+
+
+def test_an_unknown_outcome_workload_stop_still_reaches_an_operator():
+    """The short-circuit is not gated on the hardware ladder's operations.
+
+    STOP_WORKLOADS, RESTART_VM and RESTART_FABRIC_MANAGER are not classifiable
+    rungs, so a FAILED one classified as None -- a silent FAILED the dispatcher
+    only stamps ``failure_handled_at`` on. With the outcome unknown (the executor
+    abandoned the stop mid-flight) that silence hides a job that may be half
+    stopped; only the three no-second-ticket operations stay out.
+    """
+
+    steps = [workflow_step(WorkflowOperation.STOP_WORKLOADS, node_ids=["node-a"])]
+    workflow = _failed_workflow(
+        steps,
+        0,
+        error="executor abandoned STOP_WORKLOADS after 600s; outcome unknown",
+        details={
+            "execution_timeout": True,
+            "operation": WorkflowOperation.STOP_WORKLOADS.value,
+            "outcome_unknown": True,
+            "manual_confirmation_required": True,
+        },
+    )
+
+    classification = HardwareEscalationService.classify(workflow)
+
+    assert classification is not None, (
+        "an unknown-outcome STOP_WORKLOADS must not fail silently"
+    )
+    assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
+
+
+def _support_reason(details, error):
+    """The first reason ``emit`` writes for a FAILED RESET_GPU with ``details``."""
+
+    store = build_store()
+    steps = [
+        workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"]),
+        workflow_step(RESET, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
+    ]
+    _, workflow = _failed(
+        store,
+        steps,
+        [
+            workflow_step_execution(0, steps[0].operation),
+            workflow_step_execution(
+                1, RESET, WorkflowStepStatus.FAILED, error=error, details=details
+            ),
+        ],
+        completed=[0],
+        gpu_uuids=("GPU-a",),
+    )
+    escalation = HardwareEscalationService(store, _StubBuilder()).escalate(workflow)
+    assert escalation is not None, "the failure must be escalated"
+    return escalation[0].reasons[0]
+
+
+def test_the_operator_reason_names_the_cause_of_each_unknown_outcome():
+    """INTERRUPTED and COMMAND_ID_REUSED must not read as the same failure.
+
+    Both folds ended in ``manual_confirmation_required`` and neither wrote
+    ``node_failures``, so ``emit`` fell back to its default label and the
+    ESCALATE_SUPPORT email said "node-a: validation failed" for a reset that
+    was interrupted and for a command body the agent refused -- the operator
+    could not tell which node to go and look at, nor why.
+    """
+
+    interrupted_agent = NodeActionResult(
+        command_id="workflow/step/node-a",
+        operation=RESET,
+        status=NodeActionStatus.INTERRUPTED,
+        error="node action attempt closed without a result",
+        retryable=False,
+    )
+    folding = NodeActionWorkflowAdapter(
+        {"node-a": ENDPOINT},
+        SECRET,
+        sender=lambda _endpoint, _envelope: interrupted_agent,
+    )
+    interrupted = folding.execute(step_context(folding))
+    reused = adapter_raising(
+        http_error(
+            409,
+            {
+                "code": "COMMAND_ID_REUSED",
+                "message": "node action command_id reused for a different command",
+                "retryable": False,
+                "requires_new_command": False,
+            },
+        )
+    )
+    reused = reused.execute(step_context(reused))
+    assert interrupted.status is WorkflowStepStatus.FAILED, interrupted
+    assert reused.status is WorkflowStepStatus.FAILED, reused
+
+    interrupted_reason = _support_reason(interrupted.details, interrupted.error)
+    reused_reason = _support_reason(reused.details, reused.error)
+
+    assert interrupted_reason != reused_reason, (
+        f"two different causes read identically to the operator: {interrupted_reason}"
+    )
+    assert "node-a: node action interrupted" in interrupted_reason, interrupted_reason
+    assert "node-a: command_id reused" in reused_reason, reused_reason
+    for reason in (interrupted_reason, reused_reason):
+        assert "validation failed" not in reason, (
+            f"the default label hides the cause: {reason}"
+        )
 
 
 def test_an_unknown_outcome_support_escalation_spawns_no_second_ticket():

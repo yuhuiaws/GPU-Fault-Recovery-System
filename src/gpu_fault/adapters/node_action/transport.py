@@ -327,8 +327,13 @@ class NodeActionTransportMixin:
             # the body, so a rebind that changed this step's GPU set collides
             # with an attempt 1 that may already have reset the old set. Both
             # ladders read this flag and hand the step to an operator instead
-            # of rebooting on top of it.
+            # of rebooting on top of it; ``node_failures`` is the per-node
+            # cause the escalation's reason text and support email quote.
             common["manual_confirmation_required"] = True
+            common["failed_nodes"] = [node_id]
+            common["node_failures"] = {
+                node_id: [f"command_id reused with a different body (HTTP {exc.code})"]
+            }
         return WorkflowStepOutcome.failed(
             f"node agent {node_id} rejected request: HTTP {exc.code}: {message}",
             details=common,

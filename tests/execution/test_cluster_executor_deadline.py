@@ -221,6 +221,12 @@ def test_a_stuck_node_action_reports_an_unknown_outcome_not_a_plain_failure() ->
             "a reset the agent may still be running is the one case where the "
             f"outcome really is unknown: {result.details}"
         )
+        assert result.details.get("node_failures") == {
+            "node-a": ["execution timed out; outcome unknown"]
+        }, (
+            "the operator's reason text falls back to 'validation failed' "
+            f"without a per-node cause: {result.details}"
+        )
         assert "unknown" in (result.error or ""), result.error
     finally:
         adapter.released.set()

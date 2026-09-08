@@ -25,10 +25,6 @@ _EXPORTS = {
         "gpu_fault.orchestration.coordinator",
         "WorkflowFencingError",
     ),
-    "failure_takes_no_rung": (
-        "gpu_fault.orchestration.escalation",
-        "failure_takes_no_rung",
-    ),
 }
 
 __getattr__, __dir__, __all__ = lazy_module(globals(), _EXPORTS)

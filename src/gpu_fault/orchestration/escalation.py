@@ -82,13 +82,23 @@ CONTAINMENT_REFUSED_STAGE = "containment_refused"
 # ``manual_confirmation_required``. The reset may have run, the reboot may still
 # be in flight -- climbing the hardware ladder from there reboots a node whose
 # GPU was possibly just reset, or replaces one that is possibly still rebooting.
-# Both ladders read this: ``_classify`` here and the DAG branch escalator's
-# guard in ``execution/executor.py``.
+# Both ladders read this: ``_classify`` here and the DAG branch escalator
+# (``execution/branch_escalation.py``), which exhausts such a branch at once.
 MANUAL_CONFIRMATION_STAGE = "manual_confirmation_required"
 _UNKNOWN_OUTCOME_FLAGS = (
     "manual_confirmation_required",
     "node_action_interrupted",
     "outcome_unknown",
+)
+# Unknown-outcome failures that must not open a successor: a second support
+# case for a support escalation the executor abandoned, or a support case for
+# an evidence freeze / checkpoint that may still be running inside the job.
+_NO_SECOND_TICKET_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.ESCALATE_SUPPORT,
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.CHECKPOINT_WORKLOADS,
+    }
 )
 # Written by the Kubernetes node adapter on a step it refused rather than
 # failed: ``safety_rejection`` on every refusal, ``absent`` when the node
@@ -141,27 +151,15 @@ def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     )
 
 
-def failure_takes_no_rung(details: Mapping[str, Any] | None) -> bool:
-    """Whether a FAILED branch step may take no in-place rung at all.
-
-    The DAG branch escalator's guard: the remediation's lifetime is over (F-N1,
-    no rung is planned for anyone) or the step's outcome is unknown. Either way
-    the whole workflow fails and ``_classify`` hands it to an operator, exactly
-    as on the non-DAG path.
-    """
-
-    return details is not None and (
-        details.get("workflow_lifetime_exceeded") is True
-        or unknown_outcome_failure(details)
-    )
-
-
 def _unknown_outcome_failures(
     executions: list[WorkflowStepExecution],
 ) -> list[WorkflowStepExecution]:
-    """FAILED classifiable executions that demand an operator, not a rung.
+    """FAILED executions that demand an operator, not a rung.
 
-    Restricted to ``_CLASSIFIABLE_OPERATIONS`` on purpose: an abandoned
+    Every operation qualifies -- a STOP_WORKLOADS or RESTART_VM the executor
+    abandoned mid-flight is not a hardware rung, but classifying it as None
+    made it a silent FAILED the dispatcher only stamps ``failure_handled_at``
+    on -- except the three in ``_NO_SECOND_TICKET_OPERATIONS``: an abandoned
     ESCALATE_SUPPORT, FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS carries the same
     flags, but a ``support-after-<wf>`` successor for a support escalation that
     timed out is a second vendor ticket. Those keep the previous behaviour -- no
@@ -172,7 +170,7 @@ def _unknown_outcome_failures(
         execution
         for execution in executions
         if execution.status is WorkflowStepStatus.FAILED
-        and execution.operation in _CLASSIFIABLE_OPERATIONS
+        and execution.operation not in _NO_SECOND_TICKET_OPERATIONS
         and unknown_outcome_failure(execution.details)
     ]
 

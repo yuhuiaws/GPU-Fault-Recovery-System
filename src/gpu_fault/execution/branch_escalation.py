@@ -13,9 +13,10 @@ whole-workflow escalation (support / drain).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from gpu_fault.models import (
     WorkflowEventCode,
@@ -30,7 +31,7 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.dag_branching import branch_node_ids
-from gpu_fault.orchestration.escalation import next_rung
+from gpu_fault.orchestration.escalation import next_rung, unknown_outcome_failure
 
 if TYPE_CHECKING:
     from gpu_fault.orchestration.dag_branching import DagBrancher
@@ -86,12 +87,21 @@ class BranchEscalator:
         workflow: WorkflowRequest,
         failed_index: int,
         error: str | None,
+        *,
+        details: Mapping[str, Any] | None = None,
     ) -> BranchEscalation | None:
         """Rewrite ``workflow`` after step ``failed_index`` FAILED.
 
         Returns ``None`` when the failure is not one node branch's (job-level
         step, multi-node step, non-DAG workflow); the caller then keeps the
         whole-workflow failure path. The returned workflow is not persisted.
+
+        ``details`` is the failed outcome's: a step whose outcome is unknown
+        (an INTERRUPTED reset, an abandoned mutation, a reused command id --
+        ``unknown_outcome_failure``) takes no rung and is exhausted at once. The
+        sibling branches still finish and release their nodes; the workflow
+        then fails and the whole-workflow classifier hands the flagged step to
+        an operator, exactly as off the DAG.
         """
 
         if not workflow.dag_enabled or not 0 <= failed_index < len(
@@ -106,7 +116,8 @@ class BranchEscalator:
         assert branch_id is not None
         branch_indexes = set(self.brancher.node_branch_step_indexes(workflow, node_id))
         recovery_context = self._recovery_context(workflow, branch_indexes)
-        rung = next_rung(step.operation, recovery_context)
+        unknown = unknown_outcome_failure(details)
+        rung = None if unknown else next_rung(step.operation, recovery_context)
         taken = workflow.branch_escalation_counts.get(node_id, 0)
         if rung is None or taken >= self.max_rungs:
             return self._exhaust(
@@ -118,7 +129,9 @@ class BranchEscalator:
                     f"{step.operation.value} failed on {node_id}"
                     f" ({error or 'no error detail'}); "
                     + (
-                        "no further rung"
+                        "outcome unknown, an operator confirms it; no rung"
+                        if unknown
+                        else "no further rung"
                         if rung is None
                         else f"{taken} rung(s) already taken"
                     )

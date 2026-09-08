@@ -216,6 +216,9 @@ class NodeActionExecutionService:
                 result,
             )
         if result.status is NodeActionStatus.INTERRUPTED:
+            # ``node_failures`` is what the escalation's reason text and the
+            # support email quote per node; without it every unknown outcome
+            # read as the default "validation failed".
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id}: {result.error}",
                 details={
@@ -223,6 +226,10 @@ class NodeActionExecutionService:
                     "node_action_interrupted": True,
                     "manual_confirmation_required": True,
                     "operation": context.step.operation.value,
+                    "failed_nodes": [node_id],
+                    "node_failures": {
+                        node_id: [f"node action interrupted: {result.error}"]
+                    },
                 },
             )
         if result.status is not NodeActionStatus.FAILED:

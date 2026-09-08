@@ -191,9 +191,9 @@ def test_a_job_workflow_past_its_lifetime_fails_without_escalating_a_branch():
     escalations: list[int] = []
 
     class _RecordingEscalator(BranchEscalator):
-        def escalate_branch(self, workflow, failed_index, error):
+        def escalate_branch(self, workflow, failed_index, error, **kwargs):
             escalations.append(failed_index)
-            return super().escalate_branch(workflow, failed_index, error)
+            return super().escalate_branch(workflow, failed_index, error, **kwargs)
 
     adapter = FakeAdapter({RESET: WorkflowStepOutcome.succeeded()})
     executor = active_workflow_executor(

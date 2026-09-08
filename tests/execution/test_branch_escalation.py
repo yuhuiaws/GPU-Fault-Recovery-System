@@ -264,6 +264,145 @@ def test_an_unknown_outcome_branch_failure_goes_to_an_operator_not_up_the_ladder
     assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
 
 
+class _ConfirmableNodeAdapter(FakeAdapter):
+    """Per-(operation, node) outcomes that still honour a confirmed WAITING."""
+
+    def __init__(self, outcomes, per_node):
+        super().__init__(outcomes)
+        self.per_node = per_node
+
+    def execute(self, context):
+        key = (context.step.operation, tuple(context.step.node_ids))
+        if key not in self.per_node:
+            return super().execute(context)
+        self.calls.append(context.idempotency_key)
+        outcome = self.per_node[key]
+        if (
+            outcome.adapter_operation_id
+            in context.request.confirmed_adapter_operation_ids
+        ):
+            return WorkflowStepOutcome.succeeded(
+                operation_id=outcome.adapter_operation_id
+            )
+        return outcome
+
+
+def _job_dag_with_release(store):
+    """STOP -> {node-b RESET_GPU, node-c RESTART_NODE -> RESTORE_SCHEDULING} -> join."""
+
+    RESTORE = WorkflowOperation.RESTORE_SCHEDULING
+    incident, workflow = workflow_state(
+        store, [STOP, RESET, REBOOT, RESTORE, RESTART_JOB]
+    )
+    base = workflow.official_steps
+    steps = [
+        copy_model(base[0], branch_id="shared", node_ids=["node-b", "node-c"]),
+        copy_model(
+            base[1],
+            node_ids=["node-b"],
+            depends_on_step_indexes=[0],
+            branch_id="branch:node-b",
+        ),
+        copy_model(
+            base[2],
+            node_ids=["node-c"],
+            depends_on_step_indexes=[0],
+            branch_id="branch:node-c",
+        ),
+        copy_model(
+            base[3],
+            node_ids=["node-c"],
+            depends_on_step_indexes=[2],
+            branch_id="branch:node-c",
+        ),
+        copy_model(
+            base[4],
+            depends_on_step_indexes=[1, 3],
+            branch_id="join",
+            node_ids=["node-b", "node-c"],
+            parameters=dict(RESTART_PARAMETERS),
+        ),
+    ]
+    workflow = copy_model(
+        workflow,
+        dag_enabled=True,
+        dag_revision=1,
+        official_steps=steps,
+        completed_step_indexes=[0],
+        completed_operations=[STOP],
+        step_executions=[workflow_step_execution(0, STOP)],
+    )
+    store.save_workflow(workflow)
+    return incident, workflow
+
+
+def test_an_unknown_outcome_branch_is_exhausted_and_its_siblings_finish_first():
+    """The unknown-outcome branch stops; the other node's repair is still wanted.
+
+    Failing the whole workflow at the end of the batch left node-c's reboot
+    WAITING forever and its RESTORE_SCHEDULING never ran -- the node stayed
+    cordoned behind node-b's mystery. An unknown outcome is treated like an
+    exhausted ladder instead: node-b's branch is retired with no rung, node-c
+    finishes and is released, the join is skipped, and only then does the
+    workflow fail to the classifier, which hands node-b to an operator.
+    """
+
+    store = build_store()
+    _, workflow = _job_dag_with_release(store)
+    adapter = _ConfirmableNodeAdapter(
+        {
+            RESET: WorkflowStepOutcome.failed(
+                "node agent node-b: attempt closed without a result",
+                details={
+                    "node_action_interrupted": True,
+                    "manual_confirmation_required": True,
+                    "operation": RESET.value,
+                },
+            ),
+            **_ok(REBOOT, RESTART_JOB, *VALIDATIONS),
+        },
+        {(REBOOT, ("node-c",)): WorkflowStepOutcome.waiting(operation_id="reboot-c")},
+    )
+    executor = active_workflow_executor(store, [adapter], ALL_OPERATIONS)
+    executor.branch_escalator = _escalator()
+
+    first = executor.execute(
+        workflow.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+    )
+    assert first.status is not WorkflowStatus.FAILED, (
+        "the workflow was failed while node-c's reboot was still in flight: "
+        f"{first.status} calls={adapter.calls}"
+    )
+    assert first.waiting_step_index == 2, first
+
+    second = executor.execute(
+        workflow.request_id,
+        WorkflowExecutionRequest(
+            expected_fencing_token=workflow.fencing_token,
+            confirmed_adapter_operation_ids=["reboot-c"],
+        ),
+    )
+    saved = store.get_workflow(workflow.request_id)
+
+    assert "workflow-active/3/RESTORE_SCHEDULING" in adapter.calls, (
+        f"node-c was never released: {adapter.calls}"
+    )
+    assert second.status is WorkflowStatus.FAILED, second.status
+    assert all(
+        call == "workflow-active/2/RESTART_NODE" or not call.endswith("/RESTART_NODE")
+        for call in adapter.calls
+    ), f"a reboot rung was appended for node-b: {adapter.calls}"
+    assert all("RESTART_WORKLOAD" not in call for call in adapter.calls), adapter.calls
+    assert saved.branch_escalation_counts == {}, saved.branch_escalation_counts
+    assert [item.split("/")[0] for item in saved.exhausted_branch_ids] == [
+        "branch:node-b"
+    ], saved.exhausted_branch_ids
+    classification = HardwareEscalationService.classify(saved)
+    assert classification is not None, "the classifier must still see the failure"
+    assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
+
+
 def test_a_job_level_step_failure_still_fails_the_whole_workflow():
     store = build_store()
     _, workflow = _job_dag(store, stop_done=False)

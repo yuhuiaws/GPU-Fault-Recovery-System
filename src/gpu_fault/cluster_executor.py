@@ -1538,12 +1538,10 @@ class ClusterActionExecutor:
 
         FAILED, because the step did not succeed and the workflow must not stay
         WAITING on a thread nobody will ever hear from again. But never a plain
-        failure for anything that mutates: the node action may be running in the
-        agent's ledger right now, so the result says the outcome is unknown and
-        demands manual confirmation -- the same shape an INTERRUPTED node action
-        reports. ``details`` is what crosses to the step record; the hardware
-        escalation reads ``outcome_unknown``/``manual_confirmation_required``
-        there and hands the step to an operator instead of climbing a rung.
+        failure for anything that mutates: the node action may still be running
+        on the node, so the result marks the outcome unknown and demands manual
+        confirmation (the INTERRUPTED shape); the hardware escalation reads
+        those ``details`` and hands the step to an operator, no rung climbed.
         """
 
         operation = command.step.operation
@@ -1555,16 +1553,18 @@ class ClusterActionExecutor:
         }
         pointer = (command.result_details or {}).get("node_action_command_id")
         if pointer is not None:
-            # The ledger row is the only way an operator can find out what the
-            # agent actually did.
+            # The ledger row is how an operator learns what the agent did.
             details["node_action_command_id"] = pointer
         if unknown:
-            # Both keys follow the same rule as ``status_source``: an
-            # idempotent read-only operation that timed out did not happen,
-            # and marking its outcome unknown would make the one key that
-            # means "go look at the node" true on every slow host validation.
+            # Only here, like ``status_source``: a read-only timeout did not
+            # happen, and this is the key that means "go look at the node".
+            # ``node_failures`` is the per-node cause the escalation quotes.
             details["outcome_unknown"] = True
             details["manual_confirmation_required"] = True
+            details["node_failures"] = {
+                node_id: ["execution timed out; outcome unknown"]
+                for node_id in command.step.node_ids
+            }
         return RemoteCommandResult(
             lease_token=str(command.lease_token),
             status=RemoteCommandStatus.FAILED,
