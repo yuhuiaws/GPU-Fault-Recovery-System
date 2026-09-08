@@ -81,6 +81,7 @@ class KubernetesNodeOperationsMixin:
     store: Any
 
     _annotations: Callable[..., Any]
+    _labels: Callable[..., dict[str, str]]
     _efa_plugin_pods: Callable[..., Any]
     _node_allocatable: Callable[..., Any]
     _pod_name: Callable[..., Any]
@@ -507,11 +508,12 @@ class KubernetesNodeOperationsMixin:
         """A node declared as a warm spare that no incident currently holds
         (pool state anything but ALLOCATED)."""
 
-        if self._labels(node).get(SPARE_LABEL) != SPARE_LABEL_VALUE:
+        labels: dict[str, str] = self._labels(node)
+        if labels.get(SPARE_LABEL) != SPARE_LABEL_VALUE:
             return False
-        return self._annotations(node).get(SPARE_POOL_STATE_ANNOTATION) != (
-            SPARE_POOL_STATE_ALLOCATED
-        )
+        annotations: dict[str, Any] = dict(self._annotations(node))
+        pool_state = annotations.get(SPARE_POOL_STATE_ANNOTATION)
+        return bool(pool_state != SPARE_POOL_STATE_ALLOCATED)
 
     def _gpu_fault_isolated(self, node: Any) -> bool:
         annotations = self._annotations(node)
