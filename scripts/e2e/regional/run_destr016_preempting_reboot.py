@@ -123,8 +123,14 @@ DEFAULT_NODE_LIFETIME_SECONDS = 3600
 # Phase budgets. The barrier park is the scarce one: it lives inside the step's
 # own waiting ceiling, and both later injections have to land inside it.
 BARRIER_WAIT_BUDGET_SECONDS = 600
-ABSORB_BUDGET_SECONDS = 180
-PREEMPTION_BUDGET_SECONDS = 300
+ABSORB_BUDGET_SECONDS = 300
+PREEMPTION_BUDGET_SECONDS = 420
+# QUIESCE_GPU_SERVICES stops kubelet, and with it the exec channel the host
+# probes answer over, so the two writes that must land inside the WAITING
+# window are scheduled on the node when the holder is armed: this many seconds
+# after the holder starts (i.e. after the quiesce row landed in the ledger).
+ABSORB_DELAY_SECONDS = 90
+ESCALATE_DELAY_SECONDS = 240
 # Supersession happens when the predecessor's executor next reaches a step
 # boundary, which can take one lease/reclaim interval after the successor was
 # written (``execution/dispatcher.py``: ``_eligible`` holds the successor while
@@ -734,6 +740,7 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
     )
     if window:
         raise RegionalFixtureError("; ".join(window))
+    run.marker = markers(f"destr016-{int(time.time())}-a{run.attempt}")
     armed = run.holder_probe.execute(
         "arm-holder",
         "--device",
@@ -748,11 +755,26 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
         run_id,
         "--probe-script",
         run.holder_probe.host_script,
+        "--inject-script",
+        run.inject_probe.host_script,
+        "--pci-bdf",
+        run.bdf,
+        "--absorb-marker",
+        run.marker["absorb"],
+        "--absorb-drill-id",
+        f"{run_id}-s",
+        "--absorb-after-seconds",
+        str(ABSORB_DELAY_SECONDS),
+        "--escalate-marker",
+        run.marker["escalate"],
+        "--escalate-drill-id",
+        f"{run_id}-e",
+        "--escalate-after-seconds",
+        str(ESCALATE_DELAY_SECONDS),
     )
     run.holder_armed = True
     write_json_atomic(case_dir / "holder-armed.json", armed)
     run.started_at = datetime.now(timezone.utc)
-    run.marker = markers(f"destr016-{int(time.time())}-a{run.attempt}")
     injection = run.inject_probe.execute(
         "write-xid46",
         "--marker",
@@ -789,7 +811,10 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
                 break
         time.sleep(5)
     write_json_atomic(run.case_dir / "barrier-state.json", last)
-    holder = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
+    try:
+        holder = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
+    except Exception as exc:  # noqa: BLE001 - a quiesced node cannot answer
+        holder = {"error": f"{type(exc).__name__}: {exc}"}
     write_json_atomic(run.case_dir / "holder-status-barrier.json", holder)
     raise RegionalFixtureError(
         "the reset workflow never parked at the client-verification barrier: "
@@ -801,18 +826,8 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
 def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     """Phase A: a second same-rank XID 46 must merge into the parked workflow."""
 
-    run_id = run.run_id
-    injection = run.inject_probe.execute(
-        "write-xid46",
-        "--marker",
-        run.marker["absorb"],
-        "--drill-id",
-        f"{run_id}-s",
-        "--pci-bdf",
-        run.bdf,
-    )
-    run.injected_at["absorb"] = datetime.now(timezone.utc).isoformat()
-    write_json_atomic(run.case_dir / "injection-absorb.json", injection)
+    # The write itself was scheduled on the node by arm-holder; kubelet is
+    # stopped behind the quiesce, so the only way to see it land is the store.
     deadline = time.monotonic() + ABSORB_BUDGET_SECONDS
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -826,6 +841,10 @@ def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "absorb-state.json", last)
+    run.injected_at["absorb"] = str(
+        (last.get("event") or {}).get("observed_at")
+        or f"scheduled {ABSORB_DELAY_SECONDS}s after the holder started"
+    )
     errors = absorb_errors(barrier, last, node=run.settings.node)
     # The absorbed fault must not have moved the boundary either: the case can
     # only preempt what is still parked.
@@ -838,21 +857,10 @@ def _escalate(
 ) -> tuple[list[str], dict[str, Any]]:
     """Phase B: XID 79 must preempt the parked reset and adopt its quiesce."""
 
-    case_dir, run_id = run.case_dir, run.run_id
+    case_dir = run.case_dir
     run.predecessor_id = str((barrier.get("workflow") or {}).get("request_id") or "")
     run.incident_id = str((barrier.get("incident") or {}).get("incident_id") or "")
-    injection = run.inject_probe.execute(
-        "write-xid79",
-        "--marker",
-        run.marker["escalate"],
-        "--drill-id",
-        f"{run_id}-e",
-        "--pci-bdf",
-        run.bdf,
-    )
-    run.injected_at["escalate"] = datetime.now(timezone.utc).isoformat()
-    write_json_atomic(case_dir / "injection-escalate.json", injection)
-
+    # Scheduled on the node by arm-holder (see ESCALATE_DELAY_SECONDS).
     successor: dict[str, Any] = {}
     deadline = time.monotonic() + PREEMPTION_BUDGET_SECONDS
     while time.monotonic() < deadline:
@@ -863,6 +871,10 @@ def _escalate(
             break
         time.sleep(5)
     write_json_atomic(case_dir / "successor-created.json", successor)
+    run.injected_at["escalate"] = str(
+        (successor.get("event") or {}).get("observed_at")
+        or f"scheduled {ESCALATE_DELAY_SECONDS}s after the holder started"
+    )
     if not run.successor_id:
         raise RegionalFixtureError(
             f"XID 79 did not create a successor workflow: {successor}"

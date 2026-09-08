@@ -537,3 +537,131 @@ def test_parser_refuses_an_arm_operation_outside_the_allowlist() -> None:
 def test_the_arm_operations_are_the_two_steps_around_the_boundary() -> None:
     assert probe.ARM_LEDGER_OPERATIONS == (QUIESCE, VERIFY)
     assert probe.RACE_OPERATION == VERIFY
+
+
+def test_arm_holder_schedules_the_absorb_and_escalation_writes_after_the_holder() -> (
+    None
+):
+    """QUIESCE stops kubelet and the exec channel; the two writes that must land
+    inside the WAITING window are systemd timers armed with the holder."""
+    arguments = probe.parser().parse_args(
+        [
+            "arm-holder",
+            "--device",
+            "/dev/nvidia0",
+            "--drill-id",
+            RUN_ID,
+            "--after-ledger-op",
+            QUIESCE,
+            "--max-hold-seconds",
+            "1800",
+            "--run-id",
+            RUN_ID,
+            "--probe-script",
+            "/run/destr016_node_probe.py",
+            "--inject-script",
+            "/run/gpu-fault-host-probe-ab894dd753.py",
+            "--pci-bdf",
+            "0000:59:00",
+            "--absorb-marker",
+            "m-absorb",
+            "--absorb-drill-id",
+            f"{RUN_ID}-s",
+            "--absorb-after-seconds",
+            "90",
+            "--escalate-marker",
+            "m-escalate",
+            "--escalate-drill-id",
+            f"{RUN_ID}-e",
+            "--escalate-after-seconds",
+            "240",
+        ]
+    )
+
+    plan = probe.injection_plan(arguments)
+
+    assert [
+        (item["phase"], item["subcommand"], item["after_seconds"]) for item in plan
+    ] == [("absorb", "write-xid46", 90), ("escalate", "write-xid79", 240)], plan
+    command = probe.injection_command(RUN_ID, plan[1])
+    assert command[:2] == ["systemd-run", "--unit"], command
+    assert command[2] == probe.injection_unit(RUN_ID, "escalate"), command
+    assert "--on-active=240" in command, command
+    assert command[-8:] == [
+        "/run/gpu-fault-host-probe-ab894dd753.py",
+        "write-xid79",
+        "--marker",
+        "m-escalate",
+        "--drill-id",
+        f"{RUN_ID}-e",
+        "--pci-bdf",
+        "0000:59:00",
+    ], command
+    assert command[-9] == "/opt/gpu-fault/current/venv/bin/python", command
+    # The scheduled units are the probe's own: the allow-listed systemctl verbs
+    # may stop them, so disarm-holder can clear a timer that never fired.
+    timer = probe.injection_unit(RUN_ID, "absorb") + ".timer"
+    assert probe.checked_command(["systemctl", "stop", timer], RUN_ID)[-1] == timer
+
+
+def test_arm_holder_without_an_inject_script_schedules_nothing() -> None:
+    arguments = probe.parser().parse_args(
+        [
+            "arm-holder",
+            "--device",
+            "/dev/nvidia0",
+            "--drill-id",
+            RUN_ID,
+            "--after-ledger-op",
+            QUIESCE,
+            "--run-id",
+            RUN_ID,
+            "--probe-script",
+            "/run/destr016_node_probe.py",
+        ]
+    )
+    assert probe.injection_plan(arguments) == [], "no inject script means no timers"
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("--inject-script", "/tmp/evil.py", "installed host probe script"),
+        ("--pci-bdf", "0000:59:00;rm", "unsafe PCI BDF"),
+        ("--absorb-after-seconds", "3", "below"),
+        ("--escalate-after-seconds", "1800", "bounded lifetime"),
+    ],
+)
+def test_arm_holder_refuses_unsafe_or_out_of_window_injections(
+    option: str, value: str, message: str
+) -> None:
+    base = {
+        "--inject-script": "/run/gpu-fault-host-probe-ab894dd753.py",
+        "--pci-bdf": "0000:59:00",
+        "--absorb-marker": "m-a",
+        "--absorb-drill-id": f"{RUN_ID}-s",
+        "--absorb-after-seconds": "90",
+        "--escalate-marker": "m-e",
+        "--escalate-drill-id": f"{RUN_ID}-e",
+        "--escalate-after-seconds": "240",
+    }
+    base[option] = value
+    argv = [
+        "arm-holder",
+        "--device",
+        "/dev/nvidia0",
+        "--drill-id",
+        RUN_ID,
+        "--after-ledger-op",
+        QUIESCE,
+        "--max-hold-seconds",
+        "1800",
+        "--run-id",
+        RUN_ID,
+        "--probe-script",
+        "/run/destr016_node_probe.py",
+    ]
+    for key, item in base.items():
+        argv += [key, item]
+    with pytest.raises(probe.ProbeError, match=message):
+        probe.injection_plan(probe.parser().parse_args(argv))
