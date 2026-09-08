@@ -29,6 +29,7 @@
 | [详细设计](详细设计.md) | 当前代码模块、协议和状态机如何实现 |
 | [详细设计 v2（可编码视角）](详细设计-v2.md) | 每个模块怎么跑、数据怎么流、异常怎么处理，够据此编码联调 |
 | [NVIDIA 策略供应链与实现](components/nvidia-policy.md) | Catalog 固定来源、生成摘要、动作语义和运行时门禁 |
+| [故障类别与处置动作总表](故障类别与处置动作总表.md) | 每类故障、每个 XID/SXID 的检测规则、NVIDIA 官方建议、策略判定和实际执行步骤 |
 | [CI 发布流程](CI发布流程.md) | main CI如何生成签名候选，Release如何验签晋级和交付制品 |
 | [EC2源码Staging统一部署流程](EC2源码Staging复现流程.md) | 首次、dirty迭代和后续升级均用四参数`gpu-fault-admin deploy` |
 | [管理员快速部署](管理员快速部署.md) | 如何用四参数`gpu-fault-admin deploy`完成首次和后续部署 |
