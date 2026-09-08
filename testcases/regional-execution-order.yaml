@@ -246,7 +246,7 @@ do_not_run:
   - case: GF-REGIONAL-BOOT-006
     reason: >-
       它驱动的 in-cluster quick diagnostics 守卫已随该路径一起删除，
-      GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS 不再存在，该守卫已不存在，用例作废。
+      GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS 不再存在，用例作废。
   - case: GF-REGIONAL-DESTR-004
     reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。
   - case: GF-REGIONAL-AUTH-012

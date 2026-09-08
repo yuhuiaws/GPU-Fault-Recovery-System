@@ -501,7 +501,7 @@ def _labelled_counter(
 
 
 def _control_loop_review_lines(dispatcher: object, archiver: object) -> list[str]:
-    """Counters the control-plane review 2026-09-08 added (D-4, F-7, F-8).
+    """Counters the control-plane review 2026-09-08 added (D-4, F-8).
 
     Each is a failure that used to be a log line and nothing else: a dispatcher
     sweep path that raised, an archiver run that failed on one incident. The

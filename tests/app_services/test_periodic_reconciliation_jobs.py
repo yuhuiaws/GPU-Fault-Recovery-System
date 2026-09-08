@@ -88,7 +88,7 @@ def _runner(store, **config) -> PeriodicServiceRunner:
         owner_id="pod-a:1",
     )
     return PeriodicServiceRunner(
-        context=SimpleNamespace(store=store, regional_mode=False, completion=None),
+        context=SimpleNamespace(store=store, regional_mode=False),
         processor=processor,
         stop=Event(),
         identity_registries=[],
@@ -171,9 +171,6 @@ def test_a_quiet_reclaim_round_logs_nothing_and_adds_nothing(caplog):
 
     assert runner.metrics_snapshot()["processor_expired_leases_reclaimed_total"] == 0
     assert caplog.records == []
-
-
-# --- F-G2 (4) -----------------------------------------------------------------
 
 
 # --- F-D10 P1-75F -------------------------------------------------------------

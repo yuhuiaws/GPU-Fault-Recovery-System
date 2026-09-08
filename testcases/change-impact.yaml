@@ -679,7 +679,8 @@ rules:
       - tests/regional/test_plugins.py
       - tests/app/test_route_tenancy_security.py
     regional_cases:
-      - GF-REGIONAL-BOOT-001..015
+      - GF-REGIONAL-BOOT-001..005
+      - GF-REGIONAL-BOOT-007..015
       - GF-REGIONAL-AUTH-001..009
       - GF-REGIONAL-AUTH-011
       - GF-REGIONAL-AUTH-013..016

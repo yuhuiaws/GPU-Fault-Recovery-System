@@ -91,7 +91,7 @@ class _OutageStore:
         return 0
 
 
-def _runner(store, completion=None, **config) -> PeriodicServiceRunner:
+def _runner(store, **config) -> PeriodicServiceRunner:
     processor = SimpleNamespace(
         is_healthy=lambda: True,
         # Leader without consumers: no task-lease write, so the store outage
@@ -102,7 +102,6 @@ def _runner(store, completion=None, **config) -> PeriodicServiceRunner:
     )
     context = SimpleNamespace(
         store=store,
-        completion=completion,
         regional_mode=False,
         control_record_archiver=None,
         spare_health_controller=None,

@@ -296,9 +296,9 @@ class CompletionService:
     ) -> CompletionDecision:
         """Decide a terminal event. Runs inside the completion transaction.
 
-        Returns the decision. No longer creates triage requests; instead uses
-        the planner's without_hardware_evidence method to create a restart or
-        escalation plan directly.
+        Returns the decision. Explicit foreign initiator → NO_ACTION; user stop
+        or success → NO_ACTION and withdraw; trusted marker → marker plan; no
+        allocation → evidence + escalate; otherwise one budgeted restart.
         """
 
         if event.termination_initiator_incident_id and (
@@ -401,10 +401,7 @@ class CompletionService:
                 attempt_id=event.attempt_id,
                 event_key=event.event_key,
                 status=DecisionStatus.PLAN_CREATED,
-                reason=(
-                    "allocation snapshot is missing; triage is "
-                    "inconclusive and automatic restart is blocked"
-                ),
+                reason="allocation snapshot is missing; automatic restart is blocked",
                 recovery_plan_id=plan.plan_id,
             )
 
