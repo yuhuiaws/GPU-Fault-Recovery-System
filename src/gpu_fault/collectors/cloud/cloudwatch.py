@@ -132,7 +132,7 @@ class CloudWatchHmaCollector:
             timestamp = datetime.fromtimestamp(
                 int(item["timestamp"]) / 1000, tz=timezone.utc
             )
-            deliver_or_raise(
+            result = deliver_or_raise(
                 self.sink,
                 "/v1/provider-events/hyperpod-hma/cloudwatch",
                 {
@@ -154,8 +154,10 @@ class CloudWatchHmaCollector:
             # An event the outbox took is durable, so the rest of the
             # subscription batch is still forwarded; only an event that went
             # nowhere aborts the batch, which is what makes CloudWatch Logs
-            # retry the whole delivery (ARCH-G3).
-            stats = stats.model_copy(update={"delivered": stats.delivered + 1})
+            # retry the whole delivery (ARCH-G3). It is counted as buffered,
+            # not delivered: ``delivered`` means the control plane has it.
+            counter = "buffered" if result.buffered else "delivered"
+            stats = stats.model_copy(update={counter: getattr(stats, counter) + 1})
         return stats
 
     @staticmethod
@@ -210,7 +212,16 @@ class SqsHmaConsumer:
             client = boto3.client("sqs")
         self.client = client
 
-    def run_once(self, wait_time_seconds: int = 20) -> int:
+    def run_once(self, wait_time_seconds: int = 20) -> CollectorStats:
+        """One receive: every message is observed, then delivered, buffered,
+        skipped (dropped as poison) or left on the queue for redelivery.
+
+        ``delivered`` means the control plane accepted the forward; a forward
+        the outbox took is ``buffered`` and its message stays on the queue, so
+        an operator reading the two numbers can tell an outage from a live
+        link (see :class:`CollectorStats`).
+        """
+
         response = self.client.receive_message(
             QueueUrl=self.queue_url,
             MaxNumberOfMessages=10,
@@ -218,8 +229,9 @@ class SqsHmaConsumer:
             VisibilityTimeout=60,
             MessageSystemAttributeNames=["ApproximateReceiveCount"],
         )
-        delivered = 0
+        observed = delivered = buffered = skipped = 0
         for message in response.get("Messages", []):
+            observed += 1
             try:
                 body = json.loads(message["Body"])
                 path = str(body["path"])
@@ -242,12 +254,14 @@ class SqsHmaConsumer:
                 # redeliver it after the visibility timeout; the control
                 # plane dedupes by CloudWatch log event id, so the outbox
                 # replay and the redelivery collapse into one record.
-                if not result.buffered:
+                if result.buffered:
+                    buffered += 1
+                else:
                     self.client.delete_message(
                         QueueUrl=self.queue_url,
                         ReceiptHandle=message["ReceiptHandle"],
                     )
-                delivered += 1
+                    delivered += 1
             except Exception as exc:
                 receives = self._receive_count(message)
                 if receives >= POISON_RECEIVE_COUNT and _is_poison_failure(exc):
@@ -281,6 +295,7 @@ class SqsHmaConsumer:
                         QueueUrl=self.queue_url,
                         ReceiptHandle=message["ReceiptHandle"],
                     )
+                    skipped += 1
                 else:
                     LOGGER.warning(
                         "queued HMA event %s delivery failed on receive %d; "
@@ -289,7 +304,9 @@ class SqsHmaConsumer:
                         receives,
                         exc_info=True,
                     )
-        return delivered
+        return CollectorStats(
+            observed=observed, delivered=delivered, buffered=buffered, skipped=skipped
+        )
 
     @staticmethod
     def _receive_count(message: dict[str, Any]) -> int:

@@ -541,7 +541,7 @@ def test_sqs_sink_and_consumer_private_delivery() -> None:
         wait_time_seconds=0
     )
 
-    assert delivered == 1
+    assert delivered.delivered == 1, f"the queued event was not delivered: {delivered}"
     assert sink.requests[0][1]["node_id"] == "worker-1"
     assert sqs.deleted == ["receipt-1"]
 

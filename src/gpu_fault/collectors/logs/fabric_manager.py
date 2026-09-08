@@ -173,6 +173,7 @@ class FabricManagerLogCollector:
                         record.get("record_id"),
                         result.error,
                     )
+                    stats = stats.model_copy(update={"buffered": stats.buffered + 1})
                 else:
                     stats = stats.model_copy(update={"delivered": stats.delivered + 1})
                 if checkpoint is not None:

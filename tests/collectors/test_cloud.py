@@ -673,9 +673,37 @@ def test_cloudwatch_subscription_continues_after_a_buffered_event() -> None:
         "event-2",
     ], "the first buffered event stopped the subscription batch"
     assert stats.observed == 2, "both log events must be observed"
-    assert stats.delivered == 2, (
-        "an event the outbox owns must count as delivered, like every other collector"
+    assert stats.delivered == 0, (
+        "`delivered` means accepted by the control plane; an event the outbox "
+        f"owns is BUFFERED, not DELIVERED: {stats}"
     )
+    assert stats.buffered == 2, (
+        f"the events the outbox took were not counted as buffered: {stats}"
+    )
+
+
+def test_cloudwatch_subscription_counts_accepted_events_as_delivered() -> None:
+    """``delivered`` = accepted by the control plane, ``buffered`` = 0 on a live path."""
+
+    sink = RecordingSink()
+    collector = CloudWatchHmaCollector(sink, context(), now=lambda: NOW)
+    message = json.dumps({"HealthMonitoringAgentDetectionEvent": "HealthEvent"})
+
+    stats = collector.collect_subscription(
+        cloudwatch_envelope(
+            [
+                {"id": "event-1", "timestamp": 1784548800000, "message": message},
+                {"id": "event-2", "timestamp": 1784548801000, "message": "noise"},
+            ]
+        )
+    )
+
+    assert (stats.observed, stats.delivered, stats.buffered, stats.skipped) == (
+        2,
+        1,
+        0,
+        1,
+    ), f"the subscription stats do not split accepted/buffered/skipped: {stats}"
 
 
 class _SqsClient:
@@ -726,7 +754,10 @@ def test_sqs_consumer_keeps_a_buffered_message_on_the_queue() -> None:
         "a buffered forward deleted the message, leaving the emptyDir outbox "
         "as the only copy of the HMA event"
     )
-    assert delivered == 1, "the forward the outbox owns was not counted as handled"
+    assert (delivered.observed, delivered.delivered, delivered.buffered) == (1, 0, 1), (
+        "`delivered` means accepted by the control plane; the forward the outbox "
+        f"owns is buffered, and the message stays on the queue: {delivered}"
+    )
 
 
 def test_sqs_consumer_deletes_a_delivered_message() -> None:
@@ -740,7 +771,9 @@ def test_sqs_consumer_deletes_a_delivered_message() -> None:
     assert client.deleted == ["receipt-1"], (
         "an accepted forward left the message for SQS to redeliver"
     )
-    assert delivered == 1, "the accepted forward was not counted as handled"
+    assert (delivered.observed, delivered.delivered, delivered.buffered) == (1, 1, 0), (
+        f"the accepted forward was not counted as delivered: {delivered}"
+    )
 
 
 def _hma_content_node(
@@ -1084,7 +1117,12 @@ def test_sqs_poison_message_is_dropped_after_five_receives(
     with caplog.at_level(logging.WARNING):
         delivered = consumer.run_once(wait_time_seconds=0)
 
-    assert delivered == 0, "a dropped poison message was counted as delivered"
+    assert delivered.delivered == 0, (
+        f"a dropped poison message was counted as delivered: {delivered}"
+    )
+    assert (delivered.observed, delivered.skipped) == (1, 1), (
+        f"a dropped poison message must be observed and counted as skipped: {delivered}"
+    )
     assert sink.requests == [], "the poison message was forwarded a sixth time"
     assert client.deleted == ["receipt-9"], (
         "the poison message stayed on the queue to be retried every visibility "

@@ -227,7 +227,7 @@ class KubernetesHmaNodeCollector:
         # relist would buffer a duplicate for the whole outage (ARCH-G3).
         self._content_digests[node_id] = digest
         if result.buffered:
-            return CollectorStats(observed=1)
+            return CollectorStats(observed=1, buffered=1)
         return CollectorStats(observed=1, delivered=1)
 
     def forget_node(self, node_id: str) -> None:
@@ -514,6 +514,7 @@ class KubernetesNodeResourceCollector:
                     "observed": stats.observed + delta.observed,
                     "skipped": stats.skipped + delta.skipped,
                     "delivered": stats.delivered + delta.delivered,
+                    "buffered": stats.buffered + delta.buffered,
                 }
             )
         return stats
@@ -683,7 +684,7 @@ class KubernetesNodeResourceCollector:
                 interval_seconds=self.health_summary_seconds,
             )
         if result.buffered:
-            return CollectorStats(observed=1)
+            return CollectorStats(observed=1, buffered=1)
         return CollectorStats(observed=1, delivered=1)
 
     def run(self) -> None:
