@@ -37,6 +37,12 @@ def _add_outbox_parser(
     dead-lettered records back to replayable and demands ``--yes`` because
     a replayed verdict is retried by every collector restart until it
     dead-letters again.
+
+    ``requeue-dead`` runs its read-modify-write under the outbox's
+    ``fcntl.flock`` (``<outbox>.lock``), so it waits for a collector that is
+    buffering or replaying instead of racing it and losing one side's update
+    (F7). It leaves records whose payload was truncated to a digest dead: only
+    a 4 KB excerpt of those bodies exists, so they cannot be replayed.
     """
 
     outbox = subcommands.add_parser(

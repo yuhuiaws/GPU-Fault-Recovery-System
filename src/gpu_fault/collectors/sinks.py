@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import gzip
+import hashlib
 import json
 import logging
 import os
 import random
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -112,6 +115,17 @@ class CollectorError(RuntimeError):
 
 
 class EventSink(Protocol):
+    """The one method every sink implements, plus two optional ones.
+
+    ``post`` is required. A sink may also offer ``deliver`` (a
+    :class:`DeliveryResult` instead of an exception, see :func:`deliver_event`)
+    and ``buffer_for_replay`` (persist a record straight to the durable outbox
+    with no network attempt, for a collector draining its in-memory queue on
+    SIGTERM). Both are optional by design so that a test double or an SQS sink
+    stays a valid ``EventSink``; callers discover them with
+    ``getattr(sink, "buffer_for_replay", None)`` rather than ``isinstance``.
+    """
+
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -307,41 +321,215 @@ def deliver_or_raise(
     return result
 
 
+#: How much of an oversize payload the outbox keeps. A 413 is the control
+#: plane refusing the body for its size, so keeping it whole re-parses and
+#: re-serialises megabytes on every later rewrite for a record that can never
+#: go out as it stands (F4). The digest identifies the event, the byte count
+#: says how far over it was, and the excerpt is what an operator reads.
+OVERSIZE_PAYLOAD_EXCERPT_BYTES = 4096
+
+#: Outbox paths whose filesystem refused ``flock``, so the degradation warning
+#: is logged once per path instead of once per buffered event.
+_FLOCK_UNSUPPORTED: set[str] = set()
+_FLOCK_UNSUPPORTED_LOCK = Lock()
+
+
+def digest_oversize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """A bounded stand-in for a payload the control plane refused as too large.
+
+    Never the whole body: a digest an operator can correlate with the source,
+    the size that was rejected, and the first
+    :data:`OVERSIZE_PAYLOAD_EXCERPT_BYTES` bytes of it.
+    """
+
+    body = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return {
+        "payload_sha256": hashlib.sha256(body).hexdigest(),
+        "payload_bytes": len(body),
+        "payload_excerpt": body[:OVERSIZE_PAYLOAD_EXCERPT_BYTES].decode(
+            "utf-8", errors="replace"
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class OutboxFile:
     """The durable NDJSON outbox one collector writes (ARCH-G2).
 
     Shared by the sink and the ``gpu-fault-collector outbox`` command so an
-    operator reads exactly the records the sink will replay.
+    operator reads exactly the records the sink will replay. Every
+    read-modify-write on either side runs inside :meth:`locked`, an
+    ``fcntl.flock`` on ``<outbox>.lock``: the sink's in-process lock cannot see
+    the operator's process, and a ``requeue-dead`` that interleaved with a
+    replay's rewrite silently lost one side's update (F7).
     """
 
     path: Path
 
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the cross-process outbox lock for one read-modify-write.
+
+        Not re-entrant: ``flock`` is held per open file description, so two
+        nested :meth:`locked` blocks in one process would deadlock. Callers
+        take it once around the whole read-modify-write.
+
+        A filesystem with no ``flock`` support (or an outbox directory this
+        process cannot open) must not fail a post: the body runs anyway,
+        serialised by the caller's in-process lock alone, with one warning per
+        path.
+        """
+
+        handle: int | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(
+                self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+            )
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError as exc:
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    os.close(handle)
+                handle = None
+            self._warn_flock_unsupported(exc)
+        try:
+            yield
+        finally:
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    os.close(handle)
+
+    def _warn_flock_unsupported(self, exc: OSError) -> None:
+        key = str(self.lock_path)
+        with _FLOCK_UNSUPPORTED_LOCK:
+            if key in _FLOCK_UNSUPPORTED:
+                return
+            _FLOCK_UNSUPPORTED.add(key)
+        LOGGER.warning(
+            "collector outbox lock %s is unavailable (%s); falling back to the "
+            "in-process lock, so a concurrent 'outbox requeue-dead' can lose an "
+            "update",
+            key,
+            exc,
+        )
+
     def read(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        records = []
+        records: list[dict[str, Any]] = []
+        unparseable = 0
         text = self.path.read_text(encoding="utf-8", errors="replace")
         for line in text.splitlines():
+            if not line.strip():
+                continue
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
+                # A crash between an append and its fsync leaves a torn last
+                # line. Skipping it loses that one record; crashing here would
+                # take the whole outbox and the collector with it.
+                unparseable += 1
                 continue
             if isinstance(value, dict):
                 records.append(value)
+            else:
+                unparseable += 1
+        if unparseable:
+            LOGGER.warning(
+                "collector outbox %s has %d unparseable line(s), skipped "
+                "(a torn append is expected after an unclean shutdown)",
+                self.path,
+                unparseable,
+            )
         return records
 
+    def count_lines(self) -> int:
+        """How many lines the file holds, without parsing any of them.
+
+        The append path needs a depth to compare against
+        ``outbox_max_records``, and counting newlines is what keeps a buffered
+        event from re-parsing the whole backlog (F4). A torn final line with
+        no newline is not counted; :meth:`read` drops it too.
+        """
+
+        if not self.path.exists():
+            return 0
+        total = 0
+        with open(self.path, "rb") as handle:
+            while chunk := handle.read(65536):
+                total += chunk.count(b"\n")
+        return total
+
+    def append(self, record: dict[str, Any]) -> None:
+        """Add one record with a single append and one ``fsync``.
+
+        Append-only is what makes buffering during an outage O(1) instead of a
+        full re-parse and rewrite per event (F4). A crash between the write
+        and the ``fsync`` may lose at most this record, and a torn line is
+        skipped by :meth:`read`; the whole backlog behind it survives, which a
+        rewrite of the entire file could not promise.
+        """
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+
     def write(self, records: list[dict[str, Any]]) -> None:
+        """Replace the file with ``records``, durably (F9).
+
+        ``os.replace`` is atomic against a kill, but without the two ``fsync``
+        calls a hard node reset -- an action this product performs -- can
+        persist the rename before the data and leave an empty outbox.
+        """
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            "".join(
-                json.dumps(item, separators=(",", ":"), default=str) + "\n"
-                for item in records
-            ),
-            encoding="utf-8",
-        )
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(
+                "".join(
+                    json.dumps(item, separators=(",", ":"), default=str) + "\n"
+                    for item in records
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, self.path)
+        self._fsync_directory()
+
+    def _fsync_directory(self) -> None:
+        """Persist the rename itself; a failure here is not a failed write."""
+
+        try:
+            descriptor = os.open(self.path.parent, os.O_RDONLY)
+        except OSError as exc:
+            LOGGER.warning(
+                "cannot open collector outbox directory %s to fsync the rename: %s",
+                self.path.parent,
+                exc,
+            )
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            LOGGER.warning(
+                "collector outbox directory %s could not be fsynced: %s",
+                self.path.parent,
+                exc,
+            )
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def summarize(
@@ -376,21 +564,41 @@ class OutboxFile:
         )
 
     def requeue_dead(self, *, path_filter: str | None = None) -> int:
-        """Mark dead-lettered records replayable again; returns how many."""
+        """Mark dead-lettered records replayable again; returns how many.
 
-        records = self.read()
-        requeued = 0
-        for record in records:
-            if record.get("replayable"):
-                continue
-            if path_filter is not None and record.get("path") != path_filter:
-                continue
-            record["replayable"] = True
-            previous = str(record.get("error") or "")
-            record["error"] = f"requeued by operator: {previous}"[:500]
-            requeued += 1
-        if requeued:
-            self.write(records)
+        The whole read-modify-write runs under :meth:`locked` so an operator
+        running this against a live collector's outbox cannot lose the sink's
+        appends, and the sink's next rewrite cannot lose this requeue (F7).
+        """
+
+        with self.locked():
+            records = self.read()
+            requeued = 0
+            skipped_truncated = 0
+            for record in records:
+                if record.get("replayable"):
+                    continue
+                if path_filter is not None and record.get("path") != path_filter:
+                    continue
+                if record.get("payload_truncated"):
+                    # Only a digest and a 4 KB excerpt of this payload were
+                    # kept, so replaying it would post a body that is not the
+                    # event. It stays dead and inspectable.
+                    skipped_truncated += 1
+                    continue
+                record["replayable"] = True
+                previous = str(record.get("error") or "")
+                record["error"] = f"requeued by operator: {previous}"[:500]
+                requeued += 1
+            if requeued:
+                self.write(records)
+        if skipped_truncated:
+            LOGGER.warning(
+                "left %d oversize record(s) dead in %s: only a digest of the "
+                "payload was kept, so it cannot be replayed",
+                skipped_truncated,
+                self.path,
+            )
         return requeued
 
 
@@ -530,6 +738,11 @@ class HttpEventSink:
             raise ValueError("collector gzip threshold must not be negative")
         self.outbox_evictions_total = 0
         self._outbox_lock = Lock()
+        # Depth of the outbox as this process last saw it, so an append does
+        # not have to parse the backlog to know whether it must compact.
+        # ``None`` means "not known yet"; it is recomputed from the file on the
+        # first append and refreshed by every full read.
+        self._outbox_line_count: int | None = None
         self._outbox_replay_state_lock = Lock()
         self._outbox_replay_active = False
         self._outbox_replay_requested = False
@@ -746,6 +959,11 @@ class HttpEventSink:
                             payload,
                             replayable=False,
                             error=f"HTTP {exc.code}: {detail}",
+                            # 413 is a verdict on the body's size: keeping it
+                            # whole costs a re-parse and a rewrite of megabytes
+                            # for a record that can never be posted as it
+                            # stands (F4).
+                            oversize=exc.code == 413,
                         )
                     raise CollectorError(
                         f"collector event rejected ({exc.code}): {detail}",
@@ -861,6 +1079,28 @@ class HttpEventSink:
             f"{accepted['processor_request_id']}: {last_error}"
         )
 
+    def buffer_for_replay(self, path: str, payload: dict[str, Any]) -> bool:
+        """Persist one record for later replay without attempting a post.
+
+        For a collector draining its in-memory queue on SIGTERM: a live post
+        per record would spend the retry ladder (and, on the two
+        receipt-bearing paths, a receipt poll) against a control plane that may
+        already be gone, so a shutdown budget of a second buys a handful of
+        records instead of the whole queue. Each record costs one appended
+        line, and the next successful post replays them in file order.
+
+        Returns ``False`` -- never raises -- when there is no outbox
+        configured or the write failed, so a drain loop can count what it
+        could not save.
+        """
+
+        return self._buffer_event(
+            path,
+            payload,
+            replayable=True,
+            error="buffered at shutdown",
+        )
+
     def _buffer_event(
         self,
         path: str,
@@ -868,49 +1108,77 @@ class HttpEventSink:
         *,
         replayable: bool,
         error: str,
+        oversize: bool = False,
     ) -> bool:
         if self.outbox_path is None:
             return False
-        record = {
+        record: dict[str, Any] = {
             "path": path,
-            "payload": payload,
+            "payload": digest_oversize_payload(payload) if oversize else payload,
             "replayable": replayable,
             "error": error,
             "failed_at": datetime.now(timezone.utc).isoformat(),
         }
+        if oversize:
+            # Read by ``requeue_dead`` and by the replay guard: what is left of
+            # this payload is a digest, so it must never be posted as an event.
+            record["payload_truncated"] = True
+        outbox = OutboxFile(self.outbox_path)
         try:
-            with self._outbox_lock:
-                records = self._read_outbox()
-                records.append(record)
-                evicted = len(records) - self.outbox_max_records
-                if evicted > 0:
-                    # The oldest records go first; they are the least likely
-                    # to still be wanted, but they are still loss and used to
-                    # be dropped silently (ARCH-G2).
-                    self.outbox_evictions_total += evicted
-                    LOGGER.warning(
-                        "collector outbox is full; evicted %d oldest record(s) "
-                        "(max_records=%d, evictions_total=%d, path=%s)",
-                        evicted,
-                        self.outbox_max_records,
-                        self.outbox_evictions_total,
-                        self.outbox_path,
-                    )
-                self._write_outbox(records[-self.outbox_max_records :])
+            # Two locks: ``_outbox_lock`` serialises this process's collector
+            # and replay threads, ``locked()`` serialises this process against
+            # ``gpu-fault-collector outbox requeue-dead`` (F7). Always in this
+            # order, everywhere.
+            with self._outbox_lock, outbox.locked():
+                if self._outbox_line_count is None:
+                    self._outbox_line_count = outbox.count_lines()
+                outbox.append(record)
+                self._outbox_line_count += 1
+                if self._outbox_line_count > self.outbox_max_records:
+                    self._compact_outbox_locked(outbox)
             return True
         except OSError:
             LOGGER.exception("cannot persist collector outbox event")
             return False
 
+    def _compact_outbox_locked(self, outbox: OutboxFile) -> None:
+        """Rewrite the outbox down to ``outbox_max_records``, newest kept.
+
+        The only place a buffered event pays for the whole file, and only once
+        the append pushed it past the ceiling. Callers hold both locks.
+        """
+
+        records = outbox.read()
+        evicted = len(records) - self.outbox_max_records
+        if evicted > 0:
+            # The oldest records go first; they are the least likely to still
+            # be wanted, but they are still loss and used to be dropped
+            # silently (ARCH-G2).
+            self.outbox_evictions_total += evicted
+            LOGGER.warning(
+                "collector outbox is full; evicted %d oldest record(s) "
+                "(max_records=%d, evictions_total=%d, path=%s)",
+                evicted,
+                self.outbox_max_records,
+                self.outbox_evictions_total,
+                self.outbox_path,
+            )
+        kept = records[-self.outbox_max_records :]
+        outbox.write(kept)
+        self._outbox_line_count = len(kept)
+
     def _read_outbox(self) -> list[dict[str, Any]]:
         if self.outbox_path is None:
             return []
-        return OutboxFile(self.outbox_path).read()
+        records = OutboxFile(self.outbox_path).read()
+        self._outbox_line_count = len(records)
+        return records
 
     def _write_outbox(self, records: list[dict[str, Any]]) -> None:
         if self.outbox_path is None:
             return
         OutboxFile(self.outbox_path).write(records)
+        self._outbox_line_count = len(records)
 
     def _replay_outbox(self) -> _OutboxReplayResult:
         """Deliver one batch of buffered records, then reconcile the file.
@@ -926,7 +1194,8 @@ class HttpEventSink:
 
         if self.outbox_path is None:
             return _OutboxReplayResult()
-        with self._outbox_lock:
+        outbox = OutboxFile(self.outbox_path)
+        with self._outbox_lock, outbox.locked():
             records = self._read_outbox()
         if not records:
             return _OutboxReplayResult()
@@ -938,6 +1207,10 @@ class HttpEventSink:
         for record in records:
             if (
                 not record.get("replayable")
+                # Only a digest of this payload survives, so posting it would
+                # send a body that is not the event. ``requeue_dead`` refuses
+                # to resurrect one; this guard covers a hand-edited file.
+                or record.get("payload_truncated")
                 or attempted >= self.outbox_replay_batch_size
                 or time.monotonic() >= deadline
             ):
@@ -990,7 +1263,7 @@ class HttpEventSink:
                     1 for record in records if record.get("replayable")
                 )
             )
-        with self._outbox_lock:
+        with self._outbox_lock, outbox.locked():
             kept = _apply_replay_outcome(self._read_outbox(), removals, updates)
             replayable_remaining = sum(1 for record in kept if record.get("replayable"))
             if attempted:

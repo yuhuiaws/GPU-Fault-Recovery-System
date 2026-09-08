@@ -10,8 +10,11 @@ outbox evicted its oldest records silently.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from email.message import Message
+from threading import Event, Thread
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 from gpu_fault.collectors.sinks import OutboxFile
@@ -232,3 +235,143 @@ def test_outbox_cli_lists_stats_and_requeues_dead_records(
     remaining = [json.loads(line) for line in outbox.read_text().splitlines() if line]
     assert all(item["replayable"] for item in remaining), "dead records not requeued"
     assert "2" in capsys.readouterr().out, "requeue did not report a count"
+
+
+def test_an_oversize_413_dead_record_keeps_a_digest_not_the_body(
+    monkeypatch, tmp_path
+) -> None:
+    """F4: a rejected oversize payload was stored whole and re-parsed forever.
+
+    The control plane refused it for its size, so the outbox keeps what an
+    operator can act on -- a digest, the byte count and a bounded excerpt.
+    """
+
+    def probe(request, **_kwargs):
+        raise _http_error(request.full_url, 413, b"payload too large")
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", probe)
+    outbox = tmp_path / "outbox.ndjson"
+    sink = HttpEventSink(
+        "https://control",
+        max_attempts=1,
+        outbox_path=str(outbox),
+        sleep=lambda _seconds: None,
+    )
+    payload = {"event_id": "e-1", "blob": "x" * 200_000}
+
+    with pytest.raises(CollectorError) as captured:
+        sink.post("/events", payload)
+
+    assert captured.value.buffered is True, "the 413 was not recorded at all"
+    record = json.loads(outbox.read_text())
+    assert record["replayable"] is False, "an oversize payload is not replayable"
+    assert record["payload_truncated"] is True, "the record was not marked truncated"
+    stored = record["payload"]
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    assert stored["payload_sha256"] == hashlib.sha256(body).hexdigest(), stored
+    assert stored["payload_bytes"] == len(body), stored
+    assert len(stored["payload_excerpt"]) <= 4096, (
+        f"the excerpt is {len(stored['payload_excerpt'])} characters, not bounded"
+    )
+    assert outbox.stat().st_size < 8192, (
+        f"the whole oversize body landed in the outbox ({outbox.stat().st_size} bytes)"
+    )
+
+
+def test_a_422_dead_record_keeps_its_payload_whole(monkeypatch, tmp_path) -> None:
+    """Only an oversize verdict truncates: every other dead letter is intact."""
+
+    def probe(request, **_kwargs):
+        raise _http_error(request.full_url, 422, b"unknown field")
+
+    monkeypatch.setattr("gpu_fault.collectors.sinks.urlopen", probe)
+    outbox = tmp_path / "outbox.ndjson"
+    sink = HttpEventSink(
+        "https://control",
+        max_attempts=1,
+        outbox_path=str(outbox),
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(CollectorError):
+        sink.post("/events", {"event_id": "e-1", "detail": "keep me"})
+
+    record = json.loads(outbox.read_text())
+    assert record["payload"] == {"event_id": "e-1", "detail": "keep me"}, record
+    assert record.get("payload_truncated") is not True, (
+        "a schema verdict truncated a payload an operator may still need"
+    )
+
+
+def test_requeue_dead_refuses_a_record_whose_payload_was_truncated(tmp_path) -> None:
+    """A truncated record cannot be replayed: only a digest of it is left."""
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    truncated = _record(0, replayable=False, error="HTTP 413: too large")
+    truncated["payload"] = {
+        "payload_sha256": "0" * 64,
+        "payload_bytes": 200_000,
+        "payload_excerpt": "{...}",
+    }
+    truncated["payload_truncated"] = True
+    _seed(
+        outbox_path, [truncated, _record(1, replayable=False, error="HTTP 422: nope")]
+    )
+
+    requeued = OutboxFile(outbox_path).requeue_dead()
+
+    assert requeued == 1, f"requeue-dead did not skip the truncated record: {requeued}"
+    remaining = [
+        json.loads(line) for line in outbox_path.read_text().splitlines() if line
+    ]
+    assert remaining[0]["replayable"] is False, (
+        "a record whose body is only a digest was made replayable"
+    )
+    assert remaining[1]["replayable"] is True, remaining[1]
+
+
+def test_the_requeue_command_waits_for_the_outbox_lock_and_loses_no_record(
+    tmp_path, capsys
+) -> None:
+    """F7: ``requeue-dead`` raced the live collector with no inter-process lock.
+
+    The flock is what makes the operator command and the sink's rewrite take
+    turns: neither the requeue nor the record appended during it is lost.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    outbox = OutboxFile(outbox_path)
+    finished = Event()
+    arguments = SimpleNamespace(
+        outbox_path=str(outbox_path),
+        collector=None,
+        outbox_action="requeue-dead",
+        yes=True,
+        path=None,
+    )
+
+    def requeue() -> None:
+        collectors_cli.run_outbox_command(arguments)
+        finished.set()
+
+    worker = Thread(target=requeue, daemon=True, name="requeue-dead")
+    with outbox.locked():
+        worker.start()
+        assert not finished.wait(0.5), (
+            "requeue-dead rewrote the outbox while the sink held the lock"
+        )
+        outbox.write([*outbox.read(), _record(1)])
+    worker.join(5)
+    capsys.readouterr()
+
+    assert finished.is_set(), "requeue-dead never finished after the lock was released"
+    remaining = [
+        json.loads(line) for line in outbox_path.read_text().splitlines() if line
+    ]
+    assert [item["payload"]["sequence"] for item in remaining] == [0, 1], (
+        f"a record was lost to the concurrent requeue: {remaining}"
+    )
+    assert all(item["replayable"] for item in remaining), (
+        f"the requeue was overwritten by the sink's rewrite: {remaining}"
+    )
