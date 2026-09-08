@@ -13,6 +13,7 @@ from uuid import uuid4
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
 import gpu_fault.execution.step_bounds as step_bounds
 from gpu_fault.execution.branch_escalation import BranchEscalation, BranchEscalator
+from gpu_fault.execution import node_rebinding
 from gpu_fault.execution.config import (
     ProductionExecutorConfig,
 )
@@ -1775,8 +1776,8 @@ class ProductionWorkflowExecutor:
             efa_zero_pending_at_by_node=efa_zero_pending_at_by_node,
         )
 
-    @staticmethod
     def _rebind_nodes(
+        self,
         workflow: WorkflowRequest,
         incident: FaultIncident,
         rebindings: dict[str, str],
@@ -1784,26 +1785,13 @@ class ProductionWorkflowExecutor:
         is_safety: bool,
         after_index: int,
     ) -> tuple[WorkflowRequest, FaultIncident]:
-        def replace(node_ids: list[str]) -> list[str]:
-            return list(
-                dict.fromkeys(rebindings.get(node_id, node_id) for node_id in node_ids)
-            )
-
-        field = "safety_steps" if is_safety else "official_steps"
-        steps = list(getattr(workflow, field))
-        for index in range(after_index + 1, len(steps)):
-            steps[index] = steps[index].model_copy(
-                update={"node_ids": replace(steps[index].node_ids)}
-            )
-        now = datetime.now(timezone.utc)
-        return (
-            workflow.model_copy(update={field: steps, "updated_at": now}),
-            incident.model_copy(
-                update={
-                    "node_ids": replace(incident.node_ids),
-                    "updated_at": now,
-                }
-            ),
+        return node_rebinding.rebind_nodes(
+            self.store,
+            workflow,
+            incident,
+            rebindings,
+            is_safety=is_safety,
+            after_index=after_index,
         )
 
     @property
