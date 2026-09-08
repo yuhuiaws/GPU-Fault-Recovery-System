@@ -542,9 +542,11 @@ class ActiveStateHealth:
             LOGGER.error(
                 "ConfigMap %s/%s cannot be used (%s: %s), so active attempt "
                 "state is not persisted and a watcher restart will re-derive "
-                "its attempts from live Pods; apply "
-                "deploy/dataplane/completion-watcher.yaml -- both its ConfigMap "
-                "and its Role. Retrying in %.0fs",
+                "its attempts from live Pods; re-run the regional release for "
+                "this state dir (gpu-fault-admin deploy --state-dir ...): its "
+                "no-change path re-creates the missing ConfigMap and Role "
+                "without touching the Deployment. Do not kubectl apply the "
+                "raw manifest. Retrying in %.0fs",
                 self.namespace,
                 self.name,
                 type(exc).__name__,
