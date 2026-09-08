@@ -139,22 +139,30 @@ def restore_persisted_attempt_observations(controller: Any) -> None:
         controller._restored_attempts.add(observation.attempt_id)
 
 
-def log_reconcile_failure(controller: Any, attempt_id: str, exc: BaseException) -> None:
-    """Report a per-attempt reconcile failure once at ERROR, then at DEBUG (F9).
+def log_attempt_failure(
+    controller: Any,
+    attempt_id: str,
+    exc: BaseException,
+    *,
+    action: str,
+) -> None:
+    """Report a per-attempt failure once at ERROR, then at DEBUG (F9 / M1).
 
-    A Pod whose status will never become valid -- a ``startTime`` that is not a
-    timestamp, a field a future kubelet writes differently -- fails on every
-    pass for as long as it exists, and each failure used to print a full
-    traceback every ``reconcile_interval_seconds``. A day of that buries the
-    failures an operator can act on and costs real money in log ingest, while
-    dropping the repeats entirely would hide a permanent breakage. So the first
-    sighting of each failure is an ERROR with its traceback and every repeat is
-    one DEBUG line; ``reconcile_failures_total`` still counts them all, which is
-    what the alert reads.
+    Two failures repeat for as long as their cause exists, once per
+    ``reconcile_interval_seconds``: a Pod whose status will never become valid
+    (a ``startTime`` that is not a timestamp, a field a future kubelet writes
+    differently) and an attempt whose state does not fit the bounded
+    attempt-state ConfigMap. Each used to print a full traceback per pass. A day
+    of that buries the failures an operator can act on and costs real money in
+    log ingest, while dropping the repeats entirely would hide a permanent
+    breakage. So the first sighting of each failure is an ERROR with its
+    traceback and every repeat is one DEBUG line; the counters
+    (``reconcile_failures_total``, ``gpu_fault_completion_outbox_...``) still
+    count them all, which is what the alerts read.
 
-    Keyed by the error text, not its type: two malformed fields on the same
-    attempt are two different problems, and the same text is the same problem
-    however many passes it survives.
+    Keyed by ``action`` and the error text, not by the exception type: two
+    malformed fields on the same attempt are two different problems, and the
+    same text is the same problem however many passes it survives.
     """
 
     seen = getattr(controller, "_reconcile_failures_logged", None)
@@ -164,11 +172,13 @@ def log_reconcile_failure(controller: Any, attempt_id: str, exc: BaseException) 
         seen = OrderedDict()
         controller._reconcile_failures_logged = seen
     description = f"{type(exc).__name__}: {exc}"
-    key = f"{attempt_id}/{hashlib.sha256(description.encode()).hexdigest()[:12]}"
+    digest = hashlib.sha256(f"{action}/{description}".encode()).hexdigest()[:12]
+    key = f"{attempt_id}/{digest}"
     if key in seen:
         seen.move_to_end(key)
         LOGGER.debug(
-            "cannot reconcile attempt %s, unchanged since it was first reported: %s",
+            "cannot %s attempt %s, unchanged since it was first reported: %s",
+            action,
             attempt_id,
             description,
         )
@@ -176,7 +186,13 @@ def log_reconcile_failure(controller: Any, attempt_id: str, exc: BaseException) 
     seen[key] = None
     while len(seen) > REPEATED_FAILURE_CAP:
         seen.popitem(last=False)
-    LOGGER.error("cannot reconcile attempt %s", attempt_id, exc_info=exc)
+    LOGGER.error("cannot %s attempt %s", action, attempt_id, exc_info=exc)
+
+
+def log_reconcile_failure(controller: Any, attempt_id: str, exc: BaseException) -> None:
+    """Report a failure to reconcile one attempt; see ``log_attempt_failure``."""
+
+    log_attempt_failure(controller, attempt_id, exc, action="reconcile")
 
 
 def cache_terminal_attempt_observation(
@@ -350,10 +366,17 @@ def publish_attempt_observation(
         if persist is not None:
             try:
                 persist(record)
-            except Exception:
-                LOGGER.exception(
-                    "cannot persist active attempt observation for %s",
+            except Exception as exc:
+                # Log-once rather than evicting the stalest record to make room:
+                # what is refused here is the *newest* state, which the next
+                # pass re-derives from the live Pod, whereas evicting an older
+                # attempt would drop exactly the record a restart cannot
+                # rebuild -- the one whose Pods are already gone (M1).
+                log_attempt_failure(
+                    controller,
                     attempt_id,
+                    exc,
+                    action="persist the active state of",
                 )
     try:
         controller.sink.post("/v1/workload-observations", payload)
@@ -369,8 +392,10 @@ def publish_attempt_observation(
     if remove is not None:
         try:
             remove(record)
-        except Exception:
-            LOGGER.exception(
-                "cannot remove persisted attempt observation for %s",
+        except Exception as exc:
+            log_attempt_failure(
+                controller,
                 attempt_id,
+                exc,
+                action="drop the persisted state of",
             )

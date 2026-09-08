@@ -36,6 +36,22 @@ _MAX_LOGGED_APPEND_FAILURES = 1024
 #: Pods of routine state could fill it and the terminal event of a failing
 #: attempt could no longer be written ahead at all (F6).
 ACTIVE_STATE_SUFFIX = "-active"
+#: Statuses on ``<name>-active`` that mean "not there yet" rather than broken:
+#: 404 is the upgrade window before the manifest that adds the object, 403 the
+#: window before the Role that names it. Both are survivable -- attempt state is
+#: a restart optimisation -- and neither may be fatal, because
+#: ``load_attempt_observations`` runs from the controller's constructor (M2).
+ACTIVE_STATE_UNAVAILABLE_STATUSES = frozenset({403, 404})
+#: How long the object is left alone after it refused. Without this every
+#: ``save_attempt_observation`` reads before it writes, so a watcher watching N
+#: attempts spent N refused GETs per reconcile pass for as long as the outage
+#: lasted (I1). One minute is short enough that an operator who applies the
+#: manifest sees state persisted again within a pass or two.
+ACTIVE_STATE_RETRY_SECONDS = 60.0
+#: How often the same degradation is restated at ERROR. Logging it once hid an
+#: outage that started hours before the operator looked; logging it per pass is
+#: the F9 storm.
+ACTIVE_STATE_REPEAT_LOG_SECONDS = 3600.0
 
 
 #: Marker in the ``post`` result: nothing was delivered live because the record
@@ -182,6 +198,54 @@ def _attempt_digest(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _remaining_depth(
+    records: list[dict[str, Any]],
+    *,
+    drained: set[str],
+    isolated: set[str],
+) -> tuple[int, int]:
+    """``(depth, quarantined_depth)`` of the pass ``replay`` just walked.
+
+    Derived from the snapshot ``replay`` already read rather than from a second
+    ConfigMap GET: the watcher reconciles every 30 s and the gauge does not
+    justify an extra API call per pass. It therefore reports the depth as of the
+    start of the pass minus what the pass drained, so a record buffered later in
+    the same reconcile shows up one pass later.
+    """
+
+    remaining = [record for record in records if str(record.get("key")) not in drained]
+    return len(remaining), sum(
+        1
+        for record in remaining
+        if record.get("quarantined", False) or str(record.get("key")) in isolated
+    )
+
+
+def _merge_legacy_attempt_state(
+    legacy: dict[str, dict[str, Any]],
+    current: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Adopt legacy records, keeping the newer ``observed_at`` per key (I2).
+
+    "The object that already holds it wins" is wrong in one direction and "the
+    legacy object wins" in the other: the migration can run again after a drop
+    that failed, and by then the live process may have written a fresher record
+    for the same attempt. Both documents are ``model_dump(mode="json")``
+    output, so ``observed_at`` is an ISO-8601 UTC string and comparing the
+    strings compares the instants. A record without one loses, because every
+    record this release writes has one.
+    """
+
+    merged = dict(current)
+    for key, record in legacy.items():
+        existing = merged.get(key)
+        if existing is None or str(record.get("observed_at") or "") > str(
+            existing.get("observed_at") or ""
+        ):
+            merged[key] = record
+    return merged
+
+
 def _attempt_document(attempts: dict[str, dict[str, Any]]) -> str:
     return json.dumps(
         attempts,
@@ -189,6 +253,97 @@ def _attempt_document(attempts: dict[str, dict[str, Any]]) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+class ActiveStateHealth:
+    """Whether ``<name>-active`` can be used, and when to try it again (I1/M2).
+
+    Its own object because the answer is three pieces of state that only make
+    sense together -- the exported 0/1 gauge, the instant the next probe is
+    allowed and the instant the outage was last reported -- and because the
+    outbox class is at its architecture size limit.
+    """
+
+    def __init__(
+        self,
+        namespace: str,
+        name: str,
+        now: Callable[[], float],
+        *,
+        retry_seconds: float = ACTIVE_STATE_RETRY_SECONDS,
+        repeat_log_seconds: float = ACTIVE_STATE_REPEAT_LOG_SECONDS,
+    ) -> None:
+        self.namespace = namespace
+        self.name = name
+        self.now = now
+        self.retry_seconds = retry_seconds
+        self.repeat_log_seconds = repeat_log_seconds
+        #: Exported as ``gpu_fault_completion_active_state_unavailable``.
+        self.unavailable = 0
+        self._retry_at: float | None = None
+        self._logged_at: float | None = None
+
+    def degraded(self) -> bool:
+        """``True`` while the object must not be touched at all.
+
+        The window expires by itself, so an operator who applies the manifest
+        needs no restart. Expiry is not recovery: the gauge stays up until a
+        call actually succeeds, and a still-refused object degrades again on
+        that one probe.
+        """
+
+        retry_at = self._retry_at
+        if retry_at is None:
+            return False
+        if self.now() < retry_at:
+            return True
+        self._retry_at = None
+        return False
+
+    def refused(self, exc: BaseException) -> bool:
+        """``True`` when ``exc`` is the object (or the permission) not existing.
+
+        The watcher keeps watching either way, and the Role deliberately grants
+        no ``create`` (a ``create`` cannot be scoped by ``resourceNames``, so it
+        would let this pod make any ConfigMap). Anything else -- an API server
+        that is down, a malformed document -- is not this and propagates.
+        """
+
+        if getattr(exc, "status", None) not in ACTIVE_STATE_UNAVAILABLE_STATUSES:
+            return False
+        self.unavailable = 1
+        now = self.now()
+        self._retry_at = now + self.retry_seconds
+        last = self._logged_at
+        if last is None or now - last >= self.repeat_log_seconds:
+            self._logged_at = now
+            LOGGER.error(
+                "ConfigMap %s/%s cannot be used (%s: %s), so active attempt "
+                "state is not persisted and a watcher restart will re-derive "
+                "its attempts from live Pods; apply "
+                "deploy/dataplane/completion-watcher.yaml -- both its ConfigMap "
+                "and its Role. Retrying in %.0fs",
+                self.namespace,
+                self.name,
+                type(exc).__name__,
+                exc,
+                self.retry_seconds,
+            )
+        return True
+
+    def usable(self) -> None:
+        """Record that the object answered, so the gauge comes back down."""
+
+        if self.unavailable:
+            LOGGER.info(
+                "ConfigMap %s/%s is usable again; active attempt state is "
+                "persisted from now on",
+                self.namespace,
+                self.name,
+            )
+        self.unavailable = 0
+        self._retry_at = None
+        self._logged_at = None
 
 
 class KubernetesCompletionOutbox:
@@ -278,7 +433,13 @@ class KubernetesCompletionOutbox:
         # has been moved to ``active_name`` yet; done once per process, on the
         # first read of the active state.
         self._legacy_state_migrated = False
-        self._active_state_missing_logged = False
+        # Whether the drop half of that migration is still owed. It is retried
+        # from the next save/remove: an adopt that succeeded and a drop that did
+        # not leaves the record in both objects, and the next restart would
+        # resurrect an attempt that has since finished (I2).
+        self._legacy_drop_pending = False
+        self._legacy_drop_failure_logged = False
+        self._active_state = ActiveStateHealth(namespace, self.active_name, self.now)
 
     def _read_data(self, name: str) -> tuple[dict[str, str], str | None]:
         value = self.core_api.read_namespaced_config_map(name, self.namespace)
@@ -555,28 +716,65 @@ class KubernetesCompletionOutbox:
                 key,
             )
 
-    def _active_state_unavailable(self, exc: BaseException) -> bool:
-        """Whether ``exc`` is the ``<name>-active`` object simply not existing.
+    @property
+    def active_state_unavailable(self) -> int:
+        """0/1: is ``<name>-active`` refusing (I1)? Exported as a gauge."""
 
-        It is shipped by ``deploy/dataplane/completion-watcher.yaml``, so this is
-        the upgrade window between a new watcher image and the manifest that
-        adds the object -- or an operator who deleted it. The watcher keeps
-        watching either way: attempt state is a restart optimisation, and the
-        Role deliberately grants no ``create`` (a ``create`` cannot be scoped by
-        ``resourceNames``, so it would let this pod make any ConfigMap).
+        return self._active_state.unavailable
+
+    def _retry_legacy_drop(self) -> None:
+        """Finish a migration whose adopt succeeded and whose drop did not (I2).
+
+        Called from the routine save/remove path, so the retry costs nothing
+        until it is owed and needs no timer of its own. Its own failure is
+        logged once and swallowed: the records are readable from either object,
+        which is the state this arrived in, and the next write tries again.
         """
 
-        if getattr(exc, "status", None) != 404:
-            return False
-        if not self._active_state_missing_logged:
-            self._active_state_missing_logged = True
-            LOGGER.error(
-                "ConfigMap %s/%s does not exist, so active attempt state is not "
-                "persisted and a watcher restart will re-derive its attempts "
-                "from live Pods; apply deploy/dataplane/completion-watcher.yaml",
-                self.namespace,
-                self.active_name,
+        def drop(current: dict[str, str]) -> dict[str, str]:
+            if self.ATTEMPTS_KEY not in current:
+                return current
+            result = dict(current)
+            result.pop(self.ATTEMPTS_KEY)
+            return result
+
+        try:
+            self._mutate_data(self.name, drop)
+        except Exception as exc:
+            if self._legacy_drop_failure_logged:
+                LOGGER.debug(
+                    "the migrated attempt state still cannot be dropped from "
+                    "%s (%s: %s)",
+                    self.name,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            self._legacy_drop_failure_logged = True
+            LOGGER.warning(
+                "cannot drop the migrated attempt state from %s (%s: %s); it "
+                "stays in both objects and the next attempt-state write will "
+                "try again -- a restart before that would restore attempts "
+                "that have since finished",
+                self.name,
+                type(exc).__name__,
+                exc,
             )
+            return
+        self._legacy_drop_pending = False
+        self._legacy_drop_failure_logged = False
+
+    def _before_active_state_write(self) -> bool:
+        """``False`` when ``<name>-active`` must not be touched at all (I1).
+
+        Also the one place the owed legacy drop is retried from, so every
+        routine write finishes a migration that a failed drop left half done.
+        """
+
+        if self._active_state.degraded():
+            return False
+        if self._legacy_drop_pending:
+            self._retry_legacy_drop()
         return True
 
     def _migrate_legacy_attempt_state(self) -> None:
@@ -588,7 +786,7 @@ class KubernetesCompletionOutbox:
         leaves the flag down so the next call tries again.
         """
 
-        if self._legacy_state_migrated:
+        if self._legacy_state_migrated or self._active_state.degraded():
             return
         self._legacy_state_migrated = True
         try:
@@ -598,7 +796,7 @@ class KubernetesCompletionOutbox:
                 return
 
             def adopt(current: dict[str, str]) -> dict[str, str]:
-                attempts = {**legacy, **self._attempts(current)}
+                attempts = _merge_legacy_attempt_state(legacy, self._attempts(current))
                 document = _attempt_document(attempts)
                 if document == current.get(self.ATTEMPTS_KEY):
                     return current
@@ -607,15 +805,7 @@ class KubernetesCompletionOutbox:
                 return result
 
             self._mutate_data(self.active_name, adopt)
-
-            def drop(current: dict[str, str]) -> dict[str, str]:
-                if self.ATTEMPTS_KEY not in current:
-                    return current
-                result = dict(current)
-                result.pop(self.ATTEMPTS_KEY)
-                return result
-
-            self._mutate_data(self.name, drop)
+            self._legacy_drop_pending = True
             LOGGER.info(
                 "migrated %d persisted attempt observations from %s to %s",
                 len(legacy),
@@ -623,22 +813,29 @@ class KubernetesCompletionOutbox:
                 self.active_name,
             )
         except Exception as exc:
-            if not self._active_state_unavailable(exc):
+            if not self._active_state.refused(exc):
                 LOGGER.exception(
                     "cannot migrate persisted attempt observations from %s to %s",
                     self.name,
                     self.active_name,
                 )
             self._legacy_state_migrated = False
+            return
+        # Only after the adoption is durable, and never fatal: the records are
+        # readable from either object, so an owed drop is a repeat, not a loss.
+        self._retry_legacy_drop()
 
     def load_attempt_observations(self) -> list[dict[str, Any]]:
         self._migrate_legacy_attempt_state()
+        if self._active_state.degraded():
+            return []
         try:
             data, _resource_version = self._read_data(self.active_name)
         except Exception as exc:
-            if not self._active_state_unavailable(exc):
+            if not self._active_state.refused(exc):
                 raise
             return []
+        self._active_state.usable()
         attempts = self._attempts(data)
         self._attempt_digests = {
             key: _attempt_digest(payload) for key, payload in attempts.items()
@@ -649,6 +846,8 @@ class KubernetesCompletionOutbox:
         key = _attempt_key(payload)
         digest = _attempt_digest(payload)
         if self._attempt_digests.get(key) == digest:
+            return False
+        if not self._before_active_state_write():
             return False
 
         def update(data: dict[str, str]) -> dict[str, str]:
@@ -661,14 +860,17 @@ class KubernetesCompletionOutbox:
         try:
             self._mutate_data(self.active_name, update)
         except Exception as exc:
-            if not self._active_state_unavailable(exc):
+            if not self._active_state.refused(exc):
                 raise
             return False
+        self._active_state.usable()
         self._attempt_digests[key] = digest
         return True
 
     def remove_attempt_observation(self, payload: dict[str, Any]) -> None:
         key = _attempt_key(payload)
+        if not self._before_active_state_write():
+            return
 
         def update(data: dict[str, str]) -> dict[str, str]:
             attempts = self._attempts(data)
@@ -682,9 +884,10 @@ class KubernetesCompletionOutbox:
         try:
             self._mutate_data(self.active_name, update)
         except Exception as exc:
-            if not self._active_state_unavailable(exc):
+            if not self._active_state.refused(exc):
                 raise
             return
+        self._active_state.usable()
         self._attempt_digests.pop(key, None)
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -788,7 +991,9 @@ class KubernetesCompletionOutbox:
         finally:
             # Even a pass that died on an unwritable ConfigMap has to leave the
             # depth behind: that is exactly when an operator needs it.
-            self._publish_depth(records, drained=drained, isolated=isolated)
+            self.last_depth, self.last_quarantined_depth = _remaining_depth(
+                records, drained=drained, isolated=isolated
+            )
 
     def _known_empty(self, *, include_quarantined: bool) -> bool:
         """Whether this process can prove the WAL holds nothing to replay.
@@ -899,32 +1104,6 @@ class KubernetesCompletionOutbox:
             "quarantined": quarantined,
         }
         return replayed
-
-    def _publish_depth(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        drained: set[str],
-        isolated: set[str],
-    ) -> None:
-        """Refresh the exported depth gauges from the pass we just walked.
-
-        Derived from the snapshot ``replay`` already read rather than from a
-        second ConfigMap GET: the watcher reconciles every 30 s and the gauge
-        does not justify an extra API call per pass. It therefore reports the
-        depth as of the start of the pass minus what the pass drained, so a
-        record buffered later in the same reconcile shows up one pass later.
-        """
-
-        remaining = [
-            record for record in records if str(record.get("key")) not in drained
-        ]
-        self.last_depth = len(remaining)
-        self.last_quarantined_depth = sum(
-            1
-            for record in remaining
-            if record.get("quarantined", False) or str(record.get("key")) in isolated
-        )
 
     def depth(self) -> int:
         records, _resource_version = self._read()

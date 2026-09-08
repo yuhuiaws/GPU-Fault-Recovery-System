@@ -798,6 +798,16 @@ class KubernetesCompletionController:
         return int(getattr(self.sink, "append_failures_total", 0))
 
     @property
+    def active_state_unavailable(self) -> int:
+        """0/1 from the sink: is the attempt-state ConfigMap refusing (I1)?
+
+        Republished here because ``/metrics`` scrapes the controller; the gauge's
+        HELP text carries the consequence. A sink without an outbox reports 0.
+        """
+
+        return int(getattr(self.sink, "active_state_unavailable", 0))
+
+    @property
     def outbox_depth(self) -> int:
         """Buffered completion records as of the last replay pass (F12).
 

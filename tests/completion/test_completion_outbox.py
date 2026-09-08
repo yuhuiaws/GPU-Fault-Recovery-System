@@ -699,3 +699,151 @@ def test_legacy_attempt_state_migrates_to_the_active_config_map() -> None:
     assert outbox.load_attempt_observations() == [legacy], (
         "the migration must be idempotent"
     )
+
+
+class UnavailableActiveState(ConfigMapCore):
+    """A ``<name>-active`` object the API server refuses.
+
+    ``status`` is what the Kubernetes client puts on ``ApiException``, and the
+    outbox reads nothing else: 404 is the upgrade window before the manifest
+    that adds the object, 403 the window before the Role that names it.
+    """
+
+    def __init__(self, status: int = 404) -> None:
+        super().__init__()
+        self.status = status
+
+    def _refuse(self, name):
+        if name != ACTIVE_NAME:
+            return
+        error = RuntimeError(f"configmaps {name} is refused")
+        error.status = self.status
+        raise error
+
+    def read_namespaced_config_map(self, name, namespace):
+        if name == ACTIVE_NAME:
+            # Recorded before it is refused: a GET the API server rejects still
+            # costs the round trip this test is counting.
+            self.reads.append(name)
+            self._refuse(name)
+        return super().read_namespaced_config_map(name, namespace)
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        self._refuse(name)
+        return super().replace_namespaced_config_map(name, namespace, body)
+
+
+def test_a_missing_active_state_is_probed_once_per_window() -> None:
+    """A degraded object must not cost a GET per attempt per pass (I1).
+
+    ``save_attempt_observation`` reads before it writes, so a watcher watching
+    50 attempts spent 50 refused GETs per reconcile pass -- for ever, behind a
+    single ERROR line that scrolled away hours earlier.
+    """
+
+    core = UnavailableActiveState()
+    clock = [1_000.0]
+    outbox = KubernetesCompletionOutbox(core, RecordingSink(), now=lambda: clock[0])
+
+    assert outbox.load_attempt_observations() == [], (
+        "a missing active state must degrade, not raise"
+    )
+    assert outbox.active_state_unavailable == 1, (
+        "the degraded state must be visible on /metrics, got "
+        f"{outbox.active_state_unavailable}"
+    )
+    core.reads.clear()
+    for index in range(50):
+        outbox.save_attempt_observation(
+            {"cluster_id": "cluster-a", "attempt_id": f"attempt-{index}"}
+        )
+    assert [name for name in core.reads if name == ACTIVE_NAME] == [], (
+        f"a degraded object must not be read again inside the window: {core.reads}"
+    )
+
+    clock[0] += 61.0
+    outbox.save_attempt_observation({"cluster_id": "cluster-a", "attempt_id": "later"})
+    assert [name for name in core.reads if name == ACTIVE_NAME] == [ACTIVE_NAME], (
+        f"one probe is owed once the window elapses: {core.reads}"
+    )
+
+
+def test_a_forbidden_active_state_degrades_and_another_error_still_raises() -> None:
+    """403 is the same upgrade window as 404, and must not CrashLoop (M2).
+
+    ``load_attempt_observations`` runs from the controller's constructor, which
+    catches only ``ValueError``, so a Role that does not yet name the new object
+    used to kill a watcher whose write-ahead log was perfectly healthy.
+    """
+
+    outbox = KubernetesCompletionOutbox(UnavailableActiveState(403), RecordingSink())
+    assert outbox.load_attempt_observations() == [], (
+        "a forbidden active state must degrade like a missing one"
+    )
+    assert outbox.active_state_unavailable == 1, (
+        f"the gauge must report the outage, got {outbox.active_state_unavailable}"
+    )
+
+    fatal = KubernetesCompletionOutbox(UnavailableActiveState(500), RecordingSink())
+    with pytest.raises(RuntimeError, match="refused"):
+        fatal.load_attempt_observations()
+
+
+class FailingDropCore(ConfigMapCore):
+    """Refuses the write that drops migrated state from the WAL object."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse_drop = True
+
+    def replace_namespaced_config_map(self, name, namespace, body):
+        if (
+            name == OUTBOX_NAME
+            and self.refuse_drop
+            and "active-attempts.json" not in body["data"]
+        ):
+            error = RuntimeError("the WAL object could not be rewritten")
+            error.status = 500
+            raise error
+        return super().replace_namespaced_config_map(name, namespace, body)
+
+
+def test_a_legacy_drop_that_failed_is_retried_before_it_can_resurrect() -> None:
+    """A half-done migration must not resurrect a finished attempt (I2).
+
+    ``adopt`` succeeded and ``drop`` failed without a crash, so the process kept
+    running with the record in both objects. The attempt then finished and was
+    removed from ``<name>-active`` -- and the next restart read the leftover in
+    the WAL object, restored a finished attempt as RUNNING, held it for a whole
+    missing-attempt grace and terminalized it a second time.
+    """
+
+    core = FailingDropCore()
+    legacy = {
+        "cluster_id": "cluster-a",
+        "attempt_id": "attempt-legacy",
+        "workload_phase": "RUNNING",
+    }
+    core.objects[OUTBOX_NAME]["active-attempts.json"] = json.dumps(
+        {"cluster-a/attempt-legacy": legacy}
+    )
+    outbox = KubernetesCompletionOutbox(core, RecordingSink())
+
+    assert outbox.load_attempt_observations() == [legacy], (
+        "the record must still be restored while the drop is owed"
+    )
+    assert "active-attempts.json" in core.objects[OUTBOX_NAME], (
+        "this test needs the drop to have failed"
+    )
+
+    core.refuse_drop = False
+    outbox.remove_attempt_observation(legacy)
+    assert "active-attempts.json" not in core.objects[OUTBOX_NAME], (
+        f"the owed drop must be retried: {core.objects[OUTBOX_NAME]}"
+    )
+
+    restarted = KubernetesCompletionOutbox(core, RecordingSink())
+    assert restarted.load_attempt_observations() == [], (
+        "a finished attempt must not come back from the WAL object: "
+        f"{restarted.load_attempt_observations()}"
+    )

@@ -136,6 +136,16 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
         "undelivered workload observation per attempt.",
     ),
     (
+        "gpu_fault_completion_active_state_unavailable",
+        "active_state_unavailable",
+        "1 while the routine attempt-state ConfigMap "
+        "(<outbox>-active) is refusing reads and writes -- the object or the "
+        "Role that names it has not been applied. The write-ahead log is "
+        "unaffected and delivery is unaffected, but a restart while this is 1 "
+        "re-derives its attempts from live Pods only, so a fault on a Pod that "
+        "vanished in the same window resolves as IDLE. Retried once a minute.",
+    ),
+    (
         "gpu_fault_completion_outbox_quarantined_depth",
         "outbox_quarantined_depth",
         "Buffered records the replay has given up on: it skips them for ever, "

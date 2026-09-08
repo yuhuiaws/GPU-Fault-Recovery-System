@@ -2,9 +2,9 @@
 
 The watcher keeps one record per active attempt in the ``<name>-active``
 ConfigMap so that a restart still knows which attempts it was watching. The
-record used to be the whole published observation: every container with its GPU
-UUIDs, container id, cgroup path and log snapshot, ~1 KB per rank. That cost the
-watcher twice (F6):
+record used to be the whole published observation: every container with its log
+snapshot and its restart count, ~1 KB per rank. That cost the watcher twice
+(F6):
 
 * **Capacity.** A ConfigMap is capped at 1 MiB per object, so a few hundred
   managed Pods filled it. Every further write then raised, including the
@@ -14,9 +14,12 @@ watcher twice (F6):
   a re-read GPU UUID list, a fresh log snapshot) are exactly the ones a restart
   does not need, and every change rewrote the whole document.
 
-So only the identity of the attempt (its spec) and the identity of each Pod are
-persisted. On restore the observation is rebuilt from these records and the very
-next reconcile pass replaces each container with the live Pod's full
+So what is persisted is the identity of the attempt (its spec) and the identity
+of each Pod -- including the fields a fault is attributed by, see
+``POD_FIELDS``. What is dropped is what the next pass re-reads from the live Pod
+and no restart needs: the log snapshot, the restart count, the exit signal, the
+fabric partition. On restore the observation is rebuilt from these records and
+the very next reconcile pass replaces each container with the live Pod's full
 observation, keyed by ``pod_uid/container_name``; a Pod that is gone takes the
 existing missing-attempt grace path (F7) instead of being invented here.
 """
@@ -49,9 +52,19 @@ SPEC_FIELDS: tuple[str, ...] = (
 #: Per-Pod fields kept, as (record key, container field). ``uid`` and
 #: ``container`` are the observation key the next pass replaces; ``rank`` and
 #: ``critical`` are what a terminal decision counts (an attempt is complete when
-#: it has ``expected_critical_ranks`` critical ranks); ``node``/``instance`` are
-#: what a fault has to be attributed to before any Pod is listed again; the exit
-#: fields keep a rank that already finished from reading as still running.
+#: it has ``expected_critical_ranks`` critical ranks); the exit fields keep a
+#: rank that already finished from reading as still running.
+#:
+#: The rest is the *attribution identity*, and it is why this list is not
+#: shorter. A fault arrives naming a GPU UUID -- or a cgroup path, a container
+#: id, a host pid -- and ``WorkloadTopologyService.resolve`` matches it against
+#: the container observations of the cluster; ``node``/``instance`` only narrow
+#: the search. A restored attempt whose Pods are already gone republishes
+#: exactly this record for a whole missing-attempt grace, and it replaces the
+#: stored observation, so a record without those fields matches nothing while
+#: looking perfectly fresh: the node reads IDLE and a RESET or REBOOT plan
+#: proceeds without stopping the workload that is still holding the GPUs. The
+#: same fields are what the tombstone's terminal reports as ``allocation``.
 POD_FIELDS: tuple[tuple[str, str], ...] = (
     ("uid", "pod_uid"),
     ("name", "pod_name"),
@@ -62,6 +75,10 @@ POD_FIELDS: tuple[tuple[str, str], ...] = (
     ("node", "node_id"),
     ("instance", "instance_id"),
     ("gpus", "gpu_count"),
+    ("uuids", "gpu_uuids"),
+    ("cid", "container_id"),
+    ("cgroup", "cgroup_path"),
+    ("pid", "host_pid"),
     ("terminated", "terminated"),
     ("exit_code", "exit_code"),
     ("finished_at", "finished_at"),
@@ -76,9 +93,9 @@ def attempt_state_record(payload: dict[str, Any]) -> dict[str, Any]:
     """The compact record to persist for a published observation payload.
 
     ``payload`` is an ``AttemptObservation.model_dump(mode="json")``, so every
-    value here is already JSON. Absent and default-ish values are dropped: this
-    document is bounded in bytes, and ``attempt_observation_payload`` puts the
-    model defaults back.
+    value here is already JSON. A value that is ``None`` is dropped and nothing
+    else is: this document is bounded in bytes, and the model's own default
+    (``None``, or the empty list of ``gpu_uuids``) comes back on restore.
     """
 
     record: dict[str, Any] = {
