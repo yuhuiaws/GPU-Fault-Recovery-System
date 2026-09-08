@@ -8,11 +8,24 @@ Wants=network-online.target
 # collector: the process stays alive with every thread blocked (nvidia-smi in
 # D state, statvfs on a dead NFS mount), so ``Restart=always`` never fires and
 # the node reports no host telemetry at all until someone notices. ``run()``
-# sends READY=1 once and WATCHDOG=1 after each completed tick, so a tick that
-# never finishes makes systemd kill and restart the unit.
+# sends READY=1 once and WATCHDOG=1 between contributors, so a tick that stops
+# advancing makes systemd kill and restart the unit.
+#
+# WatchdogSec must clear the tick's *bounded* worst case, not its typical one:
+# nvidia-smi x2, the NVSwitch topology dump, ethtool per EFA netdev, a smartctl
+# scan plus one call per drive, ipmitool, the mount budget and the sink's retry
+# ladder are minutes when the host is sick. A shorter deadline SIGABRTs the
+# tick before it reaches sink.post, so the node posts nothing at all and
+# restarts on a loop -- the outage the watchdog exists to end. The per-call
+# bounds guarantee progress; the watchdog only has to catch a tick that has
+# stopped making any (an unbounded sysfs/procfs read, a wedged interpreter).
+# TimeoutStartSec exists because GPU product discovery shells out before
+# READY=1: on a node whose driver is already wedged, a Type=notify unit would
+# otherwise sit in "activating" forever.
 Type=notify
 NotifyAccess=main
-WatchdogSec=90
+WatchdogSec=600
+TimeoutStartSec=180
 EnvironmentFile=/etc/gpu-fault/collector.env
 ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector host
 Restart=always

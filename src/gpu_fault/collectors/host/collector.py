@@ -72,6 +72,23 @@ def sd_notify(state: str) -> bool:
     return True
 
 
+def _watchdog_heartbeat() -> Callable[[], None]:
+    """A ``WATCHDOG=1`` sender that costs nothing off systemd.
+
+    ``NOTIFY_SOCKET`` is read once: without it every ping would otherwise pay a
+    ``getenv`` and a log line per contributor per tick for a collector nobody
+    supervises.
+    """
+
+    if not os.getenv("NOTIFY_SOCKET"):
+        return lambda: None
+
+    def ping() -> None:
+        sd_notify("WATCHDOG=1")
+
+    return ping
+
+
 def _reap_abandoned_process(argv: list[str], process: subprocess.Popen[str]) -> None:
     """Wait out a killed child that has not left the kernel yet.
 
@@ -147,9 +164,18 @@ class BoundedProcessRunner:
             process.kill()
         try:
             process.wait(timeout=self.kill_grace_seconds)
-            return
         except subprocess.TimeoutExpired:
             pass
+        else:
+            # ``communicate`` timed out, so its pipes were never drained or
+            # closed. A tick runs every 15 s and the collector's RLIMIT_NOFILE
+            # is the unit's default, so leaking two descriptors per timed-out
+            # call ends in EMFILE -- where every probe fails, not just this one.
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+            return
         LOGGER.warning(
             "%s did not die within %gs of SIGKILL (uninterruptible sleep in a "
             "driver); abandoning it to a background reaper",
@@ -194,6 +220,7 @@ class HostTelemetryCollector(
         runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         statvfs: Callable[[str], os.statvfs_result] | None = None,
         statvfs_timeout_seconds: float = 5,
+        statvfs_budget_seconds: float = 15,
         edge_filter_enabled: bool | None = None,
         health_summary_seconds: int | None = None,
         history_max_points: int | None = None,
@@ -264,12 +291,18 @@ class HostTelemetryCollector(
         self.runner = runner if runner is not None else BoundedProcessRunner()
         if statvfs_timeout_seconds <= 0:
             raise ValueError("statvfs timeout must be positive")
+        if statvfs_budget_seconds <= 0:
+            raise ValueError("statvfs budget must be positive")
         self.statvfs_timeout_seconds = statvfs_timeout_seconds
+        # One unreachable file server is every bind mount served from it, so
+        # the tick caps its *total* mount waiting, not just each call's.
+        self.statvfs_budget_seconds = statvfs_budget_seconds
         self._statvfs_probe = BoundedStatvfs(
             statvfs if statvfs is not None else os.statvfs,
             timeout_seconds=statvfs_timeout_seconds,
         )
         self._statvfs_tick: datetime | None = None
+        self._statvfs_spent_seconds: float = 0.0
         self._unresponsive_mounts: set[str] = set()
         #: Samples a contributor produced before it failed (see
         #: :meth:`collect_once`).
@@ -498,19 +531,35 @@ class HostTelemetryCollector(
                 timeout=self.nvidia_smi_timeout_seconds,
                 check=False,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             self._nvidia_smi_round_timed_out = True
             error = CollectorError(
                 f"nvidia-smi timed out after {self.nvidia_smi_timeout_seconds:g}s"
             )
-            error.__cause__ = exc
+            # The ``TimeoutExpired`` is deliberately *not* attached as the
+            # cause: this error is memoised for the whole round, and the
+            # exception holds the child's captured output, hence its pipes.
             self._nvidia_smi_round[key] = error
             raise error
         self._nvidia_smi_consecutive_timeouts = 0
         self._nvidia_smi_round[key] = completed
         return completed
 
-    def collect_once(self) -> HostTelemetryBatch:
+    def collect_once(
+        self, heartbeat: Callable[[], None] | None = None
+    ) -> HostTelemetryBatch:
+        """Run every contributor once and post the batch.
+
+        ``heartbeat`` is called after each contributor. The tick's worst case
+        is the sum of every per-call bound in it -- two nvidia-smi calls, a
+        topology dump, ethtool per EFA netdev, a smartctl scan plus one call
+        per drive, ipmitool, the mount budget and the sink's retry ladder --
+        which on a sick host is minutes. Reporting progress only at the end of
+        the tick meant the systemd watchdog killed a tick that was slow but
+        advancing, and it was killed *before* ``sink.post``: the node then
+        posted nothing at all and restarted forever.
+        """
+
         observed_at = self.now()
         samples: list[HostMetricSample] = []
         errors: list[str] = []
@@ -522,6 +571,8 @@ class HostTelemetryCollector(
                 samples.extend(collector(observed_at))
             except Exception as exc:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            if heartbeat is not None:
+                heartbeat()
             # A contributor that fails *after* it has something the consumer
             # needs parks it here rather than returning it, so the failure
             # still names the contributor and still opens an edge. The GPU
@@ -681,11 +732,14 @@ class HostTelemetryCollector(
     def run(self) -> None:
         # ``Type=notify``: announce readiness before the startup spread so the
         # unit does not sit in "activating" for the length of the spread, then
-        # ping the watchdog once per completed tick. A tick that never
-        # completes -- a mount or a driver that never answers -- stops the
-        # pings and systemd restarts the unit, which is the last line of
-        # defence behind the per-call bounds below.
+        # ping the watchdog as the tick advances -- between contributors, not
+        # only when the tick ends, because the sum of the tick's per-call
+        # bounds is minutes on a sick host. A tick that stops *advancing* -- a
+        # sysfs read or a driver ioctl that never answers -- stops the pings
+        # and systemd restarts the unit, which is the last line of defence
+        # behind the per-call bounds below.
         sd_notify("READY=1")
+        heartbeat = _watchdog_heartbeat()
         force_snapshot = self.force_snapshot_path.exists()
         if not force_snapshot:
             startup_time = self.now()
@@ -704,7 +758,7 @@ class HostTelemetryCollector(
         while True:
             succeeded = False
             try:
-                self.collect_once()
+                self.collect_once(heartbeat)
                 succeeded = True
             except Exception:
                 LOGGER.exception("host telemetry collection failed")

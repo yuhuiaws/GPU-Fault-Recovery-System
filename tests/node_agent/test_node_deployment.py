@@ -292,14 +292,31 @@ def test_host_collector_unit_is_watchdog_supervised() -> None:
     uninterruptible sleep, and with ``Type=simple`` and no watchdog the unit
     stayed "active (running)" forever, so ``Restart=always`` never fired and
     the node that most needed telemetry sent none. ``Type=notify`` plus
-    ``WatchdogSec=`` makes a tick that never completes a restart
-    (``run()`` sends ``READY=1`` once and ``WATCHDOG=1`` per completed tick).
+    ``WatchdogSec=`` makes a tick that never completes a restart (``run()``
+    sends ``READY=1`` once and ``WATCHDOG=1`` between contributors).
+
+    The deadline must clear the tick's *bounded* worst case, not its typical
+    one: two nvidia-smi calls, a topology dump, ethtool per EFA netdev, a
+    smartctl scan plus one call per drive, ipmitool, ``statvfs`` per mount and
+    the sink's retry ladder are minutes when the host is sick. A watchdog
+    shorter than that kills the tick before ``sink.post`` and the node posts
+    nothing, forever -- the outage the watchdog exists to end. Startup has its
+    own bound because product discovery shells out before ``READY=1``, and an
+    activating unit that never becomes ready fails the installer's
+    ``systemctl restart`` and rolls the node install back.
     """
 
     unit = (ROOT / "deploy/systemd/gpu-fault-host-collector.service").read_text()
 
     assert "Type=notify" in unit, "the collector's watchdog needs Type=notify"
-    assert "WatchdogSec=90" in unit, "a wedged tick must be restarted, not ignored"
+    assert "WatchdogSec=600" in unit, (
+        "a watchdog below the tick's bounded worst case kills every tick before "
+        "it can post"
+    )
+    assert "TimeoutStartSec=180" in unit, (
+        "a Type=notify unit whose startup discovery hangs must fail, not be "
+        "killed on systemd's default and retried forever"
+    )
     assert "Restart=always" in unit, "the watchdog restart needs a restart policy"
 
 

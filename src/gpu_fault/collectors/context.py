@@ -15,6 +15,7 @@ from gpu_fault.collectors.gpu.discovery import (
     discover_gpu_software_versions,
     normalize_gpu_product,
 )
+from gpu_fault.collectors.host.collector import BoundedProcessRunner
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -27,8 +28,22 @@ LOGGER = logging.getLogger(__name__)
 def context_from_environment(
     *,
     discover_product: bool = False,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> CollectorContext:
+    """Build the collector context, discovering the GPU product if asked.
+
+    Discovery shells out to ``nvidia-smi``, and it happens at startup --
+    before the host collector's ``READY=1``. On a node whose driver is already
+    wedged, ``subprocess.run``'s unbounded kill path meant the process never
+    reached its first tick: systemd killed the activating unit on
+    ``TimeoutStartSec`` and retried forever, and the node installer's
+    ``systemctl restart`` failed, rolling back the whole node install over a
+    GPU fault we could have reported. The default runner bounds its own kill
+    path instead.
+    """
+
+    if runner is None:
+        runner = BoundedProcessRunner()
     cluster_id = os.getenv("GPU_FAULT_CLUSTER_ID")
     if not cluster_id:
         raise CollectorError("GPU_FAULT_CLUSTER_ID is required")

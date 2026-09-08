@@ -145,11 +145,7 @@ class HostInventoryMixin:
             # about how many GPUs are installed, and reporting zero active GPUs
             # would mint a CRITICAL REBOOT_NODE finding for a slow driver.
             completed = self._nvidia_smi(list(self.GPU_QUERY_ARGV), observed_at)
-            gpu_uuids = {
-                line.split(",", 1)[0].strip()
-                for line in completed.stdout.splitlines()
-                if line.strip() and line.split(",", 1)[0].strip()
-            }
+            gpu_uuids = self._parse_gpu_uuids(completed.stdout)
             if completed.returncode != 0:
                 # A GPU that falls off the bus commonly makes ``--query-gpu``
                 # exit non-zero ("Unable to determine the device handle for
@@ -159,15 +155,32 @@ class HostInventoryMixin:
                 # rule the query exists to feed could not fire (F-H6). The
                 # samples ride out on ``_partial_samples`` and the error still
                 # names the contributor.
-                self._partial_samples.extend(
-                    self._inventory_samples(
-                        resource="gpu",
-                        expected=self.expected_gpu_count,
-                        observed=len(gpu_uuids),
-                        discovered=self._discovered_gpu_count(),
-                        extra_labels={"failure_mode": "DRIVER_QUERY_FAILED"},
+                discovered = self._discovered_gpu_count()
+                if not gpu_uuids and discovered > 0:
+                    # Not one GPU listed while the driver has several bound is
+                    # not "every GPU vanished", it is one broken userspace
+                    # query -- "Failed to initialize NVML: Driver/library
+                    # version mismatch" after a driver upgrade without a
+                    # reboot, which lands on every node of the fleet at once.
+                    # A mismatch here would mean fleet-wide REBOOT_NODE, so
+                    # only the context ships and the streak counter is left
+                    # alone.
+                    self._partial_samples.extend(
+                        self._driver_query_failure_samples(
+                            expected=self.expected_gpu_count,
+                            discovered=discovered,
+                        )
                     )
-                )
+                else:
+                    self._partial_samples.extend(
+                        self._inventory_samples(
+                            resource="gpu",
+                            expected=self.expected_gpu_count,
+                            observed=len(gpu_uuids),
+                            discovered=discovered,
+                            extra_labels={"failure_mode": "DRIVER_QUERY_FAILED"},
+                        )
+                    )
                 raise CollectorError(
                     "GPU inventory query failed: " + completed.stderr.strip()
                 )
@@ -179,6 +192,60 @@ class HostInventoryMixin:
                 )
             )
         return samples
+
+    @staticmethod
+    def _parse_gpu_uuids(stdout: str) -> set[str]:
+        """The UUIDs of ``--query-gpu``, and nothing else on stdout.
+
+        ``nvidia-smi`` prints its own diagnostics on *stdout*, interleaved with
+        the GPUs that still answer ("Unable to determine the device handle for
+        GPU 0000:07:00.0: Unknown Error") and fills unavailable fields with
+        ``[N/A]``. Counting every non-empty first column therefore counted the
+        error text as a GPU, so seven live GPUs plus one error line equalled
+        the expected eight and F-H6 never fired in its most common real shape.
+        A UUID is the only thing that counts as an observed GPU.
+        """
+
+        uuids = set()
+        for line in stdout.splitlines():
+            field = line.split(",", 1)[0].strip()
+            if field.startswith(("GPU-", "MIG-")):
+                uuids.add(field)
+        return uuids
+
+    def _driver_query_failure_samples(
+        self, *, expected: int, discovered: int
+    ) -> list[HostMetricSample]:
+        """Context for a driver query that listed nothing, minus any verdict.
+
+        The consumer's inventory rule reads ``gpu_inventory_mismatch``; these
+        samples deliberately do not carry it, so the operator sees the node and
+        the failure mode without a destructive action being derived from a
+        number ``nvidia-smi`` never produced.
+        """
+
+        labels = {
+            "resource": "GPU",
+            "expected_count": str(expected),
+            "discovered_count": str(discovered),
+            "failure_mode": "DRIVER_QUERY_FAILED",
+        }
+        if self.node_instance_type:
+            labels["node_instance_type"] = self.node_instance_type
+        return [
+            HostMetricSample(
+                name="gpu_inventory_expected_count",
+                value=expected,
+                unit="gpus",
+                labels=labels,
+            ),
+            HostMetricSample(
+                name="gpu_inventory_discovered_count",
+                value=discovered,
+                unit="gpus",
+                labels=labels,
+            ),
+        ]
 
     def _discovered_gpu_count(self) -> int:
         """GPUs the driver has bound, counted without ``nvidia-smi``.

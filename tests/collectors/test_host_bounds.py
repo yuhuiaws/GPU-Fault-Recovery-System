@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from gpu_fault.collectors.host.collector import BoundedProcessRunner
+from gpu_fault.collectors.host.system_metrics import BoundedStatvfs
 
 from ._support import (
     NOW,
@@ -92,11 +93,21 @@ def wedged_children() -> Iterator[_WedgedChildFactory]:
         factory.released.set()
 
 
+def _statvfs_workers() -> int:
+    """How many bounded-``statvfs`` worker threads exist right now."""
+
+    return sum(
+        1
+        for thread in threading.enumerate()
+        if thread.name.startswith("gpu-fault-statvfs")
+    )
+
+
 def _blocking_statvfs(released: threading.Event):
     """``os.statvfs`` that never answers for one mount (a hard NFS/Lustre hang)."""
 
     def statvfs(mount: str) -> os.statvfs_result:
-        if mount.endswith("hung") or mount == "/fsx":
+        if "hung" in mount or mount == "/fsx":
             released.wait()
         return os.statvfs_result((4096, 4096, 1_000, 500, 400, 0, 0, 0, 0, 255))
 
@@ -214,7 +225,9 @@ def test_a_timed_out_driver_query_does_not_fabricate_an_inventory_mismatch(
 
     batch = collector.collect_once()
 
-    assert not [item for item in batch.samples if item.name.startswith("gpu_inventory")]
+    assert not [
+        item for item in batch.samples if item.name.startswith("gpu_inventory")
+    ], "a query that never answered must not report an inventory at all"
     assert any("timed out" in error for error in batch.collection_errors), (
         batch.collection_errors
     )
@@ -234,7 +247,16 @@ def test_a_failed_driver_query_still_reports_the_inventory_mismatch(
     gpus = tmp_path / "driver" / "nvidia" / "gpus"
     for index in range(8):
         (gpus / f"0000:0{index}:00.0").mkdir(parents=True)
-    stdout = "".join(f"GPU-{index}, 10\n" for index in range(7))
+    # nvidia-smi prints its error on *stdout* between the GPUs that still
+    # answer, so a parser that counts every non-empty first column counts the
+    # error line as a GPU: 7 UUIDs + 1 error line == 8 == expected, and F-H6
+    # never fires in its most common real shape.
+    stdout = (
+        "".join(f"GPU-{index}, 10\n" for index in range(7))
+        + "Unable to determine the device handle for GPU 0000:07:00.0: "
+        + "Unknown Error\n"
+        + "[N/A], [N/A]\n"
+    )
 
     def runner(argv, **_kwargs):
         return subprocess.CompletedProcess(
@@ -270,7 +292,7 @@ def test_a_failed_driver_query_still_reports_the_inventory_mismatch(
     )
     assert second["gpu_inventory_mismatch"].labels["failure_mode"] == (
         "DRIVER_QUERY_FAILED"
-    )
+    ), "the consumer cannot tell a failed query from a real count delta"
 
 
 def test_a_hung_shared_mount_does_not_wedge_the_tick(
@@ -589,37 +611,139 @@ def test_the_watchdog_notification_is_a_no_op_without_systemd(
     assert sd_notify("READY=1") is False, "no socket, no notification"
 
 
-def test_the_statvfs_worker_a_hung_mount_captured_is_replaced(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One wedged mount costs one leaked daemon thread, not one per tick.
+def test_a_hung_mount_costs_one_worker_and_one_deadline_in_total() -> None:
+    """A wedged mount must not cost a thread and a deadline on *every* tick.
 
-    ``statvfs`` cannot be cancelled, so the worker the hung mount captured is
-    abandoned; a shared pool would have been poisoned by it and every later
-    mount, on every later tick, would have timed out too.
+    ``statvfs`` cannot be cancelled, so the worker a hung mount captured is
+    abandoned -- but re-probing that mount every tick abandoned another worker
+    every tick: three dead binds leaked three threads per 15 s tick until
+    ``TasksMax=256`` was exhausted, after which ``Thread.start()`` raises and
+    every other probe dies while the tick still "completes". An in-flight
+    probe is remembered across ticks instead: the mount is unavailable until
+    its own worker returns, at no further cost.
     """
-
-    from gpu_fault.collectors.host.system_metrics import BoundedStatvfs
 
     released = threading.Event()
     probe = BoundedStatvfs(_blocking_statvfs(released), timeout_seconds=0.25)
+    mounts = ["/hung-a", "/hung-b", "/hung-c"]
+    before = _statvfs_workers()
 
     try:
-        for _ in range(3):
+        first_round = time.monotonic()
+        for mount in mounts:
             with pytest.raises(TimeoutError):
-                probe("/hung")
+                probe(mount)
+        first_elapsed = time.monotonic() - first_round
+        later_round = time.monotonic()
+        for _ in range(4):
+            for mount in mounts:
+                with pytest.raises(TimeoutError):
+                    probe(mount)
+        later_elapsed = time.monotonic() - later_round
+        leaked = _statvfs_workers() - before
         answered = probe("/healthy")
     finally:
         released.set()
 
-    assert answered.f_blocks == 1_000, "the replacement worker did not answer"
-    workers = [
-        thread
+    assert first_elapsed >= 0.25, (
+        f"the first probe of a hung mount must pay the deadline: {first_elapsed:.2f}s"
+    )
+    assert later_elapsed < 0.25, (
+        "four more ticks re-paid the deadline for mounts already known to be "
+        f"blocked: {later_elapsed:.2f}s"
+    )
+    assert leaked <= len(mounts), (
+        f"12 probes of 3 hung mounts leaked {leaked} workers; at most one per "
+        "hung mount may be in flight"
+    )
+    assert answered.f_blocks == 1_000, "a healthy mount lost its worker"
+    assert all(
+        thread.daemon
         for thread in threading.enumerate()
         if thread.name.startswith("gpu-fault-statvfs")
-    ]
-    assert all(thread.daemon for thread in workers), (
-        "a captured statvfs worker would keep the process alive"
+    ), "a captured statvfs worker would keep the process alive"
+
+
+def test_a_recovered_mount_is_probed_again() -> None:
+    """A mount whose worker finally answered must stop being reported dead."""
+
+    released = threading.Event()
+    probe = BoundedStatvfs(_blocking_statvfs(released), timeout_seconds=0.25)
+
+    with pytest.raises(TimeoutError):
+        probe("/hung")
+    released.set()
+    deadline = time.monotonic() + 5
+    stat = None
+    while stat is None and time.monotonic() < deadline:
+        try:
+            stat = probe("/hung")
+        except TimeoutError:
+            time.sleep(0.05)
+
+    assert stat is not None, "a recovered mount was never probed again"
+    assert stat.f_blocks == 1_000, "the recovered mount reported no capacity"
+
+
+def test_the_tick_gives_up_on_the_remaining_mounts_when_its_budget_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dead FSx server is N hung bind mounts, not one.
+
+    Paying the per-mount deadline for each of them pushes the tick past the
+    watchdog, so the very sample the situation calls for --
+    ``shared_filesystem_unavailable=1`` -- is never posted (F-H2). Past the
+    tick's statvfs budget the remaining mounts are reported unavailable
+    without being probed at all.
+    """
+
+    monkeypatch.setattr(
+        HostTelemetryCollector, "CONTRIBUTORS", ("_shared_filesystems",)
+    )
+    mounts = [f"/fsx/pod-{index}" for index in range(6)]
+    _fake_mountinfo(
+        monkeypatch,
+        "".join(
+            f"4{index} 36 0:4{index} / {mount} rw,relatime - lustre "
+            "10.0.0.1@tcp:/fsx rw\n"
+            for index, mount in enumerate(mounts)
+        ),
+    )
+    released = threading.Event()
+    probes: list[str] = []
+
+    def statvfs(mount: str) -> os.statvfs_result:
+        probes.append(mount)
+        released.wait()
+        return os.statvfs_result((4096, 4096, 1_000, 500, 400, 0, 0, 0, 0, 255))
+
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: NOW,
+        statvfs=statvfs,
+        statvfs_timeout_seconds=0.2,
+        statvfs_budget_seconds=0.5,
+    )
+
+    try:
+        started = time.monotonic()
+        batch = collector.collect_once()
+        elapsed = time.monotonic() - started
+    finally:
+        released.set()
+
+    unavailable = {
+        item.device
+        for item in batch.samples
+        if item.name == "shared_filesystem_unavailable" and item.value == 1
+    }
+    assert elapsed < 1.5, f"the tick outran its statvfs budget: {elapsed:.2f}s"
+    assert len(probes) <= 3, f"the budget did not stop the probing: {probes}"
+    assert unavailable == set(mounts), (
+        "a mount the budget skipped must still be reported unavailable: "
+        f"{sorted(unavailable)}"
     )
 
 
@@ -704,3 +828,202 @@ def test_a_bounded_runner_kills_a_child_that_outlives_its_timeout() -> None:
         )
 
     assert time.monotonic() - started < 3, "the kill path was not bounded"
+
+
+def test_a_slow_but_progressing_tick_pings_the_watchdog_between_contributors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A single ping at the end of the tick cannot outlast ``WatchdogSec``.
+
+    Every per-call bound added up is minutes, not seconds: two nvidia-smi
+    calls, a topology dump, ethtool per EFA netdev, a smartctl scan plus one
+    call per drive, ipmitool, ``statvfs`` per mount and the delivery retry
+    ladder. A tick that is slow but *progressing* was SIGABRTed before it ever
+    reached ``sink.post``, so the node posted nothing and restarted forever.
+    The tick must therefore report progress as it goes.
+    """
+
+    notify_path = tmp_path / "notify.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind(str(notify_path))
+    listener.settimeout(0.5)
+    monkeypatch.setenv("NOTIFY_SOCKET", str(notify_path))
+    seen: list[int] = []
+
+    def drain() -> int:
+        count = 0
+        listener.settimeout(0.05)
+        while True:
+            try:
+                listener.recv(4096)
+            except TimeoutError:
+                return count
+            count += 1
+
+    def slow_contributor(_self, _observed_at):
+        seen.append(drain())
+        return []
+
+    monkeypatch.setattr(
+        HostTelemetryCollector, "CONTRIBUTORS", ("_first_step", "_second_step")
+    )
+    monkeypatch.setattr(
+        HostTelemetryCollector, "_first_step", slow_contributor, raising=False
+    )
+    monkeypatch.setattr(
+        HostTelemetryCollector, "_second_step", slow_contributor, raising=False
+    )
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise StopTheLoop("one tick is enough")
+
+    monkeypatch.setattr("gpu_fault.collectors.host.collector.time.sleep", sleep)
+    snapshot_request = tmp_path / "host.request"
+    snapshot_request.write_text("now\n")
+    times = iter([NOW + timedelta(seconds=15 * index) for index in range(8)])
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        force_snapshot_path=str(snapshot_request),
+    )
+
+    try:
+        with pytest.raises(StopTheLoop):
+            collector.run()
+    finally:
+        listener.close()
+
+    assert seen == [1, 1], (
+        "the tick reported no progress between contributors, so a long tick is "
+        f"killed before it can post: {seen}"
+    )
+
+
+def test_an_nvml_failure_reports_a_driver_error_not_a_missing_gpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """ "Driver/library version mismatch" lists no GPUs at all.
+
+    Zero parsed UUIDs against eight enumerated GPUs is not eight dead GPUs, it
+    is one dead driver: a mismatch sample here means CRITICAL/REBOOT_NODE, and
+    the trigger (a driver upgrade without a reboot) lands on every node of the
+    fleet at once. The context samples still ship so the consumer can see the
+    node, but nothing claims the GPUs are gone.
+    """
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_gpu_inventory",))
+    gpus = tmp_path / "driver" / "nvidia" / "gpus"
+    for index in range(8):
+        (gpus / f"0000:0{index}:00.0").mkdir(parents=True)
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            255,
+            stdout="",
+            stderr="Failed to initialize NVML: Driver/library version mismatch\n",
+        )
+
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: NOW,
+        runner=runner,
+        proc_root=str(tmp_path),
+        expected_gpu_count=8,
+        inventory_mismatch_consecutive_samples=2,
+    )
+
+    batches = [collector.collect_once() for _ in range(3)]
+    names = [
+        {item.name: item for item in batch.samples if item.name.startswith("gpu_")}
+        for batch in batches
+    ]
+
+    assert all("gpu_inventory_mismatch" not in item for item in names), (
+        "an NVML-level failure minted a fleet-wide REBOOT_NODE finding"
+    )
+    assert names[-1]["gpu_inventory_discovered_count"].value == 8, names[-1]
+    assert names[-1]["gpu_inventory_discovered_count"].labels["failure_mode"] == (
+        "DRIVER_QUERY_FAILED"
+    ), names[-1]["gpu_inventory_discovered_count"].labels
+    assert all(
+        any("NVML" in error for error in batch.collection_errors) for batch in batches
+    ), [batch.collection_errors for batch in batches]
+
+
+def test_an_unreadable_counter_does_not_cost_the_interface_its_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A sysfs counter can read back empty or ``N/A`` while the NIC resets.
+
+    ``int("")`` is a ``ValueError``, not an ``OSError``, so it escaped the
+    per-interface guard and discarded the whole tick; and dropping the
+    interface from the tick's ``seen`` set pruned its baseline, so an
+    intermittently failing NIC -- the one the error-rate rule exists for --
+    never reported ``network_errors_delta`` again (F-H4).
+    """
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_network",))
+    _write_interface(tmp_path, "eth0", physical=True, operstate="up")
+    eth1 = _write_interface(tmp_path, "eth1", physical=True, operstate="up")
+    times = iter([NOW + timedelta(seconds=15 * index) for index in range(4)])
+    collector = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        net_class_root=str(tmp_path),
+    )
+
+    collector.collect_once()
+    (eth1 / "statistics" / "rx_errors").write_text("")
+    second = collector.collect_once()
+    _set_counters(eth1, 9)
+    third = collector.collect_once()
+
+    second_names = {(item.name, item.device) for item in second.samples}
+    third_names = {(item.name, item.device) for item in third.samples}
+    assert ("network_errors_delta", "eth0") in second_names, (
+        "one unreadable counter discarded the whole tick"
+    )
+    assert second.collection_errors == [], second.collection_errors
+    assert ("network_errors_delta", "eth1") in third_names, (
+        "the repaired interface lost the baseline it needs to report a delta"
+    )
+
+
+def test_product_discovery_at_startup_cannot_hold_the_unit_in_activating(
+    monkeypatch: pytest.MonkeyPatch, wedged_children: _WedgedChildFactory
+) -> None:
+    """Discovery runs *before* ``READY=1``, on the unbounded ``subprocess.run``.
+
+    On a node whose driver is already wedged the collector never reached its
+    first tick, so with ``Type=notify`` systemd killed the unit every
+    ``TimeoutStartSec`` and the installer's ``systemctl restart`` failed --
+    rolling back the whole node install over a GPU fault we could have
+    reported.
+    """
+
+    from gpu_fault.collectors.context import context_from_environment
+
+    monkeypatch.setattr(subprocess, "Popen", wedged_children)
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_ID", "cluster-a")
+    monkeypatch.setenv("GPU_FAULT_GPU_PRODUCT", "H100")
+    monkeypatch.delenv("GPU_FAULT_GPU_PRODUCT_DISCOVERY", raising=False)
+    monkeypatch.delenv("GPU_FAULT_DRIVER_BRANCH", raising=False)
+
+    started = time.monotonic()
+    ctx = context_from_environment(discover_product=True)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 60, f"startup discovery was not bounded: {elapsed:.1f}s"
+    assert ctx.cluster_id == "cluster-a", ctx
+    assert all(child.kills == 1 for child in wedged_children.children), (
+        "the wedged discovery child was never killed"
+    )

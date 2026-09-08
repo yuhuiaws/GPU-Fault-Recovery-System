@@ -56,9 +56,18 @@ class HostNetworkMixin:
                 if not self._is_reported_interface(interface):
                     continue
                 samples = self._interface_samples(interface, observed_at)
-            except OSError:
-                # The interface went away mid-read; the next tick either sees
-                # it again or prunes its counters.
+            except (OSError, ValueError):
+                # Two different failures with two different answers. A veth
+                # deleted between ``iterdir`` and the read is gone, so its
+                # baseline may be pruned. A counter that reads back empty or
+                # ``[N/A]`` -- ``float("")`` raises ``ValueError``, not
+                # ``OSError``, so it used to discard the whole tick -- belongs
+                # to an interface that is still there: keeping it in ``seen``
+                # preserves the baseline, without which an intermittently
+                # failing NIC, the one the error-rate rule exists for, would
+                # never report ``network_errors_delta`` again.
+                if interface.exists():
+                    seen.add(name)
                 continue
             seen.add(name)
             result.extend(samples)
@@ -82,7 +91,9 @@ class HostNetworkMixin:
         """Every sample for one interface, or nothing if any read fails.
 
         Built as a unit so a half-read interface contributes nothing rather
-        than a link state without its counters.
+        than a link state without its counters. Raises ``OSError`` if the
+        interface disappears and ``ValueError`` if a counter reads back
+        unparseable; the caller tells those two apart.
         """
 
         name = interface.name

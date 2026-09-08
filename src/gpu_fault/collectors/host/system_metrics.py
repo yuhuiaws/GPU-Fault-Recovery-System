@@ -8,6 +8,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,37 @@ LOGGER = logging.getLogger(__name__)
 _RETIRE = "\0retire"
 
 
+class _InFlightProbe:
+    """A ``statvfs`` call that missed its deadline and is still running.
+
+    The syscall cannot be cancelled, so the worker it captured is abandoned --
+    but the *mount* is remembered, across ticks: until this worker answers,
+    that mount is unavailable by definition and probing it again would only
+    abandon another thread and re-pay another deadline. One wedged mount
+    therefore costs one thread and one deadline in total, not one per tick.
+    """
+
+    def __init__(
+        self,
+        requests: queue.SimpleQueue[str],
+        responses: queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]],
+    ) -> None:
+        self._requests = requests
+        self._responses = responses
+
+    def has_answered(self) -> bool:
+        """True once the abandoned syscall returned, so the mount is probeable."""
+
+        try:
+            self._responses.get_nowait()
+        except queue.Empty:
+            return False
+        # The worker is idle again and nothing else holds its queues: retire it
+        # rather than keep a thread per mount that ever hung.
+        self._requests.put(_RETIRE)
+        return True
+
+
 class BoundedStatvfs:
     """``os.statvfs`` a hung mount cannot wedge the caller with.
 
@@ -36,11 +68,11 @@ class BoundedStatvfs:
     ``timeout_seconds`` with ``TimeoutError`` (an ``OSError``, which the
     callers already read as "this mount is unavailable").
 
-    A worker a hung mount captured is abandoned and replaced on the next
-    probe. That costs one daemon thread per wedged mount rather than one
-    thread per mount per tick, and -- unlike a shared pool -- one wedged mount
-    cannot make every healthy mount look unavailable behind it. The abandoned
-    worker retires itself if its mount ever answers.
+    A worker a hung mount captured is abandoned, and the mount is remembered
+    until that worker answers: a dead FSx server that is N hung bind mounts
+    costs N threads once, not N threads every tick until ``TasksMax`` is
+    exhausted. Unlike a shared pool, one wedged mount also cannot make every
+    healthy mount behind it look unavailable.
     """
 
     def __init__(
@@ -55,8 +87,16 @@ class BoundedStatvfs:
         self._responses: (
             queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]] | None
         ) = None
+        self._in_flight: dict[str, _InFlightProbe] = {}
 
     def __call__(self, mount: str) -> os.statvfs_result:
+        blocked = self._in_flight.get(mount)
+        if blocked is not None:
+            if not blocked.has_answered():
+                raise TimeoutError(
+                    f"statvfs({mount}) from an earlier tick has not returned"
+                )
+            del self._in_flight[mount]
         if self._requests is None or self._responses is None:
             self._start_worker()
         requests = self._requests
@@ -67,7 +107,7 @@ class BoundedStatvfs:
         try:
             stat, error = responses.get(timeout=self._timeout_seconds)
         except queue.Empty:
-            requests.put(_RETIRE)
+            self._in_flight[mount] = _InFlightProbe(requests, responses)
             self._requests = None
             self._responses = None
             raise TimeoutError(
@@ -113,12 +153,14 @@ class BoundedStatvfs:
 class HostSystemMetricsMixin:
     # Attributes supplied by the composed concrete implementation.
     filesystems: Any
+    statvfs_budget_seconds: float
     statvfs_timeout_seconds: float
 
     _delta: Callable[..., Any]
     _previous: Any
     _sample: Callable[..., Any]
     _statvfs_probe: Callable[[str], os.statvfs_result]
+    _statvfs_spent_seconds: float
     _statvfs_tick: datetime | None
     _unresponsive_mounts: set[str]
     runner: Callable[..., Any]
@@ -131,13 +173,33 @@ class HostSystemMetricsMixin:
         an FSx or NFS path, and paying the deadline once per contributor would
         multiply the tick's worst case by the number of contributors that name
         the mount.
+
+        The tick also has a total budget for waiting on mounts. One dead file
+        server is not one mount but every bind mount served from it, and paying
+        the per-mount deadline for each of them pushed the tick past the
+        systemd watchdog -- so the batch carrying
+        ``shared_filesystem_unavailable`` was killed before it was posted. Past
+        the budget the remaining mounts are reported unavailable without being
+        probed at all.
         """
 
         if self._statvfs_tick != observed_at:
             self._statvfs_tick = observed_at
+            self._statvfs_spent_seconds = 0.0
             self._unresponsive_mounts.clear()
         if mount in self._unresponsive_mounts:
             raise TimeoutError(f"{mount} already missed its statvfs deadline this tick")
+        if self._statvfs_spent_seconds >= self.statvfs_budget_seconds:
+            self._unresponsive_mounts.add(mount)
+            LOGGER.warning(
+                "this tick already spent %gs of its %gs statvfs budget; reporting "
+                "%s as unavailable without probing it",
+                self._statvfs_spent_seconds,
+                self.statvfs_budget_seconds,
+                mount,
+            )
+            raise TimeoutError(f"the tick's statvfs budget was spent before {mount}")
+        started = time.monotonic()
         try:
             return self._statvfs_probe(mount)
         except TimeoutError:
@@ -149,6 +211,8 @@ class HostSystemMetricsMixin:
                 self.statvfs_timeout_seconds,
             )
             raise
+        finally:
+            self._statvfs_spent_seconds += time.monotonic() - started
 
     def _cpu(self, observed_at: datetime) -> list[HostMetricSample]:
         fields = [
