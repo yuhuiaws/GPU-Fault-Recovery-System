@@ -473,3 +473,51 @@ def test_buffer_for_replay_without_an_outbox_reports_that_it_did_not_persist() -
     assert sink.buffer_for_replay("/events", {"sequence": 0}) is False, (
         "a sink with no outbox claimed it persisted a drained record"
     )
+
+
+def test_a_filesystem_without_flock_still_buffers_and_warns_once(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """The cross-process lock is an improvement, never a new failure mode.
+
+    A filesystem that refuses the lock file must cost one warning per outbox
+    path and leave the in-process lock doing what it always did -- not turn a
+    transient delivery failure into a lost record.
+    """
+
+    real_open = os.open
+
+    def refuse_lock_files(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".lock"):
+            raise OSError(95, "Operation not supported")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(os, "open", refuse_lock_files)
+    monkeypatch.setattr(
+        "gpu_fault.collectors.sinks.urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unreachable")),
+    )
+    outbox = tmp_path / "no-flock.ndjson"
+    sink = HttpEventSink(
+        "https://control",
+        max_attempts=1,
+        outbox_path=str(outbox),
+        sleep=lambda _seconds: None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        for sequence in range(2):
+            with pytest.raises(CollectorError) as captured:
+                sink.post("/events", {"event_id": f"e-{sequence}"})
+            assert captured.value.buffered is True, (
+                "a missing outbox lock stopped the record from being buffered"
+            )
+
+    buffered = [json.loads(line) for line in outbox.read_text().splitlines() if line]
+    assert len(buffered) == 2, buffered
+    warnings = [
+        record for record in caplog.records if "lock" in record.getMessage().lower()
+    ]
+    assert len(warnings) == 1, (
+        f"the flock fallback warned {len(warnings)} times, not once per path"
+    )
