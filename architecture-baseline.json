@@ -22,7 +22,7 @@
     "src/gpu_fault/admin/aws_cleanup.py": 1563,
     "src/gpu_fault/admin/bootstrap.py": 2098,
     "src/gpu_fault/admin/cli.py": 1641,
-    "src/gpu_fault/cluster_executor.py": 1760,
+    "src/gpu_fault/cluster_executor.py": 1682,
     "src/gpu_fault/completion_controller.py": 1631,
     "src/gpu_fault/execution/dispatcher.py": 1538,
     "src/gpu_fault/execution/executor.py": 2340,
