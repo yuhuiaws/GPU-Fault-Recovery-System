@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import socket
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -24,6 +25,8 @@ from gpu_fault.completion_metrics_server import (
     start_completion_metrics_server,
 )
 
+NOW = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+
 
 class FakeController:
     reconcile_failures_total = 3
@@ -32,6 +35,24 @@ class FakeController:
     outbox_append_failures_total = 9
     outbox_depth = 4
     outbox_quarantined_depth = 2
+    reconcile_runs_total = 21
+    metadata_takeovers_total = 6
+    watch_timeout_seconds = 30
+
+    def __init__(
+        self, *, cycle_age_seconds: float | None = 5.0, uptime_seconds: float = 12.0
+    ) -> None:
+        self.started_at = NOW - timedelta(seconds=uptime_seconds)
+        self.last_cycle_completed_at = (
+            None
+            if cycle_age_seconds is None
+            else NOW - timedelta(seconds=cycle_age_seconds)
+        )
+
+    def now(self) -> datetime:
+        """The controller's injected clock; the health check reads it."""
+
+        return NOW
 
 
 def _ephemeral(controller: object) -> CompletionMetricsServer:
@@ -49,6 +70,16 @@ def _get(url: str) -> tuple[int, str, str]:
             response.headers.get("Content-Type", ""),
             response.read().decode("utf-8"),
         )
+
+
+def _status(url: str) -> tuple[int, str]:
+    """The status code of a GET, treating 5xx as a value rather than a raise."""
+
+    try:
+        status, _content_type, body = _get(url)
+    except HTTPError as error:
+        return error.code, error.read().decode("utf-8")
+    return status, body
 
 
 def test_metrics_endpoint_exposes_the_three_controller_counters() -> None:
@@ -196,6 +227,105 @@ def test_render_handles_a_controller_without_restore_counter() -> None:
     body = render_completion_metrics(Bare())
 
     assert "gpu_fault_completion_controller_restore_skipped_total 0" in body, body
+    assert "gpu_fault_completion_watcher_last_cycle_completed_timestamp 0" in body, (
+        f"a controller with no completed pass must report 0, not raise: {body!r}"
+    )
+
+
+def test_metrics_export_cycle_age_and_outbox_stats() -> None:
+    """F3/F12: only a completed full pass moves this timestamp.
+
+    A watch stream that hangs for ever kept every counter frozen and exposed
+    nothing an alert could read, so ten minutes of silence looked identical to
+    an idle cluster.
+    """
+    controller = FakeController(cycle_age_seconds=5.0)
+    server = _ephemeral(controller)
+    try:
+        _, _, body = _get(f"http://127.0.0.1:{server.port}/metrics")
+    finally:
+        server.stop()
+
+    lines = body.splitlines()
+    stamp = "gpu_fault_completion_watcher_last_cycle_completed_timestamp"
+    assert f"# TYPE {stamp} gauge" in lines, (
+        f"{stamp} is not typed as a gauge: {body!r}"
+    )
+    expected = int((NOW - timedelta(seconds=5)).timestamp())
+    assert f"{stamp} {expected}" in lines, f"{stamp} sample missing from {body!r}"
+    for name, value in (
+        ("gpu_fault_completion_controller_reconcile_runs_total", 21),
+        ("gpu_fault_completion_controller_metadata_takeovers_total", 6),
+    ):
+        assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
+        assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
+        assert f"{name} {value}" in lines, f"{name} sample missing from {body!r}"
+
+
+def test_healthz_passes_while_full_passes_keep_completing() -> None:
+    """A healthy idle cluster still relists every watch timeout.
+
+    Liveness must key off the reconcile pass, never off traffic: a cluster with
+    no managed Pod posts nothing and must stay healthy.
+    """
+    server = _ephemeral(FakeController(cycle_age_seconds=29.0))
+    try:
+        status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
+    finally:
+        server.stop()
+
+    assert status == 200, f"a 29 s old cycle is healthy: {status} {body!r}"
+
+
+def test_healthz_fails_when_the_cycle_is_stale() -> None:
+    """F3: three missed relists is the restart signal."""
+    server = _ephemeral(FakeController(cycle_age_seconds=91.0))
+    try:
+        status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
+    finally:
+        server.stop()
+
+    assert status == 503, f"a 91 s old cycle exceeds 3 x 30 s: {status} {body!r}"
+    assert "91" in body, f"the body must name the cycle age: {body!r}"
+
+
+@pytest.mark.parametrize(
+    "uptime_seconds, expected",
+    [(29.0, 200), (31.0, 503)],
+    ids=["inside-grace", "past-grace"],
+)
+def test_healthz_grants_one_watch_timeout_of_startup_grace(
+    uptime_seconds: float, expected: int
+) -> None:
+    """Before the first pass the probe waits exactly one watch timeout.
+
+    The initial list plus a full reconcile of every attempt takes time; failing
+    the probe during it would CrashLoop the watcher on a large cluster.
+    """
+    server = _ephemeral(
+        FakeController(cycle_age_seconds=None, uptime_seconds=uptime_seconds)
+    )
+    try:
+        status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
+    finally:
+        server.stop()
+
+    assert status == expected, f"uptime={uptime_seconds}s: {status} {body!r}"
+
+
+def test_healthz_is_unavailable_not_failing_for_a_controller_without_a_clock() -> None:
+    """A health check that raises must not restart a working watcher."""
+
+    class Bare:
+        reconcile_failures_total = 1
+
+    server = _ephemeral(Bare())
+    try:
+        status, body = _status(f"http://127.0.0.1:{server.port}/healthz")
+    finally:
+        server.stop()
+
+    assert status == 200, f"an unknown cycle age is not a stuck loop: {status} {body!r}"
 
 
 def test_server_thread_is_a_daemon() -> None:

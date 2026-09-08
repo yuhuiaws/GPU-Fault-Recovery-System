@@ -639,6 +639,40 @@ def test_completion_watcher_exposes_controller_metrics() -> None:
     assert ports["metrics"].get("protocol", "TCP") == "TCP", ports
 
 
+def test_completion_watcher_probes_the_watch_loop_liveness() -> None:
+    """完成态观察器 F3: a hung watch stream had nothing to restart the Pod.
+
+    The watch had no client read timeout and the Deployment had no probe, so a
+    silently dropped connection parked the only thread that relists Pods: ten
+    minutes later every node reads UNKNOWN and every node-mutating plan is
+    BLOCKED. ``/healthz`` fails only when no full reconcile pass has completed
+    for three watch timeouts, which an idle cluster never triggers because the
+    30 s relist is what moves the timestamp.
+    """
+    documents = list(
+        yaml.safe_load_all(
+            (ROOT / "deploy/dataplane/completion-watcher.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    deployment = next(item for item in documents if item.get("kind") == "Deployment")
+    watcher = container(deployment)
+    ports = {item.get("name"): item for item in watcher.get("ports", [])}
+    liveness = watcher["livenessProbe"]
+    readiness = watcher["readinessProbe"]
+
+    assert liveness["httpGet"]["path"] == "/healthz", liveness
+    assert liveness["httpGet"]["port"] == ports["metrics"]["containerPort"], (
+        f"the probe must hit the declared metrics port: {liveness} {ports}"
+    )
+    assert liveness["periodSeconds"] == 30, liveness
+    assert liveness["failureThreshold"] == 3, liveness
+    assert readiness["httpGet"] == liveness["httpGet"], (
+        f"readiness must read the same endpoint: {readiness}"
+    )
+
+
 def test_aurora_rotation_restarts_every_database_consumer() -> None:
     documents = list(
         yaml.safe_load_all(

@@ -168,6 +168,37 @@ spec:
             - name: metrics
               containerPort: 9109
               protocol: TCP
+          # 完成态观察器 F3. The watch used to have no client read timeout and
+          # this Pod had no probe, so an API-server endpoint that died without
+          # an RST -- or a NAT that dropped the idle stream -- parked the only
+          # thread that relists Pods. Nothing noticed: after 600 s of silence
+          # every node reads UNKNOWN and every node-mutating plan is BLOCKED,
+          # and every terminal raised during the hang was lost until an
+          # operator deleted the Pod by hand.
+          #
+          # /healthz reports 503 only when no *full* reconcile pass has
+          # completed for three watch timeouts (3 x 30 s = 90 s), plus one
+          # watch timeout of grace before the first pass. It reads two
+          # timestamps off the controller: no API call, no reconcile lock, no
+          # outbox read. An idle cluster stays healthy -- it posts nothing at
+          # all, yet the 30 s relist still completes a pass -- so this can only
+          # fire on a genuinely stuck loop. failureThreshold 3 x periodSeconds
+          # 30 means a restart takes ~90 s of continuous failure on top of the
+          # 90 s staleness window.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9109
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9109
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m
