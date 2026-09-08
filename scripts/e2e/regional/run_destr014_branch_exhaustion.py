@@ -37,6 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
+from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     replica_vanished,
     write_json_atomic,
@@ -915,8 +916,12 @@ def _control_plane_errors(
         failure_reason=workflow.get("terminal_failure_reason")
         or state.get("workflow_failure_reason"),
     )
-    follow_up = run.regional.store_snapshot(
-        event_id=f"support-after-{workflow.get('request_id')}"
+    # The support escalation that follows an exhausted branch lives on its own
+    # incident/workflow pair keyed by the failed workflow's id; read that pair
+    # (attempt 4, 2026-09-08, crashed here on a store_snapshot kwarg that never
+    # existed, before any verdict was written).
+    follow_up = run.regional.cpu_python(
+        destr018.ESCALATION_CHAIN, str(workflow.get("request_id") or "")
     )
     errors.extend(
         follow_up_errors(
