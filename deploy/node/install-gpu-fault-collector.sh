@@ -745,8 +745,7 @@ if [[ "${FABRIC_MANAGER_JOURNAL}" == "true" ]]; then
 elif [[ -z "${FABRIC_MANAGER_LOG_PATHS}" ]]; then
     die "Fabric Manager collector requires journald or file paths"
 fi
-[[ "${NODE_AGENT_PORT}" =~ ^[0-9]+$ ]] ||
-    die "--node-agent-port must be an integer"
+[[ "${NODE_AGENT_PORT}" =~ ^[0-9]+$ ]] || die "--node-agent-port must be an integer"
 (( NODE_AGENT_PORT >= 1 && NODE_AGENT_PORT <= 65535 )) ||
     die "--node-agent-port must be between 1 and 65535"
 [[ "${NODE_HEARTBEAT_INTERVAL}" =~ ^[0-9]+$ ]] ||
@@ -767,16 +766,14 @@ fi
     die "--node-action-retention-seconds must be at least 600"
 [[ "${NODE_ACTION_MAX_RESULTS}" =~ ^[0-9]+$ ]] ||
     die "--node-action-max-results must be an integer"
-(( NODE_ACTION_MAX_RESULTS >= 100 )) ||
-    die "--node-action-max-results must be at least 100"
+(( NODE_ACTION_MAX_RESULTS >= 100 )) || die "--node-action-max-results must be at least 100"
 [[ "${DIAGNOSTIC_RETENTION_SECONDS}" =~ ^[0-9]+$ ]] ||
     die "--diagnostic-retention-seconds must be an integer"
 (( DIAGNOSTIC_RETENTION_SECONDS >= 3600 )) ||
     die "--diagnostic-retention-seconds must be at least 3600"
 [[ "${DIAGNOSTIC_MAX_ARCHIVES}" =~ ^[0-9]+$ ]] ||
     die "--diagnostic-max-archives must be an integer"
-(( DIAGNOSTIC_MAX_ARCHIVES >= 1 )) ||
-    die "--diagnostic-max-archives must be positive"
+(( DIAGNOSTIC_MAX_ARCHIVES >= 1 )) || die "--diagnostic-max-archives must be positive"
 [[ "${QUIESCE_FAILSAFE_SECONDS}" =~ ^[0-9]+$ ]] ||
     die "--quiesce-failsafe-seconds must be an integer"
 (( QUIESCE_FAILSAFE_SECONDS >= 30 &&
@@ -885,10 +882,8 @@ PY
     if [[ -n "${NODE_AGENT_TLS_CERT}" || -n "${NODE_AGENT_TLS_KEY}" ]]; then
         [[ -n "${NODE_AGENT_TLS_CERT}" && -n "${NODE_AGENT_TLS_KEY}" ]] ||
             die "--node-agent-tls-cert and --node-agent-tls-key must be set together"
-        [[ -r "${NODE_AGENT_TLS_CERT}" ]] ||
-            die "--node-agent-tls-cert is not readable"
-        [[ -r "${NODE_AGENT_TLS_KEY}" ]] ||
-            die "--node-agent-tls-key is not readable"
+        [[ -r "${NODE_AGENT_TLS_CERT}" ]] || die "--node-agent-tls-cert is not readable"
+        [[ -r "${NODE_AGENT_TLS_KEY}" ]] || die "--node-agent-tls-key is not readable"
     fi
     if [[ -n "${NODE_AGENT_TLS_CLIENT_CA}" ]]; then
         [[ -n "${NODE_AGENT_TLS_CERT}" ]] ||
@@ -946,11 +941,9 @@ if [[ "${ALLOW_FABRIC_RESET}" == "true" &&
     "${ALLOW_SERVICE_QUIESCE}" != "true" ]]; then
     die "--allow-fabric-reset requires --allow-service-quiesce"
 fi
-[[ "${DIAGNOSTIC_OUTPUT_DIR}" == /* ]] ||
-    die "--diagnostic-output-dir must be absolute"
+[[ "${DIAGNOSTIC_OUTPUT_DIR}" == /* ]] || die "--diagnostic-output-dir must be absolute"
 if [[ -n "${DIAGNOSTIC_S3_URI}" ]]; then
-    [[ "${DIAGNOSTIC_S3_URI}" == s3://* ]] ||
-        die "--diagnostic-s3-uri must use s3://"
+    [[ "${DIAGNOSTIC_S3_URI}" == s3://* ]] || die "--diagnostic-s3-uri must use s3://"
 fi
 if [[ "${ALLOW_FIELD_DIAGNOSTIC}" == "true" ]]; then
     [[ "${FIELD_DIAGNOSTIC_COMMAND}" == /* ]] ||
@@ -988,8 +981,7 @@ if [[ "${ALLOW_FIRMWARE_UPDATE}" == "true" ]]; then
         die "--firmware-update-command must start with an absolute path"
     [[ "${FIRMWARE_UPDATE_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
         die "--firmware-update-sha256 must contain 64 hex characters"
-    [[ -n "${TARGET_FIRMWARE_VERSION}" ]] ||
-        die "--target-firmware-version is required"
+    [[ -n "${TARGET_FIRMWARE_VERSION}" ]] || die "--target-firmware-version is required"
     [[ "${FIRMWARE_VERIFY_COMMAND}" == /* ]] ||
         die "--firmware-verify-command must start with an absolute path"
     [[ "${FIRMWARE_VERIFY_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] ||
@@ -1038,6 +1030,108 @@ command -v "${PYTHON_COMMAND}" >/dev/null ||
     die "Python 3.12 or newer is required"
 command -v systemctl >/dev/null || die "systemd is required"
 record_unit_state
+# 升级期间重启 Agent 之前必须排空在途动作。
+# `lifespan` shuts the action pool down without waiting, so a stop or restart
+# in the middle of a handler lets systemd SIGKILL the cgroup -- the running
+# `nvidia-smi --gpu-reset` or driver install dies with it and the ledger row is
+# left INTERRUPTED, which then needs manual confirmation.
+NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
+# Keep in step with TimeoutStopSec= in the node-agent unit (deploy/systemd/):
+# the installer must not give up on an in-flight command earlier than systemd
+# itself would -- unless the installer Job it runs inside would die first.
+NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"
+NODE_AGENT_LEDGER_POLL_SECONDS="5"
+SQLITE_COMMAND="$(command -v sqlite3 2>/dev/null || true)"
+# 读不出来的 ledger 不等于没有在途动作。
+# A corrupt database, a missing `results` table and a SQLITE_BUSY while the
+# Agent writes a row all produce zero rows, which would let a fail-closed gate
+# stop the Agent mid-operation. Both readers therefore keep their non-zero exit
+# status, and the caller treats "read failed" as "assume busy".
+in_progress_node_action_ids() {
+    [[ -f "${NODE_ACTION_DB}" ]] || return 0
+    if [[ -n "${SQLITE_COMMAND}" ]]; then
+        "${SQLITE_COMMAND}" -readonly -cmd '.timeout 5000' "${NODE_ACTION_DB}" \
+            "SELECT command_id FROM results WHERE state = 'IN_PROGRESS';"
+    else
+        "${PYTHON_COMMAND}" -c '
+import sqlite3
+import sys
+
+try:
+    connection = sqlite3.connect(
+        f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5
+    )
+    rows = connection.execute(
+        "SELECT command_id FROM results WHERE state = ?", ("IN_PROGRESS",)
+    ).fetchall()
+except sqlite3.Error as error:
+    print(f"node action ledger read failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+for row in rows:
+    print(row[0])
+' "${NODE_ACTION_DB}"
+    fi
+}
+NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS="120"
+# The measured install + verify duration (venv build, unit/env writes, stop,
+# slot switch, daemon-reload, restart, verify) plus margin. The drain before the
+# first write must leave this much Job budget behind it, or the kubelet kills
+# the half-installed node that drain exists to prevent. Tunable per site.
+INSTALL_RESERVE_SECONDS="${INSTALLER_INSTALL_RESERVE_SECONDS:-420}"
+[[ "${INSTALL_RESERVE_SECONDS}" =~ ^[0-9]+$ ]] ||
+    die "INSTALLER_INSTALL_RESERVE_SECONDS must be a non-negative integer"
+wait_for_node_action_ledger_idle() {
+    local reserve="${1:-0}" deadline job_deadline="" pending unreadable
+    deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
+    # The regional installer Job passes its budget in: a drain that outlives
+    # activeDeadlineSeconds is SIGKILLed with the cgroup and no EXIT trap runs.
+    if [[ "${INSTALLER_STARTED_EPOCH:-}" =~ ^[0-9]+$ &&
+        "${INSTALLER_ACTIVE_DEADLINE_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+        job_deadline=$(( INSTALLER_STARTED_EPOCH + INSTALLER_ACTIVE_DEADLINE_SECONDS ))
+        (( job_deadline - NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS - reserve >= deadline )) ||
+            deadline=$(( job_deadline - NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS - reserve ))
+    fi
+    while :; do
+        unreadable="false"
+        pending="$(in_progress_node_action_ids | tr '\n' ' ')" ||
+            unreadable="true"
+        pending="${pending% }"
+        if [[ "${unreadable}" == "true" ]]; then
+            printf 'WARN  node action ledger unreadable (%s)\n' \
+                "${NODE_ACTION_DB}"
+        elif [[ -z "${pending}" ]]; then
+            # Drained -- unless the Job has less than the reserve left, in which
+            # case the install itself is what the kubelet would kill: die now.
+            [[ -z "${job_deadline}" ]] ||
+                (( job_deadline - $(date +%s) >= reserve )) && return 0
+            pending="(none; under ${reserve} s of Job budget left for the install)"
+            break
+        else
+            printf 'waiting for in-flight node actions: %s\n' "${pending}"
+        fi
+        if (( $(date +%s) >= deadline )); then
+            break
+        fi
+        sleep "${NODE_AGENT_LEDGER_POLL_SECONDS}"
+    done
+    if [[ "${unreadable}" == "true" ]]; then
+        die "node action ledger could not be read: ${NODE_ACTION_DB}"
+    fi
+    die "node agent still has an in-flight command; retry later: ${pending}"
+}
+drain_node_agent_before_restart() {
+    systemctl is-active --quiet gpu-fault-node-agent.service || return 0
+    wait_for_node_action_ledger_idle
+}
+drain_node_agent_before_install() {
+    systemctl is-active --quiet gpu-fault-node-agent.service || return 0
+    wait_for_node_action_ledger_idle "${INSTALL_RESERVE_SECONDS}"
+}
+# Before the quiesce restore and the first unit/env write, with the install
+# reserve; the stop and the restart drain again, and their timeout rolls back.
+if [[ "${NO_START}" == "false" ]]; then
+    drain_node_agent_before_install
+fi
 shopt -s nullglob
 existing_quiesce_states=(
     /var/lib/gpu-fault/quiesce/quiesce-*.json
@@ -1057,17 +1151,12 @@ fi
 command -v curl >/dev/null || die "curl is required"
 command -v nvidia-smi >/dev/null || die "NVIDIA driver/nvidia-smi is required"
 if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
-    command -v timeout >/dev/null ||
-        die "timeout is required for bounded hung diagnostics"
-    command -v ps >/dev/null ||
-        die "ps is required for hung diagnostics"
-    command -v ss >/dev/null ||
-        die "ss is required for hung network diagnostics"
-    command -v strace >/dev/null ||
-        die "strace is required for hung process diagnostics"
+    command -v timeout >/dev/null || die "timeout is required for bounded hung diagnostics"
+    command -v ps >/dev/null || die "ps is required for hung diagnostics"
+    command -v ss >/dev/null || die "ss is required for hung network diagnostics"
+    command -v strace >/dev/null || die "strace is required for hung process diagnostics"
     if compgen -G "/sys/class/infiniband/*" >/dev/null; then
-        command -v rdma >/dev/null ||
-            die "rdma is required for hung EFA/RDMA diagnostics"
+        command -v rdma >/dev/null || die "rdma is required for hung EFA/RDMA diagnostics"
         command -v ethtool >/dev/null ||
             die "ethtool is required for hung EFA/RDMA diagnostics"
     fi
@@ -1134,92 +1223,6 @@ json.dump(
 clear_degraded_gpu_marker() {
     rm -f "${DEGRADED_GPU_MARKER}"
 }
-
-# 升级期间重启 Agent 之前必须排空在途动作。
-# `lifespan` shuts the action pool down without waiting, so a stop or restart
-# in the middle of a handler lets systemd SIGKILL the cgroup -- the running
-# `nvidia-smi --gpu-reset` or driver install dies with it and the ledger row is
-# left INTERRUPTED, which then needs manual confirmation.
-NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
-# Keep in step with TimeoutStopSec= in the node-agent unit (deploy/systemd/):
-# the installer must not give up on an in-flight command earlier than systemd
-# itself would -- unless the installer Job it runs inside would die first.
-NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"
-NODE_AGENT_LEDGER_POLL_SECONDS="5"
-SQLITE_COMMAND="$(command -v sqlite3 2>/dev/null || true)"
-# 读不出来的 ledger 不等于没有在途动作。
-# A corrupt database, a missing `results` table and a SQLITE_BUSY while the
-# Agent writes a row all produce zero rows, which would let a fail-closed gate
-# stop the Agent mid-operation. Both readers therefore keep their non-zero exit
-# status, and the caller treats "read failed" as "assume busy".
-in_progress_node_action_ids() {
-    [[ -f "${NODE_ACTION_DB}" ]] || return 0
-    if [[ -n "${SQLITE_COMMAND}" ]]; then
-        "${SQLITE_COMMAND}" -readonly -cmd '.timeout 5000' "${NODE_ACTION_DB}" \
-            "SELECT command_id FROM results WHERE state = 'IN_PROGRESS';"
-    else
-        "${PYTHON_COMMAND}" -c '
-import sqlite3
-import sys
-
-try:
-    connection = sqlite3.connect(
-        f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=5
-    )
-    rows = connection.execute(
-        "SELECT command_id FROM results WHERE state = ?", ("IN_PROGRESS",)
-    ).fetchall()
-except sqlite3.Error as error:
-    print(f"node action ledger read failed: {error}", file=sys.stderr)
-    raise SystemExit(1)
-for row in rows:
-    print(row[0])
-' "${NODE_ACTION_DB}"
-    fi
-}
-NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS="120"
-wait_for_node_action_ledger_idle() {
-    local deadline job_deadline pending unreadable
-    deadline=$(( $(date +%s) + NODE_AGENT_STOP_TIMEOUT_SECONDS ))
-    # The regional installer Job passes its budget in: a drain that outlives
-    # activeDeadlineSeconds is SIGKILLed with the cgroup and no EXIT trap runs.
-    if [[ "${INSTALLER_STARTED_EPOCH:-}" =~ ^[0-9]+$ &&
-        "${INSTALLER_ACTIVE_DEADLINE_SECONDS:-}" =~ ^[0-9]+$ ]]; then
-        job_deadline=$(( INSTALLER_STARTED_EPOCH + INSTALLER_ACTIVE_DEADLINE_SECONDS
-            - NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS ))
-        (( job_deadline >= deadline )) || deadline="${job_deadline}"
-    fi
-    while :; do
-        unreadable="false"
-        pending="$(in_progress_node_action_ids | tr '\n' ' ')" ||
-            unreadable="true"
-        pending="${pending% }"
-        if [[ "${unreadable}" == "true" ]]; then
-            printf 'WARN  node action ledger unreadable (%s)\n' \
-                "${NODE_ACTION_DB}"
-        elif [[ -z "${pending}" ]]; then
-            return 0
-        else
-            printf 'waiting for in-flight node actions: %s\n' "${pending}"
-        fi
-        if (( $(date +%s) >= deadline )); then
-            break
-        fi
-        sleep "${NODE_AGENT_LEDGER_POLL_SECONDS}"
-    done
-    if [[ "${unreadable}" == "true" ]]; then
-        die "node action ledger could not be read: ${NODE_ACTION_DB}"
-    fi
-    die "node agent still has an in-flight command; retry later: ${pending}"
-}
-drain_node_agent_before_restart() {
-    systemctl is-active --quiet gpu-fault-node-agent.service || return 0
-    wait_for_node_action_ledger_idle
-}
-# Before the first unit/env write (and again before the stop): nothing half-done.
-if [[ "${NO_START}" == "false" ]]; then
-    drain_node_agent_before_restart
-fi
 
 # 一块 GPU 掉线不能让整台机器装不上 Agent。
 # `nvidia-smi -L` exits non-zero as soon as one GPU is unreadable even though
@@ -1292,8 +1295,7 @@ print(component.get("wheel_sha256", manifest["wheel_sha256"]))' \
             sort -nr | head -n1 | cut -d' ' -f2-)"
     fi
 fi
-[[ -n "${WHEEL}" && -f "${WHEEL}" ]] ||
-    die "collector wheel not found; pass --wheel PATH"
+[[ -n "${WHEEL}" && -f "${WHEEL}" ]] || die "collector wheel not found; pass --wheel PATH"
 EXPECTED_WHEEL_SHA256="$(
     printf '%s' "${EXPECTED_WHEEL_SHA256}" | tr '[:upper:]' '[:lower:]'
 )"
@@ -1398,8 +1400,7 @@ prepare_runtime_slot() {
         --requirement "${DEPENDENCY_LOCK}"
     )
     if [[ -n "${WHEELHOUSE}" ]]; then
-        [[ -d "${WHEELHOUSE}" ]] ||
-            die "wheelhouse does not exist: ${WHEELHOUSE}"
+        [[ -d "${WHEELHOUSE}" ]] || die "wheelhouse does not exist: ${WHEELHOUSE}"
         PIP_ARGS+=(--no-index --find-links "${WHEELHOUSE}")
     fi
     "${release_dir}/venv/bin/python" -m pip "${PIP_ARGS[@]}"
@@ -1442,8 +1443,7 @@ prepare_py_spy() {
     observed_sha="$(sha256sum "${binary}" | cut -d' ' -f1)"
     [[ "${observed_sha}" == "${PY_SPY_BINARY_SHA256}" ]] ||
         die "py-spy binary SHA-256 mismatch"
-    "${binary}" --version >/dev/null ||
-        die "py-spy installation verification failed"
+    "${binary}" --version >/dev/null || die "py-spy installation verification failed"
     touch "${tool_dir}/.complete"
     chmod 0644 "${tool_dir}/.complete"
 }

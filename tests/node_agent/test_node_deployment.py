@@ -1333,20 +1333,20 @@ def test_installer_drains_the_ledger_before_it_touches_the_agent_unit() -> None:
     assert 'NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"' in installer, (
         "the installer must wait as long as the unit's TimeoutStopSec before dying"
     )
-    # First unit write: a drain killed after it left new units and the old wheel.
+    # The reserve-bounded drain runs before the quiesce restore (an IN_PROGRESS
+    # quiesce must not have its GPU services brought back) and the first write;
+    # the budget arithmetic itself lives in test_node_installer_drain_budget.py.
     first_write = installer.index("> /etc/systemd/system/gpu-fault-gpu-persistence")
+    quiesce_restore = installer.index("existing_quiesce_states=(")
     stop_loop = installer.index('if systemctl is-active --quiet "${runtime_unit}"')
     restart = installer.index("systemctl restart gpu-fault-node-agent.service")
-    calls = [
-        match.start()
-        for match in re.finditer(
-            r"^ +drain_node_agent_before_restart$", installer, re.MULTILINE
-        )
-    ]
-    assert len(calls) == 3, f"expected drains before write, stop and restart: {calls}"
-    assert calls[0] < first_write, "the first drain must precede the first unit write"
-    assert calls[1] < stop_loop, "stopping the unit interrupts the same operation"
-    assert calls[2] < restart, "the restart must not preempt an in-flight command"
+    install = installer.index("\n    drain_node_agent_before_install\n")
+    pattern = r"^ +drain_node_agent_before_restart$"
+    calls = [match.start() for match in re.finditer(pattern, installer, re.M)]
+    assert len(calls) == 2, f"expected drains before the stop and the restart: {calls}"
+    assert install < min(quiesce_restore, first_write), "the install drain came late"
+    assert calls[0] < stop_loop, "stopping the unit interrupts the same operation"
+    assert calls[1] < restart, "the restart must not preempt an in-flight command"
 
 
 def _drain(

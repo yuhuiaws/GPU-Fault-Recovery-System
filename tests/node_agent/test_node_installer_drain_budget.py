@@ -104,6 +104,160 @@ def test_a_job_with_budget_left_does_not_cut_the_drain_short(tmp_path: Path) -> 
     assert settled.returncode == 0, settled.stdout + settled.stderr
 
 
+RESERVE_PROBE_END = (
+    "drain_node_agent_before_install() {\n"
+    "    systemctl is-active --quiet gpu-fault-node-agent.service || return 0\n"
+    '    wait_for_node_action_ledger_idle "${INSTALL_RESERVE_SECONDS}"\n'
+    "}"
+)
+
+
+def _reserve_probe(target: Path) -> Path:
+    """The ledger drain as the pre-write call runs it: with the install reserve."""
+    installer = INSTALLER.read_text()
+    start = installer.index("in_progress_node_action_ids() {")
+    assert installer.count(RESERVE_PROBE_END) == 1, (
+        "the pre-write drain must pass the install reserve to the ledger wait"
+    )
+    end = installer.index(RESERVE_PROBE_END) + len(RESERVE_PROBE_END)
+    probe = target / "reserve-probe.sh"
+    probe.write_text(
+        "set -euo pipefail\n"
+        "PYTHON_COMMAND=python3\n"
+        'NODE_ACTION_DB="$1"\n'
+        'SQLITE_COMMAND="$2"\n'
+        'NODE_AGENT_STOP_TIMEOUT_SECONDS="1900"\n'
+        'NODE_AGENT_LEDGER_POLL_SECONDS="1"\n'
+        "die() { printf 'DIE: %s\\n' \"$*\"; exit 1; }\n"
+        f"{installer[start:end]}\n"
+        'wait_for_node_action_ledger_idle "${INSTALL_RESERVE_SECONDS}"\n'
+        "printf 'DRAINED\\n'\n",
+        encoding="utf-8",
+    )
+    return probe
+
+
+def _busy_then_idle_sqlite3(tmp_path: Path) -> Path:
+    """A ledger reader that reports one in-flight command on its first call only."""
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    _write_stub(
+        binaries,
+        "sqlite3",
+        f"marker={shlex.quote(str(tmp_path / 'polled'))}\n"
+        'if [[ -f "${marker}" ]]; then exit 0; fi\n'
+        'printf served > "${marker}"\n'
+        "printf 'cmd-slow\\n'\n",
+    )
+    return binaries / "sqlite3"
+
+
+def test_pre_write_drain_refuses_a_job_that_cannot_fit_the_install(
+    tmp_path: Path,
+) -> None:
+    """Draining is not enough: the install after it needs its own budget.
+
+    A command that ends at Job second 600-720 used to let the installer enter
+    the venv build, eight unit and three env writes, stop, slot switch,
+    daemon-reload, restart and verify with at most 120 s left -- and be
+    SIGKILLed without the EXIT trap, the very half-upgraded node the drain was
+    added to prevent. The pre-write drain is bounded by
+    ``remaining - margin - INSTALL_RESERVE_SECONDS`` and dies with the retry
+    status when that is already gone, even though the ledger would have gone
+    idle a second later.
+    """
+    probe = _reserve_probe(tmp_path)
+    database = tmp_path / "node-actions.db"
+    _ledger_with_state(database, IN_PROGRESS_STATE)
+    sqlite3 = _busy_then_idle_sqlite3(tmp_path)
+    started = time.monotonic()
+
+    # 240 s of an 840 s Job left: 240 - 120 - 420 < 0.
+    refused = _drain_with_budget(
+        probe,
+        database,
+        started_epoch=int(time.time()) - 600,
+        sqlite_command=str(sqlite3),
+    )
+
+    assert refused.returncode != 0, refused.stdout + refused.stderr
+    assert "DRAINED" not in refused.stdout, (
+        f"the install must not start with less than the reserve left: {refused.stdout}"
+    )
+    assert "node agent still has an in-flight command; retry later" in refused.stdout, (
+        refused.stdout
+    )
+    assert "cmd-slow" in refused.stdout, refused.stdout
+    assert time.monotonic() - started < 30, "the refusal must not wait out the drain"
+
+
+def test_an_idle_ledger_still_refuses_a_job_below_the_install_reserve(
+    tmp_path: Path,
+) -> None:
+    probe = _reserve_probe(tmp_path)
+    database = tmp_path / "node-actions.db"
+    _ledger_with_state(database, "COMPLETED")
+
+    # Nothing in flight, but only 300 s of the Job remain for a 420 s install.
+    refused = _drain_with_budget(probe, database, started_epoch=int(time.time()) - 540)
+
+    assert refused.returncode != 0, refused.stdout + refused.stderr
+    assert "DRAINED" not in refused.stdout, refused.stdout
+    assert "retry later" in refused.stdout and "install" in refused.stdout, (
+        f"the operator must learn the Job budget, not a phantom command: "
+        f"{refused.stdout}"
+    )
+
+    # A fresh Job (840 s left) proceeds, and the reserve can be lowered by env
+    # for a slower or faster site with the same integer validation as its siblings.
+    fresh = _drain_with_budget(probe, database, started_epoch=int(time.time()))
+    assert "DRAINED" in fresh.stdout, fresh.stdout + fresh.stderr
+    tuned = subprocess.run(
+        ["bash", str(probe), str(database), "", "1900", "1"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "INSTALLER_STARTED_EPOCH": str(int(time.time()) - 540),
+            "INSTALLER_ACTIVE_DEADLINE_SECONDS": "840",
+            "INSTALLER_INSTALL_RESERVE_SECONDS": "60",
+        },
+    )
+    assert "DRAINED" in tuned.stdout, tuned.stdout + tuned.stderr
+    invalid = subprocess.run(
+        ["bash", str(probe), str(database), "", "1900", "1"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "INSTALLER_INSTALL_RESERVE_SECONDS": "soon"},
+    )
+    assert invalid.returncode != 0, invalid.stdout
+    assert "INSTALLER_INSTALL_RESERVE_SECONDS" in invalid.stdout, invalid.stdout
+
+
+def test_install_reserve_is_declared_measured_and_only_bounds_the_pre_write_drain() -> (
+    None
+):
+    installer = INSTALLER.read_text()
+
+    assert 'INSTALL_RESERVE_SECONDS="${INSTALLER_INSTALL_RESERVE_SECONDS:-420}"' in (
+        installer
+    ), "the install reserve must default to the measured 420 s"
+    assert "- NODE_AGENT_DRAIN_JOB_MARGIN_SECONDS - reserve" in installer, (
+        "the pre-write bound is remaining - margin - reserve"
+    )
+    assert "job_deadline - $(date +%s) >= reserve" in installer, (
+        "a drain that ends with less than the reserve left must still die"
+    )
+    assert (
+        "drain_node_agent_before_restart() {\n"
+        "    systemctl is-active --quiet gpu-fault-node-agent.service || return 0\n"
+        "    wait_for_node_action_ledger_idle\n"
+        "}"
+    ) in installer, "the pre-stop and pre-restart drains keep the plain bound"
+
+
 def test_installer_job_passes_its_deadline_into_the_chroot() -> None:
     """The installer can only bound the drain by a budget it has been told."""
     job = INSTALLER_JOB.read_text()
