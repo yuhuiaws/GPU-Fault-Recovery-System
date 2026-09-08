@@ -775,6 +775,11 @@ class GpuServiceQuiesceManager:
                     container_restore_timeout_seconds=(
                         self.container_restore_timeout_seconds
                     ),
+                    # This boot recreated every container, so there is nothing
+                    # of ours left to come back: polling ``ctr`` here only
+                    # delayed the HTTP server and the heartbeat by up to
+                    # container_restore_timeout_seconds *per stale file*.
+                    wait_for_containers=False,
                 )
             except Exception as exc:  # noqa: BLE001 - one file must not stop the sweep
                 report["failed"].append(
@@ -802,6 +807,7 @@ class GpuServiceQuiesceManager:
         *,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         container_restore_timeout_seconds: int = 180,
+        wait_for_containers: bool = True,
     ) -> dict[str, Any]:
         manager = cls(
             state_dir=str(state_path.parent),
@@ -809,14 +815,27 @@ class GpuServiceQuiesceManager:
             container_restore_timeout_seconds=(container_restore_timeout_seconds),
         )
         with manager._locked(state_path):
-            return manager._restore_locked(state_path)
+            return manager._restore_locked(
+                state_path,
+                wait_for_containers=wait_for_containers,
+            )
 
-    def _restore_locked(self, state_path: Path) -> dict[str, Any]:
+    def _restore_locked(
+        self,
+        state_path: Path,
+        *,
+        wait_for_containers: bool = True,
+    ) -> dict[str, Any]:
         """Restore one state file with its per-incident flock already held.
 
         ``quiesce`` restores a failed window inline, and flock is owned by the
         open file description: re-entering :meth:`_locked` in the same process
         would deadlock against the lock this thread already holds.
+
+        ``wait_for_containers`` is False only for the boot reconcile: the
+        containers this file names died with the previous boot and kubelet
+        recreates them on its own schedule, so waiting for them buys nothing
+        and costs the whole restore timeout per stale file.
         """
 
         state = self._read_state(state_path)
@@ -880,7 +899,11 @@ class GpuServiceQuiesceManager:
             state["phase"] = "RESTORE_FAILED"
             self._write_state(state_path, state)
             raise
-        pending_containers = self._wait_containers_restored(container_targets)
+        pending_containers = (
+            self._wait_containers_restored(container_targets)
+            if wait_for_containers
+            else []
+        )
         self._run(
             ["systemctl", "stop", timer_unit + ".timer"],
             check=False,
@@ -896,6 +919,10 @@ class GpuServiceQuiesceManager:
             "timer_cancelled": timer_unit + ".timer",
             "state_path": str(state_path),
         }
+        if not wait_for_containers and container_targets:
+            result["container_restore_wait_skipped"] = sorted(
+                {str(target["selector"]) for target in container_targets}
+            )
         if pending_containers:
             result.update(
                 {

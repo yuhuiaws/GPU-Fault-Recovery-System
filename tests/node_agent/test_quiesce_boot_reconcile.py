@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 from ._support import (
+    CompletedProcess,
     GpuServiceQuiesceManager,
     ServiceRunner,
     WorkflowOperation,
@@ -192,3 +193,108 @@ def test_the_agent_reconciles_stale_quiesce_state_when_it_starts(
     quiesced = agent.execute(envelope(command(WorkflowOperation.QUIESCE_GPU_SERVICES)))
     assert quiesced.status.value == "SUCCEEDED", quiesced.error
     assert quiesced.details.get("already_quiesced") is not True
+
+
+CONTAINER_SELECTOR = "kube-system/nvidia-device-plugin-ctr"
+CONTAINER_ID = "a" * 64
+
+
+class ContainerRunner(ServiceRunner):
+    """A ``ServiceRunner`` that also answers the ``ctr`` calls quiesce makes.
+
+    The container is RUNNING until quiesce kills its task and never comes
+    back, which is what a restore that has to wait looks like.
+    """
+
+    killed = False
+
+    def __call__(self, value, *, check=False, **kwargs):
+        if value[:5] == ["ctr", "-n", "k8s.io", "containers", "list"]:
+            self.commands.append(value)
+            return CompletedProcess(value, 0, stdout=CONTAINER_ID + "\n", stderr="")
+        if value[:5] == ["ctr", "-n", "k8s.io", "tasks", "kill"]:
+            self.commands.append(value)
+            self.killed = True
+            return CompletedProcess(value, 0, stdout="", stderr="")
+        if value[:5] == ["ctr", "-n", "k8s.io", "tasks", "list"]:
+            self.commands.append(value)
+            state = "STOPPED" if self.killed else "RUNNING"
+            return CompletedProcess(
+                value,
+                0,
+                stdout=f"TASK PID STATUS\n{CONTAINER_ID} 4321 {state}\n",
+                stderr="",
+            )
+        return super().__call__(value, check=check, **kwargs)
+
+
+def _container_manager(tmp_path: Path, runner: ServiceRunner, boot_id: str):
+    return GpuServiceQuiesceManager(
+        state_dir=str(tmp_path / "quiesce"),
+        services=SERVICES,
+        processes=("nv-hostengine",),
+        containers=(CONTAINER_SELECTOR,),
+        failsafe_seconds=30,
+        retry_seconds=10,
+        settle_seconds=0,
+        restore_settle_seconds=0,
+        container_restore_timeout_seconds=30,
+        restore_command="/opt/gpu-fault/restore",
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        boot_id_reader=lambda: boot_id,
+    )
+
+
+def test_boot_reconcile_does_not_wait_for_containers(tmp_path: Path) -> None:
+    """A new boot recreated the containers, so waiting for them is dead time.
+
+    ``restore_state_file`` polls ``ctr`` every second for up to 180 s per
+    state file, and the boot reconcile runs before the HTTP server and the
+    heartbeat start. On the reboot DESTR-017 found, kubelet had only just
+    started, so the device-plugin container was not RUNNING yet: two stale
+    files meant six minutes of "agent down" after a reboot that had already
+    recreated every container.
+    """
+
+    runner = ContainerRunner(active=set(SERVICES))
+    _container_manager(tmp_path, runner, "boot-1").quiesce(
+        incident_id="incident-a", workflow_request_id="workflow-a"
+    )
+    runner.active = set(SERVICES)
+    runner.commands.clear()
+
+    report = _container_manager(tmp_path, runner, "boot-2").reconcile_after_boot()
+
+    assert [item["incident_id"] for item in report["restored"]] == ["incident-a"], (
+        report
+    )
+    assert _state_files(tmp_path) == [], "the stale state file must be removed"
+    assert [item for item in runner.commands if item[:1] == ["ctr"]] == [], (
+        f"the boot reconcile must not poll containerd: {runner.commands}"
+    )
+
+
+def test_a_restore_command_still_waits_for_the_containers_it_stopped(
+    tmp_path: Path,
+) -> None:
+    """Only the boot path skips the wait; an in-boot restore must still wait.
+
+    ``RESTORE_GPU_SERVICES`` and the fail-safe timer restore containers this
+    quiesce killed on *this* boot, and the step's report of pending selectors
+    is what tells the control plane the node is not workload-ready yet.
+    """
+
+    runner = ContainerRunner(active=set(SERVICES))
+    manager = _container_manager(tmp_path, runner, "boot-1")
+    manager.quiesce(incident_id="incident-a", workflow_request_id="workflow-a")
+    runner.commands.clear()
+
+    result = manager.restore(incident_id="incident-a")
+
+    assert _state_files(tmp_path) == [], result
+    assert result["container_restore_warning"] is True, result
+    assert result["pending_container_selectors"] == [CONTAINER_SELECTOR], result
+    assert [item for item in runner.commands if item[:1] == ["ctr"]] != [], (
+        "an in-boot restore must poll containerd"
+    )
