@@ -14,6 +14,7 @@ import pytest
 from scripts.e2e.regional import (
     audit_regional_command_protocol_live as live_protocol_audit,
 )
+from scripts.e2e.regional import seeded_command_fixture
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 from scripts.e2e.regional.audit_auth_boundary import validate_matrix
 from scripts.e2e.regional.audit_executor_readiness import validate_readiness_matrix
@@ -21,13 +22,12 @@ from scripts.e2e.regional.audit_regional_command_protocol_live import (
     AUDITED_CASE_IDS,
     LiveProtocolAudit,
 )
-from scripts.e2e.regional import seeded_command_fixture
 from scripts.e2e.regional.regional_case_contract import formal_predecessor
 from scripts.e2e.regional.run_boot019_admin_lifecycle import run_admin_lifecycle
 from scripts.e2e.regional.run_boot020_release_rolling import (
+    EXECUTOR_DEPLOYMENT,
     STAGES,
     LiveReleaseRollingBackend,
-    EXECUTOR_DEPLOYMENT,
     configure_gpu_kubeconfig,
     deployment_generations,
     resume_release_rolling,

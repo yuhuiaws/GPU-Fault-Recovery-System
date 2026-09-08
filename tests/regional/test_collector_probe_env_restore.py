@@ -9,8 +9,8 @@ ignores, so a reboot never re-armed the restore either.
 
 from __future__ import annotations
 
-from argparse import Namespace
 import json
+from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
