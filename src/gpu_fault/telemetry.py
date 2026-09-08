@@ -214,6 +214,19 @@ def warn_unusable_coverage_heartbeat(cluster_id: str, reason: str) -> None:
     )
 
 
+def note_usable_coverage_heartbeat(cluster_id: str) -> None:
+    """Arm the report again: this cluster's row could be read.
+
+    The suppression above is "once per cluster", not "once per process". A
+    watcher that writes an unusable row is a watcher whose whole cluster reads
+    UNKNOWN and every node-mutating plan on it is BLOCKED, so a second
+    occurrence -- the rolled-back watcher that comes back -- has to be visible
+    even when the first one happened days ago.
+    """
+
+    _UNUSABLE_COVERAGE_HEARTBEATS.discard(cluster_id)
+
+
 def coverage_heartbeat_supersedes(
     heartbeat: WorkloadCoverageHeartbeat,
     previous: WorkloadCoverageHeartbeat,
@@ -359,6 +372,9 @@ class WorkloadTopologyService:
                 "its observed_at carries no timezone",
             )
             return False
+        # The row read cleanly, so an unusable one that replaces it later is a
+        # new fact and gets reported again.
+        note_usable_coverage_heartbeat(cluster_id)
         return abs(age) <= self.coverage_freshness_seconds
 
     def resolve(

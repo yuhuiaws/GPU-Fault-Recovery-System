@@ -20,6 +20,12 @@ from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
 ACTIVE_PHASES = frozenset({WorkloadPhase.PENDING, WorkloadPhase.RUNNING})
+#: The only two Kubernetes Pod phases that mean "nothing of this Pod is
+#: running". Everything else -- ``Pending``, ``Running``, the ``Unknown`` of a
+#: kubelet that stopped answering, a status the API server has not written yet,
+#: a phase a future release adds -- may still hold a GPU, so
+#: :func:`active_pass_counts` counts it as running rather than guessing.
+FINISHED_POD_PHASES = frozenset({"SUCCEEDED", "FAILED"})
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,13 @@ def active_pass_counts(controller: Any, pods: list[dict[str, Any]]) -> tuple[int
     process has never seen, or one inside its missing-attempt grace, is exactly
     the state where the control plane has no fresh observation and IDLE would be
     the fail-open answer.
+
+    Which is also why the Pod count is "not finished" rather than "Pending or
+    Running": the Pod this count exists for is the managed one that could not be
+    grouped at all -- no attempt-id label, so it produces no observation -- and
+    a Pod in phase ``Unknown`` (the kubelet stopped answering, which is what a
+    GPU fault does) or with no status written yet may still be training. Only
+    ``Succeeded`` and ``Failed`` are safe to skip.
     """
 
     active_pods = sum(
@@ -171,7 +184,7 @@ def active_pass_counts(controller: Any, pods: list[dict[str, Any]]) -> tuple[int
         if (
             (controller.serializer(item).get("status") or {}).get("phase") or ""
         ).upper()
-        in {"PENDING", "RUNNING"}
+        not in FINISHED_POD_PHASES
     )
     active_attempts = sum(
         1

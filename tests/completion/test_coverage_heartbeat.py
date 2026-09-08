@@ -149,6 +149,43 @@ def test_a_pass_that_watched_a_running_pod_claims_no_coverage() -> None:
     assert subject.coverage_heartbeats_total == 0, subject.coverage_heartbeats_total
 
 
+@pytest.mark.parametrize(
+    "phase",
+    ["Unknown", "Terminating", None],
+    ids=["kubelet-lost", "a-phase-this-release-does-not-know", "no-status-at-all"],
+)
+def test_a_managed_pod_that_has_not_finished_blocks_the_claim(phase) -> None:
+    """Only Succeeded and Failed mean "not running".
+
+    ``watched_pods`` exists for the managed Pod that could not be grouped -- no
+    attempt-id label, the warn-and-skip case -- because such a Pod produces no
+    observation at all, so the resolver has nothing else to read. Phase
+    ``Unknown`` is the kubelet losing contact, which correlates with the GPU
+    faults this system reacts to, and its containers may well still be running;
+    a Pod whose status has not been written yet is the same unknown. Treating
+    either as finished would let the heartbeat vouch for a cluster that is
+    training.
+    """
+
+    ungrouped = copy.deepcopy(pod(0))
+    ungrouped["metadata"]["labels"].pop("gpu-fault.io/attempt-id")
+    if phase is None:
+        ungrouped.pop("status")
+    else:
+        ungrouped["status"]["phase"] = phase
+    sink = FakeSink()
+    subject = _controller(FakeCoreApi([ungrouped]), sink)
+
+    subject.run_once()
+
+    assert _heartbeats(sink) == [], (
+        "a managed Pod that has not reached Succeeded or Failed is running "
+        "work nobody can attribute, which is precisely what the coverage "
+        f"claim must not paper over: {sink.posts}"
+    )
+    assert subject.coverage_heartbeats_total == 0, subject.coverage_heartbeats_total
+
+
 def test_an_attempt_with_no_listed_pods_still_blocks_the_claim() -> None:
     """Restored state: this process believes an attempt runs, sees no Pod."""
 

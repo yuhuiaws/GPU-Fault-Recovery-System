@@ -45,6 +45,7 @@ from gpu_fault.telemetry import (
     CollectorMetricsSnapshotRecord,
     WorkloadCoverageHeartbeat,
     coverage_heartbeat_supersedes,
+    note_usable_coverage_heartbeat,
     warn_unusable_coverage_heartbeat,
 )
 from gpu_fault.telemetry_models import WorkloadObservationState
@@ -254,6 +255,8 @@ class SharedTelemetryRecordMixin:
             ):
                 return False
             self._put("workload_coverage_heartbeat", storage_key, heartbeat)
+            # The row is readable again, so the next unusable one is news.
+            note_usable_coverage_heartbeat(heartbeat.cluster_id)
             return True
 
     def get_workload_coverage_heartbeat(
@@ -272,18 +275,30 @@ class SharedTelemetryRecordMixin:
         fault on the cluster, and it is read again by the writer, where
         answering ``None`` is what lets the next heartbeat replace the row
         instead of leaving it poisoned for ever.
+
+        Decoding fails in more ways than validation: ``_get`` ends in
+        ``self._models[kind].model_validate_json(payload)``, so a build whose
+        ``record_models()`` does not carry this kind raises ``KeyError`` and a
+        payload that is not a JSON object can raise before pydantic wraps it.
+        Every one of those is the same fact -- there is no readable coverage --
+        and answering it is what keeps this row out of the ingest path's
+        failure modes. A store or connection error is *not* caught: that is a
+        broken store, not a broken row, and the caller must see it.
         """
 
         try:
-            return cast(
+            heartbeat = cast(
                 "WorkloadCoverageHeartbeat | None",
                 self._get_optional("workload_coverage_heartbeat", storage_key),
             )
-        except ValidationError:
+        except (ValidationError, TypeError, ValueError, KeyError):
             warn_unusable_coverage_heartbeat(
-                cluster_id, "the stored payload is not a coverage heartbeat"
+                cluster_id, "the stored payload cannot be read as a coverage heartbeat"
             )
             return None
+        if heartbeat is not None:
+            note_usable_coverage_heartbeat(cluster_id)
+        return heartbeat
 
     def observe_training_progress(
         self, progress: TrainingProgressHeartbeat

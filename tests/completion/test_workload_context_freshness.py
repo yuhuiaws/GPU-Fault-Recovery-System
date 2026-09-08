@@ -337,6 +337,65 @@ def test_a_stored_heartbeat_with_a_naive_stamp_reads_as_no_coverage(caplog) -> N
     assert "ignoring the stored coverage heartbeat" in caplog.text, caplog.text
 
 
+def test_a_row_that_goes_bad_again_is_reported_again(caplog) -> None:
+    """The report is once per cluster, not once per process lifetime.
+
+    The unusable row is a real operator signal: a watcher writing a stamp
+    nothing can compare against is a watcher whose cluster reads UNKNOWN, and
+    every node-mutating plan on it is BLOCKED. Suppressing the report for ever
+    after the first one would hide the second occurrence -- a rolled-back
+    watcher writing naive stamps again -- for as long as the control plane runs.
+    """
+
+    naive_cluster = "cluster-that-goes-bad-twice"
+    good = _heartbeat(cluster_id=naive_cluster, observed_at=NOW - timedelta(seconds=5))
+    bad = WorkloadCoverageHeartbeat.model_construct(
+        cluster_id=naive_cluster,
+        observed_at=NOW.replace(tzinfo=None),
+        watched_pods=0,
+        watched_attempts=0,
+        resource_version=None,
+        watcher_instance="completion-watcher-0",
+    )
+
+    class RollingBackStore:
+        def __init__(self) -> None:
+            self.heartbeat = bad
+
+        def list_attempt_observations(self, _cluster_id: str) -> list:
+            return []
+
+        def get_workload_coverage_heartbeat(self, _cluster_id: str):
+            return self.heartbeat
+
+    store = RollingBackStore()
+    topology = _topology(store)
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.telemetry"):
+        first = topology.resolve(naive_cluster, "node-1", NOW)
+        repeat = topology.resolve(naive_cluster, "node-1", NOW)
+        reports_while_bad = caplog.text.count("ignoring the stored coverage heartbeat")
+        store.heartbeat = good
+        recovered = topology.resolve(naive_cluster, "node-1", NOW)
+        store.heartbeat = bad
+        again = topology.resolve(naive_cluster, "node-1", NOW)
+
+    assert (first.workload_state, repeat.workload_state) == ("UNKNOWN", "UNKNOWN"), (
+        f"an unusable row is absent coverage: {first} {repeat}"
+    )
+    assert reports_while_bad == 1, (
+        "coverage is read once per fault, so one bad row must not log once per "
+        f"fault: {caplog.text}"
+    )
+    assert recovered.workload_state == "IDLE", (
+        f"a readable heartbeat that saw nothing running is coverage: {recovered}"
+    )
+    assert again.workload_state == "UNKNOWN", again
+    assert caplog.text.count("ignoring the stored coverage heartbeat") == 2, (
+        f"a row that was fixed and went bad again must be reported again: {caplog.text}"
+    )
+
+
 def test_a_heartbeat_behind_the_stored_row_is_counted_and_reported(caplog) -> None:
     store = build_store()
     topology = _topology(store)

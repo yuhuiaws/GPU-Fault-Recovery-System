@@ -31,6 +31,7 @@ from gpu_fault.telemetry import (
     CollectorStatus,
     WorkloadCoverageHeartbeat,
     coverage_heartbeat_supersedes,
+    note_usable_coverage_heartbeat,
 )
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest,
@@ -405,6 +406,9 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
             ):
                 return False
             self._workload_coverage_heartbeats[heartbeat.cluster_id] = heartbeat
+            # A row that could not be compared was reported once; the
+            # replacement re-arms that report for the next bad one.
+            note_usable_coverage_heartbeat(heartbeat.cluster_id)
             return True
 
     def get_workload_coverage_heartbeat(
