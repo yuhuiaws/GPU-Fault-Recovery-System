@@ -4,6 +4,7 @@ from ._support import (
     NOW,
     NVIDIA_SMI_CORE_FIELDS,
     NVIDIA_SMI_REMAP_FIELDS,
+    BufferingSink,
     CollectorError,
     DcgmMetricsCollector,
     GpuMetricSample,
@@ -827,3 +828,117 @@ def test_nvidia_smi_csv_parses_row_remap_booleans() -> None:
     by_name = {item.canonical_name: item.value for item in samples}
     assert by_name["row_remap_pending"] == 1
     assert by_name["row_remap_failure"] == 0
+
+
+GPU_INVENTORY_CHANNEL = "/v1/collector-events/gpu-inventory"
+GPU_METRICS_CHANNEL = "/v1/collector-events/gpu-metrics"
+
+
+def _nvidia_smi_runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
+    """Answer the inventory and core-metric queries; refuse everything else.
+
+    The optional ECC/retired/remap queries and the XML temperature-limit query
+    are allowed to fail: the collector treats them as best effort.
+    """
+
+    joined = " ".join(str(item) for item in command)
+    if "--query-gpu=index,uuid,pci.bus_id,name" in joined:
+        return completed_nvidia_smi("0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n")
+    if "temperature.gpu" in joined:
+        return completed_nvidia_smi(
+            "0, GPU-a, NVIDIA H100, 00000000:B9:00.0, 75, 350.5, 98, 72, 40000, 41000\n"
+        )
+    return completed_nvidia_smi("", returncode=1, stderr="unsupported query")
+
+
+def test_nvidia_smi_inventory_the_outbox_took_is_not_re_sent_every_round(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A buffered inventory snapshot must advance the inventory schedule.
+
+    ``deliver_gpu_inventory`` raised the sink's buffered ``CollectorError``
+    straight out of ``collect_once``, so the inventory schedule never moved and
+    the run loop reported the round as a collection failure -- posting a second,
+    sample-less error batch for a round whose records were all safely buffered.
+    """
+
+    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("boot-a\n", encoding="ascii")
+    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+    sink = BufferingSink()
+    times = iter([NOW, NOW + timedelta(seconds=30)])
+    collector = NvidiaSmiMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=_nvidia_smi_runner,
+        inventory_interval_seconds=3600,
+    )
+
+    collector.collect_once()
+    collector.collect_once()
+
+    assert [path for path, _payload in sink.requests] == [
+        GPU_INVENTORY_CHANNEL,
+        GPU_METRICS_CHANNEL,
+        GPU_METRICS_CHANNEL,
+    ], "a buffered inventory snapshot was re-sent on the next round"
+
+
+def test_dcgm_batches_the_outbox_took_advance_both_schedules(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Buffered DCGM inventory and metrics both count as delivered (ARCH-G3).
+
+    With the live path down, the inventory was re-posted every round and the
+    metrics batch re-buffered with a fresh ``batch_id`` every round, because
+    both bookkeeping updates sat after a ``post`` that raises once the outbox
+    has taken the record.
+    """
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return (
+                b'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a",'
+                b'pci_bus_id="00000000:B9:00.0"} 70\n'
+            )
+
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.urlopen", lambda *_args, **_kwargs: Response()
+    )
+    monkeypatch.delenv("GPU_FAULT_EXPECTED_GPU_COUNT", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_INSTANCE_TYPE", raising=False)
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("boot-a\n", encoding="ascii")
+    monkeypatch.setenv("GPU_FAULT_BOOT_ID_PATH", str(boot_id))
+    times = iter([NOW, NOW + timedelta(seconds=15), NOW + timedelta(seconds=60)])
+    sink = BufferingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        runner=_nvidia_smi_runner,
+        health_summary_seconds=300,
+        inventory_interval_seconds=60,
+    )
+
+    for _ in range(3):
+        collector.collect_once()
+
+    paths = [path for path, _payload in sink.requests]
+    assert paths.count(GPU_INVENTORY_CHANNEL) == 2, (
+        "a buffered inventory snapshot was re-sent every round"
+    )
+    assert paths.count(GPU_METRICS_CHANNEL) == 1, (
+        "an unchanged healthy batch was re-buffered after the outbox took it"
+    )

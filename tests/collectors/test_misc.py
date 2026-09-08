@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._support import (
     NOW,
+    BufferingSink,
     CollectorError,
     HostTelemetryCollector,
     HttpEventSink,
@@ -241,3 +242,32 @@ def test_collector_cli_logging_respects_existing_handlers(monkeypatch) -> None:
     finally:
         root.handlers = saved_handlers
         root.setLevel(saved_level)
+
+
+def test_training_progress_heartbeat_the_outbox_took_is_not_a_failure(tmp_path) -> None:
+    """A buffered heartbeat is durable, so the round is not a failure (ARCH-G3).
+
+    ``post`` raises once the outbox has taken the record, so every tick of a
+    control-plane outage logged a traceback for a heartbeat that was safely
+    persisted and would be replayed.
+    """
+
+    progress = tmp_path / "progress.json"
+    progress.write_text(json.dumps({"step": 42}), encoding="utf-8")
+    sink = BufferingSink()
+    collector = TrainingProgressCollector(
+        sink,
+        cluster_id="cluster-a",
+        attempt_id="attempt-a",
+        rank=3,
+        progress_path=str(progress),
+        node_id="node-a",
+        now=lambda: NOW,
+    )
+
+    heartbeat = collector.collect_once()
+
+    assert heartbeat.step == 42, "the heartbeat was not built from the progress file"
+    assert [path for path, _payload in sink.requests] == ["/v1/training-progress"], (
+        "the heartbeat was not handed to the sink"
+    )

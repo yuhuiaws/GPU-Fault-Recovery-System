@@ -13,7 +13,11 @@ from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
 from gpu_fault.training_health import TrainingProgressHeartbeat
 
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    EventSink,
+    deliver_event,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,10 +79,21 @@ class TrainingProgressCollector:
                 str(key): str(item) for key, item in (value.get("labels") or {}).items()
             },
         )
-        self.sink.post(
+        result = deliver_event(
+            self.sink,
             TRAINING_PROGRESS_PATH,
             heartbeat.model_dump(mode="json"),
         )
+        # A heartbeat the outbox took is durable and will be replayed, so the
+        # round succeeded; only one that went nowhere is an error (ARCH-G3).
+        result.raise_for_failure()
+        if result.buffered:
+            LOGGER.warning(
+                "training progress heartbeat for rank %s persisted to the "
+                "collector outbox: %s",
+                self.rank,
+                result.error,
+            )
         return heartbeat
 
     def run(self) -> None:

@@ -29,7 +29,11 @@ from gpu_fault.collectors.gpu.discovery import (
 from gpu_fault.transport.http_client import urlopen
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    EventSink,
+    deliver_event,
+)
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
 
 LOGGER = logging.getLogger(__name__)
@@ -369,10 +373,22 @@ class DcgmMetricsCollector:
                     "edge_filter_reasons": reasons,
                 }
             )
-            self.sink.post(
+            result = deliver_event(
+                self.sink,
                 GPU_METRICS_PATH,
                 batch.model_dump(mode="json"),
             )
+            # The outbox replays what it took, so the edge filter advances for
+            # BUFFERED exactly as for DELIVERED; only a batch that went nowhere
+            # keeps the edge open (ARCH-G3).
+            result.raise_for_failure()
+            if result.buffered:
+                LOGGER.warning(
+                    "DCGM batch %s persisted to the collector outbox; "
+                    "advancing the edge filter: %s",
+                    batch.batch_id,
+                    result.error,
+                )
             self._last_delivered_at = timestamp
             if (
                 self._next_health_summary_at is None

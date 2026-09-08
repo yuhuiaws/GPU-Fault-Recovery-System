@@ -121,6 +121,44 @@ class RecordingSink:
         return {"accepted": True}
 
 
+class BufferingSink:
+    """A sink whose durable outbox took every record: nothing went live.
+
+    ``HttpEventSink.post`` raises after the outbox accepted the record, so a
+    collector that reads the exception as "the event is lost" re-reads its
+    source and re-posts the same payload every tick (ARCH-G3).
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((path, payload))
+        raise CollectorError("network unavailable", buffered=True, replayable=True)
+
+
+class RejectingSink:
+    """A sink whose control plane rejected the record: it went nowhere."""
+
+    def __init__(self, *, status_code: int = 422) -> None:
+        self.status_code = status_code
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((path, payload))
+        raise CollectorError(
+            f"rejected ({self.status_code})", status_code=self.status_code
+        )
+
+
+class StopTheLoop(BaseException):
+    """Breaks a collector's ``while True`` without being caught by it.
+
+    Every collector run loop catches ``Exception`` on purpose, so a test that
+    drives ``run()`` needs a non-``Exception`` signal to stop it.
+    """
+
+
 def context() -> CollectorContext:
     return CollectorContext(
         cluster_id="hp-cluster",

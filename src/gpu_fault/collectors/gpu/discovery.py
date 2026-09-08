@@ -22,7 +22,11 @@ from gpu_fault.gpu_metrics import (
 
 
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    EventSink,
+    deliver_event,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -380,10 +384,22 @@ def deliver_gpu_inventory(
         runtime_profile_version=context.runtime_profile_version,
         evidence_ref=f"nvidia-smi://{node_id}/inventory",
     )
-    sink.post(
+    result = deliver_event(
+        sink,
         GPU_INVENTORY_PATH,
         snapshot.model_dump(mode="json"),
     )
+    # A snapshot the outbox took is replayed from there, so the caller may
+    # advance its inventory schedule; only a snapshot that went nowhere raises
+    # (ARCH-G3).
+    result.raise_for_failure()
+    if result.buffered:
+        LOGGER.warning(
+            "GPU inventory %s persisted to the collector outbox; "
+            "advancing the inventory schedule: %s",
+            snapshot.snapshot_id,
+            result.error,
+        )
     return snapshot
 
 

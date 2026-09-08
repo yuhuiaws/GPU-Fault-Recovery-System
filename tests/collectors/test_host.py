@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from ._support import (
     NOW,
+    BufferingSink,
+    CollectorError,
     HostTelemetryCollector,
     RecordingSink,
+    RejectingSink,
     context,
     json,
     pytest,
@@ -570,3 +573,60 @@ def test_host_collector_queries_normalized_nvswitch_topology() -> None:
         "gpu_uuid": "GPU-a",
         "fabric_partition": "fabric-a",
     }
+
+
+def test_host_batch_the_outbox_took_advances_the_edge_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A buffered batch is delivered as far as the edge filter is concerned.
+
+    ``HttpEventSink.post`` writes the record to the durable outbox and *then*
+    raises, so the bookkeeping after the post was skipped: the batch stayed at
+    "never delivered", every following tick re-satisfied the summary/baseline
+    condition, blocked ~47 s in the retry ladder and buffered another 100-200 KB
+    batch with a fresh ``batch_id`` until the outbox evicted (ARCH-G3).
+    """
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ())
+    sink = BufferingSink()
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = HostTelemetryCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        health_summary_seconds=300,
+    )
+
+    collector.collect_once()
+    collector.collect_once()
+
+    assert [payload["edge_filter_reasons"] for _, payload in sink.requests] == [
+        ["baseline"]
+    ], "an unchanged tick re-buffered a batch the outbox had already taken"
+
+
+def test_host_batch_the_control_plane_rejected_is_redelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected batch went nowhere, so the next tick must try again."""
+
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ())
+    sink = RejectingSink()
+    times = iter([NOW, NOW + timedelta(seconds=15)])
+    collector = HostTelemetryCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(times),
+        health_summary_seconds=300,
+    )
+
+    for _ in range(2):
+        with pytest.raises(CollectorError, match="rejected"):
+            collector.collect_once()
+
+    assert [payload["edge_filter_reasons"] for _, payload in sink.requests] == [
+        ["baseline"],
+        ["baseline"],
+    ], "a rejected batch must not be treated as delivered"

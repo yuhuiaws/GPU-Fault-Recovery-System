@@ -13,35 +13,21 @@ from gpu_fault.collectors.sinks import DeliveryStatus, HttpEventSink, deliver_ev
 
 from ._support import (
     NOW,
+    BufferingSink,
     CollectorError,
     FabricManagerLogCollector,
     KernelLogCollector,
     NodeLogCollector,
     RecordingSink,
+    RejectingSink,
     context,
     json,
     subprocess,
 )
 
 
-class _BufferingSink:
-    """A sink whose outbox took every record: nothing is delivered live."""
-
-    def __init__(self) -> None:
-        self.requests: list[tuple[str, dict]] = []
-
-    def post(self, path, payload):
-        self.requests.append((path, payload))
-        raise CollectorError("network unavailable", buffered=True, replayable=True)
-
-
-class _RejectingSink:
-    def post(self, *_args, **_kwargs):
-        raise CollectorError("rejected (422)", status_code=422)
-
-
 def test_deliver_event_maps_a_buffered_replayable_failure_to_buffered() -> None:
-    result = deliver_event(_BufferingSink(), "/events", {"event_id": "e-1"})
+    result = deliver_event(BufferingSink(), "/events", {"event_id": "e-1"})
 
     assert result.status is DeliveryStatus.BUFFERED, result
     assert result.buffered is True, "buffered flag does not follow the status"
@@ -50,7 +36,7 @@ def test_deliver_event_maps_a_buffered_replayable_failure_to_buffered() -> None:
 
 
 def test_deliver_event_maps_a_rejection_to_failed_without_raising() -> None:
-    result = deliver_event(_RejectingSink(), "/events", {"event_id": "e-1"})
+    result = deliver_event(RejectingSink(), "/events", {"event_id": "e-1"})
 
     assert result.status is DeliveryStatus.FAILED, result
     assert result.failed is True, "failed flag does not follow the status"
@@ -105,7 +91,7 @@ def test_node_log_collector_advances_the_cursor_when_the_batch_is_buffered(
         return subprocess.CompletedProcess(list(command), 0, stdout=line, stderr="")
 
     state = tmp_path / "state.json"
-    sink = _BufferingSink()
+    sink = BufferingSink()
     collector = NodeLogCollector(
         sink,
         context(),
@@ -153,7 +139,7 @@ def test_fabric_manager_commits_the_checkpoint_when_the_record_is_buffered(
             }
         )
     )
-    sink = _BufferingSink()
+    sink = BufferingSink()
     collector = FabricManagerLogCollector(
         sink,
         context(),
@@ -194,7 +180,7 @@ def test_fabric_manager_still_pins_the_checkpoint_on_a_failed_delivery(
         )
     )
     collector = FabricManagerLogCollector(
-        _RejectingSink(),
+        RejectingSink(),
         context(),
         node_id="worker-1",
         journal_enabled=False,
@@ -216,7 +202,7 @@ def test_fabric_manager_still_pins_the_checkpoint_on_a_failed_delivery(
 
 
 def test_kernel_collector_buffered_behaviour_is_unchanged() -> None:
-    sink = _BufferingSink()
+    sink = BufferingSink()
     collector = KernelLogCollector(
         sink, context(), node_id="worker-1", boot_id="test-boot", now=lambda: NOW
     )
