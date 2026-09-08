@@ -5,12 +5,16 @@ from ._support import (
     HMA_FAULT_REASONS,
     HMA_HEALTH_STATUS,
     NOW,
+    Any,
+    BufferingSink,
     CloudWatchHmaCollector,
     CollectorError,
     KubernetesHmaNodeCollector,
     KubernetesNodeResourceCollector,
     RecordingSink,
     SimpleNamespace,
+    SqsHmaConsumer,
+    StopTheLoop,
     cloudwatch_envelope,
     context,
     json,
@@ -354,3 +358,270 @@ def test_cloudwatch_collector_rejects_unmapped_node() -> None:
         collector.collect_subscription(
             cloudwatch_envelope([], stream="stream-without-node-contract")
         )
+
+
+class _NodeRejectingSink:
+    """The control plane rejects one node's batch and accepts every other."""
+
+    def __init__(self, node_id: str) -> None:
+        self.node_id = node_id
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((path, payload))
+        if payload.get("node_id") == self.node_id:
+            raise CollectorError("rejected (422)", status_code=422)
+        return {"accepted": True}
+
+
+def _two_node_core() -> Any:
+    class Core:
+        def list_node(self, **_kwargs):
+            return SimpleNamespace(
+                metadata=SimpleNamespace(_continue=None),
+                items=[_paged_node("gpu-worker-a"), _paged_node("gpu-worker-b")],
+            )
+
+        def list_pod_for_all_namespaces(self, **_kwargs):
+            return SimpleNamespace(items=[])
+
+    return Core()
+
+
+def test_kubernetes_node_resources_buffered_batches_cover_every_node() -> None:
+    """One buffered post used to abort the whole sample (ARCH-G3).
+
+    ``HttpEventSink.post`` raises after the outbox took the record, and
+    ``collect_once`` had no per-node guard, so the first node whose batch was
+    buffered ended the cycle: every node after it in list order was never
+    sampled, and the aborted node was still "due" next cycle, so it re-buffered
+    a near-identical batch with a fresh ``batch_id`` every 15 s.
+    """
+
+    sink = BufferingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=_two_node_core(), now=lambda: NOW
+    )
+
+    collector.collect_once()
+
+    assert [payload["node_id"] for _, payload in sink.requests] == [
+        "gpu-worker-a",
+        "gpu-worker-b",
+    ], "a buffered batch for the first node stopped the whole cycle"
+
+    collector.now = lambda: NOW + timedelta(seconds=15)
+    collector.collect_once()
+
+    assert len(sink.requests) == 2, (
+        "an unchanged node re-buffered a batch the outbox had already taken"
+    )
+
+
+def test_kubernetes_node_resources_rejected_node_does_not_stop_the_cycle() -> None:
+    """A rejected node keeps its edge: the rest of the fleet is still sampled."""
+
+    sink = _NodeRejectingSink("gpu-worker-a")
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=_two_node_core(), now=lambda: NOW
+    )
+
+    stats = collector.collect_once()
+
+    assert [payload["node_id"] for _, payload in sink.requests] == [
+        "gpu-worker-a",
+        "gpu-worker-b",
+    ], "the rejected node's batch stopped the cycle before the next node"
+    assert stats.delivered == 1, "only the accepted node counts as delivered"
+
+    collector.now = lambda: NOW + timedelta(seconds=15)
+    collector.collect_once()
+
+    assert sink.requests[-1][1]["node_id"] == "gpu-worker-a", (
+        "the rejected node's edge was consumed although nothing was delivered"
+    )
+    assert sink.requests[-1][1]["edge_filter_reasons"] == [
+        "baseline:efa",
+        "baseline:gpu",
+    ], "the rejected node's baseline edge was not re-reported"
+
+
+class _FakeNodeWatch:
+    """One ``watch.Watch()`` replaying a scripted event list, then ending."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = list(events)
+        self.stop_calls = 0
+
+    def stream(self, *_args, **_kwargs):
+        yield from self.events
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class _FakeNodeApi:
+    """A ``CoreV1Api`` whose LIST is scripted round by round."""
+
+    def __init__(self, rounds: list[Any]) -> None:
+        self.rounds = list(rounds)
+        self.calls = 0
+
+    def list_node(self, **_kwargs):
+        self.calls += 1
+        if not self.rounds:
+            raise StopTheLoop
+        outcome = self.rounds.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(
+            items=list(outcome), metadata=SimpleNamespace(resource_version="7")
+        )
+
+
+def _hma_node(resource_version: str) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "name": "gpu-worker",
+            "resourceVersion": resource_version,
+            "labels": {HMA_HEALTH_STATUS: "Unschedulable"},
+        }
+    }
+
+
+def _patch_kubernetes(
+    monkeypatch: pytest.MonkeyPatch, api: Any, watches: list[_FakeNodeWatch]
+) -> None:
+    from gpu_fault.collectors.cloud import kubernetes as module
+
+    monkeypatch.setattr("kubernetes.config.load_incluster_config", lambda: None)
+    monkeypatch.setattr("kubernetes.client.CoreV1Api", lambda: api)
+    monkeypatch.setattr(
+        "kubernetes.client.ApiClient",
+        lambda: SimpleNamespace(sanitize_for_serialization=lambda value: value),
+    )
+    queue = list(watches)
+    monkeypatch.setattr(
+        "kubernetes.watch.Watch", lambda: queue.pop(0) if queue else _FakeNodeWatch([])
+    )
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+
+def test_kubernetes_hma_run_survives_sink_failure_during_relist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watcher must not exit the process on a LIST or post failure.
+
+    The initial LIST and its posts sat outside the ``try`` that guards the
+    watch, and ``post`` raises even once the outbox has taken the record, so the
+    first unreachable control plane exited ``run()``: Kubernetes restarted the
+    Pod into CrashLoopBackOff for the whole outage, and each restart re-listed
+    and re-posted every HMA-labelled node with an empty dedup table.
+    """
+
+    sink = BufferingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    api = _FakeNodeApi(
+        [OSError("apiserver unreachable"), [_hma_node("42")], [_hma_node("42")]]
+    )
+    _patch_kubernetes(monkeypatch, api, [])
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert api.calls == 4, "the run loop exited instead of relisting after a failure"
+    assert len(sink.requests) == 1, (
+        "the node the outbox already took was posted again on the next relist"
+    )
+
+
+def test_kubernetes_collector_ignores_deleted_node_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DELETED watch event is not a node record, and it clears the dedup entry.
+
+    Every watch event was forwarded, so deleting a node published a provider
+    event for a node that no longer exists (its deletion bumps the
+    ``resourceVersion``, so the dedup check did not stop it) and left the node's
+    entry in the resource-version table forever.
+    """
+
+    sink = RecordingSink()
+    collector = KubernetesHmaNodeCollector(sink, context(), now=lambda: NOW)
+    api = _FakeNodeApi([[_hma_node("42")], [_hma_node("42")]])
+    watch = _FakeNodeWatch([{"type": "DELETED", "object": _hma_node("43")}])
+    _patch_kubernetes(monkeypatch, api, [watch])
+
+    with pytest.raises(StopTheLoop):
+        collector.run()
+
+    assert [
+        payload["node"]["metadata"]["resourceVersion"]
+        for _path, payload in sink.requests
+    ] == ["42", "42"], "a DELETED node event was published as a live node record"
+    assert watch.stop_calls == 1, "the watch was not stopped before relisting"
+
+
+def test_cloudwatch_subscription_continues_after_a_buffered_event() -> None:
+    """A buffered HMA event must not abort the rest of the subscription batch."""
+
+    sink = BufferingSink()
+    collector = CloudWatchHmaCollector(sink, context(), now=lambda: NOW)
+    message = json.dumps({"HealthMonitoringAgentDetectionEvent": "HealthEvent"})
+
+    stats = collector.collect_subscription(
+        cloudwatch_envelope(
+            [
+                {"id": "event-1", "timestamp": 1784548800000, "message": message},
+                {"id": "event-2", "timestamp": 1784548801000, "message": message},
+            ]
+        )
+    )
+
+    assert [payload["log_event_id"] for _, payload in sink.requests] == [
+        "event-1",
+        "event-2",
+    ], "the first buffered event stopped the subscription batch"
+    assert stats.observed == 2, "both log events must be observed"
+
+
+def test_sqs_consumer_deletes_a_message_the_outbox_took() -> None:
+    """A buffered forward is durable, so the SQS message must be deleted.
+
+    Keeping it made the queue redeliver the same HMA event every visibility
+    timeout for the whole outage, and the outbox replayed it as well.
+    """
+
+    class Client:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def receive_message(self, **_kwargs):
+            if self.deleted:
+                return {}
+            return {
+                "Messages": [
+                    {
+                        "Body": json.dumps(
+                            {
+                                "path": ("/v1/provider-events/hyperpod-hma/cloudwatch"),
+                                "payload": {"node_id": "worker-1"},
+                            }
+                        ),
+                        "ReceiptHandle": "receipt-1",
+                    }
+                ]
+            }
+
+        def delete_message(self, **kwargs):
+            self.deleted.append(kwargs["ReceiptHandle"])
+
+    client = Client()
+    consumer = SqsHmaConsumer(BufferingSink(), "https://sqs/queue", client=client)
+
+    delivered = consumer.run_once(wait_time_seconds=0)
+
+    assert client.deleted == ["receipt-1"], (
+        "a buffered forward left the message on the queue to be redelivered"
+    )
+    assert delivered == 1, "the buffered forward was not counted as handled"

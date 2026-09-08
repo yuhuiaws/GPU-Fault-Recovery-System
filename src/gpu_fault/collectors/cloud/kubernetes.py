@@ -20,7 +20,11 @@ from gpu_fault.collectors.gpu.discovery import (
 )
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
 from gpu_fault.collectors.scheduling import next_stable_phase
-from gpu_fault.collectors.sinks import CollectorError, EventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    EventSink,
+    deliver_event,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +60,8 @@ class KubernetesHmaNodeCollector:
             return CollectorStats(observed=1, duplicates=1)
 
         collected_at = self.now()
-        self.sink.post(
+        result = deliver_event(
+            self.sink,
             "/v1/provider-events/hyperpod-hma/kubernetes-node",
             {
                 **self.context.model_dump(mode="json"),
@@ -68,9 +73,30 @@ class KubernetesHmaNodeCollector:
                 ),
             },
         )
+        # Only a record that went nowhere leaves the resourceVersion unrecorded:
+        # one the outbox took is replayed from there, and re-posting it on the
+        # next relist would buffer a duplicate for the whole outage (ARCH-G3).
+        result.raise_for_failure()
         if resource_version:
             self._resource_versions[node_id] = resource_version
+        if result.buffered:
+            LOGGER.warning(
+                "HMA node record for %s persisted to the collector outbox: %s",
+                node_id,
+                result.error,
+            )
+            return CollectorStats(observed=1)
         return CollectorStats(observed=1, delivered=1)
+
+    def forget_node(self, node_id: str) -> None:
+        """Drop a node's remembered resourceVersion.
+
+        A deleted Node must not keep an entry: the table would grow with every
+        node the fleet ever had, and a recreated node whose apiserver
+        resourceVersion happened to match would be silently deduplicated.
+        """
+
+        self._resource_versions.pop(node_id, None)
 
     def run(self) -> None:
         try:
@@ -92,28 +118,38 @@ class KubernetesHmaNodeCollector:
         api = client.CoreV1Api()
         serializer = client.ApiClient().sanitize_for_serialization
         while True:
-            listing = api.list_node()
-            for item in listing.items:
-                self.collect_node(serializer(item))
-            resource_version = listing.metadata.resource_version
-            watcher = watch.Watch()
+            # The LIST and its posts belong inside the guard: `post` raises even
+            # once the outbox has taken the record, so an unreachable control
+            # plane used to exit run() and leave Kubernetes restarting the Pod
+            # into CrashLoopBackOff -- re-listing and re-posting every
+            # HMA-labelled node with an empty dedup table on each restart.
+            watcher: Any | None = None
             try:
+                listing = api.list_node()
+                for item in listing.items:
+                    self.collect_node(serializer(item))
+                resource_version = listing.metadata.resource_version
+                watcher = watch.Watch()
                 for event in watcher.stream(
                     api.list_node,
                     resource_version=resource_version,
                     timeout_seconds=300,
                 ):
                     node = serializer(event["object"])
-                    self.collect_node(node)
+                    metadata = node.get("metadata") or {}
                     resource_version = (
-                        node.get("metadata", {}).get("resourceVersion")
-                        or resource_version
+                        metadata.get("resourceVersion") or resource_version
                     )
+                    if event.get("type") == "DELETED":
+                        self.forget_node(str(metadata.get("name") or ""))
+                        continue
+                    self.collect_node(node)
             except Exception:
                 LOGGER.exception("Kubernetes HMA watch failed; relisting nodes")
                 time.sleep(2)
             finally:
-                watcher.stop()
+                if watcher is not None:
+                    watcher.stop()
 
 
 class KubernetesNodeResourceCollector:
@@ -258,163 +294,199 @@ class KubernetesNodeResourceCollector:
         workloads = self._managed_workloads()
         stats = CollectorStats()
         for raw in self._list_nodes():
-            node = self.serializer(raw)
-            metadata = node.get("metadata") or {}
-            node_id = metadata.get("name")
-            instance_type = self._instance_type(node)
-            expected_counts = INSTANCE_ACCELERATOR_COUNTS.get(instance_type or "")
-            if not node_id or expected_counts is None:
-                stats = stats.model_copy(
-                    update={
-                        "observed": stats.observed + 1,
-                        "skipped": stats.skipped + 1,
-                    }
+            try:
+                delta = self._sample_node(raw, observed_at, workloads)
+            except Exception:
+                # One node must not end the cycle: every node after it in list
+                # order would go unsampled, so their consecutive-mismatch
+                # counters would freeze for the whole outage.
+                LOGGER.exception(
+                    "Kubernetes node resource sample failed; "
+                    "continuing with the next node"
                 )
-                continue
-            stats = stats.model_copy(update={"observed": stats.observed + 1})
-            samples: list[HostMetricSample] = []
-            edge_reasons = []
-            deliver = False
-            delivered_state_keys: list[str] = []
-            for resource in ("efa", "gpu"):
-                resource_name = self.resource_names[resource]
-                expected = expected_counts[resource]
-                allocatable_raw = (
-                    (node.get("status") or {})
-                    .get("allocatable", {})
-                    .get(resource_name, 0)
-                )
-                try:
-                    allocatable = int(allocatable_raw)
-                except (TypeError, ValueError):
-                    allocatable = 0
-                state_key = f"{node_id}/{resource}"
-                mismatch = allocatable < expected
-                count = self._mismatch_counts.get(state_key, 0) + 1 if mismatch else 0
-                self._mismatch_counts[state_key] = count
-                persistent = count >= self.required_consecutive_samples
-                previous = self._last_state.get(state_key)
-                last_delivered = self._last_delivered_at.get(state_key)
-                next_summary = self._next_summary_at.get(state_key)
-                resource_deliver = (
-                    previous is None
-                    or previous != persistent
-                    or last_delivered is None
-                    or (next_summary is not None and observed_at >= next_summary)
-                    or (
-                        next_summary is None
-                        and last_delivered is not None
-                        and (observed_at - last_delivered).total_seconds()
-                        >= self.health_summary_seconds
-                    )
-                )
-                self._last_state[state_key] = persistent
-                deliver = deliver or resource_deliver
-                if resource_deliver:
-                    delivered_state_keys.append(state_key)
-                    edge_reasons.append(
-                        (
-                            f"threshold:{resource}_kubernetes_allocatable_mismatch"
-                            if persistent
-                            else f"baseline:{resource}"
-                            if previous is None
-                            # A recovery is a transition, so only say `recovered`
-                            # when the resource really was persistently missing
-                            # before. An unchanged healthy count that delivers
-                            # because its summary interval elapsed is a
-                            # `health-summary`: labelling it `recovered` claimed
-                            # a state change that never happened, and because
-                            # the control plane only skips capturing evidence
-                            # for batches whose sole reason is `health-summary`,
-                            # every periodic delivery for a healthy node was
-                            # persisted as raw evidence forever.
-                            else f"recovered:{resource}"
-                            if previous
-                            else "health-summary"
-                        )
-                    )
-                labels = {
-                    "resource": resource.upper(),
-                    "node_instance_type": instance_type or "UNKNOWN",
-                    "expected_count": str(expected),
-                    "observed_count": str(allocatable),
-                    "missing_count": str(max(0, expected - allocatable)),
-                    "consecutive_mismatch_samples": str(count),
-                    "required_consecutive_samples": str(
-                        self.required_consecutive_samples
-                    ),
-                    "failure_mode": (
-                        "KUBERNETES_RESOURCE_MISSING" if persistent else "HEALTHY"
-                    ),
-                    "resource_name": resource_name,
+                delta = CollectorStats(observed=1)
+            stats = stats.model_copy(
+                update={
+                    "observed": stats.observed + delta.observed,
+                    "skipped": stats.skipped + delta.skipped,
+                    "delivered": stats.delivered + delta.delivered,
                 }
-                prefix = f"{resource}_kubernetes"
-                samples.extend(
-                    [
-                        HostMetricSample(
-                            name=f"{prefix}_expected_count",
-                            value=expected,
-                            unit="devices",
-                            labels=labels,
-                        ),
-                        HostMetricSample(
-                            name=f"{prefix}_allocatable_count",
-                            value=allocatable,
-                            unit="devices",
-                            labels=labels,
-                        ),
-                        HostMetricSample(
-                            name=f"{prefix}_allocatable_missing_count",
-                            value=max(0, expected - allocatable),
-                            unit="devices",
-                            labels=labels,
-                        ),
-                        HostMetricSample(
-                            name=f"{prefix}_allocatable_mismatch",
-                            value=1 if persistent else 0,
-                            labels=labels,
-                        ),
-                    ]
+            )
+        return stats
+
+    def _sample_node(
+        self,
+        raw: Any,
+        observed_at: datetime,
+        workloads: dict[str, list[str]],
+    ) -> CollectorStats:
+        """Sample one node and deliver its batch; the count is this node only."""
+
+        node = self.serializer(raw)
+        metadata = node.get("metadata") or {}
+        node_id = metadata.get("name")
+        instance_type = self._instance_type(node)
+        expected_counts = INSTANCE_ACCELERATOR_COUNTS.get(instance_type or "")
+        if not node_id or expected_counts is None:
+            return CollectorStats(observed=1, skipped=1)
+        samples: list[HostMetricSample] = []
+        edge_reasons = []
+        deliver = False
+        delivered_state_keys: list[str] = []
+        # The edge state is what makes the next cycle say "unchanged", so it is
+        # committed only once the batch reporting it is delivered or buffered.
+        # Committing it before the post consumed a real edge on a rejection: the
+        # mismatch was then not re-reported until the summary slot, up to 300 s
+        # later (ARCH-G3).
+        pending_state: dict[str, bool] = {}
+        for resource in ("efa", "gpu"):
+            resource_name = self.resource_names[resource]
+            expected = expected_counts[resource]
+            allocatable_raw = (
+                (node.get("status") or {}).get("allocatable", {}).get(resource_name, 0)
+            )
+            try:
+                allocatable = int(allocatable_raw)
+            except (TypeError, ValueError):
+                allocatable = 0
+            state_key = f"{node_id}/{resource}"
+            mismatch = allocatable < expected
+            count = self._mismatch_counts.get(state_key, 0) + 1 if mismatch else 0
+            self._mismatch_counts[state_key] = count
+            persistent = count >= self.required_consecutive_samples
+            previous = self._last_state.get(state_key)
+            last_delivered = self._last_delivered_at.get(state_key)
+            next_summary = self._next_summary_at.get(state_key)
+            resource_deliver = (
+                previous is None
+                or previous != persistent
+                or last_delivered is None
+                or (next_summary is not None and observed_at >= next_summary)
+                or (
+                    next_summary is None
+                    and last_delivered is not None
+                    and (observed_at - last_delivered).total_seconds()
+                    >= self.health_summary_seconds
                 )
-            if not deliver:
-                stats = stats.model_copy(update={"skipped": stats.skipped + 1})
-                continue
-            workload_ids = workloads.get(node_id, [])
-            batch = HostTelemetryBatch(
-                batch_id=(
-                    f"k8s-efa-{node_id}-{int(observed_at.timestamp() * 1_000_000)}"
+            )
+            pending_state[state_key] = persistent
+            deliver = deliver or resource_deliver
+            if resource_deliver:
+                delivered_state_keys.append(state_key)
+                edge_reasons.append(
+                    (
+                        f"threshold:{resource}_kubernetes_allocatable_mismatch"
+                        if persistent
+                        else f"baseline:{resource}"
+                        if previous is None
+                        # A recovery is a transition, so only say `recovered`
+                        # when the resource really was persistently missing
+                        # before. An unchanged healthy count that delivers
+                        # because its summary interval elapsed is a
+                        # `health-summary`: labelling it `recovered` claimed
+                        # a state change that never happened, and because
+                        # the control plane only skips capturing evidence
+                        # for batches whose sole reason is `health-summary`,
+                        # every periodic delivery for a healthy node was
+                        # persisted as raw evidence forever.
+                        else f"recovered:{resource}"
+                        if previous
+                        else "health-summary"
+                    )
+                )
+            labels = {
+                "resource": resource.upper(),
+                "node_instance_type": instance_type or "UNKNOWN",
+                "expected_count": str(expected),
+                "observed_count": str(allocatable),
+                "missing_count": str(max(0, expected - allocatable)),
+                "consecutive_mismatch_samples": str(count),
+                "required_consecutive_samples": str(self.required_consecutive_samples),
+                "failure_mode": (
+                    "KUBERNETES_RESOURCE_MISSING" if persistent else "HEALTHY"
                 ),
+                "resource_name": resource_name,
+            }
+            prefix = f"{resource}_kubernetes"
+            samples.extend(
+                [
+                    HostMetricSample(
+                        name=f"{prefix}_expected_count",
+                        value=expected,
+                        unit="devices",
+                        labels=labels,
+                    ),
+                    HostMetricSample(
+                        name=f"{prefix}_allocatable_count",
+                        value=allocatable,
+                        unit="devices",
+                        labels=labels,
+                    ),
+                    HostMetricSample(
+                        name=f"{prefix}_allocatable_missing_count",
+                        value=max(0, expected - allocatable),
+                        unit="devices",
+                        labels=labels,
+                    ),
+                    HostMetricSample(
+                        name=f"{prefix}_allocatable_mismatch",
+                        value=1 if persistent else 0,
+                        labels=labels,
+                    ),
+                ]
+            )
+        if not deliver:
+            self._last_state.update(pending_state)
+            return CollectorStats(observed=1, skipped=1)
+        workload_ids = workloads.get(node_id, [])
+        batch = HostTelemetryBatch(
+            batch_id=(f"k8s-efa-{node_id}-{int(observed_at.timestamp() * 1_000_000)}"),
+            cluster_id=self.context.cluster_id,
+            node_id=node_id,
+            observed_at=observed_at,
+            samples=samples,
+            runtime_profile_version=(self.context.runtime_profile_version),
+            workload_state=(
+                WorkloadState.ACTIVE if workload_ids else WorkloadState.IDLE
+            ),
+            affected_workload_ids=workload_ids,
+            evidence_ref=(f"k8s://nodes/{node_id}/status/allocatable"),
+            # Both resources can now land on the same reason, and a batch
+            # reading `["health-summary", "health-summary"]` would no longer
+            # match the control plane's steady-state test on the reason set.
+            edge_filter_reasons=list(dict.fromkeys(edge_reasons)),
+        )
+        result = deliver_event(
+            self.sink,
+            HOST_TELEMETRY_PATH,
+            batch.model_dump(mode="json"),
+        )
+        # A batch the outbox took is replayed from there, so this node's edge
+        # state and summary schedule advance exactly as for a live delivery;
+        # only a batch that went nowhere raises, and the caller logs it and
+        # moves to the next node.
+        result.raise_for_failure()
+        self._last_state.update(pending_state)
+        if result.buffered:
+            LOGGER.warning(
+                "Kubernetes node resource batch %s persisted to the collector "
+                "outbox; advancing the edge filter: %s",
+                batch.batch_id,
+                result.error,
+            )
+        for state_key in delivered_state_keys:
+            self._last_delivered_at[state_key] = observed_at
+            resource = state_key.rsplit("/", 1)[-1]
+            self._next_summary_at[state_key] = next_stable_phase(
+                observed_at,
                 cluster_id=self.context.cluster_id,
                 node_id=node_id,
-                observed_at=observed_at,
-                samples=samples,
-                runtime_profile_version=(self.context.runtime_profile_version),
-                workload_state=(
-                    WorkloadState.ACTIVE if workload_ids else WorkloadState.IDLE
-                ),
-                affected_workload_ids=workload_ids,
-                evidence_ref=(f"k8s://nodes/{node_id}/status/allocatable"),
-                # Both resources can now land on the same reason, and a batch
-                # reading `["health-summary", "health-summary"]` would no longer
-                # match the control plane's steady-state test on the reason set.
-                edge_filter_reasons=list(dict.fromkeys(edge_reasons)),
+                channel=f"kubernetes-{resource}",
+                interval_seconds=self.health_summary_seconds,
             )
-            self.sink.post(
-                HOST_TELEMETRY_PATH,
-                batch.model_dump(mode="json"),
-            )
-            for state_key in delivered_state_keys:
-                self._last_delivered_at[state_key] = observed_at
-                resource = state_key.rsplit("/", 1)[-1]
-                self._next_summary_at[state_key] = next_stable_phase(
-                    observed_at,
-                    cluster_id=self.context.cluster_id,
-                    node_id=node_id,
-                    channel=f"kubernetes-{resource}",
-                    interval_seconds=self.health_summary_seconds,
-                )
-            stats = stats.model_copy(update={"delivered": stats.delivered + 1})
-        return stats
+        if result.buffered:
+            return CollectorStats(observed=1)
+        return CollectorStats(observed=1, delivered=1)
 
     def run(self) -> None:
         if self.core is None:

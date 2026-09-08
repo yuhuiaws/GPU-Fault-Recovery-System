@@ -27,6 +27,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     SqsEventSink,
+    deliver_event,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -88,7 +89,8 @@ class CloudWatchHmaCollector:
             timestamp = datetime.fromtimestamp(
                 int(item["timestamp"]) / 1000, tz=timezone.utc
             )
-            self.sink.post(
+            result = deliver_event(
+                self.sink,
                 "/v1/provider-events/hyperpod-hma/cloudwatch",
                 {
                     **self.context.model_dump(mode="json"),
@@ -104,6 +106,18 @@ class CloudWatchHmaCollector:
                     ),
                 },
             )
+            # An event the outbox took is durable, so the rest of the
+            # subscription batch is still forwarded; only an event that went
+            # nowhere aborts the batch, which is what makes CloudWatch Logs
+            # retry the whole delivery (ARCH-G3).
+            result.raise_for_failure()
+            if result.buffered:
+                LOGGER.warning(
+                    "HMA log event %s persisted to the collector outbox: %s",
+                    event_id,
+                    result.error,
+                )
+                continue
             stats = stats.model_copy(update={"delivered": stats.delivered + 1})
         return stats
 
@@ -176,7 +190,10 @@ class SqsHmaConsumer:
                     "/v1/provider-events/hyperpod-hma/"
                 ) or not isinstance(payload, dict):
                     raise CollectorError("invalid queued HMA event")
-                self.sink.post(path, payload)
+                # A forward the outbox took is durable: keeping the message
+                # made the queue redeliver the same HMA event every visibility
+                # timeout for the whole outage while the outbox replayed it too.
+                deliver_event(self.sink, path, payload).raise_for_failure()
                 self.client.delete_message(
                     QueueUrl=self.queue_url,
                     ReceiptHandle=message["ReceiptHandle"],
