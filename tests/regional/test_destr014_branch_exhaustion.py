@@ -1068,3 +1068,40 @@ def test_env_window_open_refuses_unrecorded_live_values_and_resumes_its_own() ->
     assert env_window.open_decision(closed, baseline, assignments) == "open"
     other = {"GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "7"}
     assert env_window.open_decision(record, live_changed, other) == "refuse"
+
+
+def test_the_budget_probe_reads_the_control_plane_not_a_placeholder() -> None:
+    """Attempt 1 (2026-09-08) shipped ``{"readable": False}`` as the budget and
+    could therefore never pass its own fail-closed headroom check."""
+    assert '"readable": True' in destr014.BUDGET_HEADROOM
+    for token in (
+        "RemediationBudgetPolicy.from_mapping(os.environ)",
+        "WorkflowOperation.QUARANTINE",
+        "WorkflowOperation.RESTART_NODE",
+        "WorkflowOperation.REPLACE_NODE",
+        "remediation_budget_claims",
+        "WorkflowStatus.RUNNING",
+    ):
+        assert token in destr014.BUDGET_HEADROOM, token
+
+    class _Regional:
+        def pod_python(self, plane, app, script, *arguments, timeout=180):
+            assert (plane, app) == ("cpu", "gpu-fault-control-worker"), (plane, app)
+            assert arguments == ("cluster-a", "node-fault", "node-sibling"), arguments
+            return {"readable": True, "scopes": {"region": {"limit": 20, "active": 1}}}
+
+    class _Failing:
+        def pod_python(self, *args, **kwargs):
+            raise RuntimeError("exec failed")
+
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        regional=SimpleNamespace(cluster_id="cluster-a"),
+        fault_node="node-fault",
+        sibling_node="node-sibling",
+    )
+    assert destr014.budget_headroom(_Regional(), settings)["readable"] is True
+    failed = destr014.budget_headroom(_Failing(), settings)
+    assert failed["readable"] is False and "exec failed" in failed["error"], failed
+    assert destr014.budget_headroom_errors(failed), "an unreadable budget must refuse"

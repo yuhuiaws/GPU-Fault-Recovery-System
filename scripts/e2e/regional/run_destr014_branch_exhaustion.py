@@ -109,6 +109,85 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
 )
 
 
+BUDGET_HEADROOM = r"""
+import json
+import os
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.execution.remediation_budget import (
+    RemediationBudgetPolicy,
+    _scopes_for_steps,
+)
+from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepSpec
+
+cluster_id, fault_node, sibling_node = sys.argv[1:4]
+policy = RemediationBudgetPolicy.from_mapping(os.environ)
+# Every budgeted scope the two branches can touch: containment on both nodes,
+# the reboot rung on both, and the replace rung the sibling escalates into.
+steps = [
+    WorkflowStepSpec(operation=op, execution_owner="probe", node_ids=[node])
+    for node in (fault_node, sibling_node)
+    for op in (
+        WorkflowOperation.QUARANTINE,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowOperation.REPLACE_NODE,
+    )
+]
+limits = _scopes_for_steps(policy, cluster_id, steps)
+store = ApplicationContext.from_environment().store
+active = {scope: 0 for scope in limits}
+for workflow in store.list_workflows(limit=500):
+    if workflow.status not in {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.SAFETY_PENDING,
+        WorkflowStatus.RUNNING,
+    }:
+        continue
+    for scope in workflow.remediation_budget_claims:
+        if scope in active:
+            active[scope] += 1
+print(json.dumps({
+    "readable": True,
+    "scopes": {
+        scope: {"limit": limit, "active": active[scope]} for scope, limit in limits.items()
+    },
+    "policy": {
+        "region_limit": policy.region_limit,
+        "cluster_limit": policy.cluster_limit,
+        "node_limit": policy.node_limit,
+        "failure_domain_limit": policy.failure_domain_limit,
+        "resource_class_limit": policy.resource_class_limit,
+    },
+}, sort_keys=True))
+"""
+
+
+def budget_headroom(
+    regional: RegionalLiveFixture, settings: Settings
+) -> dict[str, Any]:
+    """What the control plane's remediation budget has left for the two
+    branches this case opens. Read on the control-worker, whose environment
+    carries the limits and the failure-domain map the executor enforces;
+    an unreadable budget is reported as such and fails the preflight closed."""
+
+    try:
+        return regional.pod_python(
+            "cpu",
+            "gpu-fault-control-worker",
+            BUDGET_HEADROOM,
+            settings.regional.cluster_id,
+            settings.fault_node,
+            settings.sibling_node,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, judged by the verdict
+        return {
+            "readable": False,
+            "scopes": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def preflight_errors(
     *,
     fault_node: str,
@@ -498,6 +577,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
             settings.predecessor_path, PREDECESSOR_CASE_ID
         ),
         "control_env": control_env,
+        "budget": budget_headroom(regional, settings),
     }
     result["errors"] = preflight_errors(
         fault_node=settings.fault_node,
@@ -511,7 +591,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         executor_env=executor_env_snapshot(regional),
         reboot_probe_errors=[],
         control_env=control_env,
-        budget={"readable": False, "scopes": {}},
+        budget=result["budget"],
         fault_workloads=regional.business_workloads(settings.fault_node),
         sibling_workloads=regional.business_workloads(settings.sibling_node),
         open_workflows=[],
