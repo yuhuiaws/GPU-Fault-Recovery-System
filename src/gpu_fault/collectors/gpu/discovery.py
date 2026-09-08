@@ -27,7 +27,6 @@ from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
-    deliver_event,
     deliver_or_raise,
 )
 
@@ -419,7 +418,7 @@ def deliver_gpu_inventory(
         raise CollectorError(f"GPU inventory snapshot is not valid: {exc}") from exc
     except ValueError as exc:
         raise CollectorError(f"GPU inventory snapshot is not usable: {exc}") from exc
-    result = deliver_or_raise(
+    deliver_or_raise(
         sink,
         GPU_INVENTORY_PATH,
         snapshot.model_dump(mode="json"),

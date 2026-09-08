@@ -28,7 +28,6 @@ from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
-    deliver_event,
     deliver_or_raise,
 )
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
@@ -555,7 +554,7 @@ class HostTelemetryCollector(
                     "edge_filter_reasons": sorted(delivery_reasons),
                 }
             )
-            result = deliver_or_raise(
+            deliver_or_raise(
                 self.sink,
                 HOST_TELEMETRY_PATH,
                 batch.model_dump(mode="json"),

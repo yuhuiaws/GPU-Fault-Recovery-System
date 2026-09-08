@@ -29,7 +29,6 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     SqsEventSink,
-    deliver_event,
     deliver_or_raise,
     is_retryable_collector_status,
 )
@@ -133,7 +132,7 @@ class CloudWatchHmaCollector:
             timestamp = datetime.fromtimestamp(
                 int(item["timestamp"]) / 1000, tz=timezone.utc
             )
-            result = deliver_or_raise(
+            deliver_or_raise(
                 self.sink,
                 "/v1/provider-events/hyperpod-hma/cloudwatch",
                 {

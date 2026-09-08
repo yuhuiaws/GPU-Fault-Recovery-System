@@ -17,7 +17,6 @@ from gpu_fault.training_health import TrainingProgressHeartbeat
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
     EventSink,
-    deliver_event,
     deliver_or_raise,
 )
 
@@ -57,7 +56,7 @@ class TrainingProgressCollector:
 
     def collect_once(self) -> TrainingProgressHeartbeat:
         heartbeat = self._heartbeat()
-        result = deliver_or_raise(
+        deliver_or_raise(
             self.sink,
             TRAINING_PROGRESS_PATH,
             heartbeat.model_dump(mode="json"),

@@ -29,7 +29,6 @@ from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
-    deliver_event,
     deliver_or_raise,
 )
 
@@ -218,7 +217,7 @@ class NvidiaSmiMetricsCollector:
             checkpoint_manifest_ref=(self.context.checkpoint_manifest_ref),
             evidence_ref=f"nvidia-smi://{self.node_id}",
         )
-        result = deliver_or_raise(
+        deliver_or_raise(
             self.sink,
             GPU_METRICS_PATH,
             batch.model_dump(mode="json"),
