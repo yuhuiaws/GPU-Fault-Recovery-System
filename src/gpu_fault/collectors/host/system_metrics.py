@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import json
 import logging
@@ -23,6 +23,29 @@ LOGGER = logging.getLogger(__name__)
 #: Sentinel that retires an abandoned ``statvfs`` worker once its mount
 #: answers, so a mount that recovers does not leave the thread behind.
 _RETIRE = "\0retire"
+
+#: How long a SMART health verdict is reused. ``smartctl -H`` is one fork per
+#: drive with a 20 s timeout -- nine forks and a 180 s worst case on a p5 with
+#: eight NVMe, inside a 15 s tick -- while the signal it reads flips on the
+#: order of days (F-H7). This is therefore also the *whole* staleness the cache
+#: may add to a health *change*: a drive that starts failing inside the window
+#: is reported when the window ends, one cache period late and never more.
+_SMART_CACHE_SECONDS = 300.0
+
+
+class _SmartHealth(NamedTuple):
+    """The last SMART verdicts, and the device set they were read from.
+
+    The device set is part of the key, so a hot-added NVMe (or one that
+    vanished) is checked on the next tick rather than at the end of the window.
+    """
+
+    observed_at: datetime | None
+    devices: tuple[str, ...]
+    samples: tuple[HostMetricSample, ...]
+
+
+_NO_SMART_HEALTH = _SmartHealth(None, (), ())
 
 
 class _InFlightProbe:
@@ -194,6 +217,11 @@ class HostSystemMetricsMixin:
     _unresponsive_mounts: set[str]
     runner: Callable[..., Any]
 
+    #: Not part of the contract above: the composed class supplies nothing
+    #: here, so the SMART cache starts from an immutable module-level default
+    #: owned by the code that reads it.
+    _smart_health = _NO_SMART_HEALTH
+
     def _probe_mount(self, mount: str, observed_at: datetime) -> os.statvfs_result:
         """``statvfs`` with a deadline, at most once per mount per tick.
 
@@ -252,7 +280,10 @@ class HostSystemMetricsMixin:
             .split()[1:]
         ]
         idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-        total = sum(fields)
+        # ``guest``/``guest_nice`` (fields 8 and 9) are already counted inside
+        # ``user``/``nice``, so summing every field double counts them and
+        # deflates the busy fraction on a node that runs VMs (F-H9).
+        total = sum(fields[:8])
         result = []
         previous_total = self._previous.get("cpu-total")
         previous_idle = self._previous.get("cpu-idle")
@@ -538,9 +569,38 @@ class HostSystemMetricsMixin:
                 )
         return result
 
-    def _smart(self, _: datetime) -> list[HostMetricSample]:
+    def _smart(self, observed_at: datetime) -> list[HostMetricSample]:
+        """SMART health per drive, re-read at most once per cache period.
+
+        The ``--scan-open`` fork still runs every tick -- one fork against one
+        per drive -- because it is what makes a drive that appeared or vanished
+        rescan immediately instead of waiting out the window. Only the per-drive
+        ``-H`` checks are cached, and the cached verdicts are still reported on
+        every tick: the consumer reads ``smart_health_failed`` as a latest
+        value, so a tick that omitted it would read as a drive that stopped
+        being watched.
+        """
+
         if not shutil.which("smartctl"):
             return []
+        devices = self._smart_devices()
+        cached = self._smart_health
+        if (
+            cached.observed_at is not None
+            and cached.devices == devices
+            and (observed_at - cached.observed_at).total_seconds()
+            < _SMART_CACHE_SECONDS
+        ):
+            return list(cached.samples)
+        samples = [
+            sample for device in devices for sample in self._smart_verdict(device)
+        ]
+        self._smart_health = _SmartHealth(observed_at, devices, tuple(samples))
+        return samples
+
+    def _smart_devices(self) -> tuple[str, ...]:
+        """The drives ``smartctl`` can open, sorted so the key is stable."""
+
         scan = self.runner(
             ["smartctl", "--scan-open"],
             capture_output=True,
@@ -548,36 +608,36 @@ class HostSystemMetricsMixin:
             timeout=20,
             check=False,
         )
-        result = []
+        devices = set()
         for line in scan.stdout.splitlines():
             fields = line.split(maxsplit=1)
-            if not fields:
-                continue
-            device = fields[0]
-            if not device.startswith("/dev/"):
-                continue
-            check = self.runner(
-                ["smartctl", "-H", "-j", device],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
+            if fields and fields[0].startswith("/dev/"):
+                devices.add(fields[0])
+        return tuple(sorted(devices))
+
+    def _smart_verdict(self, device: str) -> list[HostMetricSample]:
+        check = self.runner(
+            ["smartctl", "-H", "-j", device],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        try:
+            payload = json.loads(check.stdout)
+        except json.JSONDecodeError:
+            return []
+        passed = payload.get("smart_status", {}).get("passed")
+        if passed is None:
+            return []
+        return [
+            self._sample(
+                "smart_health_failed",
+                0 if passed else 1,
+                None,
+                device,
             )
-            try:
-                payload = json.loads(check.stdout)
-                passed = payload.get("smart_status", {}).get("passed")
-            except json.JSONDecodeError:
-                continue
-            if passed is not None:
-                result.append(
-                    self._sample(
-                        "smart_health_failed",
-                        0 if passed else 1,
-                        None,
-                        device,
-                    )
-                )
-        return result
+        ]
 
     def _bmc(self, _: datetime) -> list[HostMetricSample]:
         if not shutil.which("ipmitool"):
