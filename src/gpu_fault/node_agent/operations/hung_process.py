@@ -38,9 +38,6 @@ class HungProcessOperationsMixin:
             work_dir,
             manifest,
             process_rows,
-            settings["sample_count"],
-            settings["duration"],
-            settings["sample_interval"],
             settings["python_sample_count"],
             settings["python_sample_interval"],
             settings["python_timeout"],
@@ -274,18 +271,10 @@ class HungProcessOperationsMixin:
         work_dir,
         manifest,
         process_rows,
-        sample_count,
-        duration,
-        sample_interval,
         python_sample_count,
         python_sample_interval,
         python_timeout,
     ):
-        manifest["strace_sampling"] = {
-            "sample_count": sample_count,
-            "duration_seconds_per_sample": duration,
-            "interval_seconds": sample_interval,
-        }
         python_process_rows = []
         for row in process_rows:
             proc_dir = self.proc_root / str(row["pid"])
@@ -340,131 +329,192 @@ class HungProcessOperationsMixin:
         duration,
         sample_interval,
     ):
+        """Sample /proc and strace for every hung process, round by round.
+
+        strace used to run the whole schedule for one process before starting
+        the next, and slept the interval once per process on top: with the
+        defaults on a 16-rank node that is 16 x (3 x 3 s + 2 x 2 s), about
+        208 s of a bundle whose only purpose is to photograph the node *while*
+        it is hung, against a step deadline that does not grow with the rank
+        count. Rounds are the shape py-spy already used, so the total is now
+        the schedule's own length (samples x duration plus the intervals) for
+        any number of ranks -- strictly below the old serial worst case.
+        """
+
+        manifest["strace_sampling"] = {
+            "sample_count": sample_count,
+            "duration_seconds_per_sample": duration,
+            "interval_seconds": sample_interval,
+            "process_count": len(process_rows),
+            "mode": "round_parallel",
+        }
         for row in process_rows:
-            pid = row["pid"]
-            proc_dir = self.proc_root / str(pid)
-            for name in ("status", "cmdline"):
-                source = proc_dir / name
-                target = work_dir / f"proc-{pid}-{name}.txt"
-                try:
-                    data = source.read_bytes()[:1_048_576]
-                    target.write_bytes(data.replace(b"\0", b" "))
-                    manifest["captures"].append(
-                        {
-                            "file": target.name,
-                            "source": str(source),
-                            "returncode": 0,
-                        }
-                    )
-                except OSError as exc:
-                    manifest["captures"].append(
-                        {
-                            "file": target.name,
-                            "source": str(source),
-                            "returncode": None,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
+            self._capture_proc_metadata(work_dir, manifest, row["pid"])
+        if not process_rows:
+            return
+        with ThreadPoolExecutor(
+            max_workers=len(process_rows),
+            thread_name_prefix="gpu-fault-strace",
+        ) as executor:
             for sample_index in range(1, sample_count + 1):
-                for name in ("stack", "wchan"):
-                    source = proc_dir / name
-                    target = work_dir / (
-                        f"proc-{pid}-{name}-sample-{sample_index:02d}.txt"
+                for row in process_rows:
+                    self._capture_proc_stack_sample(
+                        work_dir,
+                        manifest,
+                        row["pid"],
+                        sample_index,
+                        sample_count,
                     )
-                    try:
-                        data = source.read_bytes()[:1_048_576]
-                        target.write_bytes(data.replace(b"\0", b" "))
-                        manifest["captures"].append(
-                            {
-                                "file": target.name,
-                                "source": str(source),
-                                "returncode": 0,
-                                "pid": pid,
-                                "sample_index": sample_index,
-                                "sample_count": sample_count,
-                            }
-                        )
-                    except OSError as exc:
-                        error = f"{type(exc).__name__}: {exc}"
-                        target.write_text(error, encoding="utf-8")
-                        manifest["captures"].append(
-                            {
-                                "file": target.name,
-                                "source": str(source),
-                                "returncode": None,
-                                "pid": pid,
-                                "sample_index": sample_index,
-                                "sample_count": sample_count,
-                                "error": error,
-                            }
-                        )
-                trace_prefix = work_dir / (f"strace-{pid}-sample-{sample_index:02d}")
-                argv = [
-                    "timeout",
-                    "--signal=INT",
-                    f"{duration}s",
-                    "strace",
-                    "-ff",
-                    "-tt",
-                    "-T",
-                    "-s",
-                    "256",
-                    "-p",
-                    str(pid),
-                    "-o",
-                    str(trace_prefix),
+                futures = [
+                    executor.submit(
+                        self._capture_strace_sample,
+                        work_dir,
+                        row["pid"],
+                        sample_index,
+                        sample_count,
+                        duration,
+                        sample_interval,
+                    )
+                    for row in process_rows
                 ]
-                started_at = self.now()
-                capture = {
-                    "file": (f"strace-{pid}-sample-{sample_index:02d}*"),
-                    "command": argv,
-                    "pid": pid,
-                    "sample_index": sample_index,
-                    "sample_count": sample_count,
-                    "duration_seconds": duration,
-                    "interval_seconds": sample_interval,
-                    "started_at": started_at.isoformat(),
-                }
-                try:
-                    completed = self.runner(
-                        argv,
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=duration + 5,
-                    )
-                    capture["returncode"] = completed.returncode
-                except (
-                    OSError,
-                    subprocess.TimeoutExpired,
-                ) as exc:
-                    capture["returncode"] = None
-                    capture["error"] = f"{type(exc).__name__}: {exc}"
-                # A fixed-duration sample is *supposed* to end by being
-                # killed: timeout(1) exits 124 and strace exits 130 on
-                # SIGINT. Reporting that as a failed capture made every
-                # healthy bundle report one failure per sample, so the
-                # summary's failed_capture_count was useless. Only count
-                # it as a failure when no trace file was produced.
-                trace_files = sorted(
-                    item.name for item in work_dir.glob(f"{trace_prefix.name}*")
-                )
-                capture["trace_file_count"] = len(trace_files)
-                if capture["returncode"] in {124, 130} and trace_files:
-                    capture["terminated_by"] = "sample_duration"
-                    capture["raw_returncode"] = capture["returncode"]
-                    capture["returncode"] = 0
-                elif capture["returncode"] not in {
-                    0,
-                    None,
-                } and (not trace_files):
-                    capture["error"] = (
-                        f"strace produced no trace file (exit {capture['returncode']})"
-                    )
-                capture["completed_at"] = self.now().isoformat()
-                manifest["captures"].append(capture)
+                manifest["captures"].extend(future.result() for future in futures)
                 if sample_index < sample_count and sample_interval > 0:
                     self.sleep(sample_interval)
+
+    def _capture_proc_metadata(self, work_dir, manifest, pid) -> None:
+        proc_dir = self.proc_root / str(pid)
+        for name in ("status", "cmdline"):
+            source = proc_dir / name
+            target = work_dir / f"proc-{pid}-{name}.txt"
+            try:
+                data = source.read_bytes()[:1_048_576]
+                target.write_bytes(data.replace(b"\0", b" "))
+                manifest["captures"].append(
+                    {
+                        "file": target.name,
+                        "source": str(source),
+                        "returncode": 0,
+                    }
+                )
+            except OSError as exc:
+                manifest["captures"].append(
+                    {
+                        "file": target.name,
+                        "source": str(source),
+                        "returncode": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+    def _capture_proc_stack_sample(
+        self, work_dir, manifest, pid, sample_index, sample_count
+    ) -> None:
+        proc_dir = self.proc_root / str(pid)
+        for name in ("stack", "wchan"):
+            source = proc_dir / name
+            target = work_dir / (f"proc-{pid}-{name}-sample-{sample_index:02d}.txt")
+            try:
+                data = source.read_bytes()[:1_048_576]
+                target.write_bytes(data.replace(b"\0", b" "))
+                manifest["captures"].append(
+                    {
+                        "file": target.name,
+                        "source": str(source),
+                        "returncode": 0,
+                        "pid": pid,
+                        "sample_index": sample_index,
+                        "sample_count": sample_count,
+                    }
+                )
+            except OSError as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                target.write_text(error, encoding="utf-8")
+                manifest["captures"].append(
+                    {
+                        "file": target.name,
+                        "source": str(source),
+                        "returncode": None,
+                        "pid": pid,
+                        "sample_index": sample_index,
+                        "sample_count": sample_count,
+                        "error": error,
+                    }
+                )
+
+    def _capture_strace_sample(
+        self,
+        work_dir: Path,
+        pid: int,
+        sample_index: int,
+        sample_count: int,
+        duration: int,
+        sample_interval: int,
+    ) -> dict[str, Any]:
+        trace_prefix = work_dir / (f"strace-{pid}-sample-{sample_index:02d}")
+        argv = [
+            "timeout",
+            "--signal=INT",
+            f"{duration}s",
+            "strace",
+            "-ff",
+            "-tt",
+            "-T",
+            "-s",
+            "256",
+            "-p",
+            str(pid),
+            "-o",
+            str(trace_prefix),
+        ]
+        started_at = self.now()
+        capture: dict[str, Any] = {
+            "file": (f"strace-{pid}-sample-{sample_index:02d}*"),
+            "command": argv,
+            "pid": pid,
+            "sample_index": sample_index,
+            "sample_count": sample_count,
+            "duration_seconds": duration,
+            "interval_seconds": sample_interval,
+            "started_at": started_at.isoformat(),
+        }
+        try:
+            completed = self.runner(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=duration + 5,
+            )
+            capture["returncode"] = completed.returncode
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            capture["returncode"] = None
+            capture["error"] = f"{type(exc).__name__}: {exc}"
+        # A fixed-duration sample is *supposed* to end by being
+        # killed: timeout(1) exits 124 and strace exits 130 on
+        # SIGINT. Reporting that as a failed capture made every
+        # healthy bundle report one failure per sample, so the
+        # summary's failed_capture_count was useless. Only count
+        # it as a failure when no trace file was produced.
+        trace_files = sorted(
+            item.name for item in work_dir.glob(f"{trace_prefix.name}*")
+        )
+        capture["trace_file_count"] = len(trace_files)
+        if capture["returncode"] in {124, 130} and trace_files:
+            capture["terminated_by"] = "sample_duration"
+            capture["raw_returncode"] = capture["returncode"]
+            capture["returncode"] = 0
+        elif capture["returncode"] not in {
+            0,
+            None,
+        } and (not trace_files):
+            capture["error"] = (
+                f"strace produced no trace file (exit {capture['returncode']})"
+            )
+        capture["completed_at"] = self.now().isoformat()
+        return capture
 
     def _capture_python_stack_sample(
         self,
