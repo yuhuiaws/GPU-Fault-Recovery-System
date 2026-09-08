@@ -101,11 +101,7 @@ class FlightRecorderOperationsMixin:
         raw_candidates.append(Path(base))
         candidates = self._process_namespace_paths(pid, raw_candidates)
         pipe = next(
-            (
-                path
-                for path in candidates
-                if path.exists() and stat.S_ISFIFO(path.stat().st_mode)
-            ),
+            (path for path in candidates if self._is_flight_pipe(path)),
             None,
         )
         if pipe is None:
@@ -116,11 +112,11 @@ class FlightRecorderOperationsMixin:
         dump_candidates = self._flight_dump_candidates(
             environment, rank, pid=pid, pipe=pipe
         )
-        previous = {
-            str(path): path.stat().st_mtime_ns
-            for path in dump_candidates
-            if path.exists() and path.is_file()
-        }
+        previous = {}
+        for candidate in dump_candidates:
+            candidate_stat = self._dump_file_stat(candidate)
+            if candidate_stat is not None:
+                previous[str(candidate)] = candidate_stat.st_mtime_ns
         try:
             descriptor = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)
             try:
@@ -224,31 +220,63 @@ class FlightRecorderOperationsMixin:
             )
         return list(dict.fromkeys(candidates))
 
+    @staticmethod
+    def _is_flight_pipe(path: Path) -> bool:
+        """Whether the candidate is a FIFO, without raising if it cannot say."""
+
+        try:
+            return stat.S_ISFIFO(path.stat().st_mode)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _dump_file_stat(path: Path) -> os.stat_result | None:
+        """The candidate's ``stat``, or None when it is not a readable file.
+
+        Every candidate path here is built from the training container's own
+        environment and lives in the container's own directories, so a
+        ``stat`` can fail for reasons that are nobody's fault and nobody's
+        emergency: the directory mode changed, the file was rotated away, the
+        env var held a component longer than NAME_MAX. ``Path.is_file`` only
+        swallows the ENOENT class, so those raised straight out of the triage
+        step and cost every rank's evidence -- see the tests in
+        ``test_diagnostics.py``. One unreadable candidate is a candidate that
+        did not answer, nothing more.
+        """
+
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return info if stat.S_ISREG(info.st_mode) else None
+
     def _finish_flight_recorder(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("status") != "triggered":
             return request
         previous = request.get("previous_mtimes") or {}
         files = [Path(value) for value in request.get("dump_candidates") or []]
-        updated = [
-            path
-            for path in files
-            if path.is_file()
-            and path.stat().st_mtime_ns > int(previous.get(str(path), -1))
-        ]
+        # One stat per candidate, kept: the winner used to be stat-ed twice
+        # more outside the parse_error guard, so a dump the container rotated
+        # in that window raised FileNotFoundError out of the whole command.
+        updated: list[tuple[Path, os.stat_result]] = []
+        for path in files:
+            info = self._dump_file_stat(path)
+            if info is not None and info.st_mtime_ns > int(previous.get(str(path), -1)):
+                updated.append((path, info))
         if not updated:
             return {
                 "status": "dump_missing",
                 "pipe": request.get("pipe"),
             }
-        dump_path = max(
+        dump_path, dump_stat = max(
             updated,
-            key=lambda path: path.stat().st_mtime_ns,
+            key=lambda item: item[1].st_mtime_ns,
         )
         summary = {
             "status": "dumped",
             "pipe": request.get("pipe"),
             "dump_file": str(dump_path),
-            "dump_size_bytes": dump_path.stat().st_size,
+            "dump_size_bytes": dump_stat.st_size,
         }
         try:
             summary.update(

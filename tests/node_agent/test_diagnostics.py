@@ -512,6 +512,158 @@ def test_flight_recorder_dump_cannot_execute_planted_code(tmp_path) -> None:
     assert "refusing to resolve" in summary["parse_error"]
 
 
+def test_flight_recorder_unstattable_dump_does_not_abort_the_triage(tmp_path) -> None:
+    """One candidate the Agent cannot stat must not lose the dump it can.
+
+    ``_finish_flight_recorder`` walked nine candidate paths per rank with a
+    bare ``path.is_file()``. ``Path.is_file`` only swallows ENOENT-class
+    errors, so a candidate whose directory the Agent cannot traverse raises
+    PermissionError -- and it escapes ``_await_flight_dumps``, the hung-triage
+    step, and the whole COLLECT_HUNG_TRIAGE command. The dumps live in the
+    training container's own directories, so their permissions change without
+    warning, and the flight recorder is the only evidence that yields a
+    CONFIRMED verdict.
+    """
+
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    hidden = sealed / "nccl_trace_rank_4"
+    hidden.write_text(_flight_dump_payload())
+    dump = tmp_path / "nccl_trace_rank_4"
+    dump.write_text(_flight_dump_payload())
+    os.chmod(sealed, 0o000)
+    agent = _triage_only_executor(tmp_path, lambda _seconds: None)
+    try:
+        summary = agent._finish_flight_recorder(
+            {
+                "status": "triggered",
+                "pipe": "/tmp/nccl_pipe_4.pipe",
+                "dump_candidates": [str(hidden), str(dump)],
+                "previous_mtimes": {},
+            }
+        )
+    finally:
+        os.chmod(sealed, 0o755)
+
+    assert summary["status"] == "dumped", summary
+    assert summary["dump_file"] == str(dump), summary
+    assert summary["last_entry"]["collective_seq_id"] == 12, summary
+
+
+def test_flight_recorder_overlong_dump_candidate_does_not_abort_the_triage(
+    tmp_path,
+) -> None:
+    """The candidate paths come from the container's own environment.
+
+    ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` is read out of ``/proc/<pid>/environ``,
+    so a training container can hand the Agent a path component longer than
+    NAME_MAX. ``Path.is_file`` raises ENAMETOOLONG for it, which used to abort
+    the triage of every rank -- a one-line env var that disables the node's
+    hang evidence.
+    """
+
+    overlong = tmp_path / ("nccl_trace_rank_" + "x" * 300)
+    agent = _triage_only_executor(tmp_path, lambda _seconds: None)
+
+    summary = agent._finish_flight_recorder(
+        {
+            "status": "triggered",
+            "pipe": "/tmp/nccl_pipe_5.pipe",
+            "dump_candidates": [str(overlong)],
+            "previous_mtimes": {},
+        }
+    )
+
+    assert summary["status"] == "dump_missing", summary
+
+
+def test_flight_recorder_vanished_dump_is_a_parse_error_not_a_crash(tmp_path) -> None:
+    """A dump that cannot be read is one rank's parse_error, not a crash."""
+
+    dump = tmp_path / "nccl_trace_rank_6"
+    dump.write_text(_flight_dump_payload())
+    os.chmod(dump, 0o000)
+    agent = _triage_only_executor(tmp_path, lambda _seconds: None)
+    try:
+        summary = agent._finish_flight_recorder(
+            {
+                "status": "triggered",
+                "pipe": "/tmp/nccl_pipe_6.pipe",
+                "dump_candidates": [str(dump)],
+                "previous_mtimes": {},
+            }
+        )
+    finally:
+        os.chmod(dump, 0o644)
+
+    assert summary["status"] == "dumped", summary
+    assert "PermissionError" in summary["parse_error"], summary
+
+
+def test_flight_recorder_dump_size_survives_a_vanishing_file(tmp_path) -> None:
+    """The reported size is the one measured when the dump was selected.
+
+    The summary re-``stat``ed the winning candidate twice more after choosing
+    it, outside the ``parse_error`` guard, so a dump the container rotated in
+    that window raised FileNotFoundError out of the whole command.
+    """
+
+    dump = tmp_path / "nccl_trace_rank_7"
+    payload = _flight_dump_payload()
+    dump.write_text(payload)
+    agent = _triage_only_executor(tmp_path, lambda _seconds: None)
+
+    summary = agent._finish_flight_recorder(
+        {
+            "status": "triggered",
+            "pipe": "/tmp/nccl_pipe_7.pipe",
+            "dump_candidates": [str(dump)],
+            "previous_mtimes": {},
+        }
+    )
+
+    assert summary["dump_size_bytes"] == len(payload), summary
+
+
+def test_flight_recorder_trigger_survives_an_unstattable_pipe(tmp_path) -> None:
+    """The trigger phase reads the same attacker-influenced paths.
+
+    ``TORCH_NCCL_DEBUG_INFO_PIPE_FILE`` is taken from the container's
+    ``environ`` too, and ``_trigger_flight_recorder`` probed it with bare
+    ``path.exists()``/``path.stat()``. An overlong component raised
+    ENAMETOOLONG before the finish phase was ever reached, so guarding only
+    the finish phase would have left the same one-env-var kill switch open.
+    """
+
+    proc_root = tmp_path / "proc"
+    (proc_root / "321" / "root" / "tmp").mkdir(parents=True)
+    (proc_root / "321" / "cwd").mkdir()
+    agent = NodeActionExecutor(
+        secret="s" * 48,
+        node_ids={"node-a"},
+        allowed_operations={WorkflowOperation.COLLECT_HUNG_TRIAGE},
+        reset_enabled=False,
+        ledger=None,
+        proc_root=str(proc_root),
+        runner=lambda argv, **_: CompletedProcess(argv, 0, "", ""),
+        sleep=lambda _seconds: None,
+        now=lambda: NOW,
+    )
+
+    result = agent._trigger_flight_recorder(
+        {
+            "pid": 321,
+            "rank": 4,
+            "_environment": {
+                "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": "/tmp/" + "p" * 300,
+                "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": "/tmp/" + "d" * 300,
+            },
+        }
+    )
+
+    assert result["status"] == "pipe_missing", result
+
+
 def test_stack_summary_drops_pyspy_banners_and_sees_device_sync() -> None:
     dump = (
         "Process 1394129: /opt/venv/bin/python3 -u train.py\n"
