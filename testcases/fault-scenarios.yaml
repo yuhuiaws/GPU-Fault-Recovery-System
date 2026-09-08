@@ -3919,7 +3919,13 @@ test_cases:
   - CloudTrail 中 BatchRebootClusterNodes、BatchReplaceClusterNodes、BatchDeleteClusterNodes 均为空；控制面日志无 Kubernetes workload 写操作；控制面 EKS 比对结果为 IDENTICAL
   - 清理后：测试作业已删除且远端命令静默；探针 Pod/ConfigMap 与预热 Pod 无残留；若某分支失败留下隔离，只允许经 validated-restore 工作流解除
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0898992083cbf303933b7cd5839b6d5d9a0816040a85938b4fedf72075ebca9d
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-015
   related_pytest: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
@@ -3958,7 +3964,13 @@ test_cases:
   - 节点回到 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；GPU 容量回到基线；quiesce state 文件与 NVIDIA compute client 无残留，基线 active 的服务全部回到 active
   - 清理后：持有者与 arm 单元已幂等解除、探针 Pod 与 ConfigMap 无残留、远端命令静默；若节点仍隔离，只允许经 validated-restore 工作流解除，任何清理失败直接判 FAIL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4a4d0394c3e7a8440e2dce837442a513c07704e53041719225a88f2205538525
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-016
   related_pytest: tests/regional/test_destr016_preempting_reboot.py::test_destr016_workflow_contract_preempts_the_reset_and_reboots_once
@@ -4000,7 +4012,13 @@ test_cases:
   - 清理后：未点火的 reboot 定时器已取消、设备占用已解除、节点 Ready 且 schedulable、无 gpu-fault taint 与 ownership 注解、GPU 数与基线一致、基线 active 的服务全部回到 active、quiesce state 与 gpu-fault timer 无残留、探针 Pod/ConfigMap 零残留
   - 隔离只允许经 validated-restore 工作流解除（先 support 后继 incident、再原 incident 走 already_restored 空操作路径），任何情况下不得手工删除 taint 或注解
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ae0b1af2ed5074f8abacf757a905c90c0b04225c467cfd6968692e1142bb7938
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-017
   related_pytest: tests/regional/test_destr017_out_of_band_reboot_fence.py::test_the_fenced_workflow_contract_accepts_the_expected_terminal_record
