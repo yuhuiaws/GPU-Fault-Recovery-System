@@ -779,3 +779,20 @@ def test_installer_refuses_a_wheel_the_release_manifest_disowns(tmp_path: Path) 
     result = _run_probe(probe, empty)
     assert result.returncode != 0
     assert "collector wheel not found" in result.stdout
+
+
+def test_deploy_scripts_accept_xz_compressed_wheel_configmaps() -> None:
+    """Wheel ConfigMaps hold ``<wheel>.xz`` since the control-plane wheel
+    outgrew the 1 MiB ceiling; the GPU-stage reconciler deploy refused the
+    executor wheel ConfigMap live because it only looked for the raw key."""
+    reconciler = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
+    assert (
+        'if sys.argv[1] not in keys and sys.argv[1] + ".xz" not in keys:' in reconciler
+    ), "reconciler deploy must accept the xz-compressed executor wheel key"
+    role_split = (
+        ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
+    ).read_text()
+    assert 'for key in (name + ".xz", name):' in role_split, (
+        "role-split apply must derive the wheel digest from either form"
+    )
+    assert "lzma.decompress(data)" in role_split, role_split[:0]

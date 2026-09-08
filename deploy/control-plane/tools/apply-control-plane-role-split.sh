@@ -144,13 +144,24 @@ fi
 WHEEL_CONFIGMAP="${GPU_FAULT_WHEEL_CONFIGMAP:-gpu-fault-control-plane-wheel-0100}"
 WHEEL_SHA256="${GPU_FAULT_WHEEL_SHA256:-}"
 if [[ -z "${WHEEL_SHA256}" ]]; then
+    # The ConfigMap holds either the raw wheel under its file name or, since the
+    # wheel outgrew the 1 MiB ConfigMap ceiling, the xz-compressed wheel under
+    # <wheel>.xz; the digest is always the wheel's own.
     WHEEL_SHA256="$(
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get configmap \
-            "${WHEEL_CONFIGMAP}" \
-            -o jsonpath='{.binaryData.gpu_fault_control_plane-0\.10\.0-py3-none-any\.whl}' |
-            base64 -d |
-            sha256sum |
-            awk '{print $1}'
+            "${WHEEL_CONFIGMAP}" -o json |
+            python3 -c '
+import base64, hashlib, json, lzma, sys
+binary = json.load(sys.stdin).get("binaryData") or {}
+name = "gpu_fault_control_plane-0.10.0-py3-none-any.whl"
+for key in (name + ".xz", name):
+    if key in binary:
+        data = base64.b64decode(binary[key])
+        if key.endswith(".xz"):
+            data = lzma.decompress(data)
+        print(hashlib.sha256(data).hexdigest())
+        break
+'
     )"
 fi
 [[ "${WHEEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {

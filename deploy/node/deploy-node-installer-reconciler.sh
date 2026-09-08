@@ -210,7 +210,9 @@ import sys
 
 document = json.load(sys.stdin)
 keys = set((document.get("data") or {})) | set(document.get("binaryData") or {})
-if sys.argv[1] not in keys:
+# The release engine stores wheels xz-compressed (<wheel>.xz) to stay under the
+# 1 MiB ConfigMap ceiling; older ConfigMaps hold the raw wheel under its name.
+if sys.argv[1] not in keys and sys.argv[1] + ".xz" not in keys:
     raise SystemExit("wheel ConfigMap is missing the candidate Executor wheel")
 ' "${EXECUTOR_WHEEL_FILENAME}"
 kubectl_context -n "${NAMESPACE}" get secret \
