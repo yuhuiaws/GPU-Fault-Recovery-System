@@ -17,8 +17,12 @@ review F5/F8):
 
 The deadline must not turn a fail-closed path into a fail-open one: for a node
 action the executor cannot know whether the Agent finished, so the timeout
-result says the outcome is unknown (``manual_confirmation_required``, exactly
-what an INTERRUPTED node action reports) instead of a plain FAILED.
+result says the outcome is unknown -- its own ``status_source``, plus
+``manual_confirmation_required`` in details, exactly what an INTERRUPTED node
+action reports -- instead of a plain FAILED. And while that verdict has not
+reached the control plane, the lease is held rather than dropped: an expired
+lease over a thread that may still be mutating is an invitation for a sibling
+replica to mutate the same node again.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import time
 from pathlib import Path
 from threading import Event
 from typing import Any
+from urllib.error import URLError
 
 import pytest
 import yaml
@@ -56,31 +61,46 @@ EXECUTOR_MANIFEST = ROOT / "deploy/dataplane/cluster-action-executor.yaml"
 CLUSTER = "cluster-a"
 
 
+_BREADCRUMB: dict[str, str] = {}
+
+
 @pytest.fixture(autouse=True)
 def breadcrumbs_outside_shared_tmp(tmp_path, monkeypatch) -> str:
     """Keep both breadcrumbs out of the shared ``/tmp`` defaults.
 
-    The liveness path is derived from the claim-state path, so pointing the
-    claim state at ``tmp_path`` moves both under this test's own directory
-    instead of one fixed name every xdist worker would rewrite.
+    The liveness path is a fixed constant in production (the probe in the
+    manifest cannot follow a variable), so a test that wants its own file has to
+    pass it in. ``build_executor`` picks it up from here so no test writes the
+    one path every xdist worker would be rewriting at once.
     """
 
     monkeypatch.setenv(
         "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH",
         str(tmp_path / "claim-state.json"),
     )
-    return str(tmp_path / "executor-loop-alive")
+    path = str(tmp_path / "executor-loop-alive")
+    monkeypatch.setitem(_BREADCRUMB, "path", path)
+    return path
 
 
 def build_executor(
     client: FakeExecutorClient, adapters: list[Any], **overrides: Any
 ) -> ClusterActionExecutor:
+    overrides.setdefault("liveness_state_path", _BREADCRUMB["path"])
     return ClusterActionExecutor(
         client,
         adapters,
         executor_id=EXECUTOR,
         allowed_namespaces={"training"},
         **overrides,
+    )
+
+
+def default_executor() -> ClusterActionExecutor:
+    """An executor built exactly the way ``main()`` builds it, paths included."""
+
+    return ClusterActionExecutor(
+        FakeExecutorClient(), [], executor_id=EXECUTOR, allowed_namespaces={"training"}
     )
 
 
@@ -185,7 +205,10 @@ def test_a_stuck_node_action_reports_an_unknown_outcome_not_a_plain_failure() ->
     try:
         executor.run_once()
         result = client.reported("command-a")
-        assert result.status_source == "executor-execution-timeout", result
+        assert result.status_source == ("executor-execution-timeout-outcome-unknown"), (
+            "an unknown outcome must be distinguishable from a bounded timeout "
+            f"by status_source alone, because nothing reads details: {result}"
+        )
         assert result.details["manual_confirmation_required"] is True, (
             "a node action whose outcome is unknown must not close silently: "
             f"{result.details}"
@@ -199,6 +222,52 @@ def test_a_stuck_node_action_reports_an_unknown_outcome_not_a_plain_failure() ->
     assert adapter.returned.wait(10), "the stuck adapter never returned"
 
 
+def test_an_abandoned_mutation_keeps_its_lease_while_the_verdict_is_missing(
+    monkeypatch,
+) -> None:
+    """A lapsed lease over a still-mutating thread invites a second mutation.
+
+    The timeout verdict is the only thing that closes the command, so when
+    posting it fails the command stays open *and* leased. Dropping the heartbeat
+    then would let the lease expire and a sibling replica claim the same
+    RESET_GPU while this process's abandoned thread is, as far as anyone can
+    tell, still driving it. The lease is held until the thread returns instead,
+    and released as soon as it does.
+    """
+
+    client = FakeExecutorClient(
+        [remote_command("command-a", operation=WorkflowOperation.RESET_GPU)],
+        complete_errors={"command-a": URLError("control plane unreachable")},
+    )
+    marks = renew_stop_marks(monkeypatch, client)
+    adapter = StuckAdapter()
+    executor = build_executor(
+        client, [adapter], max_execution_seconds=0.2, sleep=lambda _seconds: None
+    )
+
+    executor.run_once()
+
+    assert client.completed != [], "the timeout verdict was never even attempted"
+    assert marks == [], (
+        "the renewer was stopped while the verdict had not landed and the "
+        f"abandoned mutation was still running: stopped after {marks} post(s)"
+    )
+    assert executor.metrics_snapshot()["abandoned_lease_holds_total"] == 1, (
+        "an operator has to be able to see a lease held for an abandoned thread"
+    )
+
+    adapter.released.set()
+    assert adapter.returned.wait(10), "the stuck adapter never returned"
+    deadline = time.monotonic() + 10
+    while not marks and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert marks != [], (
+        "the lease was still being renewed after the abandoned thread returned, "
+        "which parks the command on this replica forever"
+    )
+
+
 def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
     """VALIDATE_HOST changes nothing, so the flag would only cost attention."""
 
@@ -210,6 +279,10 @@ def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
         executor.run_once()
         result = client.reported("command-a")
         assert "manual_confirmation_required" not in result.details, result.details
+        assert result.status_source == "executor-execution-timeout", (
+            "a read-only timeout is a plain timeout; reusing the unknown-outcome "
+            f"source would ask an operator to confirm nothing: {result}"
+        )
     finally:
         adapter.released.set()
     assert adapter.returned.wait(10), "the stuck adapter never returned"
@@ -367,6 +440,30 @@ def test_the_liveness_breadcrumb_is_refreshed_even_when_the_claim_fails(
     )
 
 
+def test_the_liveness_path_does_not_follow_the_claim_state_path(
+    monkeypatch, tmp_path
+) -> None:
+    """The probe's path is hardcoded in the manifest, so the loop's must be too.
+
+    ``GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH`` is documented and moved by
+    e2e probes. If the liveness breadcrumb followed it, moving the claim state
+    would send the breadcrumb somewhere the container's probe never reads --
+    and a perfectly healthy executor would be killed every 90 seconds.
+    """
+
+    monkeypatch.setenv(
+        "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH",
+        str(tmp_path / "elsewhere" / "claim-state.json"),
+    )
+
+    executor = default_executor()
+
+    assert executor.liveness_state_path == DEFAULT_LIVENESS_STATE_PATH, (
+        "the liveness breadcrumb must stay where the manifest probe reads it, "
+        f"but it moved to {executor.liveness_state_path}"
+    )
+
+
 def test_the_executor_manifest_probes_the_poll_loop_liveness() -> None:
     """The Deployment restarts a wedged loop, and only a wedged loop.
 
@@ -385,8 +482,12 @@ def test_the_executor_manifest_probes_the_poll_loop_liveness() -> None:
     liveness = container["livenessProbe"]
     probe = " ".join(liveness["exec"]["command"])
 
-    assert DEFAULT_LIVENESS_STATE_PATH in probe, (
-        f"the probe must read the path the poll loop writes: {probe}"
+    # Derived the way the runtime derives it, not from the constant: an
+    # executor that resolved its breadcrumb from anything else -- an env var an
+    # e2e probe moves, for instance -- would leave the probe reading a file
+    # nobody writes, and the constant alone cannot see that.
+    assert default_executor().liveness_state_path in probe, (
+        f"the probe must read the path the poll loop actually writes: {probe}"
     )
     assert str(LIVENESS_STALE_AFTER_SECONDS) in probe, (
         f"the probe must use the documented staleness bound: {probe}"
@@ -394,9 +495,14 @@ def test_the_executor_manifest_probes_the_poll_loop_liveness() -> None:
     assert "readiness" not in probe, (
         f"liveness must not depend on the control plane: {probe}"
     )
+    # The startup probe only tests a marker touched *before* ``exec``, so it
+    # says nothing about the loop; what covers the gap before the first
+    # breadcrumb is written is this budget, and it must stay wide enough that
+    # process start plus one claim cycle cannot exhaust it.
     assert liveness["periodSeconds"] * liveness["failureThreshold"] >= 60, liveness
     assert "initialDelaySeconds" not in liveness, (
-        f"the startup probe already gates liveness: {liveness}"
+        "the failure budget already covers the first breadcrumb write, and an "
+        f"initial delay would only postpone restarting a wedged loop: {liveness}"
     )
     assert (
         container["startupProbe"]["exec"]["command"] != liveness["exec"]["command"]

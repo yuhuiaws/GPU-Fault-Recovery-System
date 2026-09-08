@@ -58,6 +58,7 @@ from gpu_fault.hyperpod_spares import (
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.models import (
     AdvisoryNotification,
+    WorkflowOperation,
     WorkflowStepExecution,
     WorkflowStepStatus,
     execution_phase,
@@ -147,8 +148,27 @@ LIVENESS_STALE_AFTER_SECONDS = 300
 # half-applied. Their timeout demands manual confirmation instead of closing
 # the step silently.
 _TIMEOUT_UNKNOWN_STATE_OPERATIONS = (
-    operations_for_adapter(OperationAdapter.NODE_ACTION) | DESTRUCTIVE_OPERATIONS
+    operations_for_adapter(OperationAdapter.NODE_ACTION)
+    | DESTRUCTIVE_OPERATIONS
+    | {
+        # Neither destructive nor node actions, but each leaves state outside
+        # this process that a plain failure would misrepresent: a support case
+        # may already be open with the vendor, an evidence freeze may already
+        # have copied part of its bundle, and a checkpoint may still be running
+        # inside the job.
+        WorkflowOperation.ESCALATE_SUPPORT,
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.CHECKPOINT_WORKLOADS,
+    }
 )
+# Two status sources, because nothing reads ``details``: the plain one means
+# "this executor gave up waiting for a step that changes nothing", the unknown
+# one means "something outside this process may still be mutating and a human
+# has to confirm what happened". Only the second may be escalated by hand.
+EXECUTION_TIMEOUT_STATUS_SOURCE = "executor-execution-timeout"
+EXECUTION_TIMEOUT_UNKNOWN_STATUS_SOURCE = "executor-execution-timeout-outcome-unknown"
+# How often the guard thread checks whether an abandoned worker came back.
+_ABANDONED_WORKER_POLL_SECONDS = 0.25
 # Transport failures reach the caller as several unrelated families, and only
 # HTTPError used to be converted. ``socket.timeout`` is an alias of
 # ``TimeoutError`` on 3.12 and is named here for readers, not for coverage.
@@ -958,6 +978,7 @@ class ClusterActionExecutor:
         confirm_cluster_name: str | None = None,
         claim_backoff_max_seconds: float = 60,
         claim_state_path: str | None = None,
+        liveness_state_path: str | None = None,
         lease_renewal_failure_limit: int = 3,
         max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
         liveness_interval_seconds: float = (DEFAULT_LIVENESS_INTERVAL_SECONDS),
@@ -1060,6 +1081,10 @@ class ClusterActionExecutor:
         # thread, so an operator has to see them accumulate).
         self.execution_timeouts_total = 0
         self.stuck_executions = 0
+        # Leases kept alive for a command this executor abandoned and could not
+        # report: the local thread may still be mutating, so the lease is held
+        # rather than handed to a sibling replica.
+        self.abandoned_lease_holds_total = 0
         # SIGTERM asks the loop to stop claiming and asks every in-flight
         # command to stop renewing, so the lease lapses on the control plane's
         # own schedule instead of being parked for a full window.
@@ -1078,15 +1103,18 @@ class ClusterActionExecutor:
             "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_STATE_PATH",
             "/tmp/executor-claim-state.json",
         )
-        # Beside the claim breadcrumb, never inside it: the liveness probe must
-        # be able to tell "the loop is turning" from "the last claim succeeded",
-        # which are different questions with different answers during a
-        # control-plane outage.
-        claim_state_directory = os.path.dirname(str(self.claim_state_path))
-        self.liveness_state_path = os.path.join(
-            claim_state_directory or ".",
-            os.path.basename(DEFAULT_LIVENESS_STATE_PATH),
-        )
+        # A separate file from the claim breadcrumb, never a field inside it:
+        # the liveness probe must be able to tell "the loop is turning" from
+        # "the last claim succeeded", which are different questions with
+        # different answers during a control-plane outage.
+        #
+        # Deliberately a constant and not derived from the claim-state path or
+        # from an environment variable of its own: the container's probe reads
+        # one hardcoded path, so anything that could move this file at runtime
+        # would leave the probe reading a file nobody writes and kill a healthy
+        # executor every failure budget. Only an in-process caller (a test) may
+        # redirect it.
+        self.liveness_state_path = liveness_state_path or DEFAULT_LIVENESS_STATE_PATH
         self.fleet_registry = next(
             (
                 registry
@@ -1205,6 +1233,7 @@ class ClusterActionExecutor:
             "retryable_adapter_errors_total": self.retryable_adapter_errors_total,
             "execution_timeouts_total": self.execution_timeouts_total,
             "stuck_executions": self.stuck_executions,
+            "abandoned_lease_holds_total": (self.abandoned_lease_holds_total),
             "spare_reservations_reclaimed_total": (
                 self.spare_reservation_sweep.reclaimed_total
                 if self.spare_reservation_sweep is not None
@@ -1349,10 +1378,13 @@ class ClusterActionExecutor:
             daemon=True,
         )
         renewer.start()
-        # The node-action adapter reads this before every send, so a lost
-        # lease stops new node actions without widening the adapter API.
+        # Set by _execute_within_deadline when it gives up on a thread whose
+        # outcome is unknown: the finally has to decide between releasing the
+        # lease and holding it over a mutation that may still be running.
+        abandoned: dict[str, Any] = {}
+        reported = False
         try:
-            result = self._execute_within_deadline(command, watch, stop)
+            result = self._execute_within_deadline(command, watch, stop, abandoned)
             if watch.lost():
                 # Another executor may hold this command by now. The agent
                 # ledger keeps whatever ran; the next lease holder polls it
@@ -1374,21 +1406,30 @@ class ClusterActionExecutor:
                     watch.hold_reason(),
                 )
                 return RemoteCommandStatus.WAITING
-            if not self._report_result(command, result, watch):
+            reported = self._report_result(command, result, watch)
+            if not reported:
                 # The action ran but its verdict never landed. WAITING keeps
                 # this cycle off the fast path (the command is still open on
                 # the control plane) instead of claiming that it advanced.
                 return RemoteCommandStatus.WAITING
             return result.status
         finally:
-            stop.set()
-            renewer.join(timeout=2)
+            worker = abandoned.get("worker")
+            if worker is not None and not reported and not watch.lost():
+                # Unknown outcome, no verdict on the control plane, and a thread
+                # that may still be mutating: keep the heartbeat going instead
+                # of inviting a sibling replica in.
+                self._hold_lease_for_abandoned_worker(command, stop, renewer, worker)
+            else:
+                stop.set()
+                renewer.join(timeout=2)
 
     def _execute_within_deadline(
         self,
         command: RemoteActionCommand,
         watch: CommandLeaseWatch,
         stop: Event,
+        abandoned: dict[str, Any],
     ) -> RemoteCommandResult:
         """Run one command on its own thread, bounded by the execution cap.
 
@@ -1455,10 +1496,18 @@ class ClusterActionExecutor:
             outcome["abandoned"] = True
             self._increment("execution_timeouts_total")
             self._increment("stuck_executions")
-        # Stop the heartbeat before the verdict is posted: telling the control
-        # plane the lease is alive while reporting that the outcome is unknown
-        # would be two contradictory claims in the same cycle.
-        stop.set()
+        if self._timeout_outcome_is_unknown(command):
+            # The thread may still be mutating a node. Hand it to the caller so
+            # the lease can be held until the verdict lands or the thread comes
+            # back: an expired lease over a live mutation is how two replicas
+            # end up resetting the same GPU.
+            abandoned["worker"] = worker
+        else:
+            # Nothing outside this process is in flight, so stop the heartbeat
+            # before the verdict is posted: telling the control plane the lease
+            # is alive while reporting a step this executor gave up on would be
+            # two contradictory claims in the same cycle.
+            stop.set()
         LOGGER.error(
             "regional command exceeded the execution cap and was abandoned; "
             "the thread cannot be killed and stays stuck: command=%s "
@@ -1482,6 +1531,13 @@ class ClusterActionExecutor:
         agent's ledger right now, so the result says the outcome is unknown and
         demands manual confirmation -- the same shape an INTERRUPTED node action
         reports.
+
+        The distinction is carried by ``status_source`` and not only by
+        ``details``, because no control-plane reader looks inside ``details``
+        today: ``executor-execution-timeout-outcome-unknown`` is the single
+        string an escalation policy has to special-case to keep a workflow from
+        promoting an unknown REMEDIATE_DRIVER to REPLACE_NODE while the
+        abandoned thread is still installing a driver.
         """
 
         operation = command.step.operation
@@ -1496,12 +1552,17 @@ class ClusterActionExecutor:
             # The ledger row is the only way an operator can find out what the
             # agent actually did.
             details["node_action_command_id"] = pointer
-        if operation in _TIMEOUT_UNKNOWN_STATE_OPERATIONS:
+        unknown = self._timeout_outcome_is_unknown(command)
+        if unknown:
             details["manual_confirmation_required"] = True
         return RemoteCommandResult(
             lease_token=str(command.lease_token),
             status=RemoteCommandStatus.FAILED,
-            status_source="executor-execution-timeout",
+            status_source=(
+                EXECUTION_TIMEOUT_UNKNOWN_STATUS_SOURCE
+                if unknown
+                else EXECUTION_TIMEOUT_STATUS_SOURCE
+            ),
             details=details,
             error=(
                 f"executor abandoned {operation.value} after "
@@ -1509,6 +1570,77 @@ class ClusterActionExecutor:
                 "and the operation may still be running on the node"
             ),
         )
+
+    @staticmethod
+    def _timeout_outcome_is_unknown(command: RemoteActionCommand) -> bool:
+        """Whether abandoning this command leaves state nobody can see.
+
+        A node action lives in the agent's own ledger, a destructive operation
+        may have half-applied, and a support escalation may already have opened
+        a case. For those the timeout is not a verdict about the step, only
+        about this executor's patience.
+        """
+
+        return command.step.operation in _TIMEOUT_UNKNOWN_STATE_OPERATIONS
+
+    def _hold_lease_for_abandoned_worker(
+        self,
+        command: RemoteActionCommand,
+        stop: Event,
+        renewer: Thread,
+        worker: Thread,
+    ) -> None:
+        """Keep an abandoned command LEASED while its thread may still mutate.
+
+        Reached only when all three are true: the outcome is unknown, the
+        timeout verdict never reached the control plane (so the command is still
+        open), and the thread has not come back. Letting the lease lapse there
+        would let a sibling replica claim the same destructive command while
+        this process is, as far as anyone can tell, still driving it -- two
+        replicas resetting one GPU is worse than one command parked for a while.
+
+        Bounded on purpose: renewal ends when the thread returns, when SIGTERM
+        arrives (the process is going away and its threads with it, so the agent
+        ledger becomes the only record either way) or after one more execution
+        window, whichever comes first. A guard thread rather than an inline wait,
+        because the poll loop must keep turning.
+        """
+
+        self._increment("abandoned_lease_holds_total")
+        LOGGER.error(
+            "regional cluster executor is holding a lease for an abandoned "
+            "command whose verdict never landed: command=%s cluster=%s "
+            "operation=%s nodes=%s hold_window=%.1fs",
+            command.command_id,
+            command.cluster_id,
+            command.step.operation.value,
+            ",".join(command.step.node_ids),
+            self.max_execution_seconds,
+        )
+        deadline = self.clock() + self.max_execution_seconds
+
+        def hold() -> None:
+            try:
+                while worker.is_alive() and not self._stop_requested:
+                    if self.clock() >= deadline:
+                        LOGGER.error(
+                            "abandoned regional command is still running after "
+                            "the lease hold window; releasing the lease so the "
+                            "control plane can decide: command=%s operation=%s",
+                            command.command_id,
+                            command.step.operation.value,
+                        )
+                        break
+                    worker.join(_ABANDONED_WORKER_POLL_SECONDS)
+            finally:
+                stop.set()
+                renewer.join(timeout=2)
+
+        Thread(
+            target=hold,
+            name=f"hold-{command.command_id[:24]}",
+            daemon=True,
+        ).start()
 
     def _report_result(
         self,
@@ -2004,22 +2136,40 @@ class ClusterActionExecutor:
 
     @staticmethod
     def _node_action_already_started(command: RemoteActionCommand) -> bool:
-        """Whether this command's mutation is already under way on a node.
+        """Whether an agent has *accepted* this command's mutation.
 
-        The adapter writes ``node_action_command_id`` once the agent has
-        accepted the command, so its presence in the replayed
-        ``result_details`` means the mutation cannot be called back: re-running
-        the destructive preflight buys nothing and costs two control-plane round
-        trips on every poll -- and worse, a rollout that starts meanwhile would
-        flip the poll to WAITING, stranding the only path to the outcome.
+        Only then is re-running the destructive preflight pointless: the work
+        lives in the agent's ledger, cannot be called back, and a rollout that
+        starts meanwhile would flip the poll to WAITING and strand the only path
+        to the outcome. It costs two control-plane round trips per poll.
 
-        Nothing weaker counts. ``result_details`` also carries baselines, spare
-        state and retry counts from a cycle that was merely *held*, and treating
-        those as "started" would open the fail-closed gate in front of a
-        mutation that has not begun.
+        The pointer alone proves nothing. ``node_action_command_id`` is also
+        stamped when the submit never left this process (a refused connection --
+        the normal state of a faulty node), when the agent answered 5xx/408/429,
+        and when it demanded a new envelope (COMMAND_EXPIRED,
+        STALE_AGENT_GENERATION). In all of those the mutation has not begun, so
+        the gate has to see the acceptance the transport records only after it
+        parsed a PENDING submission out of the agent.
+
+        For a multi-node destructive step, acceptance is read at step level: the
+        step's ``result_details`` carry the state of the node the step is
+        currently waiting on (``adapters/node_action/step_execution.py`` folds
+        the batch and keeps the waiting node's details, merging the nodes already
+        completed). One accepted node is enough, and deliberately so -- the step
+        as a whole is mid-mutation from that point on, and re-fencing it would
+        strand the accepted node's action exactly the way ``fleet_preflight``
+        already refuses to strand compensation after a completed destructive
+        step. The remaining nodes are still protected per send: the adapter
+        re-resolves each endpoint and agent generation, and the lease guard stops
+        new sends outright once the lease is lost.
         """
 
-        return bool((command.result_details or {}).get("node_action_command_id"))
+        details = command.result_details or {}
+        if not details.get("node_action_command_id"):
+            return False
+        return bool(details.get("node_action_accepted")) or (
+            details.get("node_action_state") == "PENDING"
+        )
 
     @staticmethod
     def _hold_details(

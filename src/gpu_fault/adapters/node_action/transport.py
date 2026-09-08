@@ -204,11 +204,18 @@ class NodeActionTransportMixin:
                 ssl_context=ssl_context,
             )
         except NodeActionPending as exc:
+            # The only path that parsed an acceptance out of the agent: the
+            # ledger row exists and the agent owns the work. Every other branch
+            # below also carries ``node_action_command_id`` -- a refused
+            # connection, a 503, an expired envelope -- so the pointer alone
+            # cannot tell a caller that anything started. Callers that must know
+            # (the executor's destructive fleet preflight) read this key.
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
                 details={
                     "node_action_command_id": exc.command_id,
                     "node_action_state": "PENDING",
+                    "node_action_accepted": True,
                     **exc.details,
                 },
             )
