@@ -20,7 +20,6 @@
   "tests/collectors/test_gpu.py:collector._next_health_summary_at": 1,
   "tests/collectors/test_gpu.py:collector._previous_values": 1,
   "tests/collectors/test_gpu.py:collector._rank_liveness": 1,
-  "tests/collectors/test_gpu.py:collector._temperature_limit_samples": 1,
   "tests/collectors/test_host.py:HostTelemetryCollector._filesystem_type": 2,
   "tests/collectors/test_host.py:collector._bmc": 1,
   "tests/collectors/test_host.py:collector._diskstats": 2,

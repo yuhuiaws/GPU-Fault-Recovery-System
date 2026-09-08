@@ -148,7 +148,6 @@
   "src/gpu_fault/collectors/host/network.py:var-annotated": 3,
   "src/gpu_fault/collectors/host/system_metrics.py:var-annotated": 1,
   "src/gpu_fault/collectors/logs/node.py:var-annotated": 1,
-  "src/gpu_fault/collectors_cli.py:attr-defined": 2,
   "src/gpu_fault/completion_controller.py:arg-type": 2,
   "src/gpu_fault/completion_controller.py:misc": 1,
   "src/gpu_fault/completion_controller.py:no-any-return": 2,
