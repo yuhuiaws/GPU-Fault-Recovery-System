@@ -3384,11 +3384,11 @@ test_cases:
     会以 executor-internal-error FAILED 收尾并升级到 ESCALATE_SUPPORT。ARCH-INTEGRATION 已把 retryable_adapter_error
     接进 cluster executor 的异常出口（计数 retryable_adapter_errors_total）。本用例是这条对称契约在区域部署上的验收。
   injection: >-
-    （设计，尚未实现驱动）在 GPU EKS 上为目标节点创建一条 ValidatingWebhookConfiguration：rules 仅 nodes 的 UPDATE，
+    在 GPU EKS 上为目标节点创建一条 ValidatingWebhookConfiguration：rules 仅 nodes 的 UPDATE，
     objectSelector 仅 kubernetes.io/hostname=<目标节点>，matchConditions 仅 executor ServiceAccount 的 username，
     failurePolicy=Fail、timeoutSeconds=1、clientConfig 指向不存在的 Service，使该节点上 executor 的 node patch 得到 HTTP 500；
     随后按 COLLECT-017 A 段解绑一个 EFA function 开出 REMEDIATE_EFA_DRIVER 工作流（含 MARK_UNSCHEDULABLE 与 RESTORE_SCHEDULING），
-    60 s 后删除 webhook；由执行器镜像运行的 Job 作为 deadman 在到点时独立删除同名 webhook。不重启节点，不做 reset。
+    首次观察到隔离步骤以可重试标记 WAITING 后再保持 60 s 才删除 webhook（600 s 内未命中则删除并判 FAIL）；由执行器镜像运行的 Job 作为 deadman 在到点时独立删除同名 webhook。不重启节点，不做 reset。
   expected:
   - 命中 500 的节点隔离步骤在 remote command 上为 WAITING，result_details 带可重试标记（retryable_transport_error 或区域回放的 retryable_adapter_error），控制面 step_execution 为 WAITING 而非 FAILED
   - webhook 删除后同一步骤 SUCCEEDED，工作流按 COLLECT-017 A 段七步收尾为 SUCCEEDED，incident RECOVERED，节点最终 Ready 且可调度

@@ -68,6 +68,7 @@ STANDARD_RUNNERS = (
     "run_ha003_aurora_failover_reset",
     "run_ha004_waiting_reclaim_reset",
     "run_iso006_cluster_offline",
+    "run_net007_transient_api_outage",
 )
 #: Runners that select their case at configure time, so the identity comes
 #: from the settings rather than from module constants.
