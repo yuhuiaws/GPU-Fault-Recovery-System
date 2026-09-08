@@ -29,6 +29,8 @@ import json
 import logging
 import socket
 import ssl
+import time
+from datetime import datetime, timezone
 from http.client import IncompleteRead
 from io import BytesIO
 from typing import Any
@@ -54,6 +56,7 @@ from tests.execution.test_cluster_executor_lease_and_report import (
     FakeExecutorClient,
     RecordingAdapter,
     remote_command,
+    stop_events,
 )
 
 CONTROL_PLANE = "https://control-plane.example"
@@ -291,6 +294,70 @@ def test_a_lease_lost_during_the_report_backoff_withholds_the_retry(tmp_path) ->
     assert executor.reported_failures == 0, (
         "a withheld retry is not the control plane refusing the result"
     )
+
+
+class CancellingFlakyClient(FlakyReportClient):
+    """Every renewal answers "the control plane cancelled this command"."""
+
+    def renew(
+        self, command: RemoteActionCommand, executor_id: str, lease_seconds: int
+    ) -> RemoteActionCommand:
+        super().renew(command, executor_id, lease_seconds)
+        return command.model_copy(
+            update={
+                "cancellation_requested_at": datetime.now(timezone.utc),
+                "cancellation_reason": "workflow deadline expired",
+            }
+        )
+
+
+class AfterRenewalAdapter(RecordingAdapter):
+    """Returns only once the renewer has heard the cancellation."""
+
+    def __init__(self, client: FakeExecutorClient) -> None:
+        super().__init__()
+        self.client = client
+
+    def execute(self, context: Any):
+        deadline = time.monotonic() + 5
+        while not self.client.renewals and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return super().execute(context)
+
+
+def test_a_cancelled_command_still_has_its_result_reported_across_a_dropped_wire(
+    monkeypatch, tmp_path
+) -> None:
+    """A cancellation is a hold on *new* work, not a lost lease.
+
+    ``complete_remote_command`` accepts the result of a cancelled command --
+    it is the only record of what the executor did before the control plane
+    pulled the command -- and the lease is still this executor's. Giving up on
+    the first dropped connection because the watch carried a cancellation
+    reason left that record unwritten, and the command LEASED until expiry.
+    Only a *lost* lease ends the retry: past that, another replica may own it.
+    """
+
+    stop_events(monkeypatch)
+    client = CancellingFlakyClient(
+        [remote_command("command-a")],
+        complete_failures={"command-a": [URLError("connection reset by peer")]},
+    )
+    executor = build(
+        client, [AfterRenewalAdapter(client)], tmp_path, sleep=RecordingSleep()
+    )
+
+    executor.run_once()
+
+    assert client.renewals != [], "the cancellation never reached the lease watch"
+    assert client.attempts == ["command-a", "command-a"], (
+        "the report was given up after one dropped connection because the "
+        f"command was cancelled, not because the lease was lost: {client.attempts}"
+    )
+    assert client.reported("command-a").status is RemoteCommandStatus.SUCCEEDED, (
+        "the cancelled command's verdict must still land"
+    )
+    assert executor.reported_failures == 0, "nothing was refused"
 
 
 def test_a_truncated_response_on_complete_is_retried(tmp_path) -> None:

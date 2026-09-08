@@ -46,6 +46,23 @@ from gpu_fault.transport.http_client import urlopen
 TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
 
 
+def _control_plane_did_not_answer(exc: BaseException) -> bool:
+    """Whether a registry read failed without saying anything about the record.
+
+    The regional proxy raises its client errors with a ``status_code``: None
+    when the request never got an answer (URLError, timeout), the HTTP status
+    otherwise. A 404 reaches the caller as ``KeyError`` and a 4xx as a refusal,
+    both verdicts about this node; no answer and 5xx are verdicts about the
+    control plane. Matched by attribute, not type: the executor package that
+    defines the error sits above the adapters.
+    """
+
+    if not hasattr(exc, "status_code"):
+        return False
+    status = exc.status_code
+    return status is None or int(status) >= 500
+
+
 class NodeActionTransportMixin:
     # Attributes supplied by the composed concrete implementation.
     endpoints: Any
@@ -217,13 +234,14 @@ class NodeActionTransportMixin:
             # Acceptance is per node, not per step: a multi-node step is folded
             # one node at a time, so naming the node is the only way a reader
             # can tell "this step began" from "this step began on this node and
-            # has not reached the others".
+            # has not reached the others". The list is the only marker; the
+            # step-level ``node_action_accepted`` bool it replaced had no reader
+            # left and let a never-contacted node past the fleet fence.
             return WorkflowStepOutcome.waiting(
                 operation_id=context.idempotency_key,
                 details={
                     "node_action_command_id": exc.command_id,
                     "node_action_state": "PENDING",
-                    "node_action_accepted": True,
                     NODE_ACTION_ACCEPTED_NODES_KEY: [node_id],
                     **exc.details,
                 },
@@ -318,14 +336,21 @@ class NodeActionTransportMixin:
         that answers WAITING is re-dispatched every poll for as long as the
         agent works, so this is the executor's steadiest avoidable load.
 
-        Fetch failures become ``ValueError``: the caller turns that into a
-        failed step, which is the fail-closed answer for "we cannot tell which
-        key or certificate this agent expects".
+        A missing record (``KeyError``) or a refusal becomes ``ValueError``: the
+        caller turns that into a failed step, which is the fail-closed answer
+        for "we cannot tell which key or certificate this agent expects". A read
+        the control plane did not answer, or answered 5xx, says nothing about
+        the agent and is re-raised as is: the executor's retryable
+        control-plane branch holds the step WAITING, where a wrapped
+        ``ValueError`` would have failed a single-node RESET_GPU terminally --
+        and climbed the ladder to a reboot -- on one 503.
         """
 
         try:
             return self.registry.store.get_agent(cluster_id, node_id)
         except Exception as exc:
+            if _control_plane_did_not_answer(exc):
+                raise
             raise ValueError(
                 f"agent key metadata is unavailable for {node_id}"
             ) from exc

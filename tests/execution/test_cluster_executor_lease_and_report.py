@@ -66,14 +66,16 @@ def remote_command(
     node_ids: list[str] | None = None,
     result_details: dict[str, Any] | None = None,
     workflow_steps: bool = False,
+    execution_owner: str = "owner-a",
 ) -> RemoteActionCommand:
     """A claimed command whose fencing tokens agree, so ``_validate`` passes.
 
     ``workflow_steps`` puts this command's own step into the workflow's
     ``official_steps``, which is what the destructive fleet preflight reads.
+    ``execution_owner`` routes the step to a real adapter instead of a stub.
     """
 
-    step = workflow_step(operation, node_ids=node_ids)
+    step = workflow_step(operation, execution_owner, node_ids=node_ids)
     return RemoteActionCommand(
         command_id=command_id,
         cluster_id=CLUSTER,

@@ -39,6 +39,7 @@ from urllib.error import URLError
 import pytest
 import yaml
 
+from gpu_fault.adapters import NodeActionWorkflowAdapter
 from gpu_fault.cluster_executor import (
     DEFAULT_LIVENESS_STATE_PATH,
     LIVENESS_STALE_AFTER_SECONDS,
@@ -48,6 +49,7 @@ from gpu_fault.cluster_executor import (
 )
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation
+from gpu_fault.node_agent import NodeActionResult, NodeActionStatus
 from gpu_fault.regional import RemoteCommandStatus
 from tests.execution.test_cluster_executor_lease_and_report import (
     EXECUTOR,
@@ -268,6 +270,86 @@ def test_an_abandoned_mutation_keeps_its_lease_while_the_verdict_is_missing(
     assert marks != [], (
         "the lease was still being renewed after the abandoned thread returned, "
         "which parks the command on this replica forever"
+    )
+
+
+class TwoNodeAgentWire:
+    """A node-agent sender that wedges on node-a until the test releases it.
+
+    The real adapter and transport are used; only the wire is faked, because the
+    guard under test (``lease_hold_reason``) is consulted by the transport
+    immediately before every send, and a stub adapter would not consult it.
+    """
+
+    def __init__(self) -> None:
+        self.released = Event()
+        self.sent_to: list[str] = []
+
+    def __call__(self, _endpoint: str, envelope: Any) -> NodeActionResult:
+        node_id = envelope.command.node_id
+        self.sent_to.append(node_id)
+        if node_id == "node-a":
+            self.released.wait(10)
+        return NodeActionResult(
+            command_id=envelope.command.command_id,
+            operation=envelope.command.operation,
+            status=NodeActionStatus.SUCCEEDED,
+        )
+
+
+class ReturningNodeActionAdapter(NodeActionWorkflowAdapter):
+    """The real node-action adapter, signalling when ``execute`` comes back."""
+
+    def __init__(self, wire: TwoNodeAgentWire) -> None:
+        super().__init__(
+            {"node-a": "http://node-a:9099", "node-b": "http://node-b:9099"},
+            "s" * 32,
+            sender=wire,
+        )
+        self.returned = Event()
+
+    def execute(self, context: Any) -> WorkflowStepOutcome:
+        try:
+            return super().execute(context)
+        finally:
+            self.returned.set()
+
+
+def test_an_abandoned_worker_may_not_start_the_next_node_after_the_verdict() -> None:
+    """Once FAILED is on the control plane, the stuck thread must not go on.
+
+    A two-node step wedges on node-a's send. The cap passes, the executor posts
+    the unknown-outcome verdict, and the control plane treats the step as
+    settled -- it may already be starting the successor. When node-a's send
+    finally returns, ``_dispatch`` moves on to node-b: that send would start a
+    brand-new node action behind a record that says the step is over. The lease
+    guard has to refuse it the moment the verdict is reported, not up to a full
+    lease window later when the local lease happens to expire.
+    """
+
+    wire = TwoNodeAgentWire()
+    adapter = ReturningNodeActionAdapter(wire)
+    command = remote_command(
+        "command-a",
+        operation=WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+        node_ids=["node-a", "node-b"],
+        execution_owner=adapter.owner,
+    )
+    client = FakeExecutorClient([command])
+    executor = build_executor(client, [adapter], max_execution_seconds=0.2)
+
+    executor.run_once()
+    result = client.reported("command-a")
+    assert result.status is RemoteCommandStatus.FAILED, result
+    assert result.status_source == "executor-execution-timeout-outcome-unknown", result
+    assert wire.sent_to == ["node-a"], "the wedged send has not returned yet"
+
+    wire.released.set()
+    assert adapter.returned.wait(10), "the abandoned adapter never returned"
+
+    assert wire.sent_to == ["node-a"], (
+        "the abandoned worker started a node action on node-b after the "
+        f"control plane had recorded the step as FAILED: sends={wire.sent_to}"
     )
 
 

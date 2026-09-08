@@ -162,12 +162,13 @@ _TIMEOUT_UNKNOWN_STATE_OPERATIONS = (
         WorkflowOperation.CHECKPOINT_WORKLOADS,
     }
 )
-# Two status sources, because nothing reads ``details``: the plain one means
-# "this executor gave up waiting for a step that changes nothing", the unknown
-# one means "something outside this process may still be mutating and a human
-# has to confirm what happened". Only the second may be escalated by hand.
+# Two status sources: the plain one means "this executor gave up waiting for a
+# step that changes nothing", the unknown one means "something outside this
+# process may still be mutating and a human has to confirm what happened".
 EXECUTION_TIMEOUT_STATUS_SOURCE = "executor-execution-timeout"
 EXECUTION_TIMEOUT_UNKNOWN_STATUS_SOURCE = "executor-execution-timeout-outcome-unknown"
+# Why an abandoned worker's later sends are refused once its verdict landed.
+ABANDONED_WORKER_HOLD_REASON = "abandoned after the execution cap"
 # How often the guard thread checks whether an abandoned worker came back.
 _ABANDONED_WORKER_POLL_SECONDS = 0.25
 # Transport failures reach the caller as several unrelated families, and only
@@ -813,12 +814,13 @@ class CommandLeaseWatch:
     """This executor's local view of one claimed command's lease.
 
     Updated by the renewal thread, read by the executing thread (through the
-    node-action lease guard) and by ``_execute_and_report`` before it posts.
-    ``hold_reason()`` is non-None once the executor can no longer vouch for
-    the command: renewal failed ``failure_limit`` times in a row, the lease
-    window passed without a renewal landing, or the control plane asked for
-    cancellation. The first two mean another executor may already own the
-    command; the third means nothing new should start.
+    node-action lease guard), by ``_execute_under_lease`` before it posts and by
+    ``_report_result`` between report attempts. ``hold_reason()`` is non-None
+    once the executor can no longer vouch for the command: renewal failed
+    ``failure_limit`` times in a row, the lease window passed without a renewal
+    landing, the control plane asked for cancellation, or this executor gave the
+    command up (``abandon``). The first two mean another executor may already
+    own the command; all four mean nothing new should start.
     """
 
     def __init__(
@@ -867,6 +869,11 @@ class CommandLeaseWatch:
                 )
                 return True
         return False
+
+    def abandon(self, reason: str) -> None:
+        with self._lock:
+            if self.cancellation_reason is None:
+                self.cancellation_reason = reason
 
     def lost(self) -> bool:
         return self.lost_reason is not None or self.clock() >= self.expires_at
@@ -1422,6 +1429,9 @@ class ClusterActionExecutor:
                 # of inviting a sibling replica in.
                 self._hold_lease_for_abandoned_worker(command, stop, renewer, worker)
             else:
+                if worker is not None:
+                    # Verdict recorded or lease gone: no next node for the thread.
+                    watch.abandon(ABANDONED_WORKER_HOLD_REASON)
                 stop.set()
                 renewer.join(timeout=2)
 
@@ -1531,14 +1541,9 @@ class ClusterActionExecutor:
         failure for anything that mutates: the node action may be running in the
         agent's ledger right now, so the result says the outcome is unknown and
         demands manual confirmation -- the same shape an INTERRUPTED node action
-        reports.
-
-        The distinction is carried by ``status_source`` and not only by
-        ``details``, because no control-plane reader looks inside ``details``
-        today: ``executor-execution-timeout-outcome-unknown`` is the single
-        string an escalation policy has to special-case to keep a workflow from
-        promoting an unknown REMEDIATE_DRIVER to REPLACE_NODE while the
-        abandoned thread is still installing a driver.
+        reports. ``details`` is what crosses to the step record; the hardware
+        escalation reads ``outcome_unknown``/``manual_confirmation_required``
+        there and hands the step to an operator instead of climbing a rung.
         """
 
         operation = command.step.operation
@@ -1674,7 +1679,8 @@ class ClusterActionExecutor:
         the transient statuses), and only while the lease is still ours -- past
         that, another executor may already own the command and this result
         would race its result, which is exactly what the withhold rule above
-        exists to prevent.
+        exists to prevent. A cancellation is not that: the store accepts a cancelled
+        command's result, so the retry goes on under the lease this executor holds.
         """
 
         for attempt in range(1, _RESULT_REPORT_ATTEMPTS + 1):
@@ -1684,15 +1690,14 @@ class ClusterActionExecutor:
             except Exception as exc:
                 hold_reason = watch.hold_reason()
                 last_attempt = attempt >= _RESULT_REPORT_ATTEMPTS
-                if (
-                    not _retryable_report_failure(exc)
-                    or last_attempt
-                    or hold_reason is not None
-                ):
+                if not _retryable_report_failure(exc) or last_attempt or watch.lost():
                     # A rejected result (stale lease, stale fencing token,
                     # already terminal) and an unreachable control plane both
                     # end here, and neither may discard the results of the
-                    # remaining commands in this batch.
+                    # remaining commands in this batch. A cancellation is not
+                    # a reason to stop: the store accepts a cancelled command's
+                    # result, and the lease is still ours -- only a lost lease
+                    # means another replica may own it.
                     LOGGER.exception(
                         "regional cluster executor could not report result: "
                         "command=%s cluster=%s operation=%s status=%s "
@@ -1729,7 +1734,7 @@ class ClusterActionExecutor:
                 # is a withheld result, not a reporting failure: nothing was
                 # refused, and the next lease holder will redo the step.
                 hold_reason = watch.hold_reason()
-                if hold_reason is not None:
+                if watch.lost():
                     self._increment("results_withheld_total")
                     LOGGER.warning(
                         "regional cluster executor withheld an unreported "
@@ -2181,11 +2186,6 @@ class ClusterActionExecutor:
 
         details = command.result_details or {}
         if not details.get("node_action_command_id"):
-            return False
-        if not (
-            bool(details.get("node_action_accepted"))
-            or details.get("node_action_state") == "PENDING"
-        ):
             return False
         node_ids = set(command.step.node_ids)
         return bool(node_ids) and node_ids <= node_action_accepted_nodes(details)

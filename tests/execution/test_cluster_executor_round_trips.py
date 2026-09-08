@@ -237,9 +237,13 @@ def test_the_fleet_preflight_is_skipped_once_the_agent_accepted_the_command(
 
     details = node_action_details(monkeypatch, accepting_agent)
     assert details["node_action_state"] == "PENDING", details
-    assert details["node_action_accepted"] is True, (
+    assert details["node_action_accepted_nodes"] == ["node-a"], (
         "acceptance has to be stamped by the one path that parsed an agent "
         f"acceptance, so the executor can tell it from a pointer: {details}"
+    )
+    assert "node_action_accepted" not in details, (
+        "the step-level bool has no reader left; two markers for one fact drift: "
+        f"{details}"
     )
 
     registry, adapter, result = poll_a_destructive_command(details)
@@ -293,7 +297,7 @@ def test_a_pointer_the_agent_never_accepted_does_not_open_the_fence(
     assert details["node_action_state"] != "PENDING", (
         f"this wire was supposed to model a send the agent never took: {details}"
     )
-    assert "node_action_accepted" not in details, (
+    assert "node_action_accepted_nodes" not in details, (
         f"acceptance must never be stamped for a refused send: {details}"
     )
 
@@ -360,7 +364,7 @@ def test_a_node_the_step_never_reached_keeps_the_fence_closed(
     details = node_action_details(
         monkeypatch, accepting_agent, node_ids=["node-a", "node-b"]
     )
-    assert details["node_action_accepted"] is True, (
+    assert details["node_action_accepted_nodes"] == ["node-a"], (
         f"node-a's action was supposed to be accepted by the agent: {details}"
     )
 
@@ -395,7 +399,7 @@ def test_the_fence_is_skipped_once_every_node_of_the_step_is_accounted_for(
     assert details["completed_nodes"] == ["node-a"], (
         f"node-a's remediation was supposed to be folded as done: {details}"
     )
-    assert details["node_action_accepted"] is True, (
+    assert details["node_action_accepted_nodes"] == ["node-a", "node-b"], (
         f"node-b's action was supposed to be accepted by the agent: {details}"
     )
 
