@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import pytest
 import yaml
 
 from gpu_fault.admin import cluster_removal as admin_cluster_removal
@@ -515,3 +516,54 @@ def test_remove_final_checks_run_in_parallel(tmp_path, monkeypatch) -> None:
     _verify_removal_parallel(request, site.release_config["clusters"][0], site)
 
     assert maximum == 5
+
+
+def _site_with_clusters(tmp_path):
+    return load_site(site_file(tmp_path))
+
+
+def test_resolve_cluster_id_matches_an_eks_arn_without_aws(tmp_path) -> None:
+    site = _site_with_clusters(tmp_path)
+
+    resolved = admin_cluster_removal.resolve_cluster_id(
+        site,
+        "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        discover=lambda _arn: pytest.fail("an EKS ARN must not call AWS"),
+    )
+
+    assert resolved == "gpu-a"
+
+
+def test_resolve_cluster_id_resolves_a_hyperpod_arn_through_discovery(tmp_path) -> None:
+    site = _site_with_clusters(tmp_path)
+    asked: list[str] = []
+
+    def discover(arn: str) -> tuple[str, str]:
+        asked.append(arn)
+        return "arn:aws:eks:us-east-1:123456789012:cluster/other", "hp-gpu-a"
+
+    resolved = admin_cluster_removal.resolve_cluster_id(
+        site,
+        "arn:aws:sagemaker:us-east-1:123456789012:cluster/abc123def456",
+        discover=discover,
+    )
+
+    assert resolved == "gpu-a"
+    assert asked == ["arn:aws:sagemaker:us-east-1:123456789012:cluster/abc123def456"]
+
+
+def test_resolve_cluster_id_refuses_unknown_and_non_cluster_arns(tmp_path) -> None:
+    site = _site_with_clusters(tmp_path)
+
+    with pytest.raises(admin_cluster_removal.BootstrapError, match="managed clusters"):
+        admin_cluster_removal.resolve_cluster_id(
+            site, "arn:aws:eks:us-east-1:123456789012:cluster/gpu-z"
+        )
+    with pytest.raises(admin_cluster_removal.BootstrapError, match="eks or sagemaker"):
+        admin_cluster_removal.resolve_cluster_id(
+            site, "arn:aws:iam::123456789012:role/executor"
+        )
+    with pytest.raises(admin_cluster_removal.BootstrapError, match="AWS discovery"):
+        admin_cluster_removal.resolve_cluster_id(
+            site, "arn:aws:sagemaker:us-east-1:123456789012:cluster/abc123def456"
+        )

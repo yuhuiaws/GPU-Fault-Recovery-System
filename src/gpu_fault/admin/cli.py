@@ -34,6 +34,7 @@ from gpu_fault.admin.cluster_join import (
 from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
     remove_cluster,
+    resolve_cluster_id,
 )
 from gpu_fault.admin.command_log import (
     ADMIN_LOG_KIND_MUTATING,
@@ -608,12 +609,20 @@ def parser() -> argparse.ArgumentParser:
         "remove-cluster",
         usage=(
             "gpu-fault-admin remove-cluster --state-dir STATE_DIR "
-            "--cluster-id CLUSTER_ID --confirm REMOVE_GPU_CLUSTER"
+            "--gpu-cluster-arn GPU_ARN --confirm REMOVE_GPU_CLUSTER"
         ),
         help="uninstall one managed GPU data plane and keep the CPU control plane",
     )
     _add_managed_site_arguments(detach)
-    detach.add_argument("--cluster-id", required=True)
+    detach.add_argument(
+        "--gpu-cluster-arn",
+        required=True,
+        metavar="GPU_ARN",
+        help=(
+            "the managed GPU EKS or HyperPod cluster ARN to remove, as given to "
+            "deploy or join-cluster"
+        ),
+    )
     detach.add_argument(
         "--confirm",
         required=True,
@@ -647,7 +656,14 @@ def parser() -> argparse.ArgumentParser:
         choices=("keep", "delete"),
         default="keep",
     )
-    remove.add_argument("--confirm", required=True)
+    remove.add_argument(
+        "--confirm",
+        required=True,
+        help=(
+            "UNINSTALL_GPU_FAULT with --cpu-cluster keep, "
+            "DELETE_CPU_CONTROL_PLANE with --cpu-cluster delete"
+        ),
+    )
     remove.add_argument(
         "--aurora-final-snapshot",
         choices=("retain", "skip"),
@@ -832,10 +848,22 @@ def _run_remove_cluster(arguments: argparse.Namespace) -> int:
         site_file,
         repository_root=arguments.repo_root,
     )
+
+    def discover(cluster_arn: str) -> tuple[str, str]:
+        identity = discover_cluster(
+            CommandRunner(),
+            cluster_arn=cluster_arn,
+            role="gpu",
+            context="gpu-fault-admin-remove",
+        )
+        return identity.eks_arn, identity.hyperpod_name
+
     result = remove_cluster(
         RemoveClusterRequest(
             site=site,
-            cluster_id=arguments.cluster_id,
+            cluster_id=resolve_cluster_id(
+                site, arguments.gpu_cluster_arn, discover=discover
+            ),
             confirmation=arguments.confirm,
         )
     )

@@ -263,16 +263,42 @@ def test_admin_cli_exposes_single_cluster_removal(tmp_path, monkeypatch) -> None
             "remove-cluster",
             "--state-dir",
             str(tmp_path),
-            "--cluster-id",
-            "gpu-a",
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
             "--confirm",
             "REMOVE_GPU_CLUSTER",
         ]
     )
 
     assert admin_cli.run(arguments) == 0
+    # The administrator names the cluster by ARN, as for deploy and
+    # join-cluster; the derived cluster_id stays internal.
     assert calls[0].cluster_id == "gpu-a"
     assert calls[0].confirmation == "REMOVE_GPU_CLUSTER"
+
+
+def test_admin_cli_names_the_managed_clusters_for_an_unknown_arn(
+    tmp_path, monkeypatch
+) -> None:
+    site_file(tmp_path)
+    monkeypatch.setattr(
+        admin_cli, "remove_cluster", lambda request: pytest.fail("must not run")
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "remove-cluster",
+            "--state-dir",
+            str(tmp_path),
+            "--gpu-cluster-arn",
+            "arn:aws:eks:us-east-1:123456789012:cluster/gpu-z",
+            "--confirm",
+            "REMOVE_GPU_CLUSTER",
+        ]
+    )
+
+    with pytest.raises(admin_cli.BootstrapError, match="gpu-z") as failure:
+        admin_cli.run(arguments)
+    assert "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a" in str(failure.value)
 
 
 def test_admin_cli_exposes_arn_only_cluster_join(tmp_path, monkeypatch) -> None:
@@ -815,7 +841,7 @@ def test_approve_profile_help_exposes_reviewed_plan_sha(capsys) -> None:
         ("verify", ()),
         ("status", ()),
         ("join-cluster", ("--gpu-cluster-arn",)),
-        ("remove-cluster", ("--cluster-id", "--confirm")),
+        ("remove-cluster", ("--gpu-cluster-arn", "--confirm")),
         ("uninstall", ("--cpu-cluster", "--confirm")),
     ),
 )
