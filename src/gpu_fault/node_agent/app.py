@@ -149,12 +149,15 @@ def _node_action_rejection(
         )
     elif "command_id reused" in normalized:
         # The id already names a different command, so retrying this body can
-        # only collide again; the control plane has to mint a new command_id.
+        # only collide again. Nothing on the control plane mints a new
+        # command_id either -- it is derived from the step's idempotency key --
+        # so asking for one only parked the step WAITING until its 600 s bound.
+        # The reuse is a defect in the caller's body: terminal for this step.
         status, code, retryable, new_command = (
             409,
             "COMMAND_ID_REUSED",
             False,
-            True,
+            False,
         )
     else:
         status, code, retryable, new_command = (
@@ -172,6 +175,21 @@ def _node_action_rejection(
             "requires_new_command": new_command,
         },
     )
+
+
+def _closed_by_the_other_caller(result: NodeActionResult | None, error: str) -> bool:
+    """Whether the other closer of the same future already wrote this attempt.
+
+    The poll and the pool's done-callback both close a finished future, so one
+    failure goes through the wrapper twice. A non-retryable row is the
+    INTERRUPTED marker -- manual confirmation, never replay -- and a retryable
+    row over it asked for a destructive replay. A retryable row carrying this
+    very error text is the failure the first closer saved a moment ago: a second
+    row at attempt+1 spent one more ``node_action_retry_limit`` slot on a single
+    failure.
+    """
+
+    return result is not None and (not result.retryable or result.error == error)
 
 
 def _reconcile_quiesce_after_boot(agent: NodeActionExecutor) -> None:
@@ -251,7 +269,9 @@ def create_node_agent_app(
         queued, stale fencing token, command_id reused -- not an outcome. The
         command_id is deterministic, so persisting it as a permanent FAILED row
         answered every later, freshly signed envelope with that stale row. It
-        is dropped instead: the next poll 404s and the transport resubmits.
+        is dropped instead: ``submission_state`` then falls through to the
+        ledger, finds no row for the command and answers None -- a 404 to the
+        transport, which resubmits a freshly signed envelope.
         """
 
         try:
@@ -309,10 +329,8 @@ def create_node_agent_app(
                     retryable=False,
                     attempt=row[1],
                 )
-            if row is not None and row[2] is not None and not row[2].retryable:
-                # The poll and the done-callback both close the same future, so
-                # the other caller may have just written the INTERRUPTED marker.
-                # A retryable row over it asks for a destructive replay.
+            error = f"{type(exc).__name__}: {exc}"
+            if row is not None and _closed_by_the_other_caller(row[2], error):
                 return row[2]
             # Nothing was dispatched under a new attempt number, so this is
             # safe to retry: the ledger refuses to re-run a dispatched attempt.
@@ -320,7 +338,7 @@ def create_node_agent_app(
                 command_id=command_id,
                 operation=command.operation,
                 status=NodeActionStatus.FAILED,
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
                 retryable=True,
                 attempt=row[1] + 1 if row is not None else 1,
             )

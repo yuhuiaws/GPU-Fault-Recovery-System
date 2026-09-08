@@ -215,7 +215,12 @@ class Quiesced:
     """A quiesce manager stub mirroring the real fencing signature."""
 
     def assert_quiesced(
-        self, *, incident_id: str, command_id: str | None = None, for_reset: bool = True
+        self,
+        *,
+        incident_id: str,
+        command_id: str | None = None,
+        for_reset: bool = True,
+        attempt: int | None = None,
     ) -> None:
         assert incident_id == "incident-a", incident_id
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hmac
 import logging
 import os
-import sqlite3
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -329,13 +328,25 @@ class NodeActionExecutor(
         were never reset. The ledger has kept the operation, the GPU UUIDs and
         a digest of the parameters per attempt all along; this compares them.
         Columns a row does not carry (rows written before this schema, or by
-        ``save`` alone) are not evidence of a mismatch.
+        ``save`` alone) are not evidence of a mismatch -- and the newest row is
+        often such a row: the app's pool wrapper saves its failures without the
+        audit columns. Comparing only against it lost the body validation for
+        the command the moment one wrapper failure landed on top of the attempt
+        that actually ran, so the newest row that *carries* the columns decides.
         """
 
         history = self.ledger.attempt_history(command.command_id)
         if not history:
             return
-        row = history[-1]
+        row = next(
+            (
+                item
+                for item in reversed(history)
+                if item.get("gpu_uuids") is not None
+                or item.get("parameters_digest") is not None
+            ),
+            history[-1],
+        )
         recorded_uuids = row.get("gpu_uuids")
         recorded_digest = row.get("parameters_digest")
         recorded_operation = row.get("operation")
@@ -617,12 +628,26 @@ class NodeActionExecutor(
             # reset's own re-check non-retryable: past this point a resubmit
             # could only meet the claim it just took.
             self._reset_gpu_preflight(command.gpu_uuids)
-            quiesce_manager.assert_quiesced(
-                incident_id=command.incident_id,
-                command_id=command.command_id,
-            )
+            self._claim_reset_window(quiesce_manager, command)
             window_claimed = True
         return self._reset_gpu(command.gpu_uuids, window_claimed=window_claimed)
+
+    def _claim_reset_window(
+        self, quiesce_manager: GpuServiceQuiesceManager, command: NodeActionCommand
+    ) -> None:
+        """Take the quiesce window's single reset for this command's attempt.
+
+        The attempt number travels with the claim so that a refusal can name
+        "an earlier attempt of this command" when the claimant is this very
+        command_id, instead of quoting the caller its own id.
+        """
+
+        row = self.ledger.latest_row(command.command_id)
+        quiesce_manager.assert_quiesced(
+            incident_id=command.incident_id,
+            command_id=command.command_id,
+            attempt=None if row is None else row[1],
+        )
 
     def _execute_reset_all(self, command: NodeActionCommand) -> dict[str, Any]:
         if not self.service_quiesce_enabled:
@@ -631,10 +656,7 @@ class NodeActionExecutor(
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
         self._reset_all_preflight(command.gpu_uuids)
-        quiesce_manager.assert_quiesced(
-            incident_id=command.incident_id,
-            command_id=command.command_id,
-        )
+        self._claim_reset_window(quiesce_manager, command)
         return self._reset_all_gpus_nvswitches(command.gpu_uuids, window_claimed=True)
 
     def _execute_restore(self, command: NodeActionCommand) -> dict[str, Any]:
@@ -647,15 +669,11 @@ class NodeActionExecutor(
 
     @staticmethod
     def _retryable_action_error(error: Exception) -> bool:
-        return isinstance(
-            error,
-            (
-                OSError,
-                TimeoutError,
-                subprocess.TimeoutExpired,
-                sqlite3.OperationalError,
-            ),
-        )
+        # Only a handler's own exceptions arrive here. Ledger failures never do:
+        # a failed result write is swallowed by ``_persist_result`` and closes
+        # the attempt as INTERRUPTED, and a failed ``mark_in_progress`` in
+        # ``execute`` propagates before any handler runs.
+        return isinstance(error, (OSError, TimeoutError, subprocess.TimeoutExpired))
 
 
 validate_operation_handlers(NodeActionExecutor)

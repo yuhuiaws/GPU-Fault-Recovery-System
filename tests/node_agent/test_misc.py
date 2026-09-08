@@ -745,11 +745,13 @@ def test_same_command_id_with_different_body_is_rejected_not_replayed(
         assert response.status_code == 409, (
             f"a different body must not read the old row: {response.text}"
         )
+        # Terminal on both axes: nothing on the control plane mints a new
+        # command_id, so asking for one only parked the step until its bound.
         assert response.json()["detail"] == {
             "code": "COMMAND_ID_REUSED",
             "message": "node action command_id reused for a different command",
             "retryable": False,
-            "requires_new_command": True,
+            "requires_new_command": False,
         }, response.json()
     assert reset_invocations(runner) == 1, runner.commands
 

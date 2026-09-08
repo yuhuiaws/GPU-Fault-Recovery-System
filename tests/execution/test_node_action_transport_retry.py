@@ -334,6 +334,38 @@ def test_other_client_errors_still_fail_the_step(status: int, code: str) -> None
     assert outcome.details["http_status"] == status
 
 
+def test_a_reused_command_id_fails_the_step_instead_of_waiting_for_a_new_one() -> None:
+    """COMMAND_ID_REUSED is terminal: nobody can mint the command it asks for.
+
+    The command_id is derived from the step's idempotency key, so a rejection
+    that said ``requires_new_command`` sent the step into NEW_COMMAND_REQUIRED
+    and the next dispatch built the very same id again -- WAITING until the
+    600 s step bound, for a body the agent had already refused for good.
+    """
+
+    adapter = adapter_raising(
+        http_error(
+            409,
+            {
+                "code": "COMMAND_ID_REUSED",
+                "message": "node action command_id reused for a different command",
+                "retryable": False,
+                "requires_new_command": False,
+            },
+        )
+    )
+
+    outcome = adapter.execute(step_context(adapter))
+
+    assert outcome.status is WorkflowStepStatus.FAILED, (
+        f"a reused command_id must fail the step, not idle it: {outcome}"
+    )
+    assert outcome.details["node_action_error_code"] == "COMMAND_ID_REUSED"
+    assert outcome.details.get("node_action_state") != "NEW_COMMAND_REQUIRED", (
+        outcome.details
+    )
+
+
 def test_a_lost_lease_stops_new_node_actions_from_being_sent() -> None:
     """The regional executor sets the guard; the adapter must consult it."""
 

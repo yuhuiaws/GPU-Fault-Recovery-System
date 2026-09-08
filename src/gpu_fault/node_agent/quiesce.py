@@ -41,6 +41,33 @@ def restore_gpu_services() -> None:
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 
+def _reset_claim_refusal(issued: dict[str, Any], command_id: str | None) -> str:
+    """Why a second reset in one quiesce window is refused, naming the claimant.
+
+    Never states that the reset ran: the claim is taken before nvidia-smi is
+    spawned, so only the claiming command's own result says whether the GPU was
+    reset. An operator who read "already reset" here would reboot or replace a
+    node that may never have been touched. When the claimant is this very
+    command_id -- a resubmit after an attempt whose outcome is unknown -- the
+    text names the earlier attempt instead of quoting the caller its own id.
+    """
+
+    owner = issued.get("command_id")
+    if owner is not None and owner == command_id:
+        attempt = issued.get("attempt")
+        claimant = "an earlier attempt of this command" + (
+            f" (see attempt {attempt})" if attempt is not None else ""
+        )
+    else:
+        claimant = owner or "an earlier command"
+    return (
+        "the single GPU reset this quiesce window allows was already claimed by "
+        f"{claimant} at {issued.get('issued_at')}; read that command's result to "
+        "learn whether the reset ran, and restore the GPU services and quiesce "
+        "again before any further reset"
+    )
+
+
 def read_boot_id(path: Path = BOOT_ID_PATH) -> str:
     """The kernel boot id, or "" where it cannot be read (tests, containers)."""
 
@@ -678,6 +705,7 @@ class GpuServiceQuiesceManager:
         incident_id: str,
         command_id: str | None = None,
         for_reset: bool = True,
+        attempt: int | None = None,
     ) -> None:
         """Fence a reset on the quiesce state and claim the window for it.
 
@@ -702,21 +730,10 @@ class GpuServiceQuiesceManager:
                 return
             issued = state.get("reset_issued")
             if isinstance(issued, dict):
-                owner = issued.get("command_id") or "an earlier command"
-                # Never state that the reset ran: the claim is taken before
-                # nvidia-smi is spawned, so only that command's own result
-                # says whether the GPU was reset. An operator who read
-                # "already reset" here would reboot or replace a node that
-                # may never have been touched.
-                raise RuntimeError(
-                    "the single GPU reset this quiesce window allows was "
-                    f"already claimed by {owner} at {issued.get('issued_at')}; "
-                    "read that command's result to learn whether the reset "
-                    "ran, and restore the GPU services and quiesce again "
-                    "before any further reset"
-                )
+                raise RuntimeError(_reset_claim_refusal(issued, command_id))
             state["reset_issued"] = {
                 "command_id": command_id,
+                "attempt": attempt,
                 "issued_at": datetime.now(timezone.utc).isoformat(),
             }
             self._write_state(state_path, state)
