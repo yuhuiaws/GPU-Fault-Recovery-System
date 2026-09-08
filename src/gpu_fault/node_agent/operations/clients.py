@@ -342,17 +342,19 @@ class ClientOperationsMixin:
         raise RuntimeError(
             "cannot resolve device node for "
             + ", ".join(
-                f"{gpu_uuid} ({self._unresolvable_cause(gpu_uuid, inventory)})"
-                for gpu_uuid in missing
+                f"{gpu_uuid} ({cause})"
+                for gpu_uuid, cause in self._unresolvable_causes(
+                    missing, inventory
+                ).items()
             )
         )
 
-    def _unresolvable_cause(
+    def _unresolvable_causes(
         self,
-        gpu_uuid: str,
+        missing: list[str],
         inventory: list[str] | None,
-    ) -> str:
-        """Why this UUID has no device node, in the words of the evidence.
+    ) -> dict[str, str]:
+        """Why each of these UUIDs has no device node, in the evidence's words.
 
         The three causes need three different operator actions -- a card that
         fell off the bus, a workflow carrying a UUID this node never had (a
@@ -360,21 +362,35 @@ class ClientOperationsMixin:
         device node in -- and the refusal used to name none of them, leaving
         "cannot resolve device node for GPU-..." as the whole diagnosis of a
         blocked destructive step.
+
+        Takes the whole list because the inventory it may need is one probe for
+        all of them: asked per UUID, a step naming eight GPUs from a stale plan
+        spent eight ``nvidia-smi`` calls (15 s timeout each) building one error
+        message, on a node that is already in trouble.
         """
 
-        reason = self._device_path_reasons().get(gpu_uuid)
-        if reason:
-            return reason
+        reasons = self._device_path_reasons()
+        causes = {
+            gpu_uuid: reasons[gpu_uuid] for gpu_uuid in missing if reasons.get(gpu_uuid)
+        }
+        if len(causes) == len(missing):
+            return {gpu_uuid: causes[gpu_uuid] for gpu_uuid in missing}
         if inventory is None:
             try:
                 inventory = self._gpu_inventory()
             except (OSError, RuntimeError, subprocess.SubprocessError):
-                # Only ever asked on the way to a refusal, so a second probe
-                # that also fails costs nothing but this one cause.
+                # Only ever asked on the way to a refusal, so a probe that also
+                # fails costs nothing but the more specific cause.
                 inventory = None
-        if inventory is not None and gpu_uuid not in inventory:
-            return "no GPU on this node reports this UUID"
-        return "the driver reported no device node for it"
+        for gpu_uuid in missing:
+            if gpu_uuid in causes:
+                continue
+            causes[gpu_uuid] = (
+                "no GPU on this node reports this UUID"
+                if inventory is not None and gpu_uuid not in inventory
+                else "the driver reported no device node for it"
+            )
+        return {gpu_uuid: causes[gpu_uuid] for gpu_uuid in missing}
 
     def _persistent_device_clients(
         self, target: set[str]

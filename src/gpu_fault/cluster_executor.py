@@ -1576,8 +1576,8 @@ class ClusterActionExecutor:
                     "; the outcome is unknown and the operation may still be "
                     "running on the node"
                     if unknown
-                    else "; the operation changes nothing outside this process, "
-                    "so it did not happen"
+                    else "; the operation mutates no node state, so nothing "
+                    "is left running"
                 )
             ),
         )

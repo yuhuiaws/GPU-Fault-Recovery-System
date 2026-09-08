@@ -279,6 +279,12 @@ def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
     made the one key that means "somebody has to go look at the node" true for
     every host validation that ran long -- and a signal that is always on is
     the same as no signal at all.
+
+    The error text is held to what is true of *every* operation in this set,
+    not just this one: ``CHECK_MECHANICALS`` idempotently saves a pending
+    notification, so "the operation did not happen" would be a false statement
+    printed on an operator's screen. What they all share is that no node state
+    moved and nothing is left running.
     """
 
     client = FakeExecutorClient([remote_command("command-a")])
@@ -297,6 +303,12 @@ def test_a_non_mutating_timeout_does_not_demand_manual_confirmation() -> None:
         assert "unknown" not in (result.error or ""), (
             "the error text claims an unknown outcome for a read-only probe: "
             f"{result.error}"
+        )
+        assert "mutates no node state" in (result.error or ""), (
+            "the text has to hold for every operation outside "
+            "_TIMEOUT_UNKNOWN_STATE_OPERATIONS, and CHECK_MECHANICALS "
+            "idempotently saves a pending notification -- so 'it did not "
+            f"happen' overclaims: {result.error}"
         )
         assert result.status_source == "executor-execution-timeout", (
             "a read-only timeout is a plain timeout; reusing the unknown-outcome "
