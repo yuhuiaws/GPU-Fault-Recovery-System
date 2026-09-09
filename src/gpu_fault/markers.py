@@ -80,7 +80,8 @@ def marker_is_diagnostic(marker: NodeMarker) -> bool:
     until its TTL, so the job could not restart for an hour. A diagnostic
     marker that names a stored incident is therefore skipped there and the
     terminal is decided without it (a budgeted restart when nothing else
-    matches); the marker itself stays live, it is still a valid observation. A marker without a stored incident is not affected:
+    matches); the marker itself stays live, it is still a valid observation.
+    A marker without a stored incident is not affected:
     it still plans the diagnostic it asks for through ``from_marker``.
 
     A marker with no recommended action is treated as the strongest action
