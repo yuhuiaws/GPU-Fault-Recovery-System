@@ -1002,6 +1002,25 @@ def _control_plane_errors(
     return errors, workflow, incident
 
 
+def _wait_agent_unit(
+    probe: HostProbeFixture, run_id: str, *, timeout_seconds: int = 120
+) -> dict[str, Any]:
+    """The sibling's host snapshot once its Node Agent unit is enabled and
+    active again, or the last sample when the wait runs out."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        snapshot = probe.execute("snapshot", "--run-id", run_id)
+        unit = snapshot.get("agent_unit") or {}
+        if unit.get("ActiveState") == "active" and str(
+            unit.get("UnitFileState") or ""
+        ).startswith("enabled"):
+            return snapshot
+        if time.monotonic() >= deadline:
+            return snapshot
+        time.sleep(5)
+
+
 def _data_plane_errors(
     run: _LiveRun, state: dict[str, Any]
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -1022,7 +1041,10 @@ def _data_plane_errors(
     sibling_after = run.sibling_probe.execute("snapshot", "--run-id", run_id)
     run.sibling_probe.execute("restore-agent", "--run-id", run_id)
     run.agent_disabled = False
-    sibling_agent_after = run.sibling_probe.execute("snapshot", "--run-id", run_id)
+    # ``systemctl start`` returns before the unit reports active; judge the
+    # settled state, not the first sample (attempt 9, 2026-09-09).
+    sibling_agent_after = _wait_agent_unit(run.sibling_probe, run_id)
+    write_json_atomic(run.case_dir / "sibling-agent-after.json", sibling_agent_after)
     errors.extend(
         host_errors(
             fault_baseline={

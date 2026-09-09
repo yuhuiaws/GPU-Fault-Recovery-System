@@ -7,7 +7,6 @@ node and CloudTrail snapshots and touches no cluster.
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.adapters.common import (  # noqa: E402
+    quarantine_taint_value as product_quarantine_taint_value,
+)
 from scripts.e2e.regional.warm_spare_fixture import QUARANTINE_TAINT  # noqa: E402
 
 REBOOT_EVENTS = {"BatchRebootClusterNodes", "RebootClusterNodes"}
@@ -41,7 +43,13 @@ EXHAUSTION_PREFIX = "node branch escalation exhausted"
 # Pure verdict functions (unit-tested)
 # --------------------------------------------------------------------------- #
 def quarantine_taint_value(incident_id: str) -> str:
-    return hashlib.sha256(incident_id.encode()).hexdigest()[:24]
+    """The taint value the product writes: ``incident-<sha256[:24]>``.
+
+    Delegated to the product so the two cannot drift; a local copy without the
+    ``incident-`` prefix judged every correct live run's taint as wrong.
+    """
+
+    return product_quarantine_taint_value(incident_id)
 
 
 def _step_node(step: dict[str, Any]) -> list[str]:

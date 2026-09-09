@@ -592,6 +592,34 @@ class RegionalIncidentOwnershipProvider:
 # it alone.
 TRANSPORT_RETRYABLE_SOURCE = "executor-retryable-transport"
 
+# The keys a retryable WAITING report adds on top of the adapter's own record.
+# They describe one failed attempt by one executor, not the operation, so the
+# replay hands the adapter its record without them (a dead replica's
+# ``executor_id`` otherwise travels with the command for its whole life).
+RETRYABLE_MARKER_KEYS = frozenset(
+    {
+        "retryable_transport_error",
+        "retryable_adapter_error",
+        "reason",
+        "executor_id",
+        "exception_type",
+        "adapter_error",
+    }
+)
+
+
+def adapter_facing_details(details: dict[str, Any]) -> dict[str, Any]:
+    """A command's recorded details as the adapter should see them on replay."""
+
+    if not (
+        details.get("retryable_transport_error")
+        or details.get("retryable_adapter_error")
+    ):
+        return dict(details)
+    return {
+        key: value for key, value in details.items() if key not in RETRYABLE_MARKER_KEYS
+    }
+
 
 def transport_degraded_idle_delay(
     *,
@@ -1168,7 +1196,7 @@ class ClusterActionExecutor:
                     status=WorkflowStepStatus.WAITING,
                     phase=execution_phase(workflow),
                     adapter_operation_id=(f"remote/{command.command_id}"),
-                    details=command.result_details,
+                    details=adapter_facing_details(command.result_details),
                 )
                 workflow = workflow.model_copy(
                     update={
@@ -1321,6 +1349,20 @@ class ClusterActionExecutor:
             executor_id=self.executor_id,
         )
         if retryable is not None:
+            # A retryable failure must not erase what the adapter's earlier
+            # attempts recorded (the observed isolation and submitted nodes of
+            # a reboot in flight): the record is what the next claim replays
+            # to the adapter. Live 2026-09-09 (DESTR-014 attempt 9) one DNS
+            # blip mid-reboot left the command with only the error keys, so the
+            # post-reboot isolation re-assertion had nothing to act on.
+            retryable = retryable.model_copy(
+                update={
+                    "details": {
+                        **dict(command.result_details or {}),
+                        **retryable.details,
+                    }
+                }
+            )
             self.retryable_transport_errors_total += 1
             LOGGER.warning(
                 "regional cluster executor transport failed; "
@@ -1352,6 +1394,7 @@ class ClusterActionExecutor:
             status=RemoteCommandStatus.WAITING,
             status_source="executor-retryable-adapter-error",
             details={
+                **dict(command.result_details or {}),
                 "retryable_adapter_error": True,
                 "reason": "RETRYABLE_ADAPTER_ERROR",
                 "executor_id": self.executor_id,

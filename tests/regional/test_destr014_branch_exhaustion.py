@@ -345,10 +345,14 @@ def test_the_fault_node_branch_must_end_with_restore_scheduling() -> None:
     )
 
 
-def test_quarantine_taint_value_is_the_incident_digest() -> None:
-    assert (
-        destr014.quarantine_taint_value("inc-1")
-        == hashlib.sha256(b"inc-1").hexdigest()[:24]
+def test_quarantine_taint_value_is_the_products_incident_digest() -> None:
+    """The product writes ``incident-<sha256[:24]>``; a prefix-less local copy
+    judged every correct live run's taint as wrong (attempts 8 and 9)."""
+    from gpu_fault.adapters.common import quarantine_taint_value
+
+    assert destr014.quarantine_taint_value("inc-1") == quarantine_taint_value("inc-1")
+    assert destr014.quarantine_taint_value("inc-1") == (
+        "incident-" + hashlib.sha256(b"inc-1").hexdigest()[:24]
     )
 
 

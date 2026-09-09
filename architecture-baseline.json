@@ -37,7 +37,7 @@
     "src/gpu_fault/admin/bootstrap.py": 2003,
     "src/gpu_fault/admin/cli.py": 1637,
     "src/gpu_fault/admin/resource_registry.py": 1501,
-    "src/gpu_fault/cluster_executor.py": 1776,
+    "src/gpu_fault/cluster_executor.py": 1819,
     "src/gpu_fault/completion_controller.py": 1667,
     "src/gpu_fault/execution/dispatcher.py": 1697,
     "src/gpu_fault/execution/executor.py": 2794,

@@ -614,6 +614,56 @@ def _gaierror() -> socket.gaierror:
     return socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
 
 
+def test_a_transport_failure_keeps_the_adapters_recorded_details() -> None:
+    """One DNS blip must not erase a reboot in flight.
+
+    The command's ``result_details`` are the adapter's memory between claims
+    (the isolation it observed, the nodes it submitted). Live 2026-09-09
+    (DESTR-014 attempt 9) a gaierror mid-reboot replaced them with the four
+    error keys, and the next poll's isolation re-assertion had nothing to read.
+    """
+
+    recorded = {
+        "observed_isolation": {"node-a": {"kubernetes_node": "node-a"}},
+        "submitted_nodes": ["logical-a"],
+    }
+    client = FakeExecutorClient([remote_command("command-a", result_details=recorded)])
+    executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
+
+    assert executor.run_once() == 1
+
+    reported = client.reported("command-a")
+    assert reported.status is WorkflowStepStatus.WAITING or str(reported.status) in (
+        "WAITING",
+        "RemoteCommandStatus.WAITING",
+    ), reported
+    assert reported.details["retryable_transport_error"] is True, reported.details
+    assert reported.details["observed_isolation"] == recorded["observed_isolation"]
+    assert reported.details["submitted_nodes"] == ["logical-a"], reported.details
+
+
+def test_the_replay_hands_the_adapter_its_record_without_the_error_markers() -> None:
+    """A dead replica's ``executor_id`` is not the operation's state."""
+
+    command = remote_command(
+        "command-a",
+        result_details={
+            "observed_isolation": {"node-a": {}},
+            "retryable_transport_error": True,
+            "reason": "temporary DNS failure",
+            "executor_id": "cluster/dead-pod",
+            "exception_type": "gaierror",
+        },
+    )
+    adapter = RecordingAdapter(status=WorkflowStepStatus.WAITING)
+    executor = build_executor(FakeExecutorClient([command]), [adapter])
+
+    assert executor.run_once() == 1
+
+    seen = adapter.contexts[0].workflow.step_executions[0].details
+    assert seen == {"observed_isolation": {"node-a": {}}}, seen
+
+
 def test_repeated_transport_failures_count_as_network_degraded_cycles() -> None:
     client = FakeExecutorClient(*[[remote_command(f"command-{i}")] for i in range(3)])
     executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
