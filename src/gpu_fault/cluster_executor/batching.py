@@ -191,6 +191,74 @@ def _post_progress(
         )
 
 
+def _judge_step(
+    executor: ClusterActionExecutor,
+    command: RemoteActionCommand,
+    adapter: Any,
+    lease_token: str,
+    *,
+    index: int,
+    step: Any,
+    idempotency_key: str,
+    results: dict[str, dict[str, Any]],
+    prior: dict[str, Any] | None,
+) -> tuple[RemoteCommandResult, bool]:
+    """One covered step to its verdict: ``(result, held)``.
+
+    ``held`` is True when the fleet preflight stopped the step before it ran
+    (the result is the hold, nothing is recorded for the step); otherwise the
+    result is the step's own verdict from the adapter or from the dispatch
+    taxonomy. Everything that judges the step -- building its view, the
+    preflight, the context, the adapter -- runs inside the one ``try``: a
+    defect in the preflight (``fleet_preflight_reason`` fails closed) or in
+    the view is classified against *this step*, so the caller records it as
+    the step's failure and the terminal report keeps the verdicts already
+    posted. Were it to escape, ``CommandDispatch.execute`` would classify it
+    against the pre-claim head record and replace ``result_details`` -- the
+    earlier steps' results with it.
+    """
+
+    dispatch = executor.dispatch
+    view: RemoteActionCommand | None = None
+    try:
+        view = _step_view(
+            command,
+            index=index,
+            step=step,
+            idempotency_key=idempotency_key,
+            workflow=_workflow_view(command, results, index),
+            prior=prior,
+        )
+        preflight_hold = dispatch._fleet_preflight_hold(view, lease_token)
+        if preflight_hold is not None:
+            return preflight_hold, True
+        context = WorkflowStepContext(
+            workflow=view.workflow,
+            incident=view.incident,
+            step=step,
+            step_index=index,
+            request=dispatch.execution_request(view),
+            idempotency_key=idempotency_key,
+        )
+        result = dispatch.outcome_result(
+            adapter.execute(context), lease_token, operation=step.operation
+        )
+    except Exception as exc:  # noqa: BLE001 - the dispatch taxonomy classifies it
+        if view is None:
+            # ``_workflow_view`` raised: judge against the step with the
+            # workflow as minted, so the log lines still name this step.
+            view = _step_view(
+                command,
+                index=index,
+                step=step,
+                idempotency_key=idempotency_key,
+                workflow=command.workflow,
+                prior=prior,
+            )
+        result = dispatch._classify_failure(exc, view, lease_token)
+    return result, False
+
+
 def execute_batched_command(
     executor: ClusterActionExecutor,
     command: RemoteActionCommand,
@@ -210,7 +278,6 @@ def execute_batched_command(
     verdict, so a failed post costs the control plane latency, never a step.
     """
 
-    dispatch = executor.dispatch
     executor.increment("batched_commands_total")
     results = _prior_results(command)
     plan = _plan(command)
@@ -242,39 +309,27 @@ def execute_batched_command(
                     "reason": hold,
                 },
             )
-        view = _step_view(
+        sub_result, held = _judge_step(
+            executor,
             command,
+            adapter,
+            lease_token,
             index=index,
             step=step,
             idempotency_key=idempotency_key,
-            workflow=_workflow_view(command, results, index),
+            results=results,
             prior=prior,
         )
-        preflight_hold = dispatch._fleet_preflight_hold(view, lease_token)
-        if preflight_hold is not None:
-            return preflight_hold.model_copy(
+        if held:
+            return sub_result.model_copy(
                 update={
                     "details": {
-                        **preflight_hold.details,
+                        **sub_result.details,
                         BATCHED_RESULTS_KEY: results,
                         "batched_step_index": index,
                     }
                 }
             )
-        context = WorkflowStepContext(
-            workflow=view.workflow,
-            incident=view.incident,
-            step=step,
-            step_index=index,
-            request=dispatch.execution_request(view),
-            idempotency_key=idempotency_key,
-        )
-        try:
-            sub_result = dispatch.outcome_result(
-                adapter.execute(context), lease_token, operation=step.operation
-            )
-        except Exception as exc:  # noqa: BLE001 - the dispatch taxonomy classifies it
-            sub_result = dispatch._classify_failure(exc, view, lease_token)
         entry = BatchedStepResult(
             status=sub_result.status,
             status_source=sub_result.status_source,

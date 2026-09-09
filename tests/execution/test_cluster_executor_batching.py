@@ -435,3 +435,60 @@ def test_run_once_reports_the_compound_result_under_one_lease() -> None:
     assert sorted(reported.details[BATCHED_RESULTS_KEY]) == ["1", "2", "3", "4"]
     assert len(client.progress_posts) == 4
     assert client.claim() == [], "the command was handed out exactly once"
+
+
+def test_a_preflight_defect_on_a_later_step_keeps_the_earlier_results(
+    monkeypatch,
+) -> None:
+    """``_fleet_preflight_hold`` fails closed on its own: an exception out of it
+    is an executor defect, and it must be judged as *this step's* failure. Had
+    it escaped the per-step loop, ``CommandDispatch.execute`` would classify it
+    against the pre-claim head record and the terminal report would drop the
+    two verdicts this claim already posted."""
+
+    from gpu_fault.cluster_executor.dispatch import CommandDispatch
+
+    real_hold = CommandDispatch._fleet_preflight_hold
+
+    def hold_that_breaks_on_reset(self, view, lease_token):
+        if view.step_index == 3:
+            raise RuntimeError("fleet preflight lookup exploded")
+        return real_hold(self, view, lease_token)
+
+    monkeypatch.setattr(
+        "gpu_fault.cluster_executor.dispatch.CommandDispatch._fleet_preflight_hold",
+        hold_that_breaks_on_reset,
+    )
+    client = FakeClient(compound_command())
+    adapter = FakeNodeAdapter(all_succeed())
+
+    run, result = run_claimed_command(client, adapter)
+
+    assert result.status is RemoteCommandStatus.FAILED, result
+    assert result.status_source == "executor-internal-error", result
+    assert [context.step_index for context in adapter.contexts] == [1, 2], (
+        "RESET never reached the adapter and RESTORE never ran"
+    )
+    assert result.details.get("batched_step_index") == 3, (
+        f"the defect must be attributed to the RESET step: {result.details}"
+    )
+    assert result.details.get("batched_operation") == "RESET_GPU", result.details
+    results = result.details.get(BATCHED_RESULTS_KEY)
+    assert results is not None, (
+        f"the terminal report dropped the progress this claim posted: {result.details}"
+    )
+    assert sorted(results) == ["1", "2", "3"], (
+        f"steps 1-2 survive and step 3 is recorded failed: {sorted(results)}"
+    )
+    assert results["1"]["status"] == "SUCCEEDED" and results["2"]["status"] == (
+        "SUCCEEDED"
+    ), results
+    assert results["3"]["status"] == "FAILED", results["3"]
+    assert results["3"]["status_source"] == "executor-internal-error", results["3"]
+    assert "fleet preflight lookup exploded" in (results["3"]["error"] or ""), (
+        "the step entry names the defect"
+    )
+    assert run.unexpected_failures == 1, "one defect, counted once"
+    assert [
+        sorted(k for k in post if k.isdigit()) for post in client.progress_posts
+    ] == [["1"], ["2"], ["3"]], "the failed step's verdict is posted like any other"
