@@ -18,6 +18,7 @@ manifest_inputs:
   - deploy/control-plane/regional/regional-control-plane-nlb.yaml
   - deploy/control-plane/regional/regional-control-plane-patch.yaml
   - deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
+  - deploy/dataplane/adot-dataplane.yaml
   - deploy/dataplane/cluster-action-executor.yaml
   - deploy/dataplane/completion-watcher.yaml
   - deploy/dataplane/dcgm-counters.csv
@@ -112,6 +113,12 @@ component_inputs:
     - deploy/systemd/*.service
     - deploy/systemd/*.timer
   observability:
+    # The per-GPU-cluster collector belongs to the observability component:
+    # it writes to the same AMP workspace and feeds the same rules, and an
+    # edit to it has to move this digest or the release skips the re-apply.
+    # Substitution-only rendering, so the renderer modules are deliberately
+    # not listed here (contrast dcgm, whose affinity is computed from code).
+    - deploy/dataplane/adot-dataplane.yaml
     - deploy/observability/adot-control-plane.yaml
     - deploy/observability/amp-alertmanager.yaml
     - deploy/observability/amp-rules.yaml

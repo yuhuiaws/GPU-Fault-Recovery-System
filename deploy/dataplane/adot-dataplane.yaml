@@ -1,0 +1,378 @@
+# Data-plane metrics scrape path (2026-09-08 data-plane review, F7).
+#
+# One collector per GPU (HyperPod EKS) cluster. It scrapes every data-plane
+# Pod in THIS cluster's gpu-fault-system namespace that declares
+# `prometheus.io/scrape: "true"` and a `metrics` port, and remote-writes to
+# the same AMP workspace the control-plane collector
+# (deploy/observability/adot-control-plane.yaml) writes to. Until it existed
+# nothing scraped the fault-domain cluster at all: the control-plane collector
+# runs in the CONTROL-PLANE cluster and keeps only the api-ha / control-worker
+# / spool-worker Pods there, so the Completion Watcher's fifteen series on
+# :9109, the two AMP rules that read them
+# (GpuFaultCompletionActiveStateUnavailable,
+# GpuFaultCompletionOutboxAppendFailures) and the "Completion Watcher"
+# Grafana row were all inert.
+#
+# Rendered and applied per cluster by the regional release exactly like the
+# DCGM exporter DaemonSet (regional_gpu_bootstrap.apply_gpu_adot_collector):
+# it carries no executor wheel, so it is NOT a `regional_rollout` Deployment
+# and never joins the executor-pinned rollout waves. Every placeholder token
+# below is substituted by regional_release_rendering
+# .render_dataplane_adot_manifest, which fails closed on a leftover
+# placeholder; the release skips the component -- loudly, on stderr -- when a
+# cluster target has no `adot_irsa_role_arn` or the site has no
+# `health.amp_workspace_id`, because a collector without credentials is a
+# CrashLoop, not telemetry.
+#
+# Identity: IRSA (the same mechanism as the cluster executor), not EKS Pod
+# Identity like the control-plane collector -- the GPU clusters already carry
+# the OIDC provider the executor role trusts, and the pod-identity agent is not
+# a HyperPod EKS given. The role needs exactly `aps:RemoteWrite` on the
+# workspace ARN and a trust policy on this cluster's OIDC issuer for
+# system:serviceaccount:gpu-fault-system:gpu-fault-adot-dataplane.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-fault-adot-dataplane
+  namespace: gpu-fault-system
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_ADOT_IRSA_ROLE_ARN
+---
+# Pod discovery for the prometheus receiver. The receiver's kubernetes_sd is
+# pinned to this one namespace, so a namespaced Role is enough: no ClusterRole,
+# and no verb beyond reading Pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gpu-fault-adot-dataplane-discovery
+  namespace: gpu-fault-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gpu-fault-adot-dataplane-discovery
+  namespace: gpu-fault-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gpu-fault-adot-dataplane-discovery
+subjects:
+  - kind: ServiceAccount
+    name: gpu-fault-adot-dataplane
+    namespace: gpu-fault-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-fault-adot-dataplane
+  namespace: gpu-fault-system
+data:
+  collector.yaml: |
+    receivers:
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: gpu-fault-dataplane
+              scrape_interval: 15s
+              scrape_timeout: 5s
+              # No `authorization` block, unlike the control-plane job: the
+              # data-plane endpoints are plain HTTP servers that read a few
+              # counters and timestamps off their loop, and the administrator
+              # execution token must never leave the control plane
+              # (GF-REGIONAL-BLAST-004).
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces:
+                    names: [gpu-fault-system]
+              relabel_configs:
+                # Discovery is by declaration, not by name: a data-plane
+                # Deployment is scraped when its Pod template carries
+                # `prometheus.io/scrape: "true"` and a container port named
+                # `metrics` whose number matches `prometheus.io/port`. A new
+                # component (or a component that grows a /metrics server)
+                # therefore joins the scrape by editing its own manifest, and
+                # this ConfigMap never has to learn its name. The contract is
+                # pinned in tests/regional/test_dataplane_manifest_contracts.py.
+                # Today that is the Completion Watcher (:9109); the node
+                # installer reconciler (:9110) and the cluster executor
+                # (:9111) declare their ports in the same batch as their
+                # endpoints ship, and read `up == 0` until a process listens.
+                - action: keep
+                  source_labels:
+                    - __meta_kubernetes_pod_annotation_prometheus_io_scrape
+                  regex: "true"
+                - action: keep
+                  source_labels:
+                    - __meta_kubernetes_pod_container_port_name
+                  regex: metrics
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_annotation_prometheus_io_path
+                  regex: (.+)
+                  target_label: __metrics_path__
+                # The app label IS the component; keep it under the same name
+                # the control-plane collector uses, so one query can tell a
+                # watcher sample from an executor sample.
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_label_app
+                  target_label: service_role
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_name
+                  target_label: pod
+                - action: replace
+                  source_labels:
+                    - __meta_kubernetes_pod_node_name
+                  target_label: node
+                # The alert expressions aggregate `by (control_plane_cluster,
+                # region)` and Alertmanager groups on the same pair, so every
+                # series has to carry both -- with the values the control-plane
+                # collector uses, or the watcher alerts would land in their own
+                # group. `up` is synthesised from the target's label set, which
+                # is why these are target relabels rather than
+                # metric_relabel_configs. gpu_cluster is the fault-domain
+                # cluster: one workspace serves the whole fleet, and a firing
+                # watcher alert has to name the cluster whose watcher it is.
+                - action: replace
+                  target_label: control_plane_cluster
+                  replacement: gpu-fault-regional-control-plane
+                - action: replace
+                  target_label: region
+                  replacement: REPLACE_WITH_AWS_REGION
+                - action: replace
+                  target_label: gpu_cluster
+                  replacement: REPLACE_WITH_GPU_CLUSTER_ID
+              metric_relabel_configs:
+                # This keep list is the only thing that reaches AMP, and it is
+                # the metric-family contract of the data plane, one family
+                # prefix per component:
+                #   gpu_fault_completion_.+       Completion Watcher
+                #                                 (completion_metrics_server:
+                #                                 controller counters, outbox
+                #                                 gauges, the
+                #                                 gpu_fault_completion_watcher_*
+                #                                 heartbeat / liveness /
+                #                                 timestamp families)
+                #   gpu_fault_node_installer_.+   node installer reconciler
+                #   gpu_fault_cluster_executor_.+ cluster action executor
+                #   gpu_fault_node_resource_.+    node-resource collector
+                # The last three are reserved for the /metrics servers those
+                # components grow in this batch and after the executor's
+                # module split; a component that exports under another prefix
+                # is unalertable no matter what amp-rules.yaml says.
+                # tests/regional/test_dataplane_manifest_contracts.py checks
+                # every name completion_metrics_server exports against this
+                # list. Nothing control-plane-shaped belongs here: those
+                # families arrive through adot-control-plane.yaml.
+                - action: keep
+                  source_labels: [__name__]
+                  regex: up|gpu_fault_completion_.+|gpu_fault_cluster_executor_.+|gpu_fault_node_installer_.+|gpu_fault_node_resource_.+
+                # Same argument as the control-plane collector: the receiver
+                # stamps every metric with its instrumentation scope, and left
+                # in place those labels join alert series identity, so an ADOT
+                # image bump resolves and re-fires every watcher alert and
+                # drops the silences an operator put in place mid-incident.
+                - action: labeldrop
+                  regex: otel_scope_name|otel_scope_version
+
+            # The collector's own pipeline counters, for the partial-failure
+            # case absence cannot see (see the control-plane collector). A
+            # distinct job name: GpuFaultAdotSelfMetricsMissing reads
+            # `up{job="gpu-fault-adot-self"}` with absent(), and sharing that
+            # name would let one live collector hide a dead one.
+            # GpuFaultTelemetryRemoteWriteFailing and
+            # GpuFaultTelemetryRemoteWriteQueueSaturated select no job and so
+            # already cover this collector's counters.
+            - job_name: gpu-fault-adot-dataplane-self
+              scrape_interval: 30s
+              scrape_timeout: 5s
+              static_configs:
+                - targets: ["127.0.0.1:8889"]
+              relabel_configs:
+                - action: replace
+                  target_label: control_plane_cluster
+                  replacement: gpu-fault-regional-control-plane
+                - action: replace
+                  target_label: region
+                  replacement: REPLACE_WITH_AWS_REGION
+                - action: replace
+                  target_label: gpu_cluster
+                  replacement: REPLACE_WITH_GPU_CLUSTER_ID
+              metric_relabel_configs:
+                # Unsuffixed on purpose; the pinned image publishes them
+                # without `_total` and add_metric_suffixes is off below.
+                - action: keep
+                  source_labels: [__name__]
+                  regex: up|otelcol_exporter_send_failed_metric_points|otelcol_exporter_sent_metric_points|otelcol_exporter_queue_size|otelcol_exporter_queue_capacity
+                - action: labeldrop
+                  regex: otel_scope_name|otel_scope_version|service_instance_id|service_version
+
+    processors:
+      batch:
+        timeout: 5s
+        send_batch_size: 1000
+        send_batch_max_size: 2000
+
+    exporters:
+      prometheusremotewrite:
+        # The SAME workspace the control-plane collector writes to, so the
+        # existing rules, dashboards and Alertmanager routing see the watcher
+        # series without a second data source.
+        endpoint: https://aps-workspaces.REPLACE_WITH_AWS_REGION.amazonaws.com/workspaces/REPLACE_WITH_AMP_WORKSPACE_ID/api/v1/remote_write
+        add_metric_suffixes: false
+        auth:
+          authenticator: sigv4auth
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          # Same bound and reasoning as the control-plane collector: the
+          # container is capped at 256Mi and this exporter spools in memory,
+          # so a longer window buys an OOMKill instead of a gap.
+          max_elapsed_time: 120s
+
+    extensions:
+      # Credentials come from the default chain, which IRSA feeds through
+      # AWS_ROLE_ARN / AWS_WEB_IDENTITY_TOKEN_FILE injected by the EKS webhook
+      # on the ServiceAccount annotation above.
+      sigv4auth:
+        region: REPLACE_WITH_AWS_REGION
+        service: aps
+      health_check:
+        endpoint: 0.0.0.0:8090
+        path: /health
+
+    service:
+      extensions: [sigv4auth, health_check]
+      pipelines:
+        metrics:
+          receivers: [prometheus]
+          processors: [batch]
+          exporters: [prometheusremotewrite]
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    # Loopback: the only reader is the self job above.
+                    host: 127.0.0.1
+                    port: 8889
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-fault-adot-dataplane
+  namespace: gpu-fault-system
+  annotations:
+    gpu-fault.io/cleanup-phase: producer
+    gpu-fault.io/cleanup-order: "80"
+spec:
+  replicas: 1
+  # Singleton by design; Recreate, not RollingUpdate. The collector is
+  # stateless and pull-based, so nothing is lost across the restart -- but two
+  # replicas overlapping during a rollout would scrape the same watcher twice
+  # and remote-write duplicate samples for the same series, which AMP rejects
+  # as out-of-order writes and the self counters then report as drops. A
+  # scrape gap of one Pod reschedule is a gap in graphs, not lost fault data.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gpu-fault-adot-dataplane
+  template:
+    metadata:
+      labels:
+        app: gpu-fault-adot-dataplane
+    spec:
+      serviceAccountName: gpu-fault-adot-dataplane
+      # A preempted collector is a silent outage of every watcher alert: the
+      # rules evaluate on absence and report nothing.
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - key: gpu-fault.io/quarantined
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        # IRSA projects the web-identity token as a root-owned file; a
+        # non-root container reads it only through the supplemental group, so
+        # fsGroup has to equal the uid the container runs as.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: REPLACE_WITH_ADOT_IMAGE
+          args:
+            - --config=/etc/otel/collector.yaml
+          env:
+            - name: GOGC
+              value: "50"
+            - name: GOMEMLIMIT
+              value: 220MiB
+          ports:
+            - name: health
+              containerPort: 8090
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # The health_check extension answers from inside the collector
+          # process: a wedged pipeline that stops serving it is restarted,
+          # and an AMP outage is not (the extension does not gate on the
+          # exporter), which is the right split -- a restart cannot fix AMP.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gpu-fault-adot-dataplane
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gpu-fault-adot-dataplane
+  namespace: gpu-fault-system
+spec:
+  # `maxUnavailable: 1`, never `minAvailable: 1`: against `replicas: 1` the
+  # latter forbids every eviction and wedges the drain a node replacement or
+  # an EKS upgrade needs (see the control-plane collector's budget).
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: gpu-fault-adot-dataplane

@@ -36,6 +36,7 @@ proves nothing looks exactly like a fixed manifest:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -45,9 +46,11 @@ import pytest
 import yaml
 
 from gpu_fault import collectors_cli
+from gpu_fault import completion_metrics_server as COMPLETION_METRICS
 from gpu_fault import dcgm_exporter_cadence as CADENCE
 from gpu_fault.collectors.gpu.dcgm import DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
 from scripts.release_identity import file_set_identity
@@ -673,6 +676,7 @@ def test_reconciler_tolerations_are_bounded() -> None:
 #: Watcher is the worst of the three: past 600 s of silence every node reads
 #: UNKNOWN and every node-mutating plan is BLOCKED.
 PRIORITY_CLASS_SINGLETONS = (
+    "adot-dataplane.yaml",
     "completion-watcher.yaml",
     "kubernetes-node-resource-collector.yaml",
     "node-installer-reconciler.yaml",
@@ -894,3 +898,493 @@ def test_the_legacy_deploy_path_substitutes_the_affinity_placeholder() -> None:
         "the substitution must belong to the sed that reads the manifest, so "
         "the text handed to `kubectl apply` never carries the placeholder"
     )
+
+
+# --------------------------------------------------------------------------- F7
+# Data-plane metrics scrape path. The Completion Watcher publishes fifteen series
+# on :9109 inside the fault-domain cluster and two AMP rules read them, but the
+# only collector in the system ran in the control-plane cluster and kept the
+# api-ha / control-worker / spool-worker Pods of *that* cluster: both rules and
+# the "Completion Watcher" Grafana row were dead configuration. The collector
+# below is rendered and applied per GPU cluster like the DCGM exporter, writes
+# to the same AMP workspace with its own IRSA role, and stamps the grouping
+# labels the alerts aggregate on.
+
+ADOT_DATAPLANE_MANIFEST = DATAPLANE / "adot-dataplane.yaml"
+DATAPLANE_SCRAPE_JOB = "gpu-fault-dataplane"
+ADOT_DATAPLANE_IMAGE = "registry.example/adot@sha256:" + "c" * 64
+ADOT_DATAPLANE_ROLE_ARN = "arn:aws:iam::123456789012:role/gpu-fault-gpu-a-adot"
+AMP_WORKSPACE_ID = "ws-0123abcd-4567-89ef-0123-456789abcdef"
+WATCHER_METRIC_NAMES = tuple(
+    name
+    for family in (
+        COMPLETION_METRICS.COUNTERS,
+        COMPLETION_METRICS.GAUGES,
+        COMPLETION_METRICS.TIMESTAMPS,
+    )
+    for name, _attribute, _help in family
+)
+
+
+def _adot_config_file(
+    tmp_path: Path, *, workspace: bool = True, irsa_role: bool = True
+) -> Path:
+    """A release config with or without each of the two F7 prerequisites."""
+
+    path = config_file(tmp_path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if workspace:
+        value["health"] = {"amp_workspace_id": AMP_WORKSPACE_ID}
+    if irsa_role:
+        value["clusters"][0]["adot_irsa_role_arn"] = ADOT_DATAPLANE_ROLE_ARN
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
+def _adot_release(
+    tmp_path: Path, *, workspace: bool = True, irsa_role: bool = True
+) -> Any:
+    config = MODULE.ReleaseConfig.load(
+        _adot_config_file(tmp_path, workspace=workspace, irsa_role=irsa_role)
+    )
+    release = MODULE.RegionalRelease(config, _RecordingRunner())
+    release.adot_image = ADOT_DATAPLANE_IMAGE
+    return release
+
+
+def _applied_documents(release: Any) -> list[dict[str, Any]]:
+    return [
+        document
+        for _arguments, kwargs in release.runner.calls
+        for document in yaml.safe_load_all(kwargs.get("input_text") or "")
+        if isinstance(document, dict)
+    ]
+
+
+def _collector_config(documents: list[dict[str, Any]]) -> dict[str, Any]:
+    config_map = next(
+        document for document in documents if document.get("kind") == "ConfigMap"
+    )
+    return yaml.safe_load(config_map["data"]["collector.yaml"])
+
+
+def _scrape_jobs(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        job["job_name"]: job
+        for job in config["receivers"]["prometheus"]["config"]["scrape_configs"]
+    }
+
+
+def _static_relabels(job: dict[str, Any]) -> dict[str, str]:
+    return {
+        rule["target_label"]: rule["replacement"]
+        for rule in job.get("relabel_configs") or []
+        if rule.get("action") == "replace" and "replacement" in rule
+    }
+
+
+def test_dataplane_adot_renders_with_every_placeholder_replaced(tmp_path: Path) -> None:
+    """The applied collector names this cluster, this workspace and this role."""
+
+    release = _adot_release(tmp_path)
+    target = release.config.clusters[0]
+    BOOTSTRAP.preflight_gpu_adot_collector(release, target)
+
+    texts = [
+        kwargs.get("input_text") or "" for _arguments, kwargs in release.runner.calls
+    ]
+    assert texts, "the preflight applied nothing"
+    assert all("REPLACE_WITH" not in text for text in texts), texts
+    documents = _applied_documents(release)
+    service_account = next(
+        document for document in documents if document.get("kind") == "ServiceAccount"
+    )
+    assert (
+        service_account["metadata"]["annotations"]["eks.amazonaws.com/role-arn"]
+        == ADOT_DATAPLANE_ROLE_ARN
+    )
+    deployment = next(
+        document for document in documents if document.get("kind") == "Deployment"
+    )
+    (container,) = _pod_spec(deployment)["containers"]
+    assert container["image"] == ADOT_DATAPLANE_IMAGE
+    config = _collector_config(documents)
+    endpoint = config["exporters"]["prometheusremotewrite"]["endpoint"]
+    assert endpoint == (
+        f"https://aps-workspaces.{release.config.aws_region}.amazonaws.com"
+        f"/workspaces/{AMP_WORKSPACE_ID}/api/v1/remote_write"
+    )
+    assert config["extensions"]["sigv4auth"] == {
+        "region": release.config.aws_region,
+        "service": "aps",
+    }
+    for job in _scrape_jobs(config).values():
+        labels = _static_relabels(job)
+        assert labels["control_plane_cluster"] == "gpu-fault-regional-control-plane", (
+            f"{job['job_name']}: the alerts group by control_plane_cluster"
+        )
+        assert labels["region"] == target.region, job["job_name"]
+        assert labels["gpu_cluster"] == target.cluster_id, job["job_name"]
+
+
+def test_dataplane_adot_rendering_fails_closed_on_a_leftover_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A placeholder that survives substitution must stop the release.
+
+    An ADOT collector applied with ``REPLACE_WITH_AMP_WORKSPACE_ID`` in its
+    endpoint starts, scrapes and fails every remote write -- which is exactly
+    the silence this component exists to end.
+    """
+
+    root = tmp_path / "root"
+    manifest = root / "deploy" / "dataplane" / "adot-dataplane.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        ADOT_DATAPLANE_MANIFEST.read_text(encoding="utf-8")
+        + "\n# REPLACE_WITH_SOMETHING_NEW\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(RENDERING, "ROOT", root)
+
+    with pytest.raises(RENDERING.ReleaseError, match="REPLACE_WITH_SOMETHING_NEW"):
+        RENDERING.render_dataplane_adot_manifest(
+            namespace="gpu-fault-system",
+            image=ADOT_DATAPLANE_IMAGE,
+            region="us-east-1",
+            amp_workspace_id=AMP_WORKSPACE_ID,
+            irsa_role_arn=ADOT_DATAPLANE_ROLE_ARN,
+            cluster_id="gpu-a",
+        )
+
+
+@pytest.mark.parametrize(
+    "missing", ["image", "region", "amp_workspace_id", "irsa_role_arn", "cluster_id"]
+)
+def test_dataplane_adot_rendering_refuses_an_empty_input(missing: str) -> None:
+    inputs = {
+        "namespace": "gpu-fault-system",
+        "image": ADOT_DATAPLANE_IMAGE,
+        "region": "us-east-1",
+        "amp_workspace_id": AMP_WORKSPACE_ID,
+        "irsa_role_arn": ADOT_DATAPLANE_ROLE_ARN,
+        "cluster_id": "gpu-a",
+    }
+    inputs[missing] = ""
+
+    with pytest.raises(RENDERING.ReleaseError, match=missing):
+        RENDERING.render_dataplane_adot_manifest(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("workspace", "irsa_role", "named"),
+    [(False, True, "health.amp_workspace_id"), (True, False, "adot_irsa_role_arn")],
+)
+def test_dataplane_adot_is_skipped_loudly_without_its_iam_prerequisites(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    workspace: bool,
+    irsa_role: bool,
+    named: str,
+) -> None:
+    """No workspace or no IRSA role: say which on stderr and touch nothing.
+
+    A site that has not created the data-plane writer role yet must still be
+    able to deploy everything else; a collector applied without credentials
+    would only add a CrashLoop to the cluster. The skip is printed, not logged
+    at DEBUG, because the alternative outcome is the inert alerts this
+    component exists to fix.
+    """
+
+    release = _adot_release(tmp_path, workspace=workspace, irsa_role=irsa_role)
+    target = release.config.clusters[0]
+
+    assert RENDERING.dataplane_adot_skip_reason(release, target), (
+        f"a config without {named} must not render the collector"
+    )
+    BOOTSTRAP.apply_gpu_adot_collector(release, target)
+
+    assert release.runner.calls == []
+    err = capsys.readouterr().err
+    assert named in err and target.cluster_id in err, err
+    assert RENDERING.render_release_payload(release)["dataplane_observability"] == {
+        target.cluster_id: []
+    }
+
+
+def test_the_planned_dataplane_adot_is_the_applied_one(tmp_path: Path) -> None:
+    release = _adot_release(tmp_path)
+    target = release.config.clusters[0]
+    planned = RENDERING.render_release_payload(release)["dataplane_observability"]
+
+    BOOTSTRAP.apply_gpu_adot_collector(release, target)
+
+    applied = [
+        document
+        for arguments, kwargs in release.runner.calls
+        if "--dry-run=server" not in arguments
+        for document in yaml.safe_load_all(kwargs.get("input_text") or "")
+        if isinstance(document, dict)
+    ]
+    assert planned == {target.cluster_id: applied}
+    assert any(
+        "rollout" in arguments
+        and "status" in arguments
+        and "deployment/gpu-fault-adot-dataplane" in arguments
+        for arguments, _kwargs in release.runner.calls
+    ), "the apply must wait for the collector to become ready"
+
+
+def test_dataplane_adot_keep_filter_admits_every_watcher_metric() -> None:
+    """The keep list is the only thing that reaches AMP.
+
+    Every family ``completion_metrics_server`` exports has to survive it,
+    including the ``up`` series that an absence alert would read; a family
+    missing here is unalertable no matter what amp-rules.yaml says.
+    """
+
+    config = _collector_config(_documents(ADOT_DATAPLANE_MANIFEST))
+    watcher_job = _scrape_jobs(config)[DATAPLANE_SCRAPE_JOB]
+    keeps = [
+        re.compile(f"^(?:{rule['regex']})$")
+        for rule in watcher_job["metric_relabel_configs"]
+        if rule.get("action") == "keep" and rule.get("source_labels") == ["__name__"]
+    ]
+    assert len(keeps) == 1, "one metric-name keep rule, like the control plane"
+
+    assert WATCHER_METRIC_NAMES, "completion_metrics_server exports nothing?"
+    dropped = [
+        name for name in (*WATCHER_METRIC_NAMES, "up") if not keeps[0].match(name)
+    ]
+    assert dropped == [], f"watcher metrics dropped before AMP: {dropped}"
+    assert not keeps[0].match("gpu_fault_processor_queue_depth"), (
+        "the data-plane keep list must not admit control-plane families"
+    )
+
+
+def test_dataplane_adot_discovers_pods_by_declaration_not_by_name() -> None:
+    """A component joins the scrape by annotating itself, not by editing ADOT.
+
+    The keep rules select ``prometheus.io/scrape: "true"`` and the container
+    port named ``metrics``; ``prometheus.io/path`` feeds ``__metrics_path__``.
+    The job must not name any component, or the next /metrics server (the
+    reconciler's, the executor's) would ship dark.
+    """
+
+    config = _collector_config(_documents(ADOT_DATAPLANE_MANIFEST))
+    job = _scrape_jobs(config)[DATAPLANE_SCRAPE_JOB]
+    keeps = {
+        tuple(rule["source_labels"]): rule["regex"]
+        for rule in job["relabel_configs"]
+        if rule.get("action") == "keep"
+    }
+
+    assert keeps == {
+        ("__meta_kubernetes_pod_annotation_prometheus_io_scrape",): "true",
+        ("__meta_kubernetes_pod_container_port_name",): "metrics",
+    }, keeps
+    path_rule = next(
+        rule
+        for rule in job["relabel_configs"]
+        if rule.get("target_label") == "__metrics_path__"
+    )
+    assert path_rule["source_labels"] == [
+        "__meta_kubernetes_pod_annotation_prometheus_io_path"
+    ]
+    assert job["kubernetes_sd_configs"] == [
+        {"role": "pod", "namespaces": {"names": ["gpu-fault-system"]}}
+    ], "pod discovery must stay inside the system namespace of THIS cluster"
+    assert "authorization" not in job, (
+        "the data-plane endpoints are unauthenticated; the execution token must "
+        "never leave the control plane (BLAST-004)"
+    )
+    text = ADOT_DATAPLANE_MANIFEST.read_text(encoding="utf-8")
+    for name in inventory.DEPLOYMENTS + (inventory.GPU_RECONCILER_DEPLOYMENT,):
+        assert f"regex: {name}" not in text, (
+            f"{name} is selected by name; discovery must stay declarative"
+        )
+
+
+def _scrape_declarations() -> list[tuple[str, dict[str, Any]]]:
+    """Every shipped data-plane Deployment that asks to be scraped."""
+
+    found = []
+    for path, deployment in _workloads(
+        iter(sorted(DATAPLANE.glob("*.yaml"))), "Deployment"
+    ):
+        annotations = (deployment["spec"]["template"].get("metadata") or {}).get(
+            "annotations"
+        ) or {}
+        if annotations.get("prometheus.io/scrape") == "true":
+            found.append((path.name, deployment))
+    return found
+
+
+def test_every_scrape_declaration_names_a_matching_metrics_port() -> None:
+    """The collector keeps the port named ``metrics`` and reads the annotation.
+
+    A Deployment that declares the annotation without the named port is never
+    scraped; one whose ``prometheus.io/port`` disagrees with the container port
+    scrapes the wrong socket. Both fail as silence, so the pair is pinned here,
+    and the watcher, the reconciler and the executor must all declare it: the
+    watcher's endpoint is live, the other two ship theirs in this batch.
+    """
+
+    declared = dict(_scrape_declarations())
+
+    assert set(declared) == {
+        "cluster-action-executor.yaml",
+        "completion-watcher.yaml",
+        "node-installer-reconciler.yaml",
+    }, sorted(declared)
+    ports_seen: dict[int, str] = {}
+    for name, deployment in declared.items():
+        annotations = deployment["spec"]["template"]["metadata"]["annotations"]
+        assert annotations.get("prometheus.io/path") == "/metrics", name
+        metrics_ports = [
+            port
+            for container in _pod_spec(deployment)["containers"]
+            for port in container.get("ports") or []
+            if port.get("name") == "metrics"
+        ]
+        assert len(metrics_ports) == 1, f"{name}: exactly one port named metrics"
+        assert str(metrics_ports[0]["containerPort"]) == annotations.get(
+            "prometheus.io/port"
+        ), f"{name}: prometheus.io/port disagrees with the metrics containerPort"
+        port_number = int(metrics_ports[0]["containerPort"])
+        assert port_number not in ports_seen, (
+            f"{name} and {ports_seen[port_number]} both claim :{port_number}"
+        )
+        ports_seen[port_number] = name
+
+
+#: The metric-family contract of the data plane: one prefix per component. The
+#: keep regex in adot-dataplane.yaml is the only thing that reaches AMP, so a
+#: component that exports under another prefix is unalertable. The last three
+#: are reserved for the /metrics servers shipping in this batch.
+DATA_PLANE_METRIC_FAMILIES = (
+    "gpu_fault_completion_",
+    "gpu_fault_node_installer_",
+    "gpu_fault_cluster_executor_",
+    "gpu_fault_node_resource_",
+)
+
+
+def test_dataplane_adot_keep_filter_covers_every_documented_family() -> None:
+    config = _collector_config(_documents(ADOT_DATAPLANE_MANIFEST))
+    job = _scrape_jobs(config)[DATAPLANE_SCRAPE_JOB]
+    (keep,) = [
+        re.compile(f"^(?:{rule['regex']})$")
+        for rule in job["metric_relabel_configs"]
+        if rule.get("action") == "keep" and rule.get("source_labels") == ["__name__"]
+    ]
+
+    for prefix in DATA_PLANE_METRIC_FAMILIES:
+        assert keep.match(f"{prefix}example_total"), f"{prefix}.+ is dropped"
+    assert not keep.match("gpu_fault_workflow_total"), (
+        "control-plane families do not travel through the data-plane collector"
+    )
+
+
+def test_dataplane_adot_drops_the_collector_scope_labels() -> None:
+    """Otherwise an ADOT image bump resolves and re-fires every watcher alert."""
+
+    config = _collector_config(_documents(ADOT_DATAPLANE_MANIFEST))
+    for name, job in _scrape_jobs(config).items():
+        dropped = [
+            rule["regex"]
+            for rule in job["metric_relabel_configs"]
+            if rule.get("action") == "labeldrop"
+        ]
+        assert dropped, f"{name}: no labeldrop rule"
+        pattern = re.compile("^(?:" + "|".join(dropped) + ")$")
+        for label in ("otel_scope_name", "otel_scope_version"):
+            assert pattern.match(label), f"{name}: {label} enters alert identity"
+
+
+def test_dataplane_adot_reads_pods_through_a_namespaced_role_only() -> None:
+    """Pod discovery needs list/watch in the system namespace and nothing more."""
+
+    documents = _documents(ADOT_DATAPLANE_MANIFEST)
+    kinds = {document["kind"] for document in documents}
+    assert "ClusterRole" not in kinds and "ClusterRoleBinding" not in kinds, (
+        "namespaced service discovery does not need a ClusterRole"
+    )
+    (role,) = [document for document in documents if document["kind"] == "Role"]
+    assert role["metadata"]["namespace"] == "gpu-fault-system"
+    assert role["rules"] == [
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]}
+    ], role["rules"]
+    (binding,) = [
+        document for document in documents if document["kind"] == "RoleBinding"
+    ]
+    (service_account,) = [
+        document for document in documents if document["kind"] == "ServiceAccount"
+    ]
+    assert binding["roleRef"]["name"] == role["metadata"]["name"]
+    assert binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": service_account["metadata"]["name"],
+            "namespace": "gpu-fault-system",
+        }
+    ]
+
+
+def test_dataplane_adot_deployment_is_hardened_like_its_siblings() -> None:
+    ((_path, deployment),) = _workloads(iter([ADOT_DATAPLANE_MANIFEST]), "Deployment")
+    spec = _pod_spec(deployment)
+    (container,) = spec["containers"]
+    security = container["securityContext"]
+
+    assert deployment["spec"]["replicas"] == 1
+    assert spec["priorityClassName"] == "system-cluster-critical"
+    assert security["readOnlyRootFilesystem"] is True
+    assert security["runAsNonRoot"] is True
+    assert security["allowPrivilegeEscalation"] is False
+    assert security["capabilities"] == {"drop": ["ALL"]}
+    # IRSA projects the web-identity token as a root-owned file; a non-root
+    # collector can only read it through the supplemental group.
+    assert spec["securityContext"]["fsGroup"] == security["runAsUser"]
+    assert container["resources"]["limits"] == {"cpu": "500m", "memory": "256Mi"}
+    assert container["livenessProbe"]["httpGet"]["path"] == "/health"
+    assert container["readinessProbe"]["httpGet"]["path"] == "/health"
+    annotations = deployment["metadata"]["annotations"]
+    assert annotations["gpu-fault.io/cleanup-phase"] == "producer"
+    assert "gpu-fault.io/deploy-mode" not in annotations, (
+        "the collector carries no executor wheel; it is applied like the DCGM "
+        "exporter, not through the executor-pinned rollout waves"
+    )
+    text = ADOT_DATAPLANE_MANIFEST.read_text(encoding="utf-8")
+    for marker in ("execution-token", "GPU_FAULT_EXECUTION_TOKEN"):
+        assert marker not in text, (
+            f"{marker}: the execution token must never leave the control plane"
+        )
+
+
+def test_the_dataplane_adot_manifest_gates_the_observability_component() -> None:
+    """A manifest edit that changes no digest is a manifest the release skips."""
+
+    identity = yaml.safe_load(
+        (ROOT / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    relative = "deploy/dataplane/adot-dataplane.yaml"
+
+    assert relative in identity["manifest_inputs"]
+    assert relative in identity["component_inputs"]["observability"]
+    inventory = json.loads(
+        (ROOT / "deploy/control-plane/regional/cleanup-inventory.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    registered = {
+        (resource["kind"], resource["name"])
+        for resource in inventory["gpu"]["resources"]
+    }
+    for kind, name in (
+        ("deployment", "gpu-fault-adot-dataplane"),
+        ("serviceaccount", "gpu-fault-adot-dataplane"),
+        ("role", "gpu-fault-adot-dataplane-discovery"),
+        ("rolebinding", "gpu-fault-adot-dataplane-discovery"),
+    ):
+        assert (kind, name) in registered, f"cleanup inventory lacks {kind}/{name}"

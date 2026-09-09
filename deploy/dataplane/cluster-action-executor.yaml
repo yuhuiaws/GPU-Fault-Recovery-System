@@ -80,6 +80,17 @@ spec:
       app: gpu-fault-cluster-executor
   template:
     metadata:
+      # Scrape declaration for the per-cluster ADOT collector
+      # (deploy/dataplane/adot-dataplane.yaml): it discovers Pods by this
+      # annotation pair plus the container port named `metrics` below, and
+      # keeps the gpu_fault_cluster_executor_.+ family. The /metrics server
+      # behind :9111 lands after the executor's module split, in this batch;
+      # until it listens the target reads `up == 0`, which is the honest
+      # value. Liveness stays file-based (below) and is not tied to this port.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9111"
       labels:
         app: gpu-fault-cluster-executor
     spec:
@@ -298,6 +309,10 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3
+          ports:
+            - name: metrics
+              containerPort: 9111
+              protocol: TCP
           resources:
             requests:
               cpu: 50m

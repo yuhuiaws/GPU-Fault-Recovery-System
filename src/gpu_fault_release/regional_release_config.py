@@ -149,6 +149,12 @@ class ClusterTarget:
     allowed_namespaces: tuple[str, ...] = ()
     agent_endpoint_allowed_cidrs: tuple[str, ...] = ()
     fleet_master_file: str | None = None
+    #: IRSA role for the per-cluster ADOT collector (data-plane review F7):
+    #: ``aps:RemoteWrite`` on the site's AMP workspace, trusted by this
+    #: cluster's OIDC issuer for ``gpu-fault-system/gpu-fault-adot-dataplane``.
+    #: Optional: without it the release skips the collector for this cluster
+    #: and says so, rather than applying a collector with no credentials.
+    adot_irsa_role_arn: str | None = None
 
     @classmethod
     def from_mapping(
@@ -215,6 +221,14 @@ class ClusterTarget:
             control_plane_url=value.get("control_plane_url"),
             allowed_namespaces=namespaces,
             agent_endpoint_allowed_cidrs=endpoint_cidrs,
+            adot_irsa_role_arn=(
+                required_text(
+                    value["adot_irsa_role_arn"],
+                    "cluster target adot_irsa_role_arn",
+                )
+                if value.get("adot_irsa_role_arn")
+                else None
+            ),
             fleet_master_file=value.get("fleet_master_file"),
         )
 

@@ -39,6 +39,7 @@ def test_predicate_finds_the_known_singletons() -> None:
     names = sorted(path.name for path, _ in SINGLETONS)
 
     assert names == [
+        "adot-dataplane.yaml",
         "completion-watcher.yaml",
         "kubernetes-node-resource-collector.yaml",
         "node-installer-reconciler.yaml",

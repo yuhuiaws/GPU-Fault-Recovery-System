@@ -112,6 +112,17 @@ spec:
       app: gpu-fault-node-installer-reconciler
   template:
     metadata:
+      # Scrape declaration for the per-cluster ADOT collector
+      # (deploy/dataplane/adot-dataplane.yaml): it discovers Pods by this
+      # annotation pair plus the container port named `metrics` below, and
+      # keeps the gpu_fault_node_installer_.+ family. The /metrics server
+      # behind :9110 ships in the same batch as this declaration; until it
+      # listens the target reads `up == 0`, which is the honest value.
+      # Liveness stays file-based (below) and is not tied to this port.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9110"
       labels:
         app: gpu-fault-node-installer-reconciler
     spec:
@@ -195,6 +206,10 @@ spec:
               value: "*"
             - name: GPU_FAULT_INSTALLER_WAVE_CONFIG_MAP
               value: gpu-fault-node-installer-wave
+          ports:
+            - name: metrics
+              containerPort: 9110
+              protocol: TCP
           resources:
             requests:
               cpu: 50m

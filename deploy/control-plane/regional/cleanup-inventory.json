@@ -290,6 +290,14 @@
       },
       {
         "kind": "deployment",
+        "name": "gpu-fault-adot-dataplane",
+        "scope": "namespaced",
+        "phase": "producer",
+        "order": 80,
+        "clean": "delete"
+      },
+      {
+        "kind": "deployment",
         "name": "gpu-fault-cluster-executor",
         "scope": "namespaced",
         "phase": "executor",
@@ -379,6 +387,22 @@
         "clean": "delete"
       },
       {
+        "kind": "poddisruptionbudget",
+        "name": "gpu-fault-adot-dataplane",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "role",
+        "name": "gpu-fault-adot-dataplane-discovery",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
         "kind": "role",
         "name": "gpu-fault-node-installer-reconciler",
         "scope": "namespaced",
@@ -388,7 +412,23 @@
       },
       {
         "kind": "rolebinding",
+        "name": "gpu-fault-adot-dataplane-discovery",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "rolebinding",
         "name": "gpu-fault-node-installer-reconciler",
+        "scope": "namespaced",
+        "phase": "support",
+        "order": 100,
+        "clean": "delete"
+      },
+      {
+        "kind": "serviceaccount",
+        "name": "gpu-fault-adot-dataplane",
         "scope": "namespaced",
         "phase": "support",
         "order": 100,

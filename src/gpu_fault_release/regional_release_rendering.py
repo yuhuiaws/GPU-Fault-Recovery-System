@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,122 @@ def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
         if placeholder in text:
             raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")
     return text
+
+
+#: The per-GPU-cluster metrics collector (data-plane review F7) and the
+#: placeholders it carries. Every value is substituted from the release config
+#: or the cluster target; none has a default, because a collector that keeps a
+#: placeholder starts, scrapes and fails every remote write in silence.
+DATAPLANE_ADOT_MANIFEST = "deploy/dataplane/adot-dataplane.yaml"
+DATAPLANE_ADOT_DEPLOYMENT = "gpu-fault-adot-dataplane"
+ADOT_IMAGE_PLACEHOLDER = "REPLACE_WITH_ADOT_IMAGE"
+ADOT_IRSA_ROLE_ARN_PLACEHOLDER = "REPLACE_WITH_ADOT_IRSA_ROLE_ARN"
+AMP_WORKSPACE_ID_PLACEHOLDER = "REPLACE_WITH_AMP_WORKSPACE_ID"
+GPU_CLUSTER_ID_PLACEHOLDER = "REPLACE_WITH_GPU_CLUSTER_ID"
+AWS_REGION_PLACEHOLDER = "REPLACE_WITH_AWS_REGION"
+
+
+def render_dataplane_adot_manifest(
+    *,
+    namespace: str,
+    image: str,
+    region: str,
+    amp_workspace_id: str,
+    irsa_role_arn: str,
+    cluster_id: str,
+) -> str:
+    """The data-plane ADOT collector text for one GPU cluster.
+
+    One renderer for the plan payload and for the apply, like the DCGM
+    exporter, so an approver reads the text that is about to be applied. The
+    collector scrapes the data-plane Pods of THIS cluster and remote-writes to
+    the SAME AMP workspace the control-plane collector uses, with ``region``
+    and ``gpu_cluster`` stamped on every series so the alerts'
+    ``by (control_plane_cluster, region)`` grouping keeps working.
+
+    Fails closed twice: on an empty input (a blank IRSA role ARN would render a
+    ServiceAccount annotation that IRSA ignores, and the collector would run
+    without credentials) and on any ``REPLACE_WITH`` that survives
+    substitution.
+    """
+
+    inputs = {
+        "namespace": namespace,
+        "image": image,
+        "region": region,
+        "amp_workspace_id": amp_workspace_id,
+        "irsa_role_arn": irsa_role_arn,
+        "cluster_id": cluster_id,
+    }
+    empty = sorted(name for name, value in inputs.items() if not str(value).strip())
+    if empty:
+        raise ReleaseError(
+            "data-plane ADOT collector cannot be rendered without: " + ", ".join(empty)
+        )
+    text = (ROOT / DATAPLANE_ADOT_MANIFEST).read_text(encoding="utf-8")
+    for source, destination in (
+        ("namespace: gpu-fault-system", f"namespace: {namespace}"),
+        # The receiver's pod discovery is pinned to the system namespace too.
+        ("names: [gpu-fault-system]", f"names: [{namespace}]"),
+        (ADOT_IMAGE_PLACEHOLDER, image),
+        (ADOT_IRSA_ROLE_ARN_PLACEHOLDER, irsa_role_arn),
+        (AMP_WORKSPACE_ID_PLACEHOLDER, amp_workspace_id),
+        (GPU_CLUSTER_ID_PLACEHOLDER, cluster_id),
+        (AWS_REGION_PLACEHOLDER, region),
+    ):
+        text = text.replace(source, destination)
+    leftover = sorted(set(re.findall(r"REPLACE_WITH_[A-Z0-9_]+", text)))
+    if leftover:
+        raise ReleaseError(
+            "data-plane ADOT collector manifest still carries " + ", ".join(leftover)
+        )
+    return text
+
+
+def dataplane_adot_skip_reason(release: Any, target: ClusterTarget) -> str | None:
+    """Why the collector cannot be applied to ``target``, or ``None``.
+
+    The two prerequisites live outside the repository: the site's AMP
+    workspace and a per-cluster IAM role with ``aps:RemoteWrite`` on it,
+    trusted by the cluster's OIDC issuer for the collector's ServiceAccount.
+    A site that has not created them yet must still be able to release
+    everything else, so their absence skips the component instead of failing
+    the release -- but the caller prints the reason, because the alternative
+    is exactly the silent, inert watcher alerts this component exists to end.
+    """
+
+    if not release.config.health.amp_workspace_id:
+        return "health.amp_workspace_id is not configured"
+    if not target.adot_irsa_role_arn:
+        return (
+            f"cluster target {target.cluster_id} has no adot_irsa_role_arn "
+            "(an IAM role with aps:RemoteWrite on the AMP workspace, trusted by "
+            "this cluster's OIDC issuer for gpu-fault-system/"
+            f"{DATAPLANE_ADOT_DEPLOYMENT})"
+        )
+    return None
+
+
+def render_dataplane_adot_for_target(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    image: str | None = None,
+) -> str | None:
+    """The rendered collector for ``target``, or ``None`` when it is skipped."""
+
+    workspace_id = release.config.health.amp_workspace_id
+    irsa_role_arn = target.adot_irsa_role_arn
+    if dataplane_adot_skip_reason(release, target) or not irsa_role_arn:
+        return None
+    return render_dataplane_adot_manifest(
+        namespace=release.config.namespace,
+        image=image or release.adot_image,
+        region=target.region,
+        amp_workspace_id=str(workspace_id),
+        irsa_role_arn=irsa_role_arn,
+        cluster_id=target.cluster_id,
+    )
 
 
 def _number_text(value: float) -> str:
@@ -318,6 +435,17 @@ def _render_release_payload(release: Any) -> dict[str, Any]:
         "nlb": nlb_documents,
         "dcgm": _documents(dcgm_text),
         "observability": _documents(observability_text),
+        # Per GPU cluster; an empty list is a cluster the release will skip
+        # (no AMP workspace or no IRSA role for the collector yet), so the
+        # plan an approver reads says which clusters get a scrape path.
+        "dataplane_observability": {
+            target.cluster_id: (
+                _documents(rendered)
+                if (rendered := render_dataplane_adot_for_target(release, target))
+                else []
+            )
+            for target in config.clusters
+        },
         "reconciler": {
             target.cluster_id: {
                 "wheel_config_map": release.executor_wheel_cm,

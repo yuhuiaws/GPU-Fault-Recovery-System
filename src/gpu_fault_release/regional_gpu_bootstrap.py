@@ -11,7 +11,12 @@ from gpu_fault_release import regional_deployment_inventory as inventory
 import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
-from gpu_fault_release.regional_release_rendering import render_dcgm_exporter_manifest
+from gpu_fault_release.regional_release_rendering import (
+    DATAPLANE_ADOT_DEPLOYMENT,
+    dataplane_adot_skip_reason,
+    render_dataplane_adot_for_target,
+    render_dcgm_exporter_manifest,
+)
 from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,6 +102,85 @@ def apply_gpu_dcgm_exporter(
             "status",
             "daemonset/gpu-fault-dcgm-exporter",
             "--timeout=10m",
+        )
+    )
+
+
+def _render_gpu_adot_collector(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    image: str | None = None,
+) -> str | None:
+    """The collector manifest for ``target``, or ``None`` after saying why not.
+
+    The skip is printed rather than logged: this runs inside a release whose
+    stdout the operator is reading, and the outcome of a silent skip is the
+    inert watcher alerts the component exists to fix.
+    """
+
+    reason = dataplane_adot_skip_reason(release, target)
+    if reason:
+        print(
+            f"{target.cluster_id}: data-plane ADOT collector not applied "
+            f"({reason}); the Completion Watcher alerts stay inert for this "
+            "cluster",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return render_dataplane_adot_for_target(release, target, image=image)
+
+
+def preflight_gpu_adot_collector(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    image: str | None = None,
+) -> None:
+    manifest = _render_gpu_adot_collector(release, target, image=image)
+    if manifest is None:
+        return
+    release.runner.run(
+        release._gpu(target, "apply", "--dry-run=server", "-f", "-"),
+        input_text=manifest,
+    )
+
+
+def apply_gpu_adot_collector(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    image: str | None = None,
+) -> None:
+    """Apply the per-cluster metrics collector and wait for it to come up.
+
+    Same shape as :func:`apply_gpu_dcgm_exporter`, and meant to be wired the
+    same way: the release engine calls it wherever it calls the DCGM apply
+    (bootstrap, join, the OBSERVABILITY node of an upgrade, rollback with the
+    previous ``adot_image``).
+    """
+
+    manifest = _render_gpu_adot_collector(release, target, image=image)
+    if manifest is None:
+        return
+    release.runner.run(
+        release._gpu(target, "apply", "--dry-run=server", "-f", "-"),
+        input_text=manifest,
+    )
+    release.runner.run(
+        release._gpu(target, "apply", "-f", "-"),
+        input_text=manifest,
+    )
+    release.runner.run(
+        release._gpu(
+            target,
+            "-n",
+            release.config.namespace,
+            "rollout",
+            "status",
+            f"deployment/{DATAPLANE_ADOT_DEPLOYMENT}",
+            "--timeout=5m",
         )
     )
 

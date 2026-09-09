@@ -508,6 +508,62 @@ def test_the_drop_counters_reach_amp_and_carry_the_grouping_labels() -> None:
     assert {"service_instance_id", "service_version"} <= dropped, dropped
 
 
+def dataplane_adot_collector_config() -> dict:
+    documents = yaml.safe_load_all(
+        (ROOT / "deploy/dataplane/adot-dataplane.yaml").read_text(encoding="utf-8")
+    )
+    collector = next(
+        document
+        for document in documents
+        if document and document.get("kind") == "ConfigMap"
+    )
+    return yaml.safe_load(collector["data"]["collector.yaml"])
+
+
+def test_the_completion_watcher_alerts_are_fed_by_the_data_plane_collector() -> None:
+    """Both watcher rules evaluated against no series until F7.
+
+    The control-plane collector keeps ``gpu_fault_completion_.+`` too, but it
+    scrapes the control plane's own Pods, where the watcher's families never
+    appear. The data-plane collector is what puts them in AMP, so its keep
+    filter alone -- not the union with the control plane's -- must admit the
+    two alerts' metrics, and its target relabels must add the grouping labels
+    the ``by (control_plane_cluster, region)`` clauses and Alertmanager use.
+    """
+    scrapes = dataplane_adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+    watcher_rules = [_rule(alert) for alert in COMPLETION_WATCHER_ALERTS]
+    watcher_job = next(
+        job for job in scrapes if job["job_name"] == "gpu-fault-dataplane"
+    )
+    added = {
+        rule["target_label"]
+        for rule in watcher_job["relabel_configs"]
+        if rule.get("action") == "replace"
+    }
+
+    assert MODULE.keep_filter_defects([watcher_job], watcher_rules) == []
+    assert set(MODULE.GROUPING_LABELS) <= added, added
+    assert "gpu_cluster" in added, (
+        "a fleet of GPU clusters writes to one workspace; without the cluster "
+        "label a firing watcher alert cannot be traced to its cluster"
+    )
+    for job in scrapes:
+        assert MODULE.collector_label_defects(job) == [], job["job_name"]
+
+
+def test_the_completion_watcher_rule_comments_no_longer_call_the_rules_inert() -> None:
+    """The rule comments said 'no ADOT collector scrapes it today'; now one does."""
+    text = AMP_RULES.read_text(encoding="utf-8")
+
+    assert "no ADOT collector scrapes it" not in text
+    assert "nothing scrapes port 9109" not in text
+    assert "adot-dataplane.yaml" in text, (
+        "the watcher rules should name the collector that feeds them"
+    )
+
+
 def test_the_collector_internal_counters_are_selected_unsuffixed() -> None:
     """The suffixed name is the documented one and the wrong one.
 

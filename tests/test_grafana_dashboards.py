@@ -27,6 +27,7 @@ ALERTING = lazy_script_module(ROOT / "scripts/verify-regional-alerting.py")
 DASHBOARDS = ROOT / "deploy/observability/dashboards"
 AMP_RULES = ROOT / "deploy/observability/amp-rules.yaml"
 ADOT = ROOT / "deploy/observability/adot-control-plane.yaml"
+DATAPLANE_ADOT = ROOT / "deploy/dataplane/adot-dataplane.yaml"
 DATASOURCE = {"type": "prometheus", "uid": "gpu-fault-amp"}
 CLUSTER_VARIABLE_QUERY = (
     "label_values(gpu_fault_processor_cluster_queue_depth, cluster_id)"
@@ -184,6 +185,38 @@ def test_every_plotted_metric_survives_the_adot_keep_filter() -> None:
         for uid, panel in all_panels()
     ]
 
+    assert ALERTING.keep_filter_defects(scrapes, probes) == []
+
+
+def test_the_completion_watcher_row_survives_the_data_plane_keep_filter() -> None:
+    """The row plots series only the data-plane collector delivers.
+
+    ``test_every_plotted_metric_survives_the_adot_keep_filter`` passes for these
+    panels through the control-plane keep list, which admits the family name
+    but scrapes Pods that never emit it. The panels were blank until the
+    fault-domain collector existed, so they are checked against that
+    collector's own filter here.
+    """
+    documents = yaml.safe_load_all(DATAPLANE_ADOT.read_text(encoding="utf-8"))
+    collector = next(
+        document
+        for document in documents
+        if document and document.get("kind") == "ConfigMap"
+    )
+    config = yaml.safe_load(collector["data"]["collector.yaml"])
+    scrapes = config["receivers"]["prometheus"]["config"]["scrape_configs"]
+    watcher_families = {
+        "gpu_fault_completion_active_state_unavailable",
+        "gpu_fault_completion_outbox_append_failures_total",
+    }
+    probes = [
+        {"alert": f"{uid}/{panel['title']}", "expr": " ".join(panel_exprs(panel))}
+        for uid, panel in all_panels()
+        if watcher_families
+        & set(GPU_FAULT_METRIC.findall(" ".join(panel_exprs(panel))))
+    ]
+
+    assert probes, "the Completion Watcher row is gone from every dashboard"
     assert ALERTING.keep_filter_defects(scrapes, probes) == []
 
 

@@ -119,14 +119,18 @@ groups:
             collector or the write path is down, this one alone means the
             self-telemetry reader or its keep filter changed.
       # Scrape dependency: the Completion Watcher exposes these series on port
-      # 9109 inside the fault-domain cluster, and no ADOT collector scrapes it
-      # today -- adot-control-plane.yaml keeps only the api-ha, control-worker
-      # and telemetry-spool-worker jobs in gpu-fault-system. Until a data-plane
-      # scrape (or remote-write) path lands, both Completion Watcher rules below
-      # evaluate against no series and can never fire; the part to revisit then
-      # is the `by (control_plane_cluster, region)` clause, because a data-plane
-      # scrape has to carry those two labels for the grouping -- and for
-      # Alertmanager's own grouping -- to mean anything.
+      # 9109 inside the fault-domain cluster. They reach AMP through the
+      # per-GPU-cluster collector, deploy/dataplane/adot-dataplane.yaml (job
+      # `gpu-fault-dataplane`), which the regional release applies to every
+      # cluster target that carries an `adot_irsa_role_arn`; adot-control-plane
+      # .yaml runs in the control-plane cluster and never sees these Pods. That
+      # collector stamps control_plane_cluster and region with the same values
+      # the control-plane collector uses -- the `by (control_plane_cluster,
+      # region)` clauses below and Alertmanager's grouping depend on it -- plus
+      # gpu_cluster, so a firing rule can be traced to the cluster whose watcher
+      # it is. A cluster whose release skipped the collector (no IRSA role yet)
+      # contributes no series and these rules stay silent for it; the release
+      # prints that skip.
       # The Completion Watcher persists two ConfigMaps and only one of them is
       # load-bearing at runtime: the write-ahead log carries critical events,
       # while `gpu-fault-completion-watcher-outbox-active` carries the routine
@@ -167,8 +171,9 @@ groups:
             protects. The watcher retries once a minute by itself, so no
             restart is needed and the gauge clears on the first call that
             succeeds.
-      # Same scrape dependency as the rule above: nothing scrapes port 9109
-      # yet, so this one is inert until a data-plane scrape path exists.
+      # Same scrape dependency as the rule above: the counter arrives through
+      # the data-plane collector (adot-dataplane.yaml), so it is live only on
+      # clusters where that collector is applied.
       # The write-ahead copy is what lets a critical completion event survive a
       # watcher restart: buffered before the POST and cleared after it. A
       # failed append no longer vetoes the POST, so the event is still
