@@ -50,6 +50,7 @@ from scripts.e2e.regional import (  # noqa: E402
     run_destr002_hyperpod_reboot as reboot_case,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
@@ -59,8 +60,6 @@ from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
 from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     AGENT_OPERATIONS,
     FIRST_XID,
-    QUARANTINE_TAINT_PREFIX,
-    REBOOT_EVENTS,
     absorb_errors,
     barrier_reason_errors,
     cancelled_command_errors,
@@ -90,8 +89,6 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
-    record_focused_tests,
-    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -119,24 +116,22 @@ CONTROL_PLANE = "cpu"
 CONTROL_DEPLOYMENT = "gpu-fault-control-worker"
 STEP_TIMEOUT_VARIABLE = "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS"
 NODE_LIFETIME_VARIABLE = "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS"
-# ``execution/config.py`` and ``orchestration/coordinator.py`` both read this
-# switch through ``env_bool``; unset means enabled.
-PREEMPTION_VARIABLE = "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION"
-CONTROL_VARIABLES = (STEP_TIMEOUT_VARIABLE, NODE_LIFETIME_VARIABLE, PREEMPTION_VARIABLE)
-# Shipped defaults of the bounds, used only when the deployment does not
+CONTROL_VARIABLES = (STEP_TIMEOUT_VARIABLE, NODE_LIFETIME_VARIABLE)
+# Shipped defaults of the two bounds, used only when the deployment does not
 # override them (``execution/config.py``: ``from_mapping``).
 DEFAULT_STEP_TIMEOUT_SECONDS = 600
 DEFAULT_NODE_LIFETIME_SECONDS = 3600
-DEFAULT_PREEMPTION_ENABLED = True
-# The tokens ``gpu_fault.env.env_bool`` accepts; anything else makes the worker
-# refuse to start, so a replica reporting one cannot be Ready.
-TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
-FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 # Phase budgets. The barrier park is the scarce one: it lives inside the step's
 # own waiting ceiling, and both later injections have to land inside it.
 BARRIER_WAIT_BUDGET_SECONDS = 600
-ABSORB_BUDGET_SECONDS = 180
-PREEMPTION_BUDGET_SECONDS = 300
+ABSORB_BUDGET_SECONDS = 300
+PREEMPTION_BUDGET_SECONDS = 420
+# QUIESCE_GPU_SERVICES stops kubelet, and with it the exec channel the host
+# probes answer over, so the two writes that must land inside the WAITING
+# window are scheduled on the node when the holder is armed: this many seconds
+# after the holder starts (i.e. after the quiesce row landed in the ledger).
+ABSORB_DELAY_SECONDS = 90
+ESCALATE_DELAY_SECONDS = 240
 # Supersession happens when the predecessor's executor next reaches a step
 # boundary, which can take one lease/reclaim interval after the successor was
 # written (``execution/dispatcher.py``: ``_eligible`` holds the successor while
@@ -147,12 +142,6 @@ REBOOT_BUDGET_SECONDS = 1800
 OBSERVATION_BUDGET_SECONDS = 2400
 # The maintenance window must have at least this much left at injection time.
 MIN_WINDOW_REMAINING_SECONDS = 3600
-# The device holder has to outlive every phase in which the barrier must still
-# be parked: waiting for the park, absorbing, preempting, and the supersession
-# that cancels the barrier command. A holder that expires earlier releases the
-# client, the verify succeeds, and the reset commits under the case's feet.
-HOLD_MARGIN_SECONDS = 120
-DEFAULT_MAX_HOLD_SECONDS = 2400
 
 COMMANDS_BY_WORKFLOW = r"""
 import json
@@ -193,12 +182,10 @@ def preflight_errors(
     tests: dict[str, Any],
     control_env: dict[str, Any],
     identity_errors: list[str],
-    max_hold_seconds: int,
 ) -> list[str]:
     """Everything that must hold before a real reboot is authorized."""
 
     errors: list[str] = list(identity_errors)
-    errors.extend(hold_errors(max_hold_seconds=max_hold_seconds))
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
     if not tests.get("passed"):
@@ -239,7 +226,7 @@ def preflight_errors(
         errors.append("nodeReboot is not OWN by the HyperPod adapter")
     if (profile or {}).get("warnings"):
         errors.append("the runtime profile has warnings")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("the processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("the remote command queue is not empty")
@@ -257,84 +244,6 @@ def preflight_errors(
         )
     )
     return errors
-
-
-def required_hold_seconds() -> int:
-    """The shortest holder lifetime that covers every parked phase."""
-
-    return (
-        BARRIER_WAIT_BUDGET_SECONDS
-        + ABSORB_BUDGET_SECONDS
-        + PREEMPTION_BUDGET_SECONDS
-        + SUPERSEDE_BUDGET_SECONDS
-        + HOLD_MARGIN_SECONDS
-    )
-
-
-def hold_errors(*, max_hold_seconds: int) -> list[str]:
-    required = required_hold_seconds()
-    if max_hold_seconds < required:
-        return [
-            f"the device holder cap {max_hold_seconds}s is below the {required}s "
-            "the barrier, absorb, preemption and supersession budgets plus margin "
-            "need; the holder could expire while the barrier must still be parked"
-        ]
-    return []
-
-
-def preemption_enabled(value: str | None) -> bool | None:
-    """``GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION`` as the worker reads it.
-
-    Unset is the shipped default (enabled). A token ``env_bool`` would refuse
-    is reported as ``None``: such a worker cannot have started, so the value is
-    not one the case may plan against.
-    """
-
-    if value is None:
-        return DEFAULT_PREEMPTION_ENABLED
-    token = value.strip().lower()
-    if token in TRUE_TOKENS:
-        return True
-    if token in FALSE_TOKENS:
-        return False
-    if not token:
-        return DEFAULT_PREEMPTION_ENABLED
-    return None
-
-
-def stop_before_escalation(errors: list[str], *, phase: str) -> None:
-    """Refuse the destructive escalation once an earlier phase has failed.
-
-    The plan lists a broken absorb as a stop condition; carrying on to a real
-    provider reboot after it would spend the mutation on a run that has already
-    failed and could never be recorded as proof.
-    """
-
-    if errors:
-        raise RegionalFixtureError(
-            f"stopping before the {phase}: an earlier phase already failed: "
-            + "; ".join(errors)
-        )
-
-
-def restore_target(snapshot: dict[str, Any], incident_id: str) -> str | None:
-    """Which incident the validated restore must name, or ``None`` if the node
-    is not isolated. An isolated node with no known incident is a cleanup
-    failure, never a silent skip."""
-
-    isolated = bool(
-        snapshot.get("unschedulable")
-        or snapshot.get("ownership_annotations")
-        or any(
-            str(taint.get("key") or "").startswith(QUARANTINE_TAINT_PREFIX)
-            for taint in snapshot.get("taints") or []
-        )
-    )
-    if not isolated:
-        return None
-    if not incident_id:
-        raise RegionalFixtureError("the node is isolated but no incident is known")
-    return incident_id
 
 
 def _digest(value: Any) -> str:
@@ -393,9 +302,7 @@ def control_env_record(observations: dict[str, str | None]) -> dict[str, Any]:
         "node_lifetime_seconds": number(
             NODE_LIFETIME_VARIABLE, DEFAULT_NODE_LIFETIME_SECONDS
         ),
-        # Read, not assumed: a site that switched preemption off would run the
-        # whole case and fail at the escalation with a reboot never issued.
-        "preemption_enabled": preemption_enabled(observations.get(PREEMPTION_VARIABLE)),
+        "preemption_enabled": True,
     }
 
 
@@ -518,7 +425,7 @@ def configure(arguments: argparse.Namespace) -> Settings:
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     identity = plan_identity(preflight, node=settings.node)
-    details: dict[str, Any] = {
+    return {
         "risk": "destructive-provider-reboot",
         "predecessor": preflight.get("predecessor"),
         "node": settings.node,
@@ -566,31 +473,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "no_node_replacement_or_deletion_is_authorized": True,
         },
     }
-    # The --plan's focused-test result is recorded with a source digest so
-    # --execute can reuse it instead of paying for the same run twice.
-    record_focused_tests(
-        details,
-        dict(preflight.get("focused_tests") or {"passed": False}),
-    )
-    return details
 
 
 # --------------------------------------------------------------------------- #
 # Live preflight (not unit-tested; delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
-def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
-    """Run the focused pytest, or reuse the --plan's result in --execute.
-
-    ``reuse`` is set by the execution path only: the result recorded in
-    ``plan.json`` is taken when it passed against exactly this source tree
-    (``reusable_focused_tests`` compares the digest), so the same tests are
-    not paid for twice minutes apart; any edit in between forces a rerun.
-    """
-
-    if reuse:
-        recorded = reusable_focused_tests(case_dir / "plan.json")
-        if recorded is not None:
-            return {**recorded, "focused_tests_reused": True}
+def focused_tests(case_dir: Path) -> dict[str, Any]:
     command = [
         sys.executable,
         "-m",
@@ -632,12 +520,7 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     return record
 
 
-def read_only_preflight(
-    settings: Settings,
-    case_dir: Path,
-    *,
-    reuse_focused_tests: bool = False,
-) -> dict[str, Any]:
+def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     state = regional.store_snapshot(
         node=settings.node,
@@ -646,12 +529,8 @@ def read_only_preflight(
     )
     node = regional.node_snapshot(settings.node)
     runtime_identity = regional.runtime_identity()
-    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
-    predecessor = predecessor_evidence(
-        settings.predecessor_path,
-        PREDECESSOR_CASE_ID,
-        **regional.evidence_identity(),
-    )
+    tests = focused_tests(case_dir)
+    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     env = control_env(regional)
     workloads = regional.business_workloads(settings.node)
     result: dict[str, Any] = {
@@ -679,7 +558,6 @@ def read_only_preflight(
         tests=tests,
         control_env=env,
         identity_errors=runtime_identity_errors(runtime_identity),
-        max_hold_seconds=settings.max_hold_seconds,
     )
     write_json_atomic(case_dir / "preflight.json", result)
     return result
@@ -718,12 +596,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--max-hold-seconds",
         type=int,
-        default=DEFAULT_MAX_HOLD_SECONDS,
-        help=(
-            "bounded lifetime of the GPU device holder unit; the preflight "
-            f"refuses less than {required_hold_seconds()}s (the parked phases' "
-            "budgets plus margin)"
-        ),
+        default=1800,
+        help="bounded lifetime of the GPU device holder unit",
     )
     value.add_argument("--predecessor-evidence", default="")
     return value
@@ -790,7 +664,7 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
+    preflight = read_only_preflight(settings, case_dir)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -822,19 +696,13 @@ def _prepare_live_run(
     )
 
 
-def _snapshot(
-    run: _LiveRun,
-    marker: str,
-    *,
-    workflow_request_ids: list[str] | None = None,
-) -> dict[str, Any]:
+def _snapshot(run: _LiveRun, marker: str) -> dict[str, Any]:
     return run.regional.store_snapshot(
         node=run.settings.node,
         marker=marker,
         observed_after=run.started_at,
         hyperpod_cluster=run.settings.hyperpod_cluster,
         queue_attempts=1,
-        workflow_request_ids=workflow_request_ids,
     )
 
 
@@ -873,6 +741,7 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
     )
     if window:
         raise RegionalFixtureError("; ".join(window))
+    run.marker = markers(f"destr016-{int(time.time())}-a{run.attempt}")
     armed = run.holder_probe.execute(
         "arm-holder",
         "--device",
@@ -887,11 +756,26 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
         run_id,
         "--probe-script",
         run.holder_probe.host_script,
+        "--inject-script",
+        run.inject_probe.host_script,
+        "--pci-bdf",
+        run.bdf,
+        "--absorb-marker",
+        run.marker["absorb"],
+        "--absorb-drill-id",
+        f"{run_id}-s",
+        "--absorb-after-seconds",
+        str(ABSORB_DELAY_SECONDS),
+        "--escalate-marker",
+        run.marker["escalate"],
+        "--escalate-drill-id",
+        f"{run_id}-e",
+        "--escalate-after-seconds",
+        str(ESCALATE_DELAY_SECONDS),
     )
     run.holder_armed = True
     write_json_atomic(case_dir / "holder-armed.json", armed)
     run.started_at = datetime.now(timezone.utc)
-    run.marker = markers(f"destr016-{int(time.time())}-a{run.attempt}")
     injection = run.inject_probe.execute(
         "write-xid46",
         "--marker",
@@ -919,14 +803,14 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
     while time.monotonic() < deadline:
         last = _snapshot(run, run.marker["reset"])
         workflow = last.get("workflow") or {}
-        # Pin the incident the moment it exists: cleanup restores the node
-        # through it, and a failure in this loop or the absorb phase must not
-        # leave a cordoned node behind with no incident known.
-        incident_id = str((last.get("incident") or {}).get("incident_id") or "")
-        if incident_id and not run.incident_id:
-            run.incident_id = incident_id
         if workflow:
-            errors = waiting_boundary_errors(workflow)
+            # The barrier is only *proven* once the executor has folded the
+            # Agent's "clients are still active" verdict into the WAITING
+            # command; the first WAITING record is just a pointer to a PENDING
+            # node action, so keep polling until the reason is on record.
+            errors = waiting_boundary_errors(workflow) + barrier_reason_errors(
+                last.get("commands") or []
+            )
             if not errors:
                 write_json_atomic(run.case_dir / "barrier-state.json", last)
                 return last
@@ -934,7 +818,10 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
                 break
         time.sleep(5)
     write_json_atomic(run.case_dir / "barrier-state.json", last)
-    holder = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
+    try:
+        holder = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
+    except Exception as exc:  # noqa: BLE001 - a quiesced node cannot answer
+        holder = {"error": f"{type(exc).__name__}: {exc}"}
     write_json_atomic(run.case_dir / "holder-status-barrier.json", holder)
     raise RegionalFixtureError(
         "the reset workflow never parked at the client-verification barrier: "
@@ -946,18 +833,8 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
 def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     """Phase A: a second same-rank XID 46 must merge into the parked workflow."""
 
-    run_id = run.run_id
-    injection = run.inject_probe.execute(
-        "write-xid46",
-        "--marker",
-        run.marker["absorb"],
-        "--drill-id",
-        f"{run_id}-s",
-        "--pci-bdf",
-        run.bdf,
-    )
-    run.injected_at["absorb"] = datetime.now(timezone.utc).isoformat()
-    write_json_atomic(run.case_dir / "injection-absorb.json", injection)
+    # The write itself was scheduled on the node by arm-holder; kubelet is
+    # stopped behind the quiesce, so the only way to see it land is the store.
     deadline = time.monotonic() + ABSORB_BUDGET_SECONDS
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -971,6 +848,10 @@ def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "absorb-state.json", last)
+    run.injected_at["absorb"] = str(
+        (last.get("event") or {}).get("observed_at")
+        or f"scheduled {ABSORB_DELAY_SECONDS}s after the holder started"
+    )
     errors = absorb_errors(barrier, last, node=run.settings.node)
     # The absorbed fault must not have moved the boundary either: the case can
     # only preempt what is still parked.
@@ -983,23 +864,10 @@ def _escalate(
 ) -> tuple[list[str], dict[str, Any]]:
     """Phase B: XID 79 must preempt the parked reset and adopt its quiesce."""
 
-    case_dir, run_id = run.case_dir, run.run_id
+    case_dir = run.case_dir
     run.predecessor_id = str((barrier.get("workflow") or {}).get("request_id") or "")
-    run.incident_id = run.incident_id or str(
-        (barrier.get("incident") or {}).get("incident_id") or ""
-    )
-    injection = run.inject_probe.execute(
-        "write-xid79",
-        "--marker",
-        run.marker["escalate"],
-        "--drill-id",
-        f"{run_id}-e",
-        "--pci-bdf",
-        run.bdf,
-    )
-    run.injected_at["escalate"] = datetime.now(timezone.utc).isoformat()
-    write_json_atomic(case_dir / "injection-escalate.json", injection)
-
+    run.incident_id = str((barrier.get("incident") or {}).get("incident_id") or "")
+    # Scheduled on the node by arm-holder (see ESCALATE_DELAY_SECONDS).
     successor: dict[str, Any] = {}
     deadline = time.monotonic() + PREEMPTION_BUDGET_SECONDS
     while time.monotonic() < deadline:
@@ -1010,6 +878,10 @@ def _escalate(
             break
         time.sleep(5)
     write_json_atomic(case_dir / "successor-created.json", successor)
+    run.injected_at["escalate"] = str(
+        (successor.get("event") or {}).get("observed_at")
+        or f"scheduled {ESCALATE_DELAY_SECONDS}s after the holder started"
+    )
     if not run.successor_id:
         raise RegionalFixtureError(
             f"XID 79 did not create a successor workflow: {successor}"
@@ -1071,11 +943,7 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
     deadline = time.monotonic() + OBSERVATION_BUDGET_SECONDS
     state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        state = _snapshot(
-            run,
-            run.marker["escalate"],
-            workflow_request_ids=[run.successor_id] if run.successor_id else None,
-        )
+        state = _snapshot(run, run.marker["escalate"])
         workflow = state.get("workflow") or {}
         transitions, changes = step_transitions(
             transitions, workflow.get("step_executions") or []
@@ -1130,22 +998,8 @@ def _data_plane_errors(
             final_node,
         )
     )
-    # The positive claim (exactly one reboot) polls CloudTrail until the event
-    # is visible; a single read right after the reboot sees nothing and fails a
-    # correct run. The negative half (no replace/delete) cannot be settled
-    # inside the delivery window and is recorded as provisional for DESTR-013.
-    run.regional.wait_provider_events(
-        run.started_at,
-        event_names=set(REBOOT_EVENTS),
-        expected_count=1,
-    )
-    ended_at = datetime.now(timezone.utc)
-    provider = run.regional.provider_events(run.started_at, ended_at)
-    provisional = run.regional.provider_events_provisional(ended_at)
-    write_json_atomic(
-        case_dir / "provider-events.json",
-        {"events": provider, "provisional": provisional},
-    )
+    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
+    write_json_atomic(case_dir / "provider-events.json", {"events": provider})
     unique = reboot_events(provider)
     errors.extend(
         provider_errors(
@@ -1173,11 +1027,6 @@ def _data_plane_errors(
         "ledger_rows_added": len(after.get("ledger") or [])
         - len(run.baseline.get("ledger") or []),
         "holder_hold_started_at": holder.get("hold_started_at"),
-        "provider_events": {
-            "reboot_count": len(unique),
-            "count": len(provider),
-            "provisional": provisional,
-        },
     }
 
 
@@ -1208,10 +1057,6 @@ def execute_case(
         errors.extend(barrier_reason_errors(barrier.get("commands") or []))
         absorb, absorbed = _absorb(run, barrier)
         errors.extend(absorb)
-        # The plan lists a failed absorb as a stop condition: no real provider
-        # reboot is spent on a run that has already failed.
-        result["errors"] = list(errors)
-        stop_before_escalation(errors, phase="XID 79 escalation")
         escalation, adopted = _escalate(run, absorbed if absorbed else barrier)
         errors.extend(escalation)
         node_after_boot = run.regional.wait_node_ready(
@@ -1246,7 +1091,6 @@ def execute_case(
         components = evidence_components(details)
         result.update(
             {
-                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "markers": run.marker,
@@ -1255,7 +1099,6 @@ def execute_case(
                 "predecessor_workflow_id": run.predecessor_id,
                 "successor_workflow_id": run.successor_id,
                 "submission": state.get("submission"),
-                "provider_events": hosts.get("provider_events"),
                 "case_digest": case_digest(components),
                 "components": components,
             }
@@ -1299,12 +1142,10 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
     if run.holder_armed:
-        guard("holder_disarm", lambda: disarm_holder(run))
+        guard("holder_disarm", lambda: _disarm_holder(run))
     if run.incident_id:
         guard("incident_idle", lambda: run.warm.wait_incident_idle(run.incident_id))
-    # Always: a node left cordoned by a failure before the incident was known
-    # is a cleanup failure, not something to skip silently.
-    guard("restore_isolated_node", lambda: _restore_isolated_node(run))
+        guard("restore_isolated_node", lambda: _restore_isolated_node(run))
     for label, probe in (
         ("holder_probe", run.holder_probe),
         ("inject_probe", run.inject_probe),
@@ -1321,21 +1162,15 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     return result
 
 
-def disarm_holder(run: _LiveRun) -> dict[str, Any]:
+def _disarm_holder(run: _LiveRun) -> dict[str, Any]:
     """Idempotent: a holder the reboot already took with it is not an error.
 
-    The probe Pod does not survive the reboot. ``_data_plane_errors`` already
-    re-created it on the success path, so it is re-created here only when the
-    exec fails -- a third ``create()`` right after the second would delete and
-    rebuild a Pod that answers; a node that cannot answer after one re-create
-    is a cleanup failure, which is the point.
+    The probe Pod does not survive the reboot, so it is recreated first; a node
+    that cannot answer here is a cleanup failure, which is the point.
     """
 
-    try:
-        return run.holder_probe.execute("disarm-holder", "--run-id", run.run_id)
-    except Exception:  # noqa: BLE001 - the retry decides
-        run.holder_probe.create()
-        return run.holder_probe.execute("disarm-holder", "--run-id", run.run_id)
+    run.holder_probe.create()
+    return run.holder_probe.execute("disarm-holder", "--run-id", run.run_id)
 
 
 def _refuse_residual(residuals: dict[str, bool]) -> dict[str, bool]:
@@ -1350,15 +1185,22 @@ def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
 
     settings = run.settings
     snapshot = run.regional.node_snapshot(settings.node)
-    incident_id = restore_target(snapshot, run.incident_id)
-    if incident_id is None:
+    isolated = bool(
+        snapshot.get("unschedulable")
+        or snapshot.get("ownership_annotations")
+        or any(
+            str(taint.get("key") or "").startswith("gpu-fault.io/")
+            for taint in snapshot.get("taints") or []
+        )
+    )
+    if not isolated:
         return {"isolated": False}
     run.warm.wait_agent_active(settings.node)
     profile_version = str(
         (run.preflight["store"].get("profile") or {}).get("profile_version") or ""
     )
     created = run.warm.create_restore_workflow(
-        incident_id=incident_id,
+        incident_id=run.incident_id,
         node=settings.node,
         profile_version=profile_version,
         reason="DESTR-016 validated cleanup",

@@ -22,6 +22,7 @@ from gpu_fault.models import (
 from gpu_fault.orchestration.escalation import HardwareEscalationService, next_rung
 from tests._builders import (
     build_store,
+    copy_model,
     fault_incident,
     workflow_request,
     workflow_step,
@@ -208,6 +209,59 @@ def test_the_escalation_is_created_atomically_once_and_inherits_the_source_ident
     assert escalated.state is IncidentState.ACTION_PENDING
     assert replacement.status is WorkflowStatus.PENDING
     assert REBOOT in {step.operation for step in replacement.official_steps}
+
+
+def test_a_branch_exhaustion_escalates_only_the_exhausted_node():
+    """A job DAG's recovered branch is not handed to support with the exhausted one.
+
+    node-a's RESET_GPU failed, escalated in place to a reboot that succeeded and
+    RESTORE_SCHEDULING ran; node-b's reboot timed out and its REPLACE_NODE rung
+    found no spare, exhausting the branch. Live 2026-09-09 (DESTR-014) the
+    support-after incident named both nodes and re-quarantined node-a minutes
+    after it had been restored. The escalation covers the exhausted node only.
+    """
+    store = build_store()
+    steps = [
+        workflow_step(RESET, node_ids=["node-a"], branch_id="branch:node-a"),
+        workflow_step(REBOOT, node_ids=["node-a"], branch_id="branch:node-a:2"),
+        workflow_step(RESTORE, node_ids=["node-a"], branch_id="branch:node-a:2"),
+        workflow_step(REBOOT, node_ids=["node-b"], branch_id="branch:initial"),
+        workflow_step(
+            WorkflowOperation.REPLACE_NODE,
+            node_ids=["node-b"],
+            branch_id="branch:node-b",
+            branch_node_ids=["node-b"],
+        ),
+    ]
+    executions = [
+        workflow_step_execution(0, RESET, WorkflowStepStatus.FAILED, error="held"),
+        workflow_step_execution(1, REBOOT, WorkflowStepStatus.SUCCEEDED),
+        workflow_step_execution(2, RESTORE, WorkflowStepStatus.SUCCEEDED),
+        workflow_step_execution(3, REBOOT, WorkflowStepStatus.FAILED, error="cap"),
+        workflow_step_execution(
+            4,
+            WorkflowOperation.REPLACE_NODE,
+            WorkflowStepStatus.FAILED,
+            error="insufficient healthy HyperPod spares",
+        ),
+    ]
+    _, workflow = _failed(store, steps, executions, completed=[1, 2])
+    workflow = copy_model(
+        workflow, dag_enabled=True, exhausted_branch_ids=["branch:node-b"]
+    )
+    store.save_workflow(workflow)
+
+    result = HardwareEscalationService(store, _StubBuilder()).escalate(workflow)
+
+    assert result is not None
+    escalated, replacement = result
+    assert escalated.node_ids == ["node-b"], escalated.node_ids
+    quarantine = next(
+        step
+        for step in replacement.official_steps
+        if step.operation is WorkflowOperation.QUARANTINE
+    )
+    assert quarantine.node_ids == ["node-b"], quarantine.node_ids
 
 
 def test_a_multi_node_replacement_keeps_the_per_node_gpu_mapping():

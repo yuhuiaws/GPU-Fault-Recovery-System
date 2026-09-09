@@ -641,3 +641,13 @@ def test_the_runner_and_probe_are_executable_with_a_shebang() -> None:
         assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
         first = path.read_text(encoding="utf-8").splitlines()[0]
         assert first == "#!/usr/bin/env python3", first
+
+
+def test_the_preflight_gates_on_the_fault_tier_not_routine_telemetry() -> None:
+    """A stale gpu-inventory lane leaves total depth at 1 for ~120 s; that is
+    routine telemetry, not work the restart's event would queue behind
+    (attempt 2, 2026-09-08)."""
+    routine = _preflight(queue={"depth": 1, "fault_backlog_depth": 0})
+    assert not any("processor queue" in e for e in routine), routine
+    fault = _preflight(queue={"depth": 0, "fault_backlog_depth": 2})
+    assert any("processor queue" in e for e in fault), fault

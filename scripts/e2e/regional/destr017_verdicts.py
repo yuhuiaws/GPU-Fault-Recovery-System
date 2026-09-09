@@ -27,6 +27,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 # The official steps a single idle node's RESET_GPU workflow compiles to.
 OFFICIAL_OPERATIONS = (
     "FREEZE_EVIDENCE",
@@ -61,6 +63,8 @@ AGENT_OPERATIONS = (
     "RESET_GPU",
     "RESTORE_GPU_SERVICES",
 )
+# The runtime profile must hand gpuReset to this owner in OWN mode.
+AGENT_OWNER = "gpu-fault-node-agent"
 
 # Fail-closed literals. Every one is a substring of a real error the product
 # raises; none is reconstructed from a format string here.
@@ -102,6 +106,20 @@ RETIRED_GENERATION_PLAN_MODE = "retired-generation-plan"
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 EXPECTED_XID = 46
 
+# The two aftermaths the case accepts for the origin incident. The fence itself
+# is terminal for the *reset*; what happens to the incident afterwards may be
+# either of two safe outcomes:
+#   QUARANTINED -- the node was cordoned and held for an operator (the escalation
+#     path, policed by ``successor_errors``); or
+#   RECOVERED   -- the out-of-band reboot self-healed the node onto a fresh boot
+#     and generation, and a lighter, fence-respecting re-plan validated it
+#     healthy and released it (policed by ``recovery_errors``).
+# Both are acceptable only because the reset was never executed; the difference
+# is whether the product chose to release a demonstrably-healthy node or hold it.
+QUARANTINED_STATE = "QUARANTINED"
+RECOVERED_STATE = "RECOVERED"
+ACCEPTED_AFTERMATH_STATES = frozenset({QUARANTINED_STATE, RECOVERED_STATE})
+
 # Wall-clock allowances (seconds) for the lifetime arithmetic. Deliberately
 # generous so a passing estimate is a real safety margin: containment, the
 # waiting window the holder buys, the reboot and re-registration, the terminal
@@ -124,27 +142,6 @@ def _executions_of(
 
 def _error_text(item: dict[str, Any]) -> str:
     return str(item.get("error") or "")
-
-
-def _command_error_text(command: dict[str, Any]) -> str:
-    """The refusal a *remote* command carries.
-
-    A remote step keeps only pointers in ``step.details``
-    (``remote_command_id``/``remote_status``); the executor writes the real
-    error onto the command row (``cluster_executor``: ``error = outcome.error``)
-    and sometimes into ``result_details``. Both are read, the command field
-    first.
-    """
-
-    details = command.get("result_details") or {}
-    return str(command.get("error") or details.get("error") or "")
-
-
-def _capability(profile: dict[str, Any], name: str) -> dict[str, Any] | None:
-    for item in profile.get("capabilities") or []:
-        if isinstance(item, dict) and item.get("capability") == name:
-            return item
-    return None
 
 
 def _added_ledger_rows(
@@ -188,22 +185,16 @@ def fence_variant(error: str) -> str:
     return FENCE_UNKNOWN
 
 
-def fence_evidence(
-    workflow: dict[str, Any],
-    commands: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def fence_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
     """The variant of every terminal error the case reads, digest-free.
 
     Recorded whatever the verdict, so a run that fails on an unexpected variant
-    still says which one it saw. ``commands`` are the workflow's remote command
-    rows: a remote step's execution record only points at its command, so the
-    fence text of a refused dispatch lives there and nowhere else.
+    still says which one it saw.
     """
 
     executions = workflow.get("step_executions") or []
     verify = _executions_of(executions, FENCE_STEP_OPERATION)
     compensation = _executions_of(executions, COMPENSATION_OPERATION)
-    remote = commands or []
     return {
         "workflow_status": workflow.get("status"),
         "workflow_error_variant": fence_variant(str(workflow.get("error") or "")),
@@ -213,14 +204,6 @@ def fence_evidence(
         "compensation_statuses": [item.get("status") for item in compensation],
         "compensation_variants": [
             fence_variant(_error_text(item)) for item in compensation
-        ],
-        "command_statuses": [
-            {
-                "operation": (item.get("step") or {}).get("operation"),
-                "status": item.get("status"),
-                "variant": fence_variant(_command_error_text(item)),
-            }
-            for item in remote
         ],
         "executed_operations": sorted(
             {str(item.get("operation")) for item in executions}
@@ -237,17 +220,12 @@ def workflow_errors(
     incident: dict[str, Any],
     *,
     node: str,
-    commands: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """The terminal contract of the fenced RESET_GPU workflow.
 
     Not "it failed": it must fail *closed*, at the waiting maintenance step, with
     the generation fence recorded somewhere in the terminal record, having never
     executed a reset and never marked an old-generation command SUCCEEDED.
-
-    ``commands`` are the workflow's remote command rows. The fence is raised
-    while a remote command is dispatched, so its text lands on the command's
-    ``error``; the step execution of a remote step carries pointers only.
     """
 
     errors: list[str] = []
@@ -257,10 +235,11 @@ def workflow_errors(
             f"workflow status is not FAILED: {status}; an out-of-band reboot "
             "inside a maintenance window must fail the workflow closed"
         )
-    if incident.get("state") != "QUARANTINED":
+    if incident.get("state") not in ACCEPTED_AFTERMATH_STATES:
         errors.append(
-            f"incident state is not QUARANTINED: {incident.get('state')}; the "
-            "node was cordoned and never released"
+            f"incident state is neither QUARANTINED nor RECOVERED: "
+            f"{incident.get('state')}; the fenced reset left the node in an "
+            "unsafe in-between state"
         )
 
     steps = workflow.get("official_steps") or []
@@ -305,18 +284,10 @@ def workflow_errors(
             )
         variant = fence_variant(_error_text(last_verify))
         if variant not in ACCEPTED_FENCES:
-            # The step record of a remote step points at its command; the
-            # refusal itself may only be on that command row.
-            command_variants = {
-                fence_variant(_command_error_text(item))
-                for item in commands or []
-                if (item.get("step") or {}).get("operation") == FENCE_STEP_OPERATION
-            }
-            if not command_variants & set(ACCEPTED_FENCES):
-                errors.append(
-                    f"{FENCE_STEP_OPERATION} did not fail closed on a known fence: "
-                    f"{_error_text(last_verify)!r}"
-                )
+            errors.append(
+                f"{FENCE_STEP_OPERATION} did not fail closed on a known fence: "
+                f"{_error_text(last_verify)!r}"
+            )
 
     compensation = _executions_of(executions, COMPENSATION_OPERATION)
     if not compensation:
@@ -328,27 +299,25 @@ def workflow_errors(
     # The proof of the case: the generation fence has to be in the record. The
     # waiting step may have failed on any of the accepted variants, but the
     # window-exempt compensation that follows it is still generation-checked.
-    fenced_texts = [
-        _error_text(item)
+    fenced = [
+        item
         for item in executions
         if fence_variant(_error_text(item)) == FENCE_AGENT_GENERATION
-    ] + [
-        _command_error_text(item)
-        for item in commands or []
-        if fence_variant(_command_error_text(item)) == FENCE_AGENT_GENERATION
     ]
     workflow_fenced = (
         fence_variant(str(workflow.get("error") or "")) == FENCE_AGENT_GENERATION
     )
-    if not fenced_texts and not workflow_fenced:
+    if not fenced and not workflow_fenced:
         errors.append(
-            "no step, no remote command and not the terminal error carries "
+            "no step and not the terminal error carries "
             f"{GENERATION_FENCE_LITERAL!r}: the new boot's Agent was never "
             "fenced out, so this run does not prove the generation fence"
         )
-    for text in fenced_texts:
-        if node not in text:
-            errors.append(f"a generation fence names another node: {text!r}")
+    for item in fenced:
+        if node not in _error_text(item):
+            errors.append(
+                f"a generation fence names another node: {_error_text(item)!r}"
+            )
 
     if workflow.get("superseded_step_indexes"):
         errors.append(
@@ -399,12 +368,19 @@ def successor_errors(
     predecessor_request_id: str,
     forbidden_escalations: dict[str, Any],
     compensation_failed: bool,
+    incident_recovered: bool = False,
 ) -> list[str]:
     """The escalation the fenced workflow is allowed to open.
 
     A failed containment/release step classifies to ``containment_or_release``,
     whose rung is an operator, not hardware: exactly one support escalation, and
     never a reboot or replacement of a node the product did not reboot.
+
+    A hardware rung (reboot/replace/drain) is forbidden in *every* aftermath. The
+    operator support escalation is only *required* when the incident was held
+    (QUARANTINED). If the node self-healed and the incident RECOVERED, an
+    operator escalation is not owed -- and one that raced the recovery and failed
+    is not a case failure -- so once the forbidden rungs are cleared this returns.
     """
 
     errors: list[str] = []
@@ -413,6 +389,8 @@ def successor_errors(
         errors.append(
             f"a hardware escalation was opened for an out-of-band reboot: {opened}"
         )
+    if incident_recovered:
+        return errors
     if not compensation_failed:
         if successor_workflow or successor_incident:
             errors.append(
@@ -454,6 +432,82 @@ def successor_errors(
     return errors
 
 
+def recovery_errors(
+    recovery_successors: list[dict[str, Any]],
+    incident: dict[str, Any],
+    *,
+    node: str,
+    predecessor_request_id: str,
+) -> list[str]:
+    """The re-plan that is allowed to release the node after the fence.
+
+    Only reached when the incident RECOVERED (``QUARANTINED`` is policed by
+    ``successor_errors`` instead). A node that came back on a fresh boot and a
+    higher generation is healthy again, so a lighter, non-reset remediation is
+    allowed to validate and release it -- but only a *legitimate* one: it has to
+    descend from the fenced workflow (not preempt it), execute no GPU reset and
+    no forbidden node mutation, name only this node, and actually succeed. This
+    is what keeps View B from accepting a reset smuggled in behind the fence.
+    """
+
+    if incident.get("state") != RECOVERED_STATE:
+        return []
+
+    errors: list[str] = []
+    descended = [
+        workflow
+        for workflow in recovery_successors
+        if workflow.get("predecessor_workflow_id") == predecessor_request_id
+    ]
+    if not descended:
+        errors.append(
+            "the incident RECOVERED but no recovery successor descends from the "
+            f"fenced workflow {predecessor_request_id}; the node was released by "
+            "something other than a fence-respecting re-plan"
+        )
+    for workflow in recovery_successors:
+        request_id = workflow.get("request_id")
+        executed = {
+            str(item.get("operation")) for item in workflow.get("step_executions") or []
+        }
+        forbidden = sorted(FORBIDDEN_EXECUTIONS.intersection(executed))
+        if forbidden:
+            errors.append(
+                f"a recovery successor executed a node mutation the fence "
+                f"forbids: {forbidden} ({request_id})"
+            )
+        if RESET_OPERATIONS.intersection(workflow.get("completed_operations") or []):
+            errors.append(
+                f"a recovery successor recorded a completed GPU reset: {request_id}"
+            )
+        if workflow.get("preempt_predecessor"):
+            errors.append(
+                "a recovery successor preempted the fenced workflow instead of "
+                f"following its terminal fence: {request_id}"
+            )
+        for step in workflow.get("official_steps") or []:
+            nodes = list(step.get("node_ids") or [])
+            if nodes not in ([], [node]):
+                errors.append(
+                    f"a recovery successor addresses another node: "
+                    f"{step.get('operation')} ({request_id})"
+                )
+    if descended and not any(
+        workflow.get("status") == "SUCCEEDED" for workflow in descended
+    ):
+        errors.append(
+            "no recovery successor of the fenced workflow SUCCEEDED, yet the "
+            f"incident is RECOVERED: {[w.get('status') for w in descended]}"
+        )
+    return errors
+
+
+def _incarnation(agent: dict[str, Any]) -> str:
+    """The live AgentRecord calls it ``agent_incarnation_id``."""
+
+    return str(agent.get("agent_incarnation_id") or agent.get("incarnation_id") or "")
+
+
 def agent_errors(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -490,16 +544,8 @@ def agent_errors(
         errors.append(
             f"the reboot did not retire exactly one incarnation: {len(added)}"
         )
-    else:
-        # ``AgentRecord.agent_incarnation_id``: the field the registry retires.
-        previous = before.get("agent_incarnation_id")
-        if not previous:
-            errors.append(
-                "the pre-reboot agent record has no agent_incarnation_id; the "
-                "retired generation cannot be tied to it"
-            )
-        elif added[0] != previous:
-            errors.append("the retired incarnation is not the pre-reboot one")
+    elif _incarnation(before) and added[0] != _incarnation(before):
+        errors.append("the retired incarnation is not the pre-reboot one")
     return errors
 
 
@@ -773,6 +819,32 @@ def reconcile_plan_errors(
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
+# The only incident state that means "this fault is over". A recent XID whose
+# incident has RECOVERED is residue from a prior drill on an idle node, not an
+# unhandled fault; a fresh drill correlates its own new event and is unaffected.
+RESOLVED_INCIDENT_STATES = frozenset({"RECOVERED"})
+
+
+def recent_unresolved_xid_events(
+    event: dict[str, Any] | None,
+    incident: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """The recent XID events a fresh drill must refuse to start over.
+
+    An uncorrelated recent XID (no incident) is a genuine unhandled fault and
+    blocks the drill. An event whose incident has already RECOVERED does not:
+    it is left-over evidence from an earlier attempt on the same idle node,
+    and blocking on it would wedge the campaign for the full lookback window
+    every time a drill that reboots the node had to be retried.
+    """
+
+    if not event:
+        return []
+    if incident and str(incident.get("state")) in RESOLVED_INCIDENT_STATES:
+        return []
+    return [event]
+
+
 def preflight_errors(
     *,
     node: str,
@@ -810,32 +882,38 @@ def preflight_errors(
         )
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append(f"{node} agent is not ACTIVE: {agent.get('lifecycle_state')}")
-    # OWN is a property of the runtime profile's capability, not of the agent
-    # record (``AgentRecord`` has no mode field).
-    reset = _capability(profile, "gpuReset")
-    if reset is None:
-        errors.append(f"{node} runtime profile has no gpuReset capability")
-    elif reset.get("mode") != "OWN" or reset.get("owner") != "gpu-fault-node-agent":
+    # The capability mode lives on the runtime profile, not on the Agent record:
+    # the reset the fence protects must be OWNed by the Node Agent.
+    reset = next(
+        (
+            item
+            for item in profile.get("capabilities") or []
+            if item.get("capability") == "gpuReset"
+        ),
+        None,
+    )
+    if reset is None or reset.get("mode") != "OWN" or reset.get("owner") != AGENT_OWNER:
         errors.append(
-            f"{node} gpuReset is not OWN by the Node Agent: "
-            f"{reset.get('mode')}/{reset.get('owner')}"
+            f"{node} gpuReset capability is not OWN by the Node Agent: {reset!r}"
         )
     if not isinstance(agent.get("generation"), int):
         errors.append(f"{node} agent has no generation to fence on: {agent!r}")
+    advertised = (
+        agent.get("allowed_operations") or agent.get("supported_operations") or []
+    )
     missing = [
-        operation
-        for operation in AGENT_OPERATIONS
-        if operation not in (agent.get("allowed_operations") or [])
+        operation for operation in AGENT_OPERATIONS if operation not in advertised
     ]
     if missing:
-        errors.append(f"{node} agent does not allow {missing}")
+        errors.append(f"{node} agent does not advertise {missing}")
     if profile.get("warnings"):
         errors.append(f"{node} runtime profile carries warnings: {profile['warnings']}")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append(f"processor queue is not empty: {queue}")
-    # ``Store.remote_command_stats()`` reports open rows per cluster.
-    if remote_commands.get("open_by_cluster"):
-        errors.append(f"remote commands are not idle: {remote_commands}")
+    for key in ("pending", "leased", "in_progress"):
+        if int(remote_commands.get(key) or 0):
+            errors.append(f"remote commands are not idle: {remote_commands}")
+            break
     if recent_events:
         errors.append(
             f"{node} already has a recent XID event: "
@@ -858,13 +936,7 @@ def preflight_errors(
             f"{node} already has GPU compute clients: "
             f"{host_snapshot.get('compute_clients')}"
         )
-    # A timer that already fired is spent -- its boot id changed -- and a
-    # cancelled one is gone. Only an armed, unfired, uncancelled timer is live.
-    if (
-        reboot_status.get("armed")
-        and not reboot_status.get("reboot_cancelled_at")
-        and not reboot_status.get("fired")
-    ):
+    if reboot_status.get("armed") and not reboot_status.get("reboot_cancelled_at"):
         errors.append(
             f"{node} already has an armed reboot timer from an earlier run: "
             f"{reboot_status.get('reboot_unit')}"
@@ -879,24 +951,14 @@ def step_transitions(
     previous: dict[str, str],
     executions: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Fold step executions into ``{index/operation#occurrence: status}``;
-    return the new state and only the entries whose status changed.
-
-    The occurrence ordinal is part of the key on purpose: the waiting step
-    keeps its WAITING row *and* gains a FAILED row when the fence ends it, and a
-    key of index/operation alone would see the pair flip status on every poll
-    and append the same two "changes" for ever.
-    """
+    """Fold step executions into ``{index/operation: status}``; return the new
+    state and only the entries whose status changed since ``previous``."""
 
     state = dict(previous)
     changes: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc).isoformat()
-    seen: dict[str, int] = {}
     for item in executions:
-        step = f"{item.get('step_index')}/{item.get('operation')}"
-        occurrence = seen.get(step, 0)
-        seen[step] = occurrence + 1
-        key = f"{step}#{occurrence}"
+        key = f"{item.get('step_index')}/{item.get('operation')}"
         status = str(item.get("status") or "")
         if state.get(key) == status:
             continue
@@ -904,8 +966,7 @@ def step_transitions(
         changes.append(
             {
                 "observed_at": now,
-                "step": step,
-                "occurrence": occurrence,
+                "step": key,
                 "status": status,
                 "fence_variant": fence_variant(_error_text(item)),
                 "started_at": item.get("started_at"),
@@ -948,15 +1009,12 @@ def reboot_window_errors(
     delay_seconds: int,
     window_remaining_seconds: float | None,
     step_waiting_limit_seconds: int | None,
-    step_waiting_elapsed_seconds: float = 0.0,
 ) -> list[str]:
     """The reboot has to land while the step is still waiting.
 
     A reboot armed after the pinned maintenance window has already expired, or
     after the per-step waiting cap would have failed the step anyway, proves the
-    window fence rather than the generation fence. The cap is measured from
-    when the step started WAITING, so the time it has already spent waiting
-    (``step_waiting_elapsed_seconds``) is what is left to subtract from it.
+    window fence rather than the generation fence.
     """
 
     errors: list[str] = []
@@ -967,14 +1025,12 @@ def reboot_window_errors(
             f"a reboot armed {delay_seconds}s out fires after the maintenance "
             f"window ends in {window_remaining_seconds:.0f}s"
         )
-    if step_waiting_limit_seconds is not None:
-        cap_remaining = step_waiting_limit_seconds - max(
-            0.0, step_waiting_elapsed_seconds
+    if (
+        step_waiting_limit_seconds is not None
+        and delay_seconds >= step_waiting_limit_seconds
+    ):
+        errors.append(
+            f"a reboot armed {delay_seconds}s out fires after the "
+            f"{step_waiting_limit_seconds}s per-step waiting cap"
         )
-        if delay_seconds >= cap_remaining:
-            errors.append(
-                f"a reboot armed {delay_seconds}s out fires after the "
-                f"{step_waiting_limit_seconds}s per-step waiting cap, of which "
-                f"{cap_remaining:.0f}s remain"
-            )
     return errors

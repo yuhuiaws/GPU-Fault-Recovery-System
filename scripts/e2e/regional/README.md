@@ -662,7 +662,10 @@ restore a quarantined node. Direct taint or ownership-annotation deletion is
 not an equivalent cleanup.
 
 `declare_warm_spare.py` declares or releases the one warm spare node
-`DESTR-003`/`DESTR-008` require. It is read-only unless `--declare` or
+`DESTR-003`/`DESTR-008` require. It is a thin wrapper over the supported operator
+command, `gpu-fault-admin config spare` (`src/gpu_fault/admin/warm_spare.py`):
+the wrapper binds a site profile and a `--baseline` file to the same checks and
+the same mutation, and holds no logic of its own. It is read-only unless `--declare` or
 `--release` is given, each with its own confirmation string, and it records the
 node's pre-declaration labels and cordon state in a `--baseline` file so the
 release restores exactly that — a node that was already cordoned stays cordoned.

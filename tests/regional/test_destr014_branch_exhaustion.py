@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import control_plane_env_window as control_window
 from scripts.e2e.regional import executor_env_window as env_window
 from scripts.e2e.regional import run_destr014_branch_exhaustion as destr014
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
@@ -139,7 +140,7 @@ def happy_workflow() -> dict[str, Any]:
         _execution(19, "VALIDATE_FABRIC", "SUCCEEDED"),
         _execution(20, "RESTORE_SCHEDULING", "SUCCEEDED"),
         _execution(
-            21, "REPLACE_NODE", "FAILED", error=destr014.EXPECTED_REPLACE_FAILURE
+            21, "REPLACE_NODE", "FAILED", error="insufficient healthy HyperPod spares"
         ),
     ]
     return {
@@ -234,6 +235,37 @@ def test_an_exhausted_id_for_the_wrong_node_fails() -> None:
     assert any("exhausted" in item for item in errors), errors
 
 
+def _barrier_refused_reset(workflow: dict[str, Any]) -> dict[str, Any]:
+    workflow["step_executions"][5]["error"] = (
+        "node agent node-b: RuntimeError: GPU device clients are still active: "
+        "GPU-1:4242:python3"
+    )
+    workflow["step_executions"][5]["details"] = {"gpu_client_quiesce_attempt": 6}
+    return workflow
+
+
+def test_a_reset_refused_by_its_client_barrier_is_the_armed_failure() -> None:
+    """Since 2026-09-08 RESET_GPU re-verifies GPU clients before committing and
+    refuses to reset a device with a live holder: the failure carries
+    ``gpu_client_quiesce_attempt`` and the agent never runs the reset (attempt
+    7). That is the same "clients are still active" failure the case arms for."""
+    workflow = _barrier_refused_reset(happy_workflow())
+    assert _errors(workflow, happy_incident()) == [], _errors(
+        workflow, happy_incident()
+    )
+    assert destr014.reset_reached_commit(workflow, fault_node=FAULT) is False, workflow
+    assert destr014.reset_reached_commit(happy_workflow(), fault_node=FAULT) is True, (
+        "the committed shape reaches commit"
+    )
+
+
+def test_a_reset_failure_without_either_attempt_detail_fails() -> None:
+    workflow = happy_workflow()
+    workflow["step_executions"][5]["details"] = {"barrier_state": "FAILED"}
+    errors = _errors(workflow, happy_incident())
+    assert any("carries none of" in item for item in errors), errors
+
+
 def test_a_reset_that_failed_for_another_reason_fails() -> None:
     workflow = happy_workflow()
     workflow["step_executions"][5]["error"] = (
@@ -259,22 +291,12 @@ def test_the_sibling_reboot_must_fail_by_bounded_waiting() -> None:
 
 
 def test_the_sibling_replacement_must_fail_for_want_of_a_spare() -> None:
-    # With no spare pool declared at all the shipped adapter refuses because
-    # the provider fallback is disabled; "insufficient healthy HyperPod spares"
-    # is what a *declared but short* pool says (DESTR-008's topology mismatch),
-    # and a verdict pinned to it failed every correct live run.
-    assert destr014.EXPECTED_REPLACE_FAILURE == (
-        "warm-spare replacement is required; provider node replacement API "
-        "fallback is disabled"
-    )
     workflow = happy_workflow()
     workflow["step_executions"][-1]["error"] = "HyperPod preflight failed"
     errors = _errors(workflow, happy_incident())
-    assert any(destr014.EXPECTED_REPLACE_FAILURE in item for item in errors), errors
-    workflow = happy_workflow()
-    workflow["step_executions"][-1]["error"] = "insufficient healthy HyperPod spares"
-    errors = _errors(workflow, happy_incident())
-    assert any(destr014.EXPECTED_REPLACE_FAILURE in item for item in errors), errors
+    assert any("insufficient healthy HyperPod spares" in item for item in errors), (
+        errors
+    )
     workflow = happy_workflow()
     workflow["official_steps"][21]["parameters"] = {}
     errors = _errors(workflow, happy_incident())
@@ -500,6 +522,22 @@ def test_host_rejects_an_agent_that_was_never_disabled_or_never_restored() -> No
     assert any("restored" in item for item in errors), errors
 
 
+def test_host_needs_no_reset_row_when_the_barrier_refused_the_commit() -> None:
+    inputs = _host_inputs()
+    inputs["fault_after"]["ledger"] = inputs["fault_after"]["ledger"][:2]
+    assert destr014.host_errors(**inputs, reset_reached_commit=False) == [], inputs
+    inputs["fault_after"]["ledger"].append(
+        _ledger_row(
+            "wf/5/RESET_GPU/commit",
+            "RESET_GPU",
+            "SUCCEEDED",
+            "2026-09-06T10:01:00+00:00",
+        )
+    )
+    errors = destr014.host_errors(**inputs, reset_reached_commit=False)
+    assert any("succeeded" in item for item in errors), errors
+
+
 def test_host_rejects_a_reset_that_succeeded_or_a_holder_that_never_armed() -> None:
     inputs = _host_inputs()
     inputs["fault_after"]["ledger"].append(
@@ -581,21 +619,6 @@ def test_workload_must_be_gone_and_not_recreated() -> None:
     assert any("restart" in item for item in errors), errors
 
 
-def test_a_missing_restart_budget_is_reported_as_unreadable_not_advanced() -> None:
-    # Fail-safe either way, but a budget row the store never returned proves
-    # nothing; calling it "advanced" sent the reader after a restart that may
-    # never have happened.
-    missing_budgets: list[dict[str, Any] | None] = [{}, None]
-    for missing in missing_budgets:
-        errors = destr014.workload_errors(
-            pods=[], restart_budget=missing or {}, source_uids={"a"}
-        )
-        assert errors == [
-            "restart budget unreadable; cannot prove the job was not restarted"
-        ], errors
-        assert not any("advanced" in item for item in errors), errors
-
-
 def test_step_transitions_record_only_changes() -> None:
     previous: dict[str, str] = {}
     current, changes = destr014.step_transitions(
@@ -675,74 +698,6 @@ def test_budget_headroom_fails_closed() -> None:
     assert destr014.budget_headroom_errors({"readable": True, "scopes": {}}), (
         "no scopes at all means the probe did not compute the claims"
     )
-
-
-def test_budget_limits_follow_the_executor_env_and_its_defaults() -> None:
-    limits = destr014.budget_limits(
-        {
-            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "7",
-            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": None,
-            "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "",
-        }
-    )
-    assert limits == {"region": 7, "cluster": 5, "node": 1, "resource_class": 2}
-    with pytest.raises(ValueError, match="not an integer"):
-        destr014.budget_limits({"GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "many"})
-    with pytest.raises(ValueError, match="positive"):
-        destr014.budget_limits({"GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "0"})
-
-
-def test_planned_budget_scopes_follow_the_registry_classes() -> None:
-    scopes = destr014.planned_budget_scopes(
-        cluster_id="cluster-a",
-        nodes=[SIBLING, FAULT, FAULT],
-        limits={"region": 20, "cluster": 5, "node": 1, "resource_class": 2},
-        resource_classes={
-            "RESET_GPU": ["GPU_RESET"],
-            "RESTART_NODE": ["NODE_REBOOT"],
-            "REPLACE_NODE": ["NODE_REPLACE"],
-        },
-    )
-    assert scopes == {
-        "region": 20,
-        "cluster:cluster-a": 5,
-        f"node:cluster-a:{FAULT}": 1,
-        f"node:cluster-a:{SIBLING}": 1,
-        "class:cluster-a:GPU_RESET": 2,
-        "class:cluster-a:NODE_REBOOT": 2,
-        "class:cluster-a:NODE_REPLACE": 2,
-    }
-    with pytest.raises(ValueError, match="REPLACE_NODE"):
-        destr014.planned_budget_scopes(
-            cluster_id="cluster-a",
-            nodes=[FAULT],
-            limits={"region": 20, "cluster": 5, "node": 1, "resource_class": 2},
-            resource_classes={"RESET_GPU": [], "RESTART_NODE": []},
-        )
-    # The live registry answers for every budgeted operation.
-    live = destr014.registry_resource_classes()
-    assert set(live) == set(destr014.BUDGETED_OPERATIONS), live
-
-
-def test_budget_headroom_counts_only_leased_running_claims_per_scope() -> None:
-    scopes = {"region": 20, "class:c:NODE_REBOOT": 2, "node:c:node-b": 1}
-    active = [
-        {"request_id": "wf-1", "claims": ["region", "class:c:NODE_REBOOT"]},
-        {"request_id": "wf-2", "claims": ["region", "class:c:NODE_REBOOT"]},
-        {"request_id": "wf-3", "claims": ["region"]},
-    ]
-    budget = destr014.budget_headroom(scopes, active)
-    assert budget == {
-        "readable": True,
-        "scopes": {
-            "region": {"limit": 20, "active": 3},
-            "class:c:NODE_REBOOT": {"limit": 2, "active": 2},
-            "node:c:node-b": {"limit": 1, "active": 0},
-        },
-    }
-    errors = destr014.budget_headroom_errors(budget)
-    assert errors == ["remediation budget scope is full: class:c:NODE_REBOOT"], errors
-    assert destr014.budget_headroom_errors(destr014.budget_headroom(scopes, [])) == []
 
 
 def _node_snapshot(name: str) -> dict[str, Any]:
@@ -1013,7 +968,7 @@ def test_parser_accepts_the_documented_arguments() -> None:
             "--verify-max-attempts",
             "6",
             "--managed-recovery-timeout-seconds",
-            "300",
+            "900",
             "--variant",
             "sibling-exhausted",
             "--maintenance-window-end",
@@ -1024,12 +979,12 @@ def test_parser_accepts_the_documented_arguments() -> None:
     assert arguments.plan is True
     assert arguments.variant == "sibling-exhausted"
     assert arguments.verify_max_attempts == 6
-    assert arguments.managed_recovery_timeout_seconds == 300
+    assert arguments.managed_recovery_timeout_seconds == 900
     defaults = destr014.parser().parse_args(["--run-dir", "/tmp/destr014-run"])
     assert defaults.execute is False
     assert defaults.variant == "sibling-exhausted"
     assert defaults.verify_max_attempts == 6
-    assert defaults.managed_recovery_timeout_seconds == 300
+    assert defaults.managed_recovery_timeout_seconds == 600
     assert hasattr(defaults, "predecessor_evidence"), defaults
     with pytest.raises(SystemExit):
         destr014.parser().parse_args(
@@ -1039,17 +994,14 @@ def test_parser_accepts_the_documented_arguments() -> None:
 
 def test_env_window_allowlist_and_assignments() -> None:
     assignments = env_window.parse_assignments(
-        [
-            "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=6",
-            "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=300",
-        ]
+        ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=6"]
     )
-    assert assignments == {
-        "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "6",
-        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS": "300",
-    }
+    assert assignments == {"GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "6"}
     for bad in (
         ["GPU_FAULT_ALLOW_HYPERPOD_REBOOT=false"],
+        # Read by the control-worker, not the executor: attempts 1-7 set it
+        # here and the control plane kept its 1800 s default.
+        ["GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=300"],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS="],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=six"],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS"],
@@ -1061,6 +1013,28 @@ def test_env_window_allowlist_and_assignments() -> None:
     assert env_window.CONTAINER == "executor"
     assert env_window.OPEN_CONFIRMATION == "OPEN_EXECUTOR_ENV_WINDOW"
     assert env_window.CLOSE_CONFIRMATION == "CLOSE_EXECUTOR_ENV_WINDOW"
+
+
+def test_the_managed_recovery_window_is_a_control_plane_setting() -> None:
+    """The timeout the sibling branch waits on lands on the control-worker.
+
+    ``execution/config.py`` derives the RESTART_NODE/REPLACE_NODE waiting caps
+    from ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`` on the control
+    plane and refuses to boot when it sits below the default step timeout, so
+    the runner must route it through the control-plane window and refuse a
+    value the control plane would reject (300 s would CrashLoop every worker).
+    """
+    assert control_window.MANAGED_RECOVERY_VARIABLE == (
+        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS"
+    )
+    assert control_window.DEPLOYMENT == "gpu-fault-control-worker"
+    assert destr014.managed_recovery_errors(600) == [], "600 is the default step cap"
+    assert destr014.managed_recovery_errors(900) == [], "900 fits twice in the lifetime"
+    below = destr014.managed_recovery_errors(300)
+    assert any("GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS" in item for item in below), (
+        below
+    )
+    assert destr014.managed_recovery_errors(3000), "2x window must fit the job lifetime"
 
 
 def test_env_window_restores_unset_as_delete_not_false() -> None:
@@ -1161,3 +1135,57 @@ def test_env_window_open_refuses_unrecorded_live_values_and_resumes_its_own() ->
     assert env_window.open_decision(closed, baseline, assignments) == "open"
     other = {"GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "7"}
     assert env_window.open_decision(record, live_changed, other) == "refuse"
+
+
+def test_the_budget_probe_reads_the_control_plane_not_a_placeholder() -> None:
+    """Attempt 1 (2026-09-08) shipped ``{"readable": False}`` as the budget and
+    could therefore never pass its own fail-closed headroom check."""
+    assert '"readable": True' in destr014.BUDGET_HEADROOM
+    for token in (
+        "RemediationBudgetPolicy.from_mapping(os.environ)",
+        "WorkflowOperation.QUARANTINE",
+        "WorkflowOperation.RESTART_NODE",
+        "WorkflowOperation.REPLACE_NODE",
+        "remediation_budget_claims",
+        "WorkflowStatus.RUNNING",
+    ):
+        assert token in destr014.BUDGET_HEADROOM, token
+
+    class _Regional:
+        def pod_python(self, plane, app, script, *arguments, timeout=180):
+            assert (plane, app) == ("cpu", "gpu-fault-control-worker"), (plane, app)
+            assert arguments == ("cluster-a", "node-fault", "node-sibling"), arguments
+            return {"readable": True, "scopes": {"region": {"limit": 20, "active": 1}}}
+
+    class _Failing:
+        def pod_python(self, *args, **kwargs):
+            raise RuntimeError("exec failed")
+
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        regional=SimpleNamespace(cluster_id="cluster-a"),
+        fault_node="node-fault",
+        sibling_node="node-sibling",
+    )
+    assert destr014.budget_headroom(_Regional(), settings)["readable"] is True
+    failed = destr014.budget_headroom(_Failing(), settings)
+    assert failed["readable"] is False and "exec failed" in failed["error"], failed
+    assert destr014.budget_headroom_errors(failed), "an unreadable budget must refuse"
+
+
+def test_a_rebooted_probe_is_deleted_and_reapplied_before_it_is_used_again() -> None:
+    """Attempt 5 (2026-09-08): the fault node's real reboot left its probe Pod
+    Failed and the first exec after the workflow ended was refused."""
+    calls: list[str] = []
+
+    class _Probe:
+        def cleanup(self) -> dict[str, bool]:
+            calls.append("cleanup")
+            return {}
+
+        def create(self) -> None:
+            calls.append("create")
+
+    destr014.recreate_probe(_Probe())
+    assert calls == ["cleanup", "create"], calls

@@ -98,6 +98,7 @@ from gpu_fault.admin.submit_remediation import (
     run_submit_remediation_command,
 )
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
+from gpu_fault.admin import warm_spare
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
 from gpu_fault_release.regional_admin_commands import status_header_lines
 from gpu_fault_release.regional_validation_evidence import (
@@ -389,12 +390,9 @@ def _add_admin_config_command(commands: Any) -> None:
             "(Aurora window and the affected control-plane roles)"
         ),
     )
-    config.add_argument(
-        "--state-dir",
-        required=True,
-        type=Path,
-        metavar="STATE_DIR",
-    )
+    # Not ``required``: the ``config spare`` sub-action carries its own
+    # ``--state-dir``; ``_managed_site_file`` refuses a bare ``config`` without it.
+    config.add_argument("--state-dir", type=Path, metavar="STATE_DIR")
     config.add_argument(
         "--file",
         dest="admin_config_file",
@@ -418,6 +416,7 @@ def _add_admin_config_command(commands: Any) -> None:
             "change) from local state only; nothing is verified or written"
         ),
     )
+    warm_spare.add_config_spare_command(config)
 
 
 def _add_workflow_reconcile_command(commands: Any) -> None:
@@ -1460,6 +1459,8 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="config")
     assert site_file is not None
     site = load_site(site_file)
+    if getattr(arguments, "config_action", None) == "spare":
+        return warm_spare.run_config_spare_command(arguments, site=site)
     if arguments.dry_run:
         # Local only: no signature check, no cluster read, nothing written.
         current = load_desired_admin_config(arguments.state_dir)

@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
@@ -281,7 +282,9 @@ def validate_preflight(
         errors.append("target node already has an active workflow")
     if fabric.get("recent_xid_events"):
         errors.append("target node has XID events inside the companion window")
-    if int((state.get("queue") or {}).get("depth") or 0):
+    # Routine telemetry above the fault tier must not refuse the case; only a
+    # fault-tier backlog does (live 2026-09-07).
+    if processor_queue_backlog(state.get("queue") or {}):
         errors.append("processor queue is not empty")
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")

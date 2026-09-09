@@ -187,6 +187,11 @@ def test_an_exhausted_branch_fails_the_workflow_without_restarting_the_job():
     result, adapter, saved = _run(store, workflow, outcomes, escalator=_escalator())
 
     assert result.status is WorkflowStatus.FAILED
+    # The record carries its reason, not only the TERMINAL audit event: the
+    # API, the acceptance verdicts and the failure handler read the field.
+    assert str(saved.terminal_failure_reason).startswith(
+        "node branch escalation exhausted: branch:node-b"
+    ), saved.terminal_failure_reason
     assert saved.branch_escalation_counts == {"node-b": 2}
     assert len(saved.exhausted_branch_ids) == 1
     assert saved.exhausted_branch_ids[0].startswith("branch:node-b"), (

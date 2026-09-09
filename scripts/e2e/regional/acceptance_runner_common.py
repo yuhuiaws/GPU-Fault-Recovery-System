@@ -113,3 +113,48 @@ class EvidenceRecorder:
         self.document["updated_at"] = utc_now()
         self.document["error"] = f"{type(exc).__name__}: {exc}"
         write_json_atomic(self.path, self.document)
+
+
+def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
+    """The processor work a destructive preflight must wait out.
+
+    The store snapshot reports two depths. ``fault_backlog_depth`` counts the
+    reserved tier only -- control-plane actions and device events, the work a
+    case's injected event would queue behind and a control-worker roll could
+    disrupt. Total ``depth`` also counts routine telemetry (gpu-inventory,
+    evidence), which is idempotent across a roll and can livelock one lane on a
+    stale fencing token for ~120 s, so a gate on total depth flaps every
+    preflight on a healthy cluster (DESTR-018 attempt 5, DESTR-019 attempt 2,
+    2026-09-08). Gate on the fault tier when the snapshot carries it; an older
+    snapshot without the reading falls back to total depth.
+    """
+
+    values = queue or {}
+    if "fault_backlog_depth" in values:
+        return int(values.get("fault_backlog_depth") or 0)
+    return int(values.get("depth") or 0)
+
+
+# What ``kubectl exec`` prints when its target stopped being a running replica
+# between a ``ready_pods`` listing and the exec: a deleted Pod (NotFound), a
+# Pod whose process already exited 0 on SIGTERM (phase Succeeded), or the
+# kubelet's other wordings for the same moment. Every env window rolls its
+# Deployment, so a survey taken during the roll meets these routinely
+# (control-worker 2026-09-08 attempts 7/8, cluster-executor 2026-09-08
+# DESTR-014 attempt 3).
+VANISHED_REPLICA_MARKERS = (
+    "not found",
+    "notfound",
+    "completed pod",
+    "is not running",
+    "not running",
+    "terminating",
+)
+
+
+def replica_vanished(error: BaseException) -> bool:
+    """Whether an exec failed because its Pod is no longer a running replica,
+    as opposed to the read itself failing."""
+
+    text = str(error).lower()
+    return any(marker in text for marker in VANISHED_REPLICA_MARKERS)

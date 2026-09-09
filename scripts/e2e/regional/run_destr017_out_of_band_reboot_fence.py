@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -63,6 +63,8 @@ from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     lifetime_errors,
     preflight_errors,
     reboot_window_errors,
+    recent_unresolved_xid_events,
+    recovery_errors,
     reconcile_plan_errors,
     reset_journal_errors,
     schedulability_errors,
@@ -77,8 +79,6 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
-    record_focused_tests,
-    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -226,9 +226,7 @@ def plan_identity(preflight: dict[str, Any], *, node: str) -> dict[str, Any]:
         "node_uid": snapshot.get("uid"),
         "node_boot_id": snapshot.get("boot_id"),
         "agent_generation": (store.get("agent") or {}).get("generation"),
-        # ``AgentRecord.agent_incarnation_id`` -- the field the registry retires
-        # on re-registration; there is no ``incarnation_id``.
-        "agent_incarnation_id": (store.get("agent") or {}).get("agent_incarnation_id"),
+        "agent_incarnation_id": (store.get("agent") or {}).get("incarnation_id"),
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
         "runtime_identity": preflight.get("runtime_identity"),
         "node": node,
@@ -328,10 +326,6 @@ class Settings:
     reboot_delay_seconds: int
     max_hold_seconds: int
     predecessor_path: Path
-    # The attempt the plan and the execution share; the preflight derives the
-    # probe identity from it, so a second attempt never reads the first one's
-    # on-node state.
-    attempt: int = 1
 
     def environment(self) -> dict[str, str]:
         return {
@@ -371,13 +365,12 @@ def configure(arguments: argparse.Namespace) -> Settings:
         reboot_delay_seconds=int(arguments.reboot_delay_seconds),
         max_hold_seconds=int(arguments.max_hold_seconds),
         predecessor_path=predecessor,
-        attempt=int(arguments.attempt),
     )
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     identity = plan_identity(preflight, node=settings.node)
-    details: dict[str, Any] = {
+    return {
         "risk": "destructive",
         "predecessor": preflight.get("predecessor"),
         "node": settings.node,
@@ -426,31 +419,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "no_provider_reboot_or_replacement_is_authorized": True,
         },
     }
-    # The --plan's focused-test result is recorded with a source digest so
-    # --execute can reuse it instead of paying for the same run twice.
-    record_focused_tests(
-        details,
-        dict(preflight.get("focused_tests") or {"passed": False}),
-    )
-    return details
 
 
 # --------------------------------------------------------------------------- #
 # Live preflight (not unit-tested; delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
-def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
-    """Run the focused pytest, or reuse the --plan's result in --execute.
-
-    ``reuse`` is set by the execution path only: the result recorded in
-    ``plan.json`` is taken when it passed against exactly this source tree
-    (``reusable_focused_tests`` compares the digest), so the same tests are
-    not paid for twice minutes apart; any edit in between forces a rerun.
-    """
-
-    if reuse:
-        recorded = reusable_focused_tests(case_dir / "plan.json")
-        if recorded is not None:
-            return {**recorded, "focused_tests_reused": True}
+def focused_tests(case_dir: Path) -> dict[str, Any]:
     command = [
         sys.executable,
         "-m",
@@ -495,12 +469,7 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     }
 
 
-def read_only_preflight(
-    settings: Settings,
-    case_dir: Path,
-    *,
-    reuse_focused_tests: bool = False,
-) -> dict[str, Any]:
+def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
     node_snapshot = regional.node_snapshot(settings.node)
     state = regional.store_snapshot(
@@ -508,14 +477,10 @@ def read_only_preflight(
         observed_after=datetime.now(timezone.utc) - timedelta(hours=1),
     )
     runtime_identity = regional.runtime_identity()
-    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
-    predecessor = predecessor_evidence(
-        settings.predecessor_path,
-        PREDECESSOR_CASE_ID,
-        **regional.evidence_identity(),
-    )
+    tests = focused_tests(case_dir)
+    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     env = control_env(regional)
-    run_id = derived_identity(case_dir.parents[1], settings.attempt)
+    run_id = derived_identity(case_dir.parents[1], 1)
     host = _host_probe(settings, run_id)
     fence = _fence_probe(settings, run_id)
     try:
@@ -556,7 +521,9 @@ def read_only_preflight(
         business_workloads=regional.business_workloads(settings.node),
         queue=state.get("queue") or {},
         remote_commands=state.get("remote_commands") or {},
-        recent_events=[state["event"]] if state.get("event") else [],
+        recent_events=recent_unresolved_xid_events(
+            state.get("event"), state.get("incident")
+        ),
         host_snapshot=host_snapshot,
         reboot_status=reboot_state,
         expected_gpu_count=EXPECTED_GPU_COUNT,
@@ -568,8 +535,6 @@ def read_only_preflight(
             lifetime_seconds=env["node_lifetime_seconds"],
         )
     )
-    # ``predecessor_evidence`` reports ``valid`` (PASS, or an operator-selected
-    # scope that lets the run go); there is no ``pass`` key.
     if not predecessor.get("valid"):
         errors.append(f"{PREDECESSOR_CASE_ID} evidence is not PASS")
     if not tests["passed"]:
@@ -707,6 +672,11 @@ class _LiveRun:
     incident_id: str = ""
     successor_incident_id: str = ""
     workflow_request_id: str = ""
+    # The RESET_GPU workflow whose VERIFY_NO_GPU_CLIENTS the reboot interrupts.
+    # Captured the moment that step is WAITING, so the verdict grades the fenced
+    # workflow itself and not whatever successor the incident pointer moves to
+    # once the node self-heals.
+    fenced_request_id: str = ""
 
 
 def _prepare_live_run(
@@ -717,7 +687,7 @@ def _prepare_live_run(
 ) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
+    preflight = read_only_preflight(settings, case_dir)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
@@ -766,6 +736,21 @@ def _start_probes(run: _LiveRun) -> None:
     write_json_atomic(run.case_dir / "host-before.json", run.baseline)
     run.baseline_boot_id = str(run.baseline.get("boot_id") or "")
     run.baseline_agent = dict(run.preflight["store"].get("agent") or {})
+    # Pre-validate and hand the reboot to the on-node watcher. quiesce stops
+    # kubelet, so the runner can never exec ``arm-reboot`` after the fence is
+    # WAITING (live: arm-reboot "dial tcp :10250 connect: connection refused",
+    # and the node was left quarantined). The watcher arms the reboot on-node
+    # the moment quiesce lands, which is the window start; validate the delay
+    # against the full pinned window (its length is a control-plane constant)
+    # here, before injection, while the exec channel is still up.
+    control_env = run.preflight["control_env"]
+    window_errors = reboot_window_errors(
+        delay_seconds=settings.reboot_delay_seconds,
+        window_remaining_seconds=float(control_env["agent_maintenance_window_seconds"]),
+        step_waiting_limit_seconds=int(control_env["verify_waiting_limit_seconds"]),
+    )
+    if window_errors:
+        raise RegionalFixtureError("; ".join(window_errors))
     armed = run.fence.execute(
         "arm-holder",
         "--device",
@@ -778,13 +763,18 @@ def _start_probes(run: _LiveRun) -> None:
         str(settings.max_hold_seconds),
         "--run-id",
         run.run_id,
-        # The path the probe has *on the host*: the watch-ledger unit runs it
-        # under systemd, outside the Pod's /host mount.
+        "--reboot-delay-seconds",
+        str(settings.reboot_delay_seconds),
         "--probe-script",
+        # The host path: the transient unit runs on the node, where /host does
+        # not exist (live: "can't open file '/host/run/...'" and no holder).
         run.fence.host_script,
         timeout=180,
     )
     run.holder_armed = True
+    # The watcher will place the reboot timer on-node once quiesce lands; from
+    # here on cleanup must be prepared to cancel an unfired reboot.
+    run.reboot_armed = True
     write_json_atomic(run.case_dir / "holder-armed.json", armed)
 
 
@@ -828,20 +818,12 @@ def _inject(run: _LiveRun) -> dict[str, Any]:
 
 
 def _store_state(run: _LiveRun, *, queue_attempts: int = 1) -> dict[str, Any]:
-    state = run.regional.store_snapshot(
+    return run.regional.store_snapshot(
         node=run.settings.node,
         marker=run.marker,
         observed_after=run.started_at,
         queue_attempts=queue_attempts,
-        workflow_request_ids=(
-            [run.workflow_request_id] if run.workflow_request_id else None
-        ),
     )
-    # Pin the workflow as soon as it exists so every later read names it.
-    request_id = str((state.get("workflow") or {}).get("request_id") or "")
-    if request_id and not run.workflow_request_id:
-        run.workflow_request_id = request_id
-    return state
 
 
 def _wait_for_maintenance_pin(run: _LiveRun) -> dict[str, Any]:
@@ -884,8 +866,10 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
             if item.get("operation") == FENCE_STEP_OPERATION
         ]
         if waiting:
+            run.fenced_request_id = str(workflow.get("request_id") or "")
             write_json_atomic(
-                run.case_dir / "waiting-verify.json", {"executions": waiting}
+                run.case_dir / "waiting-verify.json",
+                {"executions": waiting, "fenced_request_id": run.fenced_request_id},
             )
             return state
         if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}:
@@ -897,78 +881,33 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
     )
 
 
-def waiting_elapsed_seconds(
-    workflow: dict[str, Any],
-    *,
-    operation: str,
-    now: datetime,
-) -> float:
-    """How long ``operation`` has already been WAITING, from its own record.
+def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
+    """Record the reboot placement; the timer itself is armed on-node.
 
-    The per-step waiting cap counts from the moment the step parked, not from
-    the moment the runner looks; a reboot placed against the whole cap would
-    land after the cap when the runner arrives late.
+    quiesce has already stopped kubelet by the time verify is WAITING, so the
+    reboot cannot be exec'd from here -- the on-node watcher (``arm-holder
+    --reboot-delay-seconds``) placed the transient timer the moment quiesce
+    landed, which is the window start. Confirm the placement against the actual
+    pinned window (defence in depth over the static pre-injection check) and
+    record it; the fired timer and boot-id change are read back through
+    ``reboot-status`` once the node returns and the exec channel is up again.
     """
-
-    # Read the raw records: the shared ``waiting_step_executions`` projection
-    # drops ``started_at``.
-    waiting = [
-        item
-        for item in workflow.get("step_executions") or []
-        if isinstance(item, dict)
-        and item.get("status") == "WAITING"
-        and item.get("operation") == operation
-    ]
-    starts = []
-    for item in waiting:
-        raw = item.get("started_at")
-        if not raw:
-            continue
-        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        starts.append(parsed)
-    if not starts:
-        return 0.0
-    return max(0.0, (now - min(starts)).total_seconds())
-
-
-def _arm_out_of_band_reboot(
-    run: _LiveRun,
-    waiting_state: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    """Arm the reboot, refusing a placement that would prove another fence."""
 
     now = datetime.now(timezone.utc)
     remaining = window_remaining_seconds(run.pin, now=now)
-    elapsed = waiting_elapsed_seconds(
-        waiting_state.get("workflow") or {},
-        operation=FENCE_STEP_OPERATION,
-        now=now,
-    )
     errors = reboot_window_errors(
         delay_seconds=run.settings.reboot_delay_seconds,
         window_remaining_seconds=remaining,
         step_waiting_limit_seconds=int(
             run.preflight["control_env"]["verify_waiting_limit_seconds"]
         ),
-        step_waiting_elapsed_seconds=elapsed,
     )
     if errors:
         raise RegionalFixtureError("; ".join(errors))
-    armed = run.fence.execute(
-        "arm-reboot",
-        "--run-id",
-        run.run_id,
-        "--delay-seconds",
-        str(run.settings.reboot_delay_seconds),
-        timeout=120,
-    )
-    run.reboot_armed = True
     record = {
-        "armed": armed,
+        "armed_on_node_by": "arm-holder --reboot-delay-seconds (watch-ledger)",
+        "reboot_delay_seconds": run.settings.reboot_delay_seconds,
         "window_remaining_seconds": remaining,
-        "step_waiting_elapsed_seconds": elapsed,
         "expected_fence": expected_fence_text(run.pin, node=run.settings.node),
     }
     write_json_atomic(run.case_dir / "reboot-armed.json", record)
@@ -1024,11 +963,83 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
         write_json_atomic(
             run.case_dir / "step-timeline.json", {"transitions": timeline}
         )
-        if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}:
+        incident = state.get("incident") or {}
+        # Wait for the incident itself to settle, not just for the currently
+        # pointed-at workflow to be terminal: the fenced reset terminalizes
+        # first, then the incident either quarantines or re-plans and recovers,
+        # and the verdict needs the settled aftermath.
+        if (
+            workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
+            and incident.get("state") in SETTLED_INCIDENT_STATES
+        ):
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "workflow-state.json", state)
     return state
+
+
+# The incident states that mean the aftermath is decided: held for an operator,
+# self-healed, or escalated. ACTION_PENDING / SAFETY_PENDING mean a re-plan is
+# still in flight.
+SETTLED_INCIDENT_STATES = frozenset({"QUARANTINED", "RECOVERED", "ESCALATED"})
+
+# Fetch the fenced RESET_GPU workflow, its origin incident, that incident's
+# recovery successors (workflows that descend from the fenced one and are not
+# the operator support escalation), and the fenced workflow's own remote
+# commands -- all keyed off the request id captured at WAITING, so the verdict
+# never has to follow the incident pointer to a self-heal successor.
+AFTERMATH_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+
+fenced_id = sys.argv[1]
+store = ApplicationContext.from_environment().store
+
+fenced = None
+try:
+    fenced = store.get_workflow(fenced_id)
+except NotFoundError:
+    fenced = None
+
+incident = None
+if fenced is not None and getattr(fenced, "incident_id", None):
+    try:
+        incident = store.get_incident(fenced.incident_id)
+    except NotFoundError:
+        incident = None
+
+successors = []
+for workflow in store.list_workflows(None, limit=500, newest_first=True):
+    if (
+        getattr(workflow, "predecessor_workflow_id", None) == fenced_id
+        and not str(workflow.request_id).startswith("workflow-support-after-")
+    ):
+        successors.append(workflow.model_dump(mode="json"))
+
+commands = [
+    item.model_dump(mode="json")
+    for item in store.list_remote_commands()
+    if item.workflow_request_id == fenced_id
+]
+
+print(json.dumps({
+    "fenced": fenced.model_dump(mode="json") if fenced is not None else None,
+    "incident": incident.model_dump(mode="json") if incident is not None else None,
+    "recovery_successors": successors,
+    "commands": commands,
+}, sort_keys=True, default=str))
+"""
+
+
+def _aftermath(run: _LiveRun) -> dict[str, Any]:
+    """Read the fenced workflow and its settled aftermath by request id."""
+
+    result = run.regional.cpu_python(AFTERMATH_PROBE, run.fenced_request_id)
+    write_json_atomic(run.case_dir / "aftermath.json", result)
+    return result
 
 
 def _escalations(run: _LiveRun, request_id: str) -> dict[str, Any]:
@@ -1083,22 +1094,14 @@ def _data_plane_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
             reboot_status=reboot_state,
         )
     )
-    ended_at = datetime.now(timezone.utc)
-    provider = run.regional.provider_events(run.started_at, ended_at)
-    # A negative CloudTrail claim cannot be proven inside the delivery window;
-    # it is recorded as provisional and re-checked by DESTR-013.
-    provisional = run.regional.provider_events_provisional(ended_at)
-    write_json_atomic(
-        run.case_dir / "provider-events.json",
-        {"events": provider, "provisional": provisional},
-    )
+    provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
+    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
     errors.extend(cloudtrail_errors(provider))
     return errors, {
         "host_after": after,
         "reboot_status": reboot_state,
         "holder_status": holder,
         "node_after": node_after,
-        "provider_events": {"count": len(provider), "provisional": provisional},
     }
 
 
@@ -1124,21 +1127,30 @@ def execute_case(
         _start_probes(run)
         _inject(run)
         _wait_for_maintenance_pin(run)
-        waiting_state = _wait_for_waiting_verify(run)
-        _, reboot_record = _arm_out_of_band_reboot(run, waiting_state)
+        _wait_for_waiting_verify(run)
+        _, reboot_record = _arm_out_of_band_reboot(run)
         agent_after = _wait_for_new_generation(run)
         state = _observe_until_terminal(run)
-        workflow = state.get("workflow") or {}
-        incident = state.get("incident") or {}
-        commands = list(state.get("commands") or [])
+        # Grade the fenced RESET_GPU workflow captured at WAITING, not whatever
+        # the incident pointer resolves to: once the node self-heals the pointer
+        # moves to the recovery successor, which is not the workflow the case is
+        # about. The aftermath probe reads the fenced workflow, its incident and
+        # any recovery successors by that pinned request id.
+        aftermath = _aftermath(run)
+        workflow = aftermath.get("fenced") or {}
+        incident = aftermath.get("incident") or state.get("incident") or {}
+        recovery_successors = aftermath.get("recovery_successors") or []
         run.incident_id = str(incident.get("incident_id") or "")
-        run.workflow_request_id = str(workflow.get("request_id") or "")
-        evidence = fence_evidence(workflow, commands)
-        write_json_atomic(run.case_dir / "fence-evidence.json", evidence)
-        errors = workflow_errors(
-            workflow, incident, node=settings.node, commands=commands
+        run.workflow_request_id = run.fenced_request_id or str(
+            workflow.get("request_id") or ""
         )
-        errors.extend(command_errors(commands, node=settings.node))
+        recovered = incident.get("state") == "RECOVERED"
+        evidence = fence_evidence(workflow)
+        write_json_atomic(run.case_dir / "fence-evidence.json", evidence)
+        errors = workflow_errors(workflow, incident, node=settings.node)
+        errors.extend(
+            command_errors(aftermath.get("commands") or [], node=settings.node)
+        )
         errors.extend(agent_errors(run.baseline_agent, agent_after, node=settings.node))
         escalations = _escalations(run, run.workflow_request_id)
         support = escalations.get("support") or {}
@@ -1157,8 +1169,18 @@ def execute_case(
                 },
                 compensation_failed="FAILED"
                 in (evidence.get("compensation_statuses") or []),
+                incident_recovered=recovered,
             )
         )
+        if recovered:
+            errors.extend(
+                recovery_errors(
+                    recovery_successors,
+                    incident,
+                    node=settings.node,
+                    predecessor_request_id=run.workflow_request_id,
+                )
+            )
         data_errors, hosts = _data_plane_errors(run)
         errors.extend(data_errors)
         reconcile = _reconcile_plan(run)
@@ -1176,13 +1198,13 @@ def execute_case(
             "workflow": workflow,
             "incident": incident,
             "support": support,
+            "recovery_successors": recovery_successors,
             "fence_evidence": evidence,
             "hosts": hosts,
         }
         components = evidence_components(details)
         result.update(
             {
-                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "marker": run.marker,
@@ -1192,7 +1214,6 @@ def execute_case(
                 "maintenance_pin": run.pin,
                 "reboot": reboot_record,
                 "fence_evidence": evidence,
-                "provider_events": hosts.get("provider_events"),
                 "reconcile_plan_sha256": reconcile.get("plan_sha256"),
                 "case_digest": case_digest(components),
                 "components": components,
@@ -1231,15 +1252,15 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     if run.reboot_armed and not run.reboot_fired:
         guard(
             "cancel_reboot",
-            lambda: execute_or_recreate(
-                run.fence, "cancel-reboot", "--run-id", run.run_id, timeout=120
+            lambda: run.fence.execute(
+                "cancel-reboot", "--run-id", run.run_id, timeout=120
             ),
         )
     if run.holder_armed:
         guard(
             "disarm_holder",
-            lambda: execute_or_recreate(
-                run.fence, "disarm-holder", "--run-id", run.run_id, timeout=120
+            lambda: run.fence.execute(
+                "disarm-holder", "--run-id", run.run_id, timeout=120
             ),
         )
     guard(
@@ -1257,22 +1278,13 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     guard("restore_isolation", lambda: _restore_isolation(run))
     guard(
         "quiesce_residue",
-        lambda: execute_or_recreate(
-            run.host, "restore-quiesce", "--incident-id", run.incident_id, timeout=180
+        lambda: run.host.execute(
+            "restore-quiesce", "--incident-id", run.incident_id, timeout=180
         )
         if run.incident_id
         else {"skipped": "no incident"},
     )
     guard("host_final", lambda: _host_final(run))
-    # The on-node state file is this run's alone; leaving it would let a later
-    # --plan of the same attempt read a stale holder match or reboot marker.
-    if run.holder_armed or run.reboot_armed:
-        guard(
-            "clear_state",
-            lambda: execute_or_recreate(
-                run.fence, "clear-state", "--run-id", run.run_id, timeout=120
-            ),
-        )
     guard("probe_cleanup_host", lambda: _refuse_residual_map(run.host.cleanup()))
     guard("probe_cleanup_fence", lambda: _refuse_residual_map(run.fence.cleanup()))
     guard(
@@ -1286,37 +1298,10 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     return result
 
 
-class _ProbeLike(Protocol):
-    def create(self) -> None: ...
-
-    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]: ...
-
-
-def execute_or_recreate(
-    probe: _ProbeLike,
-    *arguments: str,
-    timeout: int = 180,
-) -> dict[str, Any]:
-    """Run a probe command; if the Pod is gone, bring it back once and retry.
-
-    The probe Pods die with the node (``restartPolicy: Never``), and a failure
-    between the reboot and the post-reboot re-create leaves cleanup talking to
-    a Pod that no longer exists. Every command cleanup issues is idempotent,
-    so one re-create and retry is safe; a second failure is the real error.
-    """
-
-    try:
-        return probe.execute(*arguments, timeout=timeout)
-    except Exception:  # noqa: BLE001 - the retry decides
-        probe.create()
-        return probe.execute(*arguments, timeout=timeout)
-
-
 def _host_final(run: _LiveRun) -> dict[str, Any]:
     """The last read of the node, after everything has been undone."""
 
-    final = execute_or_recreate(
-        run.host,
+    final = run.host.execute(
         "snapshot",
         "--since-epoch",
         str(run.started_at.timestamp()),

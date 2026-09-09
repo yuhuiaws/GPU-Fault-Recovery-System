@@ -500,6 +500,43 @@ class HardwareEscalationService:
         )
 
     @staticmethod
+    def _exhausted_branch_executions(
+        workflow: WorkflowRequest,
+        failed_executions: list[WorkflowStepExecution],
+    ) -> list[WorkflowStepExecution]:
+        """Keep only the failures on the branches that actually exhausted.
+
+        A job DAG's other branch may have failed a step, escalated in place and
+        recovered (RESET_GPU failed, the reboot rung succeeded, RESTORE_SCHEDULING
+        ran): that FAILED record is history, not hardware to hand to support.
+        Read by node -- the exhausted rung's steps name the node, the branch's
+        earlier steps may still carry ``branch:initial`` -- so every failure on
+        the exhausted node stays in scope and nothing else does. Live 2026-09-09
+        (DESTR-014): the support-after incident covered both nodes and
+        re-quarantined the one that had just been restored.
+        """
+
+        exhausted = set(workflow.exhausted_branch_ids)
+        if not exhausted:
+            return failed_executions
+        steps = workflow.official_steps
+        exhausted_nodes = {
+            node_id
+            for step in steps
+            if step.branch_id in exhausted
+            for node_id in (step.branch_node_ids or step.node_ids)
+        }
+        if not exhausted_nodes:
+            return failed_executions
+        scoped = [
+            execution
+            for execution in failed_executions
+            if 0 <= execution.step_index < len(steps)
+            and set(steps[execution.step_index].node_ids) & exhausted_nodes
+        ]
+        return scoped or failed_executions
+
+    @staticmethod
     def collect_scope(
         workflow: WorkflowRequest,
         source: FaultIncident,
@@ -992,7 +1029,11 @@ class HardwareEscalationService:
                     incident_id=existing.incident_id,
                     pointer=existing.workflow_request_id,
                 )
-        scope = self.collect_scope(workflow, source, failed_executions)
+        scope = self.collect_scope(
+            workflow,
+            source,
+            self._exhausted_branch_executions(workflow, failed_executions),
+        )
         return self.emit(
             workflow,
             source,

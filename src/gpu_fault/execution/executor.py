@@ -15,6 +15,7 @@ from pydantic import ValidationError
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
 import gpu_fault.execution.step_bounds as step_bounds
 from gpu_fault.execution.branch_escalation import BranchEscalation, BranchEscalator
+from gpu_fault.execution import node_rebinding
 from gpu_fault.execution.config import (
     ProductionExecutorConfig,
 )
@@ -947,15 +948,20 @@ class ProductionWorkflowExecutor:
         incident: FaultIncident,
         execution_epoch: int,
     ) -> WorkflowExecutionResult:
+        reason = "node branch escalation exhausted: " + ", ".join(
+            workflow.exhausted_branch_ids
+        )
+        # The reason is the record's, not only the audit event's: the field is
+        # what the API, the acceptance verdicts and the failure handler read
+        # (live 2026-09-09 the exhausted DESTR-014 workflow ended FAILED with
+        # ``terminal_failure_reason`` None and the reason only in TERMINAL).
         return self._terminalize(
             workflow,
             incident,
             WorkflowStatus.FAILED,
             execution_epoch,
-            reason=(
-                "node branch escalation exhausted: "
-                + ", ".join(workflow.exhausted_branch_ids)
-            ),
+            reason=reason,
+            updates={"terminal_failure_reason": reason},
         )
 
     # Steps that undo what an earlier step did to a node; they still run for a
@@ -2067,8 +2073,8 @@ class ProductionWorkflowExecutor:
             efa_zero_pending_at_by_node=efa_zero_pending_at_by_node,
         )
 
-    @staticmethod
     def _rebind_nodes(
+        self,
         workflow: WorkflowRequest,
         incident: FaultIncident,
         rebindings: dict[str, str],
@@ -2076,26 +2082,13 @@ class ProductionWorkflowExecutor:
         is_safety: bool,
         after_index: int,
     ) -> tuple[WorkflowRequest, FaultIncident]:
-        def replace(node_ids: list[str]) -> list[str]:
-            return list(
-                dict.fromkeys(rebindings.get(node_id, node_id) for node_id in node_ids)
-            )
-
-        field = "safety_steps" if is_safety else "official_steps"
-        steps = list(getattr(workflow, field))
-        for index in range(after_index + 1, len(steps)):
-            steps[index] = steps[index].model_copy(
-                update={"node_ids": replace(steps[index].node_ids)}
-            )
-        now = datetime.now(timezone.utc)
-        return (
-            workflow.model_copy(update={field: steps, "updated_at": now}),
-            incident.model_copy(
-                update={
-                    "node_ids": replace(incident.node_ids),
-                    "updated_at": now,
-                }
-            ),
+        return node_rebinding.rebind_nodes(
+            self.store,
+            workflow,
+            incident,
+            rebindings,
+            is_safety=is_safety,
+            after_index=after_index,
         )
 
     @property

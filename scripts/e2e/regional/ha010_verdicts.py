@@ -17,6 +17,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 CASE_ID = "GF-REGIONAL-HA-010"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-HA-001"
 CONFIRMATION = "HA010_AURORA_BLACKOUT_LIVENESS"
@@ -120,7 +122,7 @@ def preflight_errors(
         errors.append("Aurora cluster is not available")
     if not rds.get("writer") or len(rds.get("members") or []) < 2:
         errors.append("Aurora cluster has no failover-capable reader")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty; a workflow is in flight")
