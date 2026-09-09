@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("gpu_fault.cluster_executor")
 
 
+# Reporting a result is not a fire-once operation: the action has already run
 # on the cluster, so a dropped connection on the result post costs a whole
 # lease of latency and then a second execution after the command is re-claimed.
 # Three attempts is enough for the baseline "Remote end closed connection"
@@ -199,10 +200,6 @@ class CommandLeaseWatch:
                     "without a successful renewal"
                 )
             return self.cancellation_reason
-
-
-# ARCH-A4b: the regional executor has no store, so a stale warm-spare
-# reservation can only be judged by its timestamp. One day mirrors the
 
 
 class CommandLifecycle:
