@@ -118,6 +118,16 @@ class InflightInstallsRefused(ReleaseError):
     """
 
 
+class StoreUnreachable(ReleaseError):
+    """No Running control-plane Pod could run the probe: the store did not answer.
+
+    The one failure an automatic rollback may proceed over. Everything that
+    happens after a probe ran -- unparseable output, a wrong shape, an unbounded
+    scan -- is evidence, raised as a plain ``ReleaseError``, and refuses in every
+    mode: the store answered, and the answer was not "clear".
+    """
+
+
 def inflight_installs_allowed(environment: dict[str, str] | None = None) -> bool:
     """Whether this command carried ``--allow-inflight-installs``."""
 
@@ -197,13 +207,19 @@ def _exec_store_probe(release: Any, *, script: str, failure: str) -> str:
             return _exec_in_role(release, deployment, script)
         except ReleaseError as exc:
             errors.append(f"{deployment}: {exc}")
-    raise ReleaseError(
+    raise StoreUnreachable(
         f"{failure} could not reach any Running control-plane Pod: " + "; ".join(errors)
     )
 
 
 def inflight_install_snapshot(release: Any) -> dict[str, Any]:
-    """One store read: the in-flight install steps, as the probe reports them."""
+    """One store read: the in-flight install steps, as the probe reports them.
+
+    Raises ``StoreUnreachable`` when no Pod could run the probe -- the store did
+    not answer -- and a plain ``ReleaseError`` for a defect in evidence the probe
+    did return (unparseable, wrong shape, unbounded scan). The caller treats
+    only the first as "unreadable"; the second is an answer and is binding.
+    """
 
     raw = _exec_store_probe(
         release, script=probe_source("inflight_installs"), failure=_CHECK
@@ -258,17 +274,19 @@ def require_no_inflight_installs(
     """Refuse ``action`` while an install step is in flight; return the snapshot.
 
     ``action`` names the transaction for the message (``upgrade`` /
-    ``rollback``). ``unreadable`` is what a store that cannot answer means:
-    ``refuse`` (manual upgrade and rollback: fail closed, the env lever opens
-    it) or ``proceed`` (the automatic rollback: log and go on, an actual
-    in-flight install still refuses). With the operator's consent set the gate
-    still reads when it can, so the log says what was skipped.
+    ``rollback``). ``unreadable`` is what a store that could not be reached
+    means: ``refuse`` (manual upgrade and rollback: fail closed, the env lever
+    opens it) or ``proceed`` (the automatic rollback: log and go on). Only a
+    probe that no Pod could run is "unreadable"; evidence the probe did return
+    -- an in-flight install, an unbounded scan, unparseable output -- is binding
+    in every mode, and only the operator's explicit consent overrides it (with
+    the log saying what was skipped).
     """
 
     allowed = inflight_installs_allowed()
     try:
         snapshot = inflight_install_snapshot(release)
-    except ReleaseError as exc:
+    except StoreUnreachable as exc:
         if allowed or unreadable == "proceed":
             narrate_step(
                 "inflight-installs-unchecked",
@@ -287,6 +305,21 @@ def require_no_inflight_installs(
             "handed to a node agent would be submitted a second time by the "
             "control plane this transaction puts in place; retry when the "
             f"control plane answers, or {_lever(action)} without the check"
+        ) from exc
+    except ReleaseError as exc:
+        # The store answered and the answer cannot be read as "clear": refused
+        # in every mode, automatic rollback included; consent alone opens it.
+        if allowed:
+            narrate_step(
+                "inflight-installs-unchecked",
+                action=action,
+                reason=ALLOW_INFLIGHT_INSTALLS_FLAG,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return {"inflight": [], "inflight_count": 0, "error": str(exc)}
+        raise InflightInstallsRefused(
+            f"{action} refused: {exc}. An install past what the check could see "
+            f"would be submitted a second time; {_lever(action)}"
         ) from exc
     count = int(snapshot.get("inflight_count") or 0)
     if not count:

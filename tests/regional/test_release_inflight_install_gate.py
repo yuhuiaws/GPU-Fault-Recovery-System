@@ -31,6 +31,7 @@ import pytest
 
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault.models import (
+    BlockedKind,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -253,13 +254,16 @@ def test_the_probe_ignores_finished_failed_superseded_and_unrelated_steps(
 def test_blocked_workflows_are_not_scanned(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BLOCKED is reached only at compile time (policy/compile errors) or as the
-    terminal status of a safety-only execution (``executor._complete_claimed_
-    workflow`` with ``is_safety``; ``coordinator`` SAFETY_PENDING → BLOCKED). No
-    transition takes a RUNNING workflow with official steps to BLOCKED, so a
-    BLOCKED row can never hold a WAITING install step -- and the table is never
-    archived, so scanning it is what let the newest RUNNING row fall past the
-    window (F1)."""
+    """BLOCKED is excluded because nothing ever re-executes a BLOCKED row, not
+    because it cannot hold an install execution (it can, see the next test).
+    ``executor.py`` returns the recorded result for SUCCEEDED / BLOCKED /
+    SUPERSEDED without executing; the operator levers close a BLOCKED row to
+    SUPERSEDED and refuse rows that were already dispatched; no writer takes
+    BLOCKED back to PENDING or RUNNING. So no control plane -- old or new --
+    will ever derive a command id for a step in a BLOCKED row again, and the
+    double-submit this gate exists for cannot start there. The table is also
+    never archived, which is what let the newest RUNNING row fall past the
+    window when BLOCKED was scanned (F1)."""
 
     blocked = _workflow(
         "wf-blocked-waiting",
@@ -272,6 +276,45 @@ def test_blocked_workflows_are_not_scanned(
 
     assert result["inflight"] == []
     assert result["bounded"] is True
+
+
+def test_a_blocked_internal_error_row_with_a_waiting_install_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A RUNNING workflow CAN end up BLOCKED with a WAITING install execution:
+    ``dispatcher._block_after_internal_error`` blocks a mid-dispatch
+    ValidationError as ``BlockedKind.INTERNAL_ERROR`` and ``terminalize_claimed``
+    leaves ``step_executions`` intact (``workflow_resolution`` and the postgres
+    open-predecessor SQL both know this shape). The node agent may still be
+    installing -- but no control plane will ever re-derive that step's command
+    id (a BLOCKED row is never re-executed), so the old/new command-id shape
+    cannot produce a second submit for it. Not in flight for this gate."""
+
+    blocked = _workflow(
+        "wf-internal-error",
+        WorkflowStatus.BLOCKED,
+        [
+            (WorkflowOperation.QUIESCE_GPU_SERVICES, ["node-m"]),
+            (WorkflowOperation.REMEDIATE_DRIVER, ["node-m"]),
+        ],
+        executions=[(0, WorkflowStepStatus.SUCCEEDED), (1, WorkflowStepStatus.WAITING)],
+        completed=[0],
+    ).model_copy(
+        update={
+            "blocked_kind": BlockedKind.INTERNAL_ERROR,
+            "blocked_reasons": ["dispatcher internal error: ValidationError"],
+        }
+    )
+    running_sibling = _workflow(
+        "wf-running",
+        WorkflowStatus.RUNNING,
+        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-n"])],
+        executions=[(0, WorkflowStepStatus.WAITING)],
+    )
+
+    result = _run_probe(monkeypatch, capsys, [blocked, running_sibling])
+
+    assert [item["workflow_id"] for item in result["inflight"]] == ["wf-running"]
 
 
 def test_a_transiently_succeeded_execution_is_not_in_flight(
@@ -563,6 +606,52 @@ def test_the_automatic_rollback_proceeds_when_the_store_cannot_answer(
         GATE.require_no_inflight_installs(
             _release(_snapshot(DRIVER_STEP)), action="rollback", unreadable="proceed"
         )
+
+
+def test_only_a_probe_that_could_not_run_counts_as_unreadable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An automatic rollback may proceed when no Pod could run the probe -- the
+    store did not answer. Once the probe ran, its evidence is binding: an
+    overflowed scan, unparseable output or a wrong shape refuse in every mode,
+    or the F1 fail-open would be back for the automatic path (fix round 2)."""
+
+    monkeypatch.delenv(ENV, raising=False)
+
+    for evidence in (_snapshot(bounded=False), "not json", "[]", '{"inflight": 1}'):
+        with pytest.raises(GATE.InflightInstallsRefused) as failure:
+            GATE.require_no_inflight_installs(
+                _release(evidence), action="rollback", unreadable="proceed"
+            )
+        assert "evidence" in str(failure.value) or "could not bound" in str(
+            failure.value
+        )
+    assert capsys.readouterr().err == "", "an evidence defect is refused, not logged"
+
+    down = _release(MODULE.ReleaseError("no running CPU ingress Pod"))
+    result = GATE.require_no_inflight_installs(
+        down, action="rollback", unreadable="proceed"
+    )
+    assert result["inflight_count"] == 0
+    assert "inflight-installs-unchecked" in capsys.readouterr().err
+
+
+def test_the_two_failure_kinds_are_distinct_exception_types() -> None:
+    assert issubclass(GATE.StoreUnreachable, GATE.ReleaseError)
+    assert not issubclass(GATE.StoreUnreachable, GATE.InflightInstallsRefused)
+    runner = RoleRunner(pods={}, answers={})
+    release = SimpleNamespace(
+        runner=runner,
+        config=SimpleNamespace(namespace=NAMESPACE),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+    with pytest.raises(GATE.StoreUnreachable):
+        GATE.inflight_install_snapshot(release)
+    with pytest.raises(GATE.ReleaseError) as defect:
+        GATE.inflight_install_snapshot(_release(_snapshot(bounded=False)))
+    assert not isinstance(defect.value, GATE.StoreUnreachable), (
+        "an overflowed scan is an answer, not an unreachable store"
+    )
 
 
 def test_the_read_falls_back_to_another_running_control_plane_role(
@@ -944,7 +1033,7 @@ def test_the_engine_exits_with_the_refusal_code_the_driver_classifies_on(
         MODULE,
         "parser",
         lambda: SimpleNamespace(
-            parse_args=lambda: SimpleNamespace(
+            parse_args=lambda argv=None: SimpleNamespace(
                 mode="rollback", dry_run=False, config="/tmp/site.json"
             )
         ),
@@ -990,10 +1079,30 @@ def test_the_rollback_mode_takes_an_automatic_marker(
     seen: list[dict[str, Any]] = []
     release = SimpleNamespace(rollback=lambda **kwargs: seen.append(kwargs))
     monkeypatch.setattr(
-        MODULE, "parser", lambda: SimpleNamespace(parse_args=lambda: parsed)
+        MODULE, "parser", lambda: SimpleNamespace(parse_args=lambda argv=None: parsed)
     )
     monkeypatch.setattr(MODULE.ReleaseConfig, "load", classmethod(lambda cls, _p: None))
     monkeypatch.setattr(MODULE, "RegionalRelease", lambda _config, _runner: release)
 
     assert MODULE.main() == 0
     assert seen == [{"automatic": True}]
+
+
+def test_the_automatic_marker_is_engine_internal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Hidden from ``--help`` (it is set by ``recover_failed_upgrade`` and the
+    release driver, never typed by an operator) and refused on every mode but
+    ``rollback``, where it would otherwise be accepted silently."""
+
+    assert "--automatic" not in MODULE.parser().format_help()
+
+    parsed = MODULE.parse_arguments(["rollback", "--config", "/tmp/x", "--automatic"])
+    assert parsed.automatic is True, "rollback keeps the marker"
+    assert MODULE.parse_arguments(["upgrade", "--config", "/tmp/x"]).automatic is False
+
+    for mode in ("upgrade", "deploy", "resume", "status"):
+        with pytest.raises(SystemExit) as failure:
+            MODULE.parse_arguments([mode, "--config", "/tmp/x", "--automatic"])
+        assert failure.value.code == 2, "argparse usage error, like any bad argv"
+        assert "--automatic" in capsys.readouterr().err

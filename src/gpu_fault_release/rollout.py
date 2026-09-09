@@ -1360,10 +1360,21 @@ def parser() -> argparse.ArgumentParser:
         default="upgrade",
     )
     value.add_argument("--dry-run", action="store_true")
-    # `rollback` only: set by the release driver's automatic rollback so the
-    # in-flight install check proceeds (logging) when the store cannot answer.
-    value.add_argument("--automatic", action="store_true")
+    # Engine-internal: set by `recover_failed_upgrade` (in-process) and by
+    # `scripts/release_failure_recovery.py` on `rollback`, never typed by an
+    # operator, so hidden from --help; `parse_arguments` refuses it elsewhere.
+    # It lets the in-flight install check proceed (logging) when no
+    # control-plane Pod can answer the store read.
+    value.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
     return value
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    value = parser()
+    arguments = value.parse_args(argv)
+    if getattr(arguments, "automatic", False) and arguments.mode != "rollback":
+        value.error("--automatic is engine-internal and only accepted with rollback")
+    return arguments
 
 
 def _run_mode(arguments: argparse.Namespace) -> int:
@@ -1444,7 +1455,7 @@ def _run_mode(arguments: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    arguments = parser().parse_args()
+    arguments = parse_arguments()
     narrate_release_start(arguments.mode, dry_run=arguments.dry_run)
     exit_code = 2
     try:

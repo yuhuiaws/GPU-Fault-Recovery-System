@@ -19,12 +19,19 @@ steps is PENDING or WAITING, and this probe is the one store read behind that
 refusal.
 
 Only the executable statuses are scanned: PENDING, SAFETY_PENDING, RUNNING.
-BLOCKED is reached at compile time (policy or compile errors) or as the
-terminal status of a safety-only execution; no transition takes a RUNNING
-workflow with official steps to BLOCKED, so a BLOCKED row never holds an
-install step mid-flight -- and BLOCKED is never archived, so including it once
-let the newest RUNNING row fall past the window and the probe report 0.
-``tests/regional/test_release_inflight_install_gate.py`` pins the status set.
+BLOCKED is excluded because nothing ever re-executes a BLOCKED row -- not
+because it cannot hold an install execution. It can: the dispatcher blocks a
+RUNNING workflow that hits a mid-dispatch ValidationError
+(``BlockedKind.INTERNAL_ERROR``) and leaves ``step_executions`` intact, so a
+BLOCKED row may still carry a WAITING install. But the executor returns the
+recorded result for a BLOCKED row without executing, the operator levers close
+it to SUPERSEDED and refuse rows already dispatched, and no writer takes
+BLOCKED back to PENDING or RUNNING: no control plane, old or new, will derive a
+command id for that step again, so the double submit this gate guards against
+cannot start there. BLOCKED is also never archived; scanning it once let the
+newest RUNNING row fall past the window and the probe report 0.
+``tests/regional/test_release_inflight_install_gate.py`` pins the status set and
+the INTERNAL_ERROR shape.
 
 A step is in flight when its index is neither completed nor superseded and its
 latest execution record is absent (PENDING: not yet handed to an adapter) or
