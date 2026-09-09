@@ -78,6 +78,92 @@ class CompletionService:
         self.store.add_marker(marker)
         return marker
 
+    def _ensure_containment(
+        self,
+        *,
+        cluster_id: str,
+        job_id: str,
+        attempt_id: str,
+        runtime_profile_version: str,
+        workload_ids: list[str],
+        node_ids: list[str],
+        gpu_uuids: list[str],
+        reasons: list[str],
+    ) -> tuple[FaultIncident, WorkflowRequest, bool]:
+        """Create or retrieve containment incident and workflow for a failure.
+
+        Builds a passive-containment-v1 incident with STOP_WORKLOAD action and
+        a two-step workflow (FREEZE_EVIDENCE, STOP_WORKLOADS). Shared by both
+        the failure-detected handler and the terminal handler (when a terminal
+        arrives before its failure-detected event).
+
+        Args:
+            cluster_id: Target cluster
+            job_id: Job identifier (not currently persisted)
+            attempt_id: Attempt identifier
+            runtime_profile_version: Runtime profile version
+            workload_ids: Workload identifiers to stop
+            node_ids: Affected node identifiers
+            gpu_uuids: Affected GPU UUIDs
+            reasons: Human-readable reason strings for the incident
+
+        Returns:
+            Tuple of (incident, workflow, created) where created is True if
+            this call created the incident, False if it already existed.
+        """
+        event_key = f"{cluster_id}/{attempt_id}/TrainingAttemptFailureDetected"
+        incident_id, workflow_id = failure_containment_ids(event_key)
+
+        def build() -> tuple[FaultIncident, WorkflowRequest]:
+            now = datetime.now(timezone.utc)
+            workflow = WorkflowRequest(
+                request_id=workflow_id,
+                incident_id=incident_id,
+                runtime_profile_version=runtime_profile_version,
+                status=WorkflowStatus.PENDING,
+                official_action="STOP_WORKLOAD",
+                fencing_token=1,
+                official_steps=[
+                    WorkflowStepSpec(
+                        operation=(WorkflowOperation.FREEZE_EVIDENCE),
+                        execution_owner=("gpu-fault-control-plane"),
+                        node_ids=node_ids,
+                        gpu_uuids=gpu_uuids,
+                        workload_ids=workload_ids,
+                    ),
+                    WorkflowStepSpec(
+                        operation=(WorkflowOperation.STOP_WORKLOADS),
+                        execution_owner=("gpu-fault-kubernetes-adapter"),
+                        node_ids=node_ids,
+                        gpu_uuids=gpu_uuids,
+                        workload_ids=workload_ids,
+                        parameters={"termination_initiator_incident_id": incident_id},
+                    ),
+                ],
+                created_at=now,
+                updated_at=now,
+            )
+            incident = FaultIncident(
+                incident_id=incident_id,
+                event_id=event_key,
+                event_type=("TRAINING_ATTEMPT_FAILURE_DETECTED"),
+                cluster_id=cluster_id,
+                node_ids=node_ids,
+                gpu_uuids=gpu_uuids,
+                policy_version="passive-containment-v1",
+                policy_source="completion-watcher",
+                official_action="STOP_WORKLOAD",
+                effective_action=RecoveryAction.STOP_WORKLOAD,
+                state=IncidentState.ACTION_PENDING,
+                workflow_request_id=workflow_id,
+                reasons=reasons,
+                created_at=now,
+                updated_at=now,
+            )
+            return incident, workflow
+
+        return self.store.create_incident_workflow_if_absent(event_key, build)
+
     def handle_failure_detected(
         self, event: FailureDetectedEvent
     ) -> FailureContainmentDecision:
@@ -86,78 +172,39 @@ class CompletionService:
         self.store.get_profile(event.runtime_profile_version)
         if not event.workload_ids:
             raise ValueError("failure detection requires owning workload IDs")
-        incident_id, workflow_id = failure_containment_ids(event.event_key)
 
-        def build() -> tuple[FaultIncident, WorkflowRequest]:
-            now = datetime.now(timezone.utc)
-            workflow = WorkflowRequest(
-                request_id=workflow_id,
-                incident_id=incident_id,
-                runtime_profile_version=(event.runtime_profile_version),
-                status=WorkflowStatus.PENDING,
-                official_action="STOP_WORKLOAD",
-                fencing_token=1,
-                official_steps=[
-                    WorkflowStepSpec(
-                        operation=(WorkflowOperation.FREEZE_EVIDENCE),
-                        execution_owner=("gpu-fault-control-plane"),
-                        node_ids=event.node_ids,
-                        gpu_uuids=event.gpu_uuids,
-                        workload_ids=event.workload_ids,
-                    ),
-                    WorkflowStepSpec(
-                        operation=(WorkflowOperation.STOP_WORKLOADS),
-                        execution_owner=("gpu-fault-kubernetes-adapter"),
-                        node_ids=event.node_ids,
-                        gpu_uuids=event.gpu_uuids,
-                        workload_ids=event.workload_ids,
-                        parameters={"termination_initiator_incident_id": (incident_id)},
-                    ),
-                ],
-                created_at=now,
-                updated_at=now,
-            )
-            incident = FaultIncident(
-                incident_id=incident_id,
-                event_id=event.event_key,
-                event_type=("TRAINING_ATTEMPT_FAILURE_DETECTED"),
-                cluster_id=event.cluster_id,
-                node_ids=event.node_ids,
-                gpu_uuids=event.gpu_uuids,
-                policy_version="passive-containment-v1",
-                policy_source="completion-watcher",
-                official_action="STOP_WORKLOAD",
-                effective_action=RecoveryAction.STOP_WORKLOAD,
-                state=IncidentState.ACTION_PENDING,
-                workflow_request_id=workflow_id,
-                reasons=[
-                    event.reason,
-                    (f"first_failed_rank={event.first_failed_rank}"),
-                    f"exit_code={event.exit_code}",
-                    *[
-                        (
-                            "workload log capture failed: "
-                            f"{item.get('namespace', '')}/"
-                            f"{item.get('pod_name', '')}: "
-                            f"{item['capture_error']}"
-                        )
-                        if item.get("capture_error")
-                        else (
-                            "workload log evidence: "
-                            f"{item.get('record_id')}"
-                            + (f" ({item.get('s3_uri')})" if item.get("s3_uri") else "")
-                        )
-                        for item in event.workload_log_snapshots
-                    ],
-                ],
-                created_at=now,
-                updated_at=now,
-            )
-            return incident, workflow
+        reasons = [
+            event.reason,
+            f"first_failed_rank={event.first_failed_rank}",
+            f"exit_code={event.exit_code}",
+            *[
+                (
+                    "workload log capture failed: "
+                    f"{item.get('namespace', '')}/"
+                    f"{item.get('pod_name', '')}: "
+                    f"{item['capture_error']}"
+                )
+                if item.get("capture_error")
+                else (
+                    "workload log evidence: "
+                    f"{item.get('record_id')}"
+                    + (f" ({item.get('s3_uri')})" if item.get("s3_uri") else "")
+                )
+                for item in event.workload_log_snapshots
+            ],
+        ]
 
-        incident, workflow, created = self.store.create_incident_workflow_if_absent(
-            event.event_key, build
+        incident, workflow, created = self._ensure_containment(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=event.workload_ids,
+            node_ids=event.node_ids,
+            gpu_uuids=event.gpu_uuids,
+            reasons=reasons,
         )
+
         if self.evidence_service is not None:
             for snapshot in event.workload_log_snapshots:
                 if (
