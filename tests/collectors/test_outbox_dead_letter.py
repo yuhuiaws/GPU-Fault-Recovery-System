@@ -801,9 +801,9 @@ def test_the_strict_refusal_names_the_collector_holding_the_lock(
 
     assert isinstance(stopped, SystemExit), f"the held lock did not refuse: {stopped!r}"
     message = str(stopped)
-    assert f"held by pid {os.getpid()} (collector) since 20" in message, (
-        f"the refusal does not name the holder's pid and role: {message!r}"
-    )
+    assert (
+        f"recorded holder pid {os.getpid()} (collector), alive, since 20" in message
+    ), f"the refusal does not name the holder's pid and role: {message!r}"
     assert "holder unknown" not in message, message
     assert json.loads(outbox_path.read_text())["replayable"] is False, (
         "requeue-dead rewrote the outbox although the collector held the lock"
@@ -830,9 +830,9 @@ def test_the_forced_warning_names_the_collector_holding_the_lock(
     assert json.loads(outbox_path.read_text())["replayable"] is True, (
         "--force answered but did not requeue the dead record"
     )
-    assert f"held by pid {os.getpid()} (collector) since 20" in warnings, (
-        f"the forced WARNING does not name who held the lock: {warnings!r}"
-    )
+    assert (
+        f"recorded holder pid {os.getpid()} (collector), alive, since 20" in warnings
+    ), f"the forced WARNING does not name who held the lock: {warnings!r}"
     assert "because --force was passed" in warnings, warnings
 
 
@@ -889,7 +889,7 @@ def test_an_unreadable_lock_file_reads_as_holder_unknown(
     assert "holder unknown" in message, (
         f"an unreadable lock file did not read as unknown: {message!r}"
     )
-    assert "held by pid" not in message and "stale holder" not in message, message
+    assert "recorded holder" not in message, message
     assert lock_path.read_bytes() == contents, (
         "a refused taker rewrote the lock file it does not hold"
     )
@@ -902,7 +902,8 @@ def test_a_recorded_holder_that_is_gone_reads_as_stale(
 
     Somebody else holds the lock without having overwritten the line -- an
     older collector, or a child that inherited the parent's descriptor. Saying
-    "held by pid N" would send the operator to ``kill`` a pid that is gone.
+    "recorded holder pid N, alive" would send the operator to ``kill`` a pid
+    that is gone.
     """
 
     outbox_path = tmp_path / "outbox.ndjson"
@@ -939,10 +940,10 @@ def test_a_recorded_holder_that_is_gone_reads_as_stale(
 
     assert isinstance(stopped, SystemExit), f"the held lock did not refuse: {stopped!r}"
     message = str(stopped)
-    assert f"stale holder pid {dead_pid} (collector, gone)" in message, (
+    assert f"stale recorded holder pid {dead_pid} (collector, gone)" in message, (
         f"a dead recorded pid was not reported as gone: {message!r}"
     )
-    assert "held by pid" not in message, message
+    assert "alive" not in message, message
 
 
 def test_every_lock_take_records_its_role_and_a_write_failure_is_harmless(
@@ -976,7 +977,7 @@ def test_every_lock_take_records_its_role_and_a_write_failure_is_harmless(
     handle = os.open(lock_path, os.O_RDONLY)
     try:
         assert collector_outbox.describe_lock_holder(handle).startswith(
-            f"held by pid {os.getpid()} (collector) since 20"
+            f"recorded holder pid {os.getpid()} (collector), alive, since 20"
         ), "the reader did not take the first line over the old tail"
     finally:
         os.close(handle)
@@ -997,4 +998,40 @@ def test_every_lock_take_records_its_role_and_a_write_failure_is_harmless(
     assert lock_path.read_bytes() == b"", (
         "the failed identity write left stale contents behind instead of an "
         "empty file, so the next refusal would name a holder that is gone"
+    )
+
+
+def test_a_lock_file_cannot_forge_a_log_line_or_pad_it_without_bound(tmp_path) -> None:
+    """The lock file is writable by whoever can open it; the refusal quotes it.
+
+    A newline inside ``role`` would otherwise land as a second, forged line in
+    the refusal and in the collector's WARNING, and an unbounded ``role`` or
+    ``since`` would pad one log line with kilobytes. Control characters are
+    dropped and both strings are cut before they are interpolated.
+    """
+
+    lock_path = OutboxFile(tmp_path / "outbox.ndjson").lock_path
+    lock_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "role": "collector\nWARNING forged line\x1b[31m" + "r" * 200,
+                "since": "2026-09-09T00:00:00+00:00\r\n" + "s" * 200,
+            }
+        )
+    )
+    handle = os.open(lock_path, os.O_RDONLY)
+    try:
+        described = collector_outbox.describe_lock_holder(handle)
+    finally:
+        os.close(handle)
+
+    assert (
+        "\n" not in described and "\r" not in described and "\x1b" not in described
+    ), f"a control character from the lock file reached the message: {described!r}"
+    assert described.startswith(
+        f"recorded holder pid {os.getpid()} (collectorWARNING"
+    ), f"the sanitised role lost more than its control characters: {described!r}"
+    assert len(described) < 64 + 40 + 60, (
+        f"the lock file padded the message past its bound: {len(described)}"
     )

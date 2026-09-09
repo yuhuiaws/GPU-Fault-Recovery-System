@@ -47,8 +47,10 @@ def _add_outbox_parser(
     waiting), and a lock still held after that exits non-zero and changes
     nothing -- unlike the collector, this process has no in-process lock to
     fall back on. The refusal names the holder from the identity line every
-    taker leaves in ``.lock`` (``held by pid <n> (collector|cli:<subcommand>)
-    since <ts>``, ``stale holder pid <n> (..., gone)`` or ``holder unknown``),
+    taker leaves in ``.lock`` (``recorded holder pid <n>
+    (collector|cli:<subcommand>), alive, since <ts>``, ``stale recorded holder
+    pid <n> (..., gone)`` or ``holder unknown`` -- "recorded" because the file
+    is the last taker's word, not the kernel's),
     so a live collector's replay can be told from a colleague's command.
     ``--force`` runs the same bounded poll and then rewrites *without* the
     lock, for a collector that is stopped and left its lock behind; its

@@ -104,16 +104,33 @@ def describe_lock_holder(handle: int) -> str:
     # 2**31 - 1; a corrupt line must read as unknown, never as a traceback.
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid > 2**31 - 1:
         return "holder unknown"
-    role = holder.get("role") if isinstance(holder.get("role"), str) else "unknown role"
-    since = holder.get("since") if isinstance(holder.get("since"), str) else "unknown"
+    role = _printable(holder.get("role"), 64, "unknown role")
+    since = _printable(holder.get("since"), 40, "unknown")
+    # "recorded", not "held by": the line is what the last taker wrote, and it
+    # can lag the truth (release-then-read-then-rewrite window, a holder that
+    # never writes its line, pid reuse). The liveness check is the one fact
+    # this process can add.
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return f"stale holder pid {pid} ({role}, gone)"
+        return f"stale recorded holder pid {pid} ({role}, gone)"
     except (OSError, OverflowError):
         # EPERM: the process exists but belongs to another user -- alive.
         pass
-    return f"held by pid {pid} ({role}) since {since}"
+    return f"recorded holder pid {pid} ({role}), alive, since {since}"
+
+
+def _printable(value: object, limit: int, fallback: str) -> str:
+    """A lock-file string fit for one log line: bounded, no control characters.
+
+    The file is writable by whoever can open it, so a newline in ``role`` would
+    otherwise become a second, forged log line in the refusal or the WARNING.
+    """
+
+    if not isinstance(value, str):
+        return fallback
+    text = "".join(char for char in value[:limit] if char.isprintable())
+    return text or fallback
 
 
 @dataclass(frozen=True)
@@ -197,8 +214,7 @@ class OutboxFile:
             while True:
                 try:
                     fcntl.flock(handle, mode)
-                    self._record_lock_holder(handle)
-                    return handle
+                    break
                 except OSError as exc:
                     attempts -= 1
                     if exc.errno not in {errno.EACCES, errno.EAGAIN}:
@@ -212,6 +228,10 @@ class OutboxFile:
                             f"{OUTBOX_LOCK_FORCE_ADVICE}",
                         ) from exc
                 time.sleep(OUTBOX_LOCK_RETRY_SECONDS)
+            # Outside the retry handler on purpose: that handler reasons about
+            # ``flock`` errnos only, and the identity write swallows its own.
+            self._record_lock_holder(handle)
+            return handle
         except BaseException:
             with contextlib.suppress(OSError):
                 os.close(handle)
@@ -233,8 +253,12 @@ class OutboxFile:
         ``close()`` of the lock a forced block flush (about 900 us). No hostname
         (the file never leaves the node) and no monotonic clock (meaningless to
         another process). A failure here must not fail the lock, let alone the
-        post the lock protects; the previous holder's line is emptied so the
-        reader says "holder unknown" rather than naming them.
+        post the lock protects; the previous holder's line is emptied where the
+        filesystem still allows it, so the reader says "holder unknown" rather
+        than naming them. Where it does not (EIO), the old line stays and reads
+        as a *recorded* holder -- the wording the reader uses for exactly this
+        reason; a short ``pwrite`` followed by the ``ftruncate`` leaves an
+        unparsable head, which is "unknown", never a lie.
         """
 
         line = json.dumps(
