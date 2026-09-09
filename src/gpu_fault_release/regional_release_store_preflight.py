@@ -540,8 +540,8 @@ def require_no_inflight_installs(
             reason = (
                 ALLOW_INFLIGHT_INSTALLS_FLAG
                 if allowed
-                else "automatic rollback: no Running control-plane Pod could run "
-                "the probe"
+                else "automatic rollback: no Running control-plane Pod with a ready "
+                "container could run the probe"
             )
             narrate_step(
                 "inflight-installs-unchecked",
