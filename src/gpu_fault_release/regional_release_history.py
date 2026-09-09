@@ -97,7 +97,13 @@ def build_history_entry(
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z"),
-        "release_id": str(release.release_id),
+        # The release the written state describes. For the release's own
+        # transaction that is this process's candidate; for the one recorded
+        # checkpoint a candidate writes on another release's behalf -- the
+        # commit of a complete, uncommitted live release -- it is that live
+        # release, which the entry must be attributed to (deploy #32,
+        # 2026-09-09, logged its commit of 7194b5261380 under 72ebbaa66a9f).
+        "release_id": str(release.state.get("release_id") or release.release_id),
         "phase": phase,
         "release_lifecycle": release.state.get("release_lifecycle"),
         "state_sha256": sha256_text(state_text),

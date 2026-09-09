@@ -120,6 +120,33 @@ def test_state_transition_appends_an_entry_with_operator_and_digests(
     assert json.loads(mirrored[-1]) == entry, "the state-dir mirror must match"
 
 
+def test_history_attributes_the_entry_to_the_release_the_state_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A candidate that commits the complete, uncommitted live release writes
+    that release's state under its own identity; the audit entry must name the
+    live release, not the candidate holding the pen."""
+
+    monkeypatch.setenv(HISTORY.HISTORY_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["rollout_regional_release.py", "deploy"])
+    runner = _Runner(existing=[])
+    release = _release(
+        runner,
+        state={
+            "phase": "complete",
+            "release_id": "live-release",
+            "transaction_committed": True,
+            "execution_plan": None,
+        },
+    )
+
+    HISTORY.record_release_history(release, phase="complete", state_text='{"a":1}')
+
+    entries = _applied_entries(runner)
+    assert [item["release_id"] for item in entries] == ["live-release"]
+    assert entries[-1]["plan_sha256"] is None
+
+
 def test_operator_identity_prefers_the_aws_caller_arn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
