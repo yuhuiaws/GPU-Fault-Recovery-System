@@ -10,7 +10,9 @@ the previous release's control plane would submit it a second time, so the
 rollback refuses before touching anything (``regional_release_store_preflight``)
 and the transaction stays in ``failed`` -- the phase resume and
 ``--supersede-failed-transaction`` already handle -- rather than going to
-``rollback-failed``, which would claim a restore was attempted.
+``rollback-failed``, which would claim a restore was attempted. A store that
+cannot answer that check does not stop the automatic rollback (its primary
+scenario is a control plane that is down); the gate logs and the rollback runs.
 """
 
 from __future__ import annotations
@@ -68,7 +70,10 @@ def recover_failed_upgrade(
     ):
         raise error
     try:
-        release.rollback(state=previous)
+        # ``automatic``: a store that cannot answer the in-flight install check
+        # does not stop this rollback (a dead control plane dispatches
+        # nothing; wedging production in ``failed`` is the worse failure).
+        release.rollback(state=previous, automatic=True)
     except InflightInstallsRefused as refusal:
         phase = release.state.get("phase")
         narrate_step("automatic-rollback-refused", phase=phase, reason=str(refusal))

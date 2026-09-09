@@ -3,7 +3,10 @@
 Request: nothing on stdin.
 Response: one JSON object on stdout with ``inflight`` (at most 100 entries,
 each ``workflow_id`` / ``incident_id`` / ``workflow_status`` / ``operation`` /
-``step_index`` / ``node_ids`` / ``step_status``) and ``inflight_count``.
+``step_index`` / ``node_ids`` / ``step_status``), ``inflight_count``,
+``scanned`` (rows read) and ``bounded`` -- ``false`` when more executable
+workflows exist than the 1000-row window, in which case the caller must not
+read ``inflight_count: 0`` as "clear".
 
 Why the release engine asks: R4 (2026-09-09) moved the node-action command id
 of REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE / REMEDIATE_EFA_DRIVER from
@@ -15,23 +18,28 @@ therefore refuses to open an upgrade or rollback transaction while one of these
 steps is PENDING or WAITING, and this probe is the one store read behind that
 refusal.
 
-A step is in flight when its workflow is still non-terminal, its index is
-neither completed nor superseded, and its latest execution record is absent
-(PENDING: the executor has not handed it to an adapter yet) or WAITING (the
-node agent has it). A latest execution that FAILED is not in flight: failure
-handling, not a retry, is what happens next. BLOCKED workflows never execute
-again on their own, so only a step already WAITING there counts.
+Only the executable statuses are scanned: PENDING, SAFETY_PENDING, RUNNING.
+BLOCKED is reached at compile time (policy or compile errors) or as the
+terminal status of a safety-only execution; no transition takes a RUNNING
+workflow with official steps to BLOCKED, so a BLOCKED row never holds an
+install step mid-flight -- and BLOCKED is never archived, so including it once
+let the newest RUNNING row fall past the window and the probe report 0.
+``tests/regional/test_release_inflight_install_gate.py`` pins the status set.
+
+A step is in flight when its index is neither completed nor superseded and its
+latest execution record is absent (PENDING: not yet handed to an adapter) or
+WAITING (the node agent has it). A latest execution that SUCCEEDED (the node is
+done; ``completed_step_indexes`` follows in the same transaction) or FAILED
+(failure handling, not a retry, follows) is not in flight.
 
 The operation set is spelled out here rather than imported from
-``gpu_fault.operation_registry.GENERATION_STABLE_COMMAND_OPERATIONS``: the
-engine ships this file to the Pod as source (see ``probes/README.md``) and it
-runs against whatever ``gpu_fault`` is *already deployed* -- for the release
-that first carries R4, and for every rollback target, a module without that
-name. ``tests/regional/test_release_inflight_install_gate.py`` pins the two
-sets equal.
+``gpu_fault.execution.config.NODE_INSTALL_OPERATIONS``: the engine ships this
+file to the Pod as source (see ``probes/README.md``) and it runs against
+whatever ``gpu_fault`` is *already deployed* -- for every rollback target, a
+module that may predate the name. The same test pins the two sets equal.
 
-The ``except Exception: continue`` arm fails closed in the only direction that
-is safe here: a workflow the probe cannot classify is counted, never skipped.
+The ``except Exception`` arm fails closed in the only direction that is safe
+here: a step the probe cannot classify is counted (``UNKNOWN``), never skipped.
 """
 
 import json
@@ -48,15 +56,14 @@ INSTALL_OPERATIONS = {
 STATUSES = {
     WorkflowStatus.PENDING,
     WorkflowStatus.SAFETY_PENDING,
-    WorkflowStatus.BLOCKED,
     WorkflowStatus.RUNNING,
 }
-LIMIT = 100
+WINDOW = 1000
+REPORT_LIMIT = 100
 
 
 def step_state(workflow: Any, index: int) -> str | None:
-    """``PENDING`` / ``WAITING`` (or another live execution status) when the
-    step is in flight, ``None`` when it is not."""
+    """``PENDING`` / ``WAITING`` when the step is in flight, else ``None``."""
 
     if index in set(workflow.completed_step_indexes) or index in set(
         workflow.superseded_step_indexes
@@ -67,20 +74,17 @@ def step_state(workflow: Any, index: int) -> str | None:
         if execution.step_index == index:
             latest = execution
     if latest is None:
-        return None if workflow.status is WorkflowStatus.BLOCKED else "PENDING"
-    if latest.status is WorkflowStepStatus.FAILED:
-        return None
-    if workflow.status is WorkflowStatus.BLOCKED and (
-        latest.status is not WorkflowStepStatus.WAITING
-    ):
-        return None
-    return str(latest.status.value)
+        return "PENDING"
+    if latest.status is WorkflowStepStatus.WAITING:
+        return "WAITING"
+    return None
 
 
 def main() -> None:
     store = ApplicationContext.from_environment().store
+    rows = list(store.list_workflows(statuses=STATUSES, limit=WINDOW + 1))
     inflight: list[dict[str, Any]] = []
-    for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
+    for workflow in rows:
         for index, step in enumerate(workflow.official_steps):
             if step.operation not in INSTALL_OPERATIONS:
                 continue
@@ -103,7 +107,12 @@ def main() -> None:
             )
     print(
         json.dumps(
-            {"inflight": inflight[:LIMIT], "inflight_count": len(inflight)},
+            {
+                "inflight": inflight[:REPORT_LIMIT],
+                "inflight_count": len(inflight),
+                "scanned": len(rows),
+                "bounded": len(rows) <= WINDOW,
+            },
             sort_keys=True,
         )
     )

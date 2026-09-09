@@ -1,6 +1,7 @@
 """The control-plane store reads a transaction must pass before it starts.
 
-Two questions, each one ``kubectl exec`` of a probe into the CPU ingress Pod:
+Two questions, each one ``kubectl exec`` of a probe into a Running
+control-plane Pod:
 
 * Is the remote command queue idle? A PENDING / LEASED / WAITING remote command
   is a node action mid-flight; the transaction that rolls the executor or the
@@ -15,13 +16,21 @@ Two questions, each one ``kubectl exec`` of a probe into the CPU ingress Pod:
   SECOND install on a node still running the first (install timeout 1800 s).
   So before an upgrade or rollback transaction opens, and before the automatic
   rollback, the engine asks once whether any of those steps is PENDING or
-  WAITING and refuses with the workflow ids and nodes named. A store that
-  cannot answer refuses too -- fail closed, naming the error -- because the
-  install the probe could not see is the one that gets doubled.
+  WAITING and refuses with the workflow ids and nodes named.
+
+  A store that cannot answer refuses too -- fail closed, naming the error --
+  with one exception, decided by the caller: the AUTOMATIC rollback proceeds
+  and logs ``inflight-installs-unchecked`` loudly, because its primary scenario
+  is a control plane that is down (CrashLoop, Aurora window, broken wheel), a
+  dead control plane dispatches nothing, and wedging production in ``failed``
+  is the worse failure. The read tries every Running control-plane role, not
+  only the ingress Pod the failed upgrade just rolled.
+
   ``--allow-inflight-installs`` on ``gpu-fault-admin deploy`` is the operator's
   consent to proceed anyway; it travels down the deploy's process chain as
   ``GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS`` like the other release-engine
-  consents, and the gate then logs what it is skipping instead of refusing.
+  consents. The engine's own ``rollback`` mode has no flag, so a refusal there
+  names the variable instead.
 """
 
 from __future__ import annotations
@@ -29,29 +38,40 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any
+from typing import Any, Literal
 
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
+    CONTROL_PLANE_PYTHON,
     cpu_ingress_pod_if_running,
     exec_cpu_ingress_probe,
 )
 
+from gpu_fault.execution.config import NODE_INSTALL_OPERATIONS
+
 # Mirrored in ``gpu_fault.admin.release_consent``; a test pins the spellings.
 ALLOW_INFLIGHT_INSTALLS_ENV = "GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS"
 ALLOW_INFLIGHT_INSTALLS_FLAG = "--allow-inflight-installs"
-# The operations whose command id R4 made generation-stable. Pinned equal to
-# ``operation_registry.GENERATION_STABLE_COMMAND_OPERATIONS`` by a test rather
-# than imported: the probe spells them out for the deployed ``gpu_fault`` that
-# predates the registry field, and this module names them for the operator.
-INSTALL_OPERATIONS = (
-    "REMEDIATE_DRIVER",
-    "UPDATE_SOFTWARE_FIRMWARE",
-    "REMEDIATE_EFA_DRIVER",
-)
+# The executor's install set is the one whose command id R4 made
+# generation-stable; a test pins it equal to
+# ``operation_registry.GENERATION_STABLE_COMMAND_OPERATIONS``. The probe spells
+# the same three out inline for the deployed ``gpu_fault`` it runs against.
+INSTALL_OPERATIONS = tuple(operation.value for operation in NODE_INSTALL_OPERATIONS)
+# The probe's row window; more executable workflows than this and the scan is
+# unbounded (the probe says so), which the gate treats as "could not check".
+SCAN_WINDOW = 1000
+# What ``rollout-regional-release.sh`` exits with when a transaction was
+# refused for an in-flight install. The release driver
+# (``scripts/release_failure_recovery.py``, which mirrors the value) sees only
+# the exit code, and must not record the refusal as a failed rollback: nothing
+# was rolled back. Distinct from the generic 2 every other engine error uses.
+INFLIGHT_INSTALLS_REFUSED_EXIT_CODE = 3
 _CHECK = "the in-flight install check"
+
+Unreadable = Literal["refuse", "proceed"]
 
 
 def remote_commands_are_idle(release: Any) -> bool:
@@ -108,15 +128,85 @@ def inflight_installs_allowed(environment: dict[str, str] | None = None) -> bool
     )
 
 
+def _exec_in_role(release: Any, deployment: str, script: str) -> str:
+    """One read through any Running Pod of ``deployment``; raises ReleaseError."""
+
+    namespace = release.config.namespace
+    pod = str(
+        release.runner.run(
+            release._cpu(
+                "-n",
+                namespace,
+                "get",
+                "pod",
+                "-l",
+                f"app={deployment}",
+                "--field-selector=status.phase=Running",
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ),
+            capture=True,
+        )
+        or ""
+    )
+    if not pod:
+        raise ReleaseError("no Running Pod")
+    return str(
+        release.runner.run(
+            release._cpu(
+                "-n",
+                namespace,
+                "exec",
+                pod,
+                "--",
+                CONTROL_PLANE_PYTHON,
+                "-c",
+                script,
+            ),
+            capture=True,
+            sensitive=True,
+        )
+        or ""
+    )
+
+
+def _exec_store_probe(release: Any, *, script: str, failure: str) -> str:
+    """Read through the ingress Pod, then through every other control-plane
+    role that is Running; raise naming every role tried when none answers.
+
+    The ingress Pod is the one an upgrade rolls; right after a failed upgrade it
+    may be the only role that is down. The consumer roles run the same wheel
+    against the same store and answer the same probe.
+    """
+
+    errors: list[str] = []
+    try:
+        return exec_cpu_ingress_probe(
+            release,
+            script=script,
+            failure=failure,
+            sensitive=True,
+            interactive=False,
+        )
+    except ReleaseError as exc:
+        errors.append(f"{inventory.CPU_INGRESS_DEPLOYMENT}: {exc}")
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        if deployment == inventory.CPU_INGRESS_DEPLOYMENT:
+            continue
+        try:
+            return _exec_in_role(release, deployment, script)
+        except ReleaseError as exc:
+            errors.append(f"{deployment}: {exc}")
+    raise ReleaseError(
+        f"{failure} could not reach any Running control-plane Pod: " + "; ".join(errors)
+    )
+
+
 def inflight_install_snapshot(release: Any) -> dict[str, Any]:
     """One store read: the in-flight install steps, as the probe reports them."""
 
-    raw = exec_cpu_ingress_probe(
-        release,
-        script=probe_source("inflight_installs"),
-        failure=_CHECK,
-        sensitive=True,
-        interactive=False,
+    raw = _exec_store_probe(
+        release, script=probe_source("inflight_installs"), failure=_CHECK
     )
     try:
         result = json.loads(raw)
@@ -124,6 +214,12 @@ def inflight_install_snapshot(release: Any) -> dict[str, Any]:
         raise ReleaseError(f"{_CHECK} returned invalid evidence") from exc
     if not isinstance(result, dict) or not isinstance(result.get("inflight"), list):
         raise ReleaseError(f"{_CHECK} returned non-object evidence")
+    if result.get("bounded") is False:
+        raise ReleaseError(
+            f"{_CHECK} could not bound the scan: more than {SCAN_WINDOW} "
+            f"executable workflows ({result.get('scanned')} rows read), so an "
+            "install past the window would read as clear"
+        )
     return result
 
 
@@ -139,23 +235,49 @@ def _operations() -> str:
     return " / ".join(INSTALL_OPERATIONS)
 
 
-def require_no_inflight_installs(release: Any, *, action: str) -> dict[str, Any]:
+def _lever(action: str) -> str:
+    """The override as the operator can actually reach it from this entrypoint."""
+
+    if action == "rollback":
+        return (
+            f"set {ALLOW_INFLIGHT_INSTALLS_ENV}=1 on the rollback to proceed anyway "
+            f"(gpu-fault-admin deploy passes it as {ALLOW_INFLIGHT_INSTALLS_FLAG})"
+        )
+    return (
+        f"rerun gpu-fault-admin deploy with {ALLOW_INFLIGHT_INSTALLS_FLAG} "
+        "to proceed anyway"
+    )
+
+
+def require_no_inflight_installs(
+    release: Any,
+    *,
+    action: str,
+    unreadable: Unreadable = "refuse",
+) -> dict[str, Any]:
     """Refuse ``action`` while an install step is in flight; return the snapshot.
 
     ``action`` names the transaction for the message (``upgrade`` /
-    ``rollback``). With the override set the gate still reads the store when
-    it can, so the log says what was skipped, and proceeds either way.
+    ``rollback``). ``unreadable`` is what a store that cannot answer means:
+    ``refuse`` (manual upgrade and rollback: fail closed, the env lever opens
+    it) or ``proceed`` (the automatic rollback: log and go on, an actual
+    in-flight install still refuses). With the operator's consent set the gate
+    still reads when it can, so the log says what was skipped.
     """
 
     allowed = inflight_installs_allowed()
     try:
         snapshot = inflight_install_snapshot(release)
     except ReleaseError as exc:
-        if allowed:
+        if allowed or unreadable == "proceed":
             narrate_step(
                 "inflight-installs-unchecked",
                 action=action,
-                override=ALLOW_INFLIGHT_INSTALLS_FLAG,
+                reason=(
+                    ALLOW_INFLIGHT_INSTALLS_FLAG
+                    if allowed
+                    else "automatic rollback proceeds on an unreadable store"
+                ),
                 error=f"{type(exc).__name__}: {exc}",
             )
             return {"inflight": [], "inflight_count": 0, "error": str(exc)}
@@ -164,8 +286,7 @@ def require_no_inflight_installs(release: Any, *, action: str) -> dict[str, Any]
             f"({type(exc).__name__}: {exc}). A {_operations()} step already "
             "handed to a node agent would be submitted a second time by the "
             "control plane this transaction puts in place; retry when the "
-            f"control plane answers, or rerun with {ALLOW_INFLIGHT_INSTALLS_FLAG} "
-            "to proceed without the check"
+            f"control plane answers, or {_lever(action)} without the check"
         ) from exc
     count = int(snapshot.get("inflight_count") or 0)
     if not count:
@@ -184,6 +305,6 @@ def require_no_inflight_installs(release: Any, *, action: str) -> dict[str, Any]
         f"{action} refused: {count} {_operations()} step(s) in flight, and the "
         "control plane this transaction puts in place would submit each install "
         f"a second time on a node still running it: {steps}. Wait for them to "
-        "finish (a driver or firmware install takes up to 30 minutes), or rerun "
-        f"with {ALLOW_INFLIGHT_INSTALLS_FLAG} to proceed anyway"
+        f"finish (a driver or firmware install takes up to 30 minutes), or "
+        f"{_lever(action)}"
     )

@@ -1852,18 +1852,27 @@ def rollback_release(
     self: Any,
     *,
     state: dict[str, Any] | None = None,
+    automatic: bool = False,
 ) -> None:
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return
-    # Before anything is refreshed or planned: the previous release's control
-    # plane would re-submit an install that is PENDING or WAITING right now.
-    self._require_no_inflight_installs(action="rollback")
     # The compensating restore restarts the control-plane roles; on 2026-09-07
     # it restarted them into a password RDS had rotated mid-transaction and the
     # release landed in rollback-failed. Fresh credentials first, fail closed,
     # before any restore is even planned.
     self._refresh_aurora_credentials()
+    # Before any restore is planned: the previous release's control plane would
+    # re-submit an install that is PENDING or WAITING right now. Skipped once
+    # the control plane is already restored (a cleanup re-entry); an automatic
+    # rollback proceeds when the store cannot answer, a manual one refuses.
+    if "rollback-cpu-restored" not in set(
+        loaded.get("rollback_completed_phases") or []
+    ):
+        self._require_no_inflight_installs(
+            action="rollback",
+            unreadable="proceed" if automatic else "refuse",
+        )
     compensation = build_rollback_compensation_plan(
         loaded,
         (target.cluster_id for target in self.config.clusters),

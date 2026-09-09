@@ -180,6 +180,8 @@ from gpu_fault_release.regional_release_state import (
     template_bundle,
 )
 from gpu_fault_release.regional_release_store_preflight import (
+    INFLIGHT_INSTALLS_REFUSED_EXIT_CODE,
+    InflightInstallsRefused,
     remote_commands_are_idle,
     require_no_inflight_installs,
 )
@@ -1327,6 +1329,9 @@ def parser() -> argparse.ArgumentParser:
         default="upgrade",
     )
     value.add_argument("--dry-run", action="store_true")
+    # `rollback` only: set by the release driver's automatic rollback so the
+    # in-flight install check proceeds (logging) when the store cannot answer.
+    value.add_argument("--automatic", action="store_true")
     return value
 
 
@@ -1365,7 +1370,7 @@ def _run_mode(arguments: argparse.Namespace) -> int:
     elif arguments.mode == "resume":
         run_resume(release)
     elif arguments.mode == "rollback":
-        release.rollback()
+        release.rollback(automatic=bool(getattr(arguments, "automatic", False)))
     elif arguments.mode == "commit":
         release.commit_release()
     elif arguments.mode == "stage-noop":
@@ -1413,6 +1418,10 @@ def main() -> int:
     exit_code = 2
     try:
         exit_code = _run_mode(arguments)
+    except InflightInstallsRefused as exc:
+        # Nothing was changed; the release driver classifies on this code.
+        exit_code = INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
+        print(f"ERROR: {exc}", file=sys.stderr)
     except (
         ReleaseError,
         OSError,

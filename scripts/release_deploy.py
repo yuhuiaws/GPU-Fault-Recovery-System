@@ -767,6 +767,7 @@ def _run_release_mode(
     mode: str,
     root: Path,
     environment: Mapping[str, str],
+    arguments: Sequence[str] = (),
 ) -> None:
     site = load_site(site_file, repository_root=root)
     rollout_environment = {
@@ -783,6 +784,7 @@ def _run_release_mode(
                 mode,
                 "--config",
                 str(config),
+                *arguments,
             ],
             cwd=root,
             environment=rollout_environment,

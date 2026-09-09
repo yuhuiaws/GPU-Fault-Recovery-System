@@ -1288,3 +1288,73 @@ def test_execute_release_runs_an_accepted_schema_change_fail_forward(
     )
     assert state["rollback"]["status"] == "SKIPPED_POLICY"
     assert "accept-schema-change" in state["rollback"]["reason"]
+
+
+def test_the_driver_and_the_engine_agree_on_the_refusal_exit_code() -> None:
+    from gpu_fault_release import regional_release_store_preflight as STORE
+
+    assert (
+        release_failure_recovery.INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
+        == STORE.INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
+    )
+    assert release_failure_recovery.refused_inflight_installs(
+        release_deploy.ReleaseDeployError("command failed (3): rollout.sh")
+    ), "the engine's refusal exit code is what the driver classifies on"
+    assert not release_failure_recovery.refused_inflight_installs(
+        release_deploy.ReleaseDeployError("command failed (2): rollout.sh")
+    ), "an ordinary engine error stays a rollback failure"
+
+
+def test_an_engine_refusal_is_recorded_as_refused_not_as_a_failed_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine refused before touching anything (an install step is in
+    flight), so the driver must not say the rollback failed: nothing was rolled
+    back, and the operator's next step is to wait, not to repair a half-restore.
+    The automatic rollback is also told it is automatic, so a control plane that
+    cannot answer the store read does not wedge it."""
+
+    site = _site(tmp_path, monkeypatch)
+    commands: list[list[str]] = []
+
+    def run(arguments, **_kwargs):
+        commands.append(list(arguments))
+        if "rollback" in arguments:
+            raise release_deploy.ReleaseDeployError(
+                f"command failed (3): {arguments[0]}"
+            )
+
+    monkeypatch.setattr(release_deploy, "_run", run)
+
+    def run_json(arguments, **_kwargs):
+        if "verify" in arguments:
+            raise release_deploy.ReleaseDeployError("verify failed")
+        if "release-diff" in arguments:
+            return _release_diff("CONTROL_PLANE_ONLY", ["control_plane_wheel"])
+        return _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+    profile = tmp_path / "repo/config/profile.yaml"
+
+    with pytest.raises(release_deploy.ReleaseDeployError) as failure:
+        release_deploy.execute_release(
+            site,
+            run_checks=False,
+            live_state={
+                "runtime_profile_sha256": hashlib.sha256(
+                    profile.read_bytes()
+                ).hexdigest()
+            },
+        )
+
+    assert "verify failed" in str(failure.value)
+    assert "rollback also failed" not in str(failure.value)
+    rollback = next(command for command in commands if command[1] == "rollback")
+    assert "--automatic" in rollback
+    state = json.loads(
+        (site.parent / "release-deploy/release-a/state.json").read_text()
+    )
+    assert state["phase"] == "FAILED"
+    assert state["rollback"]["status"] == "REFUSED_INFLIGHT_INSTALLS"
+    assert "nothing was rolled back" in state["rollback"]["reason"]
+    assert "GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS" in state["rollback"]["reason"]

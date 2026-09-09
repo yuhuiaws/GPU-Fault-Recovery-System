@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -10,6 +11,21 @@ from gpu_fault.admin.rollback_alignment import reconcile_rollback_management
 # Mirrors ``regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`` (pinned equal by
 # tests/regional/test_release_schema_change_acceptance.py).
 ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
+# Mirrors ``regional_release_store_preflight.INFLIGHT_INSTALLS_REFUSED_EXIT_CODE``
+# (pinned equal by tests/admin/test_release_deploy.py). The engine exits with it
+# when it refused to roll back because a REMEDIATE_DRIVER /
+# UPDATE_SOFTWARE_FIRMWARE / REMEDIATE_EFA_DRIVER step is in flight; the driver
+# sees only the exit code, in `_run`'s ``command failed (N): ...`` message.
+INFLIGHT_INSTALLS_REFUSED_EXIT_CODE = 3
+INFLIGHT_INSTALLS_LEVER_ENV = "GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS"
+_COMMAND_FAILED = re.compile(r"command failed \((\d+)\)")
+
+
+def refused_inflight_installs(error: BaseException) -> bool:
+    """Whether the engine refused the rollback for an in-flight install."""
+
+    match = _COMMAND_FAILED.search(str(error))
+    return bool(match) and int(match.group(1)) == INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
 
 
 def schema_change_fail_forward(
@@ -141,6 +157,10 @@ def rollback_after_failure(
             mode="rollback",
             root=root,
             environment=environment,
+            # Marks the rollback automatic: the engine's in-flight install
+            # check then proceeds (logging) when the store cannot answer,
+            # instead of wedging a release whose control plane is down.
+            arguments=("--automatic",),
         )
         live_state = read_live_state(site_file)
         align_rolled_back_management(
@@ -152,6 +172,25 @@ def rollback_after_failure(
             run_release_mode=run_release_mode,
         )
     except Exception as rollback_exc:
+        if refused_inflight_installs(rollback_exc):
+            # The engine refused before touching anything: an install step is
+            # in flight and the previous control plane would submit it again.
+            # Not a failed rollback -- nothing was rolled back -- and the
+            # engine's own state stays where the upgrade failure left it.
+            return {
+                **rollback,
+                "status": "REFUSED_INFLIGHT_INSTALLS",
+                "completed_at": _utc_now(),
+                "reason": (
+                    "the release engine refused the rollback: a REMEDIATE_DRIVER / "
+                    "UPDATE_SOFTWARE_FIRMWARE / REMEDIATE_EFA_DRIVER step is in "
+                    "flight and the previous control plane would submit it a "
+                    "second time; nothing was rolled back (the rollback log names "
+                    "the workflows). Rerun once the installs finish, or with "
+                    f"{INFLIGHT_INSTALLS_LEVER_ENV}=1 to roll back anyway"
+                ),
+                "error": f"{type(rollback_exc).__name__}: {rollback_exc}",
+            }
         return {
             **rollback,
             "status": "FAILED",

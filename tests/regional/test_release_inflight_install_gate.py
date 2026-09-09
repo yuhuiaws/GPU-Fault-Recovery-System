@@ -38,7 +38,9 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.execution.config import NODE_INSTALL_OPERATIONS
 from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
+from gpu_fault_release import regional_deployment_inventory as INVENTORY
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
@@ -56,11 +58,15 @@ NAMESPACE = "gpu-fault-system"
 
 def test_the_gate_covers_exactly_the_generation_stable_operations() -> None:
     """The three operations R4 moved off the agent-generation suffix are the
-    three whose in-flight rows an old control plane would re-submit."""
+    three whose in-flight rows an old control plane would re-submit -- and the
+    engine reads them from the executor's install set, not a private copy."""
 
     assert set(GATE.INSTALL_OPERATIONS) == {
         operation.value for operation in GENERATION_STABLE_COMMAND_OPERATIONS
     }
+    assert GATE.INSTALL_OPERATIONS == tuple(
+        operation.value for operation in NODE_INSTALL_OPERATIONS
+    )
     assert set(GATE.INSTALL_OPERATIONS) == {
         "REMEDIATE_DRIVER",
         "UPDATE_SOFTWARE_FIRMWARE",
@@ -142,7 +148,8 @@ def _run_probe(
 
     def list_workflows(statuses=None, *, limit=100, **_kwargs):
         asked.append((set(statuses or ()), limit))
-        return [workflow for workflow in workflows if workflow.status in statuses]
+        rows = [workflow for workflow in workflows if workflow.status in statuses]
+        return rows[:limit]
 
     context = SimpleNamespace(store=SimpleNamespace(list_workflows=list_workflows))
     monkeypatch.setattr(
@@ -154,7 +161,14 @@ def _run_probe(
     )
     result = json.loads(capsys.readouterr().out)
     assert len(asked) == 1, "one store read, not one per workflow"
-    assert asked[0][1] >= 1000
+    # Executable statuses only: BLOCKED is never archived and grows without
+    # bound, and (pinned below) never holds an official install step mid-flight.
+    assert asked[0][0] == {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.SAFETY_PENDING,
+        WorkflowStatus.RUNNING,
+    }
+    assert asked[0][1] == 1001, "one row past the 1000-row window proves overflow"
     return result
 
 
@@ -228,32 +242,89 @@ def test_the_probe_ignores_finished_failed_superseded_and_unrelated_steps(
         monkeypatch, capsys, [done, failed, superseded, unrelated, terminal]
     )
 
-    assert result == {"inflight": [], "inflight_count": 0}
+    assert result == {
+        "inflight": [],
+        "inflight_count": 0,
+        "bounded": True,
+        "scanned": 4,
+    }
 
 
-def test_a_blocked_workflow_counts_only_a_step_already_handed_to_the_agent(
+def test_blocked_workflows_are_not_scanned(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BLOCKED never executes again on its own, so an unstarted install there is
-    paperwork; a WAITING one is a node still installing."""
+    """BLOCKED is reached only at compile time (policy/compile errors) or as the
+    terminal status of a safety-only execution (``executor._complete_claimed_
+    workflow`` with ``is_safety``; ``coordinator`` SAFETY_PENDING → BLOCKED). No
+    transition takes a RUNNING workflow with official steps to BLOCKED, so a
+    BLOCKED row can never hold a WAITING install step -- and the table is never
+    archived, so scanning it is what let the newest RUNNING row fall past the
+    window (F1)."""
 
-    unstarted = _workflow(
-        "wf-blocked-unstarted",
-        WorkflowStatus.BLOCKED,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-h"])],
-    )
-    submitted = _workflow(
+    blocked = _workflow(
         "wf-blocked-waiting",
         WorkflowStatus.BLOCKED,
         [(WorkflowOperation.REMEDIATE_DRIVER, ["node-i"])],
         executions=[(0, WorkflowStepStatus.WAITING)],
     )
 
-    result = _run_probe(monkeypatch, capsys, [unstarted, submitted])
+    result = _run_probe(monkeypatch, capsys, [blocked])
 
-    assert [item["workflow_id"] for item in result["inflight"]] == [
-        "wf-blocked-waiting"
+    assert result["inflight"] == []
+    assert result["bounded"] is True
+
+
+def test_a_transiently_succeeded_execution_is_not_in_flight(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Between the agent's success and ``completed_step_indexes`` there is a
+    window where the latest execution says SUCCEEDED; the node is done, so the
+    step is not in flight (F5)."""
+
+    finished = _workflow(
+        "wf-finished",
+        WorkflowStatus.RUNNING,
+        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-j"])],
+        executions=[(0, WorkflowStepStatus.SUCCEEDED)],
+    )
+
+    result = _run_probe(monkeypatch, capsys, [finished])
+
+    assert result == {
+        "inflight": [],
+        "inflight_count": 0,
+        "bounded": True,
+        "scanned": 1,
+    }
+
+
+def test_more_rows_than_the_window_is_reported_as_unbounded_not_as_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``list_workflows`` is oldest-first; with more executable rows than the
+    window the newest RUNNING install would fall off the end and the probe used
+    to print 0 -- failing open. Now it says it could not bound the scan."""
+
+    old = [
+        _workflow(
+            f"wf-old-{index}",
+            WorkflowStatus.PENDING,
+            [(WorkflowOperation.RESET_GPU, ["node-k"])],
+        )
+        for index in range(1001)
     ]
+    newest = _workflow(
+        "wf-newest-install",
+        WorkflowStatus.RUNNING,
+        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-z"])],
+        executions=[(0, WorkflowStepStatus.WAITING)],
+    )
+
+    result = _run_probe(monkeypatch, capsys, [*old, newest])
+
+    assert result["bounded"] is False
+    assert result["scanned"] == 1001
+    assert result["inflight_count"] == 0, "the install fell past the window"
 
 
 # --- the gate ---------------------------------------------------------------------
@@ -286,8 +357,41 @@ def _release(result: str | Exception) -> SimpleNamespace:
     )
 
 
-def _snapshot(*items: dict[str, Any]) -> str:
-    return json.dumps({"inflight": list(items), "inflight_count": len(items)})
+def _snapshot(*items: dict[str, Any], bounded: bool = True) -> str:
+    return json.dumps(
+        {
+            "inflight": list(items),
+            "inflight_count": len(items),
+            "bounded": bounded,
+            "scanned": len(items),
+        }
+    )
+
+
+class RoleRunner:
+    """Resolves one Running Pod per control-plane Deployment and answers an exec
+    per Pod: a string is stdout, an exception is what ``kubectl exec`` raised."""
+
+    dry_run = False
+
+    def __init__(self, pods: dict[str, str], answers: dict[str, str | Exception]):
+        self.pods = pods
+        self.answers = answers
+        self.execs: list[str] = []
+
+    def run(self, args, **_kwargs):
+        if "get" in args and "pod" in args:
+            label = args[args.index("-l") + 1].removeprefix("app=")
+            return self.pods.get(label, "")
+        pod = args[args.index("exec") + 1]
+        self.execs.append(pod)
+        answer = self.answers[pod]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def probe(self, _args, **_kwargs) -> bool:
+        return True
 
 
 DRIVER_STEP = {
@@ -344,7 +448,12 @@ def test_no_in_flight_install_lets_the_transaction_proceed_quietly(
 
     result = GATE.require_no_inflight_installs(_release(_snapshot()), action="upgrade")
 
-    assert result == {"inflight": [], "inflight_count": 0}
+    assert result == {
+        "inflight": [],
+        "inflight_count": 0,
+        "bounded": True,
+        "scanned": 0,
+    }
     assert capsys.readouterr().err == ""
 
 
@@ -382,6 +491,129 @@ def test_the_override_also_covers_a_store_that_cannot_answer(
 
     assert result["inflight_count"] == 0
     assert "no running CPU ingress Pod" in capsys.readouterr().err
+
+
+def test_the_lever_named_matches_the_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``deploy`` has the flag; ``rollout-regional-release.sh rollback`` has no
+    flag at all, only the variable (F3)."""
+
+    monkeypatch.delenv(ENV, raising=False)
+
+    with pytest.raises(GATE.InflightInstallsRefused) as upgrade:
+        GATE.require_no_inflight_installs(
+            _release(_snapshot(DRIVER_STEP)), action="upgrade"
+        )
+    assert "gpu-fault-admin deploy" in str(upgrade.value)
+    assert FLAG in str(upgrade.value)
+    assert f"{ENV}=1" not in str(upgrade.value)
+
+    with pytest.raises(GATE.InflightInstallsRefused) as rollback:
+        GATE.require_no_inflight_installs(
+            _release(_snapshot(DRIVER_STEP)), action="rollback"
+        )
+    assert f"{ENV}=1" in str(rollback.value)
+    assert f"rerun with {FLAG}" not in str(rollback.value)
+
+    with pytest.raises(GATE.InflightInstallsRefused) as unreachable:
+        GATE.require_no_inflight_installs(
+            _release(MODULE.ReleaseError("exec failed")), action="rollback"
+        )
+    assert f"{ENV}=1" in str(unreachable.value)
+
+
+def test_an_unbounded_scan_refuses_instead_of_reading_zero_as_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ENV, raising=False)
+    release = _release(_snapshot(bounded=False))
+
+    with pytest.raises(GATE.InflightInstallsRefused) as failure:
+        GATE.require_no_inflight_installs(release, action="upgrade")
+
+    message = str(failure.value)
+    assert "could not bound" in message
+    assert "1000" in message
+    assert FLAG in message
+
+
+def test_the_automatic_rollback_proceeds_when_the_store_cannot_answer(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The primary automatic-rollback scenario is a control plane that is down
+    (CrashLoop, Aurora window, broken wheel); a dead control plane dispatches
+    nothing, and wedging production in ``failed`` is the worse failure (F2). An
+    actual in-flight install still refuses."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    down = _release(MODULE.ReleaseError("no running CPU ingress Pod"))
+
+    result = GATE.require_no_inflight_installs(
+        down, action="rollback", unreadable="proceed"
+    )
+
+    assert result["inflight_count"] == 0
+    logged = capsys.readouterr().err
+    assert "inflight-installs-unchecked" in logged
+    assert "no running CPU ingress Pod" in logged
+    assert "automatic" in logged
+
+    with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
+        GATE.require_no_inflight_installs(
+            _release(_snapshot(DRIVER_STEP)), action="rollback", unreadable="proceed"
+        )
+
+
+def test_the_read_falls_back_to_another_running_control_plane_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ingress Pod is the one the failed upgrade just rolled; any Running
+    control-plane role can answer the same store read (F2)."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    ingress = INVENTORY.CPU_INGRESS_DEPLOYMENT
+    other = next(name for name in INVENTORY.CPU_RUNTIME_DEPLOYMENTS if name != ingress)
+    runner = RoleRunner(
+        pods={ingress: "ingress-pod", other: "worker-pod"},
+        answers={
+            "ingress-pod": MODULE.ReleaseError("command failed (137): kubectl"),
+            "worker-pod": _snapshot(DRIVER_STEP),
+        },
+    )
+    release = SimpleNamespace(
+        runner=runner,
+        config=SimpleNamespace(namespace=NAMESPACE),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+
+    with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
+        GATE.require_no_inflight_installs(release, action="rollback")
+
+    assert runner.execs[0] == "ingress-pod"
+    assert "worker-pod" in runner.execs
+    assert runner.execs.count("ingress-pod") <= 2, (
+        "one retry at most, then the next role"
+    )
+
+
+def test_when_no_role_answers_the_error_names_every_role_tried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ENV, raising=False)
+    runner = RoleRunner(pods={}, answers={})
+    release = SimpleNamespace(
+        runner=runner,
+        config=SimpleNamespace(namespace=NAMESPACE),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+
+    with pytest.raises(GATE.InflightInstallsRefused) as failure:
+        GATE.require_no_inflight_installs(release, action="upgrade")
+
+    message = str(failure.value)
+    for name in INVENTORY.CPU_RUNTIME_DEPLOYMENTS:
+        assert name in message
 
 
 # --- where the orchestrator calls it -------------------------------------------
@@ -445,48 +677,103 @@ def test_a_refused_upgrade_writes_no_state(monkeypatch: pytest.MonkeyPatch) -> N
     assert release.state == {}
 
 
-def test_rollback_checks_for_in_flight_installs_before_refreshing_credentials(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-    release = SimpleNamespace(
-        config=SimpleNamespace(auto_rollback=True, clusters=()),
-        state={},
-        _refresh_aurora_credentials=lambda: calls.append("aurora-refresh"),
-        _require_no_inflight_installs=lambda **kwargs: calls.append(
-            f"inflight-installs:{kwargs['action']}"
+def _rollback_double(calls: list[str], **stubs: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "config": SimpleNamespace(auto_rollback=True, clusters=()),
+        "state": {},
+        "_refresh_aurora_credentials": lambda: calls.append("aurora-refresh"),
+        "_require_no_inflight_installs": lambda **kwargs: calls.append(
+            f"inflight-installs:{kwargs['action']}:{kwargs['unreadable']}"
         ),
-        _save_state=lambda phase, **_updates: calls.append(f"state:{phase}"),
-    )
+        "_save_state": lambda phase, **_updates: calls.append(f"state:{phase}"),
+    }
+    fields.update(stubs)
+    return SimpleNamespace(**fields)
 
+
+def _plan_reached(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
     def plan(*_args, **_kwargs):
         calls.append("compensation-plan")
         raise _Reached()
 
     monkeypatch.setattr(ORCHESTRATION, "build_rollback_compensation_plan", plan)
 
+
+def test_rollback_checks_for_in_flight_installs_after_the_credential_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the Aurora refresh -- a rotation-window failure gets its chance to
+    be named first -- and before any restore is planned. A manual rollback
+    fails closed on a store that cannot answer."""
+
+    calls: list[str] = []
+    _plan_reached(monkeypatch, calls)
+
+    with pytest.raises(_Reached):
+        ORCHESTRATION.rollback_release(
+            _rollback_double(calls), state={"metadata": {}, "cpu_wheel": "w"}
+        )
+
+    assert calls == [
+        "aurora-refresh",
+        "inflight-installs:rollback:refuse",
+        "compensation-plan",
+    ]
+
+
+def test_the_automatic_rollback_tells_the_gate_to_proceed_on_an_unreadable_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    _plan_reached(monkeypatch, calls)
+
+    with pytest.raises(_Reached):
+        ORCHESTRATION.rollback_release(
+            _rollback_double(calls),
+            state={"metadata": {}, "cpu_wheel": "w"},
+            automatic=True,
+        )
+
+    assert calls == [
+        "aurora-refresh",
+        "inflight-installs:rollback:proceed",
+        "compensation-plan",
+    ]
+
+
+def test_a_rollback_re_entered_after_the_control_plane_restore_skips_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once ``rollback-cpu-restored`` is checkpointed the previous control plane
+    is already the one dispatching; refusing the cleanup re-entry would only
+    strand the transaction."""
+
+    calls: list[str] = []
+    _plan_reached(monkeypatch, calls)
+    release = _rollback_double(
+        calls,
+        state={
+            "rollback_completed_phases": ["rollback-started", "rollback-cpu-restored"]
+        },
+    )
+
     with pytest.raises(_Reached):
         ORCHESTRATION.rollback_release(
             release, state={"metadata": {}, "cpu_wheel": "w"}
         )
 
-    assert calls == [
-        "inflight-installs:rollback",
-        "aurora-refresh",
-        "compensation-plan",
-    ]
+    assert calls == ["aurora-refresh", "compensation-plan"]
 
 
-def test_a_refused_rollback_touches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_refused_rollback_touches_nothing_after_the_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[str] = []
-    release = SimpleNamespace(
-        config=SimpleNamespace(auto_rollback=True, clusters=()),
-        state={},
-        _refresh_aurora_credentials=lambda: calls.append("aurora-refresh"),
+    release = _rollback_double(
+        calls,
         _require_no_inflight_installs=lambda **_kwargs: (_ for _ in ()).throw(
             GATE.InflightInstallsRefused("rollback refused: workflow-7f3a")
         ),
-        _save_state=lambda phase, **_updates: calls.append(f"state:{phase}"),
     )
     monkeypatch.setattr(
         ORCHESTRATION,
@@ -496,7 +783,7 @@ def test_a_refused_rollback_touches_nothing(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
         ORCHESTRATION.rollback_release(release, state={"metadata": {}})
-    assert calls == []
+    assert calls == ["aurora-refresh"], "the credential refresh is not a restore"
 
 
 def _failing_upgrade(
@@ -564,6 +851,9 @@ def test_a_refused_automatic_rollback_is_logged_and_leaves_the_failed_phase(
     assert FLAG in message
     assert failure.value.__cause__ is not None
     assert len(attempts) == 1
+    assert attempts[0]["automatic"] is True, (
+        "the engine's rollback must know it is automatic (unreadable store → proceed)"
+    )
     assert release.state["phase"] == "failed"
     assert release.state["release_lifecycle"] == "FAILED"
     assert "rollback_failure" not in release.state
@@ -638,3 +928,62 @@ def test_the_flag_is_a_deploy_option_not_a_verb() -> None:
     for argv in ([FLAG], [FLAG[2:]], ["status", FLAG]):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
+
+
+# --- the engine entrypoint --------------------------------------------------------
+
+
+def test_the_engine_exits_with_the_refusal_code_the_driver_classifies_on(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``scripts/release_deploy.py`` sees only the exit code of
+    ``rollout-regional-release.sh rollback``; a refusal must not look like the
+    generic 2 that means "rollback failed" (F4)."""
+
+    monkeypatch.setattr(
+        MODULE,
+        "parser",
+        lambda: SimpleNamespace(
+            parse_args=lambda: SimpleNamespace(mode="rollback", dry_run=False)
+        ),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "_run_mode",
+        lambda _arguments: (_ for _ in ()).throw(
+            GATE.InflightInstallsRefused("rollback refused: workflow-7f3a")
+        ),
+    )
+
+    assert MODULE.main() == GATE.INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
+    assert GATE.INFLIGHT_INSTALLS_REFUSED_EXIT_CODE not in (0, 1, 2)
+    assert "workflow-7f3a" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        MODULE,
+        "_run_mode",
+        lambda _arguments: (_ for _ in ()).throw(MODULE.ReleaseError("broke")),
+    )
+    assert MODULE.main() == 2, "every other engine error keeps the generic code"
+
+
+def test_the_rollback_mode_takes_an_automatic_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = MODULE.parser().parse_args(
+        ["rollback", "--config", "/tmp/site.json", "--automatic"]
+    )
+    assert arguments.automatic is True, "the driver marks its rollback automatic"
+    assert (
+        MODULE.parser().parse_args(["rollback", "--config", "/tmp/x"]).automatic
+        is False
+    )
+
+    seen: list[dict[str, Any]] = []
+    release = SimpleNamespace(rollback=lambda **kwargs: seen.append(kwargs))
+    monkeypatch.setattr(MODULE.ReleaseConfig, "load", classmethod(lambda cls, _p: None))
+    monkeypatch.setattr(MODULE, "RegionalRelease", lambda _config, _runner: release)
+
+    MODULE._run_mode(arguments)
+
+    assert seen == [{"automatic": True}]
