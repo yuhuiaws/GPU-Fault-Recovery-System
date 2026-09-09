@@ -58,6 +58,10 @@ spec:
     certificateMinValidityDays: 30
     remoteCommandMaxUnclaimedSeconds: 300
     requireConfirmedSnsSubscription: true
+    # Optional: the Region IAM Identity Center is homed in, when that is not the
+    # CPU cluster's Region. deploy looks the Grafana administrator (the user
+    # behind --admin-email) up there before granting ADMIN on the workspace.
+    # identityCenterRegion: eu-west-1
 
   notifications:
     allowEmail: false

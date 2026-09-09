@@ -468,6 +468,28 @@ def test_site_health_defaults_grafana_to_enabled_without_a_workspace(
         load_site(_site_with_health(tmp_path / "blank", grafanaWorkspaceId=""))
 
 
+def test_site_health_identity_center_region_is_optional_and_must_be_a_region(
+    tmp_path: Path,
+) -> None:
+    """``spec.health.identityCenterRegion`` names where IAM Identity Center is
+    homed when that is not the CPU cluster's region; absent means the CPU region."""
+
+    default = load_site(site_file(tmp_path / "default")).release_config["health"]
+    assert default["identity_center_region"] is None
+
+    homed = load_site(
+        _site_with_health(tmp_path / "homed", identityCenterRegion="eu-west-1")
+    )
+    assert homed.release_config["health"]["identity_center_region"] == "eu-west-1"
+
+    with pytest.raises(SiteConfigError, match="identityCenterRegion"):
+        load_site(
+            _site_with_health(tmp_path / "bad", identityCenterRegion="not a region")
+        )
+    with pytest.raises(SiteConfigError, match="identityCenterRegion"):
+        load_site(_site_with_health(tmp_path / "blank", identityCenterRegion=""))
+
+
 # --- installation registry -------------------------------------------------------------
 
 

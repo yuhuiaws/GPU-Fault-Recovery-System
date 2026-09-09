@@ -132,6 +132,9 @@ class GrafanaSettings:
     # The previous run's ``monitoring_install.grafana`` record, so the read-only
     # probe can ask for ensure until the dashboards have actually landed.
     previous: Mapping[str, Any] | None = None
+    # ``spec.health.identityCenterRegion``: where IAM Identity Center is homed
+    # when that is not the CPU cluster's region. None means the CPU region.
+    identity_center_region: str | None = None
 
 
 # --- CLI plumbing ----------------------------------------------------------------
@@ -194,29 +197,44 @@ def grafana_settings(
     state: BootstrapState,
 ) -> GrafanaSettings:
     previous = _state_result(state)
+    health = _site_health(existing_site)
+    identity_region = health.get("identityCenterRegion")
+    identity_center_region = str(identity_region) if identity_region else None
     if request.grafana_workspace_id:
         return GrafanaSettings(
             workspace_id=request.grafana_workspace_id,
             workspace_id_is_operator_input=True,
             viewer_sso_user_id=request.grafana_viewer,
             previous=previous,
+            identity_center_region=identity_center_region,
         )
-    persisted = _site_health(existing_site).get("grafanaWorkspaceId")
+    persisted = health.get("grafanaWorkspaceId")
     return GrafanaSettings(
         workspace_id=str(persisted) if persisted else None,
         viewer_sso_user_id=request.grafana_viewer,
         previous=previous,
+        identity_center_region=identity_center_region,
     )
 
 
 def grafana_site_health(
     state: BootstrapState, settings: GrafanaSettings
 ) -> dict[str, Any]:
-    """The ``spec.health`` keys that persist this run's Grafana decision."""
+    """The ``spec.health`` keys that persist this run's Grafana decision.
+
+    ``identityCenterRegion`` is the operator's, not derived: the regenerated
+    site must carry it forward or the next deploy would look the administrator
+    up in the wrong region again.
+    """
 
     result = _state_result(state) or {}
     workspace_id = result.get("workspace_id") or settings.workspace_id
-    return {"grafanaWorkspaceId": str(workspace_id)} if workspace_id else {}
+    health: dict[str, Any] = {}
+    if workspace_id:
+        health["grafanaWorkspaceId"] = str(workspace_id)
+    if settings.identity_center_region:
+        health["identityCenterRegion"] = settings.identity_center_region
+    return health
 
 
 def grafana_access_lines(state: BootstrapState) -> list[str]:
@@ -939,6 +957,7 @@ def ensure_grafana_dashboards(
                 region=cpu.region,
                 workspace_id=str(workspace["workspace_id"]),
                 email=admin_email,
+                identity_center_region=settings.identity_center_region,
             )
         return {"status": "PROBED"}
     try:
@@ -976,7 +995,11 @@ def ensure_grafana_dashboards(
         )
         viewer = {"viewer_sso_user_id": settings.viewer_sso_user_id}
     admin_grant = grant_admin(
-        runner, region=cpu.region, workspace_id=workspace_id, email=admin_email
+        runner,
+        region=cpu.region,
+        workspace_id=workspace_id,
+        email=admin_email,
+        identity_center_region=settings.identity_center_region,
     )
     return {
         "status": "PROVISIONED",
@@ -1003,7 +1026,12 @@ def grant_viewer(
 
 
 def grant_admin(
-    runner: CommandRunner, *, region: str, workspace_id: str, email: str | None
+    runner: CommandRunner,
+    *,
+    region: str,
+    workspace_id: str,
+    email: str | None,
+    identity_center_region: str | None = None,
 ) -> dict[str, Any]:
     """Grant ADMIN to the Identity Center user behind the administrator email.
 
@@ -1012,7 +1040,9 @@ def grant_admin(
     the site's, not this command's input, so nothing here raises ``BootstrapError``
     -- the dashboards are imported and access is additive. With the read-only
     runner the write itself raises ``BootstrapMutationRequired``, which is how
-    the probe asks for the task to re-run.
+    the probe asks for the task to re-run. ``region`` is the workspace's (the
+    CPU cluster's); the Identity Center lookups go to ``identity_center_region``
+    (``spec.health.identityCenterRegion``) when set, else to the same region.
     """
 
     outcome: dict[str, Any] = {"email": email, "role": "ADMIN"}
@@ -1022,9 +1052,12 @@ def grant_admin(
             "status": "not-derivable",
             "reason": "the deploy has no administrator email to derive the user from",
         }
+    identity_region = identity_center_region or region
     try:
-        store_id = _identity_store_id(runner, region)
-        sso_user_id = _identity_center_user_id(runner, region, store_id, email)
+        store_id = _identity_store_id(
+            runner, identity_region, configured=identity_center_region is not None
+        )
+        sso_user_id = _identity_center_user_id(runner, identity_region, store_id, email)
         outcome["sso_user_id"] = sso_user_id
         held = _sso_user_role(runner, region, workspace_id, sso_user_id)
         if held is not None and _ROLE_RANK[held] >= _ROLE_RANK["ADMIN"]:
@@ -1041,18 +1074,27 @@ def grant_admin(
     return {**outcome, "status": "granted"}
 
 
-def _identity_store_id(runner: CommandRunner, region: str) -> str:
-    """The identity store of the one IAM Identity Center instance; never a guess."""
+def _identity_store_id(
+    runner: CommandRunner, region: str, *, configured: bool = False
+) -> str:
+    """The identity store of the one IAM Identity Center instance; never a guess.
+
+    ``configured`` says the region came from ``spec.health.identityCenterRegion``;
+    otherwise an empty answer names that setting as the way out.
+    """
 
     instances = cast(
         list[dict[str, Any]],
         runner.aws_json(region, "sso-admin", "list-instances").get("Instances", []),
     )
     if not instances:
-        raise BootstrapError(
-            f"no IAM Identity Center instance is visible from {region} "
-            "(aws sso-admin list-instances returned none)"
+        where = (
+            f"{region} (spec.health.identityCenterRegion)"
+            if configured
+            else f"{region}; if Identity Center is homed elsewhere set "
+            "spec.health.identityCenterRegion"
         )
+        raise BootstrapError(f"no IAM Identity Center instance is visible from {where}")
     if len(instances) > 1:
         listed = ", ".join(str(item.get("InstanceArn") or "?") for item in instances)
         raise BootstrapError(

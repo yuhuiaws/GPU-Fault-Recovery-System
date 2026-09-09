@@ -13,6 +13,7 @@ AWS call goes through the recorded fake runner of ``test_admin_grafana``.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,6 +22,7 @@ import pytest
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     BootstrapMutationRequired,
+    BootstrapRequest,
     BootstrapState,
     ReadOnlyProbeRunner,
 )
@@ -28,6 +30,8 @@ from gpu_fault.admin.grafana import (
     GrafanaSettings,
     ensure_grafana_dashboards,
     grafana_access_lines,
+    grafana_settings,
+    grafana_site_health,
 )
 from tests.admin._bootstrap_support import _cluster
 from tests.admin.test_admin_grafana import (
@@ -74,6 +78,20 @@ class IdentityRunner(Runner):
         self.users = dict(users or {})
         self.permissions = [dict(item) for item in permissions]
         self.identitystore_denied = identitystore_denied
+
+    # The region the Identity Center calls are expected in; Grafana stays in
+    # the CPU cluster's region whatever the site says.
+    identity_region = REGION
+
+    def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:
+        if arguments[0] in {"sso-admin", "identitystore"}:
+            assert region == self.identity_region, (
+                f"Identity Center was asked in {region}, not {self.identity_region}"
+            )
+            return json.loads(
+                self.run(["aws", *arguments, "--region", region], **keywords)
+            )
+        return super().aws_json(region, *arguments, **keywords)
 
     def run(self, arguments: Sequence[str], **keywords: Any) -> str:
         argv = list(arguments)
@@ -335,7 +353,97 @@ def test_no_identity_center_instance_is_not_derivable(tmp_path: Path) -> None:
     assert grant["status"] == "not-derivable"
     assert "no IAM Identity Center instance" in grant["reason"]
     assert REGION in grant["reason"], "the reason does not say which region was asked"
+    assert "set spec.health.identityCenterRegion" in grant["reason"], (
+        "the reason does not name the setting for an Identity Center homed elsewhere"
+    )
     assert "get-user-id" not in runner.operations()
+
+
+# --- spec.health.identityCenterRegion --------------------------------------------------
+
+
+def test_the_site_identity_center_region_routes_the_two_lookups(tmp_path: Path) -> None:
+    """Identity Center homed in another region: list-instances and get-user-id
+    go there, the Grafana calls stay in the CPU cluster's region."""
+
+    runner = IdentityRunner(users={("emails.value", ADMIN_EMAIL): USER_ID})
+    runner.identity_region = "eu-west-1"
+
+    result = _ensure(
+        runner, tmp_path, settings=GrafanaSettings(identity_center_region="eu-west-1")
+    )
+
+    assert result["admin_grant"]["status"] == "granted"
+    assert result["admin_grant"]["sso_user_id"] == USER_ID
+    regions = {
+        argv[2]: argv[argv.index("--region") + 1]
+        for argv, _k in runner.calls
+        if argv[0] == "aws" and "--region" in argv
+    }
+    assert regions["list-instances"] == "eu-west-1"
+    assert regions["get-user-id"] == "eu-west-1"
+    assert regions["list-permissions"] == REGION
+    assert regions["update-permissions"] == REGION
+
+
+def test_no_instance_in_the_overridden_region_names_the_setting_as_the_cause(
+    tmp_path: Path,
+) -> None:
+    runner = IdentityRunner(instances=[])
+    runner.identity_region = "eu-west-1"
+
+    result = _ensure(
+        runner, tmp_path, settings=GrafanaSettings(identity_center_region="eu-west-1")
+    )
+
+    reason = result["admin_grant"]["reason"]
+    assert "eu-west-1" in reason and "spec.health.identityCenterRegion" in reason
+    assert "homed elsewhere" not in reason, (
+        "the reason suggests setting the override that is already set"
+    )
+
+
+def test_settings_read_the_identity_center_region_from_the_site_and_persist_it(
+    tmp_path: Path,
+) -> None:
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
+    existing_site = {
+        "spec": {
+            "health": {
+                "grafanaWorkspaceId": "g-persisted",
+                "identityCenterRegion": "eu-west-1",
+            }
+        }
+    }
+    request = BootstrapRequest(
+        cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
+        gpu_cluster_arns=("arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",),
+        repository_root=Path("/repo"),
+        state_dir=Path("/state"),
+    )
+
+    from_site = grafana_settings(request, existing_site=existing_site, state=state)
+    pinned = grafana_settings(
+        replace(request, grafana_workspace_id="g-option"),
+        existing_site=existing_site,
+        state=state,
+    )
+    fresh = grafana_settings(request, existing_site=None, state=state)
+
+    assert from_site.identity_center_region == "eu-west-1"
+    assert pinned.identity_center_region == "eu-west-1", (
+        "--grafana-workspace-id dropped the site's Identity Center region"
+    )
+    assert fresh.identity_center_region is None
+    state.record(
+        "monitoring_install",
+        {"grafana": {"status": "PROVISIONED", "workspace_id": "g-persisted"}},
+    )
+    assert grafana_site_health(state, from_site) == {
+        "grafanaWorkspaceId": "g-persisted",
+        "identityCenterRegion": "eu-west-1",
+    }, "regenerating site.yaml would drop the operator's Identity Center region"
+    assert grafana_site_health(state, fresh) == {"grafanaWorkspaceId": "g-persisted"}
 
 
 def test_a_deploy_without_an_administrator_email_asks_nothing(tmp_path: Path) -> None:

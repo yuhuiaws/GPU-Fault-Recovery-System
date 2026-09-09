@@ -645,6 +645,10 @@ class HealthSiteConfig:
     # pinned) and whether the dashboards are imported at all.
     grafana_workspace_id: str | None = None
     grafana_enabled: bool = True
+    # Where IAM Identity Center is homed when that is not the CPU cluster's
+    # region: the deploy looks the Grafana administrator up there. None means
+    # the CPU cluster's region.
+    identity_center_region: str | None = None
 
     @classmethod
     def from_value(cls, value: object) -> HealthSiteConfig:
@@ -661,8 +665,18 @@ class HealthSiteConfig:
                 "requireConfirmedSnsSubscription",
                 "grafanaWorkspaceId",
                 "grafanaEnabled",
+                "identityCenterRegion",
             },
         )
+        identity_center_region = _optional_text(
+            data.get("identityCenterRegion"), "spec.health.identityCenterRegion"
+        )
+        if identity_center_region is not None and not AWS_REGION_PATTERN.fullmatch(
+            identity_center_region
+        ):
+            raise SiteConfigError(
+                "spec.health.identityCenterRegion is not a valid AWS Region"
+            )
         return cls(
             aurora_cluster_id=_required_text(
                 data.get("auroraClusterId"),
@@ -711,6 +725,7 @@ class HealthSiteConfig:
                 "spec.health.grafanaEnabled",
                 default=True,
             ),
+            identity_center_region=identity_center_region,
         )
 
 
@@ -1216,6 +1231,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             ),
             "grafana_workspace_id": health.grafana_workspace_id,
             "grafana_enabled": health.grafana_enabled,
+            "identity_center_region": health.identity_center_region,
         },
         "notifications": {
             "allow_email": site.spec.notifications.allow_email,
