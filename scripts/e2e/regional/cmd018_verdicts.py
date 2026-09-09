@@ -30,6 +30,9 @@ NODE_IDS = ["cmd018-synthetic-node"]
 HOLD_REASON = "OPEN_SIBLING_COMMAND"
 HOLDS_METRIC = "gpu_fault_remote_command_open_sibling_holds_total"
 POD_DEADLINE_SECONDS = 600
+# The seeded workflow's execution lease, held by the probe's seed identity so no
+# deployed dispatcher replica claims the RUNNING workflow; outlives the Pod.
+SEED_LEASE_SECONDS = POD_DEADLINE_SECONDS + 600
 COMPLETION_TIMEOUT_SECONDS = 180
 
 

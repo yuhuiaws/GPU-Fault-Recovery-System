@@ -47,7 +47,7 @@ SCRIPT = Path(__file__).with_name("probes") / "cmd018_ledger_executor.py"
 _DISPATCH_AND_HOLD = r"""
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.execution import WorkflowStepContext
@@ -62,7 +62,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
 
-run_id, cluster_id, owner, operation_name, raw_node_ids = sys.argv[1:]
+run_id, cluster_id, owner, operation_name, raw_node_ids, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 node_ids = [item for item in raw_node_ids.split(",") if item]
 operation = WorkflowOperation(operation_name)
 incident_id = f"incident-{run_id}"
@@ -84,6 +85,12 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# The workflow is RUNNING so the deployed adapter dispatches for it, and it
+# carries a live execution lease owned by the probe: an unleased RUNNING
+# workflow is claimed by the deployed dispatcher, whose executor then drives
+# the step itself -- attempt 1 (2026-09-09) saw the workflow FAILED and command
+# A cancelled as an orphan within 46 s, before the probe had claimed once.
+# Only the probe may own this step; the lease outlives the Pod deadline.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
@@ -91,6 +98,9 @@ workflow = WorkflowRequest(
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step_v1],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 store = ApplicationContext.from_environment().store
 store.save_incident_and_workflow(incident, workflow)
@@ -137,6 +147,26 @@ print(json.dumps({
     "registered_agents": [item.node_id for item in store.list_agents(cluster_id)],
 }, sort_keys=True, default=str))
 """
+
+_WORKFLOW_FINAL = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+workflow = ApplicationContext.from_environment().store.get_workflow(sys.argv[1])
+document = workflow.model_dump(mode="json")
+print(json.dumps({
+    "status": document.get("status"),
+    "terminal_failure_reason": document.get("terminal_failure_reason"),
+    "blocked_reasons": document.get("blocked_reasons"),
+    "execution_owner_id": document.get("execution_owner_id"),
+    "execution_lease_expires_at": document.get("execution_lease_expires_at"),
+    "step_executions": document.get("step_executions"),
+    "events": (document.get("events") or [])[-20:],
+}, sort_keys=True, default=str))
+"""
+
 
 _RELEASE_AND_CANCEL = r"""
 import json
@@ -298,6 +328,7 @@ def _run_case(
         probe.owner,
         verdicts.OPERATION,
         ",".join(verdicts.NODE_IDS),
+        str(verdicts.SEED_LEASE_SECONDS),
     )
     state["seed"] = dispatch
     seeded.write_json(case_dir / "dispatch.json", dispatch)
@@ -315,6 +346,12 @@ def _run_case(
         verdicts.COMPLETION_TIMEOUT_SECONDS,
     )
     seeded.write_json(case_dir / "completed-command.json", completed)
+    # The workflow record as the control plane left it, before the purge: when
+    # A does not end SUCCEEDED this is the evidence of who moved the workflow.
+    seeded.write_json(
+        case_dir / "workflow-final.json",
+        seeded.cpu_python(_WORKFLOW_FINAL, str(dispatch["workflow_id"])),
+    )
     executor_state = seeded.read_state(probe, "/state/executor-state.json")
     ledger = dict(executor_state.get("ledger") or {})
     seeded.write_json(case_dir / "executor-state.json", executor_state)
@@ -354,15 +391,45 @@ def _run_case(
 
 
 def _control_plane_metrics() -> list[str]:
-    script = (
-        "import json,urllib.request\n"
-        "print(json.dumps({'metrics': urllib.request.urlopen("
-        "'http://127.0.0.1:8080/metrics', timeout=15).read().decode()}))"
-    )
-    try:
-        return [str(seeded.cpu_python(script)["metrics"])]
-    except Exception:  # noqa: BLE001 - the family check reports the absence
-        return []
+    """The ``/metrics`` text of one Pod per control-plane role.
+
+    ``open_sibling_holds_total`` is the dispatcher's counter, and since the role
+    split the dispatcher runs in ``gpu-fault-control-worker`` on :8081; the
+    ingress on :8080 does not carry it (attempt 1, 2026-09-09, read the ingress
+    only and reported the family absent).
+    """
+
+    texts: list[str] = []
+    for app, port in (("gpu-fault-control-worker", 8081), ("gpu-fault-api-ha", 8080)):
+        script = (
+            "import json,urllib.request\n"
+            "print(json.dumps({'metrics': urllib.request.urlopen("
+            f"'http://127.0.0.1:{port}/metrics', timeout=15).read().decode()}}))"
+        )
+        try:
+            pod = seeded.control(
+                "get",
+                "pod",
+                "-l",
+                f"app={app}",
+                "--field-selector=status.phase=Running",
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ).strip()
+            output = seeded.control(
+                "exec",
+                "-i",
+                pod,
+                "--",
+                "python3",
+                "-",
+                stdin=script.encode(),
+                timeout=120,
+            )
+            texts.append(str(json.loads(output.splitlines()[-1])["metrics"]))
+        except Exception:  # noqa: BLE001 - the family check reports the absence
+            continue
+    return texts
 
 
 def _purge(state: dict[str, Any], result: dict[str, Any], case_dir: Path) -> None:
