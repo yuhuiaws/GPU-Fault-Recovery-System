@@ -22,6 +22,7 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.adapters.kubernetes.restart_source_guard import (
     _WorkloadMutation,
+    never_submitted,
     refresh_restart_workloads,
     restart_source_failure,
     workload_lifecycle_identity,
@@ -258,23 +259,32 @@ class KubernetesWorkloadOperationsMixin:
             if not suspend and deleting:
                 deleting_workload_ids.append(workload_id)
             workloads.append((namespace, kind, name, workload_id, workload))
+        # Refusals from here to the guard come before the mutation loop, so
+        # they carry ``restart_submitted: False``; a failure raised inside the
+        # loop (``_DURING_MUTATION``) makes no such claim.
         if not suspend and absent_workload_ids:
-            return restart_source_failure(
-                "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
-                "restart source workload is missing: "
-                + ", ".join(sorted(absent_workload_ids)),
-                absent_workload_ids,
+            return never_submitted(
+                restart_source_failure(
+                    "RESTART_SOURCE_WORKLOAD_NOT_FOUND",
+                    "restart source workload is missing: "
+                    + ", ".join(sorted(absent_workload_ids)),
+                    absent_workload_ids,
+                )
             )
         if deleting_workload_ids:
-            return restart_source_failure(
-                "RESTART_SOURCE_WORKLOAD_DELETING",
-                "restart source workload is being deleted: "
-                + ", ".join(sorted(deleting_workload_ids)),
-                deleting_workload_ids,
+            return never_submitted(
+                restart_source_failure(
+                    "RESTART_SOURCE_WORKLOAD_DELETING",
+                    "restart source workload is being deleted: "
+                    + ", ".join(sorted(deleting_workload_ids)),
+                    deleting_workload_ids,
+                )
             )
         conflict = self._managed_job_recovery_conflict(workloads)
         if conflict is not None:
-            return conflict
+            # A refused restart never created anything; a refused stop is
+            # not a restart and owes no budget either way.
+            return conflict if suspend else never_submitted(conflict)
         state = _WorkloadMutation(
             workloads=workloads,
             parsed=parsed_workloads,
@@ -298,10 +308,10 @@ class KubernetesWorkloadOperationsMixin:
                 resource_version_reader=self._resource_version,
             )
             if refresh_failure is not None:
-                return refresh_failure
+                return never_submitted(refresh_failure)
             refreshed_conflict = self._managed_job_recovery_conflict(state.workloads)
             if refreshed_conflict is not None:
-                return refreshed_conflict
+                return never_submitted(refreshed_conflict)
             guard, state.restart_count = self._restart_guard(context, state.workloads)
             if guard is not None:
                 return guard

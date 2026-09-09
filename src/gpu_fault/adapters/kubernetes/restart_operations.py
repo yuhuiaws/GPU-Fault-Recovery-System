@@ -220,6 +220,9 @@ class KubernetesRestartOperationsMixin:
                         "target_gpu_count": target_gpu_count,
                         "required_approval_annotation": approval,
                         "notification_id": (notification.notification_id),
+                        # A hold, not a submission: a workflow cancelled
+                        # while it waits here owes no restart budget.
+                        "restart_submitted": False,
                     },
                 ),
                 None,
@@ -302,6 +305,7 @@ class KubernetesRestartOperationsMixin:
                 **details,
                 "reason": self.HOLD_REASON_NODE_UNDER_REMEDIATION,
                 "premise_reason": self.PREMISE_REASON_INCIDENT_NOT_RECOVERED,
+                "restart_submitted": False,
             },
         )
 

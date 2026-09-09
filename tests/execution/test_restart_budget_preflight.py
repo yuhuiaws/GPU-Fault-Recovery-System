@@ -644,18 +644,48 @@ def test_a_remote_restart_the_data_plane_refused_hands_its_reservation_back() ->
     [
         # The data-plane guard refused before submitting anything.
         ({"restart_submitted": False, "reason": "RESTART_TARGET_AVOIDED"}, True),
-        # The cluster executor refused the command before any adapter ran.
+        # No adapter ever ran: refused by the executor, or never claimed.
         ({"remote_status_source": "executor-rejected"}, True),
-        # The workflow cancelled a command still PENDING or WAITING.
+        ({"remote_status_source": "unclaimed-deadline-exceeded"}, True),
+        # Cancelled while PENDING: no report at all, so no lease and no adapter.
         ({"remote_status_source": "workflow-timeout"}, True),
         ({"remote_status_source": "workflow-preempted"}, True),
-        # A LEASED command cancelled mid-flight: the node's last word decides.
+        # Cancelled while WAITING on one of the adapter's own holds.
+        (
+            {
+                "remote_status_source": "workflow-preempted",
+                "restart_submitted": False,
+                "reason": "GPU_COUNT_CHANGED",
+            },
+            True,
+        ),
+        # Submitted, then a 5xx made the executor answer WAITING, then the
+        # workflow cancelled: the Job may exist. Keep.
+        (
+            {
+                "remote_status_source": "workflow-timeout",
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "retryable_adapter_error": True,
+            },
+            False,
+        ),
+        # A LEASED command cancelled mid-flight settles with the node's last
+        # word; only the adapter's own marker proves nothing was submitted.
         (
             {
                 "remote_status_source": "completed-after-cancellation",
                 "post_cancellation_status": "WAITING",
+                "restart_submitted": False,
             },
             True,
+        ),
+        (
+            {
+                "remote_status_source": "completed-after-cancellation",
+                "post_cancellation_status": "WAITING",
+                "retryable_adapter_error": True,
+            },
+            False,
         ),
         (
             {

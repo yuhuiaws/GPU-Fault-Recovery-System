@@ -1,9 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from gpu_fault.execution import WorkflowStepOutcome
+
+
+def never_submitted(outcome: WorkflowStepOutcome) -> WorkflowStepOutcome:
+    """Mark a restart refusal made before anything was created.
+
+    ``restart_submitted: False`` is what the control plane's terminal write
+    reads to hand the step's budget reservation back; every refusal the
+    adapter makes ahead of its mutation loop carries it.
+    """
+
+    return replace(
+        outcome, details={**(outcome.details or {}), "restart_submitted": False}
+    )
 
 
 @dataclass

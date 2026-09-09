@@ -71,8 +71,8 @@ def reservation_id(
     """The reservation a RESTART_WORKLOAD step holds on its job's budget.
 
     Also the adapter's idempotency key for that step: the restart adapter
-    reserves under its key, and the two have to agree or a step would take a
-    second reservation. The official form is the historical
+    compares its authorization's ``reservation_id`` with that key, so the two
+    have to agree or the restart is refused. The official form is the historical
     ``<workflow>/<index>/RESTART_WORKLOAD`` so rows reserved before the phase
     existed still match; only the safety phase carries a discriminator.
     """
@@ -225,10 +225,9 @@ def reserve_restart_budgets(
         phase = reservation_phase(workflow)
     # A superseded restart will never run, so it needs no reservation (F-C2).
     completed = set(resolved_step_indexes(workflow))
-    # A restart whose adapter already ran holds its reservation -- the adapter
-    # reserves under the same id -- and is only released by a terminal write,
-    # so re-reserving it on every claim was one budget write per tick for
-    # nothing (D-10).
+    # A restart whose adapter already ran still holds the reservation made on
+    # its first claim (only a terminal write releases it), so re-reserving it
+    # on every claim was one budget write per tick for nothing (D-10).
     already_attempted = {
         item.step_index
         for item in workflow.step_executions
@@ -457,17 +456,21 @@ def fail_restart_preflight(
 # The bounds in ``step_bounds`` stamp these when they, not the adapter, end a
 # step; a RESTART_WORKLOAD record carrying one never reached a submission.
 _WAITING_CAP_DETAIL = "step_waiting_timeout_seconds"
-# The restart adapter stamps this on every refusal it makes before submitting
-# anything; the regional path carries it verbatim from the data plane's
-# ``RemoteCommandResult.details`` into the step record.
+# The restart adapter stamps this on every refusal, and every hold, it makes
+# before submitting anything; the regional path carries it verbatim from the
+# data plane's ``RemoteCommandResult.details`` into the step record.
 _NOT_SUBMITTED_DETAIL = "restart_submitted"
-# ``remote_status_source`` values of a FAILED remote command that never reached
-# the data-plane adapter: the cluster executor refused it before dispatch, or
-# the workflow cancelled it while it was still PENDING or WAITING (a restart
-# that has answered WAITING has not submitted anything yet).
+# ``remote_status_source`` values of a FAILED remote command no adapter ever
+# ran: the cluster executor refused it before dispatch (its checks are
+# deterministic per command, so a later lease would have refused it too), or it
+# aged out PENDING because no executor ever claimed it.
 _NEVER_DISPATCHED_STATUS_SOURCES = frozenset(
-    {"executor-rejected", "workflow-timeout", "workflow-preempted"}
+    {"executor-rejected", "unclaimed-deadline-exceeded"}
 )
+# ``remote_status_source`` values of a command the workflow cancelled while it
+# was PENDING or WAITING. Cancellation keeps the command's last report as its
+# ``result_details``, so those details say what the node was doing.
+_CANCELLED_STATUS_SOURCES = frozenset({"workflow-timeout", "workflow-preempted"})
 
 
 def _restart_never_left_the_gate(
@@ -478,20 +481,24 @@ def _restart_never_left_the_gate(
 ) -> bool:
     """Does this RESTART_WORKLOAD record show a restart that never happened?
 
-    The restart adapter answers WAITING only before it submits anything -- an
-    approval is pending, or the incident it depends on is not recovered -- so a
+    The restart adapter's own holds -- an approval is pending, or the incident
+    it depends on is not recovered -- come before it submits anything, so a
     wait that outlived the step's cap, or that the cap already turned into a
     failure, holds budget for a restart nobody made (F-C9). A remote command
     that a cluster executor is running is the one shape that says nothing
     about submission, and keeps its reservation.
 
-    A FAILED record releases only when it proves nothing was submitted: the
-    adapter's own ``restart_submitted: False`` refusal, the waiting cap, a
-    remote command the cluster executor rejected or the workflow cancelled
-    before it left PENDING/WAITING, or a cancellation the node answered with
-    WAITING. An executor-internal or configuration error, a stale-fence
-    settle, an unclaimed command and a plain node failure say nothing about
-    submission and keep the budget spent -- conservatively, by decision.
+    A FAILED record releases only on positive evidence that nothing was
+    submitted: the adapter's ``restart_submitted: False`` (stamped on its
+    refusals and its holds), the waiting cap, or a remote command no adapter
+    ever ran (executor-rejected, unclaimed). A cancelled command releases
+    only if its last report carries that marker or it never left PENDING (no
+    report at all): the cluster executor also answers WAITING for a retryable
+    error raised *after* ``create_namespaced_job``, and cancellation keeps
+    that report, so a cancelled WAITING without the marker may hide a Job that
+    exists. A cancellation the node settled afterwards, an executor-internal
+    or configuration error, a stale-fence settle and a plain node failure keep
+    the budget spent -- conservatively, by decision.
     """
 
     details = record.details
@@ -506,8 +513,10 @@ def _restart_never_left_the_gate(
     source = details.get("remote_status_source")
     if source in _NEVER_DISPATCHED_STATUS_SOURCES:
         return True
-    if source == "completed-after-cancellation":
-        return details.get("post_cancellation_status") == "WAITING"
+    if source in _CANCELLED_STATUS_SOURCES:
+        # ``RemoteActionCommand.result_details`` starts empty and nothing ever
+        # returns a command to PENDING: no report means no lease, no adapter.
+        return set(details) <= {"remote_status_source"}
     return False
 
 

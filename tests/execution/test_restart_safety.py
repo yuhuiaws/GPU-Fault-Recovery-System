@@ -180,6 +180,8 @@ def test_gpu_count_change_waits_for_explicit_admin_approval() -> None:
     assert waiting.details["source_gpu_count"] == 2
     assert waiting.details["target_gpu_count"] == 1
     assert waiting.details["required_approval_annotation"] == "2:1"
+    # A hold is not a submission: a cancellation here owes no budget.
+    assert waiting.details["restart_submitted"] is False
     assert batch.created == {}
     assert len(store.list_notifications()) == 1
     assert sent == [waiting.details["notification_id"]]
@@ -452,6 +454,7 @@ def test_restart_missing_source_fails_closed() -> None:
     assert outcome.details["source_workload_ids"] == [
         "training/pytorchjob/training-job"
     ]
+    assert outcome.details["restart_submitted"] is False
     assert custom.created == {}
     with pytest.raises(NotFoundError):
         store.get_restart_budget("cluster-a", "train-1")
@@ -480,6 +483,7 @@ def test_restart_rejects_source_uid_drift_before_budget_or_mutation() -> None:
     outcome, store = _execute_pytorch_restart(custom, "uid-drift")
 
     assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["restart_submitted"] is False
     assert outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_IDENTITY_DRIFT"
     assert outcome.details["identity_drift"] == [
         {
@@ -519,6 +523,7 @@ def test_restart_rechecks_managed_recovery_owner_after_final_read() -> None:
 
     assert outcome.status is WorkflowStepStatus.FAILED
     assert "enable-job-auto-resume is enabled" in (outcome.error or "")
+    assert outcome.details["restart_submitted"] is False
     assert custom.patches == []
     assert custom.created == {}
     with pytest.raises(NotFoundError):
@@ -534,6 +539,7 @@ def test_restart_rejects_source_already_being_deleted() -> None:
     outcome, store = _execute_pytorch_restart(custom, "source-deleting")
 
     assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["restart_submitted"] is False
     assert outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_DELETING"
     assert custom.patches == []
     assert custom.created == {}
@@ -560,6 +566,9 @@ def test_restart_source_disappearing_during_patch_is_controlled_failure() -> Non
     assert (
         outcome.details["reason"] == "RESTART_SOURCE_WORKLOAD_NOT_FOUND_DURING_MUTATION"
     )
+    # Raised inside the mutation loop: nothing proves no Job exists, so the
+    # record makes no claim and the budget stays spent.
+    assert "restart_submitted" not in outcome.details
     assert custom.created == {}
 
 

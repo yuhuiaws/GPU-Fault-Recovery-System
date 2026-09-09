@@ -169,6 +169,8 @@ def test_restart_waits_until_the_source_incident_is_recovered() -> None:
     assert waiting.details["reason"] == "NODE_UNDER_REMEDIATION"
     assert waiting.details["premise_reason"] == "INCIDENT_NOT_RECOVERED"
     assert waiting.details["incident_state"] == "ACTION_PENDING"
+    # The hold is pre-submission; a cancelled wait hands its budget back.
+    assert waiting.details["restart_submitted"] is False
     assert batch.created == {}
 
     store.save_incident(copy_model(source, state=IncidentState.RECOVERED))
