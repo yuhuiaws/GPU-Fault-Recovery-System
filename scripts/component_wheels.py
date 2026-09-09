@@ -526,29 +526,33 @@ def package_digest(package: Path) -> str:
     """Digest of a built component's sources.
 
     ``package`` is the staged ``src/gpu_fault``; a sibling local package staged
-    next to it (``src/gpu_fault_release``) is folded in after it under its own
-    prefix, so a component that ships only ``gpu_fault`` keeps the digest it
-    had before the release engine joined the walk.
+    next to it (``src/gpu_fault_release``) is keyed under its own prefix, and
+    every file is hashed in one global key order -- the same keys and order
+    ``component_source_digest`` derives from the source tree, so the identity
+    the installer checks against the bundle manifest is one computation done
+    twice. A component that ships only ``gpu_fault`` keeps the digest it had.
     """
 
-    digest = hashlib.sha256()
     staged = [(package, "")]
     staged.extend(
         (package.parent / name, f"{name}/")
         for name in LOCAL_PACKAGES
         if name != package.name and (package.parent / name).is_dir()
     )
+    entries: dict[str, Path] = {}
     for base, prefix in staged:
-        for path in sorted(base.rglob("*")):
+        for path in base.rglob("*"):
             if path.is_dir() or "__pycache__" in path.parts:
                 continue
             if path.suffix not in {".py", ".yaml", ".yml", ".json"}:
                 continue
-            relative = prefix + path.relative_to(base).as_posix()
-            digest.update(relative.encode())
-            digest.update(b"\0")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
-            digest.update(b"\n")
+            entries[prefix + path.relative_to(base).as_posix()] = path
+    digest = hashlib.sha256()
+    for relative in sorted(entries):
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(entries[relative].read_bytes()).digest())
+        digest.update(b"\n")
     return digest.hexdigest()
 
 

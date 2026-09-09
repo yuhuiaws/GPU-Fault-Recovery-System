@@ -110,3 +110,32 @@ def test_repack_wheel_stored_keeps_content_and_drops_per_file_deflate(tmp_path) 
         assert infos[0].external_attr == 0o644 << 16, infos[0].external_attr
         assert infos[0].date_time == (1980, 1, 1, 0, 0, 0), infos[0].date_time
     assert wheel.stat().st_size > before, "stored wheel must be the larger one"
+
+
+def test_the_installed_module_digest_matches_the_staged_wheel_digest(tmp_path) -> None:
+    """``gpu_fault.module_digest`` (what the installer reads back from the venv)
+    and ``package_digest`` (what the bundle manifest records) must be one
+    computation: with the release engine staged next to ``gpu_fault`` they
+    disagreed on ordering and deploy #13 (2026-09-09) refused the install as
+    "project identity does not match bundle"."""
+    import gpu_fault
+
+    src = tmp_path / "src"
+    (src / "gpu_fault/admin").mkdir(parents=True)
+    (src / "gpu_fault/__init__.py").write_text("x = 1\n", encoding="utf-8")
+    (src / "gpu_fault/admin/cli.py").write_text("y = 2\n", encoding="utf-8")
+    (src / "gpu_fault/data").mkdir()
+    (src / "gpu_fault/data/env-inventory.json").write_text("{}", encoding="utf-8")
+    without_engine = gpu_fault.module_digest(src / "gpu_fault")
+    assert without_engine == component_wheels.package_digest(src / "gpu_fault"), (
+        "gpu_fault-only trees hash identically"
+    )
+    (src / "gpu_fault_release").mkdir()
+    (src / "gpu_fault_release/__init__.py").write_text("z = 3\n", encoding="utf-8")
+    (src / "gpu_fault_release/__pycache__").mkdir()
+    (src / "gpu_fault_release/__pycache__/skip.pyc").write_bytes(b"\x00")
+    with_engine = gpu_fault.module_digest(src / "gpu_fault")
+    assert with_engine == component_wheels.package_digest(src / "gpu_fault"), (
+        "the sibling engine is folded in identically on both sides"
+    )
+    assert with_engine != without_engine, "the engine is part of the identity"
