@@ -129,7 +129,7 @@ data-plane collector plus the rendered expected-collector rules
 (``regional_dataplane_observability``). The one exception is a previous-state
 snapshot captured before the per-cluster capture existed: its rollback falls
 back to the candidate's data-plane manifest with the previous image, and the
-rollback record's ``observability_restore`` details say ``path:
+rollback record's ``dataplane_observability_restore`` details say ``path:
 previous-image`` for exactly that case rather than this set claiming it.
 """
 

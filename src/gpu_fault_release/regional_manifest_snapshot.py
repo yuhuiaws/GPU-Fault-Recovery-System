@@ -192,18 +192,29 @@ def apply_snapshot_objects(
     objects: list[Any],
     *,
     kubectl: list[str] | None = None,
-) -> None:
-    """Apply the captured objects as one list, so a partial apply is one call."""
+) -> bool:
+    """Apply the captured objects as one list, so a partial apply is one call.
+
+    Returns whether anything changed, read from ``kubectl apply``'s own output:
+    ``False`` only when every applied object reported ``unchanged``. Output the
+    caller cannot read that way (empty, a dry run, a stub) is ``True``: the
+    restart a changed object needs is the safe default, skipping it for a
+    cluster the candidate never touched is the optimisation.
+    """
 
     if not objects:
-        return
+        return False
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "previous-objects.json"
         path.write_text(
             json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}),
             encoding="utf-8",
         )
-        release.runner.run(_command(release, kubectl, "apply", "-f", str(path)))
+        output = release.runner.run(
+            _command(release, kubectl, "apply", "-f", str(path)), capture=True
+        )
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    return not lines or not all(line.endswith(" unchanged") for line in lines)
 
 
 def delete_absent_objects(

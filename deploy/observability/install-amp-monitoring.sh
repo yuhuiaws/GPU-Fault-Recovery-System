@@ -27,10 +27,11 @@ GPU_FAULT_FORCE_ADOT_RESTART="${GPU_FAULT_FORCE_ADOT_RESTART:-false}"
 # gpu_cluster="<id>"} == 1)` rule per cluster that carries an IRSA role
 # (regional_dataplane_observability.render_dataplane_expected_rules) and hands
 # the document over here; they live in their own namespace so the static file
-# above stays byte-comparable. No argument (the bootstrap) leaves that namespace
-# alone: only the release knows the expected set. An explicit
-# --no-dataplane-expected-rules deletes it, so a rule for a cluster whose role
-# was removed cannot keep firing.
+# above stays byte-comparable. No argument (the admin bootstrap) leaves that
+# namespace alone: only the release engine knows the expected set, and it passes
+# one of the two arguments from its bootstrap, join, remove and OBSERVABILITY
+# node alike. An explicit --no-dataplane-expected-rules deletes it, so a rule
+# for a cluster whose role was removed cannot keep firing.
 DATAPLANE_EXPECTED_RULE_NAMESPACE="gpu-fault-dataplane-expected"
 DATAPLANE_EXPECTED_RULES_ACTION=""
 DATAPLANE_EXPECTED_RULES_FILE=""
@@ -132,6 +133,39 @@ wait_for_amp_definition() {
         if ((SECONDS >= deadline)); then
             printf 'ERROR: %s is still %s after %ss\n' \
                 "${label}" "${status}" "${AMP_APPLY_TIMEOUT_SECONDS}" >&2
+            exit 1
+        fi
+        sleep 5
+    done
+}
+
+# The delete is asynchronous too: the namespace answers describe as DELETING
+# for a while, and a put or create issued meanwhile -- a rollback restoring the
+# previous rules right after this installer deleted them, the next deploy's
+# create -- is a ConflictException. Deleted means describe says
+# ResourceNotFoundException; any other failure of the read is an error, not
+# "gone".
+wait_for_amp_definition_gone() {
+    local label="$1" query="$2"
+    shift 2
+    local deadline=$((SECONDS + AMP_APPLY_TIMEOUT_SECONDS))
+    local status stderr_file
+    stderr_file="$(mktemp)"
+    while :; do
+        if ! status="$("$@" --query "${query}" --output text 2>"${stderr_file}")"; then
+            if grep -q ResourceNotFoundException "${stderr_file}"; then
+                rm -f "${stderr_file}"
+                return 0
+            fi
+            printf 'ERROR: cannot read %s while waiting for its deletion: %s\n' \
+                "${label}" "$(<"${stderr_file}")" >&2
+            rm -f "${stderr_file}"
+            exit 1
+        fi
+        if ((SECONDS >= deadline)); then
+            printf 'ERROR: %s is still %s after %ss (deletion did not settle)\n' \
+                "${label}" "${status}" "${AMP_APPLY_TIMEOUT_SECONDS}" >&2
+            rm -f "${stderr_file}"
             exit 1
         fi
         sleep 5
@@ -471,6 +505,10 @@ delete)
             --region "${AWS_REGION}" \
             --workspace-id "${AMP_WORKSPACE_ID}" \
             --name "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+        wait_for_amp_definition_gone \
+            "AMP rule namespace ${DATAPLANE_EXPECTED_RULE_NAMESPACE}" \
+            'ruleGroupsNamespace.status.statusCode' \
+            describe_dataplane_expected_rules
         printf 'AMP rule namespace %s deleted: no GPU cluster is expected to carry a data-plane collector.\n' \
             "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
     else

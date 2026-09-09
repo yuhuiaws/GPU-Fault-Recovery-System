@@ -12,7 +12,9 @@ from typing import Any, Callable
 
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_dataplane_observability import (
-    restore_observability_with_dataplane,
+    phase_failure_details,
+    restore_control_plane_observability,
+    restore_dataplane_observability_phase,
 )
 from gpu_fault_release.regional_release_automatic_rollback import (
     recover_failed_upgrade,
@@ -516,14 +518,8 @@ def upgrade_gpu_clusters(
                 "CONVERGED",
                 # When this cluster stopped being restarted, for the readers that
                 # have to excuse restart-shaped alerts for a bounded window.
-                # An observability-only plan (OBSERVABILITY is a GPU-cluster
-                # component since F10) lands here too, so its clusters read
-                # CONVERGED with a fresh `converged_at_epoch` although no Agent
-                # or Deployment rolled: the grace window it opens excuses
-                # nothing that happened, and the stamp is not evidence of a
-                # data-plane roll; the cluster's progress record carries only
-                # the OBSERVABILITY component for such a release, which is the
-                # honest reading. Recorded, not changed (F10 fix 1, F5).
+                # An observability-only plan stamps a fresh `converged_at_epoch`
+                # here too although nothing rolled: not a data-plane roll (F10 F5).
                 # `identity_verified` stays false on purpose: convergence here
                 # compares the artifact and config digests, not the protocol
                 # version or the compatibility digest, so nothing yet proves the
@@ -1743,17 +1739,11 @@ def _restore_regional_singletons(
     """Put back the components there is exactly one of for the whole region.
 
     Both are snapshot restores of objects applied straight from the candidate
-    checkout, and both run before the data plane rather than after it. For the
-    endpoint that ordering is load-bearing: the per-cluster half of the endpoint
-    component restores each cluster's connection Secret and then runs
-    ``_verify_gpu_control_plane_endpoint`` against it, and that verification only
-    proves something once the Service and the Route53 record it resolves are
-    already back.
-
-    Observability's per-GPU-cluster half (the data-plane collector) is restored
-    here too, from the per-cluster snapshots inside the observability snapshot:
-    it is a global component in the compensation plan. The phase returns the
-    record (path taken, per-cluster outcome) the phase runner persists.
+    checkout, and both run before the data plane. For the endpoint that order is
+    load-bearing: the per-cluster half of the endpoint component restores each
+    cluster's connection Secret and then runs ``_verify_gpu_control_plane_endpoint``
+    against it, which only proves something once the Service and the Route53
+    record it resolves are already back.
     """
 
     if compensation.restores_observability:
@@ -1761,7 +1751,7 @@ def _restore_regional_singletons(
             "observability_restore",
             "rollback-observability-restoring",
             "rollback-observability-restored",
-            lambda: restore_observability_with_dataplane(self, previous),
+            lambda: restore_control_plane_observability(self, previous),
         )
     if compensation.restores_endpoint:
         run_phase(
@@ -1821,7 +1811,7 @@ def _rollback_phase_runner(
             "phases",
             name,
             status="FAILED",
-            details={"error": f"{type(error).__name__}: {error}"},
+            details=phase_failure_details(error),
         )
         save_progress(phase)
 
@@ -2022,6 +2012,7 @@ def rollback_release(
                 runtime_image=runtime_image,
             ),
         )
+    restore_dataplane_observability_phase(self, previous, compensation, run_phase)
     if "rollback-restored" not in completed_phases:
         complete_timed_entry(timing, "phases", "restore")
         if "safe_at_epoch" not in timing:

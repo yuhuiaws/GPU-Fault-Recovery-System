@@ -90,24 +90,30 @@ def _snapshot_parts(snapshot: object) -> tuple[str, list[Any], list[Any]]:
     return namespace, objects, absent
 
 
-def restore_adot_objects(release: Any, snapshot: object) -> None:
-    """Put the captured collector back and prove it runs again.
+def restore_adot_objects(release: Any, snapshot: object) -> bool:
+    """Put the captured collector back and, if anything changed, prove it runs.
 
     The restart is not cosmetic: the collector reads its pipeline from the
     ConfigMap it mounts, so restoring the previous ConfigMap without replacing
     the running Pod would leave the candidate's configuration serving from
-    memory, which is the exact state this compensation exists to end.
+    memory, which is the exact state this compensation exists to end. When
+    every object applied back as ``unchanged`` the candidate never touched
+    them and the running Pod already serves the restored configuration; the
+    installer skips its restart on the same evidence, and so does this.
+    Returns whether the collector was restarted.
     """
 
     namespace, objects, absent = _snapshot_parts(snapshot)
-    apply_snapshot_objects(release, objects)
+    changed = apply_snapshot_objects(release, objects)
     delete_absent_objects(release, namespace, absent)
-    restart_snapshot_deployments(
-        release,
-        namespace,
-        objects,
-        timeout=ADOT_ROLLOUT_TIMEOUT,
-    )
+    if changed:
+        restart_snapshot_deployments(
+            release,
+            namespace,
+            objects,
+            timeout=ADOT_ROLLOUT_TIMEOUT,
+        )
+    return changed
 
 
 def capture_observability_snapshot(release: Any) -> dict[str, Any]:
@@ -156,7 +162,10 @@ def capture_observability_snapshot(release: Any) -> dict[str, Any]:
 def restore_observability_snapshot(
     release: Any,
     snapshot: object,
-) -> None:
+) -> bool:
+    """Put the AMP blobs and the collector back; returns whether the collector
+    was restarted (``False`` when every object applied back ``unchanged``)."""
+
     if not isinstance(snapshot, dict):
         raise ReleaseError("previous observability snapshot is unavailable")
     try:
@@ -171,6 +180,10 @@ def restore_observability_snapshot(
         rule_namespace = str(snapshot["rule_namespace"])
     except (KeyError, ValueError) as exc:
         raise ReleaseError("previous observability snapshot is invalid") from exc
+    # The collector half is validated here too, before the AMP blobs are
+    # rewritten: a snapshot that cannot be put back whole must not be put back
+    # in part.
+    _snapshot_parts(snapshot)
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         rules_path = root / "rules.yaml"
@@ -205,4 +218,4 @@ def restore_observability_snapshot(
                 f"fileb://{alertmanager_path}",
             ]
         )
-    restore_adot_objects(release, snapshot)
+    return restore_adot_objects(release, snapshot)

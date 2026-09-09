@@ -1239,6 +1239,9 @@ def test_join_requires_gpu_dns_and_tls_before_the_executor(
             "required-regional-executor-artifact-sha256": "e" * 64,
         },
         _roll_node_runtime=lambda _target, **_kwargs: None,
+        # join re-renders the expected-collector rules after the gate; not a
+        # gate step, so it only has to be present here.
+        _apply_observability=lambda **_kwargs: None,
     )
 
     MODULE.RegionalRelease.join_cluster(release, "gpu-a")

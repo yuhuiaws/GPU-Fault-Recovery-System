@@ -78,6 +78,8 @@ ROLLBACK_PHASES = frozenset(
         "rollback-rollout-cleaned",
         "rollback-cpu-restoring",
         "rollback-cpu-restored",
+        "rollback-dataplane-observability-restoring",
+        "rollback-dataplane-observability-restored",
         "rollback-restored",
         "rollback-verifying",
         "rollback-verified",

@@ -51,6 +51,29 @@ if [[ "${key}" == "sns_create-topic" &&
     cp "${FAKE_RESPONSES}/sns_created-topic-policy" \
         "${FAKE_RESPONSES}/sns_get-topic-attributes.text"
 fi
+# AMP deletes a rule namespace asynchronously: after delete-rule-groups-namespace
+# the namespace answers describe as DELETING for FAKE_DELETE_READS_BEFORE_GONE
+# more reads (default 0) and then as ResourceNotFoundException.
+deleting="${FAKE_RESPONSES}/amp_deleting-reads-left"
+if [[ "${key}" == "amp_delete-rule-groups-namespace" ]]; then
+    printf '%s\\n' "${FAKE_DELETE_READS_BEFORE_GONE:-0}" >"${deleting}"
+    exit 0
+fi
+if [[ "${key}" == "amp_describe-rule-groups-namespace" && -f "${deleting}" &&
+    "$*" == *"--name ${FAKE_DELETING_NAMESPACE:-}"* ]]; then
+    left="$(<"${deleting}")"
+    if ((left > 0)); then
+        printf '%s\\n' "$((left - 1))" >"${deleting}"
+        if [[ "$*" == *--query* ]]; then
+            printf 'DELETING\\n'
+        else
+            printf '{"ruleGroupsNamespace":{"status":{"statusCode":"DELETING"}}}\\n'
+        fi
+        exit 0
+    fi
+    printf 'An error occurred (ResourceNotFoundException) when calling the DescribeRuleGroupsNamespace operation\\n' >&2
+    exit 254
+fi
 file="${FAKE_RESPONSES}/${key}"
 if [[ "$*" == *--query* && -f "${file}.text" ]]; then
     cat "${file}.text"
@@ -92,6 +115,14 @@ exit 0
 _FAKE_PYTHON = """#!/usr/bin/env bash
 set -u
 printf '%s\\n' "python3 $*" >>"${FAKE_CALL_LOG}"
+exit 0
+"""
+
+# The installer's polling loops sleep between reads; the fake logs the sleep so
+# a test can see the loop turned without waiting it out.
+_FAKE_SLEEP = """#!/usr/bin/env bash
+set -u
+printf '%s\\n' "sleep $*" >>"${FAKE_CALL_LOG}"
 exit 0
 """
 
@@ -177,6 +208,7 @@ class Installer:
             ("aws", _FAKE_AWS),
             ("kubectl", _FAKE_KUBECTL),
             ("python3", _FAKE_PYTHON),
+            ("sleep", _FAKE_SLEEP),
         ):
             executable = self.bin / name
             executable.write_text(body, encoding="utf-8")
@@ -260,6 +292,7 @@ class Installer:
             "FAKE_APPLY_OUTPUT": self.apply_output,
             "FAKE_ADOT_REPLICAS": self.adot_replicas,
             "FAKE_ABSENT": " ".join(self.absent),
+            "FAKE_DELETING_NAMESPACE": EXPECTED_NAMESPACE,
             **self.environment,
         }
         return subprocess.run(
@@ -486,8 +519,9 @@ STATIC_NAMESPACE = "gpu-fault-control-plane-capacity"
 def test_the_expected_rules_namespace_is_left_alone_without_an_argument(
     tmp_path: Path,
 ) -> None:
-    """The bootstrap runs this script with no arguments and must not delete the
-    rules a deploy rendered: only the release engine knows the expected set."""
+    """The admin bootstrap (``bootstrap_services``) runs this script with no
+    arguments and must not delete the rules a deploy rendered: only the release
+    engine knows the expected set (its own bootstrap, join and remove pass it)."""
     installer = Installer(tmp_path)
 
     completed = installer.run()
@@ -548,6 +582,52 @@ def test_no_expected_rules_deletes_the_namespace_when_present(tmp_path: Path) ->
     assert len(deletes) == 1, deletes
     assert f"--name {EXPECTED_NAMESPACE}" in deletes[0]
     assert installer.matching("put-rule-groups-namespace") == []
+
+
+def test_the_delete_waits_until_the_namespace_is_gone(tmp_path: Path) -> None:
+    """MEDIUM-3: AMP deletes asynchronously. Returning while the namespace is
+    still DELETING lets the next writer -- a rollback's put, the next deploy's
+    create -- hit a ConflictException. The installer polls describe until it
+    answers ResourceNotFoundException, sleeping between reads."""
+    installer = Installer(tmp_path)
+    installer.arguments = ["--no-dataplane-expected-rules"]
+    installer.environment = {"FAKE_DELETE_READS_BEFORE_GONE": "2"}
+
+    completed = installer.run()
+
+    calls = installer.calls()
+    delete = next(
+        index
+        for index, line in enumerate(calls)
+        if "delete-rule-groups-namespace" in line
+    )
+    after = calls[delete + 1 :]
+    describes = [
+        line
+        for line in after
+        if "describe-rule-groups-namespace" in line and EXPECTED_NAMESPACE in line
+    ]
+    assert len(describes) == 3, (
+        f"the delete did not poll until the namespace was gone: {after}"
+    )
+    assert len([line for line in after if line.startswith("sleep ")]) == 2, after
+    assert "deleted" in completed.stdout
+
+
+def test_a_delete_that_never_settles_stops_the_installer(tmp_path: Path) -> None:
+    installer = Installer(tmp_path)
+    installer.arguments = ["--no-dataplane-expected-rules"]
+    installer.environment = {
+        "FAKE_DELETE_READS_BEFORE_GONE": "50",
+        "GPU_FAULT_AMP_APPLY_TIMEOUT_SECONDS": "0",
+    }
+
+    completed = installer.attempt()
+
+    assert completed.returncode != 0, (
+        "a namespace stuck in DELETING was reported deleted"
+    )
+    assert "DELETING" in completed.stderr, completed.stderr
 
 
 def test_no_expected_rules_is_idempotent_when_the_namespace_is_absent(

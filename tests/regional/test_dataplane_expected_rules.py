@@ -251,11 +251,22 @@ def _amp_release(*, present: bool) -> tuple[Any, list[list[str]], list[bytes]]:
             written.append(Path(path).read_bytes())
         return ""
 
+    def probe_output(arguments: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        # Existence is read from describe's exit and stderr (LOW-5), never from a
+        # boolean probe that reads a throttle as "absent".
+        assert arguments[:3] == ["aws", "amp", "describe-rule-groups-namespace"], (
+            arguments
+        )
+        if present:
+            payload = {"ruleGroupsNamespace": {"status": {"statusCode": "ACTIVE"}}}
+            return 0, json.dumps(payload), ""
+        return 254, "", "An error occurred (ResourceNotFoundException) when calling"
+
     release = SimpleNamespace(
         config=SimpleNamespace(
             aws_region="us-east-1", health=SimpleNamespace(amp_workspace_id="ws-a")
         ),
-        runner=SimpleNamespace(run=run, probe=lambda *_a, **_k: present),
+        runner=SimpleNamespace(run=run, probe_output=probe_output),
     )
     return release, calls, written
 

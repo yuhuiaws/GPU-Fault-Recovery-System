@@ -31,11 +31,11 @@ from gpu_fault_release.regional_admin_commands import (
 )
 from gpu_fault_release.regional_aurora_credentials import refresh_aurora_credentials
 from gpu_fault_release.regional_dataplane_observability import (
+    apply_observability,
     capture_dataplane_adot_snapshot,
     capture_dataplane_expected_rules,
     capture_observability_snapshot_with_dataplane,
     dataplane_expected_rules_sha256,
-    run_amp_monitoring_installer,
 )
 from gpu_fault_release.regional_dns import apply_control_plane_nlb
 from gpu_fault_release.regional_endpoint_rollback import (
@@ -512,6 +512,7 @@ class RegionalRelease:
     _bootstrap_cpu_is_current = bootstrap_cpu_is_current
     _capture_previous = capture_previous
     _capture_observability_snapshot = capture_observability_snapshot_with_dataplane
+    _apply_observability = apply_observability
     _capture_dataplane_adot_snapshot = capture_dataplane_adot_snapshot
     _capture_dataplane_expected_rules = capture_dataplane_expected_rules
     _restore_observability_snapshot = restore_observability_snapshot
@@ -906,35 +907,6 @@ class RegionalRelease:
                 )
             )
 
-    def _apply_observability(self) -> None:
-        topic_name = self.config.health.sns_topic_arn.rsplit(":", 1)[-1]
-        environment = {
-            **os.environ,
-            "AWS_REGION": self.config.aws_region,
-            "CPU_EKS_CLUSTER": self.config.cpu_eks_arn.rsplit("/", 1)[-1],
-            "CPU_KUBECONFIG": self.config.cpu_kubeconfig,
-            "AMP_WORKSPACE_ID": self.config.health.amp_workspace_id,
-            "SNS_TOPIC_NAME": topic_name,
-            "NAMESPACE": self.config.namespace,
-            "RULE_NAMESPACE": self.config.health.amp_rule_namespace,
-            "GPU_FAULT_ADOT_IMAGE": self.adot_image,
-            "GPU_FAULT_ENABLE_ADOT": "true",
-            "GPU_FAULT_ENABLE_AMP": "true",
-            "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION": str(
-                self.config.health.require_confirmed_sns_subscription
-            ).lower(),
-        }
-        if self.config.notifications.admin_email:
-            environment["GPU_FAULT_ALERT_EMAIL"] = self.config.notifications.admin_email
-        # The installer also receives this release's rendered per-cluster
-        # expected-collector rules (one absent() per cluster with an IRSA role),
-        # or an explicit deletion when no cluster is expected to carry a
-        # collector. Re-put on every run: this method runs whenever the
-        # observability digest moves, and the digest folds the rendered text, so
-        # a rule-template edit reaches AMP through the same node. The bootstrap
-        # runs the installer without that argument and leaves the namespace be.
-        run_amp_monitoring_installer(self, environment)
-
     def _restore_cpu_role_config_maps(
         self,
         snapshots: object,
@@ -1108,6 +1080,9 @@ class RegionalRelease:
             bootstrap_gpu_clusters(self, completed_cluster_ids)
             if completed_cluster_ids:
                 checkpoint = "bootstrap-data-plane-progress"
+            # The admin bootstrap ran the installer bare; only the engine knows
+            # the expected-collector set, so the rendered rules are put here.
+            self._apply_observability()
             self._validate_release()
             self._save_state(
                 "complete",
@@ -1271,6 +1246,8 @@ class RegionalRelease:
             artifact_sha=self.node_wheel_sha,
             config_digest=self.config.agent_config_digest,
         )
+        # The joined cluster's absence rule, without waiting for the next deploy.
+        self._apply_observability()
 
     def activate_cluster(self, cluster_id: str) -> None:
         self._target(cluster_id)
@@ -1287,6 +1264,9 @@ class RegionalRelease:
             self._scale_if_present(self._gpu(target), deployment, 0)
         self._update_registry(target, remove=True)
         purge_registry_cluster(self, cluster_id)
+        # Its collector is at zero; its absence rule must not fire until the
+        # next deploy. The config still names the cluster, hence the exclusion.
+        self._apply_observability(exclude_cluster_ids=frozenset({cluster_id}))
 
     def fail_cluster(self, cluster_id: str) -> None:
         self._target(cluster_id)

@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault_release import regional_dataplane_observability as DATAPLANE
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
@@ -110,6 +111,7 @@ def _gpu_recorder(calls: list[str]) -> dict[str, Any]:
         "_apply_gpu_adot_collector": lambda _target, **_kwargs: calls.append("adot"),
         "_apply_gpu_deployments": lambda *_args, **_kwargs: calls.append("executor"),
         "_roll_node_runtime": lambda _target, **_kwargs: calls.append("node-runtime"),
+        "_apply_observability": lambda **_kwargs: calls.append("observability"),
     }
 
 
@@ -170,6 +172,9 @@ def test_join_applies_the_collector_right_after_dcgm(
         "adot",
         "executor",
         "node-runtime",
+        # Fix round 2 (LOW-3): the joined cluster's absence rule is rendered
+        # once it is up, not on the next deploy.
+        "observability",
     ]
 
 
@@ -286,6 +291,8 @@ def test_remove_cluster_scales_the_collector_down(
     release = _release(_config(tmp_path, adot_irsa_role_arn=ROLE_ARN))
     scaled: list[tuple[str, int]] = []
     monkeypatch.setattr(release, "_update_registry", lambda *_args, **_kwargs: None)
+    # The rule re-render at the end is pinned by its own test below.
+    monkeypatch.setattr(release, "_apply_observability", lambda **_kwargs: None)
     monkeypatch.setattr(
         release,
         "_scale_if_present",
@@ -318,6 +325,269 @@ def test_bootstrap_cleanup_scales_the_collector_down(
     MODULE.RegionalRelease._cleanup_bootstrap(release)
 
     assert DATAPLANE_ADOT_DEPLOYMENT in scaled, scaled
+
+
+# --- fix round 2: bootstrap, join and remove re-render the expected rules ---------
+
+
+class _InstallerRunner:
+    """Records the installer invocation and reads the rendered rules file while
+    it still exists (the release removes the temporary directory afterwards)."""
+
+    dry_run = False
+
+    def __init__(self) -> None:
+        self.installs: list[tuple[list[str], dict[str, str], str | None]] = []
+        self.other: list[list[str]] = []
+
+    def run(self, arguments: list[str], **kwargs: Any) -> str:
+        if arguments[:2] != ["bash", str(DATAPLANE.AMP_MONITORING_INSTALLER)]:
+            self.other.append(list(arguments))
+            return ""
+        handed = None
+        if "--dataplane-expected-rules" in arguments:
+            path = Path(arguments[arguments.index("--dataplane-expected-rules") + 1])
+            handed = path.read_text(encoding="utf-8")
+        self.installs.append((list(arguments), dict(kwargs.get("env") or {}), handed))
+        return ""
+
+    def probe(self, _arguments: list[str], **_kwargs: Any) -> bool:
+        return False
+
+
+def _site_target(cluster_id: str, *, role: str | None = ROLE_ARN) -> SimpleNamespace:
+    return SimpleNamespace(
+        cluster_id=cluster_id,
+        context=f"{cluster_id}-context",
+        region="us-east-1",
+        adot_irsa_role_arn=role,
+    )
+
+
+class _SiteRelease(SimpleNamespace):
+    """A release whose observability step is the REAL one -- the very function
+    the class binds -- and whose every other step only records its name."""
+
+    _apply_observability = DATAPLANE.apply_observability
+    _target = MODULE.RegionalRelease._target
+
+
+def _site_release(
+    calls: list[str], *, clusters: tuple[SimpleNamespace, ...]
+) -> _SiteRelease:
+    runner = _InstallerRunner()
+    recorded = _gpu_recorder(calls)
+    # The class method is the real step; the recorder's stand-in must not
+    # shadow it as an instance attribute.
+    recorded.pop("_apply_observability")
+    release = _SiteRelease(
+        **recorded,
+        runner=runner,
+        state={},
+        release_id="release-1",
+        adot_image="adot@sha256:" + "a" * 64,
+        bundle_sha="b" * 64,
+        executor_wheel_sha="e" * 64,
+        _ensure_contexts=lambda: None,
+        _apply_rds_ca_bundle=lambda: calls.append("rds-ca"),
+        _bootstrap_cpu_is_current=lambda: False,
+        _save_state=lambda phase, **_updates: calls.append(f"save:{phase}"),
+        _require_cpu_secrets=lambda **_kwargs: None,
+        _initialize_registry=lambda: calls.append("registry"),
+        _upload_release=lambda *_args, **_kwargs: calls.append("upload"),
+        _ensure_schema=lambda: calls.append("schema"),
+        _apply_cpu=lambda **_kwargs: calls.append("cpu"),
+        _apply_nlb=lambda: calls.append("nlb"),
+        _validate_release=lambda: calls.append("validate"),
+        _update_registry=lambda _target, *, remove: None,
+        _upload_config_map=lambda *_args, **_kwargs: None,
+        _scale_if_present=lambda *_args, **_kwargs: calls.append("scale"),
+        _cpu=lambda *arguments: ["kubectl", "--kubeconfig", "/secure/cpu", *arguments],
+        _gpu=lambda target, *arguments: [
+            "kubectl",
+            "--context",
+            target.context,
+            *arguments,
+        ],
+        _config_map_data=lambda _name: {
+            "required-agent-artifact-sha256": "a" * 64,
+            "required-regional-executor-artifact-sha256": "e" * 64,
+        },
+    )
+    release.config = SimpleNamespace(
+        clusters=clusters,
+        namespace="gpu-fault-system",
+        aws_region="us-east-1",
+        cpu_eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
+        cpu_kubeconfig="/secure/cpu.kubeconfig",
+        auto_rollback=False,
+        agent_config_digest="c" * 64,
+        executor_wheel=Path("executor.whl"),
+        bundle=Path("bundle.tar.gz"),
+        health=SimpleNamespace(
+            amp_workspace_id="ws-a",
+            amp_rule_namespace="gpu-fault-control-plane-capacity",
+            sns_topic_arn="arn:aws:sns:us-east-1:123456789012:gpu-fault-alerts",
+            require_confirmed_sns_subscription=True,
+        ),
+        notifications=SimpleNamespace(admin_email="ops@example.com"),
+    )
+    return release
+
+
+def _installs(
+    release: _SiteRelease,
+) -> list[tuple[list[str], dict[str, str], str | None]]:
+    return list(release.runner.installs)
+
+
+def test_the_release_class_binds_the_observability_step() -> None:
+    assert MODULE.RegionalRelease._apply_observability is DATAPLANE.apply_observability
+
+
+def test_the_observability_step_runs_the_installer_with_the_rendered_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOW-6: ``_apply_observability`` -> installer argv and environment. The
+    orchestration tests stub this step by name, so nothing else pinned it."""
+    monkeypatch.setenv("GPU_FAULT_TEST_MARKER", "inherited")
+    release = _site_release([], clusters=(_site_target("gpu-a"),))
+
+    MODULE.RegionalRelease._apply_observability(release)
+
+    (arguments, environment, handed), *rest = _installs(release)
+    assert rest == [], "the installer ran more than once"
+    assert arguments[:2] == ["bash", str(DATAPLANE.AMP_MONITORING_INSTALLER)]
+    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert handed == DATAPLANE.render_dataplane_expected_rules(release)
+    assert handed is not None and 'gpu_cluster="gpu-a"' in handed
+    expected_environment = {
+        "AWS_REGION": "us-east-1",
+        "CPU_EKS_CLUSTER": "control",
+        "CPU_KUBECONFIG": "/secure/cpu.kubeconfig",
+        "AMP_WORKSPACE_ID": "ws-a",
+        "SNS_TOPIC_NAME": "gpu-fault-alerts",
+        "NAMESPACE": "gpu-fault-system",
+        "RULE_NAMESPACE": "gpu-fault-control-plane-capacity",
+        "GPU_FAULT_ADOT_IMAGE": release.adot_image,
+        "GPU_FAULT_ENABLE_ADOT": "true",
+        "GPU_FAULT_ENABLE_AMP": "true",
+        "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION": "true",
+        "GPU_FAULT_ALERT_EMAIL": "ops@example.com",
+    }
+    for key, value in expected_environment.items():
+        assert environment.get(key) == value, (key, environment.get(key))
+    assert environment.get("GPU_FAULT_TEST_MARKER") == "inherited", (
+        "the installer environment no longer inherits the process environment"
+    )
+
+
+def test_bootstrap_puts_the_expected_rules_once_the_clusters_are_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM-1: the admin bootstrap runs the installer bare (it does not know
+    the expected set), and every ``save_state`` records the current
+    observability digest, so a freshly bootstrapped site with a role never got
+    its ``gpu-fault-dataplane-expected`` namespace until an unrelated
+    observability input moved the digest. The engine's bootstrap renders them."""
+    calls: list[str] = []
+    monkeypatch.setattr(MODULE, "ensure_runtime_profile", lambda _r: None)
+    monkeypatch.setattr(
+        MODULE,
+        "bootstrap_gpu_clusters",
+        lambda _release, _completed: calls.append("gpu-clusters"),
+    )
+    release = _site_release(calls, clusters=(_site_target("gpu-a"),))
+
+    MODULE.RegionalRelease.bootstrap(release)
+
+    installs = _installs(release)
+    assert len(installs) == 1, f"the bootstrap ran the installer {len(installs)}x"
+    arguments, _environment, handed = installs[0]
+    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert handed is not None and 'gpu_cluster="gpu-a"' in handed
+    assert calls.index("gpu-clusters") < calls.index("validate")
+    assert release.runner.other and "apply" in release.runner.other[0], (
+        "the prerequisites apply did not run"
+    )
+
+
+def test_bootstrap_of_a_role_less_site_asks_for_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(MODULE, "ensure_runtime_profile", lambda _r: None)
+    monkeypatch.setattr(MODULE, "bootstrap_gpu_clusters", lambda *_a: None)
+    release = _site_release(calls, clusters=(_site_target("gpu-a", role=None),))
+
+    MODULE.RegionalRelease.bootstrap(release)
+
+    (arguments, _environment, handed), *rest = _installs(release)
+    assert rest == []
+    assert arguments[2:] == ["--no-dataplane-expected-rules"], arguments
+    assert handed is None
+
+
+def test_join_re_renders_the_expected_rules_with_the_joined_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOW-3: a joined cluster with a role had no absence rule until the next
+    deploy; join re-runs the (idempotent) installer with the new set."""
+    calls: list[str] = []
+    for name in ("prepare_join_registry", "ensure_runtime_profile"):
+        monkeypatch.setattr(MODULE, name, lambda *_args, **_kwargs: None)
+    joined = _site_target("gpu-b")
+    monkeypatch.setattr(MODULE, "join_target", lambda _self, _cluster_id: joined)
+    release = _site_release(calls, clusters=(_site_target("gpu-a"), joined))
+
+    MODULE.RegionalRelease.join_cluster(release, "gpu-b")
+
+    (arguments, _environment, handed), *rest = _installs(release)
+    assert rest == []
+    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert handed is not None
+    assert 'gpu_cluster="gpu-b"' in handed and 'gpu_cluster="gpu-a"' in handed
+    assert calls.index("node-runtime") < len(calls), calls
+
+
+def test_remove_re_renders_the_expected_rules_without_the_removed_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOW-3: the removed cluster's collector is scaled to 0, so its absence
+    rule would fire 15 minutes later until the next deploy. The config handed
+    to ``remove_cluster`` still names the cluster (``_target`` finds it there),
+    so the render has to leave it out explicitly."""
+    calls: list[str] = []
+    for name in ("revoke_registry_cluster", "purge_registry_cluster"):
+        monkeypatch.setattr(MODULE, name, lambda *_args, **_kwargs: None)
+    release = _site_release(
+        calls, clusters=(_site_target("gpu-a"), _site_target("gpu-b"))
+    )
+
+    MODULE.RegionalRelease.remove_cluster(release, "gpu-b")
+
+    (arguments, _environment, handed), *rest = _installs(release)
+    assert rest == []
+    assert arguments[2] == "--dataplane-expected-rules", arguments
+    assert handed is not None
+    assert 'gpu_cluster="gpu-a"' in handed and 'gpu_cluster="gpu-b"' not in handed
+    assert "scale" in calls, "the collector was not scaled down"
+
+
+def test_remove_of_the_last_expected_cluster_asks_for_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    for name in ("revoke_registry_cluster", "purge_registry_cluster"):
+        monkeypatch.setattr(MODULE, name, lambda *_args, **_kwargs: None)
+    release = _site_release(calls, clusters=(_site_target("gpu-a"),))
+
+    MODULE.RegionalRelease.remove_cluster(release, "gpu-a")
+
+    (arguments, _environment, handed), *rest = _installs(release)
+    assert rest == []
+    assert arguments[2:] == ["--no-dataplane-expected-rules"], arguments
+    assert handed is None
 
 
 # --- rollback -----------------------------------------------------------------
@@ -425,7 +695,9 @@ def test_observability_rollback_refuses_without_a_previous_adot_image(
     with pytest.raises(ReleaseError, match="previous ADOT image"):
         _rollback(monkeypatch, {}, calls)
 
-    assert [name for name, _ in calls] == ["snapshot"]
+    # Fix round 2 (LOW-1): the whole snapshot is validated before either half
+    # is put back, so the control-plane restore never ran.
+    assert [name for name, _ in calls] == []
 
 
 def test_rollback_gpu_adot_collectors_reapplies_the_previous_image_per_cluster() -> (

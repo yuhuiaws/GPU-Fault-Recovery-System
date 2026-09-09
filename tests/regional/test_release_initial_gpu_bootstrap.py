@@ -132,6 +132,7 @@ def test_initial_bootstrap_uses_atomic_registry_then_parallel_gpu_workers(
         _ensure_schema=recorder("schema"),
         _apply_cpu=recorder("cpu"),
         _apply_nlb=recorder("nlb"),
+        _apply_observability=recorder("observability"),
         _validate_release=recorder("validate"),
     )
     monkeypatch.setattr(ROLLOUT, "ensure_runtime_profile", recorder("runtime-profile"))
@@ -158,6 +159,9 @@ def test_initial_bootstrap_uses_atomic_registry_then_parallel_gpu_workers(
         "nlb",
         "state:bootstrap-endpoint-ready",
         "gpu:[]",
+        # The rendered expected-collector rules go up once the clusters are
+        # (F10 fix round 2, MEDIUM-1); the admin bootstrap ran the installer bare.
+        "observability",
         "validate",
         "state:complete",
     ]

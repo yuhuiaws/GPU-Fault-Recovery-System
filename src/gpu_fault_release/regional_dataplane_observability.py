@@ -1,4 +1,4 @@
-"""The per-GPU-cluster half of the observability component (F10 fix round 1).
+"""The per-GPU-cluster half of the observability component (F10 fix rounds 1-2).
 
 Two things live here, both keyed on the same set: the clusters whose target
 carries an ``adot_irsa_role_arn`` while the site has an AMP workspace, which is
@@ -15,7 +15,10 @@ exactly the set the observability digest already folds.
    for a cluster whose role was removed cannot linger. The per-cluster shape is
    also what closes the blind spot the old comment admitted: one dead collector
    beside a live one produces no series at all, and only a rule that names the
-   cluster can see that.
+   cluster can see that. The rules are re-put wherever the expected set can
+   move: the OBSERVABILITY node of an upgrade, and the engine's own bootstrap,
+   ``join_cluster`` and ``remove_cluster`` (``apply_observability``); the admin
+   bootstrap runs the installer bare and leaves the namespace alone.
 
 2. **Rollback compensation.** The first wiring put every configured cluster's
    collector back by rendering the *candidate's* manifest with the previous
@@ -23,29 +26,51 @@ exactly the set the observability digest already folds.
    collectors were created on clusters the candidate never touched, and a
    cluster whose role the candidate had just added kept its collector. The
    compensation is now a snapshot, taken beside the control-plane one: every
-   GPU cluster's declared collector objects are read through that cluster's own
-   kube context before the OBSERVABILITY node runs, and rollback restores each
-   cluster from ITS snapshot -- objects applied back where a collector was live,
-   the candidate's objects deleted where none was, a cluster the snapshot never
-   saw scaled to zero -- and puts the expected-rules namespace back too. The
-   previous-image path survives only for a state captured before this snapshot
-   existed, and the rollback record says which path ran.
+   GPU cluster in the candidate config has its declared collector objects read
+   through that cluster's own kube context before the OBSERVABILITY node runs,
+   and rollback restores each cluster from ITS snapshot -- objects applied back
+   where a collector was live, the candidate's objects deleted where none was.
+   Because the capture iterates the candidate config, a cluster the candidate
+   ADDED is in the snapshot too (every object absent, so it reads ``removed``);
+   the only cluster the snapshot never saw is one added to site.yaml between the
+   transaction's opening and its rollback, and that one is scaled to zero. A
+   cluster removed from site.yaml in that window refuses the rollback. The
+   expected-rules namespace goes back too. The previous-image path survives
+   only for a state captured before this snapshot existed, and the rollback
+   record says which path ran.
+
+   The data-plane half is its own rollback phase
+   (``rollback-dataplane-observability-restored``), run AFTER the CPU control
+   plane is restored: a GPU cluster whose API is unreachable is a common reason
+   the release failed in the first place, and it must not keep the previous
+   control plane from coming back. Inside the phase one cluster's failure does
+   not stop the others or the expected-rules restore; the phase then fails once,
+   naming every failed cluster, so the rollback is honestly FAILED and a resume
+   re-runs the (idempotent) phase. The control-plane half stays in the earlier
+   ``observability_restore`` phase, which validates the WHOLE snapshot -- both
+   halves -- before it mutates anything.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
 from gpu_fault_release.regional_gpu_bootstrap import rollback_gpu_adot_collectors
 from gpu_fault_release.regional_manifest_snapshot import (
     apply_snapshot_objects,
@@ -85,6 +110,19 @@ DATAPLANE_COLLECTOR_RUNBOOK_URL = (
 DATAPLANE_CONTROL_PLANE_CLUSTER = "gpu-fault-regional-control-plane"
 DATAPLANE_ADOT_ROLLOUT_TIMEOUT = "300s"
 MAX_CAPTURE_WORKERS = 8
+#: The rollback phase that puts the per-cluster collectors and the rendered
+#: rules back: its timing entry, its in-progress and its checkpoint phase name.
+DATAPLANE_OBSERVABILITY_PHASE = "dataplane_observability_restore"
+DATAPLANE_OBSERVABILITY_RESTORING = "rollback-dataplane-observability-restoring"
+DATAPLANE_OBSERVABILITY_RESTORED = "rollback-dataplane-observability-restored"
+#: AMP validates a rule namespace asynchronously and deletes it asynchronously:
+#: a put on a CREATING/UPDATING/DELETING namespace is a ConflictException. The
+#: restore waits for it to settle, polling this often, this many times (the
+#: installer's own wait is 300 s; 60 x 5 s matches it).
+EXPECTED_RULES_SETTLE_ATTEMPTS = 60
+EXPECTED_RULES_SETTLE_SECONDS = 5.0
+_SETTLING_STATUSES = frozenset({"CREATING", "UPDATING", "DELETING"})
+_sleep: Callable[[float], None] = time.sleep
 # The cluster id is interpolated into a PromQL string literal and a YAML
 # scalar; anything outside this set is refused rather than escaped.
 _CLUSTER_ID_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -97,13 +135,22 @@ def _say(message: str) -> None:
 # --- expected-collector rules -------------------------------------------------------
 
 
-def expected_collector_targets(release: Any) -> tuple[ClusterTarget, ...]:
-    """The clusters the release applies a collector to, in config order."""
+def expected_collector_targets(
+    release: Any, *, exclude: frozenset[str] = frozenset()
+) -> tuple[ClusterTarget, ...]:
+    """The clusters the release applies a collector to, in config order.
+
+    ``exclude`` names clusters to leave out although the config still carries
+    them: ``remove_cluster`` runs against a config that still names the cluster
+    it is removing (that is how it finds the target), and the rule for that
+    cluster has to go with its collector rather than fire until the next deploy.
+    """
 
     return tuple(
         target
         for target in release.config.clusters
-        if dataplane_adot_skip_reason(release, target) is None
+        if target.cluster_id not in exclude
+        and dataplane_adot_skip_reason(release, target) is None
     )
 
 
@@ -154,7 +201,9 @@ def _expected_rule(target: ClusterTarget) -> dict[str, Any]:
     }
 
 
-def render_dataplane_expected_rules(release: Any) -> str | None:
+def render_dataplane_expected_rules(
+    release: Any, *, exclude: frozenset[str] = frozenset()
+) -> str | None:
     """The per-cluster absence rules as an AMP rule-groups document, or ``None``.
 
     ``None`` -- not an empty group -- when no cluster is expected to carry a
@@ -162,7 +211,7 @@ def render_dataplane_expected_rules(release: Any) -> str | None:
     left to fire.
     """
 
-    targets = expected_collector_targets(release)
+    targets = expected_collector_targets(release, exclude=exclude)
     if not targets:
         return None
     document = {
@@ -185,16 +234,19 @@ def dataplane_expected_rules_sha256(release: Any) -> str:
     ).hexdigest()
 
 
-def amp_installer_arguments(release: Any, directory: Path) -> list[str]:
+def amp_installer_arguments(
+    release: Any, directory: Path, *, exclude: frozenset[str] = frozenset()
+) -> list[str]:
     """The installer's positional arguments for this release's expected set.
 
     The rendered document is written into ``directory`` (a temporary directory
     the caller owns for the installer's lifetime) and handed over by path; an
-    empty expected set is an explicit deletion request. The bootstrap runs the
-    installer with no arguments at all, which leaves the namespace alone.
+    empty expected set is an explicit deletion request. Only the admin
+    bootstrap (``bootstrap_services``) runs the installer with no arguments at
+    all, which leaves the namespace alone.
     """
 
-    rendered = render_dataplane_expected_rules(release)
+    rendered = render_dataplane_expected_rules(release, exclude=exclude)
     if rendered is None:
         return ["--no-dataplane-expected-rules"]
     path = directory / "dataplane-expected-rules.yaml"
@@ -202,7 +254,12 @@ def amp_installer_arguments(release: Any, directory: Path) -> list[str]:
     return ["--dataplane-expected-rules", str(path)]
 
 
-def run_amp_monitoring_installer(release: Any, environment: dict[str, str]) -> None:
+def run_amp_monitoring_installer(
+    release: Any,
+    environment: dict[str, str],
+    *,
+    exclude: frozenset[str] = frozenset(),
+) -> None:
     """Run the AMP monitoring installer with this release's expected-rules hand-off.
 
     ``environment`` is the installer's configuration (built by the release from
@@ -210,11 +267,61 @@ def run_amp_monitoring_installer(release: Any, environment: dict[str, str]) -> N
     """
 
     with tempfile.TemporaryDirectory() as directory:
-        arguments = amp_installer_arguments(release, Path(directory))
+        arguments = amp_installer_arguments(release, Path(directory), exclude=exclude)
         release.runner.run(
             ["bash", str(AMP_MONITORING_INSTALLER), *arguments],
             env=environment,
         )
+
+
+def amp_installer_environment(release: Any) -> dict[str, str]:
+    """The installer's configuration, from the release config over the process env."""
+
+    topic_name = release.config.health.sns_topic_arn.rsplit(":", 1)[-1]
+    environment = {
+        **os.environ,
+        "AWS_REGION": release.config.aws_region,
+        "CPU_EKS_CLUSTER": release.config.cpu_eks_arn.rsplit("/", 1)[-1],
+        "CPU_KUBECONFIG": release.config.cpu_kubeconfig,
+        "AMP_WORKSPACE_ID": release.config.health.amp_workspace_id,
+        "SNS_TOPIC_NAME": topic_name,
+        "NAMESPACE": release.config.namespace,
+        "RULE_NAMESPACE": release.config.health.amp_rule_namespace,
+        "GPU_FAULT_ADOT_IMAGE": release.adot_image,
+        "GPU_FAULT_ENABLE_ADOT": "true",
+        "GPU_FAULT_ENABLE_AMP": "true",
+        "GPU_FAULT_REQUIRE_CONFIRMED_SNS_SUBSCRIPTION": str(
+            release.config.health.require_confirmed_sns_subscription
+        ).lower(),
+    }
+    if release.config.notifications.admin_email:
+        environment["GPU_FAULT_ALERT_EMAIL"] = release.config.notifications.admin_email
+    return environment
+
+
+def apply_observability(
+    release: Any, *, exclude_cluster_ids: frozenset[str] = frozenset()
+) -> None:
+    """The observability component's control-plane step (bound as
+    ``RegionalRelease._apply_observability``).
+
+    Runs the AMP monitoring installer -- the IAM writer role, the SNS topic and
+    its policy, the static rule namespace, the Alertmanager definition and the
+    control-plane collector, each short-circuited when already converged -- and
+    hands it this release's rendered per-cluster expected-collector rules (one
+    ``absent()`` per cluster with an IRSA role), or an explicit deletion when no
+    cluster is expected to carry a collector. Re-put on every run: the upgrade
+    runs this whenever the observability digest moves (the digest folds the
+    rendered text, so a rule-template edit reaches AMP through the same node),
+    and the engine's bootstrap, ``join_cluster`` and ``remove_cluster`` run it
+    because each of them changes the expected set without a deploy.
+    ``exclude_cluster_ids`` is ``remove_cluster``'s way of dropping the cluster
+    its config still names.
+    """
+
+    run_amp_monitoring_installer(
+        release, amp_installer_environment(release), exclude=exclude_cluster_ids
+    )
 
 
 def _amp_common(release: Any) -> list[str]:
@@ -237,6 +344,47 @@ def _describe_expected_rules(release: Any) -> list[str]:
     ]
 
 
+def _describe_expected_rules_document(release: Any) -> dict[str, Any] | None:
+    """The namespace's describe document, ``None`` when it does not exist.
+
+    Only ``ResourceNotFoundException`` is absence. A throttle, a credentials
+    error or an unreadable answer raises: a restore built on a guess would
+    create over a namespace that exists (ConflictException) or skip deleting
+    one that does.
+    """
+
+    code, stdout, stderr = release.runner.probe_output(
+        [*_describe_expected_rules(release), "--output", "json"]
+    )
+    if code:
+        if "ResourceNotFoundException" in stderr:
+            return None
+        raise ReleaseError(
+            "cannot read the expected-collector rule namespace "
+            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: {stderr.strip() or code}"
+        )
+    try:
+        document = json.loads(stdout)["ruleGroupsNamespace"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ReleaseError(
+            "cannot read the expected-collector rule namespace "
+            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: unexpected describe output"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ReleaseError(
+            "cannot read the expected-collector rule namespace "
+            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: unexpected describe output"
+        )
+    return document
+
+
+def _expected_rules_status(document: dict[str, Any] | None) -> str | None:
+    if document is None:
+        return None
+    status = document.get("status")
+    return str(status.get("statusCode") or "") if isinstance(status, dict) else ""
+
+
 def capture_dataplane_expected_rules(release: Any) -> dict[str, Any]:
     """Read the expected-rules namespace as it is before the release re-puts it.
 
@@ -245,24 +393,42 @@ def capture_dataplane_expected_rules(release: Any) -> dict[str, Any]:
     back the wrong rules or delete rules that were there.
     """
 
-    code, stdout, stderr = release.runner.probe_output(
-        [*_describe_expected_rules(release), "--output", "json"]
-    )
-    if code:
-        if "ResourceNotFoundException" in stderr:
-            return {"present": False, "data_base64": None}
-        raise ReleaseError(
-            "cannot read the expected-collector rule namespace "
-            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: {stderr.strip() or code}"
-        )
-    try:
-        data = json.loads(stdout)["ruleGroupsNamespace"]["data"]
-    except (ValueError, KeyError, TypeError) as exc:
+    document = _describe_expected_rules_document(release)
+    if document is None:
+        return {"present": False, "data_base64": None}
+    data = document.get("data")
+    if not isinstance(data, str) or not data:
         raise ReleaseError(
             "cannot read the expected-collector rule namespace "
             f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: unexpected describe output"
-        ) from exc
-    return {"present": True, "data_base64": str(data)}
+        )
+    return {"present": True, "data_base64": data}
+
+
+def _settled_expected_rules_exist(release: Any) -> bool:
+    """Whether the namespace exists once AMP has stopped changing it.
+
+    A namespace the candidate's installer just put or deleted may still be
+    CREATING/UPDATING/DELETING; writing to it now is a ConflictException, so
+    the restore waits for AMP to settle first and fails closed if it never
+    does. A failed definition (``CREATION_FAILED``, ``UPDATE_FAILED``) exists
+    and can be put over.
+    """
+
+    status = _expected_rules_status(_describe_expected_rules_document(release))
+    for _attempt in range(EXPECTED_RULES_SETTLE_ATTEMPTS):
+        if status not in _SETTLING_STATUSES:
+            return status is not None
+        _say(
+            f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} is {status}; "
+            "waiting for it to settle before restoring it"
+        )
+        _sleep(EXPECTED_RULES_SETTLE_SECONDS)
+        status = _expected_rules_status(_describe_expected_rules_document(release))
+    raise ReleaseError(
+        f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} is still {status} "
+        f"after {EXPECTED_RULES_SETTLE_ATTEMPTS * EXPECTED_RULES_SETTLE_SECONDS:.0f}s"
+    )
 
 
 def _expected_rules_parts(snapshot: object) -> tuple[bool, bytes]:
@@ -290,7 +456,7 @@ def restore_dataplane_expected_rules(release: Any, snapshot: object) -> str:
     """
 
     present, data = _expected_rules_parts(snapshot)
-    exists = release.runner.probe(_describe_expected_rules(release))
+    exists = _settled_expected_rules_exist(release)
     if not present:
         if not exists:
             return "absent"
@@ -396,46 +562,71 @@ def capture_observability_snapshot_with_dataplane(release: Any) -> dict[str, Any
 # --- rollback ----------------------------------------------------------------------
 
 
-def _rollback_from_previous_image(
-    release: Any, previous: dict[str, Any]
-) -> dict[str, Any]:
-    _say(
-        "previous observability snapshot predates the per-cluster collector "
-        "capture; every configured cluster's collector is re-rendered from the "
-        "CANDIDATE manifest with the previous ADOT image (template edits are "
-        "not undone on the data plane)"
-    )
-    rollback_gpu_adot_collectors(release, previous)
+class DataplaneRollbackIncomplete(ReleaseError):
+    """The data-plane observability phase finished with at least one failure.
+
+    ``phase_details`` is the phase's record as far as it got (per-cluster
+    outcome, expected-rules outcome); the phase runner folds it into the
+    durable timing entry beside the error, so the state says which clusters
+    were restored and which were not.
+    """
+
+    def __init__(self, message: str, *, phase_details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.phase_details = phase_details
+
+
+def phase_failure_details(error: Exception) -> dict[str, Any]:
+    """What a rollback phase runner records for a phase that raised ``error``.
+
+    Always the error itself; plus, for an error that knows how far its phase
+    got (``phase_details``, as :class:`DataplaneRollbackIncomplete` carries),
+    that record -- so the durable state says which clusters were restored and
+    which were not, not just that the phase failed.
+    """
+
+    details = getattr(error, "phase_details", None)
     return {
-        "path": "previous-image",
-        "image": str(previous.get("adot_image") or ""),
-        "clusters": {
-            target.cluster_id: "candidate-manifest-with-previous-image"
-            for target in release.config.clusters
-        },
+        **(dict(details) if isinstance(details, dict) else {}),
+        "error": f"{type(error).__name__}: {error}",
     }
 
 
-def restore_dataplane_adot_state(
-    release: Any, previous: dict[str, Any]
-) -> dict[str, Any]:
-    """Put every GPU cluster's collector back the way its snapshot found it.
+@dataclass(frozen=True)
+class _DataplanePlan:
+    """The validated data-plane half of a previous-state snapshot.
 
-    Validates the whole snapshot before touching any cluster. Iterates the
-    clusters the SNAPSHOT knows about, not the candidate config, and restores
-    each from its own objects regardless of how far the candidate got on it:
-    re-applying a cluster's own snapshot is idempotent and costs one collector
-    restart, while reading progress to skip it would tie the compensation to
-    the progress record and leave a partially applied cluster unrestored. A
-    configured cluster the snapshot never saw is one the candidate created,
-    so it is scaled to zero.
+    ``path`` is ``snapshot`` (per-cluster objects in ``parsed``, the rules blob
+    in ``expected_rules``, every configured target in ``targets``) or
+    ``previous-image`` (``image`` set; a state captured before the snapshot).
+    """
+
+    path: str
+    image: str = ""
+    targets: dict[str, ClusterTarget] = field(default_factory=dict)
+    parsed: dict[str, tuple[str, list[Any], list[Any]]] = field(default_factory=dict)
+    expected_rules: object = None
+
+
+def validate_dataplane_adot_snapshot(
+    release: Any, previous: dict[str, Any]
+) -> _DataplanePlan:
+    """Validate the data-plane half of the snapshot without touching anything.
+
+    Run by BOTH observability rollback phases: the control-plane phase runs it
+    first so a snapshot that cannot be put back whole is refused before any
+    half of it mutates a cluster or an AMP definition, and the data-plane
+    phase runs it again on its own (idempotent) resume.
     """
 
     observability = previous.get("observability")
     if not isinstance(observability, dict):
         raise ReleaseError("previous observability snapshot is unavailable")
     if "dataplane_adot" not in observability:
-        return _rollback_from_previous_image(release, previous)
+        image = str(previous.get("adot_image") or "")
+        if not image:
+            raise ReleaseError("previous ADOT image is unavailable for the collectors")
+        return _DataplanePlan(path="previous-image", image=image)
     state = observability["dataplane_adot"]
     if not isinstance(state, dict) or not isinstance(state.get("clusters"), dict):
         raise ReleaseError("previous data-plane ADOT collector snapshot is invalid")
@@ -455,44 +646,187 @@ def restore_dataplane_adot_state(
     }
     expected_rules = state.get("expected_rules")
     _expected_rules_parts(expected_rules)
-    record: dict[str, str] = {}
-    for cluster_id, (namespace, objects, absent) in parsed.items():
-        kubectl = release._gpu(targets[cluster_id])
-        apply_snapshot_objects(release, objects, kubectl=kubectl)
-        delete_absent_objects(release, namespace, absent, kubectl=kubectl)
-        restart_snapshot_deployments(
-            release,
-            namespace,
-            objects,
-            timeout=DATAPLANE_ADOT_ROLLOUT_TIMEOUT,
-            kubectl=kubectl,
-        )
-        record[cluster_id] = "restored" if objects else "removed"
-        _say(
-            f"{cluster_id}: data-plane ADOT collector {record[cluster_id]} "
-            "from the previous release's snapshot"
-        )
-    for cluster_id in sorted(set(targets) - set(parsed)):
-        release._scale_if_present(
-            release._gpu(targets[cluster_id]), DATAPLANE_ADOT_DEPLOYMENT, 0
-        )
-        record[cluster_id] = "scaled-to-zero"
-        _say(
-            f"{cluster_id}: data-plane ADOT collector scaled to zero (the cluster "
-            "is not in the previous release's snapshot)"
-        )
-    outcome = restore_dataplane_expected_rules(release, expected_rules)
-    return {"path": "snapshot", "clusters": record, "expected_rules": outcome}
+    return _DataplanePlan(
+        path="snapshot",
+        targets=targets,
+        parsed=parsed,
+        expected_rules=expected_rules,
+    )
 
 
-def restore_observability_with_dataplane(
-    release: Any, previous: dict[str, Any]
+def _rollback_from_previous_image(
+    release: Any, previous: dict[str, Any], plan: _DataplanePlan
 ) -> dict[str, Any]:
-    """The observability restore phase: control-plane snapshot, then the data plane.
+    _say(
+        "previous observability snapshot predates the per-cluster collector "
+        "capture; every configured cluster's collector is re-rendered from the "
+        "CANDIDATE manifest with the previous ADOT image (template edits are "
+        "not undone on the data plane)"
+    )
+    rollback_gpu_adot_collectors(release, previous)
+    return {
+        "path": "previous-image",
+        "image": plan.image,
+        "clusters": {
+            target.cluster_id: "candidate-manifest-with-previous-image"
+            for target in release.config.clusters
+        },
+    }
 
-    Returns the record the rollback's phase runner persists beside the phase
-    timing, so the durable state says which path compensated the collectors.
+
+def _restore_cluster_collector(
+    release: Any, target: ClusterTarget, parts: tuple[str, list[Any], list[Any]]
+) -> str:
+    """One cluster's collector back from its own snapshot; returns the outcome.
+
+    ``restored`` (objects applied, the collector restarted and waited for),
+    ``restored-unchanged`` (every object applied back as ``unchanged``, so the
+    running Pod already serves the previous configuration and is left alone,
+    as the installer leaves the control-plane collector alone on the same
+    evidence) or ``removed`` (the snapshot had no objects: the candidate's were
+    deleted).
     """
 
-    release._restore_observability_snapshot(previous.get("observability"))
-    return {"dataplane_adot": restore_dataplane_adot_state(release, previous)}
+    namespace, objects, absent = parts
+    kubectl = release._gpu(target)
+    changed = apply_snapshot_objects(release, objects, kubectl=kubectl)
+    delete_absent_objects(release, namespace, absent, kubectl=kubectl)
+    if not objects:
+        return "removed"
+    if not changed:
+        return "restored-unchanged"
+    restart_snapshot_deployments(
+        release,
+        namespace,
+        objects,
+        timeout=DATAPLANE_ADOT_ROLLOUT_TIMEOUT,
+        kubectl=kubectl,
+    )
+    return "restored"
+
+
+def _scale_unseen_collector_down(release: Any, target: ClusterTarget) -> str:
+    release._scale_if_present(release._gpu(target), DATAPLANE_ADOT_DEPLOYMENT, 0)
+    return "scaled-to-zero"
+
+
+def restore_dataplane_adot_state(
+    release: Any, previous: dict[str, Any]
+) -> dict[str, Any]:
+    """Put every GPU cluster's collector back the way its snapshot found it.
+
+    Validates the whole snapshot before touching any cluster. Iterates the
+    clusters the SNAPSHOT knows about, not the candidate config, and restores
+    each from its own objects regardless of how far the candidate got on it:
+    re-applying a cluster's own snapshot is idempotent, and reading progress
+    to skip it would tie the compensation to the progress record and leave a
+    partially applied cluster unrestored; the restart is skipped when the
+    apply changed nothing. A configured cluster the snapshot never saw joined
+    site.yaml after the transaction opened (the capture covers the whole
+    candidate config), so it is scaled to zero.
+
+    One cluster failing -- an unreachable API, a ``rollout status`` that times
+    out -- does not stop the others or the expected-rules restore; each failure
+    is recorded per cluster and the phase raises once at the end, naming them,
+    so the rollback is FAILED and a resume re-runs this phase.
+    """
+
+    plan = validate_dataplane_adot_snapshot(release, previous)
+    if plan.path == "previous-image":
+        return _rollback_from_previous_image(release, previous, plan)
+    record: dict[str, str] = {}
+    failed: list[str] = []
+    steps: list[tuple[str, Callable[[], str]]] = [
+        (
+            cluster_id,
+            functools.partial(
+                _restore_cluster_collector, release, plan.targets[cluster_id], parts
+            ),
+        )
+        for cluster_id, parts in plan.parsed.items()
+    ]
+    steps.extend(
+        (
+            cluster_id,
+            functools.partial(
+                _scale_unseen_collector_down, release, plan.targets[cluster_id]
+            ),
+        )
+        for cluster_id in sorted(set(plan.targets) - set(plan.parsed))
+    )
+    for cluster_id, step in steps:
+        try:
+            record[cluster_id] = step()
+        except Exception as exc:  # noqa: BLE001 -- one cluster must not stop the rest
+            record[cluster_id] = f"failed: {type(exc).__name__}: {exc}"
+            failed.append(cluster_id)
+        _say(f"{cluster_id}: data-plane ADOT collector {record[cluster_id]}")
+    try:
+        outcome = restore_dataplane_expected_rules(release, plan.expected_rules)
+    except Exception as exc:  # noqa: BLE001 -- recorded beside the clusters
+        outcome = f"failed: {type(exc).__name__}: {exc}"
+        failed.append("expected-rules")
+    details = {"path": "snapshot", "clusters": record, "expected_rules": outcome}
+    if failed:
+        reasons = "; ".join(
+            f"{name} ({record[name] if name in record else outcome})" for name in failed
+        )
+        others = ", ".join(
+            f"{name} {state}" for name, state in record.items() if name not in failed
+        )
+        raise DataplaneRollbackIncomplete(
+            f"data-plane observability rollback failed on {len(failed)} of "
+            f"{len(steps) + 1} steps: {reasons}"
+            + (f" -- the rest was restored ({others})" if others else "")
+            + "; resume the rollback to retry the failed ones",
+            phase_details=details,
+        )
+    return details
+
+
+def restore_control_plane_observability(
+    release: Any, previous: dict[str, Any]
+) -> dict[str, Any]:
+    """The ``observability_restore`` phase: the control-plane half only.
+
+    Validates the WHOLE observability snapshot first -- the data-plane half
+    included, although that half is restored later in its own phase -- so a
+    snapshot that cannot be put back whole is refused before any AMP definition
+    or collector object is touched. Returns the record the phase runner
+    persists.
+    """
+
+    plan = validate_dataplane_adot_snapshot(release, previous)
+    restarted = release._restore_observability_snapshot(previous.get("observability"))
+    record: dict[str, Any] = {
+        "dataplane_adot": f"deferred to {DATAPLANE_OBSERVABILITY_PHASE} ({plan.path})"
+    }
+    if isinstance(restarted, bool):
+        record["control_plane_collector"] = (
+            "restored" if restarted else "restored-unchanged"
+        )
+    return record
+
+
+def restore_dataplane_observability_phase(
+    release: Any,
+    previous: dict[str, Any],
+    compensation: Any,
+    run_phase: Callable[[str, str, str, Callable[[], object]], None],
+) -> None:
+    """Run the data-plane observability rollback phase through ``run_phase``.
+
+    Placed by ``rollback_release`` after the CPU restore: the previous control
+    plane comes back before any GPU cluster's collector is touched, so an
+    unreachable GPU cluster cannot hold the control plane hostage. Gated like
+    the control-plane half, on the compensation plan's OBSERVABILITY component.
+    """
+
+    if not compensation.restores_observability:
+        return
+    run_phase(
+        DATAPLANE_OBSERVABILITY_PHASE,
+        DATAPLANE_OBSERVABILITY_RESTORING,
+        DATAPLANE_OBSERVABILITY_RESTORED,
+        lambda: restore_dataplane_adot_state(release, previous),
+    )

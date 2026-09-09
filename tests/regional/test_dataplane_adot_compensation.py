@@ -7,10 +7,17 @@ candidate never touched, and left a collector running on a cluster whose role
 the candidate had just added. These tests pin the compensation: the previous
 release's live objects are captured per cluster before the OBSERVABILITY node
 runs, and rollback restores each cluster from ITS snapshot -- objects put back
-where a collector was live, the candidate's objects deleted where none was,
-and a cluster the snapshot never saw scaled to zero. The previous-image path
-survives only for a state captured before the snapshot existed, and the
-rollback record says which path ran.
+where a collector was live, the candidate's objects deleted where none was. The
+capture iterates the candidate config, so a cluster the candidate ADDED is in
+the snapshot too (every object absent -> ``removed``); ``scaled-to-zero`` is
+reached only by a cluster added to site.yaml between the transaction's opening
+and its rollback, and a cluster removed from site.yaml in that window refuses
+the rollback. The previous-image path survives only for a state captured before
+the snapshot existed, and the rollback record says which path ran.
+
+Fix round 2: the data-plane half is its own rollback phase, after the CPU
+control plane is back; one cluster failing does not stop the others or the
+expected-rules restore, and the phase then fails naming every failed cluster.
 """
 
 from __future__ import annotations
@@ -22,8 +29,11 @@ from typing import Any
 
 import pytest
 
+from gpu_fault_release import regional_admin_commands as ADMIN
 from gpu_fault_release import regional_dataplane_observability as DATAPLANE
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
+from gpu_fault_release import regional_manifest_snapshot as SNAPSHOT
+from gpu_fault_release import regional_observability_rollback as CONTROL_PLANE
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_progress as PROGRESS
@@ -230,8 +240,34 @@ def _identity() -> dict[str, Any]:
     }
 
 
+PHASE = "dataplane_observability_restore"
+PHASE_DONE = "rollback-dataplane-observability-restored"
+NOT_FOUND = "An error occurred (ResourceNotFoundException) when calling ..."
+
+
+def _describe_answer(status: str = "ACTIVE") -> tuple[int, str, str]:
+    return (
+        0,
+        json.dumps(
+            {
+                "ruleGroupsNamespace": {
+                    "status": {"statusCode": status},
+                    "data": "Z3JvdXBzOiBbXQo=",
+                }
+            }
+        ),
+        "",
+    )
+
+
 class _Rollback:
-    """Drive ``rollback_release`` with only the observability restore live."""
+    """Drive ``rollback_release`` with only the observability restores live.
+
+    ``failing_status`` names the kube contexts whose ``rollout status`` fails;
+    ``apply_output`` is what ``kubectl apply`` prints on every cluster (the
+    default, an empty string, is read as "changed"); ``cpu`` adds the CPU
+    finalize to the completed phases so the CPU restore phase is planned.
+    """
 
     def __init__(
         self,
@@ -239,7 +275,11 @@ class _Rollback:
         clusters: tuple[SimpleNamespace, ...],
         *,
         expected_rules_present: bool = True,
+        failing_status: frozenset[str] = frozenset(),
+        apply_output: str = "",
+        cpu: bool = False,
     ) -> None:
+        self.phase_calls: list[str] = []
         for name in (
             "_stage_rollback_controller",
             "_rollback_gpu_clusters",
@@ -247,9 +287,14 @@ class _Rollback:
             "_verify_and_complete_rollback",
             "cleanup_candidate_rollout_state",
         ):
-            monkeypatch.setattr(ORCHESTRATION, name, lambda *_args, **_kwargs: None)
+            monkeypatch.setattr(
+                ORCHESTRATION,
+                name,
+                lambda *_args, _name=name, **_kwargs: self.phase_calls.append(_name),
+            )
         self.clusters = clusters
         self.calls: list[list[str]] = []
+        self.probes: list[list[str]] = []
         self.applied: list[tuple[str, Any]] = []
         self.candidate_renders: list[str] = []
         self.scaled: list[tuple[list[str], str, int]] = []
@@ -264,10 +309,30 @@ class _Rollback:
                 self.applied.append(
                     (arguments[2], json.loads(path.read_text(encoding="utf-8")))
                 )
+                return apply_output
+            if (
+                arguments[0] == "kubectl"
+                and "status" in arguments
+                and arguments[2] in failing_status
+            ):
+                raise ReleaseError(f"command failed (1): kubectl on {arguments[2]}")
             return ""
 
-        def probe(arguments: list[str], **_kwargs: Any) -> bool:
-            return self.expected_rules_present
+        def probe_output(arguments: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+            self.probes.append(list(arguments))
+            if self.expected_rules_present:
+                return _describe_answer()
+            return 254, "", NOT_FOUND
+
+        completed = ["uploaded", "observability-ready"]
+        nodes = ["observability", "verify"]
+        if cpu:
+            completed.append("cpu-finalized")
+            nodes.insert(1, "cpu_finalize")
+
+        def control_plane(snapshot: Any) -> None:
+            self.control_plane_restored.append(snapshot)
+            self.phase_calls.append("_restore_observability_snapshot")
 
         self.release = SimpleNamespace(
             state={
@@ -275,8 +340,8 @@ class _Rollback:
                     "kind": str(DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY),
                     "changed": ["observability_adot"],
                 },
-                "execution_plan": {"nodes": ["observability", "verify"]},
-                "completed_phases": ["uploaded", "observability-ready"],
+                "execution_plan": {"nodes": nodes},
+                "completed_phases": completed,
             },
             runtime_image="candidate-runtime",
             node_installer_image="registry.example/installer:candidate",
@@ -287,14 +352,14 @@ class _Rollback:
                 aws_region="us-east-1",
                 health=SimpleNamespace(amp_workspace_id="ws-a"),
             ),
-            runner=SimpleNamespace(run=run, probe=probe),
+            runner=SimpleNamespace(run=run, probe_output=probe_output),
             _gpu=_gpu,
             _refresh_aurora_credentials=lambda: None,
             _require_no_inflight_installs=lambda **_kwargs: None,
             _save_state=lambda phase, **updates: self.saves.append(
                 {"phase": phase, **updates}
             ),
-            _restore_observability_snapshot=self.control_plane_restored.append,
+            _restore_observability_snapshot=control_plane,
             _apply_gpu_adot_collector=lambda target, *, image: (
                 self.candidate_renders.append(f"{target.cluster_id}@{image}")
             ),
@@ -327,9 +392,15 @@ class _Rollback:
             if arguments[:3] == ["kubectl", "--context", context]
         ]
 
+    def phase(self) -> dict[str, Any]:
+        """The data-plane phase's durable timing entry from the last save."""
+        return dict(self.saves[-1]["rollback_timing"]["phases"][PHASE])
+
     def record(self) -> dict[str, Any]:
-        phases = self.saves[-1]["rollback_timing"]["phases"]
-        return phases["observability_restore"]["details"]["dataplane_adot"]
+        return dict(self.phase()["details"])
+
+    def saved_phases(self) -> list[str]:
+        return [str(save["phase"]) for save in self.saves]
 
 
 def _snapshot_present(marker: str = "previous") -> dict[str, Any]:
@@ -366,9 +437,12 @@ def test_rollback_restores_each_cluster_from_its_own_snapshot(
 ) -> None:
     """(i) the SNAPSHOT objects are applied, never the candidate's rendering;
     (ii) a cluster with no collector before the release has the candidate's
-    objects deleted, not a collector created; a cluster in the candidate config
-    the snapshot never saw is scaled to zero; and the expected-collector rule
-    namespace goes back to what it was."""
+    objects deleted, not a collector created (this is also what a cluster the
+    candidate ADDED looks like: the capture iterates the candidate config, so
+    it is in the snapshot with every object absent); a configured cluster the
+    snapshot never saw -- one added to site.yaml after the transaction opened
+    -- is scaled to zero; and the expected-collector rule namespace goes back
+    to what it was."""
     harness = _Rollback(
         monkeypatch, (_target("gpu-a"), _target("gpu-b"), _target("gpu-c"))
     )
@@ -418,7 +492,8 @@ def test_rollback_restores_each_cluster_from_its_own_snapshot(
     assert not any(
         "apply" in arguments for arguments in harness.kubectl("gpu-b-context")
     ), "a collector was created on a cluster that had none before the release"
-    # gpu-c: not in the snapshot -> the candidate created it -> scaled to zero.
+    # gpu-c: not in the snapshot -> joined site.yaml after the transaction
+    # opened, so the candidate never captured it -> scaled to zero.
     assert harness.scaled == [
         (["kubectl", "--context", "gpu-c-context"], DATAPLANE_ADOT_DEPLOYMENT, 0)
     ]
@@ -544,6 +619,346 @@ def test_a_snapshot_cluster_missing_from_the_config_refuses_before_mutation(
     assert harness.applied == [] and harness.scaled == [], (
         "a snapshot that cannot be restored still mutated a cluster"
     )
+    # LOW-1: the WHOLE observability snapshot is validated before either half
+    # mutates anything -- the control-plane AMP blobs and collector included.
+    assert harness.control_plane_restored == [], (
+        "the control-plane observability was restored on a snapshot whose "
+        "data-plane half cannot be put back"
+    )
+    assert harness.calls == [] and harness.probes == [], (
+        f"a refused snapshot still issued commands: {harness.calls + harness.probes}"
+    )
+
+
+def test_a_fallback_state_without_the_previous_image_refuses_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOW-1 for the previous-image path: the missing ``adot_image`` is found
+    before the control-plane half is put back, not after."""
+    harness = _Rollback(monkeypatch, (_target("gpu-a"),))
+    previous_without_image = {"observability": {"adot": []}}
+
+    with pytest.raises(ReleaseError, match="previous ADOT image"):
+        DATAPLANE.restore_control_plane_observability(
+            harness.release, previous_without_image
+        )
+
+    assert harness.control_plane_restored == [], (
+        "the control-plane snapshot was restored although the data-plane half "
+        "cannot be compensated"
+    )
+
+
+# --- fix round 2, MEDIUM-2: an own phase, after the control plane, that continues
+
+
+def test_the_dataplane_phase_runs_after_the_control_plane_is_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control-plane observability snapshot is still restored where it was
+    (before the data plane); the per-cluster collectors get their own phase,
+    checkpointed after ``rollback-cpu-restored``: a GPU cluster whose API is
+    unreachable is a common reason the release failed in the first place, and
+    it must not stop the previous control plane from coming back."""
+    harness = _Rollback(monkeypatch, (_target("gpu-a"),), cpu=True)
+
+    harness.run(
+        {
+            "dataplane_adot": {
+                "clusters": {"gpu-a": _snapshot_present()},
+                "expected_rules": {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="},
+            }
+        }
+    )
+
+    phases = harness.saved_phases()
+    assert "rollback-cpu-restored" in phases, phases
+    assert phases.index("rollback-observability-restored") < phases.index(
+        "rollback-cpu-restored"
+    ), phases
+    assert phases.index("rollback-cpu-restored") < phases.index(PHASE_DONE), phases
+    assert phases.index(PHASE_DONE) < phases.index("rollback-restored"), phases
+    # The control-plane half ran in its own phase before the CPU restore, the
+    # data-plane objects were touched only after it.
+    first_kubectl = next(
+        index for index, call in enumerate(harness.calls) if call[0] == "kubectl"
+    )
+    assert len(harness.control_plane_restored) == 1, harness.control_plane_restored
+    assert harness.control_plane_restored[0]["adot"] == []
+    assert harness.phase_calls.index("_restore_observability_snapshot") < (
+        harness.phase_calls.index("_restore_rollback_cpu")
+    ), harness.phase_calls
+    assert first_kubectl >= 0
+    assert harness.record()["clusters"] == {"gpu-a": "restored"}
+    assert harness.phase()["status"] == "COMPLETED"
+    for name in (PHASE_DONE, "rollback-dataplane-observability-restoring"):
+        assert name in ADMIN.ROLLBACK_PHASES, (
+            f"{name} is not a rollback phase the admin resume recognises"
+        )
+
+
+def test_one_failed_cluster_does_not_stop_the_others_or_the_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gpu-a's ``rollout status`` fails: gpu-b is still restored, the expected
+    rules are still put back, and the phase then raises ONE error naming gpu-a,
+    so the rollback is honestly FAILED (a resume re-runs the phase) while the
+    durable record shows what did and did not happen per cluster."""
+    harness = _Rollback(
+        monkeypatch,
+        (_target("gpu-a"), _target("gpu-b")),
+        failing_status=frozenset({"gpu-a-context"}),
+    )
+
+    with pytest.raises(ReleaseError, match="gpu-a") as failure:
+        harness.run(
+            {
+                "dataplane_adot": {
+                    "clusters": {
+                        "gpu-a": _snapshot_present("a"),
+                        "gpu-b": _snapshot_present("b"),
+                    },
+                    "expected_rules": {
+                        "present": True,
+                        "data_base64": "Z3JvdXBzOiBbXQo=",
+                    },
+                }
+            }
+        )
+
+    assert "gpu-b" not in str(failure.value).split("restored")[0], (
+        f"the error names a cluster that was restored as failed: {failure.value}"
+    )
+    assert [context for context, _ in harness.applied] == [
+        "gpu-a-context",
+        "gpu-b-context",
+    ], "the failure on gpu-a stopped gpu-b from being restored"
+    aws = [arguments for arguments in harness.calls if arguments[0] == "aws"]
+    assert "put-rule-groups-namespace" in [arguments[2] for arguments in aws], (
+        "the expected-rules restore was skipped after a cluster failed"
+    )
+    phase = harness.phase()
+    assert phase["status"] == "FAILED", phase
+    record = phase["details"]
+    assert record["clusters"]["gpu-b"] == "restored", record
+    assert record["clusters"]["gpu-a"].startswith("failed: "), record
+    assert "gpu-a-context" in record["clusters"]["gpu-a"], record
+    assert record["expected_rules"] == "restored", record
+    assert record["path"] == "snapshot", record
+    assert "gpu-a" in record["error"], record
+    assert PHASE_DONE not in harness.saves[-1]["rollback_completed_phases"], (
+        "a phase that failed on a cluster was checkpointed as complete"
+    )
+
+
+# --- fix round 2, LOW-4: an unchanged apply does not restart the collector -------
+
+UNCHANGED_APPLY = (
+    f"configmap/{DATAPLANE_ADOT_DEPLOYMENT} unchanged\n"
+    f"deployment.apps/{DATAPLANE_ADOT_DEPLOYMENT} unchanged\n"
+)
+
+
+def test_an_unchanged_apply_skips_the_collector_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cluster the candidate never touched applies as ``unchanged`` on every
+    object; restarting its collector anyway costs a 30-60 s Recreate gap on a
+    cluster that was never wrong. The record says so per cluster."""
+    harness = _Rollback(monkeypatch, (_target("gpu-a"),), apply_output=UNCHANGED_APPLY)
+
+    harness.run(
+        {
+            "dataplane_adot": {
+                "clusters": {"gpu-a": _snapshot_present()},
+                "expected_rules": {"present": False, "data_base64": None},
+            }
+        }
+    )
+
+    verbs = [
+        next(word for word in arguments if word in {"apply", "delete", "rollout"})
+        for arguments in harness.kubectl("gpu-a-context")
+    ]
+    assert verbs == ["apply"], verbs
+    assert harness.record()["clusters"] == {"gpu-a": "restored-unchanged"}
+
+
+def test_apply_snapshot_objects_reports_whether_anything_changed() -> None:
+    outputs: list[str] = []
+    release = SimpleNamespace(
+        runner=SimpleNamespace(run=lambda *_a, **_k: outputs.pop(0)),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+    objects = [{"kind": "ConfigMap", "metadata": {"name": "x"}}]
+
+    outputs[:] = ["configmap/x unchanged\ndeployment.apps/y unchanged"]
+    assert SNAPSHOT.apply_snapshot_objects(release, objects) is False
+    outputs[:] = ["configmap/x unchanged\ndeployment.apps/y configured"]
+    assert SNAPSHOT.apply_snapshot_objects(release, objects) is True
+    # Output the caller cannot parse (a stub runner, a dry run) is "changed":
+    # the restart is the safe default, skipping it is the optimisation.
+    outputs[:] = [""]
+    assert SNAPSHOT.apply_snapshot_objects(release, objects) is True
+    assert SNAPSHOT.apply_snapshot_objects(release, []) is False
+
+
+def test_the_control_plane_collector_restore_is_gated_the_same_way() -> None:
+    """The installer already skips the control-plane collector's restart on an
+    ``unchanged`` pair (install-amp-monitoring.sh); its rollback twin does now."""
+    calls: list[list[str]] = []
+
+    def run(arguments: list[str], **_kwargs: Any) -> str:
+        calls.append(list(arguments))
+        if "apply" in arguments:
+            return "configmap/gpu-fault-adot unchanged\ndeployment.apps/gpu-fault-adot unchanged"
+        return ""
+
+    release = SimpleNamespace(
+        runner=SimpleNamespace(run=run), _cpu=lambda *args: ["kubectl", *args]
+    )
+    snapshot = {
+        "adot": {
+            "namespace": NAMESPACE,
+            "objects": [
+                {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "gpu-fault-adot"},
+                }
+            ],
+            "absent": [],
+        }
+    }
+
+    CONTROL_PLANE.restore_adot_objects(release, snapshot)
+
+    assert not any("rollout" in arguments for arguments in calls), calls
+
+
+def test_the_control_plane_snapshot_is_validated_whole_before_the_amp_puts() -> None:
+    """LOW-1 on the control-plane half: an ADOT object list that cannot be put
+    back is found before the AMP rule and Alertmanager blobs are rewritten."""
+    calls: list[list[str]] = []
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            aws_region="us-east-1", health=SimpleNamespace(amp_workspace_id="ws-a")
+        ),
+        runner=SimpleNamespace(run=lambda a, **_k: calls.append(list(a)) or ""),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+
+    with pytest.raises(ReleaseError, match="ADOT collector"):
+        CONTROL_PLANE.restore_observability_snapshot(
+            release,
+            {
+                "rule_namespace": "rules",
+                "rules_data_base64": "cnVsZXM=",
+                "alertmanager_data_base64": "YWxlcnRz",
+                "adot": {"namespace": NAMESPACE, "objects": [], "absent": []},
+            },
+        )
+
+    assert calls == [], f"the AMP blobs were rewritten before validation: {calls}"
+
+
+# --- fix round 2, LOW-5 / MEDIUM-3: the rules namespace's state is read, not guessed
+
+
+def _rules_release(
+    answers: list[tuple[int, str, str]],
+) -> tuple[Any, list[list[str]], list[float]]:
+    calls: list[list[str]] = []
+    slept: list[float] = []
+
+    def probe_output(arguments: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        calls.append(list(arguments))
+        return answers.pop(0)
+
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            aws_region="us-east-1", health=SimpleNamespace(amp_workspace_id="ws-a")
+        ),
+        runner=SimpleNamespace(
+            run=lambda a, **_k: calls.append(list(a)) or "", probe_output=probe_output
+        ),
+    )
+    return release, calls, slept
+
+
+def test_a_transient_describe_failure_is_not_read_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boolean probe turned a throttle or a credentials error into "the
+    namespace is absent", and the restore then tried to CREATE over an existing
+    namespace (or skipped a delete). Only ResourceNotFoundException is absence."""
+    release, calls, _slept = _rules_release([(255, "", "Unable to locate credentials")])
+
+    with pytest.raises(ReleaseError, match="expected-collector rule namespace"):
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": False, "data_base64": None}
+        )
+
+    assert [c[2] for c in calls] == ["describe-rule-groups-namespace"], calls
+
+
+def test_a_namespace_still_deleting_is_waited_for_before_the_put(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The candidate's installer may have just deleted the namespace (AMP deletes
+    asynchronously); a put on a DELETING namespace is a ConflictException. The
+    restore waits for it to settle -- here it disappears, so it is created."""
+    release, calls, slept = _rules_release(
+        [
+            _describe_answer("DELETING"),
+            _describe_answer("DELETING"),
+            (254, "", NOT_FOUND),
+        ]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
+
+    outcome = DATAPLANE.restore_dataplane_expected_rules(
+        release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+    )
+
+    assert outcome == "restored"
+    assert [c[2] for c in calls] == [
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "create-rule-groups-namespace",
+    ], calls
+    assert len(slept) == 2, slept
+
+
+def test_a_namespace_still_updating_is_waited_for_then_put(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, calls, slept = _rules_release(
+        [_describe_answer("UPDATING"), _describe_answer("ACTIVE")]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
+
+    outcome = DATAPLANE.restore_dataplane_expected_rules(
+        release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+    )
+
+    assert outcome == "restored"
+    assert [c[2] for c in calls][-1] == "put-rule-groups-namespace", calls
+    assert len(slept) == 1, slept
+
+
+def test_a_namespace_that_never_settles_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, _calls, _slept = _rules_release([_describe_answer("CREATING")] * 4)
+    monkeypatch.setattr(DATAPLANE, "_sleep", lambda _s: None)
+    monkeypatch.setattr(DATAPLANE, "EXPECTED_RULES_SETTLE_ATTEMPTS", 3)
+
+    with pytest.raises(ReleaseError, match="CREATING"):
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+        )
 
 
 def test_the_replayed_manifest_narrative_is_true_for_both_collectors() -> None:
