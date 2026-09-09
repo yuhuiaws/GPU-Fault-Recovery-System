@@ -26,8 +26,12 @@ from gpu_fault_release import regional_validation_evidence as EVIDENCE
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _release() -> SimpleNamespace:
-    return SimpleNamespace(config=SimpleNamespace(site_name="test-site"))
+def _release(release_id: str = "release-a") -> SimpleNamespace:
+    # The candidate this deploy would apply; the pending-commit case below is
+    # the *same* candidate resuming into its commit, so the ids match.
+    return SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"), release_id=release_id
+    )
 
 
 def _persisted_diff(module, monkeypatch: pytest.MonkeyPatch) -> None:
