@@ -74,6 +74,7 @@
           "src/gpu_fault_release/regional_admin_checks.py",
           "src/gpu_fault_release/regional_admin_commands.py",
           "src/gpu_fault_release/regional_aurora_credentials.py",
+          "src/gpu_fault_release/regional_dataplane_observability.py",
           "src/gpu_fault_release/regional_deployment_inventory.py",
           "src/gpu_fault_release/regional_dns.py",
           "src/gpu_fault_release/regional_endpoint_rollback.py",
