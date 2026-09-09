@@ -345,7 +345,7 @@ def test_remote_command_digest_includes_rebound_nodes() -> None:
     )
 
 
-def test_failed_remote_restart_releases_restart_budget() -> None:
+def test_failed_remote_restart_leaves_the_reservation_to_terminalization() -> None:
     store = build_store()
     store.save_regional_cluster(registration("cluster-a", TOKEN_A))
     adapter = RegionalRemoteWorkflowAdapter(
@@ -368,6 +368,8 @@ def test_failed_remote_restart_releases_restart_budget() -> None:
     context = replace(
         base, workflow=workflow, step=step, idempotency_key="restart-budget-release"
     )
+    # The preflight's reservation; dispatch only signs it.
+    store.reserve_job_restart("cluster-a", "training-a", 1, "restart-budget-release")
     adapter.execute(context)
     command = store.claim_remote_commands(
         "cluster-a",
@@ -389,9 +391,12 @@ def test_failed_remote_restart_releases_restart_budget() -> None:
     failed = adapter.execute(context)
     budget = store.get_restart_budget("cluster-a", "training-a")
 
+    # Dispatch neither reserves nor releases: the reservation stays with the
+    # step until the workflow's terminal write decides whether the restart
+    # ever left the gate (``release_unattempted_restart_reservations``).
     assert failed.status is WorkflowStepStatus.FAILED
-    assert budget.restart_count == 0
-    assert budget.reservation_ids == []
+    assert budget.restart_count == 1
+    assert budget.reservation_ids == ["restart-budget-release"]
 
 
 def test_remote_claim_filters_execution_owners_and_legacy_api() -> None:
@@ -710,6 +715,10 @@ def test_regional_api_sends_executor_workload_restart_notification() -> None:
         },
     )
     workflow = copy_model(base.workflow, official_steps=[step])
+    # The preflight's reservation; dispatch only signs it.
+    context.store.reserve_job_restart(
+        "cluster-a", "training-a", 2, "workflow-workload-restart/0/RESTART_WORKLOAD"
+    )
     remote.execute(
         replace(
             base,

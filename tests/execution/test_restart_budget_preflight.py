@@ -9,10 +9,12 @@ from gpu_fault.execution import (
     WorkflowStepOutcome,
 )
 from gpu_fault.execution.restart_budget_preflight import (
+    issue_restart_authorization,
     release_unattempted_restart_reservations,
 )
 from gpu_fault.models import (
     IncidentState,
+    RestartAuthorization,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -232,5 +234,179 @@ def test_cancelled_waiting_restart_releases_reservation() -> None:
     release_unattempted_restart_reservations(store, workflow, release_step_indexes={2})
 
     state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.restart_count == 0
+    assert state.reservation_ids == []
+
+
+def test_issue_authorization_requires_an_existing_reservation() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+        },
+    )
+
+    missing = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+    assert isinstance(missing, WorkflowStepOutcome)
+    assert missing.status is WorkflowStepStatus.FAILED
+    assert missing.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert missing.details["reservation_id"] == "wf/0/RESTART_WORKLOAD"
+
+    store.reserve_job_restart("cluster-a", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+    granted = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+    assert isinstance(granted, RestartAuthorization)
+    assert granted.reservation_id == "wf/0/RESTART_WORKLOAD"
+    assert granted.restart_count == 1
+    assert granted.restart_budget == 1
+    assert granted.source_gpu_count == 8
+    assert granted.source_attempt_id == "train-1-a1"
+
+
+def test_issue_authorization_rejects_a_reservation_held_by_another_step() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 2,
+        },
+    )
+    store.reserve_job_restart("cluster-a", "train-1", 2, "other-wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    # The budget row exists but this step's reservation is not on it: still
+    # fail closed, and say how much of the budget is spoken for.
+    assert isinstance(outcome, WorkflowStepOutcome)
+    assert outcome.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert outcome.details["restart_count"] == 1
+    assert outcome.details["restart_budget"] == 2
+
+
+def test_issue_authorization_reports_missing_safety_context() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "restart_budget": 1,
+        },
+    )
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    assert isinstance(outcome, WorkflowStepOutcome)
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error == (
+        "restart safety context is missing: source_attempt_id, source_gpu_count"
+    )
+    assert outcome.details["reason"] == "RESTART_SAFETY_CONTEXT_MISSING"
+    assert outcome.details["missing_parameters"] == [
+        "source_attempt_id",
+        "source_gpu_count",
+    ]
+
+
+class AuthorizationRecordingAdapter(RecordingAdapter):
+    """Records the authorization each step's request carried."""
+
+    def __init__(self, store: InMemoryStore) -> None:
+        super().__init__(store)
+        self.authorizations: list[RestartAuthorization | None] = []
+
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        self.authorizations.append(context.request.restart_authorization)
+        return super().execute(context)
+
+
+def test_dispatch_hands_the_preflight_reservation_to_the_restart_adapter() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = AuthorizationRecordingAdapter(store)
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert result.status is WorkflowStatus.SUCCEEDED
+    assert adapter.authorizations == [
+        None,
+        None,
+        RestartAuthorization(
+            cluster_id="cluster-a",
+            job_id="training-a",
+            source_attempt_id="attempt-a",
+            source_gpu_count=1,
+            restart_budget=1,
+            restart_count=1,
+            reservation_id="workflow-a/2/RESTART_WORKLOAD",
+        ),
+    ]
+    # Signing the reservation is a read: the preflight's row is untouched.
+    assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+
+
+class ReleasingAdapter:
+    """Drops the restart reservation mid-workflow.
+
+    Stands in for a release that raced dispatch (a reaper, an operator
+    restore) so the test can see what the restart step does when the
+    preflight's reservation is no longer there to sign.
+    """
+
+    def __init__(self, store: InMemoryStore) -> None:
+        self.store = store
+        self.calls: list[WorkflowOperation] = []
+
+    def supports(self, step: WorkflowStepSpec) -> bool:
+        return step.execution_owner == "owner-a"
+
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        self.calls.append(context.step.operation)
+        if context.step.operation is WorkflowOperation.STOP_WORKLOADS:
+            self.store.release_job_restart(
+                "cluster-a", "training-a", "workflow-a/2/RESTART_WORKLOAD"
+            )
+        return WorkflowStepOutcome.succeeded()
+
+
+def test_dispatch_fails_closed_when_the_reservation_is_gone() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = ReleasingAdapter(store)
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    persisted = store.get_workflow(workflow.request_id)
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert result.status is WorkflowStatus.FAILED
+    # The restart adapter never ran: dispatch does not reserve on its behalf.
+    assert adapter.calls == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    execution = [item for item in persisted.step_executions if item.step_index == 2][-1]
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert execution.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert execution.details["reservation_id"] == "workflow-a/2/RESTART_WORKLOAD"
     assert state.restart_count == 0
     assert state.reservation_ids == []

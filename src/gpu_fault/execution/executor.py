@@ -2564,6 +2564,16 @@ class ProductionWorkflowExecutor:
                 index,
                 phase=restart_preflight.reservation_phase(workflow),
             )
+            if request.restart_authorization is None:
+                # The preflight already reserved under that id; dispatch signs
+                # the reservation for the adapter rather than reserving again,
+                # and fails closed when it is gone.
+                issued = restart_preflight.issue_restart_authorization(
+                    self.store, incident, step, idempotency_key
+                )
+                if isinstance(issued, WorkflowStepOutcome):
+                    return issued
+                request = request.model_copy(update={"restart_authorization": issued})
         context = WorkflowStepContext(
             workflow=workflow,
             incident=incident,

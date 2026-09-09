@@ -12,6 +12,7 @@ from gpu_fault.execution.remediation_budget import remediation_budget_claims
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
+    RestartAuthorization,
     WorkflowExecutionRequest,
     WorkflowOperation,
     WorkflowRequest,
@@ -80,6 +81,61 @@ def reservation_id(
     if phase == "safety":
         return f"{workflow.request_id}/safety/{step_index}/{operation}"
     return f"{workflow.request_id}/{step_index}/{operation}"
+
+
+def issue_restart_authorization(
+    store: Any,
+    incident: FaultIncident,
+    step: WorkflowStepSpec,
+    reservation_id: str,
+) -> RestartAuthorization | WorkflowStepOutcome:
+    """The proof a data-plane restart carries: the preflight's reservation.
+
+    Only ``reserve_restart_budgets`` reserves; this reads that reservation
+    back and signs it. A step without one is a step the preflight never
+    admitted (or whose reservation was released as unattempted) and fails
+    closed rather than reserving here.
+    """
+
+    parameters = step.parameters
+    missing = _REQUIRED_RESTART_PARAMETERS - set(parameters)
+    if missing:
+        return WorkflowStepOutcome.failed(
+            "restart safety context is missing: " + ", ".join(sorted(missing)),
+            details={
+                "reason": "RESTART_SAFETY_CONTEXT_MISSING",
+                "missing_parameters": sorted(missing),
+            },
+        )
+    cluster_id = str(parameters["cluster_id"])
+    job_id = str(parameters["job_id"])
+    try:
+        state = store.get_restart_budget(cluster_id, job_id)
+    except NotFoundError:
+        state = None
+    if state is None or reservation_id not in state.reservation_ids:
+        return WorkflowStepOutcome.failed(
+            f"restart reservation missing for {cluster_id}/{job_id}: {reservation_id}",
+            details={
+                "reason": "RESTART_RESERVATION_MISSING",
+                "reservation_id": reservation_id,
+                "restart_count": state.restart_count if state is not None else 0,
+                "restart_budget": (
+                    state.budget
+                    if state is not None
+                    else int(parameters["restart_budget"])
+                ),
+            },
+        )
+    return RestartAuthorization(
+        cluster_id=cluster_id,
+        job_id=job_id,
+        source_attempt_id=str(parameters["source_attempt_id"]),
+        source_gpu_count=int(parameters["source_gpu_count"]),
+        restart_budget=state.budget,
+        restart_count=state.restart_count,
+        reservation_id=reservation_id,
+    )
 
 
 _reservation_id = reservation_id

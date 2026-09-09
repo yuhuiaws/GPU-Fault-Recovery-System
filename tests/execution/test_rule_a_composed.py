@@ -210,6 +210,13 @@ def test_the_running_premise_gives_up_at_the_window_not_the_generic_step_cap():
     # than the window but far less than the 600s generic step cap. The step's
     # clock is floored at the execution window's start (deadline minus the
     # workflow budget), so the deadline is placed to open that window 600s ago.
+    # Its first claim's preflight reserved the restart; dispatch signs that.
+    store.reserve_job_restart(
+        str(RESTART_PARAMETERS["cluster_id"]),
+        str(RESTART_PARAMETERS["job_id"]),
+        int(RESTART_PARAMETERS["restart_budget"]),
+        "wf-restart/0/RESTART_WORKLOAD",
+    )
     budget = ProductionExecutorConfig.workflow_execution_timeout_seconds
     store.save_workflow(
         copy_model(

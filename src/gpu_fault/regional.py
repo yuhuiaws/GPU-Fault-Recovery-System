@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import Field, field_validator, model_validator
 
+import gpu_fault.execution.restart_budget_preflight as restart_budget_preflight
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -752,53 +753,17 @@ class RegionalRemoteWorkflowAdapter:
                     "mutation_submitted_by_control_plane": False,
                 },
             )
-        restart_authorization = None
-        restart_reservation: tuple[str, str, str] | None = None
+        restart_authorization: RestartAuthorization | None = None
         if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
-            parameters = context.step.parameters
-            required = {
-                "cluster_id",
-                "job_id",
-                "source_attempt_id",
-                "source_gpu_count",
-                "restart_budget",
-            }
-            missing = required - set(parameters)
-            if missing:
-                return WorkflowStepOutcome.failed(
-                    "restart safety context is missing: " + ", ".join(sorted(missing))
-                )
-            state, reserved = self.store.reserve_job_restart(
-                str(parameters["cluster_id"]),
-                str(parameters["job_id"]),
-                int(parameters["restart_budget"]),
-                context.idempotency_key,
+            # The preflight is the only site that reserves restart budget;
+            # dispatch reads that reservation back and signs it for the data
+            # plane. A step without one fails closed instead of reserving here.
+            issued = restart_budget_preflight.issue_restart_authorization(
+                self.store, context.incident, context.step, context.idempotency_key
             )
-            if not reserved:
-                return WorkflowStepOutcome.failed(
-                    "restart budget exhausted for "
-                    f"{state.cluster_id}/{state.job_id}: "
-                    f"{state.restart_count}/{state.budget}",
-                    details={
-                        "reason": "RESTART_BUDGET_EXHAUSTED",
-                        "restart_count": state.restart_count,
-                        "restart_budget": state.budget,
-                    },
-                )
-            restart_reservation = (
-                state.cluster_id,
-                state.job_id,
-                context.idempotency_key,
-            )
-            restart_authorization = RestartAuthorization(
-                cluster_id=state.cluster_id,
-                job_id=state.job_id,
-                source_attempt_id=str(parameters["source_attempt_id"]),
-                source_gpu_count=int(parameters["source_gpu_count"]),
-                restart_budget=state.budget,
-                restart_count=state.restart_count,
-                reservation_id=context.idempotency_key,
-            )
+            if not isinstance(issued, RestartAuthorization):
+                return issued
+            restart_authorization = issued
         command = RemoteActionCommand(
             command_id=command_id,
             cluster_id=context.incident.cluster_id,
@@ -820,8 +785,6 @@ class RegionalRemoteWorkflowAdapter:
                 details=current.result_details,
             )
         if current.status is RemoteCommandStatus.FAILED:
-            if restart_reservation is not None:
-                self.store.release_job_restart(*restart_reservation)
             # ``status_source`` rides along so the executor can tell a command
             # the workflow itself cancelled (``workflow-preempted``,
             # ``workflow-timeout``) from a node refusing the action (D-8).
