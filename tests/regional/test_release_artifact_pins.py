@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from gpu_fault.admin.config_patch import preset_admin_config
+from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +62,12 @@ def _config_file(tmp_path: Path) -> Path:
 
 
 class RecordingRunner:
+    """Records every command; answers the in-flight install gate's two store
+    reads the way a healthy control plane would (one Running Pod per role, a
+    probe that ran and found nothing in flight), and ``""`` to everything else.
+    Answering ``""`` to the gate too would mean "no Running Pod", which a manual
+    rollback correctly refuses -- and the pins are what these tests are about."""
+
     dry_run = True
 
     def __init__(self) -> None:
@@ -68,6 +75,11 @@ class RecordingRunner:
 
     def run(self, args, **kwargs):
         self.calls.append((args, kwargs))
+        if GATE.RUNNING_PODS_JSONPATH in args:
+            return "cpu-pod-a"
+        if GATE.PROBE_WRAPPER in args:
+            clear = {"inflight": [], "inflight_count": 0, "bounded": True, "scanned": 0}
+            return f"{json.dumps(clear)}\n{GATE.PROBE_EXIT_MARKER}=0"
         return ""
 
     def probe(self, _args, **_kwargs):

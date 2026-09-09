@@ -10,9 +10,12 @@ the previous release's control plane would submit it a second time, so the
 rollback refuses before touching anything (``regional_release_store_preflight``)
 and the transaction stays in ``failed`` -- the phase resume and
 ``--supersede-failed-transaction`` already handle -- rather than going to
-``rollback-failed``, which would claim a restore was attempted. A store that
-cannot answer that check does not stop the automatic rollback (its primary
-scenario is a control plane that is down); the gate logs and the rollback runs.
+``rollback-failed``, which would claim a restore was attempted. When no Running
+control-plane Pod could run that check's probe (``StoreUnreachable``: its
+primary scenario is a control plane that is down) the automatic rollback is not
+stopped -- the gate logs ``inflight-installs-unchecked`` and the rollback runs.
+A probe that ran and could not vouch for a clear store refuses it like any
+other mode.
 """
 
 from __future__ import annotations
@@ -70,9 +73,11 @@ def recover_failed_upgrade(
     ):
         raise error
     try:
-        # ``automatic``: a store that cannot answer the in-flight install check
-        # does not stop this rollback (a dead control plane dispatches
-        # nothing; wedging production in ``failed`` is the worse failure).
+        # ``automatic``: when no Running control-plane Pod could run the
+        # in-flight install probe (StoreUnreachable) this rollback proceeds (a
+        # dead control plane dispatches nothing; wedging production in
+        # ``failed`` is the worse failure). Evidence the probe did return still
+        # refuses it.
         release.rollback(state=previous, automatic=True)
     except InflightInstallsRefused as refusal:
         phase = release.state.get("phase")

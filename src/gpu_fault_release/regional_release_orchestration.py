@@ -1874,15 +1874,20 @@ def rollback_release(
     self._refresh_aurora_credentials()
     # Before any restore is planned: the previous release's control plane would
     # re-submit an install that is PENDING or WAITING right now. Skipped once
-    # the control plane is already restored (a cleanup re-entry); an automatic
-    # rollback proceeds when the store cannot answer, a manual one refuses.
+    # the control plane is already restored (a cleanup re-entry). An automatic
+    # rollback proceeds only when no Running control-plane Pod could run the
+    # probe (StoreUnreachable); a manual one refuses. The verdict rides in the
+    # state so ``rollback-started`` persists whether and on what this was
+    # checked (``render_persisted_state`` writes the state whole).
     if "rollback-cpu-restored" not in set(
         loaded.get("rollback_completed_phases") or []
     ):
-        self._require_no_inflight_installs(
+        verdict = self._require_no_inflight_installs(
             action="rollback",
             unreadable="proceed" if automatic else "refuse",
         )
+        if isinstance(verdict, dict):
+            self.state["inflight_installs"] = verdict
     compensation = build_rollback_compensation_plan(
         loaded,
         (target.cluster_id for target in self.config.clusters),

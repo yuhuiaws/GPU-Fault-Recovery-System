@@ -28,6 +28,49 @@ def refused_inflight_installs(error: BaseException) -> bool:
     return bool(match) and int(match.group(1)) == INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
 
 
+# The engine's in-flight install gate writes its verdict under this key of the
+# transaction state before the rollback's first checkpoint
+# (``regional_release_orchestration.rollback_release``). The driver copies it
+# into its own rollback record so the release history says whether the rollback
+# was checked, and on what: "clear", "unchecked" (no Running control-plane Pod
+# could run the probe -- the automatic rollback proceeds over exactly that) or
+# "overridden" (consent over a listed set). A refusal never reaches the state
+# (nothing is written); the driver records it from the exit code.
+INFLIGHT_INSTALLS_STATE_KEY = "inflight_installs"
+
+
+def _recorded_inflight_verdict(live_state: Mapping[str, Any] | None) -> dict[str, Any]:
+    verdict = (
+        live_state.get(INFLIGHT_INSTALLS_STATE_KEY)
+        if isinstance(live_state, Mapping)
+        else None
+    )
+    if isinstance(verdict, dict) and "verdict" in verdict:
+        return dict(verdict)
+    return {
+        "checked": False,
+        "verdict": "unrecorded",
+        "reason": (
+            f"the engine state carries no {INFLIGHT_INSTALLS_STATE_KEY} verdict "
+            "(an engine that predates it, or a rollback re-entered after "
+            "rollback-cpu-restored, which skips the check)"
+        ),
+        "steps": [],
+    }
+
+
+def _refused_inflight_verdict() -> dict[str, Any]:
+    return {
+        "checked": True,
+        "verdict": "refused",
+        "reason": (
+            "the engine's in-flight install check refused the rollback; the "
+            "rollback log names the workflows and nodes"
+        ),
+        "steps": [],
+    }
+
+
 def schema_change_fail_forward(
     deployment: Mapping[str, Any],
     environment: Mapping[str, str],
@@ -151,6 +194,7 @@ def rollback_after_failure(
         failed_at=failed_at,
         rollback=rollback,
     )
+    live_state: dict[str, Any] | None = None
     try:
         run_release_mode(
             site_file,
@@ -158,8 +202,10 @@ def rollback_after_failure(
             root=root,
             environment=environment,
             # Marks the rollback automatic: the engine's in-flight install
-            # check then proceeds (logging) when the store cannot answer,
-            # instead of wedging a release whose control plane is down.
+            # check then proceeds (logging) when no Running control-plane Pod
+            # could run its probe (StoreUnreachable), instead of wedging a
+            # release whose control plane is down. Evidence the probe did
+            # return still refuses (exit 3, recorded below).
             arguments=("--automatic",),
         )
         live_state = read_live_state(site_file)
@@ -190,18 +236,29 @@ def rollback_after_failure(
                     f"{INFLIGHT_INSTALLS_LEVER_ENV}=1 to roll back anyway"
                 ),
                 "error": f"{type(rollback_exc).__name__}: {rollback_exc}",
+                "inflight_installs": _refused_inflight_verdict(),
             }
+        if live_state is None:
+            # The rollback ran past its first checkpoint before failing (or
+            # the state read itself failed); one more read is cheap and the
+            # record should still say whether the restore was checked.
+            try:
+                live_state = read_live_state(site_file)
+            except Exception:
+                live_state = None
         return {
             **rollback,
             "status": "FAILED",
             "completed_at": _utc_now(),
             "error": f"{type(rollback_exc).__name__}: {rollback_exc}",
+            "inflight_installs": _recorded_inflight_verdict(live_state),
         }
     return {
         **rollback,
         "status": "PASSED",
         "completed_at": _utc_now(),
         "management_state_synced": True,
+        "inflight_installs": _recorded_inflight_verdict(live_state),
     }
 
 

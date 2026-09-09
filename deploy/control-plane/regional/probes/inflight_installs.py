@@ -19,19 +19,33 @@ steps is PENDING or WAITING, and this probe is the one store read behind that
 refusal.
 
 Only the executable statuses are scanned: PENDING, SAFETY_PENDING, RUNNING.
-BLOCKED is excluded because nothing ever re-executes a BLOCKED row -- not
+BLOCKED is excluded because no DISPATCHED BLOCKED row is ever reopened -- not
 because it cannot hold an install execution. It can: the dispatcher blocks a
 RUNNING workflow that hits a mid-dispatch ValidationError
 (``BlockedKind.INTERNAL_ERROR``) and leaves ``step_executions`` intact, so a
 BLOCKED row may still carry a WAITING install. But the executor returns the
-recorded result for a BLOCKED row without executing, the operator levers close
-it to SUPERSEDED and refuse rows already dispatched, and no writer takes
-BLOCKED back to PENDING or RUNNING: no control plane, old or new, will derive a
-command id for that step again, so the double submit this gate guards against
+recorded result for a BLOCKED row without executing, and the operator levers
+close it to SUPERSEDED and refuse rows already dispatched. The one writer that
+does rewrite BLOCKED to PENDING -- ``families/node_lifecycle._state`` merging a
+second node fault into an open replacement -- only reaches a row whose
+``not_before`` is still in the future and that no executor owns, i.e. one the
+dispatcher has never claimed, which therefore carries no install execution
+(``tests/orchestration/test_replacement_merge_reopens_only_undispatched.py``).
+So no control plane, old or new, will derive a command id for a dispatched
+step in a BLOCKED row again, and the double submit this gate guards against
 cannot start there. BLOCKED is also never archived; scanning it once let the
 newest RUNNING row fall past the window and the probe report 0.
 ``tests/regional/test_release_inflight_install_gate.py`` pins the status set and
 the INTERNAL_ERROR shape.
+
+The probe's own failure is evidence too. A fresh store connection that fails
+(the Aurora rotation window, while the Pod's warm pool keeps dispatching), a
+module the deployed ``gpu_fault`` lacks -- these are answers of the form "I
+could not read", not "nobody could run me", and the release engine must refuse
+on them. So ``main`` runs under a catch-all that prints
+``{"probe_error": "<type>: <message>"}`` on stdout and exits 1; the engine's
+shell wrapper marks the exit code either way. Only a failure before this file
+runs at all (no Running Pod, kubectl never reaching one) is silence.
 
 A step is in flight when its index is neither completed nor superseded and its
 latest execution record is absent (PENDING: not yet handed to an adapter) or
@@ -50,6 +64,7 @@ here: a step the probe cannot classify is counted (``UNKNOWN``), never skipped.
 """
 
 import json
+import sys
 from typing import Any
 
 from gpu_fault.app import ApplicationContext
@@ -125,4 +140,14 @@ def main() -> None:
     )
 
 
-main()
+def run() -> None:
+    """Run ``main``; turn its failure into evidence the caller can refuse on."""
+
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 - the failure IS the report
+        print(json.dumps({"probe_error": f"{type(exc).__name__}: {exc}"}))
+        sys.exit(1)
+
+
+run()
