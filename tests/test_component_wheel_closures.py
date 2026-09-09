@@ -38,6 +38,36 @@ def test_collector_wheels_include_every_registry_factory_module(component: str) 
     assert missing == [], f"{component} wheel would lack {missing}"
 
 
+def test_the_deploy_host_wheel_carries_the_release_engine_the_admin_cli_imports() -> (
+    None
+):
+    """The admin CLI imports ``gpu_fault_release`` at module level (status
+    header, deploy consent, schema-change acceptance, rollback). A walk that
+    followed only ``gpu_fault`` shipped a wheel whose ``gpu-fault-admin`` died
+    with ModuleNotFoundError on the first deploy-host install from main after
+    aca7a37 (2026-09-09)."""
+    modules = component_wheels.component_modules("deploy_host")
+    assert "gpu_fault_release.regional_admin_commands" in modules, sorted(
+        name for name in modules if name.startswith("gpu_fault_release")
+    )
+    assert "gpu_fault.admin.deploy_consent" in modules, "the consent module is shipped"
+
+
+@pytest.mark.parametrize(
+    "component", sorted(component_wheels.COMPONENTS) + ["deploy_host"]
+)
+def test_every_component_closure_is_import_complete(component: str) -> None:
+    """Whatever a shipped module imports from a local package is shipped too."""
+    modules = component_wheels.component_modules(component)
+    missing = {
+        f"{module} -> {imported}"
+        for module in modules
+        for imported in component_wheels.local_imports(module)
+        if imported not in modules
+    }
+    assert missing == set(), sorted(missing)
+
+
 def test_factory_reference_strings_name_their_module() -> None:
     import ast
 

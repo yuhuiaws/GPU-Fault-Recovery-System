@@ -16,7 +16,14 @@ from typing import Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src/gpu_fault"
+SOURCE_ROOT = ROOT / "src"
+SOURCE = SOURCE_ROOT / "gpu_fault"
+# The import walk follows these top-level packages and ships what it reaches.
+# ``gpu_fault_release`` is the release engine the admin CLI imports directly
+# (status header, deploy consent, schema-change acceptance, rollback); a wheel
+# that followed only ``gpu_fault`` left it out, and the first deploy-host
+# install from main after aca7a37 died at import time (2026-09-09).
+LOCAL_PACKAGES = ("gpu_fault", "gpu_fault_release")
 
 
 @dataclass(frozen=True)
@@ -220,15 +227,32 @@ def component_definition(name: str) -> Component:
 
 def _module_map() -> dict[str, Path]:
     result = {}
-    for path in SOURCE.rglob("*.py"):
-        relative = path.relative_to(SOURCE)
-        if path.name == "__init__.py":
-            parts = relative.parts[:-1]
-        else:
-            parts = (*relative.parts[:-1], path.stem)
-        name = ".".join(("gpu_fault", *parts))
-        result[name] = path
+    for package in LOCAL_PACKAGES:
+        base = SOURCE_ROOT / package
+        for path in base.rglob("*.py"):
+            relative = path.relative_to(base)
+            if path.name == "__init__.py":
+                parts = relative.parts[:-1]
+            else:
+                parts = (*relative.parts[:-1], path.stem)
+            result[".".join((package, *parts))] = path
     return result
+
+
+def is_local_module(name: str) -> bool:
+    return any(
+        name == package or name.startswith(f"{package}.") for package in LOCAL_PACKAGES
+    )
+
+
+def source_relative(path: Path) -> str:
+    """A module's path key: relative to ``src/gpu_fault`` for that package (the
+    digests recorded before the release engine joined the walk stay stable),
+    relative to ``src`` for any other local package."""
+
+    if path.is_relative_to(SOURCE):
+        return path.relative_to(SOURCE).as_posix()
+    return path.relative_to(SOURCE_ROOT).as_posix()
 
 
 MODULES = _module_map()
@@ -318,13 +342,13 @@ def referenced_modules(tree: ast.AST) -> set[str]:
     return found
 
 
-def _local_imports(module: str) -> set[str]:
+def local_imports(module: str) -> set[str]:
     tree = ast.parse(MODULES[module].read_text(encoding="utf-8"))
     found: set[str] = set(referenced_modules(tree))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "gpu_fault" or alias.name.startswith("gpu_fault."):
+                if is_local_module(alias.name):
                     found.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             imported = (
@@ -332,7 +356,7 @@ def _local_imports(module: str) -> set[str]:
                 if node.level
                 else (node.module or "")
             )
-            if imported == "gpu_fault" or imported.startswith("gpu_fault."):
+            if is_local_module(imported):
                 found.add(imported)
                 lazy = _lazy_exports(imported) if imported in MODULES else {}
                 for alias in node.names:
@@ -382,7 +406,7 @@ def dependency_closure(roots: Iterable[str]) -> set[str]:
         if module in selected:
             continue
         selected.add(module)
-        pending.extend(sorted(_local_imports(module) - selected))
+        pending.extend(sorted(local_imports(module) - selected))
         parts = module.split(".")
         for index in range(1, len(parts)):
             parent = ".".join(parts[:index])
@@ -427,8 +451,7 @@ def _copy_modules(
     package = destination / "src/gpu_fault"
     for module in sorted(modules):
         source = MODULES[module]
-        relative = source.relative_to(SOURCE)
-        target = package / relative
+        target = destination / "src" / source.relative_to(SOURCE_ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         target.chmod(0o644)
@@ -500,17 +523,32 @@ def _write_project(
 
 
 def package_digest(package: Path) -> str:
+    """Digest of a built component's sources.
+
+    ``package`` is the staged ``src/gpu_fault``; a sibling local package staged
+    next to it (``src/gpu_fault_release``) is folded in after it under its own
+    prefix, so a component that ships only ``gpu_fault`` keeps the digest it
+    had before the release engine joined the walk.
+    """
+
     digest = hashlib.sha256()
-    for path in sorted(package.rglob("*")):
-        if path.is_dir() or "__pycache__" in path.parts:
-            continue
-        if path.suffix not in {".py", ".yaml", ".yml", ".json"}:
-            continue
-        relative = path.relative_to(package).as_posix()
-        digest.update(relative.encode())
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-        digest.update(b"\n")
+    staged = [(package, "")]
+    staged.extend(
+        (package.parent / name, f"{name}/")
+        for name in LOCAL_PACKAGES
+        if name != package.name and (package.parent / name).is_dir()
+    )
+    for base, prefix in staged:
+        for path in sorted(base.rglob("*")):
+            if path.is_dir() or "__pycache__" in path.parts:
+                continue
+            if path.suffix not in {".py", ".yaml", ".yml", ".json"}:
+                continue
+            relative = prefix + path.relative_to(base).as_posix()
+            digest.update(relative.encode())
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+            digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -523,8 +561,8 @@ def component_source_digest(
     digest = hashlib.sha256()
     paths = [MODULES[module] for module in selected]
     paths.extend(component_data_files(name))
-    for path in sorted(paths, key=lambda item: item.relative_to(SOURCE).as_posix()):
-        relative = path.relative_to(SOURCE).as_posix()
+    for path in sorted(paths, key=source_relative):
+        relative = source_relative(path)
         digest.update(relative.encode())
         digest.update(b"\0")
         content = (
