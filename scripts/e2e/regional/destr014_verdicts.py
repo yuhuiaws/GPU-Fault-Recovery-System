@@ -37,6 +37,16 @@ VALIDATION_ALLOWANCE_SECONDS = 300
 CONTAINMENT_ALLOWANCE_SECONDS = 120
 
 EXHAUSTION_PREFIX = "node branch escalation exhausted"
+# With no ``gpu-fault.io/spare`` label anywhere (the preflight insists on zero
+# spares) ``hyperpod_spares`` returns ``applicable=False`` and the lifecycle
+# adapter fails REPLACE_NODE with this message. ``insufficient healthy HyperPod
+# spares`` is the *other* branch -- a spare is labelled but none is healthy or
+# matching -- which this case never reaches (docs/区域模式端到端验收测试用例.md,
+# DESTR-014 preconditions).
+ZERO_SPARE_REPLACE_ERROR = (
+    "warm-spare replacement is required; provider node replacement API "
+    "fallback is disabled"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -241,12 +251,10 @@ def workflow_errors(
     )
     if replace_exec is None:
         errors.append(f"{sibling_node} has no FAILED REPLACE_NODE execution")
-    elif "insufficient healthy HyperPod spares" not in str(
-        replace_exec.get("error") or ""
-    ):
+    elif ZERO_SPARE_REPLACE_ERROR not in str(replace_exec.get("error") or ""):
         errors.append(
-            f"{sibling_node} REPLACE_NODE did not fail with "
-            "'insufficient healthy HyperPod spares'"
+            f"{sibling_node} REPLACE_NODE did not fail with the zero-spare "
+            f"error {ZERO_SPARE_REPLACE_ERROR!r}: {replace_exec.get('error')!r}"
         )
     return errors
 

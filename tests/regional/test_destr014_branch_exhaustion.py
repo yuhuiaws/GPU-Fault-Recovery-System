@@ -140,7 +140,13 @@ def happy_workflow() -> dict[str, Any]:
         _execution(19, "VALIDATE_FABRIC", "SUCCEEDED"),
         _execution(20, "RESTORE_SCHEDULING", "SUCCEEDED"),
         _execution(
-            21, "REPLACE_NODE", "FAILED", error="insufficient healthy HyperPod spares"
+            21,
+            "REPLACE_NODE",
+            "FAILED",
+            error=(
+                "warm-spare replacement is required; provider node replacement "
+                "API fallback is disabled"
+            ),
         ),
     ]
     return {
@@ -291,12 +297,17 @@ def test_the_sibling_reboot_must_fail_by_bounded_waiting() -> None:
 
 
 def test_the_sibling_replacement_must_fail_for_want_of_a_spare() -> None:
+    """Zero labelled spares makes the adapter refuse the provider fallback;
+    ``insufficient healthy HyperPod spares`` is the labelled-but-unhealthy
+    branch, which attempt 10 (2026-09-09) proved this case never reaches."""
     workflow = happy_workflow()
     workflow["step_executions"][-1]["error"] = "HyperPod preflight failed"
     errors = _errors(workflow, happy_incident())
-    assert any("insufficient healthy HyperPod spares" in item for item in errors), (
-        errors
-    )
+    assert any("fallback is disabled" in item for item in errors), errors
+    workflow = happy_workflow()
+    workflow["step_executions"][-1]["error"] = "insufficient healthy HyperPod spares"
+    errors = _errors(workflow, happy_incident())
+    assert any("zero-spare" in item for item in errors), errors
     workflow = happy_workflow()
     workflow["official_steps"][21]["parameters"] = {}
     errors = _errors(workflow, happy_incident())

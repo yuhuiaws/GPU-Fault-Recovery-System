@@ -9,7 +9,10 @@ HyperPod reboot that succeeds and the branch ends normally. node-c's branch
 resolves RESTART_NODE, but its Node Agent is disabled (without --now) before the
 reboot so no new boot id is reported: RESTART_NODE waits to its managed-recovery
 timeout, escalates to REPLACE_NODE, and -- with no warm spare declared -- FAILs
-``insufficient healthy HyperPod spares``, exhausting the branch. The join never
+``warm-spare replacement is required; provider node replacement API fallback is
+disabled`` (the zero-spare branch; ``insufficient healthy HyperPod spares`` is
+the labelled-but-unhealthy branch this case never reaches), exhausting the
+branch. The join never
 runs; the workflow ends FAILED, the incident QUARANTINED, and the job is not
 restarted.
 
