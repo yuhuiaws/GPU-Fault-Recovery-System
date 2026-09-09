@@ -632,6 +632,12 @@ def test_snapshot_cleanup_preserves_current_reference_and_newest_retained() -> N
     ], f"only snapshots beyond the {STATE.PREVIOUS_SNAPSHOTS_RETAINED} retained go"
 
 
+AMP_ROOTS = {
+    "describe-rule-groups-namespace": "ruleGroupsNamespace",
+    "describe-alert-manager-definition": "alertManagerDefinition",
+}
+
+
 def test_observability_snapshot_restores_amp_rules_and_alertmanager() -> None:
     calls = []
     release = SimpleNamespace(
@@ -641,7 +647,15 @@ def test_observability_snapshot_restores_amp_rules_and_alertmanager() -> None:
             health=SimpleNamespace(amp_workspace_id="ws-test"),
         ),
         runner=SimpleNamespace(
-            run=lambda arguments, **_kwargs: calls.append(arguments) or ""
+            run=lambda arguments, **_kwargs: calls.append(arguments) or "",
+            # AMP reports both definitions ACTIVE before and after each put.
+            probe_output=lambda arguments, **_kwargs: (
+                0,
+                json.dumps(
+                    {AMP_ROOTS[arguments[2]]: {"status": {"statusCode": "ACTIVE"}}}
+                ),
+                "",
+            ),
         ),
         _cpu=lambda *arguments: ["kubectl", *arguments],
     )

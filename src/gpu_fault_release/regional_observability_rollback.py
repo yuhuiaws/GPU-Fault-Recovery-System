@@ -16,13 +16,28 @@ release's own applied state, so restoring them restores the previous manifest
 
 The object capture itself is shared with the control-plane endpoint, which is
 applied from the tree the same way; see ``regional_manifest_snapshot``.
+
+The AMP definitions (the static rule namespace, the Alertmanager definition,
+and -- through ``regional_dataplane_observability`` -- the per-cluster
+expected-collector rule namespace) are applied by AMP asynchronously: a put
+returns at once, the definition sits CREATING/UPDATING while the PREVIOUS one
+keeps serving, and a write issued meanwhile is a ConflictException. Every
+restore here therefore waits for the definition to settle before it writes and
+for AMP to report ACTIVE after (``wait_for_amp_definition``), or for
+ResourceNotFoundException after a delete (``wait_for_amp_definition_gone``) --
+the same pair the installer script has -- and a definition AMP rejects fails
+the restore naming AMP's ``statusReason`` instead of being recorded as put back.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import sys
 import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +55,265 @@ from gpu_fault_release.regional_release_config import ReleaseError
 ROOT = repository_root()
 ADOT_MANIFEST = ROOT / "deploy/observability/adot-control-plane.yaml"
 ADOT_ROLLOUT_TIMEOUT = "300s"
+#: How often and how many times an AMP definition is described while waiting
+#: for it to settle, become ACTIVE or disappear (the installer's own budget is
+#: 300 s; 60 x 5 s matches it). Each wait has the whole budget.
+AMP_DEFINITION_WAIT_ATTEMPTS = 60
+AMP_DEFINITION_WAIT_SECONDS = 5.0
+#: A write on a definition in one of these is a ConflictException.
+AMP_SETTLING_STATUSES = frozenset({"CREATING", "UPDATING", "DELETING"})
+#: AMP rejected the definition; the previous one (if any) is still serving.
+AMP_FAILED_STATUSES = frozenset({"CREATION_FAILED", "UPDATE_FAILED"})
+_sleep: Callable[[float], None] = time.sleep
+
+
+def _say(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+# --- AMP definitions: describe and wait ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class AmpDefinition:
+    """One AMP definition as the ``aws amp`` CLI describes it.
+
+    ``describe`` is the complete describe command (without ``--output``);
+    ``root`` the key its JSON answer is wrapped in (``ruleGroupsNamespace`` or
+    ``alertManagerDefinition``); ``label`` how messages name it.
+    """
+
+    describe: tuple[str, ...]
+    root: str
+    label: str
+
+
+def describe_amp_definition(
+    release: Any, definition: AmpDefinition
+) -> dict[str, Any] | None:
+    """The definition's describe document, ``None`` when it does not exist.
+
+    Only ``ResourceNotFoundException`` is absence. A throttle, a credentials
+    error or an unreadable answer raises: a restore built on a guess would
+    create over a definition that exists (ConflictException) or skip deleting
+    one that does.
+    """
+
+    code, stdout, stderr = release.runner.probe_output(
+        [*definition.describe, "--output", "json"]
+    )
+    if code:
+        if "ResourceNotFoundException" in stderr:
+            return None
+        raise ReleaseError(
+            f"cannot read the {definition.label}: {stderr.strip() or code}"
+        )
+    try:
+        document = json.loads(stdout)[definition.root]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ReleaseError(
+            f"cannot read the {definition.label}: unexpected describe output"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ReleaseError(
+            f"cannot read the {definition.label}: unexpected describe output"
+        )
+    return document
+
+
+def amp_definition_status(document: dict[str, Any] | None) -> str | None:
+    """``status.statusCode`` of a describe document; ``None`` for an absent one."""
+
+    if document is None:
+        return None
+    status = document.get("status")
+    return str(status.get("statusCode") or "") if isinstance(status, dict) else ""
+
+
+def _amp_definition_status_reason(document: dict[str, Any] | None) -> str:
+    status = document.get("status") if isinstance(document, dict) else None
+    reason = status.get("statusReason") if isinstance(status, dict) else None
+    return str(reason or "").strip() or "AMP gave no statusReason"
+
+
+def poll_amp_definition(
+    release: Any,
+    definition: AmpDefinition,
+    *,
+    settled: Callable[[dict[str, Any] | None], bool],
+    waiting_for: str,
+    attempts: int | None = None,
+    interval: float | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> dict[str, Any] | None:
+    """Describe the definition until ``settled`` accepts the answer; the answer.
+
+    One describe up front, then up to ``attempts`` sleeps of ``interval``
+    seconds each followed by another describe (the module's budget unless the
+    caller brings its own). A definition that never settles is a
+    ``ReleaseError`` naming its last status, never a guess: every caller
+    writes to AMP or records an outcome on the strength of this answer.
+    """
+
+    attempts = AMP_DEFINITION_WAIT_ATTEMPTS if attempts is None else attempts
+    interval = AMP_DEFINITION_WAIT_SECONDS if interval is None else interval
+    sleep = _sleep if sleep is None else sleep
+    document = describe_amp_definition(release, definition)
+    for _attempt in range(attempts):
+        if settled(document):
+            return document
+        _say(
+            f"{definition.label} is {amp_definition_status(document) or 'absent'}; "
+            f"waiting for it to {waiting_for}"
+        )
+        sleep(interval)
+        document = describe_amp_definition(release, definition)
+    raise ReleaseError(
+        f"{definition.label} is still {amp_definition_status(document) or 'absent'} "
+        f"after {attempts * interval:.0f}s (waited for it to {waiting_for})"
+    )
+
+
+def wait_for_amp_definition_settled(
+    release: Any, definition: AmpDefinition, **budget: Any
+) -> bool:
+    """Whether the definition exists once AMP has stopped changing it.
+
+    A definition the candidate's installer just put or deleted may still be
+    CREATING/UPDATING/DELETING; writing to it now is a ConflictException, so
+    a restore waits for AMP to settle first and fails closed if it never
+    does. A failed definition (``CREATION_FAILED``, ``UPDATE_FAILED``) exists
+    and can be put over.
+    """
+
+    document = poll_amp_definition(
+        release,
+        definition,
+        settled=lambda d: amp_definition_status(d) not in AMP_SETTLING_STATUSES,
+        waiting_for="settle before restoring it",
+        **budget,
+    )
+    return document is not None
+
+
+def wait_for_amp_definition_active(
+    release: Any, definition: AmpDefinition, verb: str, **budget: Any
+) -> None:
+    """After a put/create: wait until AMP reports the definition ACTIVE.
+
+    The installer's ``wait_for_amp_definition``: a put returns at once and the
+    previous definition keeps serving until AMP has validated the new one, so
+    an outcome recorded at the put is a record of a write AMP may yet reject
+    -- and the next writer (a resume, the next deploy's installer) lands on an
+    UPDATING definition, a ConflictException. A definition AMP rejected
+    (``CREATION_FAILED``/``UPDATE_FAILED``) fails the restore naming AMP's
+    ``statusReason``; one that disappears meanwhile, reports a status this
+    code does not know, or never leaves CREATING/UPDATING within the budget,
+    fails it too.
+    """
+
+    def settled(document: dict[str, Any] | None) -> bool:
+        status = amp_definition_status(document)
+        if status is None:
+            raise ReleaseError(
+                f"{definition.label} disappeared after {verb} "
+                "(ResourceNotFoundException while waiting for it to become ACTIVE)"
+            )
+        if status in AMP_FAILED_STATUSES:
+            raise ReleaseError(
+                f"AMP rejected the {definition.label} after {verb}: status "
+                f"{status}: {_amp_definition_status_reason(document)}"
+            )
+        if status == "ACTIVE":
+            return True
+        if status in AMP_SETTLING_STATUSES:
+            return False
+        raise ReleaseError(
+            f"{definition.label} reports an unexpected status {status!r} after {verb}"
+        )
+
+    poll_amp_definition(
+        release, definition, settled=settled, waiting_for="become ACTIVE", **budget
+    )
+
+
+def wait_for_amp_definition_gone(
+    release: Any, definition: AmpDefinition, **budget: Any
+) -> None:
+    """After a delete: wait until describe answers ResourceNotFoundException.
+
+    The installer's ``wait_for_amp_definition_gone``: the delete is
+    asynchronous, and a create issued on a DELETING definition -- the next
+    deploy's installer -- is a ConflictException. Only absence is deleted;
+    any other describe failure raises (``describe_amp_definition``).
+    """
+
+    poll_amp_definition(
+        release,
+        definition,
+        settled=lambda d: d is None,
+        waiting_for="be deleted",
+        **budget,
+    )
+
+
+def _amp_common(release: Any) -> list[str]:
+    return [
+        "--region",
+        release.config.aws_region,
+        "--workspace-id",
+        str(release.config.health.amp_workspace_id),
+    ]
+
+
+def _rule_namespace_definition(release: Any, name: str) -> AmpDefinition:
+    return AmpDefinition(
+        describe=(
+            "aws",
+            "amp",
+            "describe-rule-groups-namespace",
+            *_amp_common(release),
+            "--name",
+            name,
+        ),
+        root="ruleGroupsNamespace",
+        label=f"AMP rule namespace {name}",
+    )
+
+
+def _alertmanager_definition(release: Any) -> AmpDefinition:
+    return AmpDefinition(
+        describe=(
+            "aws",
+            "amp",
+            "describe-alert-manager-definition",
+            *_amp_common(release),
+        ),
+        root="alertManagerDefinition",
+        label="AMP Alertmanager definition",
+    )
+
+
+def _put_amp_definition(
+    release: Any,
+    definition: AmpDefinition,
+    *,
+    put: str,
+    create: str,
+    arguments: list[str],
+) -> str:
+    """Write one definition the way the installer does; the verb that ran.
+
+    Waits for the definition to settle, puts it when it exists and creates it
+    when only ResourceNotFoundException says it does not, then waits for AMP to
+    report the result ACTIVE, so the caller moves on only once the previous
+    definition is really the one serving.
+    """
+
+    verb = put if wait_for_amp_definition_settled(release, definition) else create
+    release.runner.run(["aws", "amp", verb, *_amp_common(release), *arguments])
+    wait_for_amp_definition_active(release, definition, verb)
+    return verb
 
 
 def declared_adot_objects(manifest_text: str) -> tuple[dict[str, str], ...]:
@@ -165,7 +439,14 @@ def restore_observability_snapshot(
     snapshot: object,
 ) -> bool:
     """Put the AMP blobs and the collector back; returns whether the collector
-    was restarted (``False`` when every object applied back ``unchanged``)."""
+    was restarted (``False`` when every object applied back ``unchanged``).
+
+    The static rule namespace and the Alertmanager definition are each waited
+    for -- to settle before the put, to be ACTIVE after -- and a definition
+    AMP rejects fails the restore before the collector is touched, so the
+    rollback never records the previous alerting as back while the candidate's
+    is still the one evaluating.
+    """
 
     if not isinstance(snapshot, dict):
         raise ReleaseError("previous observability snapshot is unavailable")
@@ -191,32 +472,18 @@ def restore_observability_snapshot(
         alertmanager_path = root / "alertmanager.yaml"
         rules_path.write_bytes(rules)
         alertmanager_path.write_bytes(alertmanager)
-        release.runner.run(
-            [
-                "aws",
-                "amp",
-                "put-rule-groups-namespace",
-                "--region",
-                release.config.aws_region,
-                "--workspace-id",
-                release.config.health.amp_workspace_id,
-                "--name",
-                rule_namespace,
-                "--data",
-                f"fileb://{rules_path}",
-            ]
+        _put_amp_definition(
+            release,
+            _rule_namespace_definition(release, rule_namespace),
+            put="put-rule-groups-namespace",
+            create="create-rule-groups-namespace",
+            arguments=["--name", rule_namespace, "--data", f"fileb://{rules_path}"],
         )
-        release.runner.run(
-            [
-                "aws",
-                "amp",
-                "put-alert-manager-definition",
-                "--region",
-                release.config.aws_region,
-                "--workspace-id",
-                release.config.health.amp_workspace_id,
-                "--data",
-                f"fileb://{alertmanager_path}",
-            ]
+        _put_amp_definition(
+            release,
+            _alertmanager_definition(release),
+            put="put-alert-manager-definition",
+            create="create-alert-manager-definition",
+            arguments=["--data", f"fileb://{alertmanager_path}"],
         )
     return restore_adot_objects(release, snapshot)

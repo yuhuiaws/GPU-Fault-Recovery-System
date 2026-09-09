@@ -57,7 +57,6 @@ import base64
 import binascii
 import functools
 import hashlib
-import json
 import os
 import re
 import sys
@@ -81,7 +80,12 @@ from gpu_fault_release.regional_manifest_snapshot import (
     snapshot_parts,
 )
 from gpu_fault_release.regional_observability_rollback import (
+    AmpDefinition,
     capture_observability_snapshot,
+    describe_amp_definition,
+    wait_for_amp_definition_active,
+    wait_for_amp_definition_gone,
+    wait_for_amp_definition_settled,
 )
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_rendering import (
@@ -120,14 +124,12 @@ DATAPLANE_OBSERVABILITY_RESTORED = "rollback-dataplane-observability-restored"
 #: until a put settles the PREVIOUS rules keep serving. The restore waits for
 #: the namespace to settle before it writes and waits for its OWN write to
 #: land (ACTIVE after a put/create, ResourceNotFoundException after a delete)
-#: before it records the outcome -- the installer's ``wait_for_amp_definition``
-#: / ``wait_for_amp_definition_gone`` pair -- polling this often, this many
-#: times per wait (the installer's own budget is 300 s; 60 x 5 s matches it).
+#: before it records the outcome -- the shared ``wait_for_amp_definition_*``
+#: helpers of ``regional_observability_rollback`` -- polling this often, this
+#: many times per wait (the installer's own budget is 300 s; 60 x 5 s matches
+#: it). Kept here as this module's own budget so a test can shorten it.
 EXPECTED_RULES_SETTLE_ATTEMPTS = 60
 EXPECTED_RULES_SETTLE_SECONDS = 5.0
-_SETTLING_STATUSES = frozenset({"CREATING", "UPDATING", "DELETING"})
-#: AMP rejected the definition; the previous rules (if any) are still serving.
-_FAILED_STATUSES = frozenset({"CREATION_FAILED", "UPDATE_FAILED"})
 _sleep: Callable[[float], None] = time.sleep
 # The cluster id is interpolated into a PromQL string literal and a YAML
 # scalar; anything outside this set is refused rather than escaped.
@@ -350,51 +352,31 @@ def _describe_expected_rules(release: Any) -> list[str]:
     ]
 
 
-def _describe_expected_rules_document(release: Any) -> dict[str, Any] | None:
-    """The namespace's describe document, ``None`` when it does not exist.
-
-    Only ``ResourceNotFoundException`` is absence. A throttle, a credentials
-    error or an unreadable answer raises: a restore built on a guess would
-    create over a namespace that exists (ConflictException) or skip deleting
-    one that does.
-    """
-
-    code, stdout, stderr = release.runner.probe_output(
-        [*_describe_expected_rules(release), "--output", "json"]
+def _expected_rules_definition(release: Any) -> AmpDefinition:
+    return AmpDefinition(
+        describe=tuple(_describe_expected_rules(release)),
+        root="ruleGroupsNamespace",
+        label=(
+            "expected-collector rule namespace " + DATAPLANE_EXPECTED_RULE_NAMESPACE
+        ),
     )
-    if code:
-        if "ResourceNotFoundException" in stderr:
-            return None
-        raise ReleaseError(
-            "cannot read the expected-collector rule namespace "
-            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: {stderr.strip() or code}"
-        )
-    try:
-        document = json.loads(stdout)["ruleGroupsNamespace"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ReleaseError(
-            "cannot read the expected-collector rule namespace "
-            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: unexpected describe output"
-        ) from exc
-    if not isinstance(document, dict):
-        raise ReleaseError(
-            "cannot read the expected-collector rule namespace "
-            f"{DATAPLANE_EXPECTED_RULE_NAMESPACE}: unexpected describe output"
-        )
-    return document
 
 
-def _expected_rules_status(document: dict[str, Any] | None) -> str | None:
-    if document is None:
-        return None
-    status = document.get("status")
-    return str(status.get("statusCode") or "") if isinstance(status, dict) else ""
+def _wait_budget() -> dict[str, Any]:
+    # Read at call time so a test that shortens this module's budget or swaps
+    # its sleep hook is honoured by the shared helpers.
+    return {
+        "attempts": EXPECTED_RULES_SETTLE_ATTEMPTS,
+        "interval": EXPECTED_RULES_SETTLE_SECONDS,
+        "sleep": _sleep,
+    }
 
 
-def _expected_rules_status_reason(document: dict[str, Any] | None) -> str:
-    status = document.get("status") if isinstance(document, dict) else None
-    reason = status.get("statusReason") if isinstance(status, dict) else None
-    return str(reason or "").strip() or "AMP gave no statusReason"
+def _describe_expected_rules_document(release: Any) -> dict[str, Any] | None:
+    """The namespace's describe document, ``None`` when it does not exist
+    (only ``ResourceNotFoundException`` is absence; anything else raises)."""
+
+    return describe_amp_definition(release, _expected_rules_definition(release))
 
 
 def capture_dataplane_expected_rules(release: Any) -> dict[str, Any]:
@@ -417,40 +399,6 @@ def capture_dataplane_expected_rules(release: Any) -> dict[str, Any]:
     return {"present": True, "data_base64": data}
 
 
-def _poll_expected_rules(
-    release: Any,
-    *,
-    settled: Callable[[dict[str, Any] | None], bool],
-    waiting_for: str,
-) -> dict[str, Any] | None:
-    """Describe the namespace until ``settled`` accepts the answer; the answer.
-
-    One describe up front, then up to ``EXPECTED_RULES_SETTLE_ATTEMPTS`` sleeps
-    of ``EXPECTED_RULES_SETTLE_SECONDS`` each followed by another describe. A
-    namespace that never settles is a ``ReleaseError`` naming its last status,
-    never a guess: every caller writes to AMP or records an outcome on the
-    strength of this answer.
-    """
-
-    document = _describe_expected_rules_document(release)
-    for _attempt in range(EXPECTED_RULES_SETTLE_ATTEMPTS):
-        if settled(document):
-            return document
-        _say(
-            f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} is "
-            f"{_expected_rules_status(document) or 'absent'}; waiting for it "
-            f"to {waiting_for}"
-        )
-        _sleep(EXPECTED_RULES_SETTLE_SECONDS)
-        document = _describe_expected_rules_document(release)
-    raise ReleaseError(
-        f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} is still "
-        f"{_expected_rules_status(document) or 'absent'} after "
-        f"{EXPECTED_RULES_SETTLE_ATTEMPTS * EXPECTED_RULES_SETTLE_SECONDS:.0f}s "
-        f"(waited for it to {waiting_for})"
-    )
-
-
 def _settled_expected_rules_exist(release: Any) -> bool:
     """Whether the namespace exists once AMP has stopped changing it.
 
@@ -461,63 +409,28 @@ def _settled_expected_rules_exist(release: Any) -> bool:
     and can be put over.
     """
 
-    document = _poll_expected_rules(
-        release,
-        settled=lambda d: _expected_rules_status(d) not in _SETTLING_STATUSES,
-        waiting_for="settle before restoring it",
+    return wait_for_amp_definition_settled(
+        release, _expected_rules_definition(release), **_wait_budget()
     )
-    return document is not None
 
 
 def _wait_for_expected_rules_active(release: Any, verb: str) -> None:
-    """After a put/create: wait until AMP reports the definition ACTIVE.
+    """After a put/create: ``restored`` only once AMP reports the rules ACTIVE
+    (a rejected definition fails naming ``statusReason``; see the shared
+    ``wait_for_amp_definition_active``)."""
 
-    The installer's ``wait_for_amp_definition``: a put returns at once and the
-    previous rules keep serving until AMP has validated the new ones, so
-    ``restored`` recorded at the put is a record of a write AMP may yet
-    reject -- and the next writer (a resume, the next deploy's installer)
-    lands on an UPDATING namespace, a ConflictException. A definition AMP
-    rejected (``CREATION_FAILED``/``UPDATE_FAILED``) fails the restore naming
-    AMP's ``statusReason``; a namespace that disappears meanwhile, or never
-    leaves CREATING/UPDATING within the budget, fails it too.
-    """
-
-    def settled(document: dict[str, Any] | None) -> bool:
-        status = _expected_rules_status(document)
-        if status is None:
-            raise ReleaseError(
-                f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} "
-                f"disappeared after {verb} (ResourceNotFoundException while "
-                "waiting for it to become ACTIVE)"
-            )
-        if status in _FAILED_STATUSES:
-            raise ReleaseError(
-                f"AMP rejected rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} "
-                f"after {verb}: status {status}: "
-                f"{_expected_rules_status_reason(document)}"
-            )
-        if status == "ACTIVE":
-            return True
-        if status in _SETTLING_STATUSES:
-            return False
-        raise ReleaseError(
-            f"AMP rule namespace {DATAPLANE_EXPECTED_RULE_NAMESPACE} reports an "
-            f"unexpected status {status!r} after {verb}"
-        )
-
-    _poll_expected_rules(release, settled=settled, waiting_for="become ACTIVE")
+    wait_for_amp_definition_active(
+        release, _expected_rules_definition(release), verb, **_wait_budget()
+    )
 
 
 def _wait_for_expected_rules_gone(release: Any) -> None:
-    """After a delete: wait until describe answers ResourceNotFoundException.
+    """After a delete: ``deleted`` only once describe answers
+    ResourceNotFoundException (see the shared ``wait_for_amp_definition_gone``)."""
 
-    The installer's ``wait_for_amp_definition_gone``: the delete is
-    asynchronous, and a create issued on a DELETING namespace -- the next
-    deploy's installer -- is a ConflictException. Only absence is ``deleted``;
-    any other describe failure raises (``_describe_expected_rules_document``).
-    """
-
-    _poll_expected_rules(release, settled=lambda d: d is None, waiting_for="be deleted")
+    wait_for_amp_definition_gone(
+        release, _expected_rules_definition(release), **_wait_budget()
+    )
 
 
 def _expected_rules_parts(snapshot: object) -> tuple[bool, bytes]:

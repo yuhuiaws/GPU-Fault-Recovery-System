@@ -226,9 +226,17 @@ def test_observability_snapshot_carries_and_restores_the_collector() -> None:
         for item in _declared()
     }
     describe = {
-        "describe-rule-groups-namespace": {"ruleGroupsNamespace": {"data": "cnVsZXM="}},
+        "describe-rule-groups-namespace": {
+            "ruleGroupsNamespace": {
+                "data": "cnVsZXM=",
+                "status": {"statusCode": "ACTIVE"},
+            }
+        },
         "describe-alert-manager-definition": {
-            "alertManagerDefinition": {"data": "YWxlcnRz"}
+            "alertManagerDefinition": {
+                "data": "YWxlcnRz",
+                "status": {"statusCode": "ACTIVE"},
+            }
         },
     }
     calls: list[list[str]] = []
@@ -244,6 +252,11 @@ def test_observability_snapshot_carries_and_restores_the_collector() -> None:
             return json.dumps(document) if document is not None else ""
         return ""
 
+    def probe_output(arguments: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        # The restore's settle/ACTIVE waits read the definitions through the
+        # probe; both are ACTIVE throughout here.
+        return 0, json.dumps(describe[arguments[2]]), ""
+
     release = SimpleNamespace(
         config=SimpleNamespace(
             namespace="gpu-fault-system",
@@ -252,7 +265,7 @@ def test_observability_snapshot_carries_and_restores_the_collector() -> None:
                 amp_workspace_id="ws-test", amp_rule_namespace="gpu-fault-rules"
             ),
         ),
-        runner=SimpleNamespace(run=run),
+        runner=SimpleNamespace(run=run, probe_output=probe_output),
         _cpu=lambda *args: ["kubectl", *args],
     )
 
@@ -352,3 +365,209 @@ def test_adot_change_keeps_automatic_rollback_while_clusters_still_refuse() -> N
         )
     with pytest.raises(MODULE.ReleaseError, match="not transactional for: clusters"):
         ORCHESTRATION.rollback_release(release(registry), state={"metadata": {}})
+
+
+# --- the AMP puts wait for AMP, before and after, like the installer's -------------
+
+
+NOT_FOUND = "An error occurred (ResourceNotFoundException) when calling ..."
+RULES_SNAPSHOT: dict[str, Any] = {
+    "rule_namespace": "gpu-fault-rules",
+    "rules_data_base64": "Z3JvdXBzOiBbXQo=",
+    "alertmanager_data_base64": "YWxlcnRtYW5hZ2VyOiB7fQo=",
+    "adot": {
+        "namespace": "gpu-fault-system",
+        "objects": [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "gpu-fault-adot"},
+            }
+        ],
+        "absent": [],
+    },
+}
+
+
+def _describe_answer(
+    root: str, status: str, *, reason: str | None = None
+) -> tuple[int, str, str]:
+    document: dict[str, Any] = {"statusCode": status}
+    if reason is not None:
+        document["statusReason"] = reason
+    return 0, json.dumps({root: {"status": document, "data": "Z3JvdXBzOiBbXQo="}}), ""
+
+
+def _amp_release(
+    rules: list[tuple[int, str, str]], alertmanager: list[tuple[int, str, str]]
+) -> tuple[SimpleNamespace, list[list[str]], list[float]]:
+    """A release whose fake AMP answers each describe from the given script."""
+    calls: list[list[str]] = []
+    slept: list[float] = []
+    answers = {
+        "describe-rule-groups-namespace": rules,
+        "describe-alert-manager-definition": alertmanager,
+    }
+
+    def run(arguments: list[str], **_kwargs: Any) -> str:
+        calls.append(list(arguments))
+        return ""
+
+    def probe_output(arguments: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        calls.append(list(arguments))
+        assert arguments[:2] == ["aws", "amp"], arguments
+        return answers[arguments[2]].pop(0)
+
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            namespace="gpu-fault-system",
+            aws_region="us-west-2",
+            health=SimpleNamespace(amp_workspace_id="ws-test"),
+        ),
+        runner=SimpleNamespace(run=run, probe_output=probe_output),
+        _cpu=lambda *arguments: ["kubectl", *arguments],
+    )
+    return release, calls, slept
+
+
+def _aws_verbs(calls: list[list[str]]) -> list[str]:
+    return [arguments[2] for arguments in calls if arguments[0] == "aws"]
+
+
+def test_each_amp_put_waits_for_the_definition_to_settle_then_to_be_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control-plane restore put the static rule namespace and the
+    Alertmanager definition and moved on. AMP applies both asynchronously: a
+    put on a definition the candidate's installer left UPDATING is a
+    ConflictException, and until the restored one is ACTIVE the candidate's
+    rules keep serving under a record that says restored. Each put now waits
+    for the definition to settle first and for AMP to report ACTIVE after --
+    the installer's ``wait_for_amp_definition`` -- before the collector is
+    touched."""
+    rules_root, am_root = "ruleGroupsNamespace", "alertManagerDefinition"
+    release, calls, slept = _amp_release(
+        rules=[
+            _describe_answer(rules_root, "UPDATING"),  # the candidate's put
+            _describe_answer(rules_root, "ACTIVE"),
+            _describe_answer(rules_root, "UPDATING"),  # our own put
+            _describe_answer(rules_root, "ACTIVE"),
+        ],
+        alertmanager=[
+            _describe_answer(am_root, "ACTIVE"),
+            _describe_answer(am_root, "UPDATING"),
+            _describe_answer(am_root, "UPDATING"),
+            _describe_answer(am_root, "ACTIVE"),
+        ],
+    )
+    monkeypatch.setattr(ADOT, "_sleep", slept.append)
+
+    ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)
+
+    assert _aws_verbs(calls) == [
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "put-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-alert-manager-definition",
+        "put-alert-manager-definition",
+        "describe-alert-manager-definition",
+        "describe-alert-manager-definition",
+        "describe-alert-manager-definition",
+    ], f"the puts were not bracketed by settle/ACTIVE waits: {calls}"
+    assert slept == [ADOT.AMP_DEFINITION_WAIT_SECONDS] * 4, slept
+    put = next(c for c in calls if c[:3] == ["aws", "amp", "put-rule-groups-namespace"])
+    assert put[put.index("--name") + 1] == "gpu-fault-rules", put
+    # The collector follows only once both definitions are ACTIVE.
+    kubectl = [c for c in calls if c[0] == "kubectl"]
+    assert kubectl and calls.index(kubectl[0]) > calls.index(
+        next(c for c in calls if c[2] == "put-alert-manager-definition")
+    ), "the collector was touched before the AMP puts had landed"
+
+
+def test_a_definition_amp_rejects_fails_the_restore_before_the_collector_is_touched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected Alertmanager definition leaves the CANDIDATE's alerting live;
+    the restore has to fail naming AMP's ``statusReason``, and must not go on
+    to restart the collector as if the rollback had succeeded."""
+    reason = "receiver gpu-fault-sns: topic ARN is not in this region"
+    release, calls, _slept = _amp_release(
+        rules=[
+            _describe_answer("ruleGroupsNamespace", "ACTIVE"),
+            _describe_answer("ruleGroupsNamespace", "ACTIVE"),
+        ],
+        alertmanager=[
+            _describe_answer("alertManagerDefinition", "ACTIVE"),
+            _describe_answer("alertManagerDefinition", "UPDATE_FAILED", reason=reason),
+        ],
+    )
+    monkeypatch.setattr(ADOT, "_sleep", lambda _s: None)
+
+    with pytest.raises(MODULE.ReleaseError, match="UPDATE_FAILED") as caught:
+        ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)
+
+    assert reason in str(caught.value), caught.value
+    assert "Alertmanager" in str(caught.value), caught.value
+    assert [c for c in calls if c[0] == "kubectl"] == [], (
+        "the collector was restored after AMP rejected the Alertmanager definition"
+    )
+
+
+def test_a_put_that_never_reaches_active_fails_closed_on_the_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, calls, slept = _amp_release(
+        rules=[_describe_answer("ruleGroupsNamespace", "ACTIVE")]
+        + [_describe_answer("ruleGroupsNamespace", "UPDATING")] * 5,
+        alertmanager=[],
+    )
+    monkeypatch.setattr(ADOT, "_sleep", slept.append)
+    monkeypatch.setattr(ADOT, "AMP_DEFINITION_WAIT_ATTEMPTS", 3)
+
+    with pytest.raises(
+        MODULE.ReleaseError, match="gpu-fault-rules is still UPDATING after 15s"
+    ):
+        ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)
+
+    assert _aws_verbs(calls)[:2] == [
+        "describe-rule-groups-namespace",
+        "put-rule-groups-namespace",
+    ], calls
+    assert "put-alert-manager-definition" not in _aws_verbs(calls), calls
+    assert len(slept) == 3, slept
+
+
+def test_an_absent_rule_namespace_is_created_rather_than_put(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A put on a namespace that does not exist fails; the installer creates
+    it in that case and so does the restore (only ResourceNotFoundException is
+    absence -- any other describe failure raises)."""
+    release, calls, _slept = _amp_release(
+        rules=[(254, "", NOT_FOUND), _describe_answer("ruleGroupsNamespace", "ACTIVE")],
+        alertmanager=[
+            _describe_answer("alertManagerDefinition", "ACTIVE"),
+            _describe_answer("alertManagerDefinition", "ACTIVE"),
+        ],
+    )
+    monkeypatch.setattr(ADOT, "_sleep", lambda _s: None)
+
+    ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)
+
+    assert "create-rule-groups-namespace" in _aws_verbs(calls), calls
+    assert "put-rule-groups-namespace" not in _aws_verbs(calls), calls
+
+
+def test_an_unreadable_definition_refuses_the_restore_before_any_put() -> None:
+    release, calls, _slept = _amp_release(
+        rules=[(255, "", "Unable to locate credentials")], alertmanager=[]
+    )
+
+    with pytest.raises(MODULE.ReleaseError, match="cannot read the AMP rule namespace"):
+        ADOT.restore_observability_snapshot(release, RULES_SNAPSHOT)
+
+    assert [
+        c for c in calls if c[0] == "aws" and c[2].startswith(("put", "create"))
+    ] == [], calls
