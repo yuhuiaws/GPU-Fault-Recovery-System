@@ -390,6 +390,27 @@ def previous_execution(
     )
 
 
+def lifetime_budget_seconds(
+    workflow: WorkflowRequest,
+    *,
+    job_lifetime_seconds: float,
+    node_lifetime_seconds: float,
+) -> float:
+    """The lifetime budget ``claim_deadlines`` stamps a workflow with (F-N1).
+
+    A job workflow -- a DAG, or anything that restarts a workload -- gets the
+    job lifetime; a single-node remediation gets the node lifetime. Shared with
+    ``step_elapsed_since`` so the window it recovers from ``lifetime_deadline_at``
+    is the one the claim stamped, not a second copy of the rule.
+    """
+
+    is_job = workflow.dag_enabled or any(
+        step.operation is WorkflowOperation.RESTART_WORKLOAD
+        for step in workflow.official_steps
+    )
+    return float(job_lifetime_seconds if is_job else node_lifetime_seconds)
+
+
 def step_elapsed_since(
     executor: Any,
     workflow: WorkflowRequest,
@@ -399,39 +420,71 @@ def step_elapsed_since(
 
     ``started_at`` can predate the current execution window: a merged or branched
     workflow inherits the executions of the record it absorbed. So the window's
-    own start -- recoverable from the deadline, which is set once, to first-claim
-    plus the workflow budget -- is the floor. Clamping can only push the cap
-    later, never fire it early on inherited time.
+    own start is the floor. Clamping can only push the cap later, never fire it
+    early on inherited time.
+
+    The window start is recovered from a deadline that was stamped once. For a
+    single-node workflow that is ``execution_deadline`` (first claim plus the
+    execution budget). A job DAG re-stamps ``execution_deadline`` on *every*
+    claim (``claim_deadlines``: the job lifetime is its real bound), so that
+    deadline put the window start at the current claim and ``step_waiting_seconds``
+    read 0 for as long as the deadline slid -- live 2026-09-08 (DESTR-014): a
+    RESTART_NODE waited an hour against an 1800 s cap that never fired, and the
+    workflow lifetime ended the step instead, so the branch never escalated. A
+    DAG's window therefore starts where ``lifetime_deadline_at`` was stamped.
     """
 
     since = previous.started_at
-    if workflow.execution_deadline is None:
-        return since
-    # Recover the window the deadline was stamped from -- with the same budget
-    # ``claim_deadlines`` used. A workflow holding an operator-acknowledgement
-    # step (CHECK_MECHANICALS) is floored at ``now + acknowledgement timeout``
-    # at claim time; subtracting only the plain execution timeout put the
-    # window start ~24 h in the future and ``step_waiting_seconds`` went
-    # negative (-84599 observed live), so the step's age -- and the alert that
-    # watches the oldest waiting step -- reported a wait that never grew.
-    budget_seconds = float(executor.config.workflow_execution_timeout_seconds)
-    if any(
-        step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
-        for step in workflow.official_steps
-    ):
-        budget_seconds = max(
-            budget_seconds,
-            float(
-                getattr(
-                    executor.config,
-                    "operator_acknowledgement_timeout_seconds",
-                    budget_seconds,
-                )
+    now = datetime.now(timezone.utc)
+    config = executor.config
+    acknowledgement = (
+        float(
+            getattr(
+                config,
+                "operator_acknowledgement_timeout_seconds",
+                config.workflow_execution_timeout_seconds,
+            )
+        )
+        if any(
+            step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+            for step in workflow.official_steps
+        )
+        else None
+    )
+    if workflow.dag_enabled:
+        lifetime = workflow.lifetime_deadline_at
+        if lifetime is None:
+            return since
+        budget_seconds = lifetime_budget_seconds(
+            workflow,
+            job_lifetime_seconds=getattr(config, "job_workflow_lifetime_seconds", 3600),
+            node_lifetime_seconds=getattr(
+                config, "node_workflow_lifetime_seconds", 3600
             ),
         )
-    window_start = workflow.execution_deadline - timedelta(seconds=budget_seconds)
+        # ``claim_deadlines`` floors the lifetime at ``now + acknowledgement``
+        # for an inspection workflow, so the stamp is first-claim plus the
+        # larger of the two.
+        if acknowledgement is not None:
+            budget_seconds = max(budget_seconds, acknowledgement)
+        window_start = lifetime - timedelta(seconds=budget_seconds)
+    else:
+        if workflow.execution_deadline is None:
+            return since
+        # Recover the window the deadline was stamped from -- with the same
+        # budget ``claim_deadlines`` used. A workflow holding an
+        # operator-acknowledgement step (CHECK_MECHANICALS) is floored at
+        # ``now + acknowledgement timeout`` at claim time; subtracting only the
+        # plain execution timeout put the window start ~24 h in the future and
+        # ``step_waiting_seconds`` went negative (-84599 observed live), so the
+        # step's age -- and the alert that watches the oldest waiting step --
+        # reported a wait that never grew.
+        budget_seconds = float(config.workflow_execution_timeout_seconds)
+        if acknowledgement is not None:
+            budget_seconds = max(budget_seconds, acknowledgement)
+        window_start = workflow.execution_deadline - timedelta(seconds=budget_seconds)
     # A window cannot start in the future: whatever stamped the deadline did so
     # no later than now, so the clamp only ever restores a wait that the budget
     # arithmetic above would otherwise deny.
-    window_start = min(window_start, datetime.now(timezone.utc))
+    window_start = min(window_start, now)
     return max(since, window_start)

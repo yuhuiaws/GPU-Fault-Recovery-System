@@ -108,12 +108,12 @@ def claim_deadlines(
 
     lifetime = workflow.lifetime_deadline_at
     if lifetime is None:
-        is_job = workflow.dag_enabled or any(
-            step.operation is WorkflowOperation.RESTART_WORKLOAD
-            for step in workflow.official_steps
-        )
         lifetime = now + timedelta(
-            seconds=job_lifetime_seconds if is_job else node_lifetime_seconds
+            seconds=step_bounds.lifetime_budget_seconds(
+                workflow,
+                job_lifetime_seconds=job_lifetime_seconds,
+                node_lifetime_seconds=node_lifetime_seconds,
+            )
         )
     budget = timedelta(seconds=timeout_seconds)
     existing = workflow.execution_deadline
