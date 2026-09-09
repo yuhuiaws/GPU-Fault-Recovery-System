@@ -302,6 +302,16 @@ def test_a_transient_failure_in_the_one_shot_keeps_a_day_old_rejected_record(
     assert rc == 1, (
         f"the record is still quarantined, so the one-shot must say so: {rc}"
     )
+    closing = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "still quarantined" in record.getMessage()
+    ]
+    assert closing and "transiently" in closing[-1], (
+        "the closing ERROR must blame this run's transient failure, not the 422 "
+        f"verdict in last_error: {closing}"
+    )
 
 
 def test_the_one_shot_exits_nonzero_when_it_expired_a_live_record(

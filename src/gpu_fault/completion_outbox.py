@@ -1377,12 +1377,29 @@ def replay_quarantined_once(outbox: Any, logger: logging.Logger) -> int:
             expired,
         )
     if remaining:
-        logger.error(
-            "%d completion record(s) are still quarantined after the one-shot "
-            "replay; fix the cause each record's last_error names, or run the "
-            "command again if the batch bound cut the pass short",
-            remaining,
-        )
+        deferred = int(outbox.last_replay.get("deferred", 0))
+        if deferred:
+            # The control plane did not answer this run: last_error still
+            # names the original verdict, the transient failure is in the
+            # record's last_transient_* fields. Do not send the operator
+            # to fix a 422 when the run simply could not reach the API.
+            logger.error(
+                "%d completion record(s) are still quarantined after the "
+                "one-shot replay, %d of them because this run's POST failed "
+                "transiently (see each record's last_transient_error); "
+                "retry once the control plane answers, then fix the cause "
+                "last_error names for any that remain",
+                remaining,
+                deferred,
+            )
+        else:
+            logger.error(
+                "%d completion record(s) are still quarantined after the "
+                "one-shot replay; fix the cause each record's last_error "
+                "names, or run the command again if the batch bound cut the "
+                "pass short",
+                remaining,
+            )
     return 1 if remaining or expired else 0
 
 
