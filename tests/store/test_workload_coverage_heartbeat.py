@@ -21,7 +21,10 @@ from pydantic import ValidationError
 
 from gpu_fault.store import InMemoryStore, PostgresStore, SqliteStore
 from gpu_fault.store.shared.primitives import state_key
-from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
+from gpu_fault.store.shared.telemetry_records import (
+    COVERAGE_HEARTBEAT_KIND,
+    SharedTelemetryRecordMixin,
+)
 from gpu_fault.telemetry import WorkloadCoverageHeartbeat
 
 NOW = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
@@ -61,11 +64,27 @@ def coverage_store(request, tmp_path):
     postgres_url = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
     if not postgres_url:
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
+    def clear_coverage_rows() -> None:
+        # One database serves every test here; the monotonic guard would
+        # otherwise defend the newer row a previous test left for the same
+        # cluster (the release gate saw exactly that, 2026-09-09).
+        with psycopg.connect(postgres_url, autocommit=True) as admin:
+            admin.execute(
+                "DELETE FROM gpu_fault_objects WHERE kind = %s",
+                (COVERAGE_HEARTBEAT_KIND,),
+            )
+
     postgres = PostgresStore(postgres_url)
+    clear_coverage_rows()
     try:
         yield postgres
     finally:
-        postgres.close()
+        try:
+            clear_coverage_rows()
+        finally:
+            postgres.close()
 
 
 def test_a_coverage_heartbeat_round_trips_per_cluster(coverage_store) -> None:
