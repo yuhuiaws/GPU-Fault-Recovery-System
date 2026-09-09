@@ -33,6 +33,9 @@ from gpu_fault.installation_resources import (
 from tests.admin.test_admin_site import site_file
 
 GPU_B_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
+ADOT_WRITER_B = (
+    "arn:aws:iam::123456789012:role/gpu-fault-test-site-hp-gpu-b-adot-writer"
+)
 
 
 def _membership_snapshot(site) -> dict:
@@ -98,6 +101,64 @@ class Runner:
         return ""
 
 
+def _joined_prerequisites() -> dict:
+    """What ``_parallel_prerequisites`` records for gpu-b: both per-cluster roles,
+    the network it joined and its node keys."""
+
+    provider = "arn:aws:iam::123456789012:oidc-provider/issuer-b"
+    return {
+        "executor_role": {
+            "role_arn": "arn:aws:iam::123456789012:role/gpu-b-executor",
+            "ownership": "CREATED",
+            "inline_policy_name": "GPUFaultRegionalExecutor",
+            "oidc_provider_arn": provider,
+            "oidc_provider_ownership": "EXTERNAL",
+            "cluster_name": "gpu-b",
+        },
+        "adot_writer_role": {
+            "role_arn": ADOT_WRITER_B,
+            "ownership": "CREATED",
+            "inline_policy_name": "GPUFaultDataplaneAmpWriter",
+            "oidc_provider_arn": provider,
+            "oidc_provider_ownership": "EXTERNAL",
+            "cluster_name": "gpu-b",
+        },
+        "network": {
+            "vpc_id": "vpc-gpu-b",
+            "nat_eips": ["192.0.2.20"],
+            "created_ingress_eips": ["192.0.2.20"],
+            "existing_vpc_ids": ["vpc-gpu-a"],
+            "hosted_zone_id": "Z123",
+            "association_created": True,
+        },
+        "node_keys": {"cluster_id": "hp-gpu-b"},
+    }
+
+
+def _assert_adot_writer_committed(snapshot: InstallationResourceSnapshot, site) -> None:
+    """The created ADOT writer role is registered for cleanup and named in the site."""
+
+    adot_row = next(
+        item
+        for item in snapshot.resources
+        if item.resource_key == "aws/iam/adot-writer/hp-gpu-b/role"
+    )
+    assert adot_row.resource_type == "iam_role"
+    assert adot_row.resource_id == "gpu-fault-test-site-hp-gpu-b-adot-writer"
+    assert adot_row.delete_policy is InstallationResourceDeletePolicy.DELETE, (
+        "remove-cluster would leave the ADOT writer role behind"
+    )
+    assert adot_row.attributes["inline_policy_name"] == "GPUFaultDataplaneAmpWriter"
+    joined = next(
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == "hp-gpu-b"
+    )
+    assert joined["adot_irsa_role_arn"] == ADOT_WRITER_B, (
+        "the created ADOT writer role did not reach the committed site"
+    )
+
+
 def test_join_cluster_is_atomic_resumable_and_registers_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -154,29 +215,10 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "_existing_cluster_networks",
         lambda *_args, **_kwargs: [{"vpc_id": "vpc-gpu-a", "nat_eips": ["192.0.2.10"]}],
     )
-    prerequisites = {
-        "executor_role": {
-            "role_arn": "arn:aws:iam::123456789012:role/gpu-b-executor",
-            "ownership": "CREATED",
-            "inline_policy_name": "GPUFaultRegionalExecutor",
-            "oidc_provider_arn": ("arn:aws:iam::123456789012:oidc-provider/issuer-b"),
-            "oidc_provider_ownership": "EXTERNAL",
-            "cluster_name": "gpu-b",
-        },
-        "network": {
-            "vpc_id": "vpc-gpu-b",
-            "nat_eips": ["192.0.2.20"],
-            "created_ingress_eips": ["192.0.2.20"],
-            "existing_vpc_ids": ["vpc-gpu-a"],
-            "hosted_zone_id": "Z123",
-            "association_created": True,
-        },
-        "node_keys": {"cluster_id": "hp-gpu-b"},
-    }
     monkeypatch.setattr(
         admin_cluster_join,
         "_parallel_prerequisites",
-        lambda *_args, **_kwargs: prerequisites,
+        lambda *_args, **_kwargs: _joined_prerequisites(),
     )
     monkeypatch.setattr(
         admin_cluster_join, "_update_bootstrap_state", lambda *_args, **_kwargs: None
@@ -269,8 +311,10 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "cluster/hp-gpu-b/eks",
         "cluster/hp-gpu-b/hyperpod",
         "aws/iam/executor/hp-gpu-b/role",
+        "aws/iam/adot-writer/hp-gpu-b/role",
         "aws/route53/vpc-association/hp-gpu-b",
     }.issubset(keys), "Aurora registry omitted joined cluster resources"
+    _assert_adot_writer_committed(synced[-1], updated)
     assert rollout_calls == [
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),
@@ -293,6 +337,126 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert yaml.safe_load(path.read_text())["spec"]["gpuKubeconfig"] == str(
         gpu_kubeconfig
     )
+
+
+def _prerequisite_stubs(
+    monkeypatch: pytest.MonkeyPatch, order: list[str]
+) -> threading.Event:
+    executor_done = threading.Event()
+    lock = threading.Lock()
+
+    def note(name: str) -> None:
+        with lock:
+            order.append(name)
+
+    def executor_role(_runner, **_kwargs):
+        time.sleep(0.05)
+        note("executor_role")
+        executor_done.set()
+        return {"role_arn": "arn:aws:iam::123456789012:role/gpu-b-executor"}
+
+    def adot_writer_role(_runner, **kwargs):
+        assert executor_done.is_set(), (
+            "the ADOT writer role raced the executor role for the OIDC provider"
+        )
+        note("adot_writer_role")
+        return {
+            "role_arn": ADOT_WRITER_B,
+            "workspace": kwargs["amp_workspace_id"],
+            "namespace": kwargs["namespace"],
+            "site_id": kwargs["site_id"],
+        }
+
+    monkeypatch.setattr(admin_cluster_join, "ensure_executor_role", executor_role)
+    monkeypatch.setattr(admin_cluster_join, "ensure_adot_writer_role", adot_writer_role)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_ensure_network",
+        lambda _runner, **_kwargs: note("network") or {"vpc_id": "vpc-gpu-b"},
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "provision_node_action_keys",
+        lambda _runner, **_kwargs: note("node_keys") or {"cluster_id": "hp-gpu-b"},
+    )
+    return executor_done
+
+
+def _prerequisites(site, *, tmp_path: Path, state: dict) -> dict:
+    return admin_cluster_join._parallel_prerequisites(
+        JoinClusterRequest(site=site, gpu_cluster_arn=GPU_B_ARN, state_dir=tmp_path),
+        runner=Runner(),
+        target=_target(),
+        cluster_id="hp-gpu-b",
+        gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+        fleet_master_file=tmp_path / "fleet-master",
+        state=state,
+        state_path=tmp_path / "state.json",
+    )
+
+
+def test_join_prerequisites_create_the_adot_writer_role_after_the_executor_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """join-cluster makes the data-plane collector's role like bootstrap does.
+
+    It runs after the executor role (same OIDC provider; two concurrent
+    ``create-open-id-connect-provider`` calls would fail one of them) and reads
+    the workspace from the site, so a joined cluster gets its collector without
+    the operator hand-making a role.
+    """
+
+    site = load_site(site_file(tmp_path))
+    order: list[str] = []
+    _prerequisite_stubs(monkeypatch, order)
+    state: dict = {}
+
+    result = _prerequisites(site, tmp_path=tmp_path, state=state)
+
+    assert result["adot_writer_role"] == {
+        "role_arn": ADOT_WRITER_B,
+        "workspace": "ws-test",
+        "namespace": "gpu-fault-system",
+        "site_id": "test-site",
+    }, "the writer role was not created from the site's workspace and namespace"
+    assert order.index("adot_writer_role") > order.index("executor_role")
+    assert state["evidence"]["PREREQUISITES_READY"]["adot_writer_role"]["role_arn"] == (
+        ADOT_WRITER_B
+    ), "the writer role is not persisted with the other prerequisites"
+
+
+def test_join_prerequisites_skip_the_adot_writer_role_without_a_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No workspace, no collector, no role -- the same rule the release applies."""
+
+    site = load_site(site_file(tmp_path))
+    site.release_config["health"]["amp_workspace_id"] = None
+    order: list[str] = []
+    _prerequisite_stubs(monkeypatch, order)
+
+    result = _prerequisites(site, tmp_path=tmp_path, state={})
+
+    assert "adot_writer_role" not in result, (
+        "a writer role was created for a site with no AMP workspace"
+    )
+    assert "adot_writer_role" not in order
+    assert set(order) == {"executor_role", "network", "node_keys"}
+
+
+def test_a_resumed_join_does_not_recreate_a_recorded_adot_writer_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    order: list[str] = []
+    _prerequisite_stubs(monkeypatch, order)
+    recorded = {"role_arn": ADOT_WRITER_B, "inline_policy_name": "x"}
+    state = {"evidence": {"PREREQUISITES_READY": {"adot_writer_role": recorded}}}
+
+    result = _prerequisites(site, tmp_path=tmp_path, state=state)
+
+    assert result["adot_writer_role"] == recorded, "a cached prerequisite was redone"
+    assert "adot_writer_role" not in order
 
 
 def test_join_cluster_rolls_back_before_site_commit(

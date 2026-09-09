@@ -80,9 +80,15 @@ spec:
       # Optional. IAM role for this cluster's data-plane ADOT collector:
       # `aps:RemoteWrite` on spec.health.ampWorkspaceId, trusted by the GPU
       # cluster's OIDC provider for
-      # system:serviceaccount:gpu-fault-system:gpu-fault-adot-dataplane. Leave
-      # the key out until the role exists; the release then prints that it
-      # skipped the collector for this cluster and applies everything else.
+      # system:serviceaccount:gpu-fault-system:gpu-fault-adot-dataplane.
+      # `gpu-fault-admin bootstrap` / `join-cluster` create one per GPU cluster
+      # (`gpu-fault-<site>-<hyperpod>-adot-writer`) whenever the site has an
+      # AMP workspace and fill this key in; `remove-cluster` deletes it with
+      # the cluster's other resources. Set it only to point at a role you own
+      # instead -- an explicit value always wins over the created one. Never
+      # write a placeholder: a leftover REPLACE_WITH_ value fails the render.
+      # Without the key the release prints that it skipped the collector for
+      # this cluster and applies everything else.
       adotIrsaRoleArn: REPLACE_WITH_ADOT_IRSA_ROLE_ARN
       allowedNamespaces:
         - gpu-fault-system

@@ -113,6 +113,30 @@ def _joined_resources(
             attributes={"inline_policy_name": str(role["inline_policy_name"])},
         ),
     ]
+    # The data-plane ADOT writer role (present only when the site has an AMP
+    # workspace) is registered under the cluster so remove-cluster and
+    # uninstall delete it with the executor role. The OIDC provider row stays
+    # with the executor: the two roles share one provider.
+    adot_writer = execution.prerequisites.get("adot_writer_role")
+    if isinstance(adot_writer, dict) and adot_writer.get("role_arn"):
+        resources.append(
+            _resource(
+                site_id=site_id,
+                key=f"aws/iam/adot-writer/{cluster_id}/role",
+                resource_type="iam_role",
+                resource_id=str(adot_writer["role_arn"]).rsplit("/", 1)[-1],
+                arn=str(adot_writer["role_arn"]),
+                region=region,
+                account_id=account_id,
+                ownership=InstallationResourceOwnership.CREATED,
+                policy=InstallationResourceDeletePolicy.DELETE,
+                attributes={
+                    "inline_policy_name": str(
+                        adot_writer.get("inline_policy_name") or ""
+                    )
+                },
+            )
+        )
     provider_ownership = (
         InstallationResourceOwnership.CREATED
         if role.get("oidc_provider_ownership") == "CREATED"
@@ -338,6 +362,11 @@ def activate_and_commit(
             cluster_id=cluster_id,
             role=dict(execution.prerequisites["executor_role"]),
             network=dict(execution.prerequisites["network"]),
+            adot_writer_role=(
+                dict(execution.prerequisites["adot_writer_role"])
+                if execution.prerequisites.get("adot_writer_role")
+                else None
+            ),
         )
         complete_step(state_path, state, "SITE_UPDATED")
     updated_site = load_site(
@@ -398,6 +427,8 @@ def activate_and_commit(
             f"cluster/{cluster_id}/hyperpod",
             f"aws/iam/executor/{cluster_id}/role",
         }
+        if execution.prerequisites.get("adot_writer_role"):
+            required.add(f"aws/iam/adot-writer/{cluster_id}/role")
         active = {
             item.resource_key
             for item in live.resources

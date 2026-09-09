@@ -24,10 +24,13 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
 )
 from gpu_fault.admin.bootstrap_services import (
+    amp_remote_write_policy_document,
     control_plane_policy_document,
+    ensure_adot_writer_role,
     ensure_control_plane_role,
     ensure_executor_role,
     executor_policy_document,
+    irsa_trust_document,
     pod_identity_trust,
 )
 from tests.admin._bootstrap_support import _cluster
@@ -209,6 +212,17 @@ class Account:
     def executor(self) -> dict[str, str]:
         return ensure_executor_role(
             self, cluster=_gpu(), namespace="gpu-fault-system", site_id=SITE
+        )
+
+    def adot_writer(
+        self, *, workspace_id: str = "ws-test", cluster: ClusterIdentity | None = None
+    ) -> dict[str, str]:
+        return ensure_adot_writer_role(
+            self,
+            cluster=cluster or _gpu(),
+            namespace="gpu-fault-system",
+            site_id=SITE,
+            amp_workspace_id=workspace_id,
         )
 
 
@@ -675,3 +689,161 @@ def test_an_unusable_oidc_endpoint_is_refused(
 
     with pytest.raises(BootstrapError, match=message):
         account.executor()
+
+
+# --- the data-plane ADOT writer role --------------------------------------------------
+
+ADOT_WRITER_ROLE = "gpu-fault-site-a-hp-gpu-a-adot-writer"
+
+
+def test_the_adot_writer_role_trusts_only_the_dataplane_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One role per GPU cluster, shaped like the executor role but for AMP.
+
+    The trust policy pins the cluster's OIDC provider, the STS audience and the
+    one ServiceAccount the collector runs as; the inline policy allows only
+    ``aps:RemoteWrite`` on the site's workspace. Anything wider would let a pod
+    in another namespace write telemetry as this site.
+    """
+
+    account = Account()
+    account.install(monkeypatch)
+
+    result = account.adot_writer()
+
+    create = account.mutations("create-role")[0]
+    assert _role_name(create) == ADOT_WRITER_ROLE, (
+        "the ADOT writer role does not follow gpu-fault-<site>-<hyperpod>-adot-writer"
+    )
+    trust = json.loads(create[create.index("--assume-role-policy-document") + 1])
+    issuer_host = ISSUER.removeprefix("https://")
+    statement = trust["Statement"][0]
+    assert statement["Principal"]["Federated"] == (
+        f"arn:aws:iam::{ACCOUNT}:oidc-provider/{issuer_host}"
+    ), "the trust is not on the GPU cluster's OIDC provider"
+    assert statement["Action"] == "sts:AssumeRoleWithWebIdentity"
+    assert statement["Condition"]["StringEquals"] == {
+        f"{issuer_host}:aud": "sts.amazonaws.com",
+        f"{issuer_host}:sub": (
+            "system:serviceaccount:gpu-fault-system:gpu-fault-adot-dataplane"
+        ),
+    }, "the trust admits more than the data-plane collector ServiceAccount"
+    put = account.mutations("put-role-policy")[0]
+    assert _role_name(put) == ADOT_WRITER_ROLE
+    policy = json.loads(put[put.index("--policy-document") + 1])
+    assert policy == {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["aps:RemoteWrite"],
+                "Resource": f"arn:aws:aps:{REGION}:{ACCOUNT}:workspace/ws-test",
+            }
+        ],
+    }, "the writer policy is wider than aps:RemoteWrite on the site workspace"
+    assert result["role_arn"] == f"arn:aws:iam::{ACCOUNT}:role/{ADOT_WRITER_ROLE}"
+    assert result["inline_policy_name"] == "GPUFaultDataplaneAmpWriter"
+    assert result["cluster_name"] == "gpu-a"
+    assert result["oidc_provider_arn"] == (
+        f"arn:aws:iam::{ACCOUNT}:oidc-provider/{issuer_host}"
+    )
+    assert result["oidc_provider_ownership"] == "CREATED"
+
+
+def test_a_matching_adot_writer_role_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rerun with nothing changed must issue no IAM write.
+
+    The bootstrap re-proves the role through a read-only probe on every run; a
+    role that already carries the trust and policy the site wants has to pass
+    that probe, or every deploy would turn into a mutation.
+    """
+
+    issuer_host = ISSUER.removeprefix("https://")
+    account = Account()
+    account.provider_exists = True
+    account.provider_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
+    account.role_exists = True
+    account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
+    account.role_trust = irsa_trust_document(
+        provider_arn=f"arn:aws:iam::{ACCOUNT}:oidc-provider/{issuer_host}",
+        issuer=issuer_host,
+        namespace="gpu-fault-system",
+        service_account="gpu-fault-adot-dataplane",
+    )
+    account.role_policy = amp_remote_write_policy_document(
+        region=REGION, account_id=ACCOUNT, workspace_id="ws-test"
+    )
+    account.install(monkeypatch)
+
+    result = account.adot_writer()
+
+    for fragment in ("create-role", "update-assume-role-policy", "put-role-policy"):
+        assert not account.mutations(fragment), (
+            f"an up-to-date ADOT writer role was rewritten ({fragment})"
+        )
+    assert result["role_arn"] == f"arn:aws:iam::{ACCOUNT}:role/{ADOT_WRITER_ROLE}"
+    assert result["oidc_provider_ownership"] == "CREATED"
+
+
+def test_a_drifted_adot_writer_policy_is_repaired_to_the_site_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A policy pointing at another workspace is narrowed back, not kept."""
+
+    issuer_host = ISSUER.removeprefix("https://")
+    account = Account()
+    account.provider_exists = True
+    account.role_exists = True
+    account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
+    account.role_trust = irsa_trust_document(
+        provider_arn=f"arn:aws:iam::{ACCOUNT}:oidc-provider/{issuer_host}",
+        issuer=issuer_host,
+        namespace="gpu-fault-system",
+        service_account="gpu-fault-adot-dataplane",
+    )
+    account.role_policy = amp_remote_write_policy_document(
+        region=REGION, account_id=ACCOUNT, workspace_id="ws-someone-else"
+    )
+    account.install(monkeypatch)
+
+    account.adot_writer()
+
+    assert not account.mutations("create-role")
+    put = account.mutations("put-role-policy")
+    assert len(put) == 1, "the drifted writer policy was not rewritten exactly once"
+    policy = json.loads(put[0][put[0].index("--policy-document") + 1])
+    assert policy["Statement"][0]["Resource"].endswith("workspace/ws-test")
+
+
+def test_the_adot_writer_role_is_refused_without_a_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No workspace means no collector, so a role with an empty resource ARN
+    would be a credential for nothing; the caller skips instead of calling."""
+
+    account = Account()
+    account.install(monkeypatch)
+
+    with pytest.raises(BootstrapError, match="AMP workspace"):
+        account.adot_writer(workspace_id="")
+    assert not account.mutations("create-role"), (
+        "a writer role was created for a site with no AMP workspace"
+    )
+
+
+def test_a_long_hyperpod_name_keeps_the_adot_writer_role_within_iam_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = Account()
+    account.install(monkeypatch)
+    cluster = replace(_gpu(), hyperpod_name="hp-" + "x" * 70)
+
+    account.adot_writer(cluster=cluster)
+
+    create = account.mutations("create-role")[0]
+    role_name = _role_name(create)
+    assert len(role_name) <= 64, f"IAM role names are capped at 64: {role_name!r}"
+    assert role_name.startswith("gpu-fault-site-a-hp-"), role_name

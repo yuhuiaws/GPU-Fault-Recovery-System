@@ -106,6 +106,18 @@ def _bootstrap_state() -> dict:
                 "email_subscription_endpoint": "ops@example.com",
                 "sns_topic_generation": "a" * 32,
             },
+            "adot_writer_role:gpu-a": {
+                "role_arn": (
+                    "arn:aws:iam::123456789012:role/gpu-fault-test-gpu-a-adot-writer"
+                ),
+                "ownership": "CREATED",
+                "inline_policy_name": "GPUFaultDataplaneAmpWriter",
+                "oidc_provider_arn": (
+                    "arn:aws:iam::123456789012:oidc-provider/oidc.eks/id/A"
+                ),
+                "oidc_provider_ownership": "EXTERNAL",
+                "cluster_name": "gpu-a",
+            },
             "control_plane_role": {
                 "role_arn": ("arn:aws:iam::123456789012:role/gpu-fault-control"),
                 "ownership": "CREATED",
@@ -203,6 +215,17 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
     assert parameter_group.dependencies == []
     assert by_key["aws/ecr/runtime"].delete_policy is (
         InstallationResourceDeletePolicy.DELETE
+    )
+    adot_writer = by_key["aws/iam/adot-writer/gpu-a/role"]
+    assert adot_writer.resource_type == "iam_role"
+    assert adot_writer.resource_id == "gpu-fault-test-gpu-a-adot-writer"
+    assert adot_writer.delete_policy is InstallationResourceDeletePolicy.DELETE, (
+        "uninstall would leave the data-plane ADOT writer role behind"
+    )
+    assert adot_writer.attributes["inline_policy_name"] == "GPUFaultDataplaneAmpWriter"
+    assert "aws/iam/adot-writer/gpu-a/oidc-provider" not in by_key, (
+        "the executor task owns the OIDC provider row; a second row would make "
+        "uninstall delete it twice"
     )
     assert by_key["aws/ecr/cache"].attributes["purpose"] == "build-cache"
     assert (

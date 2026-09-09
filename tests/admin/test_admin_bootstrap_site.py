@@ -22,6 +22,7 @@ from gpu_fault.admin import notification_bootstrap as admin_notification_bootstr
 from gpu_fault.admin.bootstrap import _ensure_security_group
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
+    BootstrapRequest,
     BootstrapState,
     CommandRunner,
 )
@@ -35,6 +36,7 @@ from gpu_fault.admin.bootstrap_site import (
     validate_existing_cluster_identity,
 )
 from gpu_fault.admin.bootstrap_site import site_identifier as _site_identifier
+from gpu_fault.admin.notifications import NotificationRouting
 from tests.admin._bootstrap_support import _cluster
 
 
@@ -442,6 +444,116 @@ def test_existing_site_preserves_release_profile_and_cluster_context() -> None:
         "gpu-fault-system",
         "training",
     ]
+
+
+def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -> None:
+    """A fresh site with a workspace gets the data-plane collector with no hand step.
+
+    The role the ``adot_writer_role:<cluster>`` task created lands on the
+    cluster entry as ``adotIrsaRoleArn``; a cluster the task produced no role
+    for keeps the key absent, which is the release's "skip the collector" signal.
+    """
+
+    gpu_a = replace(_cluster(), role="gpu", hyperpod_name="gpu-a", eks_name="gpu-a")
+    gpu_b = replace(_cluster(), role="gpu", hyperpod_name="gpu-b", eks_name="gpu-b")
+    document = admin_bootstrap._site_document(
+        request=BootstrapRequest(
+            cpu_cluster_arn=_cluster().input_arn,
+            gpu_cluster_arns=(gpu_a.input_arn, gpu_b.input_arn),
+            repository_root=tmp_path / "repo",
+            state_dir=tmp_path / "state",
+        ),
+        site_id="site-a",
+        cpu=_cluster(),
+        gpu_clusters=[gpu_a, gpu_b],
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+        release={
+            "manifest": str(tmp_path / "release.json"),
+            "agent_config_digest": "a" * 64,
+            "images": {
+                "runtime": "r:1",
+                "node_installer": "n:1",
+                "dcgm_exporter": "d:1",
+                "adot": "adot:1",
+            },
+        },
+        nlb={"name": "nlb", "public_subnets": ["subnet-1"], "security_group": "sg"},
+        pki={
+            "hostname": "gpu-fault.example.com",
+            "ca_file": str(tmp_path / "ca.pem"),
+            "certificate_arn": "arn:aws:acm:us-east-1:123456789012:certificate/x",
+            "hosted_zone_id": "Z1",
+        },
+        aurora={"cluster_id": "aurora"},
+        monitoring={"workspace_id": "ws-1", "sns_topic_arn": "arn:aws:sns:x"},
+        roles={
+            "executor_role:gpu-a": {
+                "role_arn": "arn:aws:iam::123456789012:role/gpu-a-executor"
+            },
+            "executor_role:gpu-b": {
+                "role_arn": "arn:aws:iam::123456789012:role/gpu-b-executor"
+            },
+            "adot_writer_role:gpu-a": {
+                "role_arn": "arn:aws:iam::123456789012:role/gpu-a-adot-writer"
+            },
+            "aurora": {"cluster_id": "aurora"},
+        },
+        token_files={"gpu-a": tmp_path / "a.token", "gpu-b": tmp_path / "b.token"},
+        fleet_master_file=tmp_path / "fleet-master",
+        adot_image="adot:1",
+        admin_email="admin@example.com",
+        routing=NotificationRouting(
+            sender="admin@example.com",
+            recipients=("admin@example.com",),
+            subject_prefix="[gpu-fault]",
+        ),
+        grafana_health={},
+    )
+
+    clusters = {item["clusterId"]: item for item in document["spec"]["clusters"]}
+    assert clusters["gpu-a"]["adotIrsaRoleArn"] == (
+        "arn:aws:iam::123456789012:role/gpu-a-adot-writer"
+    ), "the created ADOT writer role did not reach the generated site"
+    assert "adotIrsaRoleArn" not in clusters["gpu-b"], (
+        "a cluster without a writer role was given a placeholder ARN"
+    )
+    assert clusters["gpu-a"]["executorIrsaRoleArn"].endswith("gpu-a-executor")
+
+
+def test_existing_site_keeps_the_operator_owned_adot_role() -> None:
+    """An explicit ``adotIrsaRoleArn`` in site.yaml wins over the created role.
+
+    Operators who made the role by hand before bootstrap created one keep
+    theirs; a site that never had the key takes the generated one.
+    """
+
+    generated = {
+        "spec": {
+            "clusters": [
+                {"clusterId": "gpu-a", "adotIrsaRoleArn": "arn:created:a"},
+                {"clusterId": "gpu-b", "adotIrsaRoleArn": "arn:created:b"},
+            ]
+        }
+    }
+    existing = {
+        "spec": {
+            "clusters": [
+                {"clusterId": "gpu-a", "adotIrsaRoleArn": "arn:operator:a"},
+                {"clusterId": "gpu-b"},
+            ]
+        }
+    }
+
+    result = preserve_existing_site_contract(deepcopy(generated), existing)
+
+    clusters = {item["clusterId"]: item for item in result["spec"]["clusters"]}
+    assert clusters["gpu-a"]["adotIrsaRoleArn"] == "arn:operator:a", (
+        "the operator's ADOT writer role was overwritten by the created one"
+    )
+    assert clusters["gpu-b"]["adotIrsaRoleArn"] == "arn:created:b", (
+        "a cluster that never declared a role lost the created one"
+    )
 
 
 def test_existing_site_keeps_the_declared_rollback_policy() -> None:

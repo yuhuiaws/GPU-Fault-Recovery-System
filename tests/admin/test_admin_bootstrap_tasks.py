@@ -339,7 +339,9 @@ def _foundation_graph(
 
 
 def _stub_foundation_services(
-    monkeypatch: pytest.MonkeyPatch, log: list[tuple[str, bool, bool]]
+    monkeypatch: pytest.MonkeyPatch,
+    log: list[tuple[str, bool, bool]],
+    adot_keywords: list[dict[str, Any]] | None = None,
 ) -> None:
     monkeypatch.setattr(
         bootstrap_load_balancer,
@@ -353,16 +355,27 @@ def _stub_foundation_services(
             f"executor_role:{keywords['cluster'].hyperpod_name}", log
         )(runner),
     )
+
+    def adot_writer(runner: CommandRunner, **keywords: Any) -> dict:
+        if adot_keywords is not None:
+            adot_keywords.append(keywords)
+        return Recorder(f"adot_writer_role:{keywords['cluster'].hyperpod_name}", log)(
+            runner
+        )
+
+    monkeypatch.setattr(bootstrap_services, "ensure_adot_writer_role", adot_writer)
+
+    def monitoring_resources(runner: CommandRunner) -> dict:
+        # The writer role reads the workspace the notification task created.
+        return {**Recorder("monitoring_resources", log)(runner), "workspace_id": "ws-1"}
+
     monkeypatch.setattr(
         notification_bootstrap,
         "notification_bootstrap_tasks",
         lambda runner, **_keywords: {
-            name: (lambda name=name: Recorder(name, log)(runner))
-            for name in (
-                "control_plane_role",
-                "email_notifications",
-                "monitoring_resources",
-            )
+            "control_plane_role": lambda: Recorder("control_plane_role", log)(runner),
+            "email_notifications": lambda: Recorder("email_notifications", log)(runner),
+            "monitoring_resources": lambda: monitoring_resources(runner),
         },
     )
 
@@ -376,6 +389,7 @@ FOUNDATION_TASKS = {
     "email_notifications",
     "monitoring_resources",
     "executor_role:gpu-a",
+    "adot_writer_role:gpu-a",
 }
 FOUNDATION_REPROVED = {
     "load_balancer_controller",
@@ -383,6 +397,7 @@ FOUNDATION_REPROVED = {
     "email_notifications",
     "monitoring_resources",
     "executor_role:gpu-a",
+    "adot_writer_role:gpu-a",
 }
 # ``_platform_graph`` provisions node keys for two GPU clusters.
 PLATFORM_TASKS = {
@@ -417,6 +432,7 @@ def test_foundation_tasks_cache_the_one_time_resources_and_reprove_the_rest(
 
     log.clear()
     completed = {name: {"task": name} for name in results}
+    completed["monitoring_resources"]["workspace_id"] = "ws-1"
     state = _state(tmp_path, completed=completed)
     _foundation_graph(tmp_path, state, log).run(state=state)
 
@@ -426,6 +442,41 @@ def test_foundation_tasks_cache_the_one_time_resources_and_reprove_the_rest(
     assert all(read_only for _name, read_only, _probe in log), (
         "a re-proved foundation task used the mutating runner"
     )
+
+
+def test_the_adot_writer_role_waits_for_the_workspace_and_the_oidc_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The data-plane collector's role is one more foundation task per GPU cluster.
+
+    Its policy names the AMP workspace, which ``monitoring_resources`` creates,
+    and its trust sits on the same OIDC provider the executor role ensures, so
+    it is scheduled after both instead of racing the executor into a duplicate
+    ``create-open-id-connect-provider``.
+    """
+
+    log: list[tuple[str, bool, bool]] = []
+    adot_keywords: list[dict[str, Any]] = []
+    _stub_foundation_services(monkeypatch, log, adot_keywords)
+
+    state = _state(tmp_path)
+    graph = _foundation_graph(tmp_path, state, log)
+    graph.run(state=state)
+
+    assert graph.dependencies["adot_writer_role:gpu-a"] == (
+        "executor_role:gpu-a",
+        "monitoring_resources",
+    ), "the writer role does not wait for the workspace and the OIDC provider"
+    order = [name for name, _read_only, _probe in log]
+    assert order.index("adot_writer_role:gpu-a") > order.index("executor_role:gpu-a")
+    assert order.index("adot_writer_role:gpu-a") > order.index("monitoring_resources")
+    assert len(adot_keywords) == 1
+    assert adot_keywords[0]["amp_workspace_id"] == "ws-1", (
+        "the writer role was not given the workspace monitoring_resources created"
+    )
+    assert adot_keywords[0]["namespace"] == "gpu-fault-system"
+    assert adot_keywords[0]["site_id"] == "site-a"
+    assert adot_keywords[0]["cluster"].hyperpod_name == "gpu-a"
 
 
 # --- the scheduler ----------------------------------------------------------------------

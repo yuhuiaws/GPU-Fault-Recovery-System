@@ -729,6 +729,7 @@ def _target_resource(resource: InstallationResource, cluster_id: str) -> bool:
     resource_key = str(resource.resource_key)
     return (
         resource_key.startswith(f"aws/iam/executor/{cluster_id}/")
+        or resource_key.startswith(f"aws/iam/adot-writer/{cluster_id}/")
         or resource_key.startswith(f"cluster/{cluster_id}/")
         or resource_key == f"aws/route53/vpc-association/{cluster_id}"
     )
@@ -771,10 +772,20 @@ def _remove_target_aws_resources(
         for resource in snapshot.resources
         if _target_resource(resource, request.cluster_id)
     ]
-    roles = [resource for resource in selected if resource.resource_type == "iam_role"]
-    if len(roles) != 1:
+    # Exactly one executor role; the data-plane ADOT writer role is optional (a
+    # site without an AMP workspace has none) and is the only other role the
+    # cluster prefix may hold.
+    role_keys = [
+        str(resource.resource_key)
+        for resource in selected
+        if resource.resource_type == "iam_role"
+    ]
+    executor_key = f"aws/iam/executor/{request.cluster_id}/role"
+    allowed_keys = {executor_key, f"aws/iam/adot-writer/{request.cluster_id}/role"}
+    if role_keys.count(executor_key) != 1 or set(role_keys) - allowed_keys:
         raise BootstrapError(
             "installation registry must contain exactly one target Executor IAM role"
+            " (and at most one data-plane ADOT writer role)"
         )
     cleaner.validate_supported(selected)
     deleted: list[str] = []
@@ -876,6 +887,7 @@ def _update_bootstrap_state(
     resources = value.get("resources") or {}
     for name in (
         f"executor_role:{request.cluster_id}",
+        f"adot_writer_role:{request.cluster_id}",
         f"node_keys:{request.cluster_id}",
     ):
         completed.discard(name)

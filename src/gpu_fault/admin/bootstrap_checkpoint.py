@@ -338,7 +338,10 @@ def bind_bootstrap_inputs(
     }
     for cluster_identity in gpu_identity:
         cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        name = f"executor_role:{cluster_id}"
-        task_digests[name] = task_digest(name, {"cluster": cluster_identity})
+        # Both per-cluster roles are re-proved by a read-only probe; the digest
+        # only has to change when the cluster itself does.
+        for prefix in ("executor_role:", "adot_writer_role:"):
+            name = f"{prefix}{cluster_id}"
+            task_digests[name] = task_digest(name, {"cluster": cluster_identity})
     state.bind_inputs(digest, task_digests)
     return digest

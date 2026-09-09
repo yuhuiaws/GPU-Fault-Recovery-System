@@ -79,6 +79,7 @@ from gpu_fault.admin.bootstrap_site import (
     cluster_alias as _cluster_alias,
 )
 from gpu_fault.admin.bootstrap_site import (
+    cluster_irsa_role_entries,
     discover_bootstrap_scope,
     discover_subnet_cidrs,
     finalize_bootstrap_site,
@@ -1680,7 +1681,7 @@ def _site_document(
     pki: Mapping[str, Any],
     aurora: Mapping[str, Any],
     monitoring: Mapping[str, Any],
-    executor_roles: Mapping[str, str],
+    roles: Mapping[str, Any],
     token_files: Mapping[str, Path],
     fleet_master_file: Path,
     adot_image: str,
@@ -1697,7 +1698,7 @@ def _site_document(
                 "context": cluster.context,
                 "hyperpodClusterName": cluster.hyperpod_name,
                 "eksClusterArn": cluster.eks_arn,
-                "executorIrsaRoleArn": executor_roles[cluster_id],
+                **cluster_irsa_role_entries(roles, cluster_id),
                 "allowedNamespaces": ["gpu-fault-system", "training"],
                 "agentEndpointAllowedCidrs": list(cluster.subnet_cidrs),
                 "controlPlaneUrl": f"https://{pki['hostname']}",
@@ -1963,11 +1964,6 @@ def bootstrap_from_arns(
             grafana=grafana,
         ),
     )
-    executor_roles = {
-        name.removeprefix("executor_role:"): value["role_arn"]
-        for name, value in results.items()
-        if name.startswith("executor_role:")
-    }
     # The readiness task owns the master Secret ARN; a checkpoint written before
     # the split still carries it on ``aurora`` itself, and either shape serves.
     aurora = cast(
@@ -1990,7 +1986,8 @@ def bootstrap_from_arns(
         pki=cast(dict[str, Any], results["pki"]),
         aurora=aurora,
         monitoring=monitoring,
-        executor_roles=executor_roles,
+        # ``executor_role:*`` and ``adot_writer_role:*`` name the per-cluster roles.
+        roles=results,
         token_files=token_files,
         fleet_master_file=fleet_master_file,
         adot_image=adot_image,

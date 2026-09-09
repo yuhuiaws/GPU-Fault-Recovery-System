@@ -357,6 +357,26 @@ def existing_gpu_context(
     return None
 
 
+def cluster_irsa_role_entries(
+    results: Mapping[str, Any], cluster_id: str
+) -> dict[str, str]:
+    """The site keys naming one GPU cluster's per-cluster IAM roles.
+
+    ``executorIrsaRoleArn`` is always there. ``adotIrsaRoleArn`` is present only
+    when the ``adot_writer_role:<cluster>`` task made a role: its absence is the
+    release's "skip the data-plane collector" signal, and a value the operator
+    declared in an existing site wins over it (``preserve_existing_site_contract``).
+    """
+
+    entries = {
+        "executorIrsaRoleArn": str(results[f"executor_role:{cluster_id}"]["role_arn"])
+    }
+    writer = results.get(f"adot_writer_role:{cluster_id}") or {}
+    if writer.get("role_arn"):
+        entries["adotIrsaRoleArn"] = str(writer["role_arn"])
+    return entries
+
+
 def preserve_existing_site_contract(
     generated: dict[str, Any],
     existing: Mapping[str, Any] | None,
@@ -402,6 +422,9 @@ def preserve_existing_site_contract(
         previous = existing_clusters.get(item.get("clusterId"))
         if not isinstance(previous, dict):
             continue
+        # ``adotIrsaRoleArn``: a role the operator declared (hand-made before
+        # bootstrap created one) wins over the created role; a cluster that
+        # never declared one takes the generated value.
         for key in (
             "context",
             "allowedNamespaces",
@@ -409,6 +432,7 @@ def preserve_existing_site_contract(
             "tokenFile",
             "caFile",
             "fleetMasterFile",
+            "adotIrsaRoleArn",
         ):
             if key in previous:
                 item[key] = deepcopy(previous[key])

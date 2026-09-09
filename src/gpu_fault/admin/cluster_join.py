@@ -32,6 +32,7 @@ from gpu_fault.admin.bootstrap_common import (
     write_secret,
 )
 from gpu_fault.admin.bootstrap_services import (
+    ensure_adot_writer_role,
     ensure_executor_role,
     provision_node_action_keys,
 )
@@ -533,6 +534,20 @@ def _parallel_prerequisites(
         error = failures[0][1]
         error.add_note(f"join prerequisite task(s) failed: {names}")
         raise error
+    # The data-plane ADOT writer role follows the executor role on purpose: both
+    # sit on the cluster's OIDC provider, and two concurrent ensures would race
+    # ``create-open-id-connect-provider``. No workspace, no collector, no role.
+    workspace_id = request.site.release_config["health"].get("amp_workspace_id")
+    if workspace_id and "adot_writer_role" not in cached:
+        cached["adot_writer_role"] = ensure_adot_writer_role(
+            runner,
+            cluster=target,
+            namespace=str(request.site.release_config["namespace"]),
+            site_id=str(request.site.release_config["site_name"]),
+            amp_workspace_id=str(workspace_id),
+        )
+        state.setdefault("evidence", {})["PREREQUISITES_READY"] = cached
+        write_json_atomic(state_path, state)
     return cached
 
 
@@ -545,6 +560,7 @@ def _cluster_document(
     token_file: Path,
     ca_file: Path,
     fleet_master_file: Path,
+    adot_irsa_role_arn: str | None = None,
 ) -> dict[str, Any]:
     namespaces = tuple(
         sorted(
@@ -554,7 +570,7 @@ def _cluster_document(
             }
         )
     )
-    return {
+    document = {
         "clusterId": cluster_id,
         "context": target.context,
         "region": target.region,
@@ -568,6 +584,10 @@ def _cluster_document(
         "caFile": str(ca_file),
         "fleetMasterFile": str(fleet_master_file),
     }
+    # Absent means the release skips this cluster's data-plane collector.
+    if adot_irsa_role_arn:
+        document["adotIrsaRoleArn"] = adot_irsa_role_arn
+    return document
 
 
 def _write_candidate_site(
@@ -629,6 +649,7 @@ def _update_bootstrap_state(
     cluster_id: str,
     role: dict[str, Any],
     network: dict[str, Any],
+    adot_writer_role: dict[str, Any] | None = None,
 ) -> None:
     path = _bootstrap_state_path(site)
     if path is None:
@@ -637,6 +658,12 @@ def _update_bootstrap_state(
     resources = value.setdefault("resources", {})
     resources[f"executor_role:{cluster_id}"] = role
     resources[f"node_keys:{cluster_id}"] = {"cluster_id": cluster_id}
+    completed_names = {f"executor_role:{cluster_id}", f"node_keys:{cluster_id}"}
+    if adot_writer_role:
+        # Recorded like the executor role so the next bootstrap re-proves it
+        # and the registry/uninstall know it belongs to this cluster.
+        resources[f"adot_writer_role:{cluster_id}"] = adot_writer_role
+        completed_names.add(f"adot_writer_role:{cluster_id}")
     nlb = resources.setdefault("nlb_network", {})
     nlb["gpu_nat_eips"] = sorted(
         {
@@ -657,7 +684,7 @@ def _update_bootstrap_state(
             )
         pki["vpc_associations"] = associations
     completed = set(value.get("completed_tasks") or [])
-    completed.update({f"executor_role:{cluster_id}", f"node_keys:{cluster_id}"})
+    completed.update(completed_names)
     value["completed_tasks"] = sorted(completed)
     value.setdefault("removed_clusters", {}).pop(cluster_id, None)
     value.setdefault("joined_clusters", {})[cluster_id] = {
@@ -723,6 +750,38 @@ def _rollback_command(
         f"rollback command failed ({result.returncode}): "
         f"{' '.join(arguments[:3])}: {result.stderr.strip()}"
     )
+
+
+def _rollback_iam_role(role: object, *, label: str, errors: list[str]) -> None:
+    """Delete a role a failed join created (inline policy first); absent is fine."""
+
+    if not isinstance(role, dict) or not role.get("role_arn"):
+        return
+    role_name = str(role["role_arn"]).rsplit("/", 1)[-1]
+    policy = str(role.get("inline_policy_name") or "")
+    if policy:
+        try:
+            _rollback_command(
+                [
+                    "aws",
+                    "iam",
+                    "delete-role-policy",
+                    "--role-name",
+                    role_name,
+                    "--policy-name",
+                    policy,
+                ],
+                not_found=("NoSuchEntity",),
+            )
+        except BootstrapError as exc:
+            errors.append(f"{label} policy rollback: {exc}")
+    try:
+        _rollback_command(
+            ["aws", "iam", "delete-role", "--role-name", role_name],
+            not_found=("NoSuchEntity",),
+        )
+    except BootstrapError as exc:
+        errors.append(f"{label} role rollback: {exc}")
 
 
 def _rollback_network(network: dict[str, Any], site: RenderedSite) -> None:
@@ -838,33 +897,11 @@ def _rollback(
             _rollback_network(network, request.site)
         except Exception as exc:
             errors.append(f"network rollback: {exc}")
-    role = prerequisites.get("executor_role")
-    if isinstance(role, dict) and role.get("role_arn"):
-        role_name = str(role["role_arn"]).rsplit("/", 1)[-1]
-        policy = str(role.get("inline_policy_name") or "")
-        if policy:
-            try:
-                _rollback_command(
-                    [
-                        "aws",
-                        "iam",
-                        "delete-role-policy",
-                        "--role-name",
-                        role_name,
-                        "--policy-name",
-                        policy,
-                    ],
-                    not_found=("NoSuchEntity",),
-                )
-            except BootstrapError as exc:
-                errors.append(f"Executor policy rollback: {exc}")
-        try:
-            _rollback_command(
-                ["aws", "iam", "delete-role", "--role-name", role_name],
-                not_found=("NoSuchEntity",),
-            )
-        except BootstrapError as exc:
-            errors.append(f"Executor role rollback: {exc}")
+    for prerequisite, label in (
+        ("executor_role", "Executor"),
+        ("adot_writer_role", "ADOT writer"),
+    ):
+        _rollback_iam_role(prerequisites.get(prerequisite), label=label, errors=errors)
     token_file = Path(str(local.get("token_file") or ""))
     secure = state_dir / "secure"
     for path in {
@@ -1084,6 +1121,9 @@ def _prepare_execution(
             token_file=Path(local["token_file"]),
             ca_file=Path(local["ca_file"]),
             fleet_master_file=Path(local["fleet_master_file"]),
+            adot_irsa_role_arn=(prerequisites.get("adot_writer_role") or {}).get(
+                "role_arn"
+            ),
         )
         candidate_path = _write_candidate_site(
             request,

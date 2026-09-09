@@ -752,12 +752,49 @@ def ensure_executor_role(
         cluster,
         site_id,
     )
-    service_account = "gpu-fault-cluster-executor"
     role_name = safe_name(
         f"gpu-fault-{site_id}-{cluster.hyperpod_name}-executor",
         maximum=64,
     )
-    trust = {
+    trust = irsa_trust_document(
+        provider_arn=provider_arn,
+        issuer=issuer,
+        namespace=namespace,
+        service_account="gpu-fault-cluster-executor",
+    )
+    policy = executor_policy_document(hyperpod_arn=cluster.hyperpod_arn)
+    role = _ensure_role(
+        runner,
+        account_id=cluster.account_id,
+        role_name=role_name,
+        trust=trust,
+        policy_name="GPUFaultRegionalExecutor",
+        policy=policy,
+        site_id=site_id,
+    )
+    return {
+        **role,
+        "oidc_provider_arn": provider_arn,
+        "oidc_provider_ownership": provider_ownership,
+        "cluster_name": cluster.eks_name,
+    }
+
+
+def irsa_trust_document(
+    *,
+    provider_arn: str,
+    issuer: str,
+    namespace: str,
+    service_account: str,
+) -> dict[str, Any]:
+    """IRSA trust for one ServiceAccount in one EKS cluster.
+
+    The audience keeps the role to STS; the subject keeps it to one namespace and
+    one ServiceAccount under the cluster's own OIDC issuer, so no other pod in
+    the cluster (or in another cluster) can assume it.
+    """
+
+    return {
         "Version": "2012-10-17",
         "Statement": [
             {
@@ -775,14 +812,77 @@ def ensure_executor_role(
             }
         ],
     }
-    policy = executor_policy_document(hyperpod_arn=cluster.hyperpod_arn)
+
+
+def amp_remote_write_policy_document(
+    *, region: str, account_id: str, workspace_id: str
+) -> dict[str, Any]:
+    """``aps:RemoteWrite`` on one AMP workspace and nothing else -- the whole
+    permission set of both the control-plane and the data-plane collectors."""
+
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["aps:RemoteWrite"],
+                "Resource": f"arn:aws:aps:{region}:{account_id}:workspace/{workspace_id}",
+            }
+        ],
+    }
+
+
+DATAPLANE_ADOT_SERVICE_ACCOUNT = "gpu-fault-adot-dataplane"
+
+
+def ensure_adot_writer_role(
+    runner: CommandRunner,
+    *,
+    cluster: ClusterIdentity,
+    namespace: str,
+    site_id: str,
+    amp_workspace_id: str,
+) -> dict[str, str]:
+    """The IRSA role one GPU cluster's data-plane ADOT collector writes AMP with.
+
+    Same shape as the executor role -- trust on the cluster's OIDC provider for
+    ``gpu-fault-system/gpu-fault-adot-dataplane`` -- with the AMP writer policy
+    in place of the SageMaker one. Callers schedule it after the executor role
+    (the two share the provider ``_ensure_oidc_provider`` creates) and only when
+    the site has a workspace: no workspace means no collector, so a role with
+    an empty resource ARN would be a credential for nothing.
+    """
+
+    if not amp_workspace_id:
+        raise BootstrapError(
+            f"cluster {cluster.hyperpod_name}: the data-plane ADOT writer role "
+            "needs the site's AMP workspace id"
+        )
+    provider_arn, issuer, provider_ownership = _ensure_oidc_provider(
+        runner,
+        cluster,
+        site_id,
+    )
+    role_name = safe_name(
+        f"gpu-fault-{site_id}-{cluster.hyperpod_name}-adot-writer",
+        maximum=64,
+    )
     role = _ensure_role(
         runner,
         account_id=cluster.account_id,
         role_name=role_name,
-        trust=trust,
-        policy_name="GPUFaultRegionalExecutor",
-        policy=policy,
+        trust=irsa_trust_document(
+            provider_arn=provider_arn,
+            issuer=issuer,
+            namespace=namespace,
+            service_account=DATAPLANE_ADOT_SERVICE_ACCOUNT,
+        ),
+        policy_name="GPUFaultDataplaneAmpWriter",
+        policy=amp_remote_write_policy_document(
+            region=cluster.region,
+            account_id=cluster.account_id,
+            workspace_id=amp_workspace_id,
+        ),
         site_id=site_id,
     )
     return {
@@ -1035,19 +1135,11 @@ def install_monitoring(
         role_name=role_name,
         trust=_pod_identity_trust(cpu),
         policy_name="gpu-fault-amp-remote-write",
-        policy={
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": ["aps:RemoteWrite"],
-                    "Resource": (
-                        f"arn:aws:aps:{cpu.region}:{cpu.account_id}:"
-                        f"workspace/{monitoring['workspace_id']}"
-                    ),
-                }
-            ],
-        },
+        policy=amp_remote_write_policy_document(
+            region=cpu.region,
+            account_id=cpu.account_id,
+            workspace_id=str(monitoring["workspace_id"]),
+        ),
         site_id=site_id,
     )
     environment = {

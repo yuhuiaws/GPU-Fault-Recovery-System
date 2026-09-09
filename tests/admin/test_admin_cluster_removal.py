@@ -11,6 +11,7 @@ import yaml
 
 from gpu_fault import node_installer_reconciler
 from gpu_fault.admin import cluster_removal as admin_cluster_removal
+from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal import (
     RemoveClusterRequest,
     _detach_network,
@@ -76,6 +77,12 @@ def _snapshot() -> InstallationResourceSnapshot:
                 policy=InstallationResourceDeletePolicy.PRESERVE,
             ),
             _resource(
+                "aws/iam/adot-writer/gpu-a/role",
+                "iam_role",
+                "adot-writer-role",
+                policy=InstallationResourceDeletePolicy.DELETE,
+            ),
+            _resource(
                 "cluster/gpu-a/eks",
                 "gpu_eks",
                 "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
@@ -139,8 +146,16 @@ def test_target_aws_resources_are_deleted_or_detached_without_touching_cpu(
     )
     statuses = {item.resource_key: item.status for item in updated.resources}
 
-    assert deleted == ["aws/iam/executor/gpu-a/role"]
+    # The executor role and the data-plane ADOT writer role go together; the
+    # waves run on threads, so only the set is deterministic.
+    assert sorted(deleted) == [
+        "aws/iam/adot-writer/gpu-a/role",
+        "aws/iam/executor/gpu-a/role",
+    ], "remove-cluster left the cluster's ADOT writer role behind"
     assert statuses["aws/iam/executor/gpu-a/role"] is InstallationResourceStatus.DELETED
+    assert (
+        statuses["aws/iam/adot-writer/gpu-a/role"] is InstallationResourceStatus.DELETED
+    )
     assert (
         statuses["aws/iam/executor/gpu-a/oidc-provider"]
         is InstallationResourceStatus.DETACHED
@@ -151,7 +166,60 @@ def test_target_aws_resources_are_deleted_or_detached_without_touching_cpu(
         is InstallationResourceStatus.DETACHED
     )
     assert statuses["aws/nlb"] is InstallationResourceStatus.ACTIVE
-    assert evidence["deleted"] == ["aws/iam/executor/gpu-a/role"]
+    assert sorted(evidence["deleted"]) == [
+        "aws/iam/adot-writer/gpu-a/role",
+        "aws/iam/executor/gpu-a/role",
+    ]
+
+
+def _without(snapshot: InstallationResourceSnapshot, key: str):
+    return snapshot.model_copy(
+        update={
+            "resources": [
+                item for item in snapshot.resources if item.resource_key != key
+            ]
+        }
+    )
+
+
+def test_target_resources_still_require_exactly_one_executor_role(
+    tmp_path, monkeypatch
+) -> None:
+    """The writer role is optional (no workspace, no role); the executor role is
+    not, and a second role under the executor prefix is a registry the removal
+    must not act on."""
+
+    site = load_site(site_file(tmp_path))
+
+    class Cleaner:
+        def __init__(self, _site):
+            pass
+
+    monkeypatch.setattr(admin_cluster_removal, "ResourceCleaner", Cleaner)
+    request = RemoveClusterRequest(
+        site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+    )
+
+    with pytest.raises(BootstrapError, match="exactly one target Executor IAM role"):
+        _remove_target_aws_resources(
+            request, _without(_snapshot(), "aws/iam/executor/gpu-a/role")
+        )
+
+    duplicated = _snapshot().model_copy(
+        update={
+            "resources": [
+                *_snapshot().resources,
+                _resource(
+                    "aws/iam/executor/gpu-a/role-2",
+                    "iam_role",
+                    "executor-role-2",
+                    policy=InstallationResourceDeletePolicy.DELETE,
+                ),
+            ]
+        }
+    )
+    with pytest.raises(BootstrapError, match="exactly one target Executor IAM role"):
+        _remove_target_aws_resources(request, duplicated)
 
 
 def test_cluster_network_detach_removes_only_exclusive_sources(

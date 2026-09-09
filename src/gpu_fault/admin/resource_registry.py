@@ -689,16 +689,18 @@ def _role_resources(
     add_role("aurora-refresh", refresh)
     monitoring = state.get("monitoring_install") or {}
     add_role("adot", monitoring)
-    for name, value in state.items():
-        if not name.startswith("executor_role:"):
+    # Per GPU cluster: executor role (owns the shared OIDC row) + ADOT writer role.
+    for name, raw in state.items():
+        kind, _, cluster_id = name.partition(":")
+        value = raw or {}
+        if kind == "adot_writer_role":
+            add_role(f"adot-writer/{cluster_id}", value)
+        if kind != "executor_role":
             continue
-        cluster_id = name.removeprefix("executor_role:")
-        add_role(f"executor/{cluster_id}", value or {})
-        provider_arn = (value or {}).get("oidc_provider_arn")
+        add_role(f"executor/{cluster_id}", value)
+        provider_arn = value.get("oidc_provider_arn")
         if provider_arn:
-            ownership = _foundation_ownership(
-                (value or {}).get("oidc_provider_ownership")
-            )
+            ownership = _foundation_ownership(value.get("oidc_provider_ownership"))
             resources.append(
                 _record(
                     site_id=site_id,
@@ -713,9 +715,7 @@ def _role_resources(
                         ownership,
                         created=InstallationResourceDeletePolicy.DETACH,
                     ),
-                    attributes={
-                        "cluster_name": (value or {}).get("cluster_name"),
-                    },
+                    attributes={"cluster_name": value.get("cluster_name")},
                 )
             )
     lbc = state.get("load_balancer_controller") or {}

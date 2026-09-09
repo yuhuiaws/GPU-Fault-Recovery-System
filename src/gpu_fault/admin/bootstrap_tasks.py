@@ -237,7 +237,10 @@ def foundation_task_graph(
     from gpu_fault.admin.bootstrap_load_balancer import (
         ensure_load_balancer_controller,
     )
-    from gpu_fault.admin.bootstrap_services import ensure_executor_role
+    from gpu_fault.admin.bootstrap_services import (
+        ensure_adot_writer_role,
+        ensure_executor_role,
+    )
     from gpu_fault.admin.notification_bootstrap import (
         notification_bootstrap_tasks,
     )
@@ -253,6 +256,22 @@ def foundation_task_graph(
                     cluster=cluster,
                     namespace=namespace,
                     site_id=site_id,
+                )
+            )
+            for cluster in gpu_clusters
+        }
+        # The data-plane collector's role reads the AMP workspace the
+        # ``monitoring_resources`` task created (see ``dependencies`` below).
+        adot_writer_tasks = {
+            f"adot_writer_role:{safe_name(cluster.hyperpod_name)}": (
+                lambda cluster=cluster: ensure_adot_writer_role(
+                    active_runner,
+                    cluster=cluster,
+                    namespace=namespace,
+                    site_id=site_id,
+                    amp_workspace_id=str(
+                        state.result("monitoring_resources")["workspace_id"]
+                    ),
                 )
             )
             for cluster in gpu_clusters
@@ -298,10 +317,12 @@ def foundation_task_graph(
                 archive_s3_uri=archive_s3_uri,
             ),
             **executor_tasks,
+            **adot_writer_tasks,
         }
 
     tasks = build_tasks(runner, state)
     executor_tasks = {name for name in tasks if name.startswith("executor_role:")}
+    adot_writer_tasks = {name for name in tasks if name.startswith("adot_writer_role:")}
     return TaskGraph(
         tasks=tasks,
         probes=build_tasks(ReadOnlyProbeRunner(runner), None),
@@ -312,8 +333,20 @@ def foundation_task_graph(
                 "email_notifications",
                 "monitoring_resources",
                 *executor_tasks,
+                *adot_writer_tasks,
             }
         ),
+        # The writer role's policy names the workspace ``monitoring_resources``
+        # creates, and its trust sits on the OIDC provider the executor role
+        # ensures for the same cluster: running it concurrently with the
+        # executor would race two ``create-open-id-connect-provider`` calls.
+        dependencies={
+            name: (
+                name.replace("adot_writer_role:", "executor_role:", 1),
+                "monitoring_resources",
+            )
+            for name in adot_writer_tasks
+        },
     )
 
 
