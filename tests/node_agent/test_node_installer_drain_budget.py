@@ -10,7 +10,7 @@ now hands its start time and budget into the chroot, the installer bounds the
 wait by ``min(1900, remaining budget - margin)`` and fails with a status the
 operator can act on; the Job goes Failed and the reconciler retries it with
 backoff. Ordering (the drain runs before the first unit/env write) is asserted
-in ``test_node_deployment.py`` next to the other drain contracts.
+in ``test_node_deployment_ledger_drain.py`` next to the other drain contracts.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from gpu_fault.node_agent.ledger import IN_PROGRESS_STATE
-from tests.node_agent.test_node_deployment import (
+from tests.node_agent._deployment_support import (
     NODE_SCRIPTS,
     _ledger_drain_probe,
     _ledger_with_state,
