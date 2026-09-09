@@ -9,12 +9,17 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
     compute_agent_config_digest,
+)
+from gpu_fault.admin.release_consent import (
+    ACCEPT_SCHEMA_CHANGE_ENV,
+    ALLOW_INFLIGHT_INSTALLS_ENV,
+    SUPERSEDE_FAILED_TRANSACTION_ENV,
 )
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
@@ -149,6 +154,41 @@ def runtime_image_exists(*, region: str, reference: str) -> bool:
     if "ImageNotFoundException" in error or "RepositoryNotFoundException" in error:
         return False
     raise BootstrapError(f"cannot verify signed runtime image: {error}")
+
+
+# Deploy-scoped consent the CLI exports for the release engine. The release
+# gates (static, pytest, postgres) run in a child process of that same deploy,
+# and a suite that inherits the consent reads it as the state under test: with
+# ``--accept-schema-change`` one rollback-compatibility test took the accepted
+# branch (deploy #18, 2026-09-09); with ``--supersede-failed-transaction`` 35
+# deploy/resume decision tests demanded a supersede (deploy #22). The gates
+# judge the tree, not this deploy's consent, so the consent stays out of them.
+RELEASE_GATE_EXCLUDED_ENVIRONMENT = frozenset(
+    {
+        ACCEPT_SCHEMA_CHANGE_ENV,
+        SUPERSEDE_FAILED_TRANSACTION_ENV,
+        ALLOW_INFLIGHT_INSTALLS_ENV,
+    }
+)
+
+
+def release_gate_environment(
+    parent: Mapping[str, str],
+    *,
+    postgres_url: str,
+    cosign_password: str | None,
+) -> dict[str, str]:
+    """The environment the release gates and the release build run under."""
+
+    environment = {
+        key: value
+        for key, value in parent.items()
+        if key not in RELEASE_GATE_EXCLUDED_ENVIRONMENT
+    }
+    environment["GPU_FAULT_TEST_POSTGRES_URL"] = postgres_url
+    if cosign_password is not None:
+        environment["COSIGN_PASSWORD"] = cosign_password
+    return environment
 
 
 @contextmanager
@@ -527,12 +567,9 @@ def build_signed_release(
         isolated_postgres_url(runner) if postgres_required else nullcontext("")
     )
     with postgres_context as postgres_url:
-        environment = {
-            **os.environ,
-            "GPU_FAULT_TEST_POSTGRES_URL": str(postgres_url),
-        }
-        if password is not None:
-            environment["COSIGN_PASSWORD"] = password
+        environment = release_gate_environment(
+            os.environ, postgres_url=str(postgres_url), cosign_password=password
+        )
         runner.run(
             command,
             cwd=repository_root,
