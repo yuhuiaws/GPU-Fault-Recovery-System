@@ -834,6 +834,12 @@ class KubernetesCompletionController:
 
         return int(getattr(self.sink, "expired_total", 0))
 
+    @property
+    def outbox_quarantine_evictions_total(self) -> int:
+        """Quarantined records evicted to make room for a critical event (R5)."""
+
+        return int(getattr(self.sink, "quarantine_evictions_total", 0))
+
     def _sink_timing(self, attribute: str, default: float) -> float:
         """A delivery timeout read off the sink, or off the sink it wraps.
 
