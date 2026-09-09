@@ -64,6 +64,11 @@ def _dispatcher(store, adapter=None) -> WorkflowDispatcher:
 
 
 def _waiting_restart(index: int, started_at: datetime, **details):
+    # The shape the adapter's approval hold leaves: the TTL only releases a
+    # wait that says nothing was submitted.
+    details.setdefault(
+        "details", {"reason": "GPU_COUNT_CHANGED", "restart_submitted": False}
+    )
     return workflow_step_execution(
         index,
         RESTART,
@@ -188,6 +193,8 @@ def test_revoking_a_retired_generation_applies_the_waiting_ttl(
                 details={
                     "remote_status": "WAITING",
                     "remote_command_id": "cmd-restart",
+                    # The data plane's hold, carried by the regional adapter.
+                    "restart_submitted": False,
                 },
             )
         ],

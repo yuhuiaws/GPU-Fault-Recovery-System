@@ -22,6 +22,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     resolved_step_indexes,
 )
+from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
@@ -473,6 +474,31 @@ _NEVER_DISPATCHED_STATUS_SOURCES = frozenset(
 _CANCELLED_STATUS_SOURCES = frozenset({"workflow-timeout", "workflow-preempted"})
 
 
+def _wait_was_before_submission(details: dict[str, Any]) -> bool:
+    """Does a WAITING report (or the cap failure copied from one) prove that
+    the restart adapter had not submitted anything?
+
+    The adapter's own holds carry ``restart_submitted: False``. Two shapes
+    override or outrank that: a retryable adapter error is a WAITING the
+    *executor* answered for an exception that may have been raised after
+    ``create_namespaced_job`` (a 5xx on the second workload, a client
+    timeout after the API server persisted the Job), and a remote command
+    that is LEASED is on a data-plane executor right now -- its last report
+    may be a hold the executor has since moved past. A PENDING remote command
+    was never leased, so no adapter ran. Anything else says nothing, and
+    nothing means keep.
+    """
+
+    if details.get("retryable_adapter_error"):
+        return False
+    remote_status = details.get("remote_status")
+    if remote_status == RemoteCommandStatus.LEASED.value:
+        return False
+    if remote_status == RemoteCommandStatus.PENDING.value:
+        return True
+    return details.get(_NOT_SUBMITTED_DETAIL) is False
+
+
 def _restart_never_left_the_gate(
     record: WorkflowStepExecution,
     *,
@@ -481,34 +507,38 @@ def _restart_never_left_the_gate(
 ) -> bool:
     """Does this RESTART_WORKLOAD record show a restart that never happened?
 
-    The restart adapter's own holds -- an approval is pending, or the incident
-    it depends on is not recovered -- come before it submits anything, so a
-    wait that outlived the step's cap, or that the cap already turned into a
-    failure, holds budget for a restart nobody made (F-C9). A remote command
-    that a cluster executor is running is the one shape that says nothing
-    about submission, and keeps its reservation.
+    Release needs positive evidence that nothing was submitted; a record that
+    says nothing keeps the budget spent, by decision (F-C9, Task 13 C-1).
 
-    A FAILED record releases only on positive evidence that nothing was
-    submitted: the adapter's ``restart_submitted: False`` (stamped on its
-    refusals and its holds), the waiting cap, or a remote command no adapter
-    ever ran (executor-rejected, unclaimed). A cancelled command releases
-    only if its last report carries that marker or it never left PENDING (no
-    report at all): the cluster executor also answers WAITING for a retryable
-    error raised *after* ``create_namespaced_job``, and cancellation keeps
-    that report, so a cancelled WAITING without the marker may hide a Job that
-    exists. A cancellation the node settled afterwards, an executor-internal
-    or configuration error, a stale-fence settle and a plain node failure keep
-    the budget spent -- conservatively, by decision.
+    A WAITING record older than ``waiting_ttl``, and a FAILED record the
+    waiting cap produced from one, release only when the wait was one of the
+    adapter's own pre-submission holds (``restart_submitted: False``) or the
+    remote command was never leased (``remote_status`` PENDING); a wait the
+    executor answered for a retryable adapter error, or whose remote command
+    is LEASED, may hide a Job that exists (``_wait_was_before_submission``).
+
+    A FAILED record otherwise releases on the adapter's own marker (its
+    refusals carry it; the regional path copies it verbatim from the data
+    plane's ``RemoteCommandResult.details``), on a remote command no adapter
+    ever ran (executor-rejected, unclaimed), or on a cancelled command whose
+    last report carries the marker or that never left PENDING (no report at
+    all). A cancellation the node settled afterwards, an executor-internal or
+    configuration error, a stale-fence settle and a plain node failure keep
+    the budget spent.
     """
 
     details = record.details
-    if str(details.get("remote_status") or "") == "RUNNING":
-        return False
     if record.status is WorkflowStepStatus.WAITING:
-        return waiting_ttl is not None and now - record.started_at >= waiting_ttl
+        if waiting_ttl is None or now - record.started_at < waiting_ttl:
+            return False
+        return _wait_was_before_submission(details)
     if record.status is not WorkflowStepStatus.FAILED:
         return False
-    if details.get(_NOT_SUBMITTED_DETAIL) is False or _WAITING_CAP_DETAIL in details:
+    if _WAITING_CAP_DETAIL in details:
+        # ``bounded_waiting_outcome`` copies the last WAITING's details into
+        # this failure, so the same evidence rule applies.
+        return _wait_was_before_submission(details)
+    if details.get(_NOT_SUBMITTED_DETAIL) is False:
         return True
     source = details.get("remote_status_source")
     if source in _NEVER_DISPATCHED_STATUS_SOURCES:

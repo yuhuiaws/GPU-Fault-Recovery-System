@@ -811,6 +811,9 @@ class RegionalRemoteWorkflowAdapter:
                     ),
                 },
             )
+        # A RESTART_WORKLOAD hold on the data plane says ``restart_submitted``;
+        # carried here so the reservation release can judge a live wait.
+        restart_submitted = current.result_details.get("restart_submitted")
         return WorkflowStepOutcome.waiting(
             operation_id=operation_id,
             details={
@@ -818,6 +821,11 @@ class RegionalRemoteWorkflowAdapter:
                 "remote_cluster_id": current.cluster_id,
                 "remote_status": current.status.value,
                 "mutation_submitted_by_control_plane": False,
+                **(
+                    {"restart_submitted": restart_submitted}
+                    if restart_submitted is not None
+                    else {}
+                ),
             },
         )
 

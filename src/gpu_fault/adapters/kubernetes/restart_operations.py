@@ -82,13 +82,13 @@ class KubernetesRestartOperationsMixin:
         context: WorkflowStepContext,
         workloads: list[tuple[str, str, str, str, Any]],
     ) -> tuple[WorkflowStepOutcome | None, int | None]:
-        """Compare the step's ``RestartAuthorization`` with the workload.
+        """Compare the step's ``RestartAuthorization`` with the step as signed.
 
         The control plane reserves the job's restart budget in its preflight
-        and signs that reservation into the authorization; this guard only
-        checks that the authorization describes the workload in front of it.
-        ``(None, restart_count)`` clears the restart; otherwise the outcome
-        says why not.
+        and signs that reservation into the authorization; this guard checks
+        that the authorization describes the step in front of it, then reads
+        the workload's premises. ``(None, restart_count)`` clears the
+        restart; otherwise the outcome says why not.
         """
 
         parameters = context.step.parameters
@@ -96,6 +96,34 @@ class KubernetesRestartOperationsMixin:
         if authorization is None:
             return (
                 self._rejected("restart safety guard requires a restart authorization"),
+                None,
+            )
+        # Compare the authorization with the parameters as the preflight
+        # signed them. The label and observation rewrites below refine the
+        # values the new Job is built from (a discovered attempt id, a GPU
+        # count the plan could not know), and would otherwise make a genuine
+        # authorization look forged.
+        signed = {
+            "cluster_id": str(parameters["cluster_id"]),
+            "job_id": str(parameters["job_id"]),
+            "source_attempt_id": str(parameters["source_attempt_id"]),
+            "source_gpu_count": int(parameters["source_gpu_count"]),
+            "restart_budget": int(parameters["restart_budget"]),
+            "reservation_id": context.idempotency_key,
+        }
+        actual = {
+            "cluster_id": authorization.cluster_id,
+            "job_id": authorization.job_id,
+            "source_attempt_id": authorization.source_attempt_id,
+            "source_gpu_count": authorization.source_gpu_count,
+            "restart_budget": authorization.restart_budget,
+            "reservation_id": authorization.reservation_id,
+        }
+        if actual != signed:
+            return (
+                self._rejected(
+                    "restart authorization does not match the workload safety context"
+                ),
                 None,
             )
         premise = self._incident_premise(context)
@@ -224,30 +252,6 @@ class KubernetesRestartOperationsMixin:
                         # while it waits here owes no restart budget.
                         "restart_submitted": False,
                     },
-                ),
-                None,
-            )
-
-        expected = {
-            "cluster_id": str(parameters["cluster_id"]),
-            "job_id": str(parameters["job_id"]),
-            "source_attempt_id": str(parameters["source_attempt_id"]),
-            "source_gpu_count": source_gpu_count,
-            "restart_budget": int(parameters["restart_budget"]),
-            "reservation_id": context.idempotency_key,
-        }
-        actual = {
-            "cluster_id": authorization.cluster_id,
-            "job_id": authorization.job_id,
-            "source_attempt_id": authorization.source_attempt_id,
-            "source_gpu_count": authorization.source_gpu_count,
-            "restart_budget": authorization.restart_budget,
-            "reservation_id": authorization.reservation_id,
-        }
-        if actual != expected:
-            return (
-                self._rejected(
-                    "restart authorization does not match the workload safety context"
                 ),
                 None,
             )

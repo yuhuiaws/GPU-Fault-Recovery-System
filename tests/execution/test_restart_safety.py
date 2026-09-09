@@ -19,7 +19,9 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import NotFoundError, SqliteStore
 from tests._builders import (
+    attempt_observation,
     build_store,
+    container_observation,
     copy_model,
     fault_incident,
     workflow_request,
@@ -312,6 +314,43 @@ def test_restart_rejects_an_authorization_for_another_job() -> None:
     assert "does not match" in (outcome.error or "")
     assert outcome.details["restart_submitted"] is False
     assert batch.created == {}
+
+
+def test_authorization_is_compared_as_signed_not_as_refined() -> None:
+    """A plan that could not learn the GPU count signs ``source_gpu_count=0``;
+    the guard then discovers the real count from observations. The discovered
+    value builds the Job; the signed value is what the authorization must
+    match, or every such restart would look forged."""
+
+    store = build_store()
+    store.save_attempt_observation(
+        attempt_observation(
+            "train-1",
+            "attempt-zero",
+            NOW,
+            containers=[
+                container_observation(
+                    "pod-a", "trainer", 0, "node-a", host_pid=100, gpu_uuids=["GPU-a"]
+                )
+            ],
+            workload_ids=["training/job/training-job"],
+        )
+    )
+    batch = BatchApi(gpu_count=1)
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
+    )
+    context = restart_context("zero", source_gpu_count=0, restart_budget=1)
+    store.reserve_job_restart("cluster-a", "train-1", 1, context.idempotency_key)
+
+    completed = adapter.execute(context)
+
+    assert completed.status is WorkflowStepStatus.SUCCEEDED, completed
+    assert len(batch.created) == 1
+    # The refined count drove the Job; the signed count satisfied the guard.
+    assert context.request.restart_authorization is not None
+    assert context.request.restart_authorization.source_gpu_count == 0
+    assert context.step.parameters["source_gpu_count"] == 1
 
 
 def test_restart_rejections_before_submission_say_so() -> None:

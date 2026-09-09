@@ -2704,6 +2704,10 @@ class ProductionWorkflowExecutor:
         if previous is not None and previous.status is WorkflowStepStatus.WAITING:
             inherited = dict(previous.details)
             operation_id = previous.adapter_operation_id
+            # A hold's "nothing submitted yet" does not survive a retry: this
+            # error may have been raised after the adapter created the Job,
+            # and the reservation release must not read the stale marker.
+            inherited.pop("restart_submitted", None)
         details: dict[str, Any] = {
             **inherited,
             "retryable_adapter_error": True,
