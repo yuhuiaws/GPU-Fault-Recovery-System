@@ -65,11 +65,12 @@ def unlabelled_jobset_pod() -> dict:
 
 
 def test_pods_are_always_listed_by_the_managed_selector() -> None:
-    """Cluster-wide and per namespace, polling path and watch stream alike.
+    """Cluster-wide and per namespace, the LIST always carries the selector.
 
-    There is no switch that drops the selector: an unlabelled Pod is never
-    listed, so it is neither an attempt nor a running Pod the coverage
-    heartbeat counts.
+    There is no switch that drops it: an unlabelled Pod is never listed, so
+    it is neither an attempt nor a running Pod the coverage heartbeat
+    counts. The watch stream reuses ``completion_list_arguments`` and is
+    covered by the same call, not driven here.
     """
 
     cluster_wide = SelectorRecordingCoreApi([pod(0)])
@@ -102,8 +103,9 @@ def test_pods_are_always_listed_by_the_managed_selector() -> None:
 def test_an_unlabelled_pod_is_neither_grouped_nor_observed() -> None:
     """An unlabelled JobSet Pod is outside the contract, whatever the API returns.
 
-    The selector keeps such Pods off the list; should one arrive anyway (a
-    stale watch cache, a permissive fake), it is not turned into a synthetic
+    The selector keeps such Pods off the list; should the API server hand
+    one back anyway (defence in depth; this fake ignores the selector), it
+    is not turned into a synthetic
     attempt: no observation is published and nothing is stopped. It still
     counts as a running Pod for the coverage heartbeat -- "every non-finished
     Pod counts" is fail-closed on purpose -- so the pass claims no IDLE either,
