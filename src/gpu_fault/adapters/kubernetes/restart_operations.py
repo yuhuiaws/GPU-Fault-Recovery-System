@@ -287,9 +287,12 @@ class KubernetesRestartOperationsMixin:
     ) -> WorkflowStepOutcome | None:
         """Honour ``requires_incident_state`` at execution time.
 
-        The planner's ``after_incident`` restart depends on the incident that
-        owns the nodes being ``RECOVERED``. Only the simulated executor read
-        that premise, so a production restart went ahead mid-repair (F-G5).
+        A restart planned after a repair depends on the incident that owns the
+        nodes being ``RECOVERED``. The compiler writes that premise onto the
+        step from ``RecoveryPlan.restart_after_incident_id``; both executors
+        read it -- the simulated one straight off the plan, this adapter off
+        the compiled step -- because for a while only the simulated executor
+        did, and a production restart went ahead mid-repair (F-G5).
         Not yet recovered: wait (the executor re-runs the step). Can never
         recover (quarantined, escalated): fail. Cannot be verified: fail
         closed rather than restart on an assumption.

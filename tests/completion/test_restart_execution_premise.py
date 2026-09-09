@@ -1,8 +1,10 @@
-"""The Kubernetes restart adapter reads the planner's two safety premises (F-G5).
+"""Both executors read the two safety premises of a restart (F-G5).
 
 ``requires_incident_state`` was honoured only by the simulated executor, so a
 production restart went ahead while the incident it depended on was still
-being repaired. ``avoid_node_ids`` had no reader at all.
+being repaired. ``avoid_node_ids`` had no reader at all. Today the Kubernetes
+adapter reads both from the compiled step, and the simulated executor reads
+the incident premise from ``RecoveryPlan.restart_after_incident_id``.
 """
 
 from __future__ import annotations
@@ -10,14 +12,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from gpu_fault.adapters import KubernetesWorkflowAdapter
+from gpu_fault.adapters import KubernetesWorkflowAdapter, SimulatedRecoveryExecutor
+from gpu_fault.app import default_simulated_profile
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
+    PlanStatus,
+    TerminalEvent,
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.planner import PlanBuilder
 from gpu_fault.regional import RemoteIncidentOwnershipReport
 from tests._builders import (
     build_store,
@@ -254,3 +260,44 @@ def test_restart_keeps_the_new_attempt_off_avoided_nodes() -> None:
             ]
         }
     ]
+
+
+def test_simulated_executor_reads_the_premise_from_the_plan(
+    failed_event: TerminalEvent,
+) -> None:
+    """The premise moved off the plan step, so its reader had to move too.
+
+    The simulated executor read ``requires_incident_state`` from the plan
+    step's parameters. Once the compiler became the only writer of that
+    parameter the gate stopped firing without failing anything:
+    ``/v1/recovery-plans/{id}/simulate`` reported SUCCEEDED, and stored
+    ``PlanStatus.SUCCEEDED``, for a plan whose incident was still being
+    repaired.
+    """
+    store = build_store()
+    incident = fault_incident(
+        "inc-premise",
+        "event-premise",
+        node_ids=["node-a"],
+        state=IncidentState.ACTION_PENDING,
+    )
+    store.save_incident(incident)
+    plan = PlanBuilder().after_incident(
+        failed_event, incident, default_simulated_profile()
+    )
+    store.save_plan(plan)
+    executor = SimulatedRecoveryExecutor(store)
+
+    held = executor.execute(plan)
+
+    assert held.status is PlanStatus.FAILED
+    assert held.error is not None
+    assert "inc-premise" in held.error
+    assert "ACTION_PENDING" in held.error
+    assert store.get_plan(plan.plan_id).status is PlanStatus.FAILED
+
+    store.save_incident(copy_model(incident, state=IncidentState.RECOVERED))
+    released = executor.execute(plan)
+
+    assert released.status is PlanStatus.SUCCEEDED
+    assert store.get_plan(plan.plan_id).status is PlanStatus.SUCCEEDED

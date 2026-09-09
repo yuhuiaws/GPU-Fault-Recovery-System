@@ -602,9 +602,12 @@ def test_passive_recovery_waits_for_proactive_incident(
 
     assert [step.operation for step in workflow.official_steps]
     assert len(plan.steps) == 1
-    assert plan.steps[0].parameters["incident_id"] == (incident.incident_id)
+    assert plan.steps[0].parameters == {}
+    assert plan.restart_after_incident_id == incident.incident_id
     assert blocked.status is PlanStatus.FAILED
+    assert incident.incident_id in blocked.error
     assert "requires RECOVERED" in blocked.error
+    assert context.store.get_plan(plan.plan_id).status is PlanStatus.FAILED
 
     context.orchestrator.simulate(workflow.request_id, workflow.fencing_token)
     resumed = context.executor.execute(plan)

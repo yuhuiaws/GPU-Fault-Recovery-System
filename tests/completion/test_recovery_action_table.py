@@ -212,17 +212,21 @@ def test_compiler_derives_the_incident_premise_from_the_plan(
 
     The planner only names the incident the restart waits on; turning that
     into the step's ``requires_incident_state`` parameters here keeps the
-    adapter reading the incident at execution time (F-G5).
+    adapter reading the incident at execution time (F-G5). The stored
+    incident is what counts: the compiler re-reads it, so a node the
+    incident grew after the plan was built is still avoided.
     """
-    incident = fault_incident(
+    stored = fault_incident(
         "inc-pending",
         "event-pending",
-        node_ids=["node-a"],
+        node_ids=["node-a", "node-z"],
         state=IncidentState.ACTION_PENDING,
     )
-    context.store.save_incident(incident)
+    context.store.save_incident(stored)
     plan = PlanBuilder().after_incident(
-        failed_event, incident, default_simulated_profile()
+        failed_event,
+        copy_model(stored, node_ids=["node-a"]),
+        default_simulated_profile(),
     )
 
     compiled = PassiveWorkflowCompiler(context.store).compile(plan, failed_event)
@@ -232,7 +236,7 @@ def test_compiler_derives_the_incident_premise_from_the_plan(
     assert restart.operation is WorkflowOperation.RESTART_WORKLOAD
     assert restart.parameters["requires_incident_state"] == "RECOVERED"
     assert restart.parameters["incident_id"] == "inc-pending"
-    assert restart.parameters["incident_node_ids"] == ["node-a"]
+    assert restart.parameters["incident_node_ids"] == ["node-a", "node-z"]
     assert restart.parameters["restart_budget"] == failed_event.restart_budget
     assert "reuse_allocation" not in restart.parameters
 

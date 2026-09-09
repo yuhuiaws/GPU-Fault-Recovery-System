@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from gpu_fault.models import (
+    IncidentState,
     OperationResult,
     PlanStatus,
     RecoveryPlan,
@@ -18,27 +19,35 @@ class SimulatedRecoveryExecutor:
         self.operations: dict[str, OperationResult] = {}
 
     def execute(self, plan: RecoveryPlan) -> OperationResult:
-        for step in plan.steps:
-            required_state = step.parameters.get("requires_incident_state")
-            incident_id = step.parameters.get("incident_id")
-            if required_state and incident_id:
-                incident = self.store.get_incident(incident_id)
-                if incident.state.value != required_state:
-                    operation = OperationResult(
-                        operation_id=f"op-{uuid4()}",
-                        plan_id=plan.plan_id,
-                        status=PlanStatus.FAILED,
-                        error=(
-                            f"incident {incident_id} is "
-                            f"{incident.state.value}; requires "
-                            f"{required_state}"
-                        ),
-                    )
-                    self.operations[operation.operation_id] = operation
-                    self.store.save_plan(
-                        plan.model_copy(update={"status": PlanStatus.FAILED})
-                    )
-                    return operation
+        """Simulate the plan, honouring its one execution premise.
+
+        The premise is read from ``plan.restart_after_incident_id`` and not
+        from the plan's step parameters: the planner no longer writes
+        ``requires_incident_state`` onto a step (the compiler derives it for
+        the workflow engine), so reading the step here would have turned the
+        gate into a no-op and reported SUCCEEDED for a restart whose incident
+        was still being repaired (F-G5).
+        """
+
+        premise_id = plan.restart_after_incident_id
+        if premise_id is not None:
+            incident = self.store.get_incident(premise_id)
+            if incident.state is not IncidentState.RECOVERED:
+                operation = OperationResult(
+                    operation_id=f"op-{uuid4()}",
+                    plan_id=plan.plan_id,
+                    status=PlanStatus.FAILED,
+                    error=(
+                        f"incident {premise_id} is "
+                        f"{incident.state.value}; requires "
+                        f"{IncidentState.RECOVERED.value}"
+                    ),
+                )
+                self.operations[operation.operation_id] = operation
+                self.store.save_plan(
+                    plan.model_copy(update={"status": PlanStatus.FAILED})
+                )
+                return operation
 
         operation = OperationResult(
             operation_id=f"op-{uuid4()}",
