@@ -33,8 +33,9 @@ def refused_inflight_installs(error: BaseException) -> bool:
 # (``regional_release_orchestration.rollback_release``). The driver copies it
 # into its own rollback record so the release history says whether the rollback
 # was checked, and on what: "clear", "unchecked" (no Running control-plane Pod
-# could run the probe -- the automatic rollback proceeds over exactly that) or
-# "overridden" (consent over a listed set). A refusal never reaches the state
+# with a ready container could run the probe -- the automatic rollback proceeds
+# over exactly that -- or a kubectl-level failure on a ready Pod that consent
+# waved through) or "overridden" (consent over a listed set). A refusal never reaches the state
 # (nothing is written); the driver records it from the exit code.
 INFLIGHT_INSTALLS_STATE_KEY = "inflight_installs"
 
@@ -202,9 +203,11 @@ def rollback_after_failure(
             environment=environment,
             # Marks the rollback automatic: the engine's in-flight install
             # check then proceeds (logging) when no Running control-plane Pod
-            # could run its probe (StoreUnreachable), instead of wedging a
-            # release whose control plane is down. Evidence the probe did
-            # return still refuses (exit 3, recorded below).
+            # with a ready container could run its probe (StoreUnreachable),
+            # instead of wedging a release whose control plane is down. A
+            # kubectl-level failure on a ready Pod (KubectlFailure) and
+            # evidence the probe did return still refuse (exit 3, recorded
+            # below).
             arguments=("--automatic",),
         )
         live_state = read_live_state(site_file)

@@ -11,11 +11,13 @@ rollback refuses before touching anything (``regional_release_store_preflight``)
 and the transaction stays in ``failed`` -- the phase resume and
 ``--supersede-failed-transaction`` already handle -- rather than going to
 ``rollback-failed``, which would claim a restore was attempted. When no Running
-control-plane Pod could run that check's probe (``StoreUnreachable``: its
-primary scenario is a control plane that is down) the automatic rollback is not
-stopped -- the gate logs ``inflight-installs-unchecked`` and the rollback runs.
-A probe that ran and could not vouch for a clear store refuses it like any
-other mode.
+control-plane Pod with a ready container could run that check's probe
+(``StoreUnreachable``: its primary scenario is a control plane that is down or
+CrashLooping) the automatic rollback is not stopped -- the gate logs
+``inflight-installs-unchecked`` and the rollback runs. A kubectl-level failure
+on a ready Pod (``KubectlFailure``: a live dispatcher we could not ask) and a
+probe that ran and could not vouch for a clear store refuse it like any other
+mode.
 """
 
 from __future__ import annotations
@@ -73,11 +75,12 @@ def recover_failed_upgrade(
     ):
         raise error
     try:
-        # ``automatic``: when no Running control-plane Pod could run the
-        # in-flight install probe (StoreUnreachable) this rollback proceeds (a
-        # dead control plane dispatches nothing; wedging production in
-        # ``failed`` is the worse failure). Evidence the probe did return still
-        # refuses it.
+        # ``automatic``: when no Running control-plane Pod with a ready
+        # container could run the in-flight install probe (StoreUnreachable)
+        # this rollback proceeds (a dead control plane dispatches nothing;
+        # wedging production in ``failed`` is the worse failure). A
+        # kubectl-level failure on a ready Pod and evidence the probe did
+        # return still refuse it.
         release.rollback(state=previous, automatic=True)
     except InflightInstallsRefused as refusal:
         phase = release.state.get("phase")
