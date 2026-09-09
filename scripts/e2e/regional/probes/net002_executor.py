@@ -179,8 +179,13 @@ def rollback_stale_block() -> None:
             time.sleep(0.25)
             continue
         if age_seconds >= BLOCK_ROLLBACK_SECONDS:
-            BLOCK.unlink(missing_ok=True)
-            ROLLBACK_STATE.write_text(
+            # Record first, atomically, then lift the block: the record is
+            # what the case reads once the block is gone, and a reader that
+            # saw the marker vanish must never find the record empty or
+            # missing (the release gate hit exactly that window on
+            # 2026-09-09).
+            temporary = ROLLBACK_STATE.with_suffix(".tmp")
+            temporary.write_text(
                 json.dumps(
                     {
                         "automatic": True,
@@ -190,6 +195,8 @@ def rollback_stale_block() -> None:
                 ),
                 encoding="utf-8",
             )
+            temporary.replace(ROLLBACK_STATE)
+            BLOCK.unlink(missing_ok=True)
             logging.error(
                 "automatically removed stale network block after %.1f seconds",
                 age_seconds,

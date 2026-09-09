@@ -46,7 +46,14 @@ def test_net002_automatic_block_rollback(tmp_path: Path, monkeypatch) -> None:
         time.sleep(0.01)
 
     assert not block.exists(), "automatic rollback left the network block marker"
-    assert json.loads(rollback.read_text())["automatic"] is True
+    # The record is written (atomically) before the marker is lifted, so the
+    # moment the marker is gone the record is complete -- no second wait.
+    record = json.loads(rollback.read_text())
+    assert record["automatic"] is True, record
+    assert record["blocked_seconds"] >= 0.05, record
+    assert not rollback.with_suffix(".tmp").exists(), (
+        "the temporary file was left behind"
+    )
 
 
 def test_net003_ledger_is_exactly_once(tmp_path: Path, monkeypatch) -> None:
