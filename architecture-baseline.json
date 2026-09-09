@@ -4,7 +4,7 @@
     "scripts/e2e/regional/capacity_acceptance_cases.py:CapacityAcceptanceCases": 817,
     "scripts/e2e/regional/regional_live_fixture.py:RegionalLiveFixture": 838,
     "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 862,
-    "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 878,
+    "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 881,
     "src/gpu_fault/collectors/logs/node.py:NodeLogCollector": 828,
     "src/gpu_fault/completion_controller.py:KubernetesCompletionController": 1039,
     "src/gpu_fault/execution/dispatcher.py:WorkflowDispatcher": 1607,
