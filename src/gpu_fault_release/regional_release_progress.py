@@ -121,9 +121,16 @@ everything the pins control and silently wrong for anything the template edit
 itself changed, so it is recorded rather than left to be inferred.
 
 ``observability_manifests`` and ``endpoint_manifests`` are deliberately absent:
-both are restored from a snapshot of the live objects
-(``regional_observability_rollback``, ``regional_endpoint_rollback``) rather than
-re-applied from the tree, so a template edit to either is genuinely undone.
+both are restored from snapshots of the live objects rather than re-applied
+from the tree, so a template edit to either is genuinely undone. For
+observability that holds for both halves: the control-plane collector and the
+AMP blobs (``regional_observability_rollback``) and, per GPU cluster, the
+data-plane collector plus the rendered expected-collector rules
+(``regional_dataplane_observability``). The one exception is a previous-state
+snapshot captured before the per-cluster capture existed: its rollback falls
+back to the candidate's data-plane manifest with the previous image, and the
+rollback record's ``observability_restore`` details say ``path:
+previous-image`` for exactly that case rather than this set claiming it.
 """
 
 PHASE_COMPONENTS = {

@@ -157,12 +157,21 @@ def apply_gpu_adot_collector(
 
     Same shape as :func:`apply_gpu_dcgm_exporter`, and meant to be wired the
     same way: the release engine calls it wherever it calls the DCGM apply
-    (bootstrap, join, the OBSERVABILITY node of an upgrade, rollback with the
-    previous ``adot_image``).
+    (bootstrap, join, the OBSERVABILITY node of an upgrade, and the
+    previous-image rollback fallback).
+
+    The skip branch is not read-only: removing a cluster's role (or the site's
+    workspace) is a release -- the inputs are in the observability digest -- and
+    the OBSERVABILITY node then lands here for that cluster. A collector the
+    previous release applied would otherwise keep running with credentials that
+    no longer exist (sigv4 refused, zero series, and the per-cluster absence
+    rule gone with the role), so the skip scales it to zero with the same lever
+    ``remove_cluster`` uses. The preflight's skip stays a dry run.
     """
 
     manifest = _render_gpu_adot_collector(release, target, image=image)
     if manifest is None:
+        release._scale_if_present(release._gpu(target), DATAPLANE_ADOT_DEPLOYMENT, 0)
         return
     release.runner.run(
         release._gpu(target, "apply", "--dry-run=server", "-f", "-"),
@@ -186,11 +195,15 @@ def apply_gpu_adot_collector(
 
 
 def rollback_gpu_adot_collectors(release: Any, previous: dict[str, Any]) -> None:
-    """Put every cluster's collector back on the previous ``adot_image``.
+    """Put every configured cluster's collector on the previous ``adot_image``.
 
-    Runs inside the observability restore of an automatic rollback, after the
-    control-plane snapshot. Clusters the release skipped (no IRSA role) print
-    the same skip as the apply and are left alone.
+    The FALLBACK compensation, for a previous-state snapshot captured before the
+    per-cluster collector snapshot existed (``regional_dataplane_observability``
+    decides, and records which path ran). It renders the CANDIDATE manifest with
+    the previous image, so only the image is undone; a state that carries the
+    snapshot never takes this path. Clusters the release skips (no IRSA role)
+    print the same skip as the apply and have any leftover collector scaled to
+    zero.
     """
 
     image = str(previous.get("adot_image") or "")

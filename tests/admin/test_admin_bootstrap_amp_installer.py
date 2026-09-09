@@ -185,6 +185,9 @@ class Installer:
         self.adot_replicas = "1"
         self.absent: tuple[str, ...] = ()
         self.environment: dict[str, str] = {}
+        # Positional arguments for the script (the per-cluster expected-rules
+        # hand-off); the release engine is the only caller that passes any.
+        self.arguments: list[str] = []
         self.answer("sts_get-caller-identity", ACCOUNT)
         self.answer("eks_describe-cluster", CLUSTER_ARN)
         self.answer("iam_get-role", json.dumps({"Role": {"RoleName": ROLE_NAME}}))
@@ -260,7 +263,7 @@ class Installer:
             **self.environment,
         }
         return subprocess.run(
-            ["bash", str(SCRIPT)],
+            ["bash", str(SCRIPT), *self.arguments],
             env=environment,
             text=True,
             capture_output=True,
@@ -472,3 +475,103 @@ def test_an_operator_can_force_the_collector_restart(tmp_path: Path) -> None:
 
 def test_the_installer_parses(tmp_path: Path) -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
+
+
+# --- the per-cluster expected-collector rules (F10 fix 1, F3) --------------------
+
+EXPECTED_NAMESPACE = "gpu-fault-dataplane-expected"
+STATIC_NAMESPACE = "gpu-fault-control-plane-capacity"
+
+
+def test_the_expected_rules_namespace_is_left_alone_without_an_argument(
+    tmp_path: Path,
+) -> None:
+    """The bootstrap runs this script with no arguments and must not delete the
+    rules a deploy rendered: only the release engine knows the expected set."""
+    installer = Installer(tmp_path)
+
+    completed = installer.run()
+
+    assert installer.matching(EXPECTED_NAMESPACE) == []
+    assert "left as-is" in completed.stdout
+
+
+def test_rendered_expected_rules_are_put_under_their_own_namespace(
+    tmp_path: Path,
+) -> None:
+    """The static namespace stays byte-stable; the rendered rules get their own,
+    written with the same put/create + wait-for-ACTIVE path as the static file."""
+    installer = Installer(tmp_path)
+    rules = tmp_path / "expected.yaml"
+    rules.write_text(
+        "groups:\n- name: gpu-fault-dataplane-expected\n  rules: []\n", encoding="utf-8"
+    )
+    installer.arguments = ["--dataplane-expected-rules", str(rules)]
+
+    installer.run()
+
+    puts = installer.matching("amp put-rule-groups-namespace")
+    assert len(puts) == 1, puts
+    assert f"--name {EXPECTED_NAMESPACE}" in puts[0]
+    assert f"fileb://{rules}" in puts[0]
+    assert not any(f"--name {STATIC_NAMESPACE}" in line for line in puts), (
+        "the converged static namespace was rewritten"
+    )
+    assert installer.matching("amp delete-rule-groups-namespace") == []
+
+
+def test_matching_expected_rules_are_not_rewritten(tmp_path: Path) -> None:
+    """The fake answers every describe with the checked-in static rules, so
+    handing it that very file is the converged case: no put, no wait."""
+    installer = Installer(tmp_path)
+    installer.arguments = [
+        "--dataplane-expected-rules",
+        str(ROOT / "deploy/observability/amp-rules.yaml"),
+    ]
+
+    completed = installer.run()
+
+    assert installer.matching("put-rule-groups-namespace") == []
+    assert "already matches the rendered per-cluster rules" in completed.stdout
+
+
+def test_no_expected_rules_deletes_the_namespace_when_present(tmp_path: Path) -> None:
+    """Deleting on an empty expected set is the honest choice: an empty group
+    would keep a namespace nobody reads, and a stale per-cluster rule would fire
+    for a cluster whose role was removed."""
+    installer = Installer(tmp_path)
+    installer.arguments = ["--no-dataplane-expected-rules"]
+
+    installer.run()
+
+    deletes = installer.matching("amp delete-rule-groups-namespace")
+    assert len(deletes) == 1, deletes
+    assert f"--name {EXPECTED_NAMESPACE}" in deletes[0]
+    assert installer.matching("put-rule-groups-namespace") == []
+
+
+def test_no_expected_rules_is_idempotent_when_the_namespace_is_absent(
+    tmp_path: Path,
+) -> None:
+    installer = Installer(tmp_path)
+    installer.missing("amp_describe-rule-groups-namespace")
+    # The static namespace is then created and waited for; the wait polls the
+    # status query, which has to answer.
+    installer.answer("amp_describe-rule-groups-namespace.text", "ACTIVE")
+    installer.arguments = ["--no-dataplane-expected-rules"]
+
+    completed = installer.run()
+
+    assert installer.matching("amp delete-rule-groups-namespace") == []
+    assert "nothing to delete" in completed.stdout
+
+
+def test_an_unknown_argument_stops_the_installer(tmp_path: Path) -> None:
+    installer = Installer(tmp_path)
+    installer.arguments = ["--bogus"]
+
+    completed = installer.attempt()
+
+    assert completed.returncode == 2, completed.stderr
+    assert "unknown argument" in completed.stderr
+    assert installer.calls() == [], "an argument error still ran the installer"

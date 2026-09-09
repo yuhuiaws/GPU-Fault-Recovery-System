@@ -17,6 +17,11 @@ back.
 Restore is the inverse of apply over that same object set: an object the
 manifest declares that was not live yet is one the candidate adds, so rollback
 deletes it. Objects outside the set are touched by neither direction.
+
+Every helper reads and writes through the control-plane kubectl by default;
+a caller compensating an object on a GPU cluster (the per-cluster data-plane
+collector, ``regional_dataplane_observability``) passes that cluster's kubectl
+prefix as ``kubectl`` and the same capture/restore runs there.
 """
 
 from __future__ import annotations
@@ -113,11 +118,20 @@ def restorable_object(document: object, name: str, *, label: str) -> dict[str, A
     return value
 
 
+def _command(release: Any, kubectl: list[str] | None, *arguments: str) -> list[str]:
+    """``kubectl`` prefix plus ``arguments``; the control-plane kubectl by default."""
+
+    if kubectl is None:
+        return list(release._cpu(*arguments))
+    return [*kubectl, *arguments]
+
+
 def capture_declared_objects(
     release: Any,
     declared: tuple[dict[str, str], ...],
     *,
     label: str,
+    kubectl: list[str] | None = None,
 ) -> dict[str, Any]:
     """Read the live form of every declared object in the release namespace."""
 
@@ -126,7 +140,9 @@ def capture_declared_objects(
     absent: list[dict[str, str]] = []
     for item in declared:
         text = release.runner.run(
-            release._cpu(
+            _command(
+                release,
+                kubectl,
                 "-n",
                 namespace,
                 "get",
@@ -171,7 +187,12 @@ def snapshot_parts(snapshot: object, *, label: str) -> tuple[str, list[Any], lis
     return namespace, objects, absent
 
 
-def apply_snapshot_objects(release: Any, objects: list[Any]) -> None:
+def apply_snapshot_objects(
+    release: Any,
+    objects: list[Any],
+    *,
+    kubectl: list[str] | None = None,
+) -> None:
     """Apply the captured objects as one list, so a partial apply is one call."""
 
     if not objects:
@@ -182,13 +203,15 @@ def apply_snapshot_objects(release: Any, objects: list[Any]) -> None:
             json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}),
             encoding="utf-8",
         )
-        release.runner.run(release._cpu("apply", "-f", str(path)))
+        release.runner.run(_command(release, kubectl, "apply", "-f", str(path)))
 
 
 def delete_absent_objects(
     release: Any,
     namespace: str,
     absent: list[Any],
+    *,
+    kubectl: list[str] | None = None,
 ) -> None:
     """Remove the objects the candidate added, in reverse declaration order.
 
@@ -198,7 +221,9 @@ def delete_absent_objects(
 
     for item in reversed(absent):
         release.runner.run(
-            release._cpu(
+            _command(
+                release,
+                kubectl,
                 "-n",
                 namespace,
                 "delete",
@@ -215,6 +240,7 @@ def restart_snapshot_deployments(
     objects: list[Any],
     *,
     timeout: str,
+    kubectl: list[str] | None = None,
 ) -> None:
     """Replace the Pods of every restored Deployment and wait for them.
 
@@ -230,10 +256,20 @@ def restart_snapshot_deployments(
         if not name:
             raise ReleaseError("restored Deployment has no name")
         release.runner.run(
-            release._cpu("-n", namespace, "rollout", "restart", f"deployment/{name}")
+            _command(
+                release,
+                kubectl,
+                "-n",
+                namespace,
+                "rollout",
+                "restart",
+                f"deployment/{name}",
+            )
         )
         release.runner.run(
-            release._cpu(
+            _command(
+                release,
+                kubectl,
                 "-n",
                 namespace,
                 "rollout",

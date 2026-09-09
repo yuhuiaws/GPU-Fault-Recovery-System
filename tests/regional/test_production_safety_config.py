@@ -1118,9 +1118,10 @@ def test_amp_installer_waits_for_the_definition_it_just_wrote() -> None:
     installer = (ROOT / "deploy/observability/install-amp-monitoring.sh").read_text(
         encoding="utf-8"
     )
-    # Both writes are covered: the rule namespace and the Alertmanager
+    # Every write is covered: the static rule namespace, the release-rendered
+    # per-cluster expected-collector namespace (F10 fix 1) and the Alertmanager
     # definition are separate AMP resources with separate convergence.
-    assert installer.count("wait_for_amp_definition \\\n") == 2
+    assert installer.count("wait_for_amp_definition \\\n") == 3
     for write, query in (
         ("put-rule-groups-namespace", "ruleGroupsNamespace.status.statusCode"),
         ("put-alert-manager-definition", "alertManagerDefinition.status.statusCode"),

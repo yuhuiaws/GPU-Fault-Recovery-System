@@ -22,6 +22,40 @@ ADOT_IMAGE="${GPU_FAULT_ADOT_IMAGE:?GPU_FAULT_ADOT_IMAGE is required}"
 # manifest with stale credentials or a wedged exporter.
 GPU_FAULT_FORCE_ADOT_RESTART="${GPU_FAULT_FORCE_ADOT_RESTART:-false}"
 
+# The per-GPU-cluster expected-collector rules (F10 fix round 1, F3). The
+# release engine renders one `absent(up{job="gpu-fault-dataplane",
+# gpu_cluster="<id>"} == 1)` rule per cluster that carries an IRSA role
+# (regional_dataplane_observability.render_dataplane_expected_rules) and hands
+# the document over here; they live in their own namespace so the static file
+# above stays byte-comparable. No argument (the bootstrap) leaves that namespace
+# alone: only the release knows the expected set. An explicit
+# --no-dataplane-expected-rules deletes it, so a rule for a cluster whose role
+# was removed cannot keep firing.
+DATAPLANE_EXPECTED_RULE_NAMESPACE="gpu-fault-dataplane-expected"
+DATAPLANE_EXPECTED_RULES_ACTION=""
+DATAPLANE_EXPECTED_RULES_FILE=""
+while (($# > 0)); do
+    case "$1" in
+    --dataplane-expected-rules)
+        if (($# < 2)) || [[ ! -r "$2" ]]; then
+            printf 'ERROR: --dataplane-expected-rules needs a readable file\n' >&2
+            exit 2
+        fi
+        DATAPLANE_EXPECTED_RULES_ACTION="put"
+        DATAPLANE_EXPECTED_RULES_FILE="$2"
+        shift 2
+        ;;
+    --no-dataplane-expected-rules)
+        DATAPLANE_EXPECTED_RULES_ACTION="delete"
+        shift
+        ;;
+    *)
+        printf 'ERROR: unknown argument: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+done
+
 if [[ "${GPU_FAULT_ENABLE_AMP}" != "true" ]]; then
     printf 'AMP integration disabled; built-in collector silence alerts remain active.\n'
     exit 0
@@ -391,6 +425,65 @@ if [[ "${RULES_DEFINITION_CURRENT}" != "true" ]]; then
         --name "${RULE_NAMESPACE}"
 fi
 step_done amp-rules
+
+# Takes the wait helper's `--query ... --output text` suffix when it polls;
+# the existence checks below call it bare.
+# shellcheck disable=SC2120
+describe_dataplane_expected_rules() {
+    aws amp describe-rule-groups-namespace \
+        --region "${AWS_REGION}" \
+        --workspace-id "${AMP_WORKSPACE_ID}" \
+        --name "${DATAPLANE_EXPECTED_RULE_NAMESPACE}" "$@"
+}
+case "${DATAPLANE_EXPECTED_RULES_ACTION}" in
+put)
+    if amp_definition_is_current \
+        "${DATAPLANE_EXPECTED_RULES_FILE}" \
+        ruleGroupsNamespace \
+        describe_dataplane_expected_rules; then
+        printf 'AMP rule namespace %s already matches the rendered per-cluster rules.\n' \
+            "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+    else
+        if describe_dataplane_expected_rules >/dev/null 2>&1; then
+            aws amp put-rule-groups-namespace \
+                --region "${AWS_REGION}" \
+                --workspace-id "${AMP_WORKSPACE_ID}" \
+                --name "${DATAPLANE_EXPECTED_RULE_NAMESPACE}" \
+                --data "fileb://${DATAPLANE_EXPECTED_RULES_FILE}" \
+                >/dev/null
+        else
+            aws amp create-rule-groups-namespace \
+                --region "${AWS_REGION}" \
+                --workspace-id "${AMP_WORKSPACE_ID}" \
+                --name "${DATAPLANE_EXPECTED_RULE_NAMESPACE}" \
+                --data "fileb://${DATAPLANE_EXPECTED_RULES_FILE}" \
+                >/dev/null
+        fi
+        wait_for_amp_definition \
+            "AMP rule namespace ${DATAPLANE_EXPECTED_RULE_NAMESPACE}" \
+            'ruleGroupsNamespace.status.statusCode' \
+            describe_dataplane_expected_rules
+    fi
+    ;;
+delete)
+    if describe_dataplane_expected_rules >/dev/null 2>&1; then
+        aws amp delete-rule-groups-namespace \
+            --region "${AWS_REGION}" \
+            --workspace-id "${AMP_WORKSPACE_ID}" \
+            --name "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+        printf 'AMP rule namespace %s deleted: no GPU cluster is expected to carry a data-plane collector.\n' \
+            "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+    else
+        printf 'AMP rule namespace %s is absent; nothing to delete.\n' \
+            "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+    fi
+    ;;
+*)
+    printf 'AMP rule namespace %s left as-is (no expected-rules argument; the release engine owns it).\n' \
+        "${DATAPLANE_EXPECTED_RULE_NAMESPACE}"
+    ;;
+esac
+step_done amp-dataplane-expected-rules
 
 sed \
     -e "s#REPLACE_WITH_SNS_TOPIC_ARN#${SNS_TOPIC_ARN}#g" \

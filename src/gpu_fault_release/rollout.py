@@ -30,6 +30,13 @@ from gpu_fault_release.regional_admin_commands import (
     stage_noop_release,
 )
 from gpu_fault_release.regional_aurora_credentials import refresh_aurora_credentials
+from gpu_fault_release.regional_dataplane_observability import (
+    capture_dataplane_adot_snapshot,
+    capture_dataplane_expected_rules,
+    capture_observability_snapshot_with_dataplane,
+    dataplane_expected_rules_sha256,
+    run_amp_monitoring_installer,
+)
 from gpu_fault_release.regional_dns import apply_control_plane_nlb
 from gpu_fault_release.regional_endpoint_rollback import (
     capture_endpoint_snapshot,
@@ -52,7 +59,6 @@ from gpu_fault_release.regional_notifications import (
     notification_digest,
 )
 from gpu_fault_release.regional_observability_rollback import (
-    capture_observability_snapshot,
     restore_observability_snapshot,
 )
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
@@ -505,7 +511,9 @@ class RegionalRelease:
     _apply_nlb = apply_control_plane_nlb
     _bootstrap_cpu_is_current = bootstrap_cpu_is_current
     _capture_previous = capture_previous
-    _capture_observability_snapshot = capture_observability_snapshot
+    _capture_observability_snapshot = capture_observability_snapshot_with_dataplane
+    _capture_dataplane_adot_snapshot = capture_dataplane_adot_snapshot
+    _capture_dataplane_expected_rules = capture_dataplane_expected_rules
     _restore_observability_snapshot = restore_observability_snapshot
     _capture_endpoint_snapshot = capture_endpoint_snapshot
     _restore_endpoint_snapshot = restore_endpoint_snapshot
@@ -678,6 +686,7 @@ class RegionalRelease:
                         item.cluster_id: item.adot_irsa_role_arn
                         for item in config.clusters
                     },
+                    "dataplane_expected_rules": dataplane_expected_rules_sha256(self),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -917,13 +926,14 @@ class RegionalRelease:
         }
         if self.config.notifications.admin_email:
             environment["GPU_FAULT_ALERT_EMAIL"] = self.config.notifications.admin_email
-        self.runner.run(
-            [
-                "bash",
-                str(ROOT / "deploy/observability/install-amp-monitoring.sh"),
-            ],
-            env=environment,
-        )
+        # The installer also receives this release's rendered per-cluster
+        # expected-collector rules (one absent() per cluster with an IRSA role),
+        # or an explicit deletion when no cluster is expected to carry a
+        # collector. Re-put on every run: this method runs whenever the
+        # observability digest moves, and the digest folds the rendered text, so
+        # a rule-template edit reaches AMP through the same node. The bootstrap
+        # runs the installer without that argument and leaves the namespace be.
+        run_amp_monitoring_installer(self, environment)
 
     def _restore_cpu_role_config_maps(
         self,

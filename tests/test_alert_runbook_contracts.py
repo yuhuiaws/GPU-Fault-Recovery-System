@@ -810,11 +810,15 @@ def test_the_data_plane_scrape_path_has_its_own_absence_alert() -> None:
     """A data-plane collector that writes nothing must not be silent (F7 F2).
 
     Every watcher alert evaluates over the series this collector delivers, so
-    with it gone they all read as healthy. ``absent(... == 1)`` catches the
-    fleet with no collector writing at all -- the same shape as
-    ``GpuFaultControlPlaneMetricsMissing`` -- and the per-cluster ``== 0`` half
-    catches a live collector whose every target in one cluster is refusing, so
-    the notification can name the ``gpu_cluster``.
+    with it gone they all read as healthy. The static rule keeps only the half
+    that needs a live series to name the cluster: a collector whose every
+    target in one ``gpu_cluster`` is refusing. The absence half is NOT static
+    any more -- a global ``absent(up{job="gpu-fault-dataplane"} == 1)`` fired
+    forever on every site with an AMP workspace and no collector yet (F10 fix
+    1, F3). It is rendered per expected cluster at release time instead
+    (``regional_dataplane_observability.render_dataplane_expected_rules``), and
+    that per-cluster ``absent`` is also what catches one dead collector beside
+    a live one, which neither static half could.
     """
     rule = _rule(DATAPLANE_COLLECTOR_ALERT)
     expression = _expression(DATAPLANE_COLLECTOR_ALERT)
@@ -822,10 +826,14 @@ def test_the_data_plane_scrape_path_has_its_own_absence_alert() -> None:
     assert isinstance(annotations, dict), "the alert has no annotations mapping"
 
     assert expression == (
-        'absent(up{job="gpu-fault-dataplane"} == 1) '
-        "or max by (control_plane_cluster, region, gpu_cluster) "
+        "max by (control_plane_cluster, region, gpu_cluster) "
         '(up{job="gpu-fault-dataplane"}) == 0'
     ), f"unexpected expression shape: {expression}"
+    assert "absent(" not in expression, (
+        "a global absent() on the data-plane job fires forever on a site with no "
+        "collector; the absence half is rendered per expected cluster at release "
+        f"time: {expression}"
+    )
     assert rule["for"] == "15m", f"`for` is {rule['for']!r}, expected 15m"
     assert rule["labels"] == {"severity": "warning"}, (
         f"the collector's absence is a warning, not {rule['labels']!r}: nothing "

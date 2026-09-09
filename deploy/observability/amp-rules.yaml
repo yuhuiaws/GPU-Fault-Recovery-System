@@ -122,23 +122,30 @@ groups:
       # (deploy/dataplane/adot-dataplane.yaml, job `gpu-fault-dataplane`) is
       # what puts every gpu_fault_completion_* / gpu_fault_node_installer_* /
       # gpu_fault_cluster_executor_* series into AMP; with it gone the watcher
-      # rules below evaluate over nothing and read as healthy. Two halves:
-      # `absent(... == 1)` is the fleet with no data-plane collector writing at
-      # all (same shape as GpuFaultControlPlaneMetricsMissing -- a collector
-      # that never came up leaves no `up` series to group on), and the
-      # `max by (gpu_cluster) == 0` half is a live collector none of whose
-      # targets in one cluster answers, which is the only half that can name
-      # the cluster. `for: 15m` matches the watcher rules it guards: a release
-      # re-applies the collector and a rollout restarts it well inside that.
-      # Warning, not critical: nothing is lost while the watcher stays up, the
-      # loss is that its alerts are blind. Known gap: with several GPU clusters,
-      # one dead collector beside a live one produces no series and is caught
-      # by neither half; until AMP knows the registered cluster set, compare
-      # the `gpu_cluster` values present with the site's cluster targets.
+      # rules below evaluate over nothing and read as healthy. This alert has
+      # two sources under ONE name. The static half here is a live collector
+      # none of whose targets in one cluster answers (`max by (gpu_cluster) ==
+      # 0`; `max` not `min`, because the executor port reads `up == 0` until
+      # its metrics server ships). The absence half is NOT in this file: a
+      # global `absent(up{job="gpu-fault-dataplane"} == 1)` fired forever on
+      # every site with an AMP workspace and no collector yet, i.e. an SNS page
+      # every four hours for a component the site had deliberately not
+      # enabled. Instead the release renders one
+      # `absent(up{job="gpu-fault-dataplane", gpu_cluster="<id>"} == 1)` rule
+      # per cluster whose target carries an adot_irsa_role_arn
+      # (regional_dataplane_observability.render_dataplane_expected_rules) and
+      # the installer puts them under the rule-groups namespace
+      # `gpu-fault-dataplane-expected`, re-put whenever the observability
+      # digest moves and deleted when no cluster is expected. Those per-cluster
+      # rules are also what catches one dead collector beside a live one: the
+      # dead one produces no series at all, so no static rule can see it, but a
+      # rule that names the cluster can. `for: 15m` on both matches the
+      # watcher rules they guard: a release re-applies the collector and a
+      # rollout restarts it well inside that. Warning, not critical: nothing is
+      # lost while the watcher stays up, the loss is that its alerts are blind.
       - alert: GpuFaultDataplaneCollectorMissing
         expr: >-
-          absent(up{job="gpu-fault-dataplane"} == 1)
-          or max by (control_plane_cluster, region, gpu_cluster)
+          max by (control_plane_cluster, region, gpu_cluster)
           (up{job="gpu-fault-dataplane"}) == 0
         for: 15m
         labels:
@@ -147,25 +154,25 @@ groups:
           summary: The data-plane metrics collector is not scraping a GPU cluster
           runbook_url: docs/管理员日常运维.md#gpufaultdataplanecollectormissing
           description: >-
-            No `up` series from the per-GPU-cluster ADOT collector (job
-            gpu-fault-dataplane) reached AMP, or every target it scrapes in
-            {{ $labels.gpu_cluster }} is down. While this fires the Completion
-            Watcher alerts (GpuFaultCompletionActiveStateUnavailable,
+            The per-GPU-cluster ADOT collector (job gpu-fault-dataplane) in
+            {{ $labels.gpu_cluster }} is alive but every target it scrapes is
+            down. (A collector that writes nothing at all is reported by the
+            same alert name from the release-rendered per-cluster rules in
+            namespace gpu-fault-dataplane-expected, one per cluster with an
+            `adot_irsa_role_arn`; a cluster without the role is skipped by
+            design and has no rule.) While this fires the Completion Watcher
+            alerts (GpuFaultCompletionActiveStateUnavailable,
             GpuFaultCompletionOutboxAppendFailures) are blind for that cluster
-            and a quiet dashboard is not evidence. First check whether the
-            release skipped the collector: `gpu-fault-admin plan` shows
-            `dataplane_observability` per cluster, and a cluster without
-            `adot_irsa_role_arn` (site.yaml `adotIrsaRoleArn`, an IAM role with
-            aps:RemoteWrite on the AMP workspace trusted by the cluster's OIDC
-            issuer) is skipped by design. Add the role and re-run
-            `gpu-fault-admin deploy --state-dir STATE_DIR`: the role moves the
-            observability digest, so the release applies the collector and
-            touches nothing else. If the role is present, read
-            deployment/gpu-fault-adot-dataplane in gpu-fault-system on that
-            cluster (IRSA token, sigv4 errors, the /health probe) and the
-            scrape targets' `metrics` ports; the executor's port reads `up ==
-            0` until its metrics server ships, which is why the rule requires
-            every target of a cluster to be down before it fires.
+            and a quiet dashboard is not evidence. Check the scrape targets'
+            `metrics` ports and their `prometheus.io/scrape` annotations on
+            that cluster; the executor's port reads `up == 0` until its metrics
+            server ships, which is why the rule requires every target of a
+            cluster to be down before it fires. If the collector itself is the
+            problem, read deployment/gpu-fault-adot-dataplane in
+            gpu-fault-system (IRSA token, sigv4 errors, the /health probe) and
+            fix it through `gpu-fault-admin deploy --state-dir STATE_DIR`
+            (`gpu-fault-admin plan` shows `dataplane_observability` per
+            cluster), never by applying the raw manifest.
       # Scrape dependency: the Completion Watcher exposes these series on port
       # 9109 inside the fault-domain cluster. They reach AMP through the
       # per-GPU-cluster collector, deploy/dataplane/adot-dataplane.yaml (job

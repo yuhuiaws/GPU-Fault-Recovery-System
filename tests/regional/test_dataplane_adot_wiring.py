@@ -5,7 +5,9 @@ and gave the release ``apply_gpu_adot_collector``; nothing called it. These test
 pin the wiring: the collector is applied wherever the DCGM exporter is applied,
 its inputs move the observability digest so a brownfield site that adds the IRSA
 role later gets a release that applies it, ``remove-cluster`` scales it down,
-and an automatic rollback puts it back on the previous ADOT image.
+and an automatic rollback compensates it -- from a per-cluster snapshot
+(``test_dataplane_adot_compensation.py``), or, for a state captured before that
+snapshot existed, by re-rendering with the previous ADOT image (pinned here).
 """
 
 from __future__ import annotations
@@ -39,10 +41,17 @@ class _Runner:
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.probes: list[list[str]] = []
 
     def run(self, arguments: list[str], **kwargs: Any) -> str:
         self.calls.append((list(arguments), kwargs))
         return ""
+
+    def probe(self, arguments: list[str], **_kwargs: Any) -> bool:
+        # No Deployment on the cluster: the skip branch's scale-down probe
+        # answers "absent" and nothing is scaled.
+        self.probes.append(list(arguments))
+        return False
 
 
 def _config(
@@ -392,10 +401,11 @@ def _rollback(
 def test_observability_rollback_puts_every_collector_on_the_previous_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control-plane snapshot restore alone would leave the GPU clusters on
-    the candidate collector image; the previous ``adot_image`` is what every
-    cluster goes back to, after the snapshot so the two collectors never
-    disagree once the rollback is verified."""
+    """The fallback for a state whose observability snapshot predates the
+    per-cluster collector capture (``dataplane_adot`` key absent): every
+    configured cluster gets the candidate manifest with the previous
+    ``adot_image``, after the control-plane snapshot. A state that carries the
+    key never takes this path (``test_dataplane_adot_compensation.py``)."""
     calls: list[tuple[str, Any]] = []
 
     _rollback(monkeypatch, {"adot_image": PREVIOUS_ADOT_IMAGE}, calls)
@@ -421,7 +431,7 @@ def test_observability_rollback_refuses_without_a_previous_adot_image(
 def test_rollback_gpu_adot_collectors_reapplies_the_previous_image_per_cluster() -> (
     None
 ):
-    """The helper the observability restore calls, on its own."""
+    """The previous-image fallback helper, on its own."""
     calls: list[tuple[str, str]] = []
     release = SimpleNamespace(
         config=SimpleNamespace(clusters=(TARGET, SimpleNamespace(cluster_id="gpu-b"))),
@@ -517,5 +527,10 @@ def test_a_release_with_the_role_applies_the_collector_and_without_it_skips(
 
     skipped = _release(_config(tmp_path, name="b.json"))
     BOOTSTRAP.apply_gpu_adot_collector(skipped, skipped.config.clusters[0])
+    # The skip only probes for a leftover collector to scale down (F10 fix 1,
+    # F4); with none present it applies and scales nothing.
     assert skipped.runner.calls == []
+    assert [arguments[-3:] for arguments in skipped.runner.probes] == [
+        ["get", "deployment", DATAPLANE_ADOT_DEPLOYMENT]
+    ]
     assert "gpu-a: data-plane ADOT collector not applied" in capsys.readouterr().err

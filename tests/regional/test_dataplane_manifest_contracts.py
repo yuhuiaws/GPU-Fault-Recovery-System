@@ -76,6 +76,12 @@ class _RecordingRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
 
+    def probe(self, arguments: Any, **_kwargs: Any) -> bool:
+        # The collector's skip branch probes for a leftover Deployment to scale
+        # down (F10 fix 1, F4); a cluster that never had one answers "absent",
+        # so the skip still mutates nothing.
+        return False
+
     def run(self, arguments: Any, **kwargs: Any) -> str:
         self.calls.append((list(arguments), dict(kwargs)))
         if "create" in arguments and "configmap" in arguments:
