@@ -155,8 +155,8 @@ POSTGRES_TESTS = \
 	tests/store/test_store_migrate.py \
 	tests/store/test_workflow_scan_cursor.py \
 	tests/store/test_workflow_scan_pushdown.py \
-	tests/store/test_workflow_scan_whole_second.py
-	tests/store/test_workload_coverage_heartbeat.py \
+	tests/store/test_workflow_scan_whole_second.py \
+	tests/store/test_workload_coverage_heartbeat.py
 
 # POSTGRES_TESTS above: every test module that skips without
 # GPU_FAULT_TEST_POSTGRES_URL (G-1), kept equal to
