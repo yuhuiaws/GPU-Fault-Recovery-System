@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release import repository_root
+from gpu_fault_release.regional_adot_self_metrics import adot_self_metrics_report
 from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
@@ -1049,10 +1050,6 @@ def check_aurora_refresh(
     )
 
 
-ADOT_SELF_METRICS_PORT = 8889
-ADOT_POD_SELECTOR = "app=gpu-fault-adot"
-
-
 def check_control_record_archive_bucket(release: Any) -> CheckValue:
     """The control-record archive target exists in this Region before the
     workers that will archive into it roll out (control-plane review
@@ -1095,73 +1092,10 @@ def check_control_record_archive_bucket(release: Any) -> CheckValue:
     )
 
 
-def adot_self_metric_names() -> set[str]:
-    """Every ``otelcol_*`` series the alert rules or the ADOT keep list rely on."""
-
-    names: set[str] = set()
-    for relative in (
-        "deploy/observability/amp-rules.yaml",
-        "deploy/observability/adot-control-plane.yaml",
-    ):
-        names.update(
-            re.findall(r"otelcol_[a-z0-9_]+", (ROOT / relative).read_text("utf-8"))
-        )
-    return names
-
-
 def check_adot_self_metrics(release: Any) -> CheckValue:
-    """The live ADOT collector exports every ``otelcol_*`` series the alerts
-    read (control-plane review 2026-09-08, H2-4).
-
-    The self-scrape metric names were taken from the exporter's no-suffix
-    convention; a collector image bump can rename them, and a rule that reads
-    a series that never exists is silent forever. Read through the API server
-    proxy because the collector image has no shell for ``kubectl exec``.
-    """
-
-    namespace = release.config.namespace
-    pods = (
-        release._get_json(
-            release._cpu(
-                "-n", namespace, "get", "pods", "-l", ADOT_POD_SELECTOR, "-o", "json"
-            )
-        ).get("items")
-        or []
-    )
-    running = [
-        str(pod["metadata"]["name"])
-        for pod in pods
-        if (pod.get("status") or {}).get("phase") == "Running"
-    ]
-    if not running:
-        raise ReleaseError("no running gpu-fault-adot Pod to read self metrics from")
-    raw = release.runner.run(
-        release._cpu(
-            "get",
-            "--raw",
-            f"/api/v1/namespaces/{namespace}/pods/{running[0]}"
-            f":{ADOT_SELF_METRICS_PORT}/proxy/metrics",
-        ),
-        capture=True,
-    )
-    exported = {
-        line.split("{", 1)[0].split(" ", 1)[0]
-        for line in str(raw or "").splitlines()
-        if line and not line.startswith("#")
-    }
-    required = adot_self_metric_names()
-    missing = sorted(name for name in required if name not in exported)
-    if missing:
-        raise ReleaseError(
-            "ADOT self-metrics endpoint does not export "
-            + ", ".join(missing)
-            + "; the collector image renamed them (suffix?) -- fix the keep "
-            "list and the rules before trusting the ADOT alerts"
-        )
-    return CheckValue(
-        f"ADOT {running[0]} exports all {len(required)} otelcol series the rules read",
-        {"pod": running[0], "series": sorted(required)},
-    )
+    """AMP holds every ``otelcol_*`` series the alerts read (control-plane
+    review 2026-09-08, H2-4); the read lives in ``regional_adot_self_metrics``."""
+    return CheckValue(*adot_self_metrics_report(release))
 
 
 def build_preflight_report(release: Any) -> dict[str, Any]:

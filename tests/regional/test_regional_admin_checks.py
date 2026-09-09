@@ -1544,59 +1544,6 @@ def test_archive_bucket_check_requires_the_site_region(monkeypatch) -> None:
         module.check_control_record_archive_bucket(release)
 
 
-def test_adot_self_metrics_check_reads_the_live_collector() -> None:
-    module = _checks_module()
-    required = module.adot_self_metric_names()
-    assert "otelcol_process_memory_rss" in required, "the memory alert reads it"
-
-    class Runner:
-        def __init__(self, body: str) -> None:
-            self.body = body
-            self.commands: list[tuple[str, ...]] = []
-
-        def run(self, command, capture=False, **_kwargs):
-            self.commands.append(tuple(command))
-            return self.body
-
-    class AdotRelease:
-        config = SimpleNamespace(namespace="gpu-fault-system")
-
-        def __init__(self, body: str) -> None:
-            self.runner = Runner(body)
-
-        @staticmethod
-        def _cpu(*args):
-            return args
-
-        @staticmethod
-        def _get_json(_command):
-            return {
-                "items": [
-                    {
-                        "metadata": {"name": "gpu-fault-adot-1"},
-                        "status": {"phase": "Running"},
-                    }
-                ]
-            }
-
-    complete = "\n".join(
-        [f'# TYPE {name} gauge\n{name}{{x="y"}} 1' for name in sorted(required)]
-    )
-    release = AdotRelease(complete)
-    value = module.check_adot_self_metrics(release)
-    assert "gpu-fault-adot-1" in value.summary
-    assert "8889/proxy/metrics" in release.runner.commands[-1][-1]
-
-    with pytest.raises(module.ReleaseError, match="otelcol_process_memory_rss"):
-        module.check_adot_self_metrics(
-            AdotRelease(
-                complete.replace(
-                    "otelcol_process_memory_rss", "otelcol_process_memory_rss_bytes"
-                )
-            )
-        )
-
-
 def _cpu_node(name: str, pods_allocatable: int) -> dict:
     return {
         "metadata": {"name": name},
