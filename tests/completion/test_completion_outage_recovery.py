@@ -194,6 +194,106 @@ def test_a_rejected_attempt_is_evicted_only_after_its_record_is_delivered() -> N
     )
 
 
+def _expiring_watcher(core: FakeCoreApi, sink: OutageSink, clock: Clock):
+    """A watcher whose outbox ages records on the test clock, not the wall."""
+
+    outbox = KubernetesCompletionOutbox(core, sink, now=lambda: clock.value.timestamp())
+    controller = KubernetesCompletionController(
+        core,
+        outbox,
+        cluster_id="hp-cluster",
+        now=clock,
+        terminal_retention_seconds=3600,
+    )
+    return controller, outbox
+
+
+def test_an_expired_record_is_removed_and_the_held_live_path_re_buffers_it() -> None:
+    """R5 (a): a day-old retry disposition leaves the WAL; the hold does not.
+
+    While the watcher still holds the attempt its live path re-posts the event
+    from the cache every pass, so the slot the expired record gave up is taken
+    again -- by a *live* record of the same event, which is what the slot is
+    for. The expiry is counted and the old disposition is gone.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi(_fleet())
+    sink = OutageSink(OSError("control plane unavailable"))
+    subject, outbox = _expiring_watcher(core, sink, clock)
+
+    subject.run_once()
+    _outage_then_gc(subject, core, clock, passes=2)
+    assert outbox.depth() == 2, _records(core)
+    expired_at = clock.value + timedelta(hours=24)
+
+    clock.value = expired_at
+    subject.run_once()  # the replay at the top of the pass expires both records
+
+    assert outbox.expired_total == 2, (
+        f"both day-old records must expire: expired_total={outbox.expired_total}"
+    )
+    assert outbox.quarantined_depth() == 0, (
+        f"an expired record is removed, never kept quarantined: {_records(core)}"
+    )
+    records = _records(core)
+    assert set(records) == {
+        f"hp-cluster/{FAILED}/failure-detected",
+        f"hp-cluster/{FAILED}/terminal",
+    }, f"the held live path re-buffers the still-owed events: {records}"
+    for record in records.values():
+        assert record["buffered_at"] >= expired_at.timestamp() and (
+            record["quarantined"] is False
+        ), f"the re-buffered record must be a fresh live disposition: {record}"
+    assert subject.evicted_attempts_total == 0, (
+        "the WAL names the attempt again, so it stays held"
+    )
+
+
+def test_an_expired_record_leaves_a_restarted_watcher_nothing_to_hold() -> None:
+    """After a restart nothing re-posts the event: the record expires and goes.
+
+    Before R5 it stayed quarantined for ever, holding one of the 256 slots and
+    the attempt id with it; only the one-shot could have delivered it. Now the
+    ERROR names key and digest, the record is removed and the log is clean.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi(_fleet())
+    sink = OutageSink(OSError("control plane unavailable"))
+    first, _first_outbox = _expiring_watcher(core, sink, clock)
+    first.run_once()
+    _outage_then_gc(first, core, clock, passes=2)
+    assert len(_records(core)) == 2, _records(core)
+
+    # The watcher restarts with the sibling still running and the failed
+    # attempt's Pods long gone: nothing in the new process re-posts them.
+    restarted, outbox = _expiring_watcher(core, sink, clock)
+    restarted.run_once()
+    assert outbox.buffered_attempt_ids == frozenset({FAILED}), (
+        f"the restored process must see the WAL still names the attempt: "
+        f"{outbox.buffered_attempt_ids}"
+    )
+    critical_before = [path for path, _ in sink.posts if path in CRITICAL]
+
+    clock.value += timedelta(hours=24)
+    restarted.run_once()
+
+    assert outbox.expired_total == 2, (
+        f"both day-old records must expire: expired_total={outbox.expired_total}"
+    )
+    assert _records(core) == {}, f"expired records must be removed: {_records(core)}"
+    assert outbox.buffered_attempt_ids == frozenset(), (
+        f"nothing holds the attempt any more: {outbox.buffered_attempt_ids}"
+    )
+    assert (outbox.last_depth, outbox.last_quarantined_depth) == (0, 0)
+    replayed = [path for path, _ in sink.posts if path in CRITICAL]
+    assert len(replayed) == len(critical_before) + 2, (
+        "the expiring pass replays each record once more before giving up; "
+        f"nothing else may re-post them after the restart: {replayed}"
+    )
+
+
 def _quarantined_record(core: FakeCoreApi, clock: Clock) -> dict:
     """Leave one quarantined terminal in ``core``'s write-ahead ConfigMap."""
 

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import logging
 import os
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.collectors.sinks import (
@@ -15,6 +12,30 @@ from gpu_fault.collectors.sinks import (
     EventSink,
     HttpEventSink,
     is_retryable_delivery_status,
+)
+from gpu_fault.completion_outbox_records import (
+    ATTEMPT_STATE_KEY,
+    EVENT_LOG_KEY,
+    _attempt_digest,
+    _attempt_document,
+    _attempt_key,
+    _attempt_records,
+    _attempt_removal,
+    _buffered_attempt_ids,
+    _buffered_record,
+    _data,
+    _event_document,
+    _event_log_byte_budget,
+    _event_records,
+    _evict_quarantined_for_room,
+    _legacy_adoption,
+    _payload_digest,
+    _record_field_update,
+    _record_key,
+    _remaining_depth,
+    _resource_version,
+    _sorted_records,
+    _without_attempt_state,
 )
 
 CRITICAL_COMPLETION_PATHS = frozenset(
@@ -38,11 +59,6 @@ _MAX_LOGGED_APPEND_FAILURES = 1024
 #: Pods of routine state could fill it and the terminal event of a failing
 #: attempt could no longer be written ahead at all (F6).
 ACTIVE_STATE_SUFFIX = "-active"
-#: Key both objects use for attempt state: the one the WAL object carried
-#: before F6 split them, and the only key of ``<name>-active`` after it.
-ATTEMPT_STATE_KEY = "active-attempts.json"
-#: Key of the write-ahead log inside the WAL object.
-EVENT_LOG_KEY = "events.json"
 #: Statuses on ``<name>-active`` that mean "not there yet" rather than broken:
 #: 404 is the upgrade window before the manifest that adds the object, 403 the
 #: window before the Role that names it. Both are survivable -- attempt state is
@@ -76,6 +92,15 @@ DEFAULT_MAX_RETRY_AGE_SECONDS = 24 * 3600.0
 #: record, quarantined ones included, once, and exit. See
 #: ``replay_quarantined_once``.
 REPLAY_QUARANTINED_FLAG = "--replay-quarantined"
+
+
+#: ``last_replay`` of a pass that touched nothing.
+_EMPTY_PASS: dict[str, int] = {
+    "replayed": 0,
+    "deferred": 0,
+    "quarantined": 0,
+    "expired": 0,
+}
 
 
 class CompletionOutboxFull(RuntimeError):
@@ -174,89 +199,6 @@ def completion_delivery_disposition(exc: BaseException) -> str:
     return "retry"
 
 
-# Pure helpers, module level rather than static methods: the outbox class is
-# at its architecture size limit, and none of them reads the instance.
-def _record_key(path: str, payload: dict[str, Any]) -> str:
-    cluster_id = str(payload.get("cluster_id") or "")
-    attempt_id = str(payload.get("attempt_id") or "")
-    if not cluster_id or not attempt_id:
-        raise ValueError("critical completion event requires cluster_id and attempt_id")
-    return f"{cluster_id}/{attempt_id}/{path.rsplit('/', 1)[-1]}"
-
-
-def _data(value: Any) -> dict[str, str]:
-    raw = value.get("data", {}) if isinstance(value, dict) else value.data
-    return dict(raw or {})
-
-
-def _resource_version(value: Any) -> str | None:
-    metadata = value.get("metadata", {}) if isinstance(value, dict) else value.metadata
-    if isinstance(metadata, dict):
-        return metadata.get("resourceVersion") or metadata.get("resource_version")
-    return getattr(metadata, "resource_version", None)
-
-
-def _attempt_key(payload: dict[str, Any]) -> str:
-    cluster_id = str(payload.get("cluster_id") or "")
-    attempt_id = str(payload.get("attempt_id") or "")
-    if not cluster_id or not attempt_id:
-        raise ValueError("attempt observation requires cluster_id and attempt_id")
-    return f"{cluster_id}/{attempt_id}"
-
-
-def _attempt_digest(payload: dict[str, Any]) -> str:
-    structural = dict(payload)
-    structural.pop("observed_at", None)
-    return hashlib.sha256(
-        json.dumps(
-            structural,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode()
-    ).hexdigest()
-
-
-def _remaining_depth(
-    records: list[dict[str, Any]],
-    *,
-    drained: set[str],
-    isolated: set[str],
-) -> tuple[int, int]:
-    """``(depth, quarantined_depth)`` of the pass ``replay`` just walked.
-
-    Derived from the snapshot ``replay`` already read rather than from a second
-    ConfigMap GET: the watcher reconciles every 30 s and the gauge does not
-    justify an extra API call per pass. It therefore reports the depth as of the
-    start of the pass minus what the pass drained, so a record buffered later in
-    the same reconcile shows up one pass later.
-    """
-
-    remaining = [record for record in records if str(record.get("key")) not in drained]
-    return len(remaining), sum(
-        1
-        for record in remaining
-        if record.get("quarantined", False) or str(record.get("key")) in isolated
-    )
-
-
-def _buffered_attempt_ids(records: list[dict[str, Any]]) -> frozenset[str]:
-    """The attempt ids the write-ahead log still names.
-
-    Read off the record keys (``<cluster>/<attempt>/<kind>``) so the controller
-    can hold an attempt's state for as long as any event of it is buffered:
-    once it has evicted the attempt, a quarantined record has no live path
-    left and only the operator lever can deliver it.
-    """
-
-    ids = set()
-    for record in records:
-        parts = str(record.get("key") or "").split("/")
-        if len(parts) >= 2 and parts[1]:
-            ids.add(parts[1])
-    return frozenset(ids)
-
-
 def _replay_failure(
     record: dict[str, Any],
     exc: BaseException,
@@ -269,9 +211,10 @@ def _replay_failure(
     ``outcome`` is ``"retry"``, ``"rejected"`` (a non-retryable status: the
     control plane's verdict on the event) or ``"expired"`` (every failure was
     retryable but the record has been buffered longer than
-    ``max_retry_age_seconds``). Only the last two quarantine. A record without
-    a readable ``buffered_at`` cannot expire: it keeps being retried, which is
-    the failure mode that loses nothing.
+    ``max_retry_age_seconds``). Only a rejection quarantines; an expired record
+    is removed by the caller (R5), so its ``fields`` are for the log only. A
+    record without a readable ``buffered_at`` cannot expire: it keeps being
+    retried, which is the failure mode that loses nothing.
     """
 
     fields: dict[str, Any] = {
@@ -288,27 +231,13 @@ def _replay_failure(
         age = now - float(buffered_at) if isinstance(buffered_at, (int, float)) else 0.0
         if age < max_retry_age_seconds:
             return "retry", fields
-        outcome = "expired"
+        fields["age_seconds"] = age
+        return "expired", fields
     fields.update(quarantined=True, quarantined_at=now, quarantine_reason=outcome)
     return outcome, fields
 
 
-def _log_quarantine(
-    key: str, outcome: str, fields: dict[str, Any], exc: BaseException
-) -> None:
-    if outcome == "expired":
-        LOGGER.error(
-            "completion outbox record expired after %d retryable failures and "
-            "is quarantined: key=%s last_status=%s error=%s -- the control "
-            "plane never accepted it; once the cause is fixed, run "
-            "`gpu-fault-completion-watcher %s` in the watcher Pod to deliver it",
-            fields["attempts"],
-            key,
-            fields["last_status"],
-            exc,
-            REPLAY_QUARANTINED_FLAG,
-        )
-        return
+def _log_quarantine(key: str, fields: dict[str, Any], exc: BaseException) -> None:
     LOGGER.warning(
         "completion outbox record quarantined after %d attempts: "
         "key=%s status=%s error=%s",
@@ -319,161 +248,115 @@ def _log_quarantine(
     )
 
 
-def _observed_instant(record: dict[str, Any]) -> datetime | None:
-    """When ``record`` was observed, or ``None`` if it does not say.
+def _log_expiry(
+    key: str, record: dict[str, Any], fields: dict[str, Any], exc: BaseException
+) -> None:
+    """The ERROR an expired record leaves behind; it is removed right after (R5).
 
-    Parsed rather than compared as text: pydantic renders a whole second as
-    ``...T10:00:00Z`` and anything else as ``...T10:00:00.500000Z``, and ``Z``
-    sorts *after* ``.``, so string order puts the earlier instant last. The
-    ``Z`` is spelled out for ``fromisoformat`` because Python before 3.11 does
-    not accept it.
+    Names the key and a digest of the payload because the record itself is
+    about to be gone: a day-old retry disposition kept in the write-ahead log
+    only consumed one of the slots a critical event needs, while the live path
+    of a still-held attempt keeps re-posting the event from the watcher's
+    cache regardless. The one-shot cannot deliver what is no longer there, and
+    the message says so rather than pointing the operator at it.
     """
 
-    text = str(record.get("observed_at") or "")
-    try:
-        instant = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    # A record without a zone is one an older release (or a hand edit) wrote,
-    # and UTC is the only zone anything in this system writes. Without this the
-    # comparison below raises ``TypeError`` inside the migration's own
-    # try/except, so the migration never completed and every load and every
-    # owed probe printed the same traceback again.
-    return instant if instant.tzinfo else instant.replace(tzinfo=timezone.utc)
+    LOGGER.error(
+        "completion outbox record expired after %d retryable failures over "
+        "%.0f s and is removed from the write-ahead log: key=%s digest=%s "
+        "last_status=%s error=%s -- the control plane never accepted it; if "
+        "the watcher still holds the attempt its live path keeps re-posting "
+        "the event, but after a restart nothing delivers it and "
+        "`gpu-fault-completion-watcher %s` cannot revive a removed record",
+        fields["attempts"],
+        fields["age_seconds"],
+        key,
+        _payload_digest(record.get("payload")),
+        fields["last_status"],
+        exc,
+        REPLAY_QUARANTINED_FLAG,
+    )
 
 
-def _merge_legacy_attempt_state(
-    legacy: dict[str, dict[str, Any]],
-    current: dict[str, dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """Adopt legacy records, keeping the newer ``observed_at`` per key (I2).
+def _log_eviction(victim: dict[str, Any], key: str) -> None:
+    """The ERROR a quarantined record leaves when a critical event takes its
+    slot (R5): the evidence the operator would have read off the record."""
 
-    "The object that already holds it wins" is wrong in one direction and "the
-    legacy object wins" in the other: the migration can run again after a drop
-    that failed, and by then the live process may have written a fresher record
-    for the same attempt. A record whose timestamp cannot be read loses to one
-    that has a readable timestamp, and to nothing else.
+    LOGGER.error(
+        "completion outbox is full; evicted the oldest quarantined record to "
+        "write ahead critical event key=%s: evicted_key=%s digest=%s "
+        "quarantine_reason=%s last_status=%s attempts=%s last_error=%s -- "
+        "the control plane never accepted it and `gpu-fault-completion-watcher "
+        "%s` cannot revive a removed record",
+        key,
+        victim.get("key"),
+        _payload_digest(victim.get("payload")),
+        victim.get("quarantine_reason"),
+        victim.get("last_status"),
+        victim.get("attempts"),
+        victim.get("last_error"),
+        REPLAY_QUARANTINED_FLAG,
+    )
+
+
+def _log_stranded_delivery(
+    key: str, removal_error: BaseException, flag_error: BaseException
+) -> None:
+    LOGGER.error(
+        "a delivered completion record could not be cleared (%s: %s) "
+        "nor flagged as delivered (%s: %s): key=%s stays buffered "
+        "until a pass that can write the ConfigMap picks it up, or "
+        "until an operator removes it",
+        type(removal_error).__name__,
+        removal_error,
+        type(flag_error).__name__,
+        flag_error,
+        key,
+    )
+
+
+def _log_append_failure(
+    logged: set[str], key: str, exc: BaseException, *, stage: str
+) -> None:
+    """Log the first outbox write failure per key; the rest at DEBUG.
+
+    ``stage`` is ``"buffer"`` for the write-ahead append and ``"clear"`` for
+    the removal that follows a successful delivery. Both mean the ConfigMap
+    could not be written; only the consequence differs, so only the message
+    does. The watcher reconciles every 30 s, so logging each pass would bury
+    the cause under its own repetition (the same rule as F9).
     """
 
-    merged = dict(current)
-    for key, record in legacy.items():
-        existing = merged.get(key)
-        if existing is None:
-            merged[key] = record
-            continue
-        candidate = _observed_instant(record)
-        held = _observed_instant(existing)
-        if candidate is not None and (held is None or candidate > held):
-            merged[key] = record
-    return merged
-
-
-def _event_records(data: dict[str, str]) -> list[dict[str, Any]]:
-    """The write-ahead log of the WAL object, validated."""
-
-    document = json.loads(data.get(EVENT_LOG_KEY, "[]"))
-    if not isinstance(document, list) or any(
-        not isinstance(item, dict) for item in document
-    ):
-        raise RuntimeError("completion outbox ConfigMap contains invalid JSON")
-    return document
-
-
-def _buffered_record(
-    key: str,
-    path: str,
-    payload: dict[str, Any],
-    buffered_at: Any,
-) -> dict[str, Any]:
-    """A fresh write-ahead record: never delivered, never quarantined."""
-
-    return {
-        "key": key,
-        "path": path,
-        "payload": payload,
-        "buffered_at": buffered_at,
-        "attempts": 0,
-        "quarantined": False,
-    }
-
-
-def _record_field_update(
-    key: str, fields: dict[str, Any]
-) -> Callable[[list[dict[str, Any]]], list[dict[str, Any]]]:
-    """Mutation that sets ``fields`` on the record with ``key``, if it is there."""
-
-    def update(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            {**item, **fields} if item.get("key") == key else item for item in records
-        ]
-
-    return update
-
-
-def _attempt_records(data: dict[str, str]) -> dict[str, dict[str, Any]]:
-    """The attempt-state document of either object, validated."""
-
-    document = json.loads(data.get(ATTEMPT_STATE_KEY, "{}"))
-    if not isinstance(document, dict) or any(
-        not isinstance(key, str) or not isinstance(item, dict)
-        for key, item in document.items()
-    ):
-        raise RuntimeError("completion attempt state contains invalid JSON")
-    return document
-
-
-def _without_attempt_state(current: dict[str, str]) -> dict[str, str]:
-    """The WAL document with the migrated attempt-state key dropped."""
-
-    if ATTEMPT_STATE_KEY not in current:
-        return current
-    result = dict(current)
-    result.pop(ATTEMPT_STATE_KEY)
-    return result
-
-
-def _legacy_adoption(
-    legacy: dict[str, dict[str, Any]],
-) -> Callable[[dict[str, str]], dict[str, str]]:
-    """Mutation that merges ``legacy`` into ``<name>-active``."""
-
-    def adopt(current: dict[str, str]) -> dict[str, str]:
-        attempts = _merge_legacy_attempt_state(legacy, _attempt_records(current))
-        document = _attempt_document(attempts)
-        if document == current.get(ATTEMPT_STATE_KEY):
-            return current
-        result = dict(current)
-        result[ATTEMPT_STATE_KEY] = document
-        return result
-
-    return adopt
-
-
-def _attempt_removal(key: str) -> Callable[[dict[str, str]], dict[str, str]]:
-    """Mutation that drops ``key`` from the attempt-state document."""
-
-    def update(data: dict[str, str]) -> dict[str, str]:
-        attempts = _attempt_records(data)
-        if key not in attempts:
-            return data
-        attempts.pop(key)
-        result = dict(data)
-        result[ATTEMPT_STATE_KEY] = _attempt_document(attempts)
-        return result
-
-    return update
-
-
-def _sorted_records(attempts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(attempts[key]) for key in sorted(attempts)]
-
-
-def _attempt_document(attempts: dict[str, dict[str, Any]]) -> str:
-    return json.dumps(
-        attempts,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
+    if key in logged:
+        LOGGER.debug(
+            "completion outbox write (%s) still failing: key=%s (%s: %s)",
+            stage,
+            key,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if len(logged) >= _MAX_LOGGED_APPEND_FAILURES:
+        logged.clear()
+    logged.add(key)
+    if stage == "clear":
+        LOGGER.error(
+            "cannot clear the delivered critical completion event key=%s "
+            "(%s: %s); the control plane has already accepted it, so the "
+            "record is flagged as delivered for the next replay pass to "
+            "drop without re-sending it",
+            key,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    LOGGER.error(
+        "cannot write ahead critical completion event key=%s (%s: %s); "
+        "delivering it live without a buffered copy -- a watcher restart "
+        "before the control plane accepts it would lose the event",
+        key,
+        type(exc).__name__,
+        exc,
     )
 
 
@@ -643,16 +526,16 @@ class KubernetesCompletionOutbox:
         self.max_retry_age_seconds = max_retry_age_seconds
         self.monotonic = monotonic
         self.now = now
-        self.last_replay: dict[str, int] = {
-            "replayed": 0,
-            "deferred": 0,
-            "quarantined": 0,
-        }
-        # Retryable records quarantined for age; exported as
+        self.last_replay: dict[str, int] = dict(_EMPTY_PASS)
+        # Retryable records removed for age (R5); exported as
         # ``gpu_fault_completion_outbox_expired_total``. Each one is an event
-        # the control plane never accepted in a day and nothing will deliver
-        # without the operator lever.
+        # the control plane never accepted in a day; a still-held attempt keeps
+        # re-posting it live, a restarted watcher has nothing left to deliver.
         self.expired_total = 0
+        # Quarantined records evicted, oldest first, so that a critical event
+        # could be written ahead into a full log (R5); exported as
+        # ``gpu_fault_completion_outbox_quarantine_evictions_total``.
+        self.quarantine_evictions_total = 0
         # Attempt ids the WAL named as of the last read or write we own, or
         # ``None`` while that is unknown; the controller holds an attempt's
         # state until its id is gone from here. Maintained beside the depth.
@@ -789,22 +672,26 @@ class KubernetesCompletionOutbox:
 
     def _mutate(
         self,
-        function: Callable[
-            [list[dict[str, Any]]],
-            list[dict[str, Any]],
-        ],
+        function: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+        *,
+        fit: Callable[[list[dict[str, Any]], int], list[dict[str, Any]]] | None = None,
     ) -> None:
+        """Apply ``function`` to the write-ahead log in one ConfigMap replace.
+
+        ``fit``, when given, sees the mutated records and the byte budget the
+        object leaves them and may shrink the list (R5 eviction) before the
+        bounds are checked; it runs inside the same read-mutate-replace as
+        ``function``, so a 409 retry re-derives both from the fresh read.
+        """
+
         written: list[dict[str, Any]] = []
 
         def update(data: dict[str, str]) -> dict[str, str]:
             records = function(_event_records(data))
+            if fit is not None:
+                records = fit(records, _event_log_byte_budget(data, self.max_bytes))
             written[:] = records
-            document = json.dumps(
-                records,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
+            document = _event_document(records)
             if document == data.get(self.DATA_KEY):
                 return data
             result = dict(data)
@@ -831,22 +718,47 @@ class KubernetesCompletionOutbox:
         POST is the other path: the record is kept as it is -- attempts,
         quarantine flag and last error stay readable -- and the caller
         removes it once the control plane accepts the event.
+
+        A new record that needs a slot in a full log takes it from the oldest
+        quarantined record, never from a live one (R5): the eviction happens in
+        the same ConfigMap write as the append, is counted in
+        ``quarantine_evictions_total`` and logged at ERROR with the evicted
+        record's key, digest and last status. ``CompletionOutboxFull`` is left
+        for a log that is full of live records.
         """
 
         buffered = pointer_sized_completion_payload(
             payload, max_tail_bytes=self.max_buffered_tail_bytes
         )
         deliver_live = True
+        added = False
+        evicted: list[dict[str, Any]] = []
 
         def append(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            nonlocal deliver_live
+            nonlocal deliver_live, added
+            added = False
             existing = next((item for item in records if item.get("key") == key), None)
             if existing is not None:
                 deliver_live = bool(existing.get("quarantined", False))
                 return records
+            added = True
             return [*records, _buffered_record(key, path, buffered, self.now())]
 
-        self._mutate(append)
+        def fit(
+            records: list[dict[str, Any]], byte_budget: int
+        ) -> list[dict[str, Any]]:
+            if not added:
+                return records
+            kept, evicted[:] = _evict_quarantined_for_room(
+                records, max_records=self.max_records, byte_budget=byte_budget
+            )
+            return kept
+
+        self._mutate(append, fit=fit)
+        # Only after the replace succeeded: a write that raised evicted nothing.
+        for victim in evicted:
+            self.quarantine_evictions_total += 1
+            _log_eviction(victim, key)
         return deliver_live
 
     def _count_append_failure(
@@ -854,46 +766,12 @@ class KubernetesCompletionOutbox:
     ) -> None:
         """Count every outbox bookkeeping failure; log the first one per key.
 
-        ``stage`` is ``"buffer"`` for the write-ahead append and ``"clear"``
-        for the removal that follows a successful delivery. Both mean the
-        ConfigMap could not be written, and both are counted the same way; only
-        the consequence differs, so only the message does. The watcher
-        reconciles every 30 s, so logging each pass would bury the cause under
-        its own repetition (the same rule as F9).
+        Both stages (``"buffer"``, ``"clear"``) mean the ConfigMap could not be
+        written and both are counted the same way; see ``_log_append_failure``.
         """
 
         self.append_failures_total += 1
-        if key in self._append_failures_logged:
-            LOGGER.debug(
-                "completion outbox write (%s) still failing: key=%s (%s: %s)",
-                stage,
-                key,
-                type(exc).__name__,
-                exc,
-            )
-            return
-        if len(self._append_failures_logged) >= _MAX_LOGGED_APPEND_FAILURES:
-            self._append_failures_logged.clear()
-        self._append_failures_logged.add(key)
-        if stage == "clear":
-            LOGGER.error(
-                "cannot clear the delivered critical completion event key=%s "
-                "(%s: %s); the control plane has already accepted it, so the "
-                "record is flagged as delivered for the next replay pass to "
-                "drop without re-sending it",
-                key,
-                type(exc).__name__,
-                exc,
-            )
-            return
-        LOGGER.error(
-            "cannot write ahead critical completion event key=%s (%s: %s); "
-            "delivering it live without a buffered copy -- a watcher restart "
-            "before the control plane accepts it would lose the event",
-            key,
-            type(exc).__name__,
-            exc,
-        )
+        _log_append_failure(self._append_failures_logged, key, exc, stage=stage)
 
     def _upsert_latest(self, path: str, payload: dict[str, Any]) -> str:
         key = _record_key(path, payload)
@@ -929,17 +807,7 @@ class KubernetesCompletionOutbox:
         try:
             self._update(key, delivered=True, quarantined=False, attempts=0)
         except Exception as flag_error:
-            LOGGER.error(
-                "a delivered completion record could not be cleared (%s: %s) "
-                "nor flagged as delivered (%s: %s): key=%s stays buffered "
-                "until a pass that can write the ConfigMap picks it up, or "
-                "until an operator removes it",
-                type(removal_error).__name__,
-                removal_error,
-                type(flag_error).__name__,
-                flag_error,
-                key,
-            )
+            _log_stranded_delivery(key, removal_error, flag_error)
 
     @property
     def active_state_unavailable(self) -> int:
@@ -1201,13 +1069,17 @@ class KubernetesCompletionOutbox:
     def replay(self, *, include_quarantined: bool = False) -> int:
         """Deliver buffered records, isolating each one (F-G1).
 
-        A record whose delivery fails is kept and counted, never allowed to
-        stop the records behind it: a non-retryable status quarantines it as
-        ``rejected``, a retryable failure defers it to the next cycle until
-        the record is ``max_retry_age_seconds`` old, when it is quarantined as
-        ``expired`` and counted in ``expired_total``. Attempt count never
-        quarantines (final review C1). Quarantined records are skipped unless
-        ``include_quarantined`` is set; the one caller that sets it is the
+        A record whose delivery fails is counted, never allowed to stop the
+        records behind it: a non-retryable status quarantines it as
+        ``rejected`` and keeps it, a retryable failure defers it to the next
+        cycle until the record is ``max_retry_age_seconds`` old, when it is
+        ``expired``: logged at ERROR with its key and payload digest, counted
+        in ``expired_total`` and *removed* (R5) -- the live path of a
+        still-held attempt keeps re-posting the event from the watcher's
+        cache, and a day-old retry in the log only cost a critical event its
+        slot. Attempt count never quarantines (final review C1). Quarantined
+        records are skipped unless ``include_quarantined`` is set; the one
+        caller that sets it is the
         operator's one-shot ``gpu-fault-completion-watcher --replay-quarantined``
         (``kubectl exec`` into the watcher Pod, or a Job with the watcher's
         environment), run after fixing the cause -- for example registering
@@ -1233,7 +1105,7 @@ class KubernetesCompletionOutbox:
             self.replay_reads_skipped_total += 1
             self.last_depth = 0
             self.last_quarantined_depth = 0
-            self.last_replay = {"replayed": 0, "deferred": 0, "quarantined": 0}
+            self.last_replay = dict(_EMPTY_PASS)
             return 0
         try:
             records, _resource_version = self._read()
@@ -1301,7 +1173,7 @@ class KubernetesCompletionOutbox:
         ]
         batch = candidates[: self.replay_batch_size]
         deferred = len(candidates) - len(batch)
-        replayed = quarantined = 0
+        replayed = quarantined = expired = 0
         deadline = self.monotonic() + self.replay_budget_seconds
         for index, record in enumerate(batch):
             if index > 0 and self.monotonic() >= deadline:
@@ -1336,14 +1208,22 @@ class KubernetesCompletionOutbox:
                     now=self.now(),
                     max_retry_age_seconds=self.max_retry_age_seconds,
                 )
+                if outcome == "expired":
+                    # The ERROR first, then the removal, then the count: a
+                    # removal that raises leaves the record for the next pass
+                    # to expire again, and a loss is counted once it happened.
+                    _log_expiry(key, record, fields, exc)
+                    self._remove(key)
+                    self.expired_total += 1
+                    expired += 1
+                    drained.add(key)
+                    continue
                 if outcome == "retry":
                     deferred += 1
                 else:
                     quarantined += 1
                     isolated.add(key)
-                    if outcome == "expired":
-                        self.expired_total += 1
-                    _log_quarantine(key, outcome, fields, exc)
+                    _log_quarantine(key, fields, exc)
                 self._update(key, **fields)
                 continue
             if path == WORKLOAD_OBSERVATION_PATH and str(
@@ -1357,6 +1237,7 @@ class KubernetesCompletionOutbox:
             "replayed": replayed,
             "deferred": deferred,
             "quarantined": quarantined,
+            "expired": expired,
         }
         return replayed
 
@@ -1451,10 +1332,11 @@ def replay_quarantined_once(outbox: Any, logger: logging.Logger) -> int:
     remaining = int(getattr(outbox, "last_quarantined_depth", 0))
     logger.info(
         "one-shot replay of the completion outbox: replayed=%d deferred=%d "
-        "quarantined=%d still_quarantined=%d depth=%d",
+        "quarantined=%d expired=%d still_quarantined=%d depth=%d",
         replayed,
         outbox.last_replay["deferred"],
         outbox.last_replay["quarantined"],
+        outbox.last_replay.get("expired", 0),
         remaining,
         int(getattr(outbox, "last_depth", 0)),
     )

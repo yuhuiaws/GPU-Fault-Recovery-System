@@ -4,7 +4,8 @@ The completion controller is a watch/poll loop with no HTTP server of its own,
 so the counters it keeps (``reconcile_failures_total``,
 ``evicted_attempts_total``, ``restore_skipped_total``,
 ``outbox_append_failures_total``, ``outbox_expired_total``,
-``reconcile_runs_total``, ``metadata_takeovers_total``,
+``outbox_quarantine_evictions_total``, ``reconcile_runs_total``,
+``metadata_takeovers_total``,
 ``resumed_attempts_total``), the outbox depth gauges (``outbox_depth``,
 ``outbox_quarantined_depth``), the liveness budget
 (``progress_stall_budget_seconds``) and the timestamp of the last completed
@@ -126,12 +127,27 @@ COUNTERS: tuple[tuple[str, str, str], ...] = (
     (
         "gpu_fault_completion_outbox_expired_total",
         "outbox_expired_total",
-        "Buffered completion records quarantined because every delivery "
-        "attempt failed retryably for 24 h since they were buffered. Each one "
-        "is a failure-detected or terminal event the control plane never "
-        "accepted; nothing delivers it now except the operator running "
-        "`gpu-fault-completion-watcher --replay-quarantined` in the watcher "
-        "Pod after fixing the cause.",
+        "Buffered completion records removed from the write-ahead ConfigMap "
+        "because every delivery attempt failed retryably for 24 h since they "
+        "were buffered; each removal is logged at ERROR with the record key "
+        "and payload digest. Each one is a failure-detected or terminal event "
+        "the control plane never accepted. While the watcher still holds the "
+        "attempt its live path keeps re-posting the event from its cache; "
+        "after a restart nothing delivers it, and "
+        "`gpu-fault-completion-watcher --replay-quarantined` cannot revive a "
+        "removed record.",
+    ),
+    (
+        "gpu_fault_completion_outbox_quarantine_evictions_total",
+        "outbox_quarantine_evictions_total",
+        "Rejected (quarantined) completion records evicted from the "
+        "write-ahead ConfigMap, oldest first, so that a critical event could "
+        "be written ahead when the log was at its record or byte bound. Each "
+        "one is logged at ERROR with its key, payload digest, last status and "
+        "last error, and is gone: the one-shot cannot deliver it any more. "
+        "Live records are never evicted -- a critical append fails only when "
+        "the log is full of them -- so a rising rate means rejected records "
+        "are piling up faster than the operator fixes their cause.",
     ),
 )
 
@@ -160,10 +176,12 @@ GAUGES: tuple[tuple[str, str, str], ...] = (
         "gpu_fault_completion_outbox_quarantined_depth",
         "outbox_quarantined_depth",
         "Buffered records the loop's replay will not retry: rejected by a "
-        "non-retryable control-plane status, or expired after 24 h of "
-        "retryable failures. They are delivered only by a later live POST or "
-        "by the operator's `gpu-fault-completion-watcher --replay-quarantined` "
-        "one-shot. Anything above zero needs a look.",
+        "non-retryable control-plane status (a record that expires after 24 h "
+        "of retryable failures is removed instead, see "
+        "..._outbox_expired_total). They are delivered only by a later live "
+        "POST or by the operator's `gpu-fault-completion-watcher "
+        "--replay-quarantined` one-shot, and the oldest is evicted when a "
+        "critical event needs its slot. Anything above zero needs a look.",
     ),
     (
         "gpu_fault_completion_watcher_progress_stall_budget_seconds",

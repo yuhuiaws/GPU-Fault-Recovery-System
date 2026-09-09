@@ -411,3 +411,30 @@ def test_metrics_export_the_outbox_expiry_counter() -> None:
     assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
     assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
     assert f"{name} 3" in lines, f"{name} sample missing from {body!r}"
+
+
+def test_metrics_export_the_quarantine_eviction_counter() -> None:
+    """R5 (b): a rejected record evicted to seat a critical event is counted."""
+
+    class EvictingController(FakeController):
+        outbox_quarantine_evictions_total = 2
+
+    body = render_completion_metrics(EvictingController())
+
+    name = "gpu_fault_completion_outbox_quarantine_evictions_total"
+    lines = body.splitlines()
+    assert f"# HELP {name} " in body, f"{name} has no HELP line: {body!r}"
+    assert f"# TYPE {name} counter" in lines, f"{name} is not typed as a counter"
+    assert f"{name} 2" in lines, f"{name} sample missing from {body!r}"
+
+
+def test_the_expiry_counter_help_says_the_record_is_removed() -> None:
+    body = render_completion_metrics(FakeController())
+    help_line = next(
+        line
+        for line in body.splitlines()
+        if line.startswith("# HELP gpu_fault_completion_outbox_expired_total ")
+    )
+    assert "removed" in help_line and "quarantined because" not in help_line, (
+        f"an expired record is removed from the WAL, not quarantined: {help_line}"
+    )

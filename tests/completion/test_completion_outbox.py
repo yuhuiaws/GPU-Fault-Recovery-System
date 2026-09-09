@@ -163,6 +163,8 @@ def test_active_attempt_state_ignores_timestamp_only_refreshes() -> None:
 
 
 def test_completion_outbox_fails_closed_instead_of_dropping_oldest() -> None:
+    """A WAL full of *live* records refuses; nothing undelivered is dropped."""
+
     core = ConfigMapCore()
     outbox = KubernetesCompletionOutbox(core, RecordingSink(fail=True), max_records=1)
     with pytest.raises(OSError):
@@ -173,6 +175,171 @@ def test_completion_outbox_fails_closed_instead_of_dropping_oldest() -> None:
 
     records = json.loads(core.data["events.json"])
     assert [item["key"] for item in records] == ["cluster-a/attempt-a/terminal"]
+    assert outbox.quarantine_evictions_total == 0, (
+        "a live record is never evicted to make room; only a quarantined one is"
+    )
+
+
+def _quarantine(core: ConfigMapCore, now, *attempts: str) -> None:
+    """Leave one ``rejected`` (quarantined) terminal per attempt in ``core``.
+
+    ``now`` advances by a second per record so the first attempt is the oldest.
+    """
+
+    sink = RejectingSink(fail=True)
+    for attempt in attempts:
+        outbox = KubernetesCompletionOutbox(core, sink, now=lambda: now[0])
+        with pytest.raises(CollectorError):
+            outbox.post("/v1/attempts/terminal", payload(attempt))
+        outbox.replay()
+        now[0] += 1.0
+
+
+def _keys(core: ConfigMapCore) -> list[str]:
+    return [item["key"] for item in json.loads(core.data["events.json"])]
+
+
+def test_a_critical_append_evicts_the_oldest_quarantined_record_when_full(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R5 (b): quarantined records must not cost a CRITICAL event its slot.
+
+    Two rejected records and one live record fill a three-record WAL. The
+    terminal of a fourth attempt must still be written ahead: the oldest
+    quarantined record goes (never the live one), the eviction is counted and
+    named at ERROR with the evidence an operator would otherwise have read off
+    the record, and the write-ahead copy of the new event is in the same
+    ConfigMap write.
+    """
+
+    now = [1_000.0]
+    core = ConfigMapCore()
+    _quarantine(core, now, "attempt-a", "attempt-b")
+    live = RecordingSink(fail=True)
+    outbox = KubernetesCompletionOutbox(core, live, max_records=3, now=lambda: now[0])
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", payload("attempt-c"))
+    assert outbox.depth() == 3, f"the WAL must be full first: {_keys(core)}"
+    writes_before = core.versions[OUTBOX_NAME]
+
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.completion_outbox"):
+        with pytest.raises(OSError):
+            outbox.post("/v1/attempts/terminal", payload("attempt-d"))
+
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+        "cluster-a/attempt-d/terminal",
+    ], f"the oldest quarantined record must go, and only that one: {_keys(core)}"
+    assert core.versions[OUTBOX_NAME] == writes_before + 1, (
+        "eviction and append must be one ConfigMap replace, not two"
+    )
+    assert outbox.quarantine_evictions_total == 1
+    assert outbox.buffered_attempt_ids == frozenset(
+        {"attempt-b", "attempt-c", "attempt-d"}
+    ), (
+        f"the evicted attempt must leave the held set at once: {outbox.buffered_attempt_ids}"
+    )
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    named = [text for text in errors if "cluster-a/attempt-a/terminal" in text]
+    assert named, f"the eviction must be logged at ERROR with the record key: {errors}"
+    assert "last_status=422" in named[0] and "digest=" in named[0], named[0]
+    assert "cluster-a/attempt-d/terminal" in named[0], (
+        f"the ERROR must say which event took the slot: {named[0]}"
+    )
+
+
+def test_a_critical_append_evicts_only_as_many_quarantined_records_as_it_needs() -> (
+    None
+):
+    core = ConfigMapCore()
+    now = [1_000.0]
+    _quarantine(core, now, "attempt-a", "attempt-b", "attempt-c")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(fail=True), max_records=3, now=lambda: now[0]
+    )
+
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", payload("attempt-d"))
+
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+        "cluster-a/attempt-d/terminal",
+    ], _keys(core)
+    assert outbox.quarantine_evictions_total == 1
+
+
+def test_a_wal_full_of_live_records_still_refuses_a_critical_append() -> None:
+    """Eviction only ever removes quarantined records: live ones are owed."""
+
+    core = ConfigMapCore()
+    now = [1_000.0]
+    _quarantine(core, now, "attempt-a")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(fail=True), max_records=2, now=lambda: now[0]
+    )
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", payload("attempt-b"))
+    # The quarantined record makes room once ...
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", payload("attempt-c"))
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+    ], _keys(core)
+
+    # ... and a WAL of nothing but live records is full.
+    with pytest.raises(CompletionOutboxFull):
+        outbox.post("/v1/attempts/terminal", payload("attempt-d"))
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+    ], f"a refused append must leave the WAL as it was: {_keys(core)}"
+    assert outbox.quarantine_evictions_total == 1
+
+
+def test_a_critical_append_evicts_a_quarantined_record_for_the_byte_bound() -> None:
+    """The byte bound is the other way a WAL is full (F1's 900 000)."""
+
+    core = ConfigMapCore()
+    now = [1_000.0]
+    _quarantine(core, now, "attempt-a", "attempt-b")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(fail=True), max_bytes=1024, now=lambda: now[0]
+    )
+    # Two 314-byte rejected records plus this ~500-byte one overrun a 1024-byte
+    # object by one record's worth, so exactly one eviction makes it fit.
+    heavy = {**payload("attempt-c"), "reason": "x" * 300}
+
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", heavy)
+
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+    ], _keys(core)
+    assert outbox.quarantine_evictions_total == 1
+
+
+def test_an_already_buffered_quarantined_key_evicts_nothing() -> None:
+    """Re-posting a quarantined event is the held live path, not a new slot."""
+
+    core = ConfigMapCore()
+    now = [1_000.0]
+    _quarantine(core, now, "attempt-a", "attempt-b")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(fail=True), max_records=2, now=lambda: now[0]
+    )
+
+    with pytest.raises(OSError):
+        outbox.post("/v1/attempts/terminal", payload("attempt-a"))
+
+    assert _keys(core) == [
+        "cluster-a/attempt-a/terminal",
+        "cluster-a/attempt-b/terminal",
+    ], _keys(core)
+    assert outbox.quarantine_evictions_total == 0
 
 
 class FakeApiException(Exception):

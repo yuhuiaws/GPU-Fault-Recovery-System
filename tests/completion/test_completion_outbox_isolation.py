@@ -115,7 +115,12 @@ def test_a_transient_failure_keeps_the_record_and_continues_with_the_next() -> N
     assert set(records) == {"cluster-a/attempt-a/terminal"}
     assert records["cluster-a/attempt-a/terminal"].get("quarantined", False) is False
     assert records["cluster-a/attempt-a/terminal"]["attempts"] == 1
-    assert outbox.last_replay == {"replayed": 1, "deferred": 1, "quarantined": 0}
+    assert outbox.last_replay == {
+        "replayed": 1,
+        "deferred": 1,
+        "quarantined": 0,
+        "expired": 0,
+    }
 
 
 def test_repeated_transient_failures_never_quarantine_by_count() -> None:
@@ -142,14 +147,17 @@ def test_repeated_transient_failures_never_quarantine_by_count() -> None:
     assert outbox.expired_total == 0
 
 
-def test_a_retry_disposition_older_than_a_day_expires_into_quarantine(
+def test_a_retry_disposition_older_than_a_day_expires_out_of_the_wal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The bound on a retryable record is its age, not its attempt count.
 
-    Nothing that has failed for a whole day is a transient outage any more;
-    the record is quarantined so the operator lever can still push it, and
-    the expiry is counted and named so the loss is visible.
+    Nothing that has failed for a whole day is a transient outage any more.
+    The record is *removed* (R5 (a)): a day-old retry disposition kept in the
+    WAL only consumed one of the 256 slots a critical event needs, and the
+    live path of a still-held attempt keeps re-posting from its cache anyway.
+    The expiry is counted and named at ERROR -- key, payload digest, and the
+    fact that the one-shot cannot deliver what is gone.
     """
 
     now = [1_000_000.0]
@@ -162,29 +170,71 @@ def test_a_retry_disposition_older_than_a_day_expires_into_quarantine(
 
     now[0] += 24 * 3600 - 1
     outbox.replay()
-    assert outbox.quarantined_depth() == 0, (
+    assert outbox.depth() == 1, (
         f"one second short of a day is still a retry: {_records(core)}"
     )
+    assert outbox.expired_total == 0
 
     now[0] += 1
     with caplog.at_level(logging.ERROR, logger="gpu_fault.completion_outbox"):
         outbox.replay()
 
-    record = _records(core)["cluster-a/attempt-a/terminal"]
-    assert record["quarantined"] is True, f"a day-old retry must expire: {record}"
-    assert record["quarantine_reason"] == "expired", record
+    assert _records(core) == {}, (
+        f"a day-old retry must be removed from the WAL, not kept: {_records(core)}"
+    )
     assert outbox.expired_total == 1, (
         f"the expiry must be counted, expired_total={outbox.expired_total}"
     )
-    assert outbox.last_replay["quarantined"] == 1
+    assert outbox.last_replay == {
+        "replayed": 0,
+        "deferred": 0,
+        "quarantined": 0,
+        "expired": 1,
+    }, outbox.last_replay
+    assert (outbox.last_depth, outbox.last_quarantined_depth) == (0, 0), (
+        "the depth gauges must drop with the removal, not one pass later"
+    )
+    assert outbox.buffered_attempt_ids == frozenset(), (
+        "the WAL no longer names the attempt, so the controller may evict it: "
+        f"{outbox.buffered_attempt_ids}"
+    )
     errors = [
         message.getMessage()
         for message in caplog.records
         if message.levelno == logging.ERROR
     ]
-    assert any("cluster-a/attempt-a/terminal" in text for text in errors), (
-        f"the expiry must be logged at ERROR with the record key: {errors}"
+    named = [text for text in errors if "cluster-a/attempt-a/terminal" in text]
+    assert named, f"the expiry must be logged at ERROR with the record key: {errors}"
+    assert "digest=" in named[0], named[0]
+    assert "--replay-quarantined" in named[0] and "cannot" in named[0], (
+        f"the ERROR must say the one-shot cannot revive a removed record: {named[0]}"
     )
+
+
+def test_an_expired_record_whose_removal_fails_is_not_counted_yet() -> None:
+    """Count the loss only once it happened; the next pass tries again."""
+
+    from tests.completion.test_completion_outbox import UnwritableCore
+
+    now = [1_000_000.0]
+    core = UnwritableCore()
+    outbox = KubernetesCompletionOutbox(
+        core, ScriptedSink({"attempt-a": OSError("down")}), now=lambda: now[0]
+    )
+    with pytest.raises(OSError):
+        outbox.post(TERMINAL, payload("attempt-a"))
+    now[0] += 24 * 3600
+    core.writable = False
+
+    with pytest.raises(Exception):
+        outbox.replay()
+
+    assert outbox.expired_total == 0, "nothing was removed, so nothing expired"
+    assert _records(core)["cluster-a/attempt-a/terminal"]["quarantined"] is False
+    core.writable = True
+    outbox.replay()
+    assert _records(core) == {}
+    assert outbox.expired_total == 1
 
 
 def test_a_non_retryable_status_quarantines_on_first_sight() -> None:
