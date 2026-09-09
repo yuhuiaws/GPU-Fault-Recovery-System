@@ -71,6 +71,18 @@ from gpu_fault.admin.notifications import (
 from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
 from gpu_fault.admin.profile_approval import approve_profile
 from gpu_fault.admin.release_artifacts import verify_prebuilt_release
+from gpu_fault.admin.release_consent import (  # noqa: F401 - re-exported
+    ACCEPT_SCHEMA_CHANGE_ENV,
+    ALLOW_INFLIGHT_INSTALLS_ENV,
+    SCHEMA_CHANGE_NO_SNAPSHOT_MODE,
+    SCHEMA_CHANGE_SNAPSHOT_MODE,
+    SUPERSEDE_FAILED_TRANSACTION_ENV,
+    add_release_consent_arguments,
+    inflight_installs_environment,
+    release_consent_environment,
+    schema_change_environment,
+    supersede_environment,
+)
 from gpu_fault.admin.release_state import live_release_state as _live_release_state
 from gpu_fault.admin.resource_registry import sync_installation_resource_registry
 from gpu_fault.admin.rollback_alignment import materialized_rollback_status_site
@@ -112,18 +124,6 @@ QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 
 
-# Mirrors ``regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`` and the two mode
-# values; ``tests/regional/test_release_schema_change_acceptance.py`` pins them
-# equal. The release engine reads the variable; the CLI only sets it.
-ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
-SCHEMA_CHANGE_SNAPSHOT_MODE = "snapshot"
-SCHEMA_CHANGE_NO_SNAPSHOT_MODE = "no-snapshot"
-# Mirrors ``regional_admin_commands.SUPERSEDE_FAILED_TRANSACTION_ENV``; the same
-# test pins them equal. Set by ``--supersede-failed-transaction``, read by the
-# release engine's deploy entrypoint.
-SUPERSEDE_FAILED_TRANSACTION_ENV = "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION"
-
-
 RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
 
 
@@ -139,51 +139,6 @@ def release_history_environment(arguments: argparse.Namespace) -> dict[str, str]
     if not isinstance(state_dir, Path):
         return {}
     return {RELEASE_HISTORY_DIR_ENV: str(state_dir.expanduser().resolve() / "history")}
-
-
-def schema_change_environment(arguments: argparse.Namespace) -> dict[str, str]:
-    """The operator's consent to a schema-version release, for the release engine.
-
-    A release that changes the PostgreSQL schema cannot be rolled back (the new
-    wheel requires the exact version), so the engine refuses it under
-    ``autoRollback: true``. ``--accept-schema-change`` says once, on the command,
-    that the operator knows; the engine then takes an Aurora snapshot before the
-    schema Jobs and runs this one transaction fail-forward without touching
-    ``site.yaml``. ``--accept-schema-change-without-snapshot`` is the same
-    consent for a database nobody would restore. An explicit environment value
-    wins, as with the other release-engine variables. The engine ignores the
-    variable when the release does not change the schema, so passing the flag on
-    an ordinary release is harmless.
-    """
-
-    if os.environ.get(ACCEPT_SCHEMA_CHANGE_ENV, "").strip():
-        return {}
-    if getattr(arguments, "accept_schema_change_without_snapshot", False):
-        return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_NO_SNAPSHOT_MODE}
-    if getattr(arguments, "accept_schema_change", False):
-        return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_SNAPSHOT_MODE}
-    return {}
-
-
-def supersede_environment(arguments: argparse.Namespace) -> dict[str, str]:
-    """The operator's consent to replace a failed fail-forward transaction.
-
-    A transaction that stopped in ``failed``/``partial-convergence`` only
-    resumes the release that failed; a deploy of a *different* candidate (the
-    fix) is refused with this flag named. ``--supersede-failed-transaction``
-    tells the engine to open a new transaction for the candidate whose rollback
-    baseline is the failed transaction's last committed release and whose diff
-    re-rolls everything the failed release moved. It travels as one variable for
-    the same reason the schema-change acceptance does; the engine refuses it
-    when the recorded transaction is not such a failure, so it cannot be left on
-    by habit.
-    """
-
-    if os.environ.get(SUPERSEDE_FAILED_TRANSACTION_ENV, "").strip():
-        return {}
-    if getattr(arguments, "supersede_failed_transaction", False):
-        return {SUPERSEDE_FAILED_TRANSACTION_ENV: "1"}
-    return {}
 
 
 def quick_validation_evidence_environment(
@@ -291,37 +246,6 @@ def _add_managed_site_arguments(
             action="store_true",
             help="print the redacted generated release configuration",
         )
-
-
-def _add_schema_change_arguments(deploy: argparse.ArgumentParser) -> None:
-    deploy.add_argument(
-        "--accept-schema-change",
-        action="store_true",
-        help=(
-            "this release changes the PostgreSQL schema and cannot be rolled "
-            "back: take an Aurora snapshot first and run this one transaction "
-            "fail-forward without editing spec.autoRollback"
-        ),
-    )
-    deploy.add_argument(
-        "--accept-schema-change-without-snapshot",
-        action="store_true",
-        help=(
-            "like --accept-schema-change but without the Aurora snapshot; only "
-            "for a database nobody would restore"
-        ),
-    )
-    deploy.add_argument(
-        "--supersede-failed-transaction",
-        action="store_true",
-        help=(
-            "the recorded transaction is a fail-forward release that stopped in "
-            "failed/partial-convergence and this candidate is a different "
-            "release: open a new transaction for it on the last committed "
-            "baseline instead of resuming the failed one; refused in any other "
-            "state"
-        ),
-    )
 
 
 def _add_capacity_options(command: argparse.ArgumentParser) -> None:
@@ -551,7 +475,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    _add_schema_change_arguments(deploy)
+    add_release_consent_arguments(deploy)
     deploy.add_argument("--impact-base", default="origin/main", help=argparse.SUPPRESS)
     deploy.add_argument(
         "--email-sender",
@@ -1507,8 +1431,7 @@ def run(arguments: argparse.Namespace) -> int:
                 impact_base=getattr(arguments, "impact_base", "origin/main"),
                 current_directory=Path.cwd(),
                 extra_environment={
-                    **schema_change_environment(arguments),
-                    **supersede_environment(arguments),
+                    **release_consent_environment(arguments),
                     **grafana_environment(arguments),
                 },
             )
@@ -1605,9 +1528,8 @@ def run(arguments: argparse.Namespace) -> int:
         environment = {
             **effective_environment(site),
             **quick_validation_evidence_environment(arguments),
-            **schema_change_environment(arguments),
             **release_history_environment(arguments),
-            **supersede_environment(arguments),
+            **release_consent_environment(arguments),
         }
         if arguments.command == "deploy":
             preflight = subprocess.run(

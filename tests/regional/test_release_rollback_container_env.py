@@ -435,6 +435,7 @@ def _restore_fake(
         ),
         _cpu=lambda *args: ["cpu", *args],
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _save_state=lambda phase, **updates: saved.append((phase, updates)),
         _restore_secret=lambda *_a, **_k: mutations.append("secret"),
         _restore_registry_backup=lambda: mutations.append("registry"),
@@ -618,6 +619,7 @@ def test_rollback_records_the_cpu_restore_details_in_the_timing(
         ),
         _save_state=lambda phase, **updates: saved.append((phase, updates)),
         _refresh_aurora_credentials=lambda *_args, **_kwargs: None,
+        _require_no_inflight_installs=lambda *_args, **_kwargs: None,
     )
 
     ORCHESTRATION.rollback_release(release, state=_rollback_previous())

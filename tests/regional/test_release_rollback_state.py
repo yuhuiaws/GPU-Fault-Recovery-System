@@ -230,6 +230,7 @@ def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None
         _require_cpu_secrets=lambda: None,
         _apply_rds_ca_bundle=lambda: None,
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: True,
         _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(ValidationPassed()),
     )
@@ -253,6 +254,7 @@ def test_database_schema_change_still_requires_rollback_compatibility() -> None:
         _require_cpu_secrets=lambda: None,
         _apply_rds_ca_bundle=lambda: None,
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: True,
     )
     diff = DIFF.ReleaseDiff(
@@ -1028,6 +1030,7 @@ def rollback_release_fake(
             )
         ),
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _save_state=lambda phase, **_updates: saved.append(phase),
     )
 

@@ -26,6 +26,7 @@ import pytest
 
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault_release import regional_admin_commands as ADMIN
+from gpu_fault_release import regional_release_automatic_rollback as AUTOMATIC_ROLLBACK
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_schema_change as SCHEMA_CHANGE
 from gpu_fault_release.regional_release_config import ReleaseError, canonical_sha256
@@ -369,6 +370,7 @@ def _engine_release(
         _require_cpu_secrets=lambda: None,
         _apply_rds_ca_bundle=lambda: None,
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: True,
         _load_state=lambda: pytest.fail("a superseding transaction is not a resume"),
         _capture_previous=lambda **_kwargs: pytest.fail(
@@ -485,7 +487,7 @@ def test_a_superseding_transaction_follows_the_site_auto_rollback(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ReleaseError("gpu-a broke")),
     )
     monkeypatch.setattr(
-        ORCHESTRATION, "record_upgrade_failure", lambda *_args, **_kwargs: None
+        AUTOMATIC_ROLLBACK, "record_upgrade_failure", lambda *_args, **_kwargs: None
     )
     release, _saved = _engine_release(auto_rollback=True)
     rolled_back: list[dict[str, Any]] = []

@@ -352,6 +352,7 @@ def test_cluster_local_upgrade_failure_pauses_without_auto_rollback(
         _require_cpu_secrets=lambda: None,
         _apply_rds_ca_bundle=lambda: None,
         _refresh_aurora_credentials=lambda: None,
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: True,
         rollback=lambda **_kwargs: pytest.fail(
             "cluster-local failure triggered automatic rollback"
@@ -499,6 +500,9 @@ def test_control_plane_only_upgrade_skips_schema_and_gpu(
     monkeypatch.setattr(release, "_require_cpu_secrets", lambda: None)
     monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
+    monkeypatch.setattr(
+        release, "_require_no_inflight_installs", lambda **_kwargs: None
+    )
     monkeypatch.setattr(release, "_remote_commands_are_idle", lambda: True)
     monkeypatch.setattr(
         release, "_capture_previous", lambda **_kwargs: {"metadata": {}}
@@ -584,6 +588,9 @@ def test_finalize_proves_fleet_pin_before_closing_the_window(
     monkeypatch.setattr(release, "_upload_release", lambda _diff: None)
     monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
+    monkeypatch.setattr(
+        release, "_require_no_inflight_installs", lambda **_kwargs: None
+    )
     monkeypatch.setattr(release, "_ensure_schema", lambda: None)
     monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(release, "_validate_release_quick", lambda _plan: None)
@@ -665,6 +672,9 @@ def test_new_upgrade_discards_stale_rollback_checkpoints(
     monkeypatch.setattr(release, "_upload_release", lambda _diff: None)
     monkeypatch.setattr(release, "_apply_rds_ca_bundle", lambda: None)
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
+    monkeypatch.setattr(
+        release, "_require_no_inflight_installs", lambda **_kwargs: None
+    )
     monkeypatch.setattr(release, "_ensure_schema", lambda: None)
     monkeypatch.setattr(release, "_apply_cpu", lambda **_kwargs: None)
     monkeypatch.setattr(

@@ -161,10 +161,6 @@ from gpu_fault_release.regional_release_reporting import build_release_plan
 from gpu_fault_release.regional_release_resume_validation import (
     validate_resume_checkpoint,
 )
-from gpu_fault_release.regional_release_runtime_identity import (
-    cpu_ingress_pod_if_running,
-    exec_cpu_ingress_probe,
-)
 from gpu_fault_release.regional_release_state import (
     STATE_CONFIG_MAP as STATE_CONFIG_MAP,
 )
@@ -182,6 +178,10 @@ from gpu_fault_release.regional_release_state import (
     require_digest_pinned_image,
     save_state,
     template_bundle,
+)
+from gpu_fault_release.regional_release_store_preflight import (
+    remote_commands_are_idle,
+    require_no_inflight_installs,
 )
 from gpu_fault_release.regional_release_transaction import commit_release
 from gpu_fault_release.regional_release_validation import (
@@ -511,6 +511,7 @@ class RegionalRelease:
     _ensure_schema = ensure_schema
     _apply_rds_ca_bundle = apply_rds_ca_bundle
     _refresh_aurora_credentials = refresh_aurora_credentials
+    _require_no_inflight_installs = require_no_inflight_installs
     _get_json = get_json
     _load_state = load_state
     _prime_deployment_snapshot = prime_deployment_snapshot
@@ -708,40 +709,7 @@ class RegionalRelease:
             *args,
         ]
 
-    def _remote_commands_are_idle(self) -> bool:
-        script = (
-            "from gpu_fault.app import ApplicationContext;"
-            "stats=ApplicationContext.from_environment()"
-            ".store.remote_command_stats();"
-            "bad={name:int(stats['by_status'].get(name,0)) "
-            "for name in ('PENDING','LEASED','WAITING') "
-            "if int(stats['by_status'].get(name,0))};"
-            "print(bad if bad else '')"
-        )
-        # Asked once, outside the retry loop: a control plane with no Running
-        # ingress Pod has nothing dispatching, so the absence answers the
-        # question rather than failing it, which is why this cannot use the
-        # probe helper's resolver -- for every other caller an absent Pod is a
-        # check that could not be made.
-        if not cpu_ingress_pod_if_running(self):
-            return True
-        for attempt in range(3):
-            try:
-                output = exec_cpu_ingress_probe(
-                    self,
-                    script=script,
-                    failure="the remote command idle check",
-                    interactive=False,
-                    retries=0,
-                )
-            except ReleaseError:
-                if attempt == 2:
-                    raise
-                time.sleep(2)
-                continue
-            return not output.strip()
-        raise ReleaseError("remote command idle check exhausted retries")
-
+    _remote_commands_are_idle = remote_commands_are_idle
     _ensure_profile_transition_safe = ensure_profile_transition_safe
 
     def gpu_cluster_rollout_step(self) -> str:

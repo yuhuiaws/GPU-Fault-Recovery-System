@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_release_automatic_rollback import (
+    recover_failed_upgrade,
+)
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
@@ -85,11 +88,7 @@ from gpu_fault_release.regional_release_timing import (
     merge_rollback_wave_timings,
     start_timed_entry,
 )
-from gpu_fault_release.regional_release_transaction import (
-    complete_rollback,
-    raise_automatic_rollback_failure,
-    record_upgrade_failure,
-)
+from gpu_fault_release.regional_release_transaction import complete_rollback
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 from gpu_fault_release.regional_runtime_profile import ensure_runtime_profile
 
@@ -1126,6 +1125,9 @@ def upgrade_release(
     self._refresh_aurora_credentials()
     if not self._remote_commands_are_idle():
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
+    # One store read; refuses by name while a driver/firmware/EFA install is
+    # PENDING or WAITING (``regional_release_store_preflight``).
+    self._require_no_inflight_installs(action="upgrade")
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
     acceptance = _validate_upgrade_transaction(
@@ -1191,40 +1193,16 @@ def upgrade_release(
             registry_staged=registry_staged,
         )
     except Exception as upgrade_error:
-        record_upgrade_failure(
+        recover_failed_upgrade(
             self,
             error=upgrade_error,
-            release_diff=active_diff.as_dict(),
-            execution_plan=plan.as_dict(),
+            diff=active_diff,
+            plan=plan,
             previous=previous,
             completed_phases=completed_phases,
             completed_clusters=completed_clusters,
             registry_staged=registry_staged,
         )
-        # An accepted schema change runs fail-forward: the rollback would be
-        # refused at the schema anyway, and the operator was told so when they
-        # accepted. The state keeps the acceptance (and the snapshot id) for
-        # the recovery the manual describes.
-        if (
-            self.config.auto_rollback
-            and recorded_acceptance(self.state) is None
-            and not isinstance(
-                upgrade_error,
-                PartialClusterRolloutError,
-            )
-        ):
-            try:
-                self.rollback(state=previous)
-            except Exception as rollback_error:
-                raise_automatic_rollback_failure(
-                    self,
-                    upgrade_error=upgrade_error,
-                    rollback_error=rollback_error,
-                    previous=previous,
-                    release_diff=active_diff.as_dict(),
-                    execution_plan=plan.as_dict(),
-                )
-        raise
 
 
 def _rollback_context(
@@ -1878,6 +1856,9 @@ def rollback_release(
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return
+    # Before anything is refreshed or planned: the previous release's control
+    # plane would re-submit an install that is PENDING or WAITING right now.
+    self._require_no_inflight_installs(action="rollback")
     # The compensating restore restarts the control-plane roles; on 2026-09-07
     # it restarted them into a password RDS had rotated mid-transaction and the
     # release landed in rollback-failed. Fresh credentials first, fail closed,

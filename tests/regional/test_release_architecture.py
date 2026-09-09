@@ -636,6 +636,9 @@ def test_rollback_accepts_endpoint_change_once_compensated(
     # The credential refresh preflight probes the live CronJob; this test is
     # about the transactional guard, not the site.
     monkeypatch.setattr(release, "_refresh_aurora_credentials", lambda: None)
+    monkeypatch.setattr(
+        release, "_require_no_inflight_installs", lambda **_kwargs: None
+    )
 
     with pytest.raises(MODULE.ReleaseError, match="previous Agent identities"):
         release.rollback(state={"metadata": {}, "cpu_wheel": "old-wheel"})

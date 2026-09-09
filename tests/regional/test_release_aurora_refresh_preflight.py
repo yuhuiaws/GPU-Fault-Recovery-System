@@ -199,6 +199,7 @@ def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
         _require_cpu_secrets=lambda: calls.append("cpu-secrets"),
         _apply_rds_ca_bundle=lambda: calls.append("rds-ca-bundle"),
         _refresh_aurora_credentials=lambda: calls.append("aurora-refresh"),
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: (calls.append("idle"), True)[1],
         _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(_Reached()),
     )
@@ -256,6 +257,7 @@ def _rollback_double(calls: list[str], *, refresh=None, **stubs) -> SimpleNamesp
         ),
         state={},
         _refresh_aurora_credentials=refresh or (lambda: calls.append("aurora-refresh")),
+        _require_no_inflight_installs=lambda **_kwargs: None,
         _save_state=lambda phase, **_updates: calls.append(f"state:{phase}"),
         **stubs,
     )
