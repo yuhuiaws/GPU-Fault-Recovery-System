@@ -6,7 +6,6 @@ import re
 import time
 from dataclasses import dataclass
 from math import ceil
-from pathlib import Path
 from typing import Any
 
 # One definition of "failure domain" for the whole system: the remediation
@@ -19,6 +18,7 @@ from gpu_fault.failure_domains import (
     node_failure_domain,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_agent_convergence import (
     agent_heartbeats_converged as agent_heartbeats_converged,
 )
@@ -42,7 +42,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 from gpu_fault_release.regional_release_timing import record_rollback_wave_event
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 CANDIDATE_CPU_HEARTBEAT_TIMEOUT_SECONDS = 75.0
 ROLLOUT_AGENT_GATE_TIMEOUT_SECONDS = 60.0
 ROLLOUT_AGENT_POLL_SECONDS = 5.0

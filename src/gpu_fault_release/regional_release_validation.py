@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
@@ -26,7 +27,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 from gpu_fault_release.regional_release_state import require_digest_pinned_image
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
 CRITICAL_CLEAR_TIMEOUT_SECONDS = 420
 CRITICAL_CLEAR_SAMPLE_SECONDS = 15

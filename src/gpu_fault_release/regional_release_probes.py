@@ -10,9 +10,9 @@ echo a probe by name instead of by its whole body.
 
 from __future__ import annotations
 
-from pathlib import Path
+from gpu_fault_release import repository_root
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 # The probes stay next to the manifests under deploy/: they are shipped to Pods
 # as source text, not imported, so they are release inputs rather than package
 # modules (``deploy/control-plane/regional/probes/README.md``).

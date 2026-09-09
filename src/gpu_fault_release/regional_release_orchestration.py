@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
@@ -94,7 +95,7 @@ from gpu_fault_release.regional_schema_change import (
     resolve_acceptance,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 # Changes whose previous state nothing captures, so a rollback that claimed to
 # restore them would be reporting a state it never put back. The ADOT manifest
 # and image used to be here; the observability snapshot now carries the live

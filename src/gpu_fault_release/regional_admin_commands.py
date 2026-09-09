@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     # The same tolerant wrapper the checks use: a release object that predates
     # the read cache, or a test double standing in for one, has no
@@ -29,7 +29,7 @@ from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
 from gpu_fault_release.regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
 # The operator's consent to open a new transaction for a different candidate
 # over a fail-forward transaction that stopped in `failed`/`partial-convergence`.

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
@@ -39,7 +40,7 @@ from gpu_fault_release.regional_validation_evidence import (
     quick_validation_evidence as _quick_validation_evidence,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 REQUIRED_TOOLS = ("aws", "kubectl", "helm", "jq", "openssl", "sha256sum", "python3")
 
 

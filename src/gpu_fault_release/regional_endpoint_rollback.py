@@ -29,9 +29,9 @@ same load balancer back in place rather than building a new one.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_dns import (
     SERVICE_HOSTNAME_JSONPATH,
     SERVICE_HOSTNAME_POLL_SECONDS,
@@ -50,7 +50,7 @@ from gpu_fault_release.regional_manifest_snapshot import (
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 NLB_MANIFEST = ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
 NLB_SERVICE = "gpu-fault-api-nlb"
 ENDPOINT_RECORD_TYPE = "CNAME"

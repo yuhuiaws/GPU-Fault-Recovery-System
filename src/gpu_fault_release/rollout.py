@@ -15,6 +15,7 @@ from typing import Any
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
     build_preflight_report,
@@ -205,7 +206,7 @@ from gpu_fault_release.regional_runtime_profile import (
     runtime_profile_policy_digest,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 FAST_ROLLOUT_TIMEOUT = "5m"
 SLOW_COMMAND_SECONDS = 15.0
 SLOW_COMMAND_LABEL_LIMIT = 160
