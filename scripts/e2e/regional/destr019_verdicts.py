@@ -13,8 +13,9 @@ built from the pre-C4 schema is migrated in place by the deployed wheel.
 What the case deliberately does *not* do is restart the Agent while a
 maintenance command is in flight. ``NodeActionLedger._interrupt_in_progress``
 marks such a row INTERRUPTED and ``step_execution._fold_result`` fails the
-step closed with ``manual_confirmation_required``; on a RESET_GPU workflow that
-failure escalates to a provider reboot, and there is no on-node stop for it.
+step closed with ``manual_confirmation_required``; the escalation classifier
+hands such a failure to an operator (no rung is climbed on an unknown outcome),
+and there is no on-node stop for it.
 See the spec's 局限 for the reasoning.
 """
 
@@ -23,6 +24,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+from gpu_fault.node_agent.ledger import LEDGER_SCHEMA_VERSION
 
 CASE_ID = "GF-REGIONAL-DESTR-019"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-010"
@@ -73,7 +76,9 @@ AUDIT_COLUMNS = (
     "signature_digest",
     "exit_code",
 )
-LEDGER_SCHEMA_VERSION = 2
+# ``LEDGER_SCHEMA_VERSION`` is the node agent's own: the verdict refuses any
+# other ``user_version``, so a literal here lagged every schema bump (2 -> 3
+# with ``agent_generation``) and failed the live case against a healthy node.
 LEDGER_PRIMARY_KEY = ("command_id", "attempt")
 HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 # ARCH-C5: the /healthz payload shape and the counters it reports.

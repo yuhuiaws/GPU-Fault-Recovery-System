@@ -549,7 +549,10 @@ def test_the_plan_names_the_risk_the_hard_stops_and_the_fail_safe(
     assert "no command in flight" in details["mutation"], details["mutation"]
     assert "No reset, no reboot" in details["mutation"], details["mutation"]
     assert details["preflight_identity"]["agent_generation"] == GENERATION, details
-    assert details["preflight_identity"]["ledger_user_version"] == 2, details
+    assert (
+        details["preflight_identity"]["ledger_user_version"]
+        == verdicts.LEDGER_SCHEMA_VERSION
+    ), details
     assert (
         details["rollback"]["fail_safe_start_timer_is_armed_before_the_restart"] is True
     )
@@ -641,3 +644,20 @@ def test_the_runner_and_probe_are_executable_with_a_shebang() -> None:
         assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
         first = path.read_text(encoding="utf-8").splitlines()[0]
         assert first == "#!/usr/bin/env python3", first
+
+
+def test_the_verdict_pins_the_ledger_schema_version_the_node_agent_writes() -> None:
+    """A node running the deployed wheel writes ``NodeActionLedger``'s version.
+
+    The verdict refuses any other ``user_version`` (``host_errors``,
+    ``ledger_schema_errors``), so a literal here that lags a schema bump fails
+    the live case against a healthy node. F5 bumped the ledger to 3 while the
+    verdict still said 2.
+    """
+
+    from gpu_fault.node_agent import ledger
+
+    assert verdicts.LEDGER_SCHEMA_VERSION == ledger.LEDGER_SCHEMA_VERSION, (
+        verdicts.LEDGER_SCHEMA_VERSION,
+        ledger.LEDGER_SCHEMA_VERSION,
+    )
