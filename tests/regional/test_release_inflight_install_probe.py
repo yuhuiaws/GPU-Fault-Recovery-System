@@ -30,7 +30,6 @@ from gpu_fault.models import (
 )
 from gpu_fault_release import regional_release_probes as PROBES
 
-
 # --- the probe --------------------------------------------------------------------
 
 

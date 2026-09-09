@@ -14,7 +14,6 @@ from pathlib import Path
 
 from gpu_fault.node_agent.ledger import NodeActionLedger
 
-
 ROOT = Path(__file__).parents[2]
 
 NODE_SCRIPTS = (

@@ -16,7 +16,6 @@ from pathlib import Path
 
 from tests.node_agent._deployment_support import NODE_SCRIPTS, ROOT, _write_stub
 
-
 DEGRADED_MARKER_START = (
     'DEGRADED_GPU_MARKER="/var/lib/gpu-fault/installer-degraded-gpu.json"'
 )

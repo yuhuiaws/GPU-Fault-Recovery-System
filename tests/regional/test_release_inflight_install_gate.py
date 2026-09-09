@@ -38,9 +38,9 @@ from gpu_fault.execution.config import NODE_INSTALL_OPERATIONS
 from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
 from gpu_fault_release import regional_deployment_inventory as INVENTORY
 from gpu_fault_release import regional_release_diff as DIFF
-from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_probes as PROBES
+from gpu_fault_release import regional_release_store_preflight as GATE
 from gpu_fault_release import rollout as MODULE
 
 ROOT = Path(__file__).resolve().parents[2]

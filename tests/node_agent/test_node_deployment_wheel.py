@@ -15,7 +15,6 @@ from pathlib import Path
 
 from tests.node_agent._deployment_support import NODE_SCRIPTS, ROOT
 
-
 WHEEL_BLOCK_START = 'MANIFEST_WHEEL_SHA256=""'
 
 WHEEL_BLOCK_END = (
