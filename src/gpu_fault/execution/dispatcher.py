@@ -3,12 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    Future,
-    ThreadPoolExecutor,
-    wait,
-)
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from threading import Event
 from typing import Callable, Literal, TypeVar
@@ -16,7 +11,7 @@ from typing import Callable, Literal, TypeVar
 from pydantic import ValidationError
 
 from gpu_fault.compile_blocked import close_compile_blocked_workflows
-from gpu_fault.execution import restart_budget_preflight
+from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
@@ -64,7 +59,7 @@ from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,
 )
-from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.store.contracts import ControlPlaneStore, WakeupChannel
 from gpu_fault.store.shared.errors import StaleWriteError, WorkflowMergedError
 from gpu_fault.store.shared.workflow_scan import dispatch_eligible_at
 from gpu_fault.workflow_resolution import (
@@ -171,21 +166,21 @@ class WorkflowDispatcher:
         # the newest event whichever process reported it (ARCH-E E4).
         self.internal_error_last_seen_timestamp_seconds = 0.0
         self.failure_handling_abandoned_last_seen_timestamp_seconds = 0.0
+        # Store-wakeup counters and listener state (``dispatcher_wakeups``).
+        self.wakeups_total = dispatcher_wakeups.per_channel(0)
+        self.wakeups_ignored_total = 0
+        self.wakeup_last_seen_timestamp_seconds = 0.0
+        self.wakeup_listener_connected = dispatcher_wakeups.per_channel(False)
         self._stop = Event()
         self._wake = Event()
         self._worker_pool = ThreadPoolExecutor(
-            max_workers=config.max_workers,
-            thread_name_prefix="workflow-dispatch",
+            max_workers=config.max_workers, thread_name_prefix="workflow-dispatch"
         )
 
     def wake(self) -> None:
-        """Request an early durable workflow scan.
-
-        Process-local: in the split deployment the ingress process that calls
-        this is not the worker process that scans, so the call only shortens
-        the poll interval when both roles share a process. The scan cadence
-        itself is ``poll_interval_seconds`` (F-A8).
-        """
+        """Request an early durable workflow scan. Process-local: the listener
+        threads in ``dispatcher_wakeups`` carry store wakeups into the worker
+        process and coalesce bursts into one extra scan (F-A8)."""
         if self.config.enabled:
             self._wake.set()
 
@@ -194,6 +189,13 @@ class WorkflowDispatcher:
         if requested:
             self._wake.clear()
         return requested
+
+    def run_wakeups(self, channel: WakeupChannel, stop: Event | None = None) -> None:
+        """Listener thread body for ``channel``; see ``dispatcher_wakeups``."""
+        dispatcher_wakeups.run_wakeups(self, channel, stop)
+
+    def _set_wakeup_listener_state(self, channel: WakeupChannel, state: bool) -> None:
+        dispatcher_wakeups.set_listener_state(self, channel, state)
 
     DISPATCH_LEASE_KEY = "workflow-dispatch"
     MAX_SCAN_ROWS = 20_000
@@ -864,10 +866,7 @@ class WorkflowDispatcher:
 
     def _dispatch_workflow(
         self, workflow: WorkflowRequest
-    ) -> tuple[
-        tuple[int, int, int, int],
-        WorkflowDispatchFailure | None,
-    ]:
+    ) -> tuple[tuple[int, int, int, int], WorkflowDispatchFailure | None]:
         result = self.executor.execute(
             workflow.request_id,
             WorkflowExecutionRequest(
@@ -1609,11 +1608,7 @@ class WorkflowDispatcher:
                 expected=current,
             )
 
-    def _sync_plan(
-        self,
-        workflow: WorkflowRequest,
-        status: WorkflowStatus,
-    ) -> None:
+    def _sync_plan(self, workflow: WorkflowRequest, status: WorkflowStatus) -> None:
         if not workflow.source_plan_id:
             return
         try:

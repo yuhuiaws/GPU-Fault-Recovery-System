@@ -136,6 +136,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_store.py \
 	tests/store/test_postgres_store_review_indexes.py \
 	tests/store/test_postgres_stuck_workflow_audit.py \
+	tests/store/test_postgres_wakeup_triggers.py \
 	tests/store/test_postgres_workflow_indexes.py \
 	tests/store/test_postgres_workflow_lock_order.py \
 	tests/store/test_preemption_pending_marker.py \

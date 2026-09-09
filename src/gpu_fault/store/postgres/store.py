@@ -34,6 +34,7 @@ from gpu_fault.store.postgres.record_cas import PostgresRecordCasMixin
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
 from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
 from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
+from gpu_fault.store.postgres.wakeups import PostgresWakeupMixin
 from gpu_fault.store.postgres.workflows import PostgresWorkflowMixin
 from gpu_fault.store.postgres.xid import PostgresXidMixin
 from gpu_fault.store.shared.compositions import SharedCompositionMixin
@@ -74,6 +75,7 @@ class PostgresStore(
     PostgresGpuTelemetryMixin,
     PostgresCollectorTelemetryMixin,
     PostgresTelemetrySpoolMixin,
+    PostgresWakeupMixin,
     PostgresProcessorAdminMixin,
     PostgresProcessorAdmissionMixin,
     PostgresProcessorClaimsMixin,

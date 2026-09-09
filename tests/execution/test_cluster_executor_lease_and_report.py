@@ -119,6 +119,7 @@ class FakeExecutorClient:
         execution_owners: list[str],
         max_commands: int,
         lease_seconds: int,
+        wait_seconds: float = 0,
     ) -> list[RemoteActionCommand]:
         self.claims.append(
             {
@@ -126,6 +127,7 @@ class FakeExecutorClient:
                 "execution_owners": execution_owners,
                 "max_commands": max_commands,
                 "lease_seconds": lease_seconds,
+                "wait_seconds": wait_seconds,
             }
         )
         return self.batches.pop(0) if self.batches else []

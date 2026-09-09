@@ -72,6 +72,7 @@ MEMORY_SHARED_PUBLIC = frozenset(
         "processor_batch_transaction",
         "processor_queue_count_status",
         "remote_command_cluster_health",
+        "run_wakeup_listener",
         "save_attempt_observations_batch",
         "try_enqueue_processor_requests_batch",
     }
@@ -144,11 +145,13 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        "record_remote_command_progress",
         "record_xid74_occurrences",
         "release_job_restart",
         "release_notification_delivery",
         "remote_command_cluster_health",
         "renew_remote_command_lease",
+        "run_wakeup_listener",
         "reserve_hyperpod_submission",
         "reserve_job_restart",
         "save_agent",
@@ -239,6 +242,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        "record_remote_command_progress",
         "record_xid74_occurrences",
         "release_job_restart",
         "remote_command_cluster_health",
@@ -561,7 +565,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
-        if migration.version <= 12
+        if migration.version <= 13
     }
 
     assert historical == {
@@ -577,13 +581,14 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         10: "ffbb8e4a1f3b383c5126efc3e7f13bd4bebf8cd8a304775bb2ac219a53551f26",
         11: "3cc0c8918c4fae0fec4c294d21af06a43b552e3387a6936efae7331b5c8d1b57",
         12: "4b0e0447339441e31d0da248472dc0d025e0441ea48ac072850eb779d885aba7",
+        13: "c7a4f950bfde00579b0ecb7a8d55890e6205cebcefa3efbd6cce8dbe0c50f186",
     }, (
-        "a published migration's checksum changed: do not edit v1-v12 (not even "
+        "a published migration's checksum changed: do not edit v1-v13 (not even "
         "a comment inside its apply callback); append a new migration instead"
     )
-    # v13 (control-plane review 2026-09-08 indexes) is pinned here once it has
+    # v14 (the gpu_fault_objects wakeup trigger) is pinned here once it has
     # been released to production; until then its checksum follows the DDL.
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 13
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 14
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:
@@ -1052,6 +1057,7 @@ POSTGRES_CONCURRENCY_SEMANTICS: dict[str, str] = {
     "completion_transaction": "tests/store/test_postgres_core_guards.py",
     "claim_due_xid_correlations": "tests/store/test_postgres_store.py",
     "renew_workflow_lease": "tests/store/test_lease_renewal_half_life.py",
+    "run_wakeup_listener": "tests/store/test_postgres_wakeup_triggers.py",
     "claim_health_signal_transitions": (
         "tests/store/test_postgres_health_signal_claim_isolation.py"
     ),

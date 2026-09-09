@@ -73,6 +73,8 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        # Two round-trips (_get_optional + _put), both under _state_transaction.
+        "record_remote_command_progress",
         "record_xid74_occurrences",
         "release_job_restart",
         "renew_remote_command_lease",

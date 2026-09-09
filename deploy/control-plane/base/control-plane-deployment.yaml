@@ -122,6 +122,14 @@ spec:
               value: "true"
             - name: GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION
               value: "true"
+            # 性能 C: one compound remote command for a contiguous run of
+            # node-side steps on one node. Effective only once the release
+            # pins admit no executor older than protocol 3; the transition
+            # deploy keeps the previous version compatible, so batching turns
+            # itself on with the follow-up deploy. "false" restores one
+            # command per step.
+            - name: GPU_FAULT_REMOTE_STEP_BATCHING
+              value: "true"
             - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
               value: "5"
             - name: GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS

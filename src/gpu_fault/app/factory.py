@@ -65,6 +65,7 @@ from gpu_fault.app.middleware.dispatch import (
     install_processor_dispatch,
 )
 from gpu_fault.app.processor_factory import ProcessorFactory
+from gpu_fault.app.remote_command_wakeups import RemoteCommandWakeupHub
 from gpu_fault.app.routes.admin import (
     AdminRouterDependencies,
     get_admin_dependencies,
@@ -396,6 +397,10 @@ def _configure_service_runtime(
             process_metrics_render=process_local_metric_lines,
         )
     )
+    # Long-poll claim wakeups (``remote_command_wakeups.py``): one lazily
+    # started LISTEN thread per process, closed when the lifespan exits.
+    remote_command_wakeups = RemoteCommandWakeupHub(ctx.store)
+    lifespan = remote_command_wakeups.wrap_lifespan(lifespan)
     return (
         regional_auth_registry,
         service_role,
@@ -410,6 +415,7 @@ def _configure_service_runtime(
         collector_metrics_snapshot,
         lifespan,
         local_processor_diagnostics,
+        remote_command_wakeups,
     )
 
 
@@ -568,6 +574,7 @@ def _install_core_routes(
             executor_compatibility=(
                 RegionalExecutorCompatibilityPolicy.from_mapping(os.environ)
             ),
+            remote_command_wakeups=app.state.remote_command_wakeups,
         )
     )
     app.include_router(regional_router)
@@ -782,9 +789,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         os.getenv("GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS", "5")
     )
     processor = ProcessorFactory(
-        ctx,
-        mode=processor_mode,
-        exit_grace_seconds=processor_exit_grace_seconds,
+        ctx, mode=processor_mode, exit_grace_seconds=processor_exit_grace_seconds
     ).build()
     admission = AdmissionRuntimeFactory(ctx, processor).build()
     processor_max_queue_depth = admission.max_queue_depth
@@ -829,6 +834,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         collector_metrics_snapshot,
         lifespan,
         local_processor_diagnostics,
+        remote_command_wakeups,
     ) = _configure_service_runtime(
         ctx,
         processor,
@@ -856,6 +862,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
+    app.state.remote_command_wakeups = remote_command_wakeups
     app.state.context = ctx
     app.state.processor = processor
     app.state.processor_replay_tracker = processor_replay_tracker

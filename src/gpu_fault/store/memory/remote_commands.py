@@ -14,6 +14,8 @@ from gpu_fault.store.shared.errors import (
     WorkflowLeaseError,
 )
 from gpu_fault.store.shared.remote_commands import (
+    covering_compound_command,
+    merged_batched_results,
     stale_fence,
     stale_fence_reason,
     stale_fence_update,
@@ -103,6 +105,56 @@ class MemoryRemoteCommandMixin:
             )
         return matches[0] if matches else None
 
+    def find_remote_command_covering_step(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        fencing_token: int,
+    ) -> RemoteActionCommand | None:
+        with self._lock:
+            candidates = [
+                item
+                for item in self._remote_commands.values()
+                if item.workflow_request_id == workflow_request_id
+                and item.fencing_token == fencing_token
+            ]
+        return covering_compound_command(candidates, step_index, command_step_space)
+
+    def record_remote_command_progress(
+        self,
+        cluster_id: str,
+        command_id: str,
+        executor_id: str,
+        lease_token: str,
+        *,
+        batched_results: dict[str, Any],
+    ) -> RemoteActionCommand:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            command: RemoteActionCommand | None = self._remote_commands.get(command_id)
+            if command is None or command.cluster_id != cluster_id:
+                raise NotFoundError(f"{cluster_id}/{command_id}")
+            if (
+                command.status is not RemoteCommandStatus.LEASED
+                or command.lease_owner != executor_id
+                or command.lease_token != lease_token
+                or command.lease_expires_at is None
+                or command.lease_expires_at <= now
+            ):
+                raise WorkflowLeaseError("remote command lease is stale")
+            command = command.model_copy(
+                update={
+                    "result_details": merged_batched_results(
+                        command.result_details, batched_results
+                    ),
+                    "updated_at": now,
+                }
+            )
+            self._remote_commands[command_id] = command
+            return command
+
     def _open_remote_command_candidates(
         self,
         cluster_id: str,
@@ -140,6 +192,7 @@ class MemoryRemoteCommandMixin:
         limit: int,
         lease_seconds: int,
         execution_owners: set[str] | None = None,
+        accept_batched_steps: bool = True,
     ):
         now = datetime.now(timezone.utc)
         claimed = []
@@ -169,6 +222,9 @@ class MemoryRemoteCommandMixin:
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
                     )
+                    # A compound command is never handed to an executor whose
+                    # protocol predates ``batched_steps`` (性能 C).
+                    or (not accept_batched_steps and command.batched_steps)
                     or (
                         command.status
                         not in {

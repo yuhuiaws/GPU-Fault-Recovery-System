@@ -14,6 +14,7 @@ from gpu_fault.store.shared.errors import (
     NotFoundError,
 )
 from gpu_fault.store.shared.remote_commands import (
+    covering_compound_command,
     stale_fence,
     stale_fence_update,
 )
@@ -117,6 +118,33 @@ class SqliteRemoteCommandMixin:
                 return command  # type: ignore[no-any-return]
         return None
 
+    def find_remote_command_covering_step(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        fencing_token: int,
+    ) -> RemoteActionCommand | None:
+        # Only compound rows carry the key at all (the serializer omits an
+        # empty list), so ``json_type`` narrows to them before any decode.
+        rows = self._db.execute(
+            """
+            SELECT payload FROM objects
+            WHERE kind='remote_command'
+              AND json_extract(payload, '$.workflow_request_id')=?
+              AND json_extract(payload, '$.fencing_token')=?
+              AND json_type(payload, '$.batched_steps')='array'
+            """,
+            (workflow_request_id, fencing_token),
+        ).fetchall()
+        model = self._models["remote_command"]
+        return covering_compound_command(
+            [model.model_validate_json(row[0]) for row in rows],
+            step_index,
+            command_step_space,
+        )
+
     def _open_remote_command_candidates(
         self,
         cluster_id: str,
@@ -154,6 +182,7 @@ class SqliteRemoteCommandMixin:
         limit: int,
         lease_seconds: int,
         execution_owners: set[str] | None = None,
+        accept_batched_steps: bool = True,
     ):
         now = datetime.now(timezone.utc)
         claimed = []
@@ -188,6 +217,8 @@ class SqliteRemoteCommandMixin:
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
                     )
+                    # See ``MemoryRemoteCommandMixin.claim_remote_commands``.
+                    or (not accept_batched_steps and command.batched_steps)
                     or (
                         command.status
                         not in {

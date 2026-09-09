@@ -44,6 +44,12 @@ from gpu_fault.store.shared.errors import (
     WorkflowLeaseError as WorkflowLeaseError,
 )
 from gpu_fault.store.shared.xid import SharedXidSignalMixin
+from gpu_fault.store.shared.wakeups import (
+    InProcessWakeupMixin,
+    WakeupHub,
+    observed_remote_command_rows,
+    observed_workflow_rows,
+)
 
 
 class InMemoryStore(
@@ -63,6 +69,9 @@ class InMemoryStore(
     SharedEfaTrafficRulesMixin,
     SharedXidSignalMixin,
     SharedCompositionMixin,
+    # Wakeups: the workflow and remote-command tables below are observed
+    # dicts that publish into the hub on assignment, the in-process row trigger.
+    InProcessWakeupMixin,
 ):
     """Thread-safe store for tests and single-process tooling.
 
@@ -75,6 +84,7 @@ class InMemoryStore(
 
     def __init__(self) -> None:
         self._lock = RLock()
+        self._wakeup_hub = WakeupHub()
         self._events: dict[str, TerminalEvent] = {}
         self._decisions: dict[str, CompletionDecision] = {}
         self._attempt_event_keys: dict[tuple[str, str], str] = {}
@@ -84,7 +94,9 @@ class InMemoryStore(
         self._installation_resources: dict[str, InstallationResource] = {}
         self._incidents: dict[str, FaultIncident] = {}
         self._incident_by_event: dict[str, str] = {}
-        self._workflows: dict[str, WorkflowRequest] = {}
+        self._workflows: dict[str, WorkflowRequest] = observed_workflow_rows(
+            self._wakeup_hub
+        )
         self._notifications: dict[str, AdvisoryNotification] = {}
         self._collector_metrics_snapshot = None
         self._notification_by_deduplication_key: dict[str, str] = {}
@@ -115,7 +127,7 @@ class InMemoryStore(
         self._regional_registry_revisions = {}
         self._regional_registry_head = None
         self._regional_registry_members = {}
-        self._remote_commands = {}
+        self._remote_commands = observed_remote_command_rows(self._wakeup_hub)
         self._processor_leadership = None
         self._periodic_task_leases = {}
         self._processor_lanes = {}

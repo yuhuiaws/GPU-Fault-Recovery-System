@@ -16,6 +16,7 @@ from gpu_fault.store.postgres.ddl_helpers import (
     _recorded_schema_version,
 )
 from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
+from gpu_fault.store.postgres.ddl_wakeups import _create_wakeup_triggers
 
 
 def create_postgres_schema(cursor) -> None:
@@ -53,6 +54,7 @@ def create_postgres_schema(cursor) -> None:
     _seed_processor_counters(cursor)
     _create_processor_indexes(cursor)
     _create_telemetry_spool(cursor)
+    _create_wakeup_triggers(cursor)
 
 
 def _create_base_tables(cursor) -> None:

@@ -44,6 +44,7 @@ data:
   GPU_FAULT_REGISTRY_STALE_SECONDS: '90'
   GPU_FAULT_REMOTE_EXECUTION_OWNERS: gpu-fault-kubernetes-adapter, gpu-fault-node-agent,
     gpu-fault-hyperpod-adapter
+  GPU_FAULT_REMOTE_STEP_BATCHING: 'true'
   GPU_FAULT_REQUEST_BUDGET_SECONDS: '15'
   GPU_FAULT_REQUIRED_AGENT_VERSION: 0.10.0
   GPU_FAULT_REQUIRED_POLICY_VERSION: nvidia-xid-catalog-610/sha256:ffb82509abb57457

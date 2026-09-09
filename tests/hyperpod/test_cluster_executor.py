@@ -453,6 +453,7 @@ def _remote_command(operation=WorkflowOperation.VALIDATE_HOST):
         idempotency_key="idem-a",
         result_details=None,
         restart_authorization=None,
+        batched_steps=[],
         step=SimpleNamespace(
             operation=operation,
             workload_ids=[],

@@ -122,15 +122,28 @@ def _open_sibling_hold_lines(context: object) -> list[str]:
 
     executor = getattr(context, "workflow_executor", None)
     adapters = getattr(executor, "adapters", None) if executor is not None else None
-    held = 0
+    totals = {
+        "open_sibling_holds_total": 0,
+        "batched_commands_total": 0,
+        "batched_steps_total": 0,
+    }
     for adapter in adapters or ():
-        value = getattr(adapter, "open_sibling_holds_total", None)
-        if isinstance(value, int):
-            held += value
+        for name in totals:
+            value = getattr(adapter, name, None)
+            if isinstance(value, int):
+                totals[name] += value
     return [
         "# HELP gpu_fault_remote_command_open_sibling_holds_total dispatches held because another command for the same workflow step was still open (ARCH-D5).",
         "# TYPE gpu_fault_remote_command_open_sibling_holds_total counter",
-        f"gpu_fault_remote_command_open_sibling_holds_total {held}",
+        f"gpu_fault_remote_command_open_sibling_holds_total {totals['open_sibling_holds_total']}",
+        # 性能 C: one compound command replaces one command per node-side
+        # step; the steps counter is how many round trips it saved.
+        "# HELP gpu_fault_remote_command_batched_commands_total compound remote commands minted for a contiguous run of node-side steps.",
+        "# TYPE gpu_fault_remote_command_batched_commands_total counter",
+        f"gpu_fault_remote_command_batched_commands_total {totals['batched_commands_total']}",
+        "# HELP gpu_fault_remote_command_batched_steps_total workflow steps carried by a compound remote command beyond its head step.",
+        "# TYPE gpu_fault_remote_command_batched_steps_total counter",
+        f"gpu_fault_remote_command_batched_steps_total {totals['batched_steps_total']}",
     ]
 
 
@@ -608,6 +621,23 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
         "# HELP gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds Unix time this process last started a workflow dispatch cycle, lease held or not; 0 on replicas whose dispatcher never ran (ARCH-E E3).",
         "# TYPE gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds gauge",
         f"gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds {read('last_cycle_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds Unix time this process last turned a store wakeup into an early dispatch scan (see gpu_fault_workflow_dispatch_wakeups_total); 0 if never (ARCH-E E4).",
+        "# TYPE gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds {read('wakeup_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_wakeups_total Store wakeups this process turned into an early dispatch scan, by channel; a remote-command payload counts only on SUCCEEDED/FAILED, the statuses that let a WAITING step advance (性能 A).",
+        "# TYPE gpu_fault_workflow_dispatch_wakeups_total counter",
+        *_dispatch_wakeup_channel_lines(
+            "gpu_fault_workflow_dispatch_wakeups_total",
+            getattr(dispatcher, "wakeups_total", None),
+            0,
+        ),
+        "# HELP gpu_fault_workflow_dispatch_wakeup_listener_connected 1 while this process's LISTEN thread for the wakeup channel is connected, 0 while the dispatcher is polling only for it; any disconnected process makes the Pod's value 0.",
+        "# TYPE gpu_fault_workflow_dispatch_wakeup_listener_connected gauge",
+        *_dispatch_wakeup_channel_lines(
+            "gpu_fault_workflow_dispatch_wakeup_listener_connected",
+            getattr(dispatcher, "wakeup_listener_connected", None),
+            False,
+        ),
         "# HELP gpu_fault_workflow_dispatch_filtered_total Rows a dispatch cycle scanned and set aside, by reason, summed over the process (F-L1).",
         "# TYPE gpu_fault_workflow_dispatch_filtered_total counter",
     ]
@@ -622,6 +652,25 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
     return lines
+
+
+# Both channels are always rendered, zero included, so an alert on a channel
+# that never connected has a sample to read (same reason as
+# ``DISPATCH_FILTER_REASONS``).
+DISPATCH_WAKEUP_CHANNELS = ("remote_command", "workflow_dispatch")
+
+
+def _dispatch_wakeup_channel_lines(
+    family: str, values: object, default: int | bool
+) -> list[str]:
+    totals: dict[str, int] = dict.fromkeys(DISPATCH_WAKEUP_CHANNELS, int(default))
+    if isinstance(values, dict):
+        for channel, value in values.items():
+            totals[str(channel)] = int(value)
+    return [
+        f'{family}{{channel="{_escape_label(channel)}"}} {count}'
+        for channel, count in sorted(totals.items())
+    ]
 
 
 def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:

@@ -112,6 +112,7 @@ def test_the_writer_set_is_the_reviewed_one(name: str) -> None:
         "shared": {
             "ensure_remote_command",
             "renew_remote_command_lease",
+            "record_remote_command_progress",
             "complete_remote_command",
         },
         "sqlite": {

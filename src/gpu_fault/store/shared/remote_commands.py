@@ -16,9 +16,10 @@ result, and ``stale_fence_update`` is the one shape both writers and the
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from gpu_fault.remote_command_models import (
+    BATCHED_RESULTS_KEY,
     RemoteCommandStatus,
     lease_deadline,
 )
@@ -32,8 +33,15 @@ from gpu_fault.store.shared.primitives import (
     StateTransaction,
 )
 from gpu_fault.store.shared.remote_helpers import (
+    OPEN_REMOTE_COMMAND_STATUSES,
+    remote_command_step_space,
+)
+from gpu_fault.store.shared.remote_helpers import (
     remote_command_identity as _remote_command_identity,
 )
+
+if TYPE_CHECKING:
+    from gpu_fault.regional import RemoteActionCommand
 
 STALE_FENCE_STATUS_SOURCE = "stale-fence"
 
@@ -92,6 +100,47 @@ def stale_fence_update(
     )
 
 
+def merged_batched_results(
+    result_details: dict[str, Any], batched_results: dict[str, Any]
+) -> dict[str, Any]:
+    """``result_details`` with ``batched_results`` merged over its existing
+    per-step entries; the memory store and the shared writer use one shape."""
+
+    existing = result_details.get(BATCHED_RESULTS_KEY)
+    return {
+        **result_details,
+        BATCHED_RESULTS_KEY: {
+            **(existing if isinstance(existing, dict) else {}),
+            **batched_results,
+        },
+    }
+
+
+def covering_compound_command(
+    commands: Iterable[RemoteActionCommand],
+    step_index: int,
+    command_step_space: str,
+) -> RemoteActionCommand | None:
+    """Pick the compound command covering ``step_index`` from candidates of one
+    workflow generation: an open one first, else the newest terminal one."""
+
+    matches = sorted(
+        (
+            item
+            for item in commands
+            if item.batched_steps
+            and step_index in item.covered_step_indexes
+            and remote_command_step_space(item) == command_step_space
+        ),
+        key=lambda item: (
+            item.status in OPEN_REMOTE_COMMAND_STATUSES,
+            item.created_at,
+            item.command_id,
+        ),
+    )
+    return matches[-1] if matches else None
+
+
 class SharedRemoteCommandMixin:
     # Attributes supplied by the composed concrete implementation.
     _get_optional: GetOptionalRecord
@@ -147,6 +196,41 @@ class SharedRemoteCommandMixin:
                 update["cancellation_requested_at"] = now
                 update["cancellation_reason"] = stale_fence_reason(command, workflow)
             command = command.model_copy(update=update)
+            self._put("remote_command", command_id, command)
+            return command
+
+    def record_remote_command_progress(
+        self,
+        cluster_id: str,
+        command_id: str,
+        executor_id: str,
+        lease_token: str,
+        *,
+        batched_results: dict[str, Any],
+    ) -> RemoteActionCommand:
+        now = datetime.now(timezone.utc)
+        with self._state_transaction(f"remote_command/{command_id}"):
+            command: RemoteActionCommand | None = self._get_optional(
+                "remote_command", command_id
+            )
+            if command is None or command.cluster_id != cluster_id:
+                raise NotFoundError(f"{cluster_id}/{command_id}")
+            if (
+                command.status is not RemoteCommandStatus.LEASED
+                or command.lease_owner != executor_id
+                or command.lease_token != lease_token
+                or command.lease_expires_at is None
+                or command.lease_expires_at <= now
+            ):
+                raise WorkflowLeaseError("remote command lease is stale")
+            command = command.model_copy(
+                update={
+                    "result_details": merged_batched_results(
+                        command.result_details, batched_results
+                    ),
+                    "updated_at": now,
+                }
+            )
             self._put("remote_command", command_id, command)
             return command
 

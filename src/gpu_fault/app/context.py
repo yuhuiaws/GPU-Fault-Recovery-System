@@ -74,6 +74,7 @@ from gpu_fault.orchestration.incident_closure import IncidentClosureService
 from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
+from gpu_fault.remote_step_batching import RemoteStepBatchingPolicy
 from gpu_fault.regional_registry import (
     configured_regional_registrations,
     regional_registry_config_sha256,
@@ -663,7 +664,9 @@ class ApplicationContext:
         if context.regional_mode:
             remote_owners = set(settings.remote_execution_owners)
             regional_remote_adapter = RegionalRemoteWorkflowAdapter(
-                context.store, owners=remote_owners
+                context.store,
+                owners=remote_owners,
+                step_batching=RemoteStepBatchingPolicy.from_environment(),
             )
             adapters.append(regional_remote_adapter)
         if not context.regional_mode and settings.node_action_adapter_enabled:

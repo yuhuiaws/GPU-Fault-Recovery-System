@@ -35,6 +35,7 @@ from gpu_fault.regional import (
     RemoteCommandClaim,
     RemoteCommandClaimRequest,
     RemoteCommandLeaseRenewal,
+    RemoteCommandProgress,
     RemoteCommandResult,
     RemoteEvidenceCaptureRequest,
     RemoteFleetRolloutFence,
@@ -45,6 +46,7 @@ from gpu_fault.regional import (
     RemoteSpareHealthRequest,
 )
 from gpu_fault.regional_compatibility import (
+    REMOTE_STEP_BATCHING_PROTOCOL_VERSION,
     RegionalExecutorCompatibilityPolicy,
 )
 from gpu_fault.store import NotFoundError
@@ -61,6 +63,9 @@ class RegionalRouterDependencies:
     max_unclaimed_seconds: float
     max_claim_age_seconds: float
     executor_compatibility: RegionalExecutorCompatibilityPolicy
+    # ``RemoteCommandWakeupHub`` (or None): the long-poll wait behind an empty
+    # claim with ``wait_seconds > 0``. None keeps every claim immediate.
+    remote_command_wakeups: Any | None = None
 
 
 def get_regional_dependencies() -> RegionalRouterDependencies:
@@ -239,16 +244,43 @@ async def claim_remote_commands(
             headers={"Retry-After": "5"},
         )
     owners = set(claim.execution_owners) or {"gpu-fault-kubernetes-adapter"}
-    commands = await _store_call(
-        dependencies,
-        dependencies.context.store.claim_remote_commands,
-        cluster_id,
-        claim.executor_id,
-        limit=claim.max_commands,
-        lease_seconds=claim.lease_seconds,
-        execution_owners=owners,
+    # The mint-time gate (``RemoteStepBatchingPolicy``) should already keep
+    # compound commands out of a cluster that still admits older executors;
+    # this is the hard stop for a row minted before the pins were widened
+    # again: an executor that cannot decode ``batched_steps`` never sees one.
+    accept_batched_steps = (
+        claim.executor_protocol_version >= REMOTE_STEP_BATCHING_PROTOCOL_VERSION
     )
-    return RemoteCommandClaim(commands=commands)
+
+    async def claim_once() -> list[RemoteActionCommand]:
+        commands: list[RemoteActionCommand] = await _store_call(
+            dependencies,
+            dependencies.context.store.claim_remote_commands,
+            cluster_id,
+            claim.executor_id,
+            limit=claim.max_commands,
+            lease_seconds=claim.lease_seconds,
+            execution_owners=owners,
+            accept_batched_steps=accept_batched_steps,
+        )
+        return commands
+
+    hub = dependencies.remote_command_wakeups
+    if claim.wait_seconds <= 0 or hub is None:
+        return RemoteCommandClaim(commands=await claim_once())
+    # Long-poll. Subscribe before the first claim so a command written between
+    # that claim and the wait still wakes this request. The wait holds no
+    # store I/O thread; the hub bounds it (server cap, and the old poll
+    # interval while its listener is not connected). A wait that timed out or
+    # lost its listener still claims again: a wakeup is a hint, and a hint
+    # that never came must cost one wait, not a command. A waiter the hub did
+    # not admit (per-cluster cap) answers with the first claim at once.
+    async with hub.subscribe(cluster_id) as waiter:
+        commands = await claim_once()
+        if commands or not waiter.admitted:
+            return RemoteCommandClaim(commands=commands)
+        await waiter.wait(claim.wait_seconds)
+        return RemoteCommandClaim(commands=await claim_once())
 
 
 @router.post(
@@ -274,6 +306,48 @@ async def renew_remote_command(
         renewal.lease_token,
         lease_seconds=renewal.lease_seconds,
     )
+
+
+@router.post(
+    "/executors/{command_id}/progress",
+    response_model=RemoteActionCommand,
+)
+@authorization_bucket("cluster-token")
+async def report_remote_command_progress(
+    command_id: str,
+    progress: RemoteCommandProgress,
+    cluster_id: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> RemoteActionCommand:
+    """Per-step results of a compound command, before its terminal result.
+
+    A separate route rather than a field on the renewal: the renewal runs on
+    the executor's heartbeat thread at its own cadence, while progress is
+    posted by the executing thread the moment a step settles, and the terminal
+    ``/result`` stays exactly what it was. Lease-fenced like the renewal.
+    """
+
+    ctx = dependencies.context
+    command: RemoteActionCommand = await _store_call(
+        dependencies,
+        ctx.store.record_remote_command_progress,
+        _require_cluster(cluster_id),
+        command_id,
+        progress.executor_id,
+        progress.lease_token,
+        batched_results={
+            index: result.model_dump(mode="json")
+            for index, result in progress.batched_results.items()
+        },
+    )
+    # A settled step lets the control-plane loop mark it and dispatch the next
+    # covered one (which then waits on this same command); no need to wait
+    # for the poll interval to notice.
+    ctx.dispatcher.wake()
+    return command
 
 
 @router.post(

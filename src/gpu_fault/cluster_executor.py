@@ -20,8 +20,16 @@ from gpu_fault.adapters import (
     NodeActionWorkflowAdapter,
 )
 from gpu_fault.adapters.node_action.lease_guard import active_lease_guard
+from gpu_fault.cluster_executor_batching import execute_batched_command
+from gpu_fault.cluster_executor_results import (
+    ClusterExecutorError as ClusterExecutorError,
+)
+from gpu_fault.cluster_executor_results import (
+    failure_result,
+    fleet_preflight_hold,
+    outcome_result,
+)
 from gpu_fault.aws_errors import (
-    aws_configuration_error,
     missing_aws_credentials,
 )
 from gpu_fault.env import env_bool
@@ -29,10 +37,6 @@ from gpu_fault.env_validation import (
     validate_gpu_fault_environment,
 )
 from gpu_fault.execution import WorkflowStepContext
-from gpu_fault.execution.fleet_preflight import (
-    command_requires_fleet_preflight,
-    fleet_preflight_reason,
-)
 from gpu_fault.execution.transient_errors import retryable_adapter_error
 from gpu_fault.fleet import (
     AgentLifecycleState,
@@ -61,12 +65,14 @@ from gpu_fault.models import (
 )
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
 from gpu_fault.regional import (
+    BatchedStepResult,
     RegionalExecutorReadinessRequest,
     RemoteActionCommand,
     RemoteAdvisoryNotificationRequest,
     RemoteCommandClaim,
     RemoteCommandClaimRequest,
     RemoteCommandLeaseRenewal,
+    RemoteCommandProgress,
     RemoteCommandResult,
     RemoteCommandStatus,
     RemoteEvidenceCaptureRequest,
@@ -87,12 +93,6 @@ from gpu_fault.transport_errors import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-
-class ClusterExecutorError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
 
 
 def _persistent_store_from_environment():
@@ -165,7 +165,13 @@ class RegionalExecutorClient:
             raise ClusterExecutorError(f"{name} must not contain control characters")
         return cleaned
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         request = Request(
             self.base_url + path,
             data=json.dumps(payload, separators=(",", ":"), default=str).encode(),
@@ -179,7 +185,9 @@ class RegionalExecutorClient:
         try:
             with urlopen(
                 request,
-                timeout=self.timeout_seconds,
+                timeout=(
+                    self.timeout_seconds if timeout_seconds is None else timeout_seconds
+                ),
                 ssl_context=self.ssl_context,
             ) as response:
                 return json.loads(response.read() or b"{}")
@@ -220,7 +228,18 @@ class RegionalExecutorClient:
         execution_owners: list[str] | None = None,
         max_commands: int,
         lease_seconds: int,
+        wait_seconds: float = 0,
     ) -> list[RemoteActionCommand]:
+        """Claim up to ``max_commands``; with ``wait_seconds > 0`` the control
+        plane may hold an empty claim that long for a command to arrive.
+
+        A disabled wait leaves the field out of the body altogether -- the
+        request models forbid unknown fields, so this is what lets the
+        executor keep claiming from a control plane that predates the
+        long-poll. The HTTP timeout grows by the wait so a held request is
+        not mistaken for a stalled one.
+        """
+
         payload = RemoteCommandClaimRequest(
             executor_id=executor_id,
             executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
@@ -229,11 +248,19 @@ class RegionalExecutorClient:
             execution_owners=execution_owners or [],
             max_commands=max_commands,
             lease_seconds=lease_seconds,
+            wait_seconds=wait_seconds,
         )
-        response = self._post(
-            "/v1/regional/executors/claim",
-            payload.model_dump(mode="json"),
-        )
+        if wait_seconds > 0:
+            response = self._post(
+                "/v1/regional/executors/claim",
+                payload.model_dump(mode="json"),
+                timeout_seconds=self.timeout_seconds + wait_seconds,
+            )
+        else:
+            response = self._post(
+                "/v1/regional/executors/claim",
+                payload.model_dump(mode="json", exclude={"wait_seconds"}),
+            )
         return RemoteCommandClaim.model_validate(response).commands
 
     def readiness(
@@ -272,6 +299,31 @@ class RegionalExecutorClient:
         response = self._post(
             f"/v1/regional/executors/{command.command_id}/result",
             result.model_dump(mode="json"),
+        )
+        return RemoteActionCommand.model_validate(response)
+
+    def progress(
+        self,
+        command: RemoteActionCommand,
+        executor_id: str,
+        batched_results: dict[str, dict[str, Any]],
+    ) -> RemoteActionCommand:
+        """Report the settled steps of a compound command (性能 C)."""
+
+        if not command.lease_token:
+            raise ClusterExecutorError(
+                "cannot report progress on a command without a lease token"
+            )
+        response = self._post(
+            f"/v1/regional/executors/{command.command_id}/progress",
+            RemoteCommandProgress(
+                executor_id=executor_id,
+                lease_token=command.lease_token,
+                batched_results={
+                    index: BatchedStepResult.model_validate(entry)
+                    for index, entry in batched_results.items()
+                },
+            ).model_dump(mode="json"),
         )
         return RemoteActionCommand.model_validate(response)
 
@@ -738,6 +790,7 @@ class ClusterActionExecutor:
         executor_id: str,
         allowed_namespaces: set[str],
         poll_seconds: float = 2,
+        claim_wait_seconds: float = 0,
         lease_seconds: int = 120,
         batch_size: int = 5,
         max_concurrent_commands: int = 5,
@@ -751,6 +804,10 @@ class ClusterActionExecutor:
     ) -> None:
         if poll_seconds <= 0:
             raise ClusterExecutorError("cluster executor poll seconds must be positive")
+        if not 0 <= claim_wait_seconds <= 30:
+            raise ClusterExecutorError(
+                "cluster executor claim wait seconds must be between 0 and 30"
+            )
         if not 10 <= lease_seconds <= 7200:
             raise ClusterExecutorError(
                 "cluster executor lease seconds must be between 10 and 7200"
@@ -788,6 +845,11 @@ class ClusterActionExecutor:
         # cluster fails the adapter's confirmation gate.
         self.confirm_cluster_name = confirm_cluster_name
         self.poll_seconds = poll_seconds
+        # Long-poll: how long the control plane may hold an empty claim. While
+        # positive, run() goes straight back into claim() after an empty
+        # answer -- the server already waited -- and poll_seconds only paces a
+        # held (WAITING) command and the transport backoff. 0 is pure polling.
+        self.claim_wait_seconds = claim_wait_seconds
         self.lease_seconds = lease_seconds
         self.batch_size = batch_size
         self.max_concurrent_commands = max_concurrent_commands
@@ -828,6 +890,13 @@ class ClusterActionExecutor:
         # network is the problem, not the target's -- see _idle_delay.
         self.retryable_transport_errors_total = 0
         self.consecutive_transport_degraded_cycles = 0
+        # Compound commands run, the steps they carried, and progress posts
+        # the control plane did not accept (性能 C). The terminal result
+        # carries every step's verdict, so a failed progress post costs the
+        # control plane latency, never a step.
+        self.batched_commands_total = 0
+        self.batched_steps_total = 0
+        self.batched_progress_failures_total = 0
         self.last_successful_claim_at: datetime | None = None
         # Whether the last claim cycle moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
@@ -873,6 +942,9 @@ class ClusterActionExecutor:
             "consecutive_transport_degraded_cycles": (
                 self.consecutive_transport_degraded_cycles
             ),
+            "batched_commands_total": self.batched_commands_total,
+            "batched_steps_total": self.batched_steps_total,
+            "batched_progress_failures_total": self.batched_progress_failures_total,
             "spare_reservations_reclaimed_total": (
                 self.spare_reservation_sweep.reclaimed_total
                 if self.spare_reservation_sweep is not None
@@ -916,6 +988,7 @@ class ClusterActionExecutor:
             execution_owners=self.execution_owners,
             max_commands=self.batch_size,
             lease_seconds=self.lease_seconds,
+            wait_seconds=self.claim_wait_seconds,
         )
         # A successful claim round-trip proves the token, the TLS trust
         # chain and the control-plane route all work, even when the
@@ -1127,6 +1200,11 @@ class ClusterActionExecutor:
                     )
                 time.sleep(delay)
                 continue
+            if count == 0 and self.claim_wait_seconds > 0:
+                # The control plane held this claim for up to
+                # claim_wait_seconds already; sleeping again would only add
+                # latency to the next command.
+                continue
             if count == 0 or not self.last_cycle_advanced:
                 time.sleep(self._idle_delay())
 
@@ -1146,37 +1224,11 @@ class ClusterActionExecutor:
             raise ClusterExecutorError("claimed command has no lease token")
         try:
             self._validate(command)
-            if self.fleet_registry is not None and command_requires_fleet_preflight(
-                command.step.operation
-            ):
-                steps = (
-                    command.workflow.safety_steps
-                    if command.workflow.executes_safety_steps
-                    else command.workflow.official_steps
-                )
-                preflight_error = fleet_preflight_reason(
-                    self.fleet_registry,
-                    command.workflow,
-                    command.incident,
-                    steps,
-                )
-                if preflight_error is not None:
-                    LOGGER.warning(
-                        "remote command held before destructive action: "
-                        "command=%s workflow=%s operation=%s reason=%s",
-                        command.command_id,
-                        command.workflow_request_id,
-                        command.step.operation.value,
-                        preflight_error,
-                    )
-                    return RemoteCommandResult(
-                        lease_token=lease_token,
-                        status=RemoteCommandStatus.WAITING,
-                        details={
-                            "fleet_preflight_blocked": True,
-                            "reason": preflight_error,
-                        },
-                    )
+            preflight_hold = fleet_preflight_hold(
+                self, command, command.workflow, command.step.operation, lease_token
+            )
+            if preflight_hold is not None:
+                return preflight_hold
             matches = [
                 adapter for adapter in self.adapters if adapter.supports(command.step)
             ]
@@ -1188,6 +1240,8 @@ class ClusterActionExecutor:
             barrier_hold = self._barrier_hold(command, matches[0], lease_token)
             if barrier_hold is not None:
                 return barrier_hold
+            if command.batched_steps:
+                return execute_batched_command(self, command, matches[0], lease_token)
             workflow = command.workflow
             if command.result_details:
                 previous = WorkflowStepExecution(
@@ -1216,115 +1270,17 @@ class ClusterActionExecutor:
                     idempotency_key=command.idempotency_key,
                 )
             )
-            status = {
-                WorkflowStepStatus.WAITING: (RemoteCommandStatus.WAITING),
-                WorkflowStepStatus.SUCCEEDED: (RemoteCommandStatus.SUCCEEDED),
-                WorkflowStepStatus.FAILED: (RemoteCommandStatus.FAILED),
-            }[outcome.status]
-            details = dict(outcome.details or {})
-            error = outcome.error
-            if status is RemoteCommandStatus.FAILED and not error:
-                # A FAILED outcome without a message is still the adapter's
-                # verdict, not an executor defect. Left as None it failed the
-                # result model's validation inside this try block and was
-                # caught below as an executor-internal-error -- a stack trace,
-                # an unexpected-failure count and an alert for a refusal the
-                # adapter merely forgot to describe.
-                error = (
-                    f"{command.step.operation.value} adapter reported FAILED "
-                    "without an error message"
-                )
-                details["error_message_missing"] = True
-            return RemoteCommandResult(
-                lease_token=lease_token,
-                status=status,
-                details=details,
-                error=error,
+            return outcome_result(
+                outcome, lease_token, operation=command.step.operation
             )
-        except ClusterExecutorError as exc:
-            retryable = self._retryable_control_plane_result(exc, command, lease_token)
-            if retryable is not None:
-                return retryable
-            # Rejections the executor raises on purpose: cluster
-            # mismatch, stale fencing token, no or ambiguous adapter.
-            # These are legitimate FAILED results, not executor bugs.
-            LOGGER.warning(
-                "regional cluster executor rejected command: "
-                "command=%s cluster=%s operation=%s owner=%s nodes=%s: %s",
-                command.command_id,
-                command.cluster_id,
-                command.step.operation.value,
-                command.step.execution_owner,
-                ",".join(command.step.node_ids),
+        except Exception as exc:  # noqa: BLE001 - classified in cluster_executor_results
+            return failure_result(
+                self,
                 exc,
-            )
-            return RemoteCommandResult(
-                lease_token=lease_token,
-                status=RemoteCommandStatus.FAILED,
-                status_source="executor-rejected",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        except Exception as exc:
-            retryable = self._retryable_result(exc, command, lease_token)
-            if retryable is not None:
-                return retryable
-            configuration_reason = aws_configuration_error(exc)
-            if configuration_reason is not None:
-                # A missing IRSA annotation, an unassumable role or a
-                # denied API call is a deployment gap, not a defect: no
-                # stack trace, no internal-error count (which alerting
-                # watches), and a reason that names the knob. Counting
-                # these as executor bugs is what once made "the
-                # ServiceAccount has no role-arn" look like an adapter
-                # crash for the operator reading the step details.
-                LOGGER.error(
-                    "regional cluster executor is misconfigured for "
-                    "AWS: command=%s cluster=%s operation=%s nodes=%s: "
-                    "%s (%s)",
-                    command.command_id,
-                    command.cluster_id,
-                    command.step.operation.value,
-                    ",".join(command.step.node_ids),
-                    configuration_reason,
-                    type(exc).__name__,
-                )
-                return RemoteCommandResult(
-                    lease_token=lease_token,
-                    status=RemoteCommandStatus.FAILED,
-                    status_source="executor-configuration-error",
-                    error=configuration_reason,
-                    details={
-                        "configuration_error": True,
-                        "executor_id": self.executor_id,
-                        "exception_type": type(exc).__name__,
-                    },
-                )
-            # Anything else is an executor-side defect (a missing
-            # attribute, a bad adapter wiring, an unhandled provider
-            # error). Reporting it as a bare FAILED string hides the
-            # difference between "the action was refused" and "the
-            # executor is broken", so record a stack trace, tag the
-            # result, and count it for alerting.
-            self.unexpected_failures += 1
-            LOGGER.exception(
-                "regional cluster executor raised while executing: "
-                "command=%s cluster=%s operation=%s owner=%s nodes=%s",
-                command.command_id,
-                command.cluster_id,
-                command.step.operation.value,
-                command.step.execution_owner,
-                ",".join(command.step.node_ids),
-            )
-            return RemoteCommandResult(
-                lease_token=lease_token,
-                status=RemoteCommandStatus.FAILED,
-                status_source="executor-internal-error",
-                error=f"{type(exc).__name__}: {exc}",
-                details={
-                    "executor_internal_error": True,
-                    "executor_id": self.executor_id,
-                    "exception_type": type(exc).__name__,
-                },
+                command,
+                lease_token,
+                operation=command.step.operation,
+                node_ids=command.step.node_ids,
             )
 
     def _retryable_result(
@@ -1709,6 +1665,12 @@ def executor_from_environment() -> ClusterActionExecutor:
             os.getenv(
                 "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
                 "2",
+            )
+        ),
+        claim_wait_seconds=float(
+            os.getenv(
+                "GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS",
+                "20",
             )
         ),
         lease_seconds=int(

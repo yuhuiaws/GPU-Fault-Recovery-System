@@ -320,7 +320,7 @@ def test_regional_wiring_either_coordinates_or_refuses_barrier_operations(
     # The fleet preflight is a control-plane round trip; it is not what this
     # test is about and it must not decide the outcome here.
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.fleet_preflight_reason",
+        "gpu_fault.cluster_executor_results.fleet_preflight_reason",
         lambda *_args, **_kwargs: None,
     )
     executor = executor_from_environment()

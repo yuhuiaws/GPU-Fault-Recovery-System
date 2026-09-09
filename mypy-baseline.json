@@ -136,7 +136,7 @@
   "src/gpu_fault/cluster_executor.py:no-any-return": 2,
   "src/gpu_fault/cluster_executor.py:no-untyped-call": 1,
   "src/gpu_fault/cluster_executor.py:no-untyped-def": 7,
-  "src/gpu_fault/cluster_executor.py:type-arg": 3,
+  "src/gpu_fault/cluster_executor.py:type-arg": 2,
   "src/gpu_fault/collector_requirements.py:no-any-return": 2,
   "src/gpu_fault/collector_requirements.py:no-untyped-def": 5,
   "src/gpu_fault/collectors/cloud/cloudwatch.py:no-any-return": 1,

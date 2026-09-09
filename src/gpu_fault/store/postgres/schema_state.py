@@ -203,6 +203,9 @@ class PostgresSchemaMixin:
                         'gpu_fault_telemetry_spool_notify_available()'
                     ),
                     to_regprocedure(
+                        'gpu_fault_objects_notify_wakeup()'
+                    ),
+                    to_regprocedure(
                         'gpu_fault_processor_priority_count_sync()'
                     )
                 """
@@ -218,6 +221,7 @@ class PostgresSchemaMixin:
         trigger_names = (
             "gpu_fault_processor_queue_notify_pending_trigger",
             "gpu_fault_telemetry_spool_notify_available_trigger",
+            "gpu_fault_objects_notify_wakeup_trigger",
         )
         with self._db.cursor() as cursor:
             cursor.execute(
@@ -244,11 +248,17 @@ class PostgresSchemaMixin:
             fault_counter_triggers_exist = cursor.fetchone()[0]
         missing = set(trigger_names) - present_triggers
         if missing:
-            label = (
-                "processor queue" if trigger_names[0] in missing else "telemetry spool"
-            )
+            if trigger_names[0] in missing:
+                label = "processor queue notification"
+            elif trigger_names[1] in missing:
+                label = "telemetry spool notification"
+            else:
+                # Schema v14: without it the dispatcher and the executor fall
+                # back to their polls silently, the exact latency this trigger
+                # exists to remove.
+                label = "objects wakeup"
             raise RuntimeError(
-                f"PostgreSQL {label} notification trigger is missing; "
+                f"PostgreSQL {label} trigger is missing; "
                 "run gpu-fault-store-migrate --ensure-schema"
             )
         if not fault_counter_triggers_exist:

@@ -11,6 +11,7 @@ from gpu_fault.remote_command_models import (
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.remote_commands import (
+    covering_compound_command,
     stale_fence,
     stale_fence_update,
 )
@@ -123,6 +124,40 @@ class PostgresRemoteCommandMixin:
             if _remote_command_step_space(command) == command_step_space:
                 return command  # type: ignore[no-any-return]
         return None
+
+    def find_remote_command_covering_step(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        fencing_token: int,
+    ) -> RemoteActionCommand | None:
+        """See ``WorkflowStore.find_remote_command_covering_step``.
+
+        The workflow prefix of ``gpu_fault_remote_command_workflow_all`` narrows
+        to one workflow's rows; only compound rows carry ``batched_steps`` (the
+        serializer omits an empty list), so the type test leaves a handful of
+        rows to decode.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload FROM gpu_fault_objects
+                WHERE kind='remote_command'
+                  AND payload->>'workflow_request_id'=%s
+                  AND (payload->>'fencing_token')::int=%s
+                  AND jsonb_typeof(payload->'batched_steps')='array'
+                """,
+                (workflow_request_id, fencing_token),
+            )
+            rows = cursor.fetchall()
+        return covering_compound_command(
+            [self._decode("remote_command", row[0]) for row in rows],
+            step_index,
+            command_step_space,
+        )
 
     def remote_command_stats(self, *, now: datetime | None = None) -> dict[str, Any]:
         observed_at = now or datetime.now(timezone.utc)
@@ -282,6 +317,7 @@ class PostgresRemoteCommandMixin:
         limit: int,
         lease_seconds: int,
         execution_owners: set[str] | None = None,
+        accept_batched_steps: bool = True,
     ):
         """Lease a batch of commands inside a single transaction.
 
@@ -320,6 +356,9 @@ class PostgresRemoteCommandMixin:
         if owners is not None:
             query += "  AND cmd.payload->'step'->>'execution_owner' = ANY(%s)\n"
             params.append(owners)
+        if not accept_batched_steps:
+            # Compound rows are the only ones that carry the key (性能 C).
+            query += "  AND cmd.payload->'batched_steps' IS NULL\n"
         query += """
               AND NOT EXISTS (
                   SELECT 1 FROM gpu_fault_objects AS flow
@@ -387,6 +426,7 @@ class PostgresRemoteCommandMixin:
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
                     )
+                    or (not accept_batched_steps and command.batched_steps)
                     or (
                         command.status
                         not in {
