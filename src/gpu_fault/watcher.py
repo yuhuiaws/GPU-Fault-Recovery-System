@@ -50,6 +50,9 @@ class ContainerObservation(StrictModel):
     cgroup_path: str | None = None
     role: str
     rank: int = Field(ge=0)
+    # Always True on the Kubernetes path: non-critical Pods are filtered
+    # before observation (completion_controller._is_critical). Kept for the
+    # wire contract and hand-built fixtures.
     critical: bool = True
     node_id: str | None = None
     instance_id: str | None = None

@@ -1,6 +1,6 @@
 {
   "classes": {
-    "scripts/e2e/regional/audit_regional_command_protocol_live.py:LiveProtocolAudit": 1126,
+    "scripts/e2e/regional/audit_regional_command_protocol_live.py:LiveProtocolAudit": 1179,
     "scripts/e2e/regional/capacity_acceptance_cases.py:CapacityAcceptanceCases": 817,
     "scripts/e2e/regional/regional_live_fixture.py:RegionalLiveFixture": 838,
     "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 862,
@@ -24,7 +24,7 @@
   "files": {
     "deploy/hyperpod/deploy.sh": 3331,
     "deploy/node/install-gpu-fault-collector.sh": 1748,
-    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1628,
+    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1682,
     "scripts/e2e/regional/identity_acceptance_auth.py": 1787,
     "scripts/e2e/regional/regional_live_fixture.py": 1617,
     "scripts/e2e/regional/run_collector_acceptance.py": 1693,

@@ -3043,13 +3043,12 @@ test_cases:
   level: live
   risk: read-only-signal-replay
   problem: 预算检查若发生在委托之后，数据面会先停 workload 再发现不允许重启，导致任务被无谓杀死。
-  injection: 不触碰任何 workload：在控制面 store 上为合成 job 预留 restart-budget 1 后，用 RegionalRemoteWorkflowAdapter 对指向不存在 workload 的 RESTART_WORKLOAD step 直接执行，再构造缺 source_gpu_count 的同类 step；结束后删除合成预算行。
+  injection: 不触碰任何 workload：在控制面 store 上为合成 job 预留 restart-budget 1 后，对指向不存在 workload 的 RESTART_WORKLOAD step 先直接驱动 claim 预检 reserve_restart_budgets，再用 RegionalRemoteWorkflowAdapter 以从未预留的 idempotency key 直接执行，再构造缺 source_gpu_count 的同类 step 由 adapter 执行；结束后删除合成预算行。
   expected:
-  - 预算已耗尽时 step FAILED 且 reason 为 RESTART_BUDGET_EXHAUSTED
-  - error 含 restart budget exhausted 与 1/1
-  - 没有新的 remote command 被创建，全程没有任何 workload 被停止
-  - "缺参数时 step FAILED 且 error 含 restart safety context is missing: source_gpu_count"
-  - 缺参数时同样没有 command 下发
+  - 预算已耗尽时 claim 预检返回 FAILED outcome 且 reason 为 RESTART_BUDGET_EXHAUSTED，error 含 restart budget exhausted 与 1/1，预算行不变
+  - 无预留下发时 step FAILED 且 reason 为 RESTART_RESERVATION_MISSING，error 含 restart reservation missing
+  - "缺参数时 step FAILED 且 reason 为 RESTART_SAFETY_CONTEXT_MISSING，error 含 restart safety context is missing: source_gpu_count"
+  - 三个分支都没有新的 remote command 被创建，全程没有任何 workload 被停止
   evidence:
     verdict: NOT_RUN
   automation: manual
