@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -134,13 +135,13 @@ def _run_cmd017_case(
     if seed_problems:
         raise seeded.SeededCommandError("seed contract: " + "; ".join(seed_problems))
 
-    executor_state = seeded.wait_executor_state(
+    threshold_state = seeded.wait_executor_state(
         probe,
         lambda item: int(item.get("barrier_unavailable_holds_total") or 0)
         >= verdicts.MINIMUM_HOLDS,
         verdicts.HOLD_TIMEOUT_SECONDS,
     )
-    seeded.write_json(case_dir / "executor-state.json", executor_state)
+    seeded.write_json(case_dir / "executor-state-at-threshold.json", threshold_state)
     held = seeded.wait_command(
         str(seed["command_id"]),
         lambda item: item.get("status_source") == verdicts.STATUS_SOURCE
@@ -148,8 +149,16 @@ def _run_cmd017_case(
         60,
     )
     seeded.write_json(case_dir / "held-command.json", held)
+    # The executor keeps claiming (and holding) while the command is awaited,
+    # so the breadcrumb it writes on every claim runs ahead of a snapshot taken
+    # at the threshold (attempt 2, 2026-09-09: breadcrumb 4/5 vs snapshot 2/2).
+    # Read the breadcrumb first, give the one-second state recorder a beat,
+    # then take the snapshot the verdict compares it with.
     claim_state = seeded.read_state(probe, "/state/claim-state.json")
     seeded.write_json(case_dir / "claim-state.json", claim_state)
+    time.sleep(verdicts.STATE_RECORDER_SETTLE_SECONDS)
+    executor_state = seeded.read_state(probe, "/state/executor-state.json")
+    seeded.write_json(case_dir / "executor-state.json", executor_state)
     marker = (
         seeded.read_state(probe, "/state/adapter-executed.json")
         if seeded.file_present(probe, "/state/adapter-executed.json")

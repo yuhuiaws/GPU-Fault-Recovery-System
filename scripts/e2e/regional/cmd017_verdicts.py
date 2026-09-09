@@ -103,6 +103,12 @@ def held_command_errors(
     return errors
 
 
+# The probe's state recorder rewrites executor-state.json once a second; a
+# snapshot the breadcrumb is compared with must be taken at least this long
+# after the breadcrumb was read.
+STATE_RECORDER_SETTLE_SECONDS = 2.0
+
+
 def executor_state_errors(
     state: dict[str, Any], *, minimum_holds: int = MINIMUM_HOLDS
 ) -> list[str]:
