@@ -27,6 +27,7 @@ from gpu_fault.cluster_executor.lease import (
     DEFAULT_MAX_EXECUTION_SECONDS,
     CommandLifecycle,
 )
+from gpu_fault.cluster_executor.metrics import ClusterExecutorMetrics
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -269,6 +270,14 @@ class ClusterActionExecutor:
         # report: the local thread may still be mutating, so the lease is held
         # rather than handed to a sibling replica.
         self.abandoned_lease_holds_total = 0
+        # Destructive steps held behind the fleet rollout fence, and result
+        # posts retried after a transport failure (F9: both were decided in
+        # the dispatch and lease layers with no count anywhere).
+        self.fleet_fence_holds_total = 0
+        self.transport_retries_total = 0
+        # The Prometheus view of the counters above (F9). ``increment`` mirrors
+        # every change, so the scrape and the breadcrumb read the same numbers.
+        self.metrics = ClusterExecutorMetrics()
         # SIGTERM asks the loop to stop claiming and asks every in-flight
         # command to stop renewing, so the lease lapses on the control plane's
         # own schedule instead of being parked for a full window.
@@ -380,7 +389,9 @@ class ClusterActionExecutor:
                     handle,
                 )
             os.replace(temporary, self.liveness_state_path)
+            self.metrics.loop_iteration(alive=True)
         except OSError:
+            self.metrics.loop_iteration(alive=False)
             # A breadcrumb that cannot be written goes stale, and stale is the
             # correct direction to fail in: the probe restarts the Pod.
             LOGGER.warning(
@@ -393,7 +404,9 @@ class ClusterActionExecutor:
         """Add to one shared counter under the counter lock."""
 
         with self._counter_lock:
-            setattr(self, counter, getattr(self, counter) + amount)
+            value = getattr(self, counter) + amount
+            setattr(self, counter, value)
+        self.metrics.counter_changed(counter, value, amount)
 
     def metrics_snapshot(self) -> dict[str, Any]:
         """Every executor counter, for the claim breadcrumb and operators.
@@ -422,6 +435,8 @@ class ClusterActionExecutor:
             "execution_timeouts_total": self.execution_timeouts_total,
             "stuck_executions": self.stuck_executions,
             "abandoned_lease_holds_total": (self.abandoned_lease_holds_total),
+            "fleet_fence_holds_total": self.fleet_fence_holds_total,
+            "transport_retries_total": self.transport_retries_total,
             "spare_reservations_reclaimed_total": (
                 self.spare_reservation_sweep.reclaimed_total
                 if self.spare_reservation_sweep is not None
@@ -485,6 +500,7 @@ class ClusterActionExecutor:
         # signal; the readiness marker file only proves pip install ran.
         self.last_successful_claim_at = datetime.now(timezone.utc)
         self.increment("claimed_total", len(commands))
+        self.metrics.claimed()
         self._record_successful_claim(self.last_successful_claim_at)
         self.last_cycle_advanced = True
         if commands:
@@ -501,6 +517,7 @@ class ClusterActionExecutor:
                     for command in commands
                 ]
                 pending = set(futures)
+                self.metrics.in_flight(len(pending))
                 while pending:
                     # Every worker is bounded by ``max_execution_seconds``, so
                     # this loop always ends; the tick exists so that a
@@ -509,6 +526,7 @@ class ClusterActionExecutor:
                     _finished, pending = wait_for_futures(
                         pending, timeout=self.liveness_interval_seconds
                     )
+                    self.metrics.in_flight(len(pending))
                     self._record_liveness()
                 statuses = [future.result() for future in futures]
             finally:
@@ -611,6 +629,7 @@ class ClusterActionExecutor:
                 continue
             if count == 0 or not self.last_cycle_advanced:
                 time.sleep(self.poll_seconds)
+        self.metrics.loop_iteration(alive=False)
         LOGGER.warning(
             "regional cluster executor stopped claiming: executor=%s reason=%s",
             self.executor_id,

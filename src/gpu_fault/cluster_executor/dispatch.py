@@ -171,6 +171,7 @@ class CommandDispatch:
                 steps,
             )
             if preflight_error is not None:
+                self.executor.increment("fleet_fence_holds_total")
                 LOGGER.warning(
                     "remote command held before destructive action: "
                     "command=%s workflow=%s operation=%s reason=%s",

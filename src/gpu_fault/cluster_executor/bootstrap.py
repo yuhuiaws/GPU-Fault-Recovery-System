@@ -21,11 +21,18 @@ from gpu_fault.adapters import (
     NodeActionWorkflowAdapter,
 )
 from gpu_fault.aws_errors import missing_aws_credentials
+from gpu_fault.dataplane_metrics import (
+    HealthPredicate,
+    MetricsServer,
+    start_metrics_server,
+)
 from gpu_fault.cluster_executor.executor import (
+    LIVENESS_STALE_AFTER_SECONDS,
     ClusterActionExecutor,
     SpareReservationSweep,
 )
 from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
+from gpu_fault.cluster_executor.metrics import loop_breadcrumb_is_fresh
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -358,10 +365,39 @@ def readiness_probe() -> int:
     return 0
 
 
+def executor_health(executor: ClusterActionExecutor) -> HealthPredicate:
+    """``/healthz``: the exec liveness probe's question, asked of its file.
+
+    The loop breadcrumb, fresher than the manifest's 300 s. Not the claim
+    breadcrumb and not a control-plane call: a regional outage must read as a
+    live loop that cannot claim, never as a dead Pod.
+    """
+
+    return lambda: loop_breadcrumb_is_fresh(
+        executor.liveness_state_path, LIVENESS_STALE_AFTER_SECONDS
+    )
+
+
+def start_executor_metrics(executor: ClusterActionExecutor) -> MetricsServer | None:
+    """Serve ``/metrics`` + ``/healthz`` on the manifest's ``metrics`` port.
+
+    Best effort, before the first claim: 0 disables, a port that cannot be
+    bound is one ERROR line and the claim loop runs without a scrape target
+    (the collector reads ``up == 0``, which is the honest value).
+    """
+
+    return start_metrics_server(
+        executor.metrics.family,
+        port=int(os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT", "9111")),
+        health=executor_health(executor),
+    )
+
+
 def main() -> None:
     configure_logging()
     validate_gpu_fault_environment(process_name="gpu-fault-cluster-executor")
     executor = executor_from_environment()
+    start_executor_metrics(executor)
     # Installed before the first claim: a rollout that arrives during the very
     # first cycle must still release its lease instead of parking it.
     executor.install_signal_handlers()

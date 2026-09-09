@@ -23,7 +23,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = "gpu_fault.cluster_executor"
-LAYERS = ("regional_client", "lease", "dispatch", "executor", "bootstrap")
+LAYERS = ("regional_client", "lease", "dispatch", "executor", "bootstrap", "metrics")
 # The names the module published before the split, as importers spell them.
 PUBLIC_NAMES = (
     "ABANDONED_WORKER_HOLD_REASON",

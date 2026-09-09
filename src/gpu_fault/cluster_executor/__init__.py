@@ -13,6 +13,8 @@ import surface and splits the code along the seams it already had:
   breadcrumbs and the stop signal; ``SpareReservationSweep``.
 * ``bootstrap`` -- ``executor_from_environment``, ``readiness_probe`` and
   ``main``, the console-script targets.
+* ``metrics`` -- the ``gpu_fault_cluster_executor_`` Prometheus family the
+  executor's counters are mirrored into, and the ``/healthz`` predicate.
 
 Every layer logs as ``gpu_fault.cluster_executor``, the name the log format
 carries and operators filter on. Nothing here is lazy: the names below are the
@@ -23,8 +25,10 @@ from __future__ import annotations
 
 from gpu_fault.cluster_executor.bootstrap import (
     executor_from_environment,
+    executor_health,
     main,
     readiness_probe,
+    start_executor_metrics,
 )
 from gpu_fault.cluster_executor.dispatch import CommandDispatch
 from gpu_fault.cluster_executor.executor import (
@@ -45,6 +49,12 @@ from gpu_fault.cluster_executor.lease import (
     CommandLeaseWatch,
     CommandLifecycle,
 )
+from gpu_fault.cluster_executor.metrics import (
+    CLUSTER_EXECUTOR_METRICS_PREFIX,
+    ClusterExecutorMetrics,
+    cluster_executor_metrics,
+    loop_breadcrumb_is_fresh,
+)
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -55,6 +65,7 @@ from gpu_fault.cluster_executor.regional_client import (
 
 __all__ = [
     "ABANDONED_WORKER_HOLD_REASON",
+    "CLUSTER_EXECUTOR_METRICS_PREFIX",
     "DEFAULT_LIVENESS_INTERVAL_SECONDS",
     "DEFAULT_LIVENESS_STATE_PATH",
     "DEFAULT_MAX_EXECUTION_SECONDS",
@@ -66,6 +77,7 @@ __all__ = [
     "ClusterActionExecutor",
     "ClusterExecutorClaimError",
     "ClusterExecutorError",
+    "ClusterExecutorMetrics",
     "CommandDispatch",
     "CommandLeaseWatch",
     "CommandLifecycle",
@@ -74,7 +86,11 @@ __all__ = [
     "RegionalHyperPodSubmissionStore",
     "RegionalIncidentOwnershipProvider",
     "SpareReservationSweep",
+    "cluster_executor_metrics",
     "executor_from_environment",
+    "executor_health",
+    "loop_breadcrumb_is_fresh",
     "main",
     "readiness_probe",
+    "start_executor_metrics",
 ]

@@ -534,6 +534,7 @@ class CommandLifecycle:
         for attempt in range(1, _RESULT_REPORT_ATTEMPTS + 1):
             try:
                 self.executor.client.complete(command, result)
+                self.executor.metrics.result_posted(result.status)
                 return True
             except Exception as exc:
                 hold_reason = watch.hold_reason()
@@ -573,6 +574,7 @@ class CommandLifecycle:
                     type(exc).__name__,
                     exc,
                 )
+                self.executor.increment("transport_retries_total")
                 self.executor.sleep(delay)
                 # The backoff is where a lease actually runs out: the local
                 # deadline can be crossed and the renewer can hit its failure
