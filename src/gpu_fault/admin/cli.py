@@ -298,8 +298,8 @@ def _add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
         default=0,
         metavar="MINUTES",
         help=(
-            "wait up to MINUTES for the SES sender verification and the SNS "
-            "alert subscription to be confirmed instead of stopping at once"
+            "wait up to MINUTES for the SNS subscription (and the SES sender on a "
+            "spec.notifications.channel: ses site) to confirm instead of stopping"
         ),
     )
 
