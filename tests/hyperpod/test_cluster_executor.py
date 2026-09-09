@@ -15,9 +15,9 @@ from gpu_fault.cluster_executor import (
     ClusterExecutorError,
     RegionalExecutorClient,
     RegionalFleetRegistry,
-    _persistent_store_from_environment,
     executor_from_environment,
 )
+from gpu_fault.cluster_executor.bootstrap import _persistent_store_from_environment
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import RemoteCommandResult, RemoteCommandStatus
@@ -132,10 +132,11 @@ def test_regional_executor_client_scopes_private_ca_to_control_plane(
             return b'{"ready":true}'
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.ssl.create_default_context", create_default_context
+        "gpu_fault.cluster_executor.regional_client.ssl.create_default_context",
+        create_default_context,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.urlopen",
+        "gpu_fault.cluster_executor.regional_client.urlopen",
         lambda request, **kwargs: (
             sent.append((request.full_url, kwargs)) or Response()
         ),
@@ -166,7 +167,7 @@ def test_regional_executor_client_preserves_http_status(monkeypatch) -> None:
         BytesIO(b'{"detail":"store unavailable"}'),
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.urlopen",
+        "gpu_fault.cluster_executor.regional_client.urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
     client = RegionalExecutorClient(
@@ -266,7 +267,7 @@ def test_cluster_executor_claim_failures_use_bounded_backoff(monkeypatch) -> Non
         if len(sleeps) == 4:
             raise StopIteration
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.time.sleep", sleep)
+    monkeypatch.setattr("gpu_fault.cluster_executor.executor.time.sleep", sleep)
     executor = ClusterActionExecutor(
         FailingClient(),
         [FakeAdapter("gpu-fault-node-agent")],
@@ -370,7 +371,7 @@ def test_cluster_executor_renews_remote_command_lease() -> None:
         command_id="command-a", cluster_id="cluster-a", lease_token="lease-a"
     )
 
-    executor._renew_lease(command, StopAfterOneRenewal())
+    executor.lifecycle.renew_lease(command, StopAfterOneRenewal())
 
     assert client.renewals == [("command-a", "executor-a", 120)]
 
@@ -396,7 +397,7 @@ def test_lease_renewal_interval_is_a_third_of_the_lease_capped_at_thirty() -> No
             lease_seconds=lease_seconds,
         )
         stop = RecordingStop()
-        executor._renew_lease(
+        executor.lifecycle.renew_lease(
             SimpleNamespace(command_id="c", cluster_id="cluster-a", lease_token="l"),
             stop,
         )
@@ -731,7 +732,7 @@ def _executor_environment(monkeypatch) -> None:
     # what they assert. The guard itself is covered by
     # test_executor_refuses_hyperpod_adapter_without_aws_credentials.
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.missing_aws_credentials", lambda: None
+        "gpu_fault.cluster_executor.bootstrap.missing_aws_credentials", lambda: None
     )
 
 
@@ -757,13 +758,14 @@ def test_executor_does_not_create_spare_coordinator_by_default(monkeypatch) -> N
             captured.update(kwargs)
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter", FakeLifecycle
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter", FakeLifecycle
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleStepAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleStepAdapter",
         FakeHyperPodStepAdapter,
     )
 
@@ -785,7 +787,8 @@ def test_hyperpod_executor_requires_independent_confirmation(monkeypatch) -> Non
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
 
     with pytest.raises(
@@ -799,7 +802,7 @@ def test_executor_refuses_hyperpod_adapter_without_aws_credentials(monkeypatch) 
     # Undo the pin _executor_environment installs: this is the one test
     # that exercises the probe rather than working around it.
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.missing_aws_credentials",
+        "gpu_fault.cluster_executor.bootstrap.missing_aws_credentials",
         lambda: "no AWS credentials are resolvable in this pod",
     )
 
@@ -811,10 +814,11 @@ def test_executor_refuses_hyperpod_adapter_without_aws_credentials(monkeypatch) 
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter",
         lambda _config, **_kwargs: pytest.fail(
             "the credential check must run before the adapter is built"
         ),
@@ -833,7 +837,7 @@ def test_executor_starts_without_credentials_when_hyperpod_is_off(monkeypatch) -
     _executor_environment(monkeypatch)
     monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", "false")
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.missing_aws_credentials",
+        "gpu_fault.cluster_executor.bootstrap.missing_aws_credentials",
         lambda: pytest.fail(
             "an executor that makes no AWS calls must not require credentials"
         ),
@@ -847,7 +851,8 @@ def test_executor_starts_without_credentials_when_hyperpod_is_off(monkeypatch) -
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
 
     executor = executor_from_environment()
@@ -870,13 +875,15 @@ def test_hyperpod_executor_requires_fleet_registry(monkeypatch) -> None:
             self.store = store
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter", FakeLifecycle
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter", FakeLifecycle
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.RegionalFleetRegistry", lambda _client: None
+        "gpu_fault.cluster_executor.bootstrap.RegionalFleetRegistry",
+        lambda _client: None,
     )
 
     with pytest.raises(ClusterExecutorError, match="requires a fleet registry"):
@@ -915,23 +922,25 @@ def test_executor_builds_spare_coordinator_when_explicitly_enabled(monkeypatch) 
             captured["step_kwargs"] = kwargs
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor._persistent_store_from_environment",
+        "gpu_fault.cluster_executor.bootstrap._persistent_store_from_environment",
         lambda: pytest.fail("remote state must not open a database"),
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter", FakeLifecycle
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter", FakeLifecycle
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.RegionalFleetRegistry", FakeRegistry
+        "gpu_fault.cluster_executor.bootstrap.RegionalFleetRegistry", FakeRegistry
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodSpareCoordinator", FakeSpareCoordinator
+        "gpu_fault.cluster_executor.bootstrap.HyperPodSpareCoordinator",
+        FakeSpareCoordinator,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleStepAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleStepAdapter",
         FakeHyperPodStepAdapter,
     )
 
@@ -957,11 +966,11 @@ def test_executor_spare_failover_requires_remote_state(monkeypatch, enabled) -> 
     monkeypatch.setenv("GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE", "false")
     monkeypatch.delenv("GPU_FAULT_STORE_URL", raising=False)
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter",
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
         lambda **_kwargs: FakeAdapter("gpu-fault-kubernetes-adapter"),
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter",
         lambda _config, **_kwargs: object(),
     )
 
@@ -974,7 +983,7 @@ def test_executor_remote_state_does_not_require_agent_secret(monkeypatch) -> Non
     monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER", "true")
     monkeypatch.setenv("GPU_FAULT_AGENT_REGISTRATION_SECRET", "short")
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor._persistent_store_from_environment",
+        "gpu_fault.cluster_executor.bootstrap._persistent_store_from_environment",
         lambda: pytest.fail("remote state must not open a database"),
     )
 
@@ -986,10 +995,11 @@ def test_executor_remote_state_does_not_require_agent_secret(monkeypatch) -> Non
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter",
         lambda _config, **_kwargs: object(),
     )
 
@@ -1014,10 +1024,11 @@ def test_executor_confirms_cluster_from_its_own_configuration(monkeypatch) -> No
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.HyperPodLifecycleAdapter",
+        "gpu_fault.cluster_executor.bootstrap.HyperPodLifecycleAdapter",
         lambda _config, **_kwargs: object(),
     )
 
@@ -1042,7 +1053,7 @@ def test_execution_request_does_not_let_a_command_confirm_itself() -> None:
         cluster_id = "attacker-supplied-cluster"
         restart_authorization = None
 
-    request = executor._execution_request(FakeCommand())
+    request = executor.dispatch.execution_request(FakeCommand())
 
     assert request.confirm_cluster_name == "hp-cluster"
     assert request.confirm_cluster_name != FakeCommand.cluster_id
@@ -1063,7 +1074,9 @@ def test_execution_request_confirmation_is_absent_without_config() -> None:
 
     # An executor that owns no HyperPod mutations must not manufacture a
     # confirmation; the adapter's gate then fails closed.
-    assert executor._execution_request(FakeCommand()).confirm_cluster_name is None
+    assert (
+        executor.dispatch.execution_request(FakeCommand()).confirm_cluster_name is None
+    )
 
 
 class _OutcomeAdapter(FakeAdapter):
@@ -1125,7 +1138,7 @@ def test_a_held_command_polls_instead_of_spinning(monkeypatch) -> None:
         if len(sleeps) == 3:
             raise StopIteration
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.time.sleep", sleep)
+    monkeypatch.setattr("gpu_fault.cluster_executor.executor.time.sleep", sleep)
     executor = ClusterActionExecutor(
         client,
         [_OutcomeAdapter(WorkflowStepStatus.WAITING)],

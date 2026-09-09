@@ -356,7 +356,7 @@ import ssl
 import time
 import urllib.request
 from urllib.parse import urlsplit
-from gpu_fault.cluster_executor import _regional_client_from_environment
+from gpu_fault.cluster_executor.bootstrap import _regional_client_from_environment
 
 nlb_dns = {nlb_dns!r}
 check_egress = {check_egress!r}

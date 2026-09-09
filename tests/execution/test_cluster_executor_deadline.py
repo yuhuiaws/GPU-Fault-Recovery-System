@@ -144,7 +144,7 @@ def renew_stop_marks(monkeypatch, client: FakeExecutorClient) -> list[int]:
             marks.append(len(client.completed))
             super().set()
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.Event", MarkingEvent)
+    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", MarkingEvent)
     return marks
 
 
@@ -426,7 +426,8 @@ def test_the_execution_cap_is_validated_and_read_from_the_environment(
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
 
     executor = executor_from_environment()
@@ -455,7 +456,7 @@ def test_sigterm_stops_claiming_and_stops_renewing(monkeypatch) -> None:
             self.waits += 1
             return self.waits > 1
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.Event", OneRenewalStopEvent)
+    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", OneRenewalStopEvent)
     client = FakeExecutorClient([remote_command("command-a")])
     executor = build_executor(client, [RecordingAdapter()])
     previous = signal.getsignal(signal.SIGTERM)

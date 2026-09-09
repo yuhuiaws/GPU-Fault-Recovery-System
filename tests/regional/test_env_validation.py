@@ -101,7 +101,7 @@ def test_all_runtime_entrypoints_validate_environment() -> None:
     for relative in (
         "src/gpu_fault/app/context.py",
         "src/gpu_fault/node_agent/app.py",
-        "src/gpu_fault/cluster_executor.py",
+        "src/gpu_fault/cluster_executor/bootstrap.py",
         "src/gpu_fault/collectors_cli.py",
         "src/gpu_fault/completion_controller.py",
     ):

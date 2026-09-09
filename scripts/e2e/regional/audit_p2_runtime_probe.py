@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import gpu_fault.cluster_executor as cluster_executor
 from gpu_fault.cluster_executor import (
     ClusterActionExecutor,
     ClusterExecutorError,
@@ -66,14 +66,14 @@ def main(endpoint: str, node_id: str) -> None:
         owner = "gpu-fault-node-agent"
 
     sleeps = []
-    original_sleep = cluster_executor.time.sleep
+    original_sleep = time.sleep
 
     def sleep(seconds):
         sleeps.append(seconds)
         if len(sleeps) == 4:
             raise StopIteration
 
-    cluster_executor.time.sleep = sleep
+    time.sleep = sleep
     try:
         executor = ClusterActionExecutor(
             FailingClient(),
@@ -90,7 +90,7 @@ def main(endpoint: str, node_id: str) -> None:
         else:
             raise AssertionError("executor backoff probe did not stop")
     finally:
-        cluster_executor.time.sleep = original_sleep
+        time.sleep = original_sleep
     assert sleeps == [2, 4, 8, 8]
 
     versions = iter(["policy-v1", "policy-v2"])

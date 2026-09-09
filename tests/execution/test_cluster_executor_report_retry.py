@@ -173,7 +173,9 @@ def transport_client(monkeypatch, bodies: list[bytes]) -> tuple[Any, list[Any]]:
         )
         return _CannedResponse(remaining.pop(0) if remaining else b"{}")
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "gpu_fault.cluster_executor.regional_client.urlopen", fake_urlopen
+    )
     return RegionalExecutorClient(CONTROL_PLANE, CLUSTER, TOKEN), sent
 
 
@@ -183,7 +185,9 @@ def raising_client(monkeypatch, error: BaseException) -> Any:
     def fake_urlopen(*_args: Any, **_kwargs: Any) -> None:
         raise error
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "gpu_fault.cluster_executor.regional_client.urlopen", fake_urlopen
+    )
     return RegionalExecutorClient(CONTROL_PLANE, CLUSTER, TOKEN)
 
 
@@ -656,7 +660,9 @@ def test_a_claim_failure_and_a_post_claim_failure_are_logged_apart(
     def stop_after_one_backoff(_seconds: float) -> None:
         raise StopIteration
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.time.sleep", stop_after_one_backoff)
+    monkeypatch.setattr(
+        "gpu_fault.cluster_executor.executor.time.sleep", stop_after_one_backoff
+    )
     executor = build(BadShapeClient(), [RecordingAdapter()], tmp_path)
 
     with caplog.at_level(logging.ERROR):

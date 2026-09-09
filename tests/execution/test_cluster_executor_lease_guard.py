@@ -179,7 +179,7 @@ def test_a_locally_expired_lease_withholds_the_result(monkeypatch) -> None:
         def set(self) -> None:
             return None
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.Event", ImmediateStop)
+    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", ImmediateStop)
     clock = {"now": 1000.0}
     client = FakeExecutorClient([remote_command("command-a")])
 
@@ -237,7 +237,8 @@ def test_the_failure_limit_is_validated_and_read_from_the_environment(
             pass
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
 
     executor = executor_from_environment()
@@ -315,12 +316,13 @@ def test_regional_wiring_either_coordinates_or_refuses_barrier_operations(
             return False
 
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.KubernetesWorkflowAdapter", FakeKubernetesAdapter
+        "gpu_fault.cluster_executor.bootstrap.KubernetesWorkflowAdapter",
+        FakeKubernetesAdapter,
     )
     # The fleet preflight is a control-plane round trip; it is not what this
     # test is about and it must not decide the outcome here.
     monkeypatch.setattr(
-        "gpu_fault.cluster_executor.fleet_preflight_reason",
+        "gpu_fault.cluster_executor.dispatch.fleet_preflight_reason",
         lambda *_args, **_kwargs: None,
     )
     executor = executor_from_environment()

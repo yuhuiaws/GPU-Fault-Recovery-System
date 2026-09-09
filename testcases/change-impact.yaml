@@ -302,7 +302,7 @@ rules:
   - id: remote-command
     description: Remote command protocol, leases, Executor, and receipts.
     paths:
-      - src/gpu_fault/cluster_executor.py
+      - src/gpu_fault/cluster_executor/**
       - src/gpu_fault/remote_command_models.py
       - src/gpu_fault/store/**/remote_commands.py
       - src/gpu_fault/app/routes/regional.py

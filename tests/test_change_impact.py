@@ -45,7 +45,7 @@ def test_deploy_host_component_change_stays_in_lifecycle_domain() -> None:
 
 
 def test_remote_command_change_does_not_select_boot_or_collect() -> None:
-    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor.py"], settings())
+    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor/executor.py"], settings())
 
     assert plan.full is False
     assert plan.domains == ("remote-command",)
@@ -95,7 +95,7 @@ def test_more_than_three_domains_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(
         [
             "src/gpu_fault_release/regional_release_diff.py",
-            "src/gpu_fault/cluster_executor.py",
+            "src/gpu_fault/cluster_executor/executor.py",
             "src/gpu_fault/notifications/ses.py",
             "src/gpu_fault/transport/http_client.py",
         ],
@@ -189,7 +189,7 @@ def test_git_change_discovery_unions_committed_dirty_staged_and_untracked(
 
 
 def test_regional_only_output_never_contains_execution_command() -> None:
-    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor.py"], settings())
+    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor/executor.py"], settings())
 
     text = MODULE.render_text(plan, regional_only=True)
 
@@ -198,7 +198,7 @@ def test_regional_only_output_never_contains_execution_command() -> None:
 
 
 def test_impact_plan_file_is_digest_and_base_bound(tmp_path: Path) -> None:
-    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor.py"], settings())
+    plan = MODULE.build_plan(["src/gpu_fault/cluster_executor/executor.py"], settings())
     path = tmp_path / "impact-plan.json"
 
     MODULE.write_plan_file(path, base="origin/main", plan=plan)

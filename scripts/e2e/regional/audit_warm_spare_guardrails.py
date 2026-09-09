@@ -780,7 +780,7 @@ import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-import gpu_fault.cluster_executor as cluster_executor
+import gpu_fault.cluster_executor.bootstrap as executor_bootstrap
 from gpu_fault.adapters.hyperpod.lifecycle import HyperPodLifecycleStepAdapter
 from gpu_fault.execution import WorkflowStepContext
 from gpu_fault.models import (
@@ -850,18 +850,18 @@ class FakeKubernetesAdapter:
     owner = "gpu-fault-kubernetes-adapter"
     core = object()
 
-cluster_executor._persistent_store_from_environment = lambda: None
-cluster_executor.KubernetesWorkflowAdapter = lambda **_kwargs: FakeKubernetesAdapter()
-cluster_executor.HyperPodLifecycleAdapter = lambda *_args, **_kwargs: object()
-cluster_executor.missing_aws_credentials = lambda: None
+executor_bootstrap._persistent_store_from_environment = lambda: None
+executor_bootstrap.KubernetesWorkflowAdapter = lambda **_kwargs: FakeKubernetesAdapter()
+executor_bootstrap.HyperPodLifecycleAdapter = lambda *_args, **_kwargs: object()
+executor_bootstrap.missing_aws_credentials = lambda: None
 os.environ["GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER"] = "false"
 os.environ["GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"] = "true"
 os.environ["GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER"] = "true"
 os.environ["GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE"] = "false"
 startup_error = None
 try:
-    cluster_executor.executor_from_environment()
-except cluster_executor.ClusterExecutorError as exc:
+    executor_bootstrap.executor_from_environment()
+except executor_bootstrap.ClusterExecutorError as exc:
     startup_error = str(exc)
 
 print(json.dumps({

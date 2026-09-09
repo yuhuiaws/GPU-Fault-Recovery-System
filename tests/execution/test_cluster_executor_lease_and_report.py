@@ -249,7 +249,7 @@ def stop_events(monkeypatch) -> list[OneRenewalStopEvent]:
         created.append(event)
         return event
 
-    monkeypatch.setattr("gpu_fault.cluster_executor.Event", factory)
+    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", factory)
     return created
 
 

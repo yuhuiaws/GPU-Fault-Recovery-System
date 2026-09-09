@@ -42,14 +42,16 @@ CASE_IDS = (ISO_002, CMD_011)
 
 
 def _executor(cluster_id: str) -> ClusterActionExecutor:
-    executor = object.__new__(ClusterActionExecutor)
-    executor.client = SimpleNamespace(cluster_id=cluster_id)
-    executor.allowed_namespaces = set()
-    executor.fleet_registry = None
-    executor.adapters = []
-    executor.executor_id = "regional-local-guard-audit"
-    executor.unexpected_failures = 0
-    return executor
+    # Built through the constructor, not ``object.__new__``: the executor now
+    # composes its lease and dispatch layers in ``__init__``, and a hand-filled
+    # instance would miss them. No adapters, so every command is rejected by
+    # the local guards before adapter selection is reached.
+    return ClusterActionExecutor(
+        SimpleNamespace(cluster_id=cluster_id),
+        [],
+        executor_id="regional-local-guard-audit",
+        allowed_namespaces=set(),
+    )
 
 
 def _command(
