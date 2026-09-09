@@ -14,7 +14,7 @@ Public surface only: ``execute``, ``validate_submission``, the ledger's
 
 from __future__ import annotations
 
-from tests._builders import copy_model
+from tests._builders import copy_model, node_action_result
 
 from ._support import (
     CompletedProcess,
@@ -143,3 +143,51 @@ def test_the_same_id_with_a_different_body_is_a_reuse_not_a_replay(tmp_path) -> 
         agent.execute(envelope(rebound))
 
     assert runner.commands == []
+
+
+def test_a_fresh_attempt_records_the_live_generation_on_its_row(tmp_path) -> None:
+    """The row, not the command_id, now says which incarnation ran the install."""
+
+    agent, runner = _driver_agent(tmp_path, agent_generation=8)
+
+    result = agent.execute(envelope(_install(8)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    installs = [argv for argv in runner.commands if argv[1:] == ["--branch", "575"]]
+    assert len(installs) == 1, runner.commands
+    (row,) = agent.ledger.attempt_history(COMMAND_ID)
+    assert row["agent_generation"] == 8, row
+
+
+def test_a_row_taken_by_another_generation_still_replays(tmp_path) -> None:
+    """The generation is an audit column, not part of the command body.
+
+    Generation 7 ran the install and failed terminally; generation 8 is asked
+    the same command. The stored result answers, the runner is never called,
+    and the row keeps saying 7 -- a different generation is not a reused id.
+    """
+
+    agent, runner = _driver_agent(tmp_path, agent_generation=8)
+    agent.ledger.mark_in_progress(_install(7), 1, agent_generation=7)
+    agent.ledger.save(
+        node_action_result(
+            COMMAND_ID,
+            WorkflowOperation.REMEDIATE_DRIVER,
+            NodeActionStatus.FAILED,
+            error="RuntimeError: driver branch verification failed: 570",
+            retryable=False,
+            attempt=1,
+        )
+    )
+
+    result = agent.execute(envelope(_install(8)))
+
+    assert runner.commands == [], (
+        "a generation change must not open a second attempt of the install"
+    )
+    assert result.status is NodeActionStatus.FAILED
+    assert result.attempt == 1
+    (row,) = agent.ledger.attempt_history(COMMAND_ID)
+    assert row["agent_generation"] == 7, (
+        f"the row must keep the generation that took the attempt: {row}"
+    )

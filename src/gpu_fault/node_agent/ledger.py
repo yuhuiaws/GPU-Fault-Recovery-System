@@ -17,10 +17,13 @@ from gpu_fault.node_agent.protocol import (
 
 LOGGER = logging.getLogger(__name__)
 
-# ``PRAGMA user_version`` of a ledger whose ``results`` table is keyed by
-# ``(command_id, attempt)``. Ledgers written before that carry version 0 and a
-# single-row-per-command table; they are migrated in place on open.
-LEDGER_SCHEMA_VERSION = 2
+# ``PRAGMA user_version`` of the ``results`` table. Version 2 keyed it by
+# ``(command_id, attempt)``; ledgers written before that carry version 0 and a
+# single-row-per-command table. Version 3 added ``agent_generation``. Both
+# steps are applied in place on open, and a row written before a column exists
+# reads NULL in it.
+LEDGER_SCHEMA_VERSION = 3
+_PER_ATTEMPT_SCHEMA_VERSION = 2
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 3600
 
 # ``state`` of a row whose handler has been dispatched but whose result has not
@@ -46,6 +49,7 @@ CREATE TABLE IF NOT EXISTS results (
     parameters_digest TEXT,
     signature_digest TEXT,
     exit_code INTEGER,
+    agent_generation INTEGER,
     PRIMARY KEY (command_id, attempt)
 )
 """
@@ -63,6 +67,12 @@ _AUDIT_COLUMNS = (
     "parameters_digest",
     "signature_digest",
     "exit_code",
+    # Which incarnation of the agent took the attempt. Written by
+    # ``mark_in_progress`` from the agent's own live generation, so with the
+    # ``agent-N`` command_id suffix gone from the generation-stable install
+    # commands the row still says who ran the install. Never compared by the
+    # command_id-reuse check: the generation is not part of the command body.
+    "agent_generation",
 )
 
 
@@ -121,12 +131,14 @@ class NodeActionLedger:
             self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _migrate_results_table(self) -> None:
-        """Bring ``results`` to the per-attempt schema without losing rows.
+        """Bring ``results`` to the current schema without losing rows.
 
-        Nodes upgrade with a populated ledger. SQLite cannot change a primary
-        key in place, so the old table is renamed, the new one created, and
-        the rows copied -- one transaction, so a crash mid-way leaves either
-        the old or the new table, never neither.
+        Nodes upgrade with a populated ledger. Two steps, each skipped when the
+        recorded version is already past it: the per-attempt key (version 2),
+        which SQLite cannot change in place, so the old table is renamed, the
+        new one created and the rows copied in one transaction -- a crash
+        mid-way leaves either the old or the new table, never neither; then
+        the additive columns (version 3), which are plain ``ALTER TABLE``.
         """
 
         version = int(self._db.execute("PRAGMA user_version").fetchone()[0])
@@ -139,6 +151,12 @@ class NodeActionLedger:
             self._db.execute(_RESULTS_TABLE)
             self._db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
             return
+        if version < _PER_ATTEMPT_SCHEMA_VERSION:
+            self._migrate_to_per_attempt_rows()
+        self._ensure_column("results", "agent_generation", "INTEGER")
+        self._db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
+
+    def _migrate_to_per_attempt_rows(self) -> None:
         # The pre-audit code added these lazily; a ledger opened only by a
         # very old agent may still be missing some.
         self._ensure_column("results", "completed_at", "TEXT")
@@ -165,7 +183,7 @@ class NodeActionLedger:
                 """
             )
             self._db.execute("DROP TABLE results_legacy")
-            self._db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
+            self._db.execute(f"PRAGMA user_version={_PER_ATTEMPT_SCHEMA_VERSION}")
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")
@@ -173,7 +191,7 @@ class NodeActionLedger:
         LOGGER.info(
             "node action ledger migrated to per-attempt schema "
             "schema_version=%d rows=%d",
-            LEDGER_SCHEMA_VERSION,
+            _PER_ATTEMPT_SCHEMA_VERSION,
             legacy_rows,
         )
 
@@ -238,7 +256,10 @@ class NodeActionLedger:
         attempt: int,
         *,
         signature: str | None = None,
+        agent_generation: int | None = None,
     ) -> None:
+        """Open one attempt; ``agent_generation`` is the live agent's, for audit."""
+
         marker = NodeActionResult(
             command_id=command.command_id,
             operation=command.operation,
@@ -255,8 +276,8 @@ class NodeActionLedger:
                     command_id, attempt, payload, completed_at, state,
                     operation, started_at, incident_id, workflow_request_id,
                     fencing_token, gpu_uuids, parameters_digest,
-                    signature_digest
-                ) VALUES (?, ?, ?, NULL, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?)
+                    signature_digest, agent_generation
+                ) VALUES (?, ?, ?, NULL, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(command_id, attempt) DO UPDATE SET
                     payload=excluded.payload,
                     completed_at=NULL,
@@ -268,7 +289,8 @@ class NodeActionLedger:
                     fencing_token=excluded.fencing_token,
                     gpu_uuids=excluded.gpu_uuids,
                     parameters_digest=excluded.parameters_digest,
-                    signature_digest=excluded.signature_digest
+                    signature_digest=excluded.signature_digest,
+                    agent_generation=excluded.agent_generation
                 """,
                 (
                     command.command_id,
@@ -286,6 +308,7 @@ class NodeActionLedger:
                         if signature
                         else None
                     ),
+                    agent_generation,
                 ),
             )
 

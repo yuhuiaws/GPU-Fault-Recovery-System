@@ -36,6 +36,7 @@ from gpu_fault.node_agent.operations import (
     RemediationOperationsMixin,
     ResetOperationsMixin,
 )
+from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
 from gpu_fault.node_agent.operations.reset import ResetProgressError
 from gpu_fault.node_agent.operations.registry import (
     OPERATION_HANDLERS,
@@ -468,7 +469,12 @@ class NodeActionExecutor(
         self._count("accepted")
         LOGGER.info("node action accepted %s", fields)
         try:
-            self.ledger.mark_in_progress(command, attempt, signature=envelope.signature)
+            self.ledger.mark_in_progress(
+                command,
+                attempt,
+                signature=envelope.signature,
+                agent_generation=self.agent_generation,
+            )
         except Exception:
             # Nothing has been dispatched, but the Event is already registered.
             # Leaving it unset turns every later submit for this command_id into
@@ -507,10 +513,12 @@ class NodeActionExecutor(
                 # A failure that got part way through carries what it did:
                 # which GPUs a multi-GPU reset finished, which one's outcome
                 # nobody can read and which were never attempted decides
-                # reboot versus replace, and only the node knows it.
+                # reboot versus replace, and only the node knows it. An
+                # install killed at its deadline carries the unknown-outcome
+                # flags the escalation ladder hands to an operator.
                 details=(
                     dict(exc.action_details)
-                    if isinstance(exc, ResetProgressError)
+                    if isinstance(exc, (ResetProgressError, InstallOutcomeUnknownError))
                     else {}
                 ),
                 error=f"{type(exc).__name__}: {exc}",
@@ -685,7 +693,11 @@ class NodeActionExecutor(
         # Only a handler's own exceptions arrive here. Ledger failures never do:
         # a failed result write is swallowed by ``_persist_result`` and closes
         # the attempt as INTERRUPTED, and a failed ``mark_in_progress`` in
-        # ``execute`` propagates before any handler runs.
+        # ``execute`` propagates before any handler runs. A ``TimeoutExpired``
+        # is retryable only while it can mean "the probe was slow": the reset
+        # and install handlers convert their own deadline into a RuntimeError
+        # (``ResetOutcomeUnknown``, ``InstallOutcomeUnknownError``) before it
+        # gets here, because a killed reset or installer may still be running.
         return isinstance(error, (OSError, TimeoutError, subprocess.TimeoutExpired))
 
 
