@@ -282,17 +282,7 @@ def workload_objects_verdict(
 
 
 MANAGED_LABEL = "gpu-fault.io/managed"
-JOB_LABEL = "gpu-fault.io/job-id"
 ATTEMPT_LABEL = "gpu-fault.io/attempt-id"
-RANK_ANNOTATION = "gpu-fault.io/rank"
-EXPECTED_RANKS_ANNOTATION = "gpu-fault.io/expected-critical-ranks"
-RUNTIME_PROFILE_ANNOTATION = "gpu-fault.io/runtime-profile-version"
-RESTART_BUDGET_ANNOTATION = "gpu-fault.io/restart-budget"
-JOBSET_NAME_LABEL = "jobset.sigs.k8s.io/jobset-name"
-PYTORCH_JOB_LABELS = (
-    "training.kubeflow.org/job-name",
-    "pytorch-job-name",
-)
 
 
 class MissingAttemptTracker:
@@ -555,83 +545,26 @@ def resolve_missing_attempt_tombstone(
     )
 
 
-class ObservationOnlyTracker:
-    def __init__(
-        self,
-        enabled: bool,
-        runtime_profile: str | None,
-        retention_cycles: int,
-    ) -> None:
-        if retention_cycles < 1:
-            raise ValueError("observation retention cycles must be positive")
-        self.retention_cycles = retention_cycles
-        self.enabled = enabled
-        self.runtime_profile = runtime_profile
-        if enabled and not runtime_profile:
-            raise ValueError("observation-only mode requires a runtime profile")
-        self.attempts: set[str] = set()
-        self.missed: dict[str, int] = {}
-
-    def update(
-        self,
-        controller,
-        observed: set[str],
-        active: set[str],
-    ) -> None:
-        self.attempts.update(observed)
-        for attempt_id in list(self.attempts):
-            if attempt_id in active:
-                self.missed.pop(attempt_id, None)
-                continue
-            count = self.missed.get(attempt_id, 0) + 1
-            if count < self.retention_cycles:
-                self.missed[attempt_id] = count
-                continue
-            self.missed.pop(attempt_id, None)
-            self.attempts.discard(attempt_id)
-            _clear_attempt(controller, attempt_id)
-
-    def contains(self, attempt_id: str) -> bool:
-        return attempt_id in self.attempts
-
-    def group(self, controller, pods, serializer):
-        grouped, observed = group_completion_pods(
-            pods,
-            serializer=serializer,
-            observe_unmanaged=self.enabled,
-            runtime_profile=self.runtime_profile,
-        )
-        self.update(controller, observed, set(grouped))
-        return grouped
-
-
 def group_completion_pods(
-    pods,
-    *,
-    serializer,
-    observe_unmanaged: bool,
-    runtime_profile: str | None,
-):
-    grouped = {}
-    observation_only = set()
+    pods: Any, *, serializer: Any
+) -> dict[str, list[dict[str, Any]]]:
+    """Managed Pods by attempt id.
+
+    The list is already restricted to ``gpu-fault.io/managed=true`` (see
+    ``completion_list_arguments``); a Pod without the label that arrives
+    anyway -- a permissive fake, a stale watch cache -- is dropped here rather
+    than turned into an attempt. A managed Pod without an attempt id is a
+    submission defect and is logged, not guessed at.
+    """
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for item in pods:
         pod = serializer(item)
         metadata = pod.get("metadata") or {}
         labels = metadata.get("labels") or {}
-        managed = labels.get(MANAGED_LABEL, "").lower() == "true"
+        if labels.get(MANAGED_LABEL, "").lower() != "true":
+            continue
         attempt_id = labels.get(ATTEMPT_LABEL)
-        if not managed:
-            if not observe_unmanaged:
-                continue
-            attempt_id = observation_only_attempt_id(pod)
-            if attempt_id is None:
-                continue
-            pod = observation_only_pod(
-                pod,
-                attempt_id,
-                runtime_profile,
-            )
-            observation_only.add(attempt_id)
         if not attempt_id:
             LOGGER.warning(
                 "managed Pod %s has no attempt ID",
@@ -639,86 +572,24 @@ def group_completion_pods(
             )
             continue
         grouped.setdefault(attempt_id, []).append(pod)
-    for attempt_id in observation_only:
-        attempt_pods = grouped.get(attempt_id, [])
-        for rank, pod in enumerate(
-            sorted(
-                attempt_pods,
-                key=lambda value: ((value.get("metadata") or {}).get("name") or ""),
-            )
-        ):
-            annotations = pod["metadata"].setdefault("annotations", {})
-            annotations.setdefault(
-                EXPECTED_RANKS_ANNOTATION,
-                str(len(attempt_pods)),
-            )
-            annotations.setdefault(RANK_ANNOTATION, str(rank))
-    return grouped, observation_only
+    return grouped
 
 
-def observation_only_attempt_id(pod) -> str | None:
-    metadata = pod.get("metadata") or {}
-    labels = metadata.get("labels") or {}
-    jobset_name = labels.get(JOBSET_NAME_LABEL)
-    job = jobset_name or next(
-        (labels.get(name) for name in PYTORCH_JOB_LABELS if labels.get(name)),
-        None,
-    )
-    if not job:
-        return None
-    namespace = metadata.get("namespace") or "default"
-    owners = metadata.get("ownerReferences") or []
-    owner = next(
-        (item for item in owners if item.get("controller")),
-        owners[0] if owners else {},
-    )
-    identity = (
-        f"jobset-{jobset_name}"
-        if jobset_name
-        else owner.get("uid") or owner.get("name") or job
-    )
-    return f"observed/{namespace}/{job}/{identity}"
+def completion_list_arguments(namespace: str | None) -> dict[str, str]:
+    """The list/watch arguments: always the managed selector, plus the namespace.
 
+    Every submitted training job carries ``gpu-fault.io/managed=true``; the
+    selector is the definition of a job, so it is never dropped.
+    """
 
-def observation_only_pod(
-    pod,
-    attempt_id: str,
-    runtime_profile: str | None,
-):
-    metadata = pod.setdefault("metadata", {})
-    labels = metadata.setdefault("labels", {})
-    annotations = metadata.setdefault("annotations", {})
-    namespace = metadata.get("namespace") or "default"
-    job = labels.get(JOBSET_NAME_LABEL) or next(
-        (labels.get(name) for name in PYTORCH_JOB_LABELS if labels.get(name)),
-        "unknown",
-    )
-    labels[MANAGED_LABEL] = "true"
-    labels[ATTEMPT_LABEL] = attempt_id
-    labels[JOB_LABEL] = f"{namespace}/{job}"
-    annotations[RUNTIME_PROFILE_ANNOTATION] = str(runtime_profile)
-    annotations[RESTART_BUDGET_ANNOTATION] = "0"
-    return pod
-
-
-def completion_list_arguments(
-    namespace: str | None,
-    observe_unmanaged: bool,
-) -> dict:
-    arguments = {}
-    if not observe_unmanaged:
-        arguments["label_selector"] = f"{MANAGED_LABEL}=true"
+    arguments = {"label_selector": f"{MANAGED_LABEL}=true"}
     if namespace:
         arguments["namespace"] = namespace
     return arguments
 
 
-def list_completion_pods(
-    core_api,
-    namespace: str | None,
-    observe_unmanaged: bool,
-):
-    selector = None if observe_unmanaged else f"{MANAGED_LABEL}=true"
+def list_completion_pods(core_api, namespace: str | None):
+    selector = f"{MANAGED_LABEL}=true"
     if namespace:
         response = core_api.list_namespaced_pod(namespace, label_selector=selector)
     else:

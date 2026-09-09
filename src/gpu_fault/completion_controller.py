@@ -34,9 +34,9 @@ from gpu_fault.completion_observation import (
     RECOVERED_VERDICT_REASON,
     TERMINATION_INCIDENT_ANNOTATION,
     MissingAttemptTracker,
-    ObservationOnlyTracker,
     TerminalObservationCache,
     completion_list_arguments,
+    group_completion_pods,
     is_unknown_profile_rejection,
     list_completion_pods,
     observe_containers,
@@ -642,9 +642,6 @@ class KubernetesCompletionController:
         emergency_fallback_seconds: float | None = None,
         reconcile_debounce_seconds: float = 0.5,
         publish_observations: bool = False,
-        observe_unmanaged_workloads: bool = False,
-        observation_runtime_profile_version: str | None = None,
-        observation_only_retention_cycles: int = 3,
         gpu_uuid_resolver: (Callable[[dict[str, Any], str], list[str]] | None) = None,
         terminal_retention_seconds: int = 3600,
         watcher_max_attempts: int = 10000,
@@ -703,11 +700,6 @@ class KubernetesCompletionController:
         # ordered ingress lane this shares with workflow dispatch carries one
         # write every two minutes instead of one per pass.
         self.coverage_heartbeat_interval_seconds = coverage_heartbeat_interval_seconds
-        self.observation_only = ObservationOnlyTracker(
-            observe_unmanaged_workloads,
-            observation_runtime_profile_version,
-            observation_only_retention_cycles,
-        )
         self.gpu_uuid_resolver = gpu_uuid_resolver
         try:
             self.watcher = CompletionWatcher(
@@ -902,11 +894,7 @@ class KubernetesCompletionController:
         self.last_progress_at = self.now()
 
     def run_once(self) -> list[dict[str, Any]]:
-        pods, resource_version = list_completion_pods(
-            self.core_api,
-            self.namespace,
-            self.observation_only.enabled,
-        )
+        pods, resource_version = list_completion_pods(self.core_api, self.namespace)
         self._last_resource_version = resource_version
         self.note_progress()
         return self._reconcile(pods)
@@ -936,7 +924,7 @@ class KubernetesCompletionController:
         attempt_filter: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         replay_completion_outbox(self.sink, LOGGER)
-        grouped = self.observation_only.group(self, pods, self.serializer)
+        grouped = group_completion_pods(pods, serializer=self.serializer)
 
         if attempt_filter is None:
             active_pod_keys = {
@@ -1026,14 +1014,6 @@ class KubernetesCompletionController:
             return
         if self.publish_observations:
             publish_attempt_observation(self, observation, attempt_id)
-        if self.observation_only.contains(attempt_id):
-            results.append(
-                {
-                    "attempt_id": attempt_id,
-                    "observation_only": True,
-                }
-            )
-            return
         synthesized = attempt_id in self._synthesized_verdicts
         if result.failure_detected is not None and not synthesized:
             failure_event = result.failure_detected
@@ -1339,11 +1319,7 @@ class KubernetesCompletionController:
         to observe what the cycle's ``finally`` does.
         """
 
-        pods, resource_version = list_completion_pods(
-            self.core_api,
-            self.namespace,
-            self.observation_only.enabled,
-        )
+        pods, resource_version = list_completion_pods(self.core_api, self.namespace)
         self._last_resource_version = resource_version
         self.note_progress()
         serialized = [self.serializer(item) for item in pods]
@@ -1421,10 +1397,7 @@ class KubernetesCompletionController:
             try:
                 for event in watcher.stream(
                     self._list_method(),
-                    **completion_list_arguments(
-                        self.namespace,
-                        self.observation_only.enabled,
-                    ),
+                    **completion_list_arguments(self.namespace),
                     resource_version=resource_version or None,
                     timeout_seconds=self.watch_timeout_seconds,
                     allow_watch_bookmarks=True,
@@ -2108,18 +2081,6 @@ def controller_from_environment() -> KubernetesCompletionController:
             )
         ),
         publish_observations=env_bool("GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS", True),
-        observe_unmanaged_workloads=env_bool(
-            "GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED", False
-        ),
-        observation_runtime_profile_version=(
-            os.getenv("GPU_FAULT_COMPLETION_OBSERVATION_RUNTIME_PROFILE") or None
-        ),
-        observation_only_retention_cycles=int(
-            os.getenv(
-                "GPU_FAULT_COMPLETION_OBSERVATION_RETENTION_CYCLES",
-                "3",
-            )
-        ),
         gpu_uuid_resolver=resolver,
     )
 
