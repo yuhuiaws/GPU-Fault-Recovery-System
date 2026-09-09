@@ -8,6 +8,7 @@
   "pass_case_bindings": {
     "bound": [
       "GF-REGIONAL-BOOT-023",
+      "GF-REGIONAL-CMD-017",
       "GF-REGIONAL-COLLECT-001",
       "GF-REGIONAL-COLLECT-002",
       "GF-REGIONAL-COLLECT-003",
