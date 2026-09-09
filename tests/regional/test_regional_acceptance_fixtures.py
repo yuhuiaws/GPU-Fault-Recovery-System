@@ -46,6 +46,11 @@ from scripts.e2e.regional.run_ha008_processor_exit_acceptance import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# The drivers import gpu_fault; run them against THIS checkout's src, not
+# whatever editable install the interpreter would otherwise resolve.
+_CHECKOUT_ENV = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+
 PROMOTED_MANUAL_DRIVERS = {
     "GF-REGIONAL-NET-002": "run_net002_command_recovery.py",
     "GF-REGIONAL-NET-003": "run_net003_result_retry.py",
@@ -348,6 +353,7 @@ def test_net004_dependency_audit_is_environment_driven() -> None:
     help_result = subprocess.run(
         [sys.executable, str(path), "--help"],
         cwd=ROOT,
+        env=_CHECKOUT_ENV,
         text=True,
         capture_output=True,
         check=True,
@@ -385,6 +391,7 @@ def test_promoted_manual_live_driver_has_safety_entrypoint(
     help_result = subprocess.run(
         [sys.executable, str(path), "--help"],
         cwd=ROOT,
+        env=_CHECKOUT_ENV,
         text=True,
         capture_output=True,
         check=True,
