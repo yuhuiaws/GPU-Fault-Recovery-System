@@ -747,6 +747,7 @@ def bootstrap_recorder() -> tuple[SimpleNamespace, list[str]]:
         _quiesce_gpu_executor=lambda _target: calls.append("quiesce"),
         _verify_gpu_control_plane_endpoint=lambda _target: calls.append("endpoint"),
         _apply_gpu_dcgm_exporter=lambda _target: calls.append("dcgm"),
+        _apply_gpu_adot_collector=lambda _target: calls.append("adot"),
         _apply_gpu_deployments=lambda _target, _wheel: calls.append("executor"),
         _roll_node_runtime=lambda _target, **_kwargs: calls.append("node-runtime"),
     )
@@ -774,6 +775,7 @@ def test_bootstrap_gates_each_gpu_step_on_its_dependency() -> None:
         "quiesce",
         "endpoint",
         "dcgm",
+        "adot",
         "executor",
         "node-runtime",
     ]
@@ -1117,6 +1119,7 @@ def rollout_gate_recorder(calls: list[str]) -> dict:
         "_ensure_connection_secret": lambda _target: None,
         "_verify_gpu_control_plane_endpoint": lambda _target: calls.append("endpoint"),
         "_apply_gpu_dcgm_exporter": lambda _target, **_kwargs: calls.append("dcgm"),
+        "_apply_gpu_adot_collector": lambda _target, **_kwargs: None,
         "_apply_gpu_deployments": lambda *_args, **_kwargs: calls.append("deployments"),
     }
 

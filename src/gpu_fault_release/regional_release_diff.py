@@ -93,6 +93,22 @@ def control_plane_role_targets(diff: ReleaseDiff) -> tuple[str, ...]:
     return ("spool", "worker", "ingress")
 
 
+#: Plan nodes with a per-GPU-cluster half, in rollout order. OBSERVABILITY is
+#: global in the compensation plan (the control-plane collector and the AMP
+#: rules) but also applies the data-plane collector to every cluster target, so
+#: an observability-only release still visits the clusters.
+GPU_CLUSTER_COMPONENTS = (
+    ReleaseComponent.ENDPOINT,
+    ReleaseComponent.DCGM,
+    ReleaseComponent.OBSERVABILITY,
+    ReleaseComponent.EXECUTOR,
+    ReleaseComponent.WATCHER,
+    ReleaseComponent.COLLECTOR,
+    ReleaseComponent.RECONCILER,
+    ReleaseComponent.AGENT,
+)
+
+
 def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     changed = diff.changed
     selected = {ReleaseComponent.VERIFY}
@@ -109,6 +125,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     observability = bool(
         changed
         & {
+            "observability_manifests",
             "observability_rules",
             "observability_adot",
             "adot_image",

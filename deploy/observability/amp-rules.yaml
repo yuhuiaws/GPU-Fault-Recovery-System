@@ -118,6 +118,54 @@ groups:
             with GpuFaultControlPlaneMetricsMissing: both absent means the
             collector or the write path is down, this one alone means the
             self-telemetry reader or its keep filter changed.
+      # The data-plane scrape path itself. One collector per GPU cluster
+      # (deploy/dataplane/adot-dataplane.yaml, job `gpu-fault-dataplane`) is
+      # what puts every gpu_fault_completion_* / gpu_fault_node_installer_* /
+      # gpu_fault_cluster_executor_* series into AMP; with it gone the watcher
+      # rules below evaluate over nothing and read as healthy. Two halves:
+      # `absent(... == 1)` is the fleet with no data-plane collector writing at
+      # all (same shape as GpuFaultControlPlaneMetricsMissing -- a collector
+      # that never came up leaves no `up` series to group on), and the
+      # `max by (gpu_cluster) == 0` half is a live collector none of whose
+      # targets in one cluster answers, which is the only half that can name
+      # the cluster. `for: 15m` matches the watcher rules it guards: a release
+      # re-applies the collector and a rollout restarts it well inside that.
+      # Warning, not critical: nothing is lost while the watcher stays up, the
+      # loss is that its alerts are blind. Known gap: with several GPU clusters,
+      # one dead collector beside a live one produces no series and is caught
+      # by neither half; until AMP knows the registered cluster set, compare
+      # the `gpu_cluster` values present with the site's cluster targets.
+      - alert: GpuFaultDataplaneCollectorMissing
+        expr: >-
+          absent(up{job="gpu-fault-dataplane"} == 1)
+          or max by (control_plane_cluster, region, gpu_cluster)
+          (up{job="gpu-fault-dataplane"}) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: The data-plane metrics collector is not scraping a GPU cluster
+          runbook_url: docs/管理员日常运维.md#gpufaultdataplanecollectormissing
+          description: >-
+            No `up` series from the per-GPU-cluster ADOT collector (job
+            gpu-fault-dataplane) reached AMP, or every target it scrapes in
+            {{ $labels.gpu_cluster }} is down. While this fires the Completion
+            Watcher alerts (GpuFaultCompletionActiveStateUnavailable,
+            GpuFaultCompletionOutboxAppendFailures) are blind for that cluster
+            and a quiet dashboard is not evidence. First check whether the
+            release skipped the collector: `gpu-fault-admin plan` shows
+            `dataplane_observability` per cluster, and a cluster without
+            `adot_irsa_role_arn` (site.yaml `adotIrsaRoleArn`, an IAM role with
+            aps:RemoteWrite on the AMP workspace trusted by the cluster's OIDC
+            issuer) is skipped by design. Add the role and re-run
+            `gpu-fault-admin deploy --state-dir STATE_DIR`: the role moves the
+            observability digest, so the release applies the collector and
+            touches nothing else. If the role is present, read
+            deployment/gpu-fault-adot-dataplane in gpu-fault-system on that
+            cluster (IRSA token, sigv4 errors, the /health probe) and the
+            scrape targets' `metrics` ports; the executor's port reads `up ==
+            0` until its metrics server ships, which is why the rule requires
+            every target of a cluster to be down before it fires.
       # Scrape dependency: the Completion Watcher exposes these series on port
       # 9109 inside the fault-domain cluster. They reach AMP through the
       # per-GPU-cluster collector, deploy/dataplane/adot-dataplane.yaml (job
@@ -126,11 +174,12 @@ groups:
       # .yaml runs in the control-plane cluster and never sees these Pods. That
       # collector stamps control_plane_cluster and region with the same values
       # the control-plane collector uses -- the `by (control_plane_cluster,
-      # region)` clauses below and Alertmanager's grouping depend on it -- plus
-      # gpu_cluster, so a firing rule can be traced to the cluster whose watcher
-      # it is. A cluster whose release skipped the collector (no IRSA role yet)
-      # contributes no series and these rules stay silent for it; the release
-      # prints that skip.
+      # region, gpu_cluster)` clauses below and Alertmanager's grouping depend
+      # on it -- plus gpu_cluster, kept in the aggregation so a firing rule
+      # names the cluster whose watcher it is. A cluster whose release skipped
+      # the collector (no IRSA role yet) contributes no series and these rules
+      # stay silent for it; the release prints that skip, and
+      # GpuFaultDataplaneCollectorMissing above is the alert for the path.
       # The Completion Watcher persists two ConfigMaps and only one of them is
       # load-bearing at runtime: the write-ahead log carries critical events,
       # while `gpu-fault-completion-watcher-outbox-active` carries the routine
@@ -144,7 +193,7 @@ groups:
       # nothing is lost while the watcher stays up.
       - alert: GpuFaultCompletionActiveStateUnavailable
         expr: >-
-          max by (control_plane_cluster, region)
+          max by (control_plane_cluster, region, gpu_cluster)
           (gpu_fault_completion_active_state_unavailable) == 1
         for: 15m
         labels:
@@ -155,7 +204,8 @@ groups:
           description: >-
             The routine attempt-state ConfigMap
             (gpu-fault-completion-watcher-outbox-active), or the Role that names
-            it, is refusing with 404/403, so attempt state is not persisted.
+            it, is refusing with 404/403 on {{ $labels.gpu_cluster }}, so
+            attempt state is not persisted.
             Delivery and the write-ahead log are unaffected, but a watcher
             restart in this window re-derives its attempts from live Pods only:
             a fault on an attempt whose Pods are already gone then resolves the
@@ -184,7 +234,7 @@ groups:
       # warning because the loss needs a restart to become real.
       - alert: GpuFaultCompletionOutboxAppendFailures
         expr: >-
-          sum by (control_plane_cluster, region)
+          sum by (control_plane_cluster, region, gpu_cluster)
           (increase(gpu_fault_completion_outbox_append_failures_total[10m])) > 0
         for: 15m
         labels:
@@ -193,8 +243,9 @@ groups:
           summary: Completion Watcher write-ahead appends are failing
           runbook_url: docs/管理员日常运维.md#gpufaultcompletionoutboxappendfailures
           description: >-
-            {{ $value }} critical completion event(s) in the last 10 minutes got
-            no write-ahead ConfigMap copy, so a restart of that watcher can lose
+            {{ $value }} critical completion event(s) on {{ $labels.gpu_cluster }}
+            in the last 10 minutes got no write-ahead ConfigMap copy, so a
+            restart of that watcher can lose
             an event it never delivered or replay one it already did. Check the
             outbox ConfigMap's size against the object ceiling and the watcher
             Role's verbs on it before restarting anything: a restart is the one

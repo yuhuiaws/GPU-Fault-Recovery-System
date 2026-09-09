@@ -36,10 +36,12 @@ from gpu_fault_release.regional_endpoint_rollback import (
     restore_endpoint_snapshot,
 )
 from gpu_fault_release.regional_gpu_bootstrap import (
+    apply_gpu_adot_collector,
     apply_gpu_dcgm_exporter,
     cancel_active_installer_jobs,
     ensure_connection_secret,
     ensure_gpu_namespace,
+    preflight_gpu_adot_collector,
     preflight_gpu_dcgm_exporter,
     quiesce_gpu_executor,
     settle_installer_jobs,
@@ -150,6 +152,7 @@ from gpu_fault_release.regional_release_registry import (
     write_registry,
 )
 from gpu_fault_release.regional_release_rendering import (
+    DATAPLANE_ADOT_DEPLOYMENT,
     DEFAULT_DCGM_EXPORTER_IMAGE,
     DEFAULT_RUNTIME_IMAGE,
     build_cpu_apply_environment,
@@ -493,6 +496,8 @@ class RegionalRelease:
     _ensure_contexts = ensure_region_contexts
     _apply_gpu_dcgm_exporter = apply_gpu_dcgm_exporter
     _preflight_gpu_dcgm_exporter = preflight_gpu_dcgm_exporter
+    _apply_gpu_adot_collector = apply_gpu_adot_collector
+    _preflight_gpu_adot_collector = preflight_gpu_adot_collector
     _cancel_active_installer_jobs = cancel_active_installer_jobs
     _apply_gpu_deployments = apply_gpu_deployments
     _preflight_gpu_deployments = preflight_gpu_deployments
@@ -654,9 +659,30 @@ class RegionalRelease:
                 + self._sha256(ROOT / "deploy/observability/amp-alertmanager.yaml")
             ).encode()
         ).hexdigest()
-        self.observability_adot_digest = self._sha256(
-            ROOT / "deploy/observability/adot-control-plane.yaml"
-        )
+        # The data-plane collector's inputs live here and nowhere else: the
+        # IRSA role is kept out of the registry digest on purpose, and a
+        # brownfield site that deploys first and creates the role or the AMP
+        # workspace later must not read as NOOP -- that release is the one that
+        # applies the collector.
+        self.observability_adot_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "control_plane_manifest": self._sha256(
+                        ROOT / "deploy/observability/adot-control-plane.yaml"
+                    ),
+                    "dataplane_manifest": self._sha256(
+                        ROOT / "deploy/dataplane/adot-dataplane.yaml"
+                    ),
+                    "amp_workspace_id": config.health.amp_workspace_id,
+                    "adot_irsa_role_arns": {
+                        item.cluster_id: item.adot_irsa_role_arn
+                        for item in config.clusters
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         self.rendered_manifest_digest = rendered_release_manifest_sha256(self)
 
     def _release_image(
@@ -1117,7 +1143,10 @@ class RegionalRelease:
                 save("bootstrap-cleanup-progress")
             if "gpu-scaled-down" not in completed:
                 for target in self.config.clusters:
-                    for deployment in inventory.DEPLOYMENTS:
+                    for deployment in (
+                        *inventory.DEPLOYMENTS,
+                        DATAPLANE_ADOT_DEPLOYMENT,
+                    ):
                         self._scale_if_present(
                             self._gpu(target),
                             deployment,
@@ -1197,6 +1226,7 @@ class RegionalRelease:
         self._quiesce_gpu_executor(target)
         self._verify_gpu_control_plane_endpoint(target)
         self._apply_gpu_dcgm_exporter(target)
+        self._apply_gpu_adot_collector(target)
         self._upload_config_map(
             self._gpu(target),
             self.executor_wheel_cm,
@@ -1242,6 +1272,7 @@ class RegionalRelease:
         for deployment in (
             *inventory.DEPLOYMENTS,
             inventory.GPU_RECONCILER_DEPLOYMENT,
+            DATAPLANE_ADOT_DEPLOYMENT,
         ):
             self._scale_if_present(self._gpu(target), deployment, 0)
         self._update_registry(target, remove=True)

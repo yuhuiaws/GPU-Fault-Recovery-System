@@ -28,6 +28,9 @@ CONTROL_PLANE_SELECTOR = (
 )
 CLUSTER_SELECTOR = 'cluster_id=~"$cluster_id"'
 BY_CONTROL_PLANE = "by (control_plane_cluster, region)"
+#: Series the per-GPU-cluster collector (adot-dataplane.yaml) delivers carry
+#: the cluster they were scraped in; the rules on them group on it too.
+BY_GPU_CLUSTER = "by (control_plane_cluster, region, gpu_cluster)"
 
 
 @dataclass(frozen=True)
@@ -427,6 +430,26 @@ TELEMETRY_PIPELINE = Dashboard(
                         "not reaching AMP, so the two panels above are blind."
                     ),
                 ),
+                Panel(
+                    "Data-plane scrape up by GPU cluster",
+                    (
+                        Target(
+                            f"max {BY_GPU_CLUSTER} ("
+                            + series("up", 'job="gpu-fault-dataplane"')
+                            + ")",
+                            "{{gpu_cluster}}",
+                        ),
+                    ),
+                    kind="stat",
+                    description=(
+                        "1 per GPU cluster whose ADOT collector "
+                        "(adot-dataplane.yaml) scrapes at least one data-plane "
+                        "target. 0 or a missing cluster: the Completion Watcher "
+                        "row below is blind for it. A cluster whose release "
+                        "skipped the collector (no adot_irsa_role_arn) never "
+                        "appears here."
+                    ),
+                ),
             ),
         ),
         Row(
@@ -436,10 +459,10 @@ TELEMETRY_PIPELINE = Dashboard(
                     "Completion attempt state unavailable",
                     (
                         Target(
-                            f"max {BY_CONTROL_PLANE} ("
+                            f"max {BY_GPU_CLUSTER} ("
                             + series("gpu_fault_completion_active_state_unavailable")
                             + ")",
-                            "{{control_plane_cluster}} {{region}}",
+                            "{{gpu_cluster}}",
                         ),
                     ),
                     kind="stat",
@@ -453,11 +476,12 @@ TELEMETRY_PIPELINE = Dashboard(
                     "Completion write-ahead append failures (10m increase)",
                     (
                         Target(
-                            increase_by_control_plane(
-                                "gpu_fault_completion_outbox_append_failures_total",
-                                "10m",
-                            ),
-                            "{{control_plane_cluster}} {{region}}",
+                            f"sum {BY_GPU_CLUSTER} (increase("
+                            + series(
+                                "gpu_fault_completion_outbox_append_failures_total"
+                            )
+                            + "[10m]))",
+                            "{{gpu_cluster}}",
                         ),
                     ),
                     description=(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_gpu_bootstrap import rollback_gpu_adot_collectors
 from gpu_fault_release.regional_release_automatic_rollback import (
     recover_failed_upgrade,
 )
@@ -22,6 +23,7 @@ from gpu_fault_release.regional_release_config import (
     canonical_sha256,
 )
 from gpu_fault_release.regional_release_diff import (
+    GPU_CLUSTER_COMPONENTS,
     ReleaseChangeKind,
     ReleaseComponent,
     ReleaseDiff,
@@ -407,15 +409,7 @@ def upgrade_gpu_clusters(
     completed_clusters: set[str],
     registry_staged: bool,
 ) -> None:
-    if not plan.has(
-        ReleaseComponent.ENDPOINT,
-        ReleaseComponent.DCGM,
-        ReleaseComponent.EXECUTOR,
-        ReleaseComponent.WATCHER,
-        ReleaseComponent.COLLECTOR,
-        ReleaseComponent.RECONCILER,
-        ReleaseComponent.AGENT,
-    ):
+    if not plan.has(*GPU_CLUSTER_COMPONENTS):
         return
     pending_targets = [
         target
@@ -608,6 +602,7 @@ def bootstrap_gpu_target(self: Any, target: ClusterTarget) -> None:
     self._quiesce_gpu_executor(target)
     self._verify_gpu_control_plane_endpoint(target)
     self._apply_gpu_dcgm_exporter(target)
+    self._apply_gpu_adot_collector(target)
     self._apply_gpu_deployments(target, self.executor_wheel_cm)
     self._roll_node_runtime(
         target,
@@ -1747,7 +1742,13 @@ def _restore_regional_singletons(
             "observability_restore",
             "rollback-observability-restoring",
             "rollback-observability-restored",
-            lambda: self._restore_observability_snapshot(previous.get("observability")),
+            # The snapshot covers the control-plane cluster only; the GPU
+            # clusters' collectors go back to the previous image the way the
+            # DCGM rollback re-applies the previous exporter image.
+            lambda: (
+                self._restore_observability_snapshot(previous.get("observability")),
+                rollback_gpu_adot_collectors(self, previous),
+            ),
         )
     if compensation.restores_endpoint:
         run_phase(

@@ -985,3 +985,50 @@ def test_an_explicit_schema_change_variable_wins_over_the_flag(monkeypatch) -> N
     )
 
     assert admin_cli.schema_change_environment(arguments) == {}
+
+
+ADOT_ROLE_ARN = "arn:aws:iam::123456789012:role/gpu-fault-adot-writer"
+
+
+def test_site_cluster_adot_irsa_role_reaches_the_release_config(tmp_path: Path) -> None:
+    """``adotIrsaRoleArn`` is the product path to the data-plane collector.
+
+    The regional release applies the per-cluster ADOT collector only for a
+    target that carries ``adot_irsa_role_arn`` (F7); a site.yaml field that the
+    generated release config dropped would leave every site on the skip path
+    with no way through the sanctioned CLI.
+    """
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["spec"]["clusters"][0]["adotIrsaRoleArn"] = ADOT_ROLE_ARN
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    rendered = load_site(path)
+
+    cluster = rendered.release_config["clusters"][0]
+    assert cluster["adot_irsa_role_arn"] == ADOT_ROLE_ARN
+    with materialized_release_config(rendered) as materialized:
+        config = RELEASE_CONFIG.ReleaseConfig.load(materialized)
+    assert config.clusters[0].adot_irsa_role_arn == ADOT_ROLE_ARN
+
+
+def test_site_cluster_without_an_adot_role_stays_on_the_skip_path(
+    tmp_path: Path,
+) -> None:
+    """Optional: a brownfield site deploys everything else and adds the role later."""
+    rendered = load_site(site_file(tmp_path))
+
+    cluster = rendered.release_config["clusters"][0]
+    assert "adot_irsa_role_arn" not in cluster
+    with materialized_release_config(rendered) as materialized:
+        config = RELEASE_CONFIG.ReleaseConfig.load(materialized)
+    assert config.clusters[0].adot_irsa_role_arn is None
+
+
+def test_site_cluster_adot_role_must_be_text_when_present(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["spec"]["clusters"][0]["adotIrsaRoleArn"] = ["not", "text"]
+
+    with pytest.raises(SiteConfigError, match=r"clusters\[0\]\.adotIrsaRoleArn"):
+        RegionalSite.from_value(document)

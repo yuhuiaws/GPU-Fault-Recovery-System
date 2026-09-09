@@ -534,6 +534,11 @@ class GpuClusterSiteConfig:
     token_file: str
     ca_file: str
     fleet_master_file: str
+    #: Optional IRSA role for this cluster's data-plane ADOT collector
+    #: (``aps:RemoteWrite`` on the site's AMP workspace, trusted by the
+    #: cluster's OIDC issuer for ``gpu-fault-system/gpu-fault-adot-dataplane``).
+    #: Without it the release skips the collector for this cluster and says so.
+    adot_irsa_role_arn: str | None = None
 
     @classmethod
     def from_value(cls, value: object, index: int) -> GpuClusterSiteConfig:
@@ -548,6 +553,7 @@ class GpuClusterSiteConfig:
                 "hyperpodClusterName",
                 "eksClusterArn",
                 "executorIrsaRoleArn",
+                "adotIrsaRoleArn",
                 "allowedNamespaces",
                 "agentEndpointAllowedCidrs",
                 "controlPlaneUrl",
@@ -580,6 +586,10 @@ class GpuClusterSiteConfig:
             executor_irsa_role_arn=_required_text(
                 data.get("executorIrsaRoleArn"),
                 f"{path}.executorIrsaRoleArn",
+            ),
+            adot_irsa_role_arn=_optional_text(
+                data.get("adotIrsaRoleArn"),
+                f"{path}.adotIrsaRoleArn",
             ),
             allowed_namespaces=_text_list(
                 data.get("allowedNamespaces"),
@@ -810,26 +820,27 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
     ).resolve()
     clusters = []
     for cluster in site.spec.clusters:
-        clusters.append(
-            {
-                "cluster_id": cluster.cluster_id,
-                "context": cluster.context,
-                "region": cluster.region or site.spec.aws_region,
-                "hyperpod_cluster_name": cluster.hyperpod_cluster_name,
-                "eks_cluster_arn": cluster.eks_cluster_arn,
-                "executor_irsa_role_arn": cluster.executor_irsa_role_arn,
-                "allowed_namespaces": list(cluster.allowed_namespaces),
-                "agent_endpoint_allowed_cidrs": list(
-                    cluster.agent_endpoint_allowed_cidrs
-                ),
-                "control_plane_url": cluster.control_plane_url,
-                "token_file": str(_resolve(root, cluster.token_file).resolve()),
-                "ca_file": str(_resolve(root, cluster.ca_file).resolve()),
-                "fleet_master_file": str(
-                    _resolve(root, cluster.fleet_master_file).resolve()
-                ),
-            }
-        )
+        entry: dict[str, Any] = {
+            "cluster_id": cluster.cluster_id,
+            "context": cluster.context,
+            "region": cluster.region or site.spec.aws_region,
+            "hyperpod_cluster_name": cluster.hyperpod_cluster_name,
+            "eks_cluster_arn": cluster.eks_cluster_arn,
+            "executor_irsa_role_arn": cluster.executor_irsa_role_arn,
+            "allowed_namespaces": list(cluster.allowed_namespaces),
+            "agent_endpoint_allowed_cidrs": list(cluster.agent_endpoint_allowed_cidrs),
+            "control_plane_url": cluster.control_plane_url,
+            "token_file": str(_resolve(root, cluster.token_file).resolve()),
+            "ca_file": str(_resolve(root, cluster.ca_file).resolve()),
+            "fleet_master_file": str(
+                _resolve(root, cluster.fleet_master_file).resolve()
+            ),
+        }
+        # Absent means "not yet": the release prints the collector skip for
+        # this cluster and applies everything else.
+        if cluster.adot_irsa_role_arn:
+            entry["adot_irsa_role_arn"] = cluster.adot_irsa_role_arn
+        clusters.append(entry)
     health = site.spec.health
     admin_state_dir = source.parent
     for candidate in source.parents:

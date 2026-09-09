@@ -25,6 +25,8 @@ def preflight_upgrade_mutations(
     for target in release.config.clusters:
         if plan.has(ReleaseComponent.DCGM):
             release._preflight_gpu_dcgm_exporter(target)
+        if plan.has(ReleaseComponent.OBSERVABILITY):
+            release._preflight_gpu_adot_collector(target)
         if deployment_names:
             release._preflight_gpu_deployments(
                 target,

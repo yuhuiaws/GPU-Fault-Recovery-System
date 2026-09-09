@@ -51,6 +51,7 @@
       "hyperpod_cluster_name": "REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME",
       "eks_cluster_arn": "REPLACE_WITH_GPU_EKS_ARN",
       "executor_irsa_role_arn": "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN",
+      "adot_irsa_role_arn": "REPLACE_WITH_ADOT_IRSA_ROLE_ARN",
       "allowed_namespaces": [
         "gpu-fault-system",
         "training"

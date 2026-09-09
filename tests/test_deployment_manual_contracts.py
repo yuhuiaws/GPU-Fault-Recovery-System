@@ -77,6 +77,13 @@ def test_regional_region_is_operator_selected_and_fail_closed() -> None:
         "version": "hyperpod-v1",
         "registration_cluster_id": "gpu-prod-a",
     }
+    # The data-plane collector's per-cluster role (F7/F10): a placeholder that
+    # survives into a real release fails the render closed, and dropping the
+    # key is the documented way to defer the collector.
+    assert (
+        release_template["clusters"][0]["adot_irsa_role_arn"]
+        == "REPLACE_WITH_ADOT_IRSA_ROLE_ARN"
+    )
 
 
 def test_manual_forbids_multiple_global_load_balancer_controllers() -> None:

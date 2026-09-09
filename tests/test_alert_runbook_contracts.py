@@ -75,11 +75,16 @@ def test_the_completion_watcher_alerts_keep_the_grouping_labels() -> None:
     """A label-less aggregation merges every control plane into one page.
 
     Alertmanager groups on control_plane_cluster/region, so ``max(...)`` over
-    the whole fleet would name only the first control plane that trips.
+    the whole fleet would name only the first control plane that trips. The
+    series arrive through one collector per GPU cluster, each stamping
+    ``gpu_cluster``; keeping it in the aggregation is what lets a firing rule
+    name the cluster whose watcher it is (F7 re-review item 5).
     """
     for alert in COMPLETION_WATCHER_ALERTS:
-        assert "by (control_plane_cluster, region)" in _expression(alert), (
-            f"{alert} aggregates without the Alertmanager grouping labels: "
+        assert "by (control_plane_cluster, region, gpu_cluster)" in _expression(
+            alert
+        ), (
+            f"{alert} aggregates without the grouping labels and gpu_cluster: "
             f"{_expression(alert)}"
         )
 
@@ -115,7 +120,7 @@ def test_the_active_state_alert_is_a_state_test_not_a_threshold() -> None:
     expression = _expression("GpuFaultCompletionActiveStateUnavailable")
 
     assert expression == (
-        "max by (control_plane_cluster, region) "
+        "max by (control_plane_cluster, region, gpu_cluster) "
         "(gpu_fault_completion_active_state_unavailable) == 1"
     ), f"unexpected expression shape: {expression}"
 
@@ -129,7 +134,7 @@ def test_the_outbox_append_failure_alert_reads_a_windowed_increase() -> None:
     expression = _expression("GpuFaultCompletionOutboxAppendFailures")
 
     assert expression == (
-        "sum by (control_plane_cluster, region) "
+        "sum by (control_plane_cluster, region, gpu_cluster) "
         "(increase(gpu_fault_completion_outbox_append_failures_total[10m])) > 0"
     ), f"unexpected expression shape: {expression}"
 
@@ -796,3 +801,51 @@ def test_the_active_state_alert_names_the_sanctioned_recovery() -> None:
         assert "kubectl apply -f deploy/" not in text, (
             f"{rule['alert']} tells the operator to apply an unrendered manifest"
         )
+
+
+DATAPLANE_COLLECTOR_ALERT = "GpuFaultDataplaneCollectorMissing"
+
+
+def test_the_data_plane_scrape_path_has_its_own_absence_alert() -> None:
+    """A data-plane collector that writes nothing must not be silent (F7 F2).
+
+    Every watcher alert evaluates over the series this collector delivers, so
+    with it gone they all read as healthy. ``absent(... == 1)`` catches the
+    fleet with no collector writing at all -- the same shape as
+    ``GpuFaultControlPlaneMetricsMissing`` -- and the per-cluster ``== 0`` half
+    catches a live collector whose every target in one cluster is refusing, so
+    the notification can name the ``gpu_cluster``.
+    """
+    rule = _rule(DATAPLANE_COLLECTOR_ALERT)
+    expression = _expression(DATAPLANE_COLLECTOR_ALERT)
+    annotations = rule["annotations"]
+    assert isinstance(annotations, dict), "the alert has no annotations mapping"
+
+    assert expression == (
+        'absent(up{job="gpu-fault-dataplane"} == 1) '
+        "or max by (control_plane_cluster, region, gpu_cluster) "
+        '(up{job="gpu-fault-dataplane"}) == 0'
+    ), f"unexpected expression shape: {expression}"
+    assert rule["for"] == "15m", f"`for` is {rule['for']!r}, expected 15m"
+    assert rule["labels"] == {"severity": "warning"}, (
+        f"the collector's absence is a warning, not {rule['labels']!r}: nothing "
+        "is lost while the watcher itself stays up"
+    )
+    anchor = MODULE.markdown_anchor(DATAPLANE_COLLECTOR_ALERT)
+    expected = f"{MODULE.RUNBOOK_DOCUMENT}#{anchor}"
+    assert annotations["runbook_url"] == expected, annotations["runbook_url"]
+    description = str(annotations["description"])
+    for needle in ("gpu-fault-admin deploy", "adot_irsa_role_arn", "gpu_cluster"):
+        assert needle in description, (
+            f"the description must name the sanctioned fix ({needle}): {description}"
+        )
+
+
+def test_the_data_plane_absence_alert_is_fed_by_the_collectors_keep_list() -> None:
+    """``up`` must survive the data-plane job's keep filter or the rule is inert."""
+    scrapes = dataplane_adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+    job = next(job for job in scrapes if job["job_name"] == "gpu-fault-dataplane")
+
+    assert MODULE.keep_filter_defects([job], [_rule(DATAPLANE_COLLECTOR_ALERT)]) == []

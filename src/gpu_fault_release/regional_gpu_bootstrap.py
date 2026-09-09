@@ -185,6 +185,21 @@ def apply_gpu_adot_collector(
     )
 
 
+def rollback_gpu_adot_collectors(release: Any, previous: dict[str, Any]) -> None:
+    """Put every cluster's collector back on the previous ``adot_image``.
+
+    Runs inside the observability restore of an automatic rollback, after the
+    control-plane snapshot. Clusters the release skipped (no IRSA role) print
+    the same skip as the apply and are left alone.
+    """
+
+    image = str(previous.get("adot_image") or "")
+    if not image:
+        raise ReleaseError("previous ADOT image is unavailable for the collectors")
+    for target in release.config.clusters:
+        release._apply_gpu_adot_collector(target, image=image)
+
+
 def _installer_jobs(release: Any, target: ClusterTarget) -> list[dict[str, Any]]:
     return list(
         release._get_json(

@@ -879,6 +879,11 @@ def upgrade_gpu_target(
                 target,
             ),
         )
+    if active_plan.has(ReleaseComponent.OBSERVABILITY):
+        run_component(
+            (ReleaseComponent.OBSERVABILITY,),
+            lambda: release._apply_gpu_adot_collector(target),
+        )
     deployment_components = tuple(
         (component, deployment)
         for component, deployment in (

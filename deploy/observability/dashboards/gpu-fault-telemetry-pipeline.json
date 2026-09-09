@@ -215,7 +215,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 10
       },
@@ -251,6 +251,67 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "1 per GPU cluster whose ADOT collector (adot-dataplane.yaml) scrapes at least one data-plane target. 0 or a missing cluster: the Completion Watcher row below is blind for it. A cluster whose release skipped the collector (no adot_irsa_role_arn) never appears here.\n\nAlert GpuFaultDataplaneCollectorMissing (warning, for 15m): docs/管理员日常运维.md#gpufaultdataplanecollectormissing",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region, gpu_cluster) (up{job=\"gpu-fault-dataplane\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": true,
+          "legendFormat": "{{gpu_cluster}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Data-plane scrape up by GPU cluster",
+      "type": "stat"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -258,7 +319,7 @@
         "x": 0,
         "y": 18
       },
-      "id": 6,
+      "id": 7,
       "panels": [],
       "title": "Completion Watcher",
       "type": "row"
@@ -293,7 +354,7 @@
         "x": 0,
         "y": 19
       },
-      "id": 7,
+      "id": 8,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -314,9 +375,9 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (control_plane_cluster, region) (gpu_fault_completion_active_state_unavailable{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (control_plane_cluster, region, gpu_cluster) (gpu_fault_completion_active_state_unavailable{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": true,
-          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "legendFormat": "{{gpu_cluster}}",
           "range": false,
           "refId": "A"
         }
@@ -367,7 +428,7 @@
         "x": 12,
         "y": 19
       },
-      "id": 8,
+      "id": 9,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -385,9 +446,9 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "sum by (control_plane_cluster, region) (increase(gpu_fault_completion_outbox_append_failures_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[10m]))",
+          "expr": "sum by (control_plane_cluster, region, gpu_cluster) (increase(gpu_fault_completion_outbox_append_failures_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[10m]))",
           "instant": false,
-          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "legendFormat": "{{gpu_cluster}}",
           "range": true,
           "refId": "A"
         }
