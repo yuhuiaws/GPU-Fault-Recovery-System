@@ -479,7 +479,9 @@ def execute_case(
                 history_before, history_after, release_id=release_id
             )
         )
-        appended = history_after[len(history_before) :]
+        appended = (
+            verdicts.appended_history_entries(history_before, history_after) or []
+        )
         errors.extend(verdicts.mirror_errors(release["mirror_lines"], appended))
         errors.extend(verdicts.snapshot_retention_errors(groups_before, groups_after))
         errors.extend(verdicts.registry_probe_errors(probes_after))
@@ -501,10 +503,15 @@ def execute_case(
     finally:
         cleanup: dict[str, Any] = {"errors": []}
         try:
+            # The NOOP is a state write: its checkpoint re-stamps
+            # ``updated_at_epoch`` and nothing else, so that one field is the
+            # only drift a passing run may show (2026-09-09 attempt 2 failed
+            # on exactly it).
             cleanup["runtime_identity"] = regional.verify_runtime_identity(
                 preflight["runtime_identity"],
                 evidence_path=case_dir / "runtime-identity-after-release.json",
                 stage=f"after {CASE_ID} release",
+                mutable_state_fields=("updated_at_epoch",),
             )
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             cleanup["errors"].append(f"runtime_identity: {type(exc).__name__}: {exc}")

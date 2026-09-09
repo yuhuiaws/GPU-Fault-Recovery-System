@@ -223,6 +223,86 @@ def test_the_history_bound_is_enforced() -> None:
     assert any("above the 200 bound" in item for item in errors), _text(errors)
 
 
+def test_a_full_ring_that_dropped_its_oldest_entry_still_counts_as_growth() -> None:
+    """The live history is a 200-entry ring: once full, an append drops the
+    oldest entry and the count stays at 200. The first live run (2026-09-09)
+    read that as "did not grow"; the appended entries are found by aligning
+    the retained suffix of ``before`` with the prefix of ``after``."""
+
+    before = [
+        _entry(
+            phase="p", timestamp=f"2026-09-06T{index // 60:02d}:{index % 60:02d}:00Z"
+        )
+        for index in range(verdicts.HISTORY_MAX_ENTRIES)
+    ]
+    newest = _entry()
+    after = [*before[1:], newest]
+
+    assert verdicts.appended_history_entries(before, after) == [newest]
+    assert verdicts.history_append_errors(before, after, release_id=RELEASE_ID) == []
+
+    two = [*before[2:], _entry(phase="cpu-staged"), newest]
+    assert verdicts.appended_history_entries(before, two) == [
+        _entry(phase="cpu-staged"),
+        newest,
+    ]
+
+
+def test_entries_lost_before_the_ring_is_full_are_a_rewrite() -> None:
+    before = _before() + [_entry(phase="q", timestamp="2026-09-06T09:30:00Z")]
+    after = [before[1], _entry()]  # dropped the first entry while far below the bound
+    assert verdicts.appended_history_entries(before, after) is None
+    errors = verdicts.history_append_errors(before, after, release_id=RELEASE_ID)
+    assert any("append-only" in item for item in errors), _text(errors)
+    assert verdicts.appended_history_entries([], [_entry()]) == [_entry()]
+
+
+def test_the_runner_reads_the_appended_entries_through_the_ring_aware_helper() -> None:
+    source = (ROOT / "scripts/e2e/regional/run_boot023_release_history.py").read_text(
+        encoding="utf-8"
+    )
+    assert "verdicts.appended_history_entries(history_before, history_after)" in source
+    assert "history_after[len(history_before) :]" not in source
+
+
+def test_the_noop_may_move_only_the_state_timestamp_of_the_runtime_identity() -> None:
+    from scripts.e2e.regional.regional_live_fixture import identity_without_state_fields
+
+    before = {
+        "release_state": {
+            "release_id": "r",
+            "updated_at_epoch": 1,
+            "phase": "complete",
+        },
+        "deployments": {"cpu": {"gpu-fault-api-ha": {"generation": 3}}},
+    }
+    after = {
+        "release_state": {
+            "release_id": "r",
+            "updated_at_epoch": 2,
+            "phase": "complete",
+        },
+        "deployments": {"cpu": {"gpu-fault-api-ha": {"generation": 3}}},
+    }
+    fields = ("updated_at_epoch",)
+    assert identity_without_state_fields(
+        before, fields
+    ) == identity_without_state_fields(after, fields)
+    assert identity_without_state_fields(before, ()) != identity_without_state_fields(
+        after, ()
+    ), "without the allowance the timestamp still counts as drift"
+    moved = {**after, "deployments": {"cpu": {"gpu-fault-api-ha": {"generation": 4}}}}
+    assert identity_without_state_fields(
+        before, fields
+    ) != identity_without_state_fields(moved, fields), (
+        "a Deployment generation change is never allowed"
+    )
+    source = (ROOT / "scripts/e2e/regional/run_boot023_release_history.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'mutable_state_fields=("updated_at_epoch",)' in source
+
+
 def test_the_mirror_must_carry_the_appended_tail() -> None:
     appended = [_entry()]
     line = json.dumps(appended[0], sort_keys=True, separators=(",", ":"))

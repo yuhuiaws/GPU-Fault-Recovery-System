@@ -76,6 +76,18 @@ def provider_event_actor_matches_role(
     return expected_role_name in event.get("username", "")
 
 
+def identity_without_state_fields(
+    identity: dict[str, Any], fields: tuple[str, ...]
+) -> dict[str, Any]:
+    if not fields:
+        return identity
+    value = dict(identity)
+    state = value.get("release_state")
+    if isinstance(state, dict):
+        value["release_state"] = {k: v for k, v in state.items() if k not in fields}
+    return value
+
+
 def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
     errors = []
     release_state = value.get("release_state")
@@ -1139,10 +1151,21 @@ class RegionalLiveFixture:
         *,
         evidence_path: Path,
         stage: str,
+        mutable_state_fields: tuple[str, ...] = (),
     ) -> dict[str, Any]:
+        """Fail unless the live identity equals ``expected``.
+
+        ``mutable_state_fields`` names the release-state fields a case's own
+        sanctioned release write is allowed to move (a NOOP re-stamps
+        ``updated_at_epoch``); every other field, and every Deployment
+        identity, must be byte-identical.
+        """
+
         current = self.runtime_identity()
         write_json_atomic(evidence_path, current)
-        if current != expected:
+        if identity_without_state_fields(
+            current, mutable_state_fields
+        ) != identity_without_state_fields(expected, mutable_state_fields):
             raise RegionalFixtureError(
                 f"{stage} release/runtime deployment identity drifted"
             )

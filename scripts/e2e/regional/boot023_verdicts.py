@@ -232,6 +232,32 @@ def history_entry_errors(
     return errors
 
 
+def appended_history_entries(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    *,
+    bound: int = HISTORY_MAX_ENTRIES,
+) -> list[dict[str, Any]] | None:
+    """The entries ``after`` gained over ``before``; ``None`` if it was rewritten.
+
+    The history is a ring of ``bound`` entries: once full, every append drops
+    the oldest, so the count stops growing and the retained part of ``after``
+    is a *suffix* of ``before``, not the whole of it. Counting entries read a
+    full ring as "did not grow" on the first live run (2026-09-09, 200 -> 200).
+    Align the longest suffix of ``before`` with the prefix of ``after``; entries
+    may only disappear from the front, and only when the ring is full.
+    """
+
+    for kept in range(min(len(before), len(after)), 0, -1):
+        if after[:kept] != before[len(before) - kept :]:
+            continue
+        dropped = len(before) - kept
+        if dropped and len(after) < bound:
+            return None
+        return after[kept:]
+    return list(after) if not before else None
+
+
 def history_append_errors(
     before: list[dict[str, Any]],
     after: list[dict[str, Any]],
@@ -239,24 +265,22 @@ def history_append_errors(
     release_id: str,
     expected_phase: str = NOOP_PHASE,
 ) -> list[str]:
-    """The history grew, and only grew: prefix unchanged, new entries valid."""
+    """The history grew, and only grew: retained entries unchanged, new ones valid."""
 
     errors: list[str] = []
-    if len(after) <= len(before):
+    appended = appended_history_entries(before, after)
+    if appended is None:
+        return ["the release history prefix was rewritten; it must be append-only"]
+    if not appended:
         errors.append(
             f"the release history did not grow: {len(before)} -> {len(after)} entries"
         )
         return errors
-    if after[: len(before)] != before:
-        errors.append(
-            "the release history prefix was rewritten; it must be append-only"
-        )
     if len(after) > HISTORY_MAX_ENTRIES:
         errors.append(
             f"the release history holds {len(after)} entries, above the "
             f"{HISTORY_MAX_ENTRIES} bound"
         )
-    appended = after[len(before) :]
     for index, entry in enumerate(appended):
         errors.extend(
             history_entry_errors(
