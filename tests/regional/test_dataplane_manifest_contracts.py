@@ -35,12 +35,13 @@ proves nothing looks exactly like a fixed manifest:
 
 from __future__ import annotations
 
-import inspect
+import argparse
 import re
 import subprocess
 from pathlib import Path
 from typing import Any, Iterator
 
+import pytest
 import yaml
 
 from gpu_fault import collectors_cli
@@ -304,7 +305,9 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
     )
 
 
-def test_the_exporter_period_is_pinned_to_the_collector_scrape_period() -> None:
+def test_the_exporter_period_is_pinned_to_the_collector_scrape_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The cadence constant is tied to the period the collector actually uses.
 
     Every other check in this file derives its expectation from
@@ -326,19 +329,16 @@ def test_the_exporter_period_is_pinned_to_the_collector_scrape_period() -> None:
         "the installer no longer defaults METRICS_INTERVAL as a plain literal, "
         "so the collector's scrape period cannot be read from it"
     )
-    cli_default = re.search(
-        r'GPU_FAULT_DCGM_METRICS_URL.*?GPU_FAULT_METRICS_INTERVAL_SECONDS", "(\d+)"',
-        inspect.getsource(collectors_cli),
-        re.S,
-    )
-    assert cli_default is not None, (
-        "the dcgm collector CLI no longer defaults GPU_FAULT_METRICS_INTERVAL_SECONDS "
-        "next to its metrics URL, so its scrape period cannot be read from it"
-    )
+    # The CLI's default is read the way an operator meets it: through the
+    # registered dcgm subcommand's parser, with the environment override unset.
+    monkeypatch.delenv("GPU_FAULT_METRICS_INTERVAL_SECONDS", raising=False)
+    parser = argparse.ArgumentParser()
+    collectors_cli.CLI_ARGUMENTS["dcgm"](parser)
+    cli_seconds = parser.parse_args(["--node-id", "node-a"]).interval_seconds
     collector_seconds = int(installer_default.group(1))
-    assert int(cli_default.group(1)) == collector_seconds, (
+    assert cli_seconds == collector_seconds, (
         "the installer and the collector CLI default the dcgm scrape period "
-        f"differently ({collector_seconds} s vs {cli_default.group(1)} s), so "
+        f"differently ({collector_seconds} s vs {cli_seconds} s), so "
         "the exporter cadence has two periods to match"
     )
     assert CADENCE.DCGM_COLLECTOR_INTERVAL_SECONDS == collector_seconds, (

@@ -31,11 +31,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from tests._builders import copy_model, workflow_step_execution
 
 from gpu_fault.execution import step_bounds
 from gpu_fault.node_agent import NodeActionExecutionState, NodeActionSubmission
-
+from tests._builders import copy_model, workflow_step_execution
 from tests.execution._support import (
     NodeActionResult,
     NodeActionStatus,

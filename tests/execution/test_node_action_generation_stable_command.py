@@ -19,8 +19,8 @@ body, so the agent's own generation check is untouched.
 from __future__ import annotations
 
 import pytest
-from tests._builders import build_store, copy_model, node_action_result
 
+from tests._builders import build_store, copy_model, node_action_result
 from tests.execution._support import (
     NodeActionPending,
     NodeActionStatus,
