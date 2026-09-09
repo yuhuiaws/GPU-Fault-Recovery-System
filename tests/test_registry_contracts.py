@@ -29,13 +29,16 @@ from gpu_fault.node_agent.operations.registry import (
 from gpu_fault.operation_registry import (
     CONTAINMENT_ONLY_OPERATIONS,
     DESTRUCTIVE_OPERATIONS,
+    GENERATION_STABLE_COMMAND_OPERATIONS,
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     HOST_PROC_ROOT_OPERATIONS,
     MAINTENANCE_GENERATION_OPERATIONS,
     NODE_MUTATING_OPERATIONS,
     OPERATION_REGISTRY,
+    OperationAdapter,
     OperationResourceClaim,
     OperationScope,
+    validate_operation_registry,
 )
 from gpu_fault.processor.batching import TELEMETRY_BATCH_SIZE_BY_PATH
 from gpu_fault.store.postgres import processor_claims
@@ -65,6 +68,15 @@ EXPECTED_MAINTENANCE_GENERATION = {
     WorkflowOperation.RESET_GPU,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     WorkflowOperation.RESTORE_GPU_SERVICES,
+}
+# Long-running mutating node actions whose command_id must survive an agent
+# generation change: the restarted agent answers from its ledger for the id
+# it already holds, where a generation-suffixed id would have been a brand
+# new command and a second driver/firmware install (R4, 2026-09-08 review).
+EXPECTED_GENERATION_STABLE_COMMAND = {
+    WorkflowOperation.REMEDIATE_DRIVER,
+    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+    WorkflowOperation.REMEDIATE_EFA_DRIVER,
 }
 # A set literal this large is unreadable at a call site and drifts the
 # moment an operation is added, so re-listing one is what the duplication
@@ -153,10 +165,42 @@ def test_containment_and_node_mutating_sets_are_disjoint_and_complete() -> None:
 def test_registry_semantic_sets_match_declared_membership() -> None:
     assert HOST_PROC_ROOT_OPERATIONS == EXPECTED_HOST_PROC_ROOT
     assert MAINTENANCE_GENERATION_OPERATIONS == EXPECTED_MAINTENANCE_GENERATION
+    assert GENERATION_STABLE_COMMAND_OPERATIONS == EXPECTED_GENERATION_STABLE_COMMAND
     # Escalating to hardware support is only defensible for operations the
     # fleet has actually attempted on the device.
     assert HARDWARE_ESCALATION_RELEVANT_OPERATIONS
     assert not (HARDWARE_ESCALATION_RELEVANT_OPERATIONS & CONTAINMENT_ONLY_OPERATIONS)
+
+
+def test_generation_stable_commands_are_unpinned_mutating_node_actions() -> None:
+    # A maintenance-generation-scoped action already pins the generation the
+    # quiesce captured, so its command_id never moves; the stable-command
+    # flag is for the mutating node actions that read the generation live.
+    # A non-mutating action must keep the suffix: re-collecting on the fresh
+    # agent is the useful answer there, not an INTERRUPTED replay.
+    assert not (
+        GENERATION_STABLE_COMMAND_OPERATIONS & MAINTENANCE_GENERATION_OPERATIONS
+    )
+    for operation in GENERATION_STABLE_COMMAND_OPERATIONS:
+        semantics = OPERATION_REGISTRY[operation]
+        assert OperationAdapter.NODE_ACTION in semantics.adapters, operation
+        assert operation in NODE_MUTATING_OPERATIONS, operation
+    # Every mutating node action is covered one way or the other: pinned by
+    # the quiesce or named without the generation. QUIESCE itself produces
+    # the pin and re-quiescing is idempotent; RESTART_FABRIC_MANAGER is the
+    # DESTR-019 subject whose suffix the case's verdicts read.
+    covered = GENERATION_STABLE_COMMAND_OPERATIONS | MAINTENANCE_GENERATION_OPERATIONS
+    uncovered = {
+        operation
+        for operation, semantics in OPERATION_REGISTRY.items()
+        if OperationAdapter.NODE_ACTION in semantics.adapters
+        and operation in NODE_MUTATING_OPERATIONS
+        and operation not in covered
+    }
+    assert uncovered == {
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.RESTART_FABRIC_MANAGER,
+    }
 
 
 def test_large_registry_sets_are_not_relisted_as_literals() -> None:
@@ -165,6 +209,7 @@ def test_large_registry_sets_are_not_relisted_as_literals() -> None:
         "NODE_MUTATING_OPERATIONS": NODE_MUTATING_OPERATIONS,
         "HOST_PROC_ROOT_OPERATIONS": HOST_PROC_ROOT_OPERATIONS,
         "MAINTENANCE_GENERATION_OPERATIONS": (MAINTENANCE_GENERATION_OPERATIONS),
+        "GENERATION_STABLE_COMMAND_OPERATIONS": (GENERATION_STABLE_COMMAND_OPERATIONS),
         "HARDWARE_ESCALATION_RELEVANT_OPERATIONS": (
             HARDWARE_ESCALATION_RELEVANT_OPERATIONS
         ),
@@ -182,6 +227,32 @@ def test_large_registry_sets_are_not_relisted_as_literals() -> None:
                         f"{path.relative_to(ROOT)}:{lineno} re-lists {name}"
                     )
     assert not duplicated
+
+
+@pytest.mark.parametrize(
+    ("operation", "updates", "message"),
+    [
+        (
+            WorkflowOperation.REMEDIATE_DRIVER,
+            {"maintenance_generation_scoped": True},
+            "already pins its command_id",
+        ),
+        (
+            WorkflowOperation.REMEDIATE_DRIVER,
+            {"adapters": frozenset({OperationAdapter.KUBERNETES})},
+            "generation-stable command_id but is not a node action",
+        ),
+    ],
+)
+def test_generation_stable_command_invariants_fail_closed(
+    monkeypatch, operation, updates, message
+) -> None:
+    monkeypatch.setitem(
+        OPERATION_REGISTRY, operation, replace(OPERATION_REGISTRY[operation], **updates)
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        validate_operation_registry()
 
 
 def test_node_action_handlers_match_adapter_and_executor() -> None:

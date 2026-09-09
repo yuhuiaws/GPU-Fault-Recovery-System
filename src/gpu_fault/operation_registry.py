@@ -62,6 +62,7 @@ class OperationSemantics:
     hardware_escalation_relevant: bool | None = None
     host_proc_root_dependent: bool = False
     maintenance_generation_scoped: bool = False
+    generation_stable_command_id: bool = False
     planning_only: bool = False
     dominates: frozenset[WorkflowOperation] = field(default_factory=frozenset)
 
@@ -278,6 +279,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         resource_claims=frozenset({OperationResourceClaim.EFA_RUNTIME_MUTATION}),
         dominates=frozenset({WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN}),
         hardware_escalation_relevant=True,
+        generation_stable_command_id=True,
     ),
     WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN: _semantics(
         CapabilityName.SCHEDULER_DRAIN,
@@ -363,6 +365,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
+        generation_stable_command_id=True,
     ),
     WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE: _semantics(
         CapabilityName.SOFTWARE_FIRMWARE_UPDATE,
@@ -377,6 +380,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         hardware_escalation_relevant=True,
         host_proc_root_dependent=True,
+        generation_stable_command_id=True,
     ),
     WorkflowOperation.ESCALATE_SUPPORT: _semantics(
         CapabilityName.SUPPORT_ESCALATION,
@@ -471,6 +475,17 @@ def validate_operation_registry() -> None:
                 raise RuntimeError(
                     f"{operation.value} must explicitly declare "
                     + ", ".join(missing_risk_fields)
+                )
+        if semantics.generation_stable_command_id:
+            if OperationAdapter.NODE_ACTION not in semantics.adapters:
+                raise RuntimeError(
+                    f"{operation.value} names a generation-stable command_id "
+                    "but is not a node action"
+                )
+            if semantics.maintenance_generation_scoped:
+                raise RuntimeError(
+                    f"{operation.value} is maintenance-generation scoped, which "
+                    "already pins its command_id; drop generation_stable_command_id"
                 )
         unknown = semantics.dominates - operations
         if unknown:
@@ -592,6 +607,16 @@ HOST_PROC_ROOT_OPERATIONS = operations_with("host_proc_root_dependent")
 # generation captured when the node was quiesced, instead of reading the
 # live fleet endpoint.
 MAINTENANCE_GENERATION_OPERATIONS = operations_with("maintenance_generation_scoped")
+# Long-running mutating node actions that read the agent generation live.
+# Their command_id is ``<step key>/<node>`` with no generation suffix: an
+# agent restart under the action bumps the generation, and a suffix that
+# moved with it formed a new command the restarted agent had never seen --
+# a second driver install. Named by step and node alone, the retry lands on
+# the ledger row the restart closed as INTERRUPTED (or on the finished
+# result) and is answered, not executed. The live generation still rides in
+# the command body for the agent's own generation check. Scoped operations
+# above already pin the quiesce-time generation and need no second flag.
+GENERATION_STABLE_COMMAND_OPERATIONS = operations_with("generation_stable_command_id")
 OPERATION_RESOURCE_CLAIMS = {
     operation: frozenset(item.value for item in semantics.resource_claims)
     for operation, semantics in OPERATION_REGISTRY.items()

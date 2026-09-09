@@ -27,6 +27,7 @@ from gpu_fault.models import (
 from gpu_fault.node_action_keys import (
     resolve_node_action_secret,
 )
+from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
 from gpu_fault.node_agent import (
     NodeActionCommand,
     NodeActionExecutionState,
@@ -194,11 +195,19 @@ class NodeActionTransportMixin:
         except ValueError as exc:
             return WorkflowStepOutcome.failed(str(exc))
         now = datetime.now(timezone.utc)
+        command_id = f"{context.idempotency_key}/{command_suffix}"
+        if (
+            agent_generation is not None
+            and operation not in GENERATION_STABLE_COMMAND_OPERATIONS
+        ):
+            # The suffix is right for an action a fresh agent should simply run
+            # again (a snapshot, a bundle). A driver install is not one: keyed
+            # by the live generation, a restart under the action formed a new
+            # command and ran the install twice, so the long-running mutations
+            # are named by step and node alone and replay from the ledger.
+            command_id += f"/agent-{agent_generation}"
         command = NodeActionCommand(
-            command_id=(
-                f"{context.idempotency_key}/{command_suffix}"
-                + (f"/agent-{agent_generation}" if agent_generation is not None else "")
-            ),
+            command_id=command_id,
             workflow_request_id=context.workflow.request_id,
             incident_id=context.incident.incident_id,
             fencing_token=context.workflow.fencing_token,

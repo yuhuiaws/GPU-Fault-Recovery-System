@@ -265,6 +265,11 @@ class StubFleetRegistry:
         self.endpoint_calls = []
         self.maintenance_calls = []
 
+    def restart_agent(self) -> int:
+        """The agent re-registered after a restart: the next generation is live."""
+        self._generation += 1
+        return self._generation
+
     def endpoint(self, cluster_id, node_id):
         self.endpoint_calls.append((cluster_id, node_id))
         if not self._ready or node_id not in self._endpoints:
