@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Open or close a temporary env window on the cluster executor Deployment.
 
-`GF-REGIONAL-DESTR-014` needs two executor variables changed for one
+`GF-REGIONAL-DESTR-014` needs one executor variable changed for one
 maintenance window and then restored exactly:
 
 * ``GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`` -- lowered so node-b's RESET_GPU
   reaches FAILED in tens of seconds rather than ~5 minutes.
-* ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`` -- lowered so
-  node-c's RESTART_NODE reaches its bounded-waiting timeout inside the window.
+
+The managed-recovery timeout the same case compresses is *not* an executor
+variable: ``execution/config.py`` reads it on the control-worker to derive the
+RESTART_NODE/REPLACE_NODE waiting caps, so it goes through
+``control_plane_env_window.py``. Until 2026-09-08 this window carried it too,
+and seven live attempts set it where nothing read it.
 
 Modeled on ``synthetic_replacement_route.py``: it records the Deployment's
 pre-window env in a baseline file before mutating, waits until *every ready
@@ -52,10 +56,7 @@ from scripts.e2e.regional.site_profile import (  # noqa: E402
 
 DEPLOYMENT = "gpu-fault-cluster-executor"
 CONTAINER = "executor"
-ALLOWED_VARIABLES = (
-    "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS",
-    "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
-)
+ALLOWED_VARIABLES = ("GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS",)
 OPEN_CONFIRMATION = "OPEN_EXECUTOR_ENV_WINDOW"
 CLOSE_CONFIRMATION = "CLOSE_EXECUTOR_ENV_WINDOW"
 
@@ -73,9 +74,9 @@ def now() -> str:
 def parse_assignments(pairs: list[str]) -> dict[str, str]:
     """Validate ``NAME=VALUE`` pairs against the compiled-in allow-list.
 
-    Values must be positive integers -- both variables are second/attempt
-    counts, and the case exists to *lower* them, so a non-numeric or zero value
-    is a typo that would silently disable the very timeout it means to tighten.
+    Values must be positive integers -- the variable is an attempt count, and
+    the case exists to *lower* it, so a non-numeric or zero value is a typo that
+    would silently disable the very bound it means to tighten.
     """
 
     result: dict[str, str] = {}

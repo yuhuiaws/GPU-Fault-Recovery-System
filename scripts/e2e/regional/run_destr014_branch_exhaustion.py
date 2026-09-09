@@ -13,6 +13,13 @@ timeout, escalates to REPLACE_NODE, and -- with no warm spare declared -- FAILs
 runs; the workflow ends FAILED, the incident QUARANTINED, and the job is not
 restarted.
 
+Two env windows shorten the wait. The managed-recovery timeout is a
+control-worker setting (``execution/config.py`` derives the RESTART_NODE and
+REPLACE_NODE waiting caps from it), so it is compressed through the
+control-plane window; the executor window lowers only the GPU client verify
+attempts. Attempts 1-7 (2026-09-08) set both on the executor Deployment, where
+nothing reads the timeout, and the control plane kept its 1800 s default.
+
 The runner defaults to ``--plan``; ``--execute`` needs ``--confirm
 DESTR014_EXECUTE``. The verdict functions are pure and unit-tested; the runner
 records digests only.
@@ -36,6 +43,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import control_plane_env_window as control_window  # noqa: E402
 from scripts.e2e.regional import executor_env_window as env_window  # noqa: E402
 from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
@@ -104,6 +112,7 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     injection_errors,
     lifetime_errors,
     quarantine_taint_value,
+    reset_reached_commit,
     schedulability_errors,
     step_transitions,
     workflow_errors,
@@ -386,10 +395,30 @@ class Settings:
         }
 
 
+def managed_recovery_errors(seconds: int) -> list[str]:
+    """Why ``--managed-recovery-timeout-seconds`` cannot take this value.
+
+    The value lands on the control-worker, whose boot-time timing guard
+    (``execution/config.py``) refuses a managed-recovery window below the
+    default step timeout or above the node lifetime; an accepted-but-invalid
+    value would roll every worker replica into CrashLoopBackOff mid-case.
+    """
+
+    return control_window.assignment_errors(
+        {control_window.MANAGED_RECOVERY_VARIABLE: str(int(seconds))}
+    )
+
+
 def configure(arguments: argparse.Namespace) -> Settings:
     default_job, default_attempt = derived_identity(
         arguments.run_dir, arguments.attempt
     )
+    problems = managed_recovery_errors(int(arguments.managed_recovery_timeout_seconds))
+    if problems:
+        raise RegionalFixtureError(
+            "managed recovery timeout is not a value the control plane accepts: "
+            + "; ".join(problems)
+        )
     job_id = arguments.job_id.strip() or default_job
     predecessor = (
         Path(arguments.predecessor_evidence).expanduser().resolve()
@@ -483,6 +512,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "restore_the_sibling_node_agent_to_its_baseline": True,
             "un_quarantine_the_sibling_via_a_validation_first_workflow": True,
             "close_the_executor_env_window_to_baseline": True,
+            "close_the_control_plane_env_window_to_baseline": True,
             "delete_the_test_workload_after_async_quiescence": True,
             "never_call_provider_replace_or_delete": True,
         },
@@ -493,7 +523,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
 # Live preflight (not unit-tested; delegates every assertion to the pure funcs)
 # --------------------------------------------------------------------------- #
 def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
-    values: dict[str, Any] = {"poll_interval_seconds": 5.0}
+    values: dict[str, Any] = {"poll_interval_seconds": 5.0, "max_rungs": 2}
     for pod in regional.ready_pods("gpu", env_window.DEPLOYMENT):
         try:
             output = regional.kubectl(
@@ -506,7 +536,6 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
                 (
                     "import json,os;"
                     "print(json.dumps({"
-                    "'max_rungs':os.getenv('GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS'),"
                     "'poll':os.getenv('GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS')}))"
                 ),
                 timeout=60,
@@ -516,10 +545,21 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
                 continue
             raise
         parsed = json.loads(output.splitlines()[-1])
-        values["max_rungs"] = int(parsed.get("max_rungs") or 2)
         if parsed.get("poll"):
             values["poll_interval_seconds"] = float(parsed["poll"])
         break
+    # The branch rung count is read by the control-worker
+    # (``app.context._branch_escalator``), not by the executor.
+    rungs = [
+        item["values"].get("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS")
+        for item in control_window.replica_env(
+            regional,
+            plane="cpu",
+            deployment=control_window.DEPLOYMENT,
+            names=["GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS"],
+        )
+    ]
+    values["max_rungs"] = min((int(value) for value in rungs if value), default=2)
     connection = json.loads(
         regional.kubectl(
             "cpu", "get", "configmap", "gpu-fault-regional-release-state", "-o", "json"
@@ -641,7 +681,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--attempt-id", default="")
     value.add_argument("--predecessor-evidence", default="")
     value.add_argument("--verify-max-attempts", type=int, default=6)
-    value.add_argument("--managed-recovery-timeout-seconds", type=int, default=300)
+    value.add_argument("--managed-recovery-timeout-seconds", type=int, default=600)
     value.add_argument("--variant", choices=VARIANTS, default="sibling-exhausted")
     return value
 
@@ -695,12 +735,14 @@ class _LiveRun:
     workload: ManagedWorkloadFixture
     prewarm: ImagePrewarmFixture
     env_baseline: Path
+    control_env_baseline: Path
     fault_probe: Any
     sibling_probe: Any
     inject_fault: Any
     inject_sibling: Any
     incident_id: str = ""
     env_opened: bool = False
+    control_env_opened: bool = False
     holder_armed: bool = False
     agent_disabled: bool = False
     marker: str = ""
@@ -761,6 +803,7 @@ def _prepare_live_run(
         workload=workload,
         prewarm=ImagePrewarmFixture(regional, case_id=CASE_ID, run_id=run_id),
         env_baseline=case_dir / "executor-env-window.json",
+        control_env_baseline=case_dir / "control-plane-env-window.json",
         fault_probe=_host_probe(settings, settings.fault_node, run_id),
         sibling_probe=_host_probe(settings, settings.sibling_node, run_id),
         inject_fault=_destructive_probe(settings, settings.fault_node, f"{run_id}-b"),
@@ -771,10 +814,31 @@ def _prepare_live_run(
 
 
 def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Open the executor env window, start the job, arm both node-side
-    failures, inject the two faults and wait until both land in one DAG."""
+    """Open the control-plane and executor env windows, start the job, arm
+    both node-side failures, inject the two faults and wait until both land in
+    one DAG."""
 
     settings, case_dir, run_id = run.settings, run.case_dir, run.run_id
+    # The managed-recovery window is read by the control-worker (it derives the
+    # RESTART_NODE/REPLACE_NODE waiting caps from it); opening it rolls every
+    # worker replica, so it goes first and before anything is injected.
+    control_report = control_window.open_window(
+        control_window.Settings(
+            baseline=run.control_env_baseline, rollout_timeout_seconds=600
+        ),
+        run.regional,
+        control_window.survey(run.regional),
+        {
+            control_window.MANAGED_RECOVERY_VARIABLE: str(
+                settings.managed_recovery_timeout_seconds
+            )
+        },
+    )
+    run.control_env_opened = True
+    write_json_atomic(
+        case_dir / "control-plane-env-window-open.json",
+        control_window.without_survey(control_report),
+    )
     env_report = env_window.open_window(
         env_window.Settings(baseline=run.env_baseline, rollout_timeout_seconds=300),
         run.regional,
@@ -782,9 +846,6 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         {
             "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": str(
                 settings.verify_max_attempts
-            ),
-            "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS": str(
-                settings.managed_recovery_timeout_seconds
             ),
         },
     )
@@ -972,6 +1033,9 @@ def _data_plane_errors(
             holder_status=holder,
             sibling_agent_during=(run.sibling_agent_during.get("agent_unit") or {}),
             sibling_agent_after=(sibling_agent_after.get("agent_unit") or {}),
+            reset_reached_commit=reset_reached_commit(
+                state.get("workflow") or {}, fault_node=settings.fault_node
+            ),
         )
     )
     nodes = {
@@ -1068,6 +1132,8 @@ def execute_case(
             incident_id=run.incident_id,
             env_baseline=run.env_baseline,
             env_opened=run.env_opened,
+            control_env_baseline=run.control_env_baseline,
+            control_env_opened=run.control_env_opened,
             holder_armed=run.holder_armed,
             agent_disabled=run.agent_disabled,
             profile_version=str(
@@ -1118,6 +1184,8 @@ def _cleanup(
     incident_id: str,
     env_baseline: Path,
     env_opened: bool,
+    control_env_baseline: Path,
+    control_env_opened: bool,
     holder_armed: bool,
     agent_disabled: bool,
     profile_version: str,
@@ -1159,6 +1227,19 @@ def _cleanup(
                 env_window.Settings(baseline=env_baseline, rollout_timeout_seconds=300),
                 regional,
                 env_window.survey(regional),
+            ),
+        )
+    if control_env_opened:
+        guard(
+            "control_env_window_close",
+            lambda: control_window.without_survey(
+                control_window.close_window(
+                    control_window.Settings(
+                        baseline=control_env_baseline, rollout_timeout_seconds=600
+                    ),
+                    regional,
+                    control_window.survey(regional),
+                )
             ),
         )
     guard("prewarm_cleanup", prewarm.cleanup)

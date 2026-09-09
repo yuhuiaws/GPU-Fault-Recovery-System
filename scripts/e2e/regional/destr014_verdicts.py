@@ -77,6 +77,33 @@ def _first(
     )
 
 
+# Where node-b's RESET_GPU met the armed device holder. ``gpu_reset_commit_attempt``:
+# the reset was committed and the node agent's nvidia-smi refused it.
+# ``gpu_client_quiesce_attempt``: the step's own client barrier
+# (``adapters/node_action/barriers.py``) re-verified the device before
+# committing and refused to reset a GPU with a live client -- the agent never
+# ran the reset. Both are the "clients are still active" failure the case arms
+# for; the product moved from the first to the second on 2026-09-08 (attempt 7).
+RESET_FAILURE_DETAIL_KEYS = frozenset(
+    {"gpu_reset_commit_attempt", "gpu_client_quiesce_attempt"}
+)
+
+
+def reset_reached_commit(workflow: dict[str, Any], *, fault_node: str) -> bool:
+    """True when node-b's failed RESET_GPU got as far as committing the reset.
+
+    Decides whether the host ledger must show a RESET_GPU row: a barrier
+    refusal leaves none, by design.
+    """
+
+    steps = workflow.get("official_steps") or []
+    executions = workflow.get("step_executions") or []
+    for item in _branch_executions(steps, executions, fault_node):
+        if item.get("operation") == "RESET_GPU" and item.get("status") == "FAILED":
+            return "gpu_reset_commit_attempt" in (item.get("details") or {})
+    return True
+
+
 def workflow_errors(
     workflow: dict[str, Any],
     incident: dict[str, Any],
@@ -146,9 +173,10 @@ def workflow_errors(
             errors.append(
                 f"{fault_node} RESET_GPU did not fail with 'clients are still active'"
             )
-        if "gpu_reset_commit_attempt" not in (reset.get("details") or {}):
+        if not (RESET_FAILURE_DETAIL_KEYS & set(reset.get("details") or {})):
             errors.append(
-                f"{fault_node} RESET_GPU failure lacks gpu_reset_commit_attempt"
+                f"{fault_node} RESET_GPU failure carries none of "
+                f"{sorted(RESET_FAILURE_DETAIL_KEYS)}"
             )
 
     if _first(fault_execs, "RESTART_NODE", "SUCCEEDED") is None:
@@ -224,6 +252,7 @@ def host_errors(
     holder_status: dict[str, Any],
     sibling_agent_during: dict[str, Any],
     sibling_agent_after: dict[str, Any],
+    reset_reached_commit: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     if fault_after.get("boot_id") == fault_baseline.get("boot_id"):
@@ -241,7 +270,9 @@ def host_errors(
         if row.get("operation") == "RESET_GPU"
         and (row.get("command_id"), row.get("operation")) not in baseline_ids
     ]
-    if not new_reset_rows:
+    # A reset the client barrier refused never reaches the agent, so no ledger
+    # row is the expected shape there; only a committed reset owes one.
+    if reset_reached_commit and not new_reset_rows:
         errors.append("fault node ledger has no new RESET_GPU row; the reset never ran")
     if any(row.get("state") == "SUCCEEDED" for row in new_reset_rows):
         errors.append("fault node RESET_GPU succeeded; the holder did not break it")

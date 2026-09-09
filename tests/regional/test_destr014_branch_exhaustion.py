@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import control_plane_env_window as control_window
 from scripts.e2e.regional import executor_env_window as env_window
 from scripts.e2e.regional import run_destr014_branch_exhaustion as destr014
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
@@ -232,6 +233,37 @@ def test_an_exhausted_id_for_the_wrong_node_fails() -> None:
     workflow["exhausted_branch_ids"] = [f"branch:{FAULT}"]
     errors = _errors(workflow, happy_incident())
     assert any("exhausted" in item for item in errors), errors
+
+
+def _barrier_refused_reset(workflow: dict[str, Any]) -> dict[str, Any]:
+    workflow["step_executions"][5]["error"] = (
+        "node agent node-b: RuntimeError: GPU device clients are still active: "
+        "GPU-1:4242:python3"
+    )
+    workflow["step_executions"][5]["details"] = {"gpu_client_quiesce_attempt": 6}
+    return workflow
+
+
+def test_a_reset_refused_by_its_client_barrier_is_the_armed_failure() -> None:
+    """Since 2026-09-08 RESET_GPU re-verifies GPU clients before committing and
+    refuses to reset a device with a live holder: the failure carries
+    ``gpu_client_quiesce_attempt`` and the agent never runs the reset (attempt
+    7). That is the same "clients are still active" failure the case arms for."""
+    workflow = _barrier_refused_reset(happy_workflow())
+    assert _errors(workflow, happy_incident()) == [], _errors(
+        workflow, happy_incident()
+    )
+    assert destr014.reset_reached_commit(workflow, fault_node=FAULT) is False, workflow
+    assert destr014.reset_reached_commit(happy_workflow(), fault_node=FAULT) is True, (
+        "the committed shape reaches commit"
+    )
+
+
+def test_a_reset_failure_without_either_attempt_detail_fails() -> None:
+    workflow = happy_workflow()
+    workflow["step_executions"][5]["details"] = {"barrier_state": "FAILED"}
+    errors = _errors(workflow, happy_incident())
+    assert any("carries none of" in item for item in errors), errors
 
 
 def test_a_reset_that_failed_for_another_reason_fails() -> None:
@@ -488,6 +520,22 @@ def test_host_rejects_an_agent_that_was_never_disabled_or_never_restored() -> No
     }
     errors = destr014.host_errors(**inputs)
     assert any("restored" in item for item in errors), errors
+
+
+def test_host_needs_no_reset_row_when_the_barrier_refused_the_commit() -> None:
+    inputs = _host_inputs()
+    inputs["fault_after"]["ledger"] = inputs["fault_after"]["ledger"][:2]
+    assert destr014.host_errors(**inputs, reset_reached_commit=False) == [], inputs
+    inputs["fault_after"]["ledger"].append(
+        _ledger_row(
+            "wf/5/RESET_GPU/commit",
+            "RESET_GPU",
+            "SUCCEEDED",
+            "2026-09-06T10:01:00+00:00",
+        )
+    )
+    errors = destr014.host_errors(**inputs, reset_reached_commit=False)
+    assert any("succeeded" in item for item in errors), errors
 
 
 def test_host_rejects_a_reset_that_succeeded_or_a_holder_that_never_armed() -> None:
@@ -920,7 +968,7 @@ def test_parser_accepts_the_documented_arguments() -> None:
             "--verify-max-attempts",
             "6",
             "--managed-recovery-timeout-seconds",
-            "300",
+            "900",
             "--variant",
             "sibling-exhausted",
             "--maintenance-window-end",
@@ -931,12 +979,12 @@ def test_parser_accepts_the_documented_arguments() -> None:
     assert arguments.plan is True
     assert arguments.variant == "sibling-exhausted"
     assert arguments.verify_max_attempts == 6
-    assert arguments.managed_recovery_timeout_seconds == 300
+    assert arguments.managed_recovery_timeout_seconds == 900
     defaults = destr014.parser().parse_args(["--run-dir", "/tmp/destr014-run"])
     assert defaults.execute is False
     assert defaults.variant == "sibling-exhausted"
     assert defaults.verify_max_attempts == 6
-    assert defaults.managed_recovery_timeout_seconds == 300
+    assert defaults.managed_recovery_timeout_seconds == 600
     assert hasattr(defaults, "predecessor_evidence"), defaults
     with pytest.raises(SystemExit):
         destr014.parser().parse_args(
@@ -946,17 +994,14 @@ def test_parser_accepts_the_documented_arguments() -> None:
 
 def test_env_window_allowlist_and_assignments() -> None:
     assignments = env_window.parse_assignments(
-        [
-            "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=6",
-            "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=300",
-        ]
+        ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=6"]
     )
-    assert assignments == {
-        "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "6",
-        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS": "300",
-    }
+    assert assignments == {"GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": "6"}
     for bad in (
         ["GPU_FAULT_ALLOW_HYPERPOD_REBOOT=false"],
+        # Read by the control-worker, not the executor: attempts 1-7 set it
+        # here and the control plane kept its 1800 s default.
+        ["GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=300"],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS="],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS=six"],
         ["GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS"],
@@ -968,6 +1013,28 @@ def test_env_window_allowlist_and_assignments() -> None:
     assert env_window.CONTAINER == "executor"
     assert env_window.OPEN_CONFIRMATION == "OPEN_EXECUTOR_ENV_WINDOW"
     assert env_window.CLOSE_CONFIRMATION == "CLOSE_EXECUTOR_ENV_WINDOW"
+
+
+def test_the_managed_recovery_window_is_a_control_plane_setting() -> None:
+    """The timeout the sibling branch waits on lands on the control-worker.
+
+    ``execution/config.py`` derives the RESTART_NODE/REPLACE_NODE waiting caps
+    from ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`` on the control
+    plane and refuses to boot when it sits below the default step timeout, so
+    the runner must route it through the control-plane window and refuse a
+    value the control plane would reject (300 s would CrashLoop every worker).
+    """
+    assert control_window.MANAGED_RECOVERY_VARIABLE == (
+        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS"
+    )
+    assert control_window.DEPLOYMENT == "gpu-fault-control-worker"
+    assert destr014.managed_recovery_errors(600) == [], "600 is the default step cap"
+    assert destr014.managed_recovery_errors(900) == [], "900 fits twice in the lifetime"
+    below = destr014.managed_recovery_errors(300)
+    assert any("GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS" in item for item in below), (
+        below
+    )
+    assert destr014.managed_recovery_errors(3000), "2x window must fit the job lifetime"
 
 
 def test_env_window_restores_unset_as_delete_not_false() -> None:
