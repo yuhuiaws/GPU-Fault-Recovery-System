@@ -59,6 +59,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     runtime_identity_errors,
     settings_from_arguments,
 )
+from scripts.e2e.regional.runtime_identity_fields import (  # noqa: E402
+    verify_runtime_identity_allowing,
+)
 
 CASE_ID = verdicts.CASE_ID
 PREDECESSOR_CASE_ID = verdicts.PREDECESSOR_CASE_ID
@@ -507,7 +510,8 @@ def execute_case(
             # ``updated_at_epoch`` and nothing else, so that one field is the
             # only drift a passing run may show (2026-09-09 attempt 2 failed
             # on exactly it).
-            cleanup["runtime_identity"] = regional.verify_runtime_identity(
+            cleanup["runtime_identity"] = verify_runtime_identity_allowing(
+                regional,
                 preflight["runtime_identity"],
                 evidence_path=case_dir / "runtime-identity-after-release.json",
                 stage=f"after {CASE_ID} release",

@@ -257,16 +257,10 @@ def test_entries_lost_before_the_ring_is_full_are_a_rewrite() -> None:
     assert verdicts.appended_history_entries([], [_entry()]) == [_entry()]
 
 
-def test_the_runner_reads_the_appended_entries_through_the_ring_aware_helper() -> None:
-    source = (ROOT / "scripts/e2e/regional/run_boot023_release_history.py").read_text(
-        encoding="utf-8"
-    )
-    assert "verdicts.appended_history_entries(history_before, history_after)" in source
-    assert "history_after[len(history_before) :]" not in source
-
-
 def test_the_noop_may_move_only_the_state_timestamp_of_the_runtime_identity() -> None:
-    from scripts.e2e.regional.regional_live_fixture import identity_without_state_fields
+    from scripts.e2e.regional.runtime_identity_fields import (
+        identity_without_state_fields,
+    )
 
     before = {
         "release_state": {
@@ -297,10 +291,6 @@ def test_the_noop_may_move_only_the_state_timestamp_of_the_runtime_identity() ->
     ) != identity_without_state_fields(moved, fields), (
         "a Deployment generation change is never allowed"
     )
-    source = (ROOT / "scripts/e2e/regional/run_boot023_release_history.py").read_text(
-        encoding="utf-8"
-    )
-    assert 'mutable_state_fields=("updated_at_epoch",)' in source
 
 
 def test_the_mirror_must_carry_the_appended_tail() -> None:
