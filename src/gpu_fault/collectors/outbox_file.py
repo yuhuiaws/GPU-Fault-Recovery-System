@@ -221,10 +221,11 @@ class OutboxFile:
         The flock is on the open file description, not the bytes, so
         rewriting the contents while holding it is safe, and a later taker
         simply overwrites the line. One ~80-byte ``pwrite`` and one
-        ``ftruncate`` on a descriptor already open, no fsync (about 5 us
-        measured): it runs once per lock take -- a buffered append or a
-        replay/compaction rewrite, each of which already fsyncs the outbox --
-        never per collected event. The write goes *first* and the truncate
+        ``ftruncate`` on a descriptor already open, no fsync: about 20 us
+        measured per take, against about 2.8 ms for the fsync'd append or
+        rewrite it accompanies. It runs once per lock take -- a buffered append
+        or a replay/compaction rewrite, each of which already fsyncs the outbox
+        -- never per collected event. The write goes *first* and the truncate
         trims to its length: truncating to zero and rewriting is the pattern
         ext4's ``auto_da_alloc`` treats as a file replace, and it charged every
         ``close()`` of the lock a forced block flush (about 900 us). No hostname
