@@ -133,8 +133,8 @@ def cluster_executor_metrics() -> MetricFamily:
 class ClusterExecutorMetrics:
     """The family plus the four moves the executor makes on it."""
 
-    def __init__(self, family: MetricFamily | None = None) -> None:
-        self.family = family if family is not None else cluster_executor_metrics()
+    def __init__(self) -> None:
+        self.family = cluster_executor_metrics()
 
     def counter_changed(self, counter: str, value: int, amount: int) -> None:
         """Mirror one ``executor.increment`` into the exported series."""

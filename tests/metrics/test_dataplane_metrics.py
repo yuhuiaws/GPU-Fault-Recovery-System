@@ -215,3 +215,19 @@ def test_started_server_runs_on_a_daemon_thread() -> None:
         assert thread.daemon, "a non-daemon thread would block process exit"
     finally:
         live.stop()
+
+
+def test_an_out_of_range_port_disables_the_server_instead_of_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """socket.bind raises OverflowError past 65535; the component must keep running."""
+
+    family = metrics_module.MetricFamily(
+        "gpu_fault_test_", counters=(("x_total", "x"),)
+    )
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.dataplane_metrics"):
+        server = metrics_module.start_metrics_server(family, port=70000)
+    assert server is None, "a bad port must disable the server, not start one"
+    assert any("out of range" in record.getMessage() for record in caplog.records), (
+        f"the refusal must be logged at ERROR: {caplog.text}"
+    )

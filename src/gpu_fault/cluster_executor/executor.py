@@ -406,7 +406,9 @@ class ClusterActionExecutor:
         with self._counter_lock:
             value = getattr(self, counter) + amount
             setattr(self, counter, value)
-        self.metrics.counter_changed(counter, value, amount)
+            # Mirrored under the same lock: a gauge set from a released
+            # snapshot could apply two racing changes in the wrong order.
+            self.metrics.counter_changed(counter, value, amount)
 
     def metrics_snapshot(self) -> dict[str, Any]:
         """Every executor counter, for the claim breadcrumb and operators.

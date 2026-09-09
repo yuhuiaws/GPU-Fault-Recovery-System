@@ -191,10 +191,15 @@ def start_metrics_server(
     if port <= 0:
         LOGGER.info("%s metrics disabled (port %s)", prefix, port)
         return None
+    if port > 65535:
+        # socket.bind raises OverflowError, not OSError, for this; a typo in
+        # the port variable must not take the component down at start-up.
+        LOGGER.error("%s metrics disabled: port %s is out of range", prefix, port)
+        return None
     server = MetricsServer(family, port=port, health=health)
     try:
         server.start()
-    except OSError as exc:
+    except (OSError, OverflowError) as exc:
         LOGGER.error("%s metrics disabled: cannot bind port %s (%s)", prefix, port, exc)
         return None
     return server
