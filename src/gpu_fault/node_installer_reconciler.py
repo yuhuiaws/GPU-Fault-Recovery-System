@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.dataplane_metrics import MetricFamily, start_metrics_server
 from gpu_fault.dcgm_exporter_cadence import DCGM_EXPORTER_COLLECT_INTERVAL_MS
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.logging_setup import configure_logging
@@ -75,8 +76,108 @@ REQUEST_TIMEOUT = (5, 60)
 # reads its age. A constant path, not an env var: the probe is a shell test in
 # the manifest and the two must agree without a second knob to keep in sync.
 RECONCILER_HEARTBEAT_PATH = "/tmp/reconciler-heartbeat"  # noqa: S108
+# The age at which the manifest's livenessProbe calls the heartbeat stale; the
+# ``/healthz`` predicate asks the same question of the same file.
+HEARTBEAT_STALE_SECONDS = 300
 # The maximum retry delay for a node that keeps failing to install.
 MAX_RETRY_SECONDS = 3600
+# Prometheus family served on GPU_FAULT_NODE_INSTALLER_METRICS_PORT (F8). The
+# reconciler's only other output is one INFO line per pass, so a fleet that
+# stopped installing looked exactly like a quiet one. Counters are events, not
+# states: a node parked in Failed is seen every 5 s but counted once.
+NODE_INSTALLER_METRICS_PREFIX = "gpu_fault_node_installer_"
+
+
+def node_installer_metrics() -> MetricFamily:
+    return MetricFamily(
+        NODE_INSTALLER_METRICS_PREFIX,
+        counters=(
+            (
+                "reconcile_passes_total",
+                "Reconcile passes that ran to completion; a pass that fails "
+                "closed (an invalid wave ConfigMap, a wedged apiserver call) "
+                "leaves it flat, so a flat line is the loop not doing work.",
+            ),
+            (
+                "nodes_seen_total",
+                "Nodes of the active wave listed across all passes; divided by "
+                "passes it is the fleet size the reconciler is managing.",
+            ),
+            (
+                "jobs_created_total",
+                "Installer Jobs created; one per node per install attempt.",
+            ),
+            (
+                "jobs_succeeded_total",
+                "Installer Jobs seen Complete whose node was then marked "
+                "Succeeded at this release's identity.",
+            ),
+            (
+                "jobs_failed_total",
+                "Installer Jobs first seen Failed, whether the node was parked "
+                "in Failed to wait out its backoff or retried at once.",
+            ),
+            (
+                "retries_scheduled_total",
+                "Nodes moved to Retrying (a failed or stale Job deleted for "
+                "replay, a re-imaged node) or given an installer-retry-after "
+                "time because their Pod never started.",
+            ),
+            (
+                "errors_total",
+                "Nodes whose reconcile raised and was logged so the rest of the "
+                "pass could continue; a steady rate is one node the apiserver "
+                "keeps refusing (404 after LIST, 5xx, no InternalIP).",
+            ),
+        ),
+        gauges=(
+            (
+                "nodes_pending",
+                "Nodes of the active wave not yet at this release and not in "
+                "Retrying: unannotated, Installing, Failed, Unsupported or "
+                "installed at an older identity. Refreshed every pass.",
+            ),
+            (
+                "nodes_retrying",
+                "Nodes whose installer-state annotation read Retrying at the "
+                "start of the pass: waiting for an install slot to try again.",
+            ),
+            (
+                "nodes_installed",
+                "Nodes current at this release's identity on this pass, "
+                "including ones re-stamped after a plain reboot.",
+            ),
+            (
+                "budget_in_flight",
+                "Installer Jobs active at the end of the pass against the "
+                "max-unavailable budget: Jobs already running plus the ones "
+                "this pass created.",
+            ),
+        ),
+        timestamps=(
+            (
+                "last_pass_completed_timestamp",
+                "Unix seconds at which the last pass ran to completion; 0 "
+                "before the first one. Alert on time() - this exceeding a few "
+                "reconcile intervals.",
+            ),
+        ),
+    )
+
+
+def heartbeat_is_fresh(
+    max_age_seconds: float = HEARTBEAT_STALE_SECONDS,
+    *,
+    path: str = RECONCILER_HEARTBEAT_PATH,
+) -> bool:
+    """Whether the heartbeat file was touched within ``max_age_seconds``."""
+
+    try:
+        return time.time() - os.path.getmtime(path) < max_age_seconds
+    except OSError:
+        return False
+
+
 # Container waiting reasons that mean the installer never ran a single line, so
 # there is nothing on the node to roll back and nothing a fast retry can fix.
 # The first one is what a node with no key in ``gpu-fault-node-action-keys``
@@ -294,9 +395,11 @@ class NodeInstallerReconciler:
         agent_port: int = DEFAULT_AGENT_PORT,
         reboot_grace_seconds: int = DEFAULT_REBOOT_GRACE_SECONDS,
         agent_alive: Callable[[str, int], bool] = agent_answers,
+        metrics: MetricFamily | None = None,
     ) -> None:
         self.core = core_api
         self.batch = batch_api
+        self.metrics = metrics if metrics is not None else node_installer_metrics()
         self.namespace = namespace
         self.cluster_name = cluster_name
         self.version = version
@@ -402,7 +505,34 @@ class NodeInstallerReconciler:
                 result["error"] += 1
                 continue
             result[outcome] += 1
+        self._record_pass(result, nodes, budget)
         return result
+
+    def _record_pass(
+        self, result: dict[str, int], nodes: list[Any], budget: _InstallBudget
+    ) -> None:
+        """Move the pass's counters and refresh the fleet gauges."""
+
+        metrics = self.metrics
+        metrics.inc("reconcile_passes_total")
+        metrics.inc("nodes_seen_total", len(nodes))
+        metrics.inc("jobs_succeeded_total", result["succeeded"])
+        metrics.inc("errors_total", result["error"])
+        installed = result["current"] + result["rebooted"] + result["succeeded"]
+        # Read as of the LIST, like every other decision in the pass: a node
+        # this pass moved to Retrying shows up in the gauge one pass later.
+        retrying = sum(
+            (_value(_metadata(node), "annotations", {}) or {}).get(
+                INSTALLER_STATE_ANNOTATION
+            )
+            == "Retrying"
+            for node in nodes
+        )
+        metrics.set("nodes_installed", installed)
+        metrics.set("nodes_retrying", retrying)
+        metrics.set("nodes_pending", max(len(nodes) - installed - retrying, 0))
+        metrics.set("budget_in_flight", budget.used)
+        metrics.mark("last_pass_completed_timestamp", self.now())
 
     def _active_installer_jobs(self) -> int:
         response = self.batch.list_namespaced_job(
@@ -539,8 +669,9 @@ class NodeInstallerReconciler:
                 if _api_status(create_error) != 409:
                     raise
             # Before the annotation patch: the slot is spent the moment the Job
-            # exists, whether or not this node's patch lands.
+            # exists, whether or not this node's patch lands. The counter too.
             budget.consume()
+            self.metrics.inc("jobs_created_total")
             self._mark_node(
                 node_name, node_uid, "Installing", boot_id, annotations=annotations
             )
@@ -563,6 +694,10 @@ class NodeInstallerReconciler:
             )
             return "succeeded"
         if _job_condition(job, "Failed"):
+            if installer_state != "Failed":
+                # First sight of this failure; a node parked in Failed is seen
+                # again every pass until its backoff elapses.
+                self.metrics.inc("jobs_failed_total")
             attempts = _attempt_count(annotations)
             if self._retry_due(job, attempts):
                 self._delete_job(name)
@@ -767,6 +902,8 @@ class NodeInstallerReconciler:
                 annotations.pop(key, None)
             else:
                 annotations[key] = value
+        if state == "Retrying" or retry_after is not None:
+            self.metrics.inc("retries_scheduled_total")
 
     def _build_job(self, node: Any, job_name: str) -> dict[str, Any]:
         body = copy.deepcopy(self.job_template)
@@ -986,6 +1123,14 @@ def main() -> None:
         reboot_grace_seconds=int(
             os.environ.get("GPU_FAULT_INSTALLER_REBOOT_GRACE_SECONDS", "600")
         ),
+    )
+    # Before the loop, best effort: 0 disables, a port that cannot be bound is
+    # one ERROR line and the reconciler runs without metrics. The heartbeat
+    # file stays the liveness signal; /healthz asks it the probe's question.
+    start_metrics_server(
+        reconciler.metrics,
+        port=int(os.getenv("GPU_FAULT_NODE_INSTALLER_METRICS_PORT", "9110")),
+        health=heartbeat_is_fresh,
     )
     while True:
         try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +29,9 @@ from gpu_fault.node_installer_reconciler import (
     REQUEST_TIMEOUT,
     TEMPLATE_CONTENT_SHA256_ENV,
     NodeInstallerReconciler,
+    heartbeat_is_fresh,
     load_job_template,
+    node_installer_metrics,
 )
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
@@ -1071,3 +1075,196 @@ def test_repeated_failures_back_off_on_a_doubling_curve():
     assert current.metadata.annotations[INSTALLER_ATTEMPTS_ANNOTATION] == "9", (
         current.metadata.annotations
     )
+
+
+# --------------------------------------------------------------------------- F8
+# Prometheus metrics. The reconciler's only observable output was one INFO line
+# per pass, so a fleet that stopped installing (a wedged budget, every node
+# parked in Failed) looked like a quiet one. The family below is what the
+# per-cluster data-plane collector scrapes.
+
+METRIC_NAME = re.compile(r"^gpu_fault_node_installer_[a-z_]+$")
+EXPECTED_METRICS = {
+    "gpu_fault_node_installer_reconcile_passes_total": "counter",
+    "gpu_fault_node_installer_nodes_seen_total": "counter",
+    "gpu_fault_node_installer_jobs_created_total": "counter",
+    "gpu_fault_node_installer_jobs_succeeded_total": "counter",
+    "gpu_fault_node_installer_jobs_failed_total": "counter",
+    "gpu_fault_node_installer_retries_scheduled_total": "counter",
+    "gpu_fault_node_installer_errors_total": "counter",
+    "gpu_fault_node_installer_nodes_pending": "gauge",
+    "gpu_fault_node_installer_nodes_retrying": "gauge",
+    "gpu_fault_node_installer_nodes_installed": "gauge",
+    "gpu_fault_node_installer_budget_in_flight": "gauge",
+    "gpu_fault_node_installer_last_pass_completed_timestamp": "gauge",
+}
+
+
+def _samples(body: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    for line in body.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        name, value = line.split(" ", 1)
+        values[name] = int(value)
+    return values
+
+
+def test_metric_family_contract_names_help_and_type():
+    """Every series is prefixed, lower-snake, and carries HELP + TYPE lines."""
+
+    family = node_installer_metrics()
+    body = family.render()
+    lines = body.splitlines()
+
+    names = tuple(_samples(body))
+    assert set(names) == set(EXPECTED_METRICS), sorted(
+        set(names) ^ set(EXPECTED_METRICS)
+    )
+    assert names == family.names(), "render order must follow the family"
+    for name, metric_type in EXPECTED_METRICS.items():
+        assert METRIC_NAME.match(name), f"{name} breaks the family naming contract"
+        assert f"# TYPE {name} {metric_type}" in lines, f"{name} TYPE line missing"
+        help_lines = [line for line in lines if line.startswith(f"# HELP {name} ")]
+        assert len(help_lines) == 1, f"{name} needs exactly one HELP line"
+        assert len(help_lines[0]) > len(f"# HELP {name} ") + 20, (
+            f"{name} HELP text is too short to help anyone: {help_lines[0]!r}"
+        )
+
+
+def test_one_pass_over_a_mixed_fleet_moves_the_expected_counters_and_gauges():
+    """One pass, five nodes, every outcome the family has a series for.
+
+    hyperpod-a is fresh (Job created), -b is current at this release, -c has a
+    Failed Job past its retry delay (failure counted, retry scheduled), -d is
+    mid-retry with a running Job, and -e's annotation patch fails after its Job
+    exists (error counted, but the slot it took is still in flight).
+    """
+
+    nodes = [
+        node(name="hyperpod-a", uid="node-a"),
+        node(name="hyperpod-b", uid="node-uid", annotations=_installed_annotations()),
+        node(
+            name="hyperpod-c",
+            uid="node-c",
+            annotations={INSTALLER_STATE_ANNOTATION: "Installing"},
+        ),
+        node(
+            name="hyperpod-d",
+            uid="node-d",
+            annotations={INSTALLER_STATE_ANNOTATION: "Retrying"},
+        ),
+        node(name="hyperpod-e", uid="node-e"),
+    ]
+    core = CoreApi(nodes, patch_failures={"hyperpod-e"})
+    batch = BatchApi(
+        jobs={
+            "hyperpod-c": job(condition="Failed", age_seconds=400),
+            "hyperpod-d": job(),
+        }
+    )
+    active = reconciler(core, batch, max_unavailable=3)
+
+    result = active.reconcile_once()
+    body = active.metrics.render()
+
+    # hyperpod-e's Job exists although its outcome is "error": the counter
+    # follows the Job, like the budget, not the outcome the patch spoiled.
+    assert result["created"] == 1 and result["error"] == 1, result
+    assert len(batch.created) == 2, batch.created
+    samples = _samples(body)
+    assert samples == {
+        "gpu_fault_node_installer_reconcile_passes_total": 1,
+        "gpu_fault_node_installer_nodes_seen_total": 5,
+        "gpu_fault_node_installer_jobs_created_total": 2,
+        "gpu_fault_node_installer_jobs_succeeded_total": 0,
+        "gpu_fault_node_installer_jobs_failed_total": 1,
+        "gpu_fault_node_installer_retries_scheduled_total": 1,
+        "gpu_fault_node_installer_errors_total": 1,
+        "gpu_fault_node_installer_nodes_installed": 1,
+        "gpu_fault_node_installer_nodes_retrying": 1,
+        "gpu_fault_node_installer_nodes_pending": 3,
+        "gpu_fault_node_installer_budget_in_flight": 3,
+        "gpu_fault_node_installer_last_pass_completed_timestamp": int(NOW.timestamp()),
+    }, body
+
+
+def test_a_completed_job_counts_one_success_and_a_parked_failure_counts_once():
+    """Counters are events, not states: a node parked in Failed waiting out its
+    backoff is seen on every 5 s pass and must not add a failure each time."""
+
+    done = node(
+        name="hyperpod-a",
+        uid="node-uid",
+        annotations=_installed_annotations(
+            **{INSTALLER_STATE_ANNOTATION: "Installing"}
+        ),
+    )
+    parked = node(
+        name="hyperpod-b",
+        uid="node-b",
+        annotations={INSTALLER_STATE_ANNOTATION: "Installing"},
+    )
+    core = CoreApi([done, parked])
+    batch = BatchApi(
+        jobs={
+            "hyperpod-a": job(condition="Complete"),
+            "hyperpod-b": job(condition="Failed", age_seconds=10),
+        }
+    )
+    active = reconciler(core, batch)
+
+    first = active.reconcile_once()
+    for target in (done, parked):
+        # apply_patches folds every node's patches onto one node; keep each
+        # node's own.
+        own = [
+            (name, body) for name, body in core.patches if name == target.metadata.name
+        ]
+        target.metadata.annotations = apply_patches(
+            target, SimpleNamespace(patches=own)
+        )
+    second = active.reconcile_once()
+
+    assert first["succeeded"] == 1 and first["failed"] == 1, first
+    assert second["current"] == 1 and second["failed"] == 1, second
+    samples = _samples(active.metrics.render())
+    assert samples["gpu_fault_node_installer_reconcile_passes_total"] == 2
+    assert samples["gpu_fault_node_installer_jobs_succeeded_total"] == 1
+    assert samples["gpu_fault_node_installer_jobs_failed_total"] == 1, (
+        "a Failed Job still parked on its second pass was counted again"
+    )
+    assert samples["gpu_fault_node_installer_retries_scheduled_total"] == 0
+    assert samples["gpu_fault_node_installer_nodes_installed"] == 1
+    assert samples["gpu_fault_node_installer_nodes_pending"] == 1
+
+
+def test_a_pass_that_fails_closed_moves_no_pass_counter():
+    """``reconcile_passes_total`` is the "is the loop doing work" series, so a
+    pass that raises must leave it flat -- that flat line is the alert."""
+
+    failing = CoreApi(
+        [node()], wave_data={"allowed-nodes": "*", "max-unavailable": "invalid"}
+    )
+    active = reconciler(failing, BatchApi())
+    active.wave_config_map = "gpu-fault-node-installer-wave"
+
+    with pytest.raises(RuntimeError, match="max-unavailable"):
+        active.reconcile_once()
+
+    samples = _samples(active.metrics.render())
+    assert samples["gpu_fault_node_installer_reconcile_passes_total"] == 0, samples
+    assert samples["gpu_fault_node_installer_last_pass_completed_timestamp"] == 0
+
+
+def test_heartbeat_freshness_predicate_reads_the_probe_file(tmp_path):
+    """The same question the manifest's livenessProbe asks of the file, so a
+    later switch from the exec probe to ``/healthz`` changes no semantics."""
+
+    path = tmp_path / "heartbeat"
+    assert heartbeat_is_fresh(300, path=str(path)) is False, "no file is not fresh"
+    path.touch()
+    assert heartbeat_is_fresh(300, path=str(path)) is True
+    stale = time.time() - 600
+    os.utime(path, (stale, stale))
+    assert heartbeat_is_fresh(300, path=str(path)) is False, "600 s old is stale"
