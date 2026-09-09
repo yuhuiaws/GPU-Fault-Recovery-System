@@ -18,7 +18,6 @@ from typing import Any, Sequence
 
 import pytest
 
-from gpu_fault.admin import bootstrap_services as services
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -136,8 +135,6 @@ class Account:
                     }
                 }
             )
-        if "list-open-id-connect-provider-tags" in argv:
-            return json.dumps({"Tags": self.provider_tags})
         if argv[0] == "openssl" and "s_client" in argv:
             return self.chain
         if argv[0] == "openssl":
@@ -167,6 +164,15 @@ class Account:
             return {"association": {"roleArn": self.association_role}}
         if operation == "create-pod-identity-association":
             return {"association": {"associationId": "assoc-new"}}
+        if operation == "get-open-id-connect-provider":
+            if not self.provider_exists:
+                raise BootstrapError(
+                    "command failed (254): aws: An error occurred (NoSuchEntity) "
+                    "when calling the GetOpenIDConnectProvider operation: "
+                    "OpenIDConnect Provider not found"
+                )
+            # The provider read carries its tags, so ownership needs no second call.
+            return {"Url": self.issuer, "Tags": list(self.provider_tags)}
         raise AssertionError(f"unexpected aws call: {arguments}")
 
     def aws_text(self, _region: str, *arguments: str, **_keywords: Any) -> str:
@@ -175,21 +181,17 @@ class Account:
 
     # -- process boundary --------------------------------------------------
     def process(self, arguments: Sequence[Any], **_keywords: Any) -> Any:
-        """The one existence probe left that does not go through the runner.
+        """No existence probe bypasses the runner any more.
 
-        IAM roles, inline policies and the Pod Identity add-on are read through
-        ``run``/``aws_json`` above, once each. Only the account-wide OIDC provider
-        is still probed with a bare process, so anything else arriving here is a
-        read that was meant to be deduplicated.
+        IAM roles, inline policies, the Pod Identity add-on and the account-wide
+        OIDC provider are all read through ``run``/``aws_json`` above, once each,
+        so anything arriving here is a read that was meant to be deduplicated.
         """
 
-        argv = [str(item) for item in arguments]
-        if "get-open-id-connect-provider" in " ".join(argv):
-            return subprocess.CompletedProcess(argv, 0 if self.provider_exists else 254)
-        raise AssertionError(f"unexpected process: {argv}")
+        raise AssertionError(f"unexpected process: {[str(item) for item in arguments]}")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(services.subprocess, "run", self.process)
+        monkeypatch.setattr(subprocess, "run", self.process)
 
     def mutations(self, fragment: str) -> list[list[str]]:
         return [argv for argv in self.calls if fragment in " ".join(argv)]
@@ -251,6 +253,33 @@ def test_the_control_plane_policy_pins_email_to_the_verified_sender() -> None:
     assert email["Condition"] == {
         "StringEquals": {"ses:FromAddress": "alerts@example.com"}
     }
+
+
+def test_the_control_plane_policy_publishes_only_to_the_site_topic() -> None:
+    """``channel: sns`` grants Publish on one topic and nothing about SES.
+
+    The topic is the administrator's one confirmed subscription; a wider SNS
+    grant would let a compromised control plane page every topic in the
+    account, and any SES grant would be a permission with no sender behind it.
+    """
+
+    topic = f"arn:aws:sns:{REGION}:{ACCOUNT}:gpu-fault-{SITE}-alerts"
+    document = control_plane_policy_document(
+        region=REGION, account_id=ACCOUNT, sns_topic_arn=topic
+    )
+    publish = next(
+        item
+        for item in document["Statement"]
+        if item.get("Sid") == "AdministratorNotificationTopic"
+    )
+
+    assert publish["Action"] == "sns:Publish"
+    assert publish["Resource"] == topic
+    assert "Condition" not in publish
+    assert not [action for action in _actions(document) if action.startswith("ses:")]
+    assert [action for action in _actions(document) if action.startswith("sns:")] == [
+        "sns:Publish"
+    ]
 
 
 def test_the_pod_identity_trust_is_scoped_to_one_cluster() -> None:

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    bounded_reasons,
     BlockedKind,
     FaultIncident,
     IncidentState,
@@ -16,6 +15,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkloadState,
+    bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store import NotFoundError
@@ -175,13 +175,17 @@ class NodeLifecycleOperationService:
         existing_workflow: WorkflowRequest | None,
         now: datetime,
     ) -> ReplacementState:
+        # PENDING only. Merging into a BLOCKED record recompiled it under the
+        # same id and, once the profile had arrived, silently un-blocked it
+        # with its ``blocked_kind`` cleared -- exactly what F-B4 forbids for
+        # every other family through ``disposition()`` (C-06). A finding that
+        # lands while the group's record is BLOCKED gets its own record.
         merge = (
             existing_incident is not None
             and existing_workflow is not None
             and existing_workflow.not_before is not None
             and existing_workflow.not_before > now
-            and existing_workflow.status
-            in {WorkflowStatus.PENDING, WorkflowStatus.BLOCKED}
+            and existing_workflow.status is WorkflowStatus.PENDING
             and existing_workflow.execution_owner_id is None
         )
         if merge:

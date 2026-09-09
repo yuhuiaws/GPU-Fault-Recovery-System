@@ -43,7 +43,7 @@ def test_hyperpod_deploy_keeps_dedicated_and_role_split_defaults() -> None:
     # environment below is set on both tiers, and the deploy fails if
     # the worker tier did not come up.
     assert "control-plane/regional/generated/${manifest}.yaml" in script
-    assert "verify-control-plane-role-split.sh" in script
+    assert "verify_control_plane_role_split.py" in script
     assert "deployment/gpu-fault-control-worker" in script
     assert "enable-control-plane-role-split" not in script
 

@@ -13,6 +13,9 @@ from gpu_fault.processor import (
 from gpu_fault.store.contracts import ProcessorQueueStats
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.processor_helpers import (
+    coalesce_routine_sample,
+)
+from gpu_fault.store.shared.processor_helpers import (
     fault_rows_blocked_by_observation as _fault_rows_blocked_by_observation,
 )
 from gpu_fault.store.shared.processor_helpers import (
@@ -77,12 +80,7 @@ class SqliteProcessorQueueMixin:
                     None,
                 )
                 if pending_match is not None:
-                    coalesced = request.model_copy(
-                        update={
-                            "request_id": pending_match.request_id,
-                            "created_at": pending_match.created_at,
-                        }
-                    )
+                    coalesced = coalesce_routine_sample(pending_match, request)
                     self._put(
                         "processor_request",
                         pending_match.request_id,

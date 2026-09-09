@@ -1,8 +1,8 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
-    Any,
     DCGM_DIAGNOSTIC_EMAIL_TEMPLATE,
     DCGM_DIAGNOSTIC_TEMPLATE_VERSION,
+    AdvisoryNotification,
+    Any,
 )
 
 

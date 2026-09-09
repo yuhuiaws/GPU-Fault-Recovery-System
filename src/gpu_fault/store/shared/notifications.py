@@ -5,7 +5,7 @@ lease transitions, each one row keyed by notification or owner id."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -55,6 +55,21 @@ class SharedNotificationMixin:
     ) -> NotificationResult | None:
         return self._get_optional("notification_result", notification_id)
 
+    def get_notification_delivery(
+        self, notification_id: str
+    ) -> NotificationDelivery | None:
+        """The outbox row for one notification, or ``None`` before it has one.
+
+        ``send`` reads this to stay idempotent: a notification already in the
+        outbox is left exactly where the dispatcher put it (control-plane
+        review 2026-09-08, F-2).
+        """
+
+        return cast(
+            "NotificationDelivery | None",
+            self._get_optional("notification_delivery", notification_id),
+        )
+
     def get_notification_watermark(
         self, owner_id: str = "default"
     ) -> NotificationDispatchWatermark | None:
@@ -101,8 +116,11 @@ class SharedNotificationMixin:
             current = self._get_optional("notification_delivery", notification_id)
             if current is not None:
                 queued_at = now or datetime.now(timezone.utc)
-                # See the in-memory implementation: asking again restarts
-                # the shelf life.
+                # See the in-memory implementation: asking again is an
+                # explicit requeue -- it restarts the shelf life and, for a
+                # row the dispatcher had backed off or given up on, the
+                # attempt budget too. ``send`` no longer reaches this branch;
+                # only ``AdvisoryNotificationService.requeue`` does (F-2).
                 update: dict = {
                     "requeued_at": queued_at,
                     "updated_at": queued_at,
@@ -113,6 +131,7 @@ class SharedNotificationMixin:
                 }:
                     update |= {
                         "status": NotificationDeliveryStatus.PENDING,
+                        "attempts": 0,
                         "available_at": queued_at,
                         "lease_owner": None,
                         "lease_expires_at": None,

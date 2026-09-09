@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import subprocess
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -8,32 +8,55 @@ from typing import Any, Sequence
 import pytest
 
 from gpu_fault.admin import bootstrap_aurora as aurora
+from gpu_fault.admin.bootstrap_common import BootstrapError, BootstrapMutationRequired
 from gpu_fault.admin.config import AuroraCapacityConfig
 from gpu_fault.admin.config_file import initialize_desired_admin_config
+
+# The error code RDS answers a describe of something that is not there with.
+NOT_FOUND = {
+    "describe-db-instances": "DBInstanceNotFound",
+    "describe-db-cluster-parameter-groups": "DBParameterGroupNotFound",
+}
 
 
 class Runner:
     """Records the AWS calls instead of making them, and plays a two-instance
-    Serverless v2 cluster whose window only changes after ``modify-db-cluster``."""
+    Serverless v2 cluster whose window only changes after ``modify-db-cluster``.
 
-    dry_run = False
+    ``missing`` names the describes that answer "not there" the way RDS does:
+    a failed read carrying the not-found code. The ensure paths decide from
+    that one read, so the fake has no separate existence switch to get wrong.
+    """
 
     def __init__(
-        self, statuses: Sequence[str] = (), *, window: tuple[float, float] = (0.5, 8.0)
+        self,
+        statuses: Sequence[str] = (),
+        *,
+        window: tuple[float, float] = (0.5, 8.0),
+        missing: Sequence[str] = (),
     ) -> None:
         self.calls: list[tuple[str, ...]] = []
         # Each entry is the cluster status one settle poll observes; the list is
         # consumed in order and the last value repeats forever.
         self.statuses = list(statuses) or ["available"]
         self.window = window
+        self.missing = frozenset(missing)
 
     def run(self, arguments: Sequence[str], **_keywords: Any) -> str:
         self.calls.append(tuple(arguments))
         return ""
 
+    def _absent(self, operation: str) -> None:
+        if operation in self.missing:
+            raise BootstrapError(
+                f"command failed (254): aws: An error occurred "
+                f"({NOT_FOUND[operation]}) when calling the operation"
+            )
+
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
         self.calls.append(("aws", *arguments))
         operation = arguments[1]
+        self._absent(operation)
         if operation == "describe-db-clusters":
             status = self.statuses[0]
             if len(self.statuses) > 1:
@@ -234,28 +257,6 @@ def test_settle_gives_up_rather_than_polling_a_stuck_cluster_forever(
         )
 
 
-def test_a_dry_run_never_polls_for_a_change_it_did_not_make(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--dry-run`` skips the modify, so waiting for it would wait forever."""
-
-    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
-    runner = Runner(["modifying"])
-    runner.dry_run = True
-
-    aurora.reconcile_existing_capacity(
-        runner,
-        aws_region="us-east-1",
-        cluster_id="aurora-a",
-        cluster={},
-        capacity=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
-    )
-
-    operations = _operations(runner)
-    assert operations.count("modify-db-cluster") == 1
-    assert operations[operations.index("modify-db-cluster") + 1 :] == []
-
-
 def test_missing_instances_are_created_in_their_own_availability_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,12 +266,7 @@ def test_missing_instances_are_created_in_their_own_availability_zone(
     depends on a no-op, and the zone is only pinned at create time.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = Runner()
+    runner = Runner(missing=["describe-db-instances"])
 
     instance_ids = aurora.ensure_serverless_instances(
         runner,
@@ -282,7 +278,9 @@ def test_missing_instances_are_created_in_their_own_availability_zone(
 
     assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
     assert _operations(runner) == [
+        "describe-db-instances",
         "create-db-instance",
+        "describe-db-instances",
         "create-db-instance",
         "wait",
         "wait",
@@ -305,11 +303,6 @@ def test_existing_instances_are_waited_for_but_not_recreated(
     in ``creating``.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = Runner()
 
     aurora.ensure_serverless_instances(
@@ -320,24 +313,48 @@ def test_existing_instances_are_waited_for_but_not_recreated(
         safe_name=lambda value, maximum: value[:maximum],
     )
 
-    assert _operations(runner) == ["wait", "wait"]
+    assert _operations(runner) == [
+        "describe-db-instances",
+        "describe-db-instances",
+        "wait",
+        "wait",
+    ]
 
 
-def test_a_missing_availability_zone_is_refused_rather_than_defaulted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_throttled_instance_read_is_not_read_as_a_missing_instance() -> None:
+    """``create-db-instance`` on an identifier that exists fails the bootstrap,
+    so a describe that failed for any reason but not-found must stop here."""
+
+    class Throttled(Runner):
+        def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
+            self.calls.append(("aws", *arguments))
+            raise BootstrapError(
+                "command failed (254): aws: An error occurred (Throttling) "
+                "when calling the DescribeDBInstances operation: Rate exceeded"
+            )
+
+    runner = Throttled()
+
+    with pytest.raises(BootstrapError, match="Throttling"):
+        aurora.ensure_serverless_instances(
+            runner,
+            aws_region="us-east-1",
+            cluster_id="aurora-a",
+            availability_zones=["us-east-1a", "us-east-1b"],
+            safe_name=lambda value, maximum: value[:maximum],
+        )
+
+    assert "create-db-instance" not in _operations(runner)
+
+
+def test_a_missing_availability_zone_is_refused_rather_than_defaulted() -> None:
     """One zone for two instances is a configuration error, not a placement.
 
     ``zip`` without ``strict`` would silently create only the writer, leaving a
     single-instance cluster that reads as a successful bootstrap.
     """
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = Runner()
+    runner = Runner(missing=["describe-db-instances"])
 
     with pytest.raises(ValueError, match="argument 2 is shorter"):
         aurora.ensure_serverless_instances(
@@ -353,12 +370,15 @@ class DiagnosticsRunner(Runner):
     """Plays the parameter-group side of RDS: the group's current values and
     the engine family, plus a quiet cluster for the settle wait."""
 
-    def __init__(self, parameters: dict[str, str] | None = None) -> None:
-        super().__init__()
+    def __init__(
+        self, parameters: dict[str, str] | None = None, *, missing: Sequence[str] = ()
+    ) -> None:
+        super().__init__(missing=missing)
         self.parameters = dict(parameters or {})
 
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> dict:
         self.calls.append(("aws", *arguments))
+        self._absent(arguments[1])
         if arguments[1] == "describe-db-engine-versions":
             return {
                 "DBEngineVersions": [{"DBParameterGroupFamily": "aurora-postgresql16"}]
@@ -382,19 +402,14 @@ def _settled(parameters: dict[str, str]) -> dict[str, str]:
     }
 
 
-def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled() -> (
+    None
+):
     """The default group cannot be modified, so a fresh cluster gets its own
     group, in the family of its engine version, with the four diagnostic
     parameters set in one call."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 254),
-    )
-    runner = DiagnosticsRunner()
+    runner = DiagnosticsRunner(missing=["describe-db-cluster-parameter-groups"])
 
     group = aurora.ensure_cluster_parameter_group(
         runner,
@@ -406,15 +421,16 @@ def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
 
     assert group == "aurora-a-pg"
     assert _operations(runner) == [
+        "describe-db-cluster-parameter-groups",
         "describe-db-engine-versions",
         "create-db-cluster-parameter-group",
         "modify-db-cluster-parameter-group",
     ]
-    create = runner.calls[1]
+    create = runner.calls[2]
     assert (
         create[create.index("--db-parameter-group-family") + 1] == "aurora-postgresql16"
     )
-    modify = runner.calls[2]
+    modify = runner.calls[3]
     parameters = modify[modify.index("--parameters") + 1 :]
     assert (
         "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate"
@@ -426,17 +442,10 @@ def test_a_missing_parameter_group_is_created_for_the_engine_family_and_filled(
     ) in parameters
 
 
-def test_a_settled_parameter_group_is_left_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_settled_parameter_group_is_left_alone() -> None:
     """A routine deploy must not modify a group whose values already match:
     the modify is a live mutation even when nothing changes."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = DiagnosticsRunner(_settled({"work_mem": "65536"}))
 
     aurora.ensure_cluster_parameter_group(
@@ -447,20 +456,16 @@ def test_a_settled_parameter_group_is_left_alone(
         safe_name=lambda value, maximum: value[:maximum],
     )
 
-    assert _operations(runner) == ["describe-db-cluster-parameters"]
+    assert _operations(runner) == [
+        "describe-db-cluster-parameter-groups",
+        "describe-db-cluster-parameters",
+    ]
 
 
-def test_only_the_drifted_parameters_are_rewritten(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_only_the_drifted_parameters_are_rewritten() -> None:
     """An operator's other parameters and the already-correct ones stay out of
     the modify call."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
     runner = DiagnosticsRunner(_settled({"log_lock_waits": "0"}))
 
     aurora.ensure_cluster_parameter_group(
@@ -537,11 +542,10 @@ def test_an_existing_group_is_read_from_the_projected_parameter_list(
     with the bare list, not ``{"Parameters": [...]}``. The first live deploy
     created the group and never listed it; the second one did and crashed."""
 
-    monkeypatch.setattr(
-        aurora.subprocess,
-        "run",
-        lambda *_args, **_keywords: subprocess.CompletedProcess([], 0),
-    )
+    # The group's existence is now probed through the runner
+    # (``describe_or_absent``); ``DiagnosticsRunner`` answers that describe with
+    # a document, so the group reads as existing without patching subprocess.
+    del monkeypatch
 
     class ProjectedRunner(DiagnosticsRunner):
         def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:
@@ -565,3 +569,324 @@ def test_an_existing_group_is_read_from_the_projected_parameter_list(
     assert modify[modify.index("--parameters") + 1 :] == (
         "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate",
     ), modify
+
+
+# --- instance readiness off the critical path -----------------------------------------
+
+
+class ReadinessRunner(Runner):
+    """Plays the instance side of RDS for the split ensure/await path.
+
+    ``instance_statuses`` answers the one filtered describe the readiness code
+    issues; ``secret_answers`` scripts ``get-secret-value`` (an exception is
+    raised, a string returned); ``secret_present`` is what ``kubectl get secret``
+    sees. ``wait_barrier`` lets a test prove both instance waits were in flight
+    at the same time: a barrier of two only opens when both threads reach it.
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_statuses: dict[str, str],
+        secret_answers: Sequence[str | Exception] = (),
+        secret_present: bool = True,
+        wait_barrier: threading.Barrier | None = None,
+        **keywords: Any,
+    ) -> None:
+        super().__init__(**keywords)
+        self.instance_statuses = dict(instance_statuses)
+        self.secret_answers = list(secret_answers)
+        self.secret_present = secret_present
+        self.wait_barrier = wait_barrier
+        self.wait_threads: list[int] = []
+
+    def run(self, arguments: Sequence[str], **_keywords: Any) -> str:
+        self.calls.append(tuple(arguments))
+        if arguments[0] == "kubectl":
+            return "gpu-fault-aurora" if self.secret_present else ""
+        if arguments[2] == "wait":
+            self.wait_threads.append(threading.get_ident())
+            if self.wait_barrier is not None:
+                self.wait_barrier.wait()
+        return ""
+
+    def aws_text(self, _region: str, *arguments: str, **_keywords: Any) -> str:
+        self.calls.append(("aws", *arguments))
+        answer = self.secret_answers.pop(0) if self.secret_answers else _SECRET
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def aws_json(self, region: str, *arguments: str, **keywords: Any) -> dict:
+        if arguments[1] == "describe-db-instances" and "--filters" in arguments:
+            self.calls.append(("aws", *arguments))
+            return {
+                "DBInstances": [
+                    {"DBInstanceIdentifier": name, "DBInstanceStatus": status}
+                    for name, status in self.instance_statuses.items()
+                ]
+            }
+        value = super().aws_json(region, *arguments, **keywords)
+        if arguments[1] == "describe-db-clusters":
+            value["DBClusters"][0].update(
+                {
+                    "Endpoint": "c.cluster.example",
+                    "MasterUserSecret": {
+                        "SecretArn": "arn:aws:secretsmanager:x",
+                        "KmsKeyId": "arn:aws:kms:x",
+                    },
+                }
+            )
+        return value
+
+
+_SECRET = '{"username": "gpu_fault", "password": "p"}'
+_NOT_FOUND = BootstrapError(
+    "command failed (254): aws: An error occurred (ResourceNotFoundException) "
+    "when calling the GetSecretValue operation: Secrets Manager can't find the "
+    "specified secret."
+)
+_AVAILABLE = {"aurora-a-writer": "available", "aurora-a-reader": "available"}
+_READER_CREATING = {"aurora-a-writer": "available", "aurora-a-reader": "creating"}
+
+
+def _await_ready(runner: ReadinessRunner) -> aurora.AuroraReadiness:
+    return aurora.await_aurora_ready(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+    )
+
+
+def test_the_foundation_creates_the_instances_without_waiting_for_them() -> None:
+    """The writer and reader take five to ten minutes to come up; the foundation
+    task only has to issue the creates, so the wait can overlap the platform
+    tasks that need no database."""
+
+    runner = Runner(missing=["describe-db-instances"])
+
+    instance_ids = aurora.ensure_serverless_instances(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        availability_zones=["us-east-1a", "us-east-1b"],
+        safe_name=lambda value, maximum: value[:maximum],
+        wait=False,
+    )
+
+    assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
+    assert _operations(runner) == [
+        "describe-db-instances",
+        "create-db-instance",
+        "describe-db-instances",
+        "create-db-instance",
+    ], "the foundation task waited for an instance"
+
+
+def test_both_instance_waits_are_in_flight_at_the_same_time() -> None:
+    """Two ``rds wait`` calls back to back cost the sum of both; issued together
+    they cost the slower one. A two-party barrier inside the fake only opens
+    when both waits have started, so a serial implementation times out here."""
+
+    runner = ReadinessRunner(
+        instance_statuses={}, wait_barrier=threading.Barrier(2, timeout=5.0)
+    )
+
+    aurora.await_serverless_instances(
+        runner,
+        aws_region="us-east-1",
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+    )
+
+    assert _operations(runner) == ["wait", "wait"]
+    assert len(set(runner.wait_threads)) == 2, "both waits ran on one thread"
+
+
+def test_an_available_cluster_is_proved_ready_by_describes_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rerun against a live site must not pay for an ``rds wait`` per
+    instance: one filtered describe says both are available, the secret is read
+    once, and nothing is created or waited for."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = ReadinessRunner(instance_statuses=_AVAILABLE)
+
+    ready = _await_ready(runner)
+
+    assert _operations(runner) == [
+        "describe-db-instances",
+        "describe-db-clusters",
+        "get-secret-value",
+    ]
+    assert ready == aurora.AuroraReadiness(
+        endpoint="c.cluster.example",
+        secret_arn="arn:aws:secretsmanager:x",
+        kms_key_arn="arn:aws:kms:x",
+        username="gpu_fault",
+        password="p",
+    )
+    assert "gpu_fault" not in repr(ready), "the credentials leaked into the repr"
+
+
+def test_only_the_instances_still_creating_are_waited_for_and_the_secret_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = ReadinessRunner(instance_statuses=_READER_CREATING)
+
+    _await_ready(runner)
+
+    operations = _operations(runner)
+    waits = [call for call in runner.calls if call[2] == "wait"]
+    assert [call[call.index("--db-instance-identifier") + 1] for call in waits] == [
+        "aurora-a-reader"
+    ], "an available instance was waited for, or a creating one was not"
+    assert operations.index("wait") < operations.index("get-secret-value"), (
+        "the master secret was read before the instances were available"
+    )
+
+
+def test_the_master_secret_read_retries_until_the_secret_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RDS reports the managed secret's ARN before Secrets Manager can serve its
+    value; a read that lands in that window must try again, not fail the
+    deploy and not fall back to an empty credential."""
+
+    naps: list[float] = []
+    monkeypatch.setattr(aurora.time, "sleep", naps.append)
+    runner = ReadinessRunner(
+        instance_statuses=_AVAILABLE, secret_answers=[_NOT_FOUND, _NOT_FOUND, _SECRET]
+    )
+
+    ready = _await_ready(runner)
+
+    assert ready.username == "gpu_fault"
+    assert _operations(runner).count("get-secret-value") == 3
+    assert naps == [aurora.MASTER_SECRET_READ_POLL_SECONDS] * 2
+
+
+def test_a_master_secret_that_never_appears_fails_closed_after_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = ReadinessRunner(
+        instance_statuses=_AVAILABLE,
+        secret_answers=[_NOT_FOUND] * (aurora.MASTER_SECRET_READ_ATTEMPTS + 5),
+    )
+
+    with pytest.raises(BootstrapError, match="master user secret is not readable"):
+        _await_ready(runner)
+
+    assert (
+        _operations(runner).count("get-secret-value")
+        == aurora.MASTER_SECRET_READ_ATTEMPTS
+    ), "the secret read did not stop at its bound"
+
+
+def test_a_secret_read_denied_by_iam_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only "not there yet" is worth another attempt; a permission error will
+    read the same on every try and must surface at once with its own message."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    denied = BootstrapError(
+        "command failed (254): aws: An error occurred (AccessDeniedException) "
+        "when calling the GetSecretValue operation"
+    )
+    runner = ReadinessRunner(
+        instance_statuses=_AVAILABLE, secret_answers=[denied, _SECRET]
+    )
+
+    with pytest.raises(BootstrapError, match="AccessDeniedException"):
+        _await_ready(runner)
+
+    assert _operations(runner).count("get-secret-value") == 1
+
+
+def _probe(runner: ReadinessRunner) -> None:
+    aurora.assert_aurora_ready(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+        kubeconfig=Path("/state/cpu.kubeconfig"),
+        namespace="gpu-fault-system",
+    )
+
+
+def test_the_readiness_probe_passes_on_an_available_cluster_with_its_secret() -> None:
+    runner = ReadinessRunner(instance_statuses=_AVAILABLE)
+
+    _probe(runner)
+
+    aws = [call[2] for call in runner.calls if call[0] == "aws"]
+    assert aws == ["describe-db-instances"], "the probe issued more than one RDS read"
+    kubectl = [call for call in runner.calls if call[0] == "kubectl"]
+    assert len(kubectl) == 1 and "gpu-fault-aurora" in kubectl[0], kubectl
+    assert "--ignore-not-found" in kubectl[0], "a missing Secret would fail the probe"
+
+
+def test_the_readiness_probe_reads_a_creating_instance_as_drift() -> None:
+    runner = ReadinessRunner(instance_statuses=_READER_CREATING)
+
+    with pytest.raises(BootstrapMutationRequired, match="aurora-a-reader"):
+        _probe(runner)
+
+    assert "wait" not in _operations(runner), "the read-only probe waited"
+
+
+def test_the_readiness_probe_reads_a_missing_secret_as_drift() -> None:
+    runner = ReadinessRunner(instance_statuses=_AVAILABLE, secret_present=False)
+
+    with pytest.raises(BootstrapMutationRequired, match="gpu-fault-aurora"):
+        _probe(runner)
+
+
+def test_a_drifted_window_waits_for_creating_instances_before_the_modify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The foundation no longer waits for the instances, but the capacity
+    reconciler still proves the window on both members, so a drifted window on
+    a cluster whose instances are still creating waits for them first -- and a
+    matching window costs neither a wait nor a describe."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = ReadinessRunner(
+        instance_statuses={
+            "aurora-a-writer": "creating",
+            "aurora-a-reader": "available",
+        }
+    )
+    cluster = {
+        "ServerlessV2ScalingConfiguration": {"MinCapacity": 0.5, "MaxCapacity": 8}
+    }
+
+    aurora.reconcile_existing_capacity(
+        runner,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster=cluster,
+        capacity=AuroraCapacityConfig(min_acu=16.0, max_acu=64.0),
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+    )
+
+    operations = _operations(runner)
+    assert operations.count("wait") == 1
+    assert operations.index("wait") < operations.index("modify-db-cluster")
+
+    settled = ReadinessRunner(
+        instance_statuses={"aurora-a-writer": "creating", "aurora-a-reader": "creating"}
+    )
+    aurora.reconcile_existing_capacity(
+        settled,
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        cluster=cluster,
+        capacity=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+    )
+    assert settled.calls == [], "a matching window still touched RDS"

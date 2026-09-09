@@ -8,6 +8,10 @@ import httpx
 import pytest
 
 from gpu_fault.app import ApplicationContext, create_app
+from gpu_fault.execution.restart_budget_preflight import (
+    release_unattempted_restart_reservations,
+    reservation_id,
+)
 from gpu_fault.fleet import (
     AgentHeartbeat,
     FleetRegistry,
@@ -28,6 +32,7 @@ from tests._builders import (
     build_context,
     build_store,
     copy_model,
+    workflow_step_execution,
 )
 from tests.regional._regional_support import (
     NOW,
@@ -345,7 +350,7 @@ def test_remote_command_digest_includes_rebound_nodes() -> None:
     )
 
 
-def test_failed_remote_restart_releases_restart_budget() -> None:
+def test_failed_remote_restart_leaves_the_reservation_to_terminalization() -> None:
     store = build_store()
     store.save_regional_cluster(registration("cluster-a", TOKEN_A))
     adapter = RegionalRemoteWorkflowAdapter(
@@ -365,9 +370,10 @@ def test_failed_remote_restart_releases_restart_budget() -> None:
         },
     )
     workflow = copy_model(base.workflow, official_steps=[step])
-    context = replace(
-        base, workflow=workflow, step=step, idempotency_key="restart-budget-release"
-    )
+    reservation = reservation_id(workflow, 0)
+    context = replace(base, workflow=workflow, step=step, idempotency_key=reservation)
+    # The preflight's reservation; dispatch only signs it.
+    store.reserve_job_restart("cluster-a", "training-a", 1, reservation)
     adapter.execute(context)
     command = store.claim_remote_commands(
         "cluster-a",
@@ -376,6 +382,8 @@ def test_failed_remote_restart_releases_restart_budget() -> None:
         lease_seconds=60,
         execution_owners={"gpu-fault-kubernetes-adapter"},
     )[0]
+    # What the cluster executor forwards from the data-plane guard's refusal:
+    # the adapter's outcome details, marker included.
     store.complete_remote_command(
         "cluster-a",
         command.command_id,
@@ -383,15 +391,39 @@ def test_failed_remote_restart_releases_restart_budget() -> None:
             lease_token=command.lease_token,
             status=RemoteCommandStatus.FAILED,
             error="restart rejected",
+            details={"restart_submitted": False},
         ),
     )
 
     failed = adapter.execute(context)
-    budget = store.get_restart_budget("cluster-a", "training-a")
+    held = store.get_restart_budget("cluster-a", "training-a")
 
+    # Dispatch neither reserves nor releases: the reservation stays with the
+    # step until the workflow's terminal write decides whether the restart
+    # ever left the gate.
     assert failed.status is WorkflowStepStatus.FAILED
-    assert budget.restart_count == 0
-    assert budget.reservation_ids == []
+    assert failed.details["restart_submitted"] is False
+    assert held.restart_count == 1
+    assert held.reservation_ids == [reservation]
+
+    # The terminal write reads the marker off the step record and releases.
+    release_unattempted_restart_reservations(
+        store,
+        copy_model(
+            workflow,
+            step_executions=[
+                workflow_step_execution(
+                    0,
+                    WorkflowOperation.RESTART_WORKLOAD,
+                    WorkflowStepStatus.FAILED,
+                    details=failed.details,
+                )
+            ],
+        ),
+    )
+    released = store.get_restart_budget("cluster-a", "training-a")
+    assert released.restart_count == 0
+    assert released.reservation_ids == []
 
 
 def test_remote_claim_filters_execution_owners_and_legacy_api() -> None:
@@ -710,6 +742,10 @@ def test_regional_api_sends_executor_workload_restart_notification() -> None:
         },
     )
     workflow = copy_model(base.workflow, official_steps=[step])
+    # The preflight's reservation; dispatch only signs it.
+    context.store.reserve_job_restart(
+        "cluster-a", "training-a", 2, "workflow-workload-restart/0/RESTART_WORKLOAD"
+    )
     remote.execute(
         replace(
             base,

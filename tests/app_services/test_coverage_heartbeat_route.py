@@ -11,9 +11,13 @@ coverage for somebody else's cluster.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault import channel_registry
 from gpu_fault.app import create_app
+from gpu_fault.channel_registry import CHANNEL_REGISTRY, ChannelPriorityMode
+from gpu_fault.processor.models import ProcessorLanePolicy, ProcessorRequest
 from gpu_fault.telemetry import ATTEMPT_COVERAGE_PATH, WorkloadCoverageHeartbeat
 from tests._builders import asgi_client, build_context
 from tests.regional._regional_support import TOKEN_A, registration
@@ -137,3 +141,42 @@ def test_a_coverage_heartbeat_without_the_cluster_token_is_refused() -> None:
     assert context.store.get_workload_coverage_heartbeat(CLUSTER) is not None, (
         "the authorized heartbeat was not persisted"
     )
+
+
+def test_the_channel_is_routine_latest_wins_and_coalesces_per_cluster() -> None:
+    """The heartbeat is queued like other routine traffic, one row per cluster.
+
+    The payload names no attempt or node, so its ordering key is the cluster;
+    latest-wins keeps a single pending row per cluster however often the
+    watcher passes, which is right for a row the next pass supersedes anyway.
+    """
+
+    assert channel_registry.ATTEMPT_COVERAGE_PATH == ATTEMPT_COVERAGE_PATH, (
+        "the registered channel and the route the watcher posts to must be one path"
+    )
+    channel = CHANNEL_REGISTRY[ATTEMPT_COVERAGE_PATH]
+    assert channel.priority_mode is ChannelPriorityMode.ROUTINE
+    assert channel.latest_wins is True
+    assert channel.receipt is True
+
+    def request(observed_at: datetime) -> ProcessorRequest:
+        body = _heartbeat().model_copy(update={"observed_at": observed_at})
+        return ProcessorRequest.from_http(
+            method="POST",
+            path=ATTEMPT_COVERAGE_PATH,
+            query="",
+            body=json.dumps(body.model_dump(mode="json")).encode(),
+            content_type="application/json",
+            cluster_id=CLUSTER,
+        )
+
+    first = request(NOW)
+    second = request(NOW + timedelta(seconds=120))
+    # ``/v1/attempts/`` is otherwise the tier-0 control-plane-action prefix; the
+    # heartbeat is carved out of it so the ROUTINE channel is what applies.
+    assert not channel_registry.is_control_plane_action_path(ATTEMPT_COVERAGE_PATH)
+    assert not channel_registry.is_fault_path(ATTEMPT_COVERAGE_PATH)
+    assert first.queue_priority() == 100
+    assert first.is_reserved_tier() is False
+    assert first.ordering_key() == second.ordering_key() == CLUSTER
+    assert first.lane_policy is second.lane_policy is ProcessorLanePolicy.REORDERABLE

@@ -614,3 +614,25 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         mode = path.stat().st_mode & 0o777
         assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
         assert source.splitlines()[0] == "#!/usr/bin/env python3", path.name
+
+
+def test_the_spare_snapshot_reports_the_reserved_at_annotation_the_case_writes() -> (
+    None
+):
+    """Live attempt 1 (2026-09-08) wrote the back-dated reservation and then
+    read the node back through a snapshot that did not project
+    ``spare-reserved-at``, so the injection was judged "not written"."""
+    from scripts.e2e.regional import warm_spare_fixture
+
+    assert (
+        verdicts.SPARE_RESERVED_AT_ANNOTATION in warm_spare_fixture.SNAPSHOT_ANNOTATIONS
+    )
+    assert (
+        verdicts.SPARE_RESERVATION_ANNOTATION in warm_spare_fixture.SNAPSHOT_ANNOTATIONS
+    )
+    assert (
+        verdicts.SPARE_POOL_STATE_ANNOTATION in warm_spare_fixture.SNAPSHOT_ANNOTATIONS
+    )
+    assert set(verdicts.TRACKED_ANNOTATIONS) <= set(
+        warm_spare_fixture.SNAPSHOT_ANNOTATIONS
+    ), "every annotation the case mutates must be in the baseline it restores from"

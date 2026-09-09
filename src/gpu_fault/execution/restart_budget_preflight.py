@@ -1,31 +1,32 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import logging
 from typing import Any, Literal, Sequence
 
+import gpu_fault.execution.step_bounds as step_bounds
+from gpu_fault.execution.config import (
+    NODE_INSTALL_OPERATIONS,
+    OPERATOR_ACKNOWLEDGEMENT_OPERATIONS,
+)
+from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.remediation_budget import remediation_budget_claims
 from gpu_fault.models import (
-    resolved_step_indexes,
     FaultIncident,
     IncidentState,
-    WorkflowOperation,
+    RestartAuthorization,
     WorkflowExecutionRequest,
+    WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepExecution,
     WorkflowStepSpec,
     WorkflowStepStatus,
+    resolved_step_indexes,
 )
+from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store import NotFoundError
-from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.execution.config import (
-    NODE_INSTALL_OPERATIONS,
-    OPERATOR_ACKNOWLEDGEMENT_OPERATIONS,
-)
-from gpu_fault.execution.remediation_budget import remediation_budget_claims
-import gpu_fault.execution.step_bounds as step_bounds
-
 
 LOGGER = logging.getLogger(__name__)
 _REQUIRED_RESTART_PARAMETERS = frozenset(
@@ -37,6 +38,9 @@ _REQUIRED_RESTART_PARAMETERS = frozenset(
         "restart_budget",
     }
 )
+# ``details["reason"]`` of the one preflight failure that does not abort the
+# workflow (see ``withhold_exhausted_restart``).
+BUDGET_EXHAUSTED_REASON = "RESTART_BUDGET_EXHAUSTED"
 
 
 @dataclass(frozen=True)
@@ -74,8 +78,8 @@ def reservation_id(
     """The reservation a RESTART_WORKLOAD step holds on its job's budget.
 
     Also the adapter's idempotency key for that step: the restart adapter
-    reserves under its key, and the two have to agree or a step would take a
-    second reservation. The official form is the historical
+    compares its authorization's ``reservation_id`` with that key, so the two
+    have to agree or the restart is refused. The official form is the historical
     ``<workflow>/<index>/RESTART_WORKLOAD`` so rows reserved before the phase
     existed still match; only the safety phase carries a discriminator.
     """
@@ -84,6 +88,78 @@ def reservation_id(
     if phase == "safety":
         return f"{workflow.request_id}/safety/{step_index}/{operation}"
     return f"{workflow.request_id}/{step_index}/{operation}"
+
+
+def issue_restart_authorization(
+    store: Any,
+    incident: FaultIncident,
+    step: WorkflowStepSpec,
+    reservation_id: str,
+) -> RestartAuthorization | WorkflowStepOutcome:
+    """The proof a data-plane restart carries: the preflight's reservation.
+
+    Only ``reserve_restart_budgets`` reserves; this reads that reservation
+    back and signs it. A step without one is a step the preflight never
+    admitted (or whose reservation was released as unattempted) and fails
+    closed rather than reserving here.
+    """
+
+    parameters = step.parameters
+    missing = _REQUIRED_RESTART_PARAMETERS - set(parameters)
+    if missing:
+        return WorkflowStepOutcome.failed(
+            "restart safety context is missing: " + ", ".join(sorted(missing)),
+            details={
+                "reason": "RESTART_SAFETY_CONTEXT_MISSING",
+                "missing_parameters": sorted(missing),
+            },
+        )
+    cluster_id = str(parameters["cluster_id"])
+    job_id = str(parameters["job_id"])
+    # The same gates the claim preflight applied, in the same words: the gate
+    # trusts the incident over the plan, and a malformed plan is a FAILED step
+    # with a reason rather than an adapter traceback.
+    if cluster_id != incident.cluster_id:
+        return WorkflowStepOutcome.failed(
+            "restart safety context cluster does not match "
+            f"incident: {cluster_id} != {incident.cluster_id}",
+            details={
+                "reason": "RESTART_CLUSTER_MISMATCH",
+                "restart_cluster_id": cluster_id,
+                "incident_cluster_id": incident.cluster_id,
+            },
+        )
+    try:
+        source_gpu_count = int(parameters["source_gpu_count"])
+        restart_budget = int(parameters["restart_budget"])
+    except (TypeError, ValueError) as exc:
+        return WorkflowStepOutcome.failed(
+            f"restart safety context is invalid: {exc}",
+            details={"reason": "RESTART_SAFETY_CONTEXT_INVALID"},
+        )
+    try:
+        state = store.get_restart_budget(cluster_id, job_id)
+    except NotFoundError:
+        state = None
+    if state is None or reservation_id not in state.reservation_ids:
+        return WorkflowStepOutcome.failed(
+            f"restart reservation missing for {cluster_id}/{job_id}: {reservation_id}",
+            details={
+                "reason": "RESTART_RESERVATION_MISSING",
+                "reservation_id": reservation_id,
+                "restart_count": state.restart_count if state is not None else 0,
+                "restart_budget": state.budget if state is not None else restart_budget,
+            },
+        )
+    return RestartAuthorization(
+        cluster_id=cluster_id,
+        job_id=job_id,
+        source_attempt_id=str(parameters["source_attempt_id"]),
+        source_gpu_count=source_gpu_count,
+        restart_budget=state.budget,
+        restart_count=state.restart_count,
+        reservation_id=reservation_id,
+    )
 
 
 _reservation_id = reservation_id
@@ -173,10 +249,21 @@ def reserve_restart_budgets(
         phase = reservation_phase(workflow)
     # A superseded restart will never run, so it needs no reservation (F-C2).
     completed = set(resolved_step_indexes(workflow))
+    # A restart whose adapter already ran still holds the reservation made on
+    # its first claim (only a terminal write releases it), so re-reserving it
+    # on every claim was one budget write per tick for nothing (D-10).
+    already_attempted = {
+        item.step_index
+        for item in workflow.step_executions
+        if item.operation is WorkflowOperation.RESTART_WORKLOAD
+        and item.status is WorkflowStepStatus.WAITING
+        and item.phase in (None, phase)
+    }
     for step_index, step in enumerate(steps):
         if (
             step.operation is not WorkflowOperation.RESTART_WORKLOAD
             or step_index in completed
+            or step_index in already_attempted
         ):
             continue
         parameters = step.parameters
@@ -238,7 +325,7 @@ def reserve_restart_budgets(
                 f"{state.cluster_id}/{state.job_id}: "
                 f"{state.restart_count}/{state.budget}",
                 details={
-                    "reason": "RESTART_BUDGET_EXHAUSTED",
+                    "reason": BUDGET_EXHAUSTED_REASON,
                     "restart_count": state.restart_count,
                     "restart_budget": state.budget,
                 },
@@ -293,11 +380,14 @@ def prepare_claimed_workflow(
     execution_epoch = workflow.execution_epoch
     workflow = executor._adopt_quiesce_handoff_from_predecessor(workflow, incident)
     executor._save_leased(workflow, execution_epoch)
-    if workflow.pending_failure_step_index is not None:
+    if (
+        workflow.pending_failure_step_index is not None
+        and not executor._job_failure_still_deferred(workflow)
+    ):
         return ClaimedWorkflowPreparation(
             workflow=workflow,
             execution_epoch=execution_epoch,
-            result=executor._resume_failure_compensation(
+            result=executor._land_pending_failure(
                 workflow,
                 incident,
                 request,
@@ -306,28 +396,123 @@ def prepare_claimed_workflow(
             ),
         )
     steps = workflow.safety_steps if is_safety else workflow.official_steps
-    failure = reserve_restart_budgets(
-        executor.store,
-        workflow,
-        incident,
-        steps,
-        phase="safety" if is_safety else "official",
-    )
-    return ClaimedWorkflowPreparation(
-        workflow=workflow,
-        execution_epoch=execution_epoch,
-        result=(
-            fail_restart_preflight(
-                executor,
-                workflow,
-                incident,
-                execution_epoch,
-                failure,
+    # Each pass either reserves every pending restart, withholds one whose
+    # budget is spent and goes round again for the rest (the withheld step is
+    # resolved, so the next pass skips it), or aborts on a malformed context.
+    while True:
+        failure = reserve_restart_budgets(
+            executor.store,
+            workflow,
+            incident,
+            steps,
+            phase="safety" if is_safety else "official",
+        )
+        if failure is None:
+            return ClaimedWorkflowPreparation(
+                workflow=workflow,
+                execution_epoch=execution_epoch,
             )
-            if failure is not None
-            else None
-        ),
+        if (failure.outcome.details or {}).get("reason") != BUDGET_EXHAUSTED_REASON:
+            return ClaimedWorkflowPreparation(
+                workflow=workflow,
+                execution_epoch=execution_epoch,
+                result=fail_restart_preflight(
+                    executor,
+                    workflow,
+                    incident,
+                    execution_epoch,
+                    failure,
+                ),
+            )
+        workflow = withhold_exhausted_restart(
+            executor,
+            workflow,
+            incident,
+            execution_epoch,
+            failure,
+        )
+
+
+def withhold_exhausted_restart(
+    executor: Any,
+    workflow: WorkflowRequest,
+    incident: FaultIncident,
+    execution_epoch: int,
+    failure: RestartBudgetPreflightFailure,
+) -> WorkflowRequest:
+    """Keep the chain, drop only the restart, when the job's budget is spent.
+
+    逻辑 4. Failing the whole workflow here left the faulty GPU untouched with
+    the job still on it: no cordon, no stop, no reset ran, and the escalation
+    classifier opened no successor because the only FAILED execution was the
+    restart. The budget says "do not restart this job again", not "do not
+    repair this node", so the repair steps go ahead as planned and only the
+    restart is withheld: its FAILED record is written now, before any adapter
+    runs, and the index is superseded so both step loops skip it (F-C2) --
+    no reservation is taken and no adapter is ever called for it, and
+    ``release_unattempted_restart_reservations`` finds a FAILED record without
+    the waiting-cap detail and leaves the (nonexistent) reservation alone.
+    ``terminal_failure_reason`` then makes ``_complete_claimed_workflow`` end
+    the workflow FAILED instead of SUCCEEDED once the rest ran: the job was
+    stopped and not restarted, and someone has to resubmit it.
+
+    The other preflight failures (missing, mismatched or invalid safety
+    context) keep aborting before the first step: they mean the plan itself is
+    malformed, and a stop-and-reset chain compiled from a broken context is
+    not one to run on trust.
+
+    The BUDGET_EXHAUSTED notice uses the restart adapter's builder -- same
+    template, same deduplication key -- saved once and sent through the
+    executor's alert path; the preflight is the only site that sends it now
+    that the adapter no longer reserves budget.
+    """
+
+    parameters = failure.step.parameters
+    outcome = failure.outcome
+    details = dict(outcome.details or {})
+    notification = executor.restart_email_builder.build_budget_exhausted(
+        cluster_id=str(parameters["cluster_id"]),
+        incident_id=incident.incident_id,
+        job_id=str(parameters["job_id"]),
+        attempt_id=str(parameters["source_attempt_id"]),
+        restart_count=int(details["restart_count"]),
+        restart_budget=int(details["restart_budget"]),
     )
+    notification = executor.store.save_notification_if_absent(notification)
+    if executor.notification_sender is not None:
+        executor.notification_sender(notification.notification_id)
+    outcome = WorkflowStepOutcome.failed(
+        outcome.error or "restart budget exhausted",
+        details={**details, "notification_id": notification.notification_id},
+    )
+    workflow = step_bounds.record_attempt(
+        workflow,
+        failure.step,
+        failure.step_index,
+        outcome,
+    )
+    workflow = workflow.model_copy(
+        update={
+            "superseded_step_indexes": sorted(
+                set(workflow.superseded_step_indexes) | {failure.step_index}
+            ),
+            "terminal_failure_reason": (
+                workflow.terminal_failure_reason or outcome.error
+            ),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+    executor._save_leased(workflow, execution_epoch)
+    LOGGER.warning(
+        "restart withheld for an exhausted budget; the remaining steps run "
+        "and the workflow will end FAILED: workflow=%s step=%s error=%s "
+        "notification=%s",
+        workflow.request_id,
+        failure.step_index,
+        outcome.error,
+        notification.notification_id,
+    )
+    return workflow
 
 
 def fail_restart_preflight(
@@ -337,20 +522,27 @@ def fail_restart_preflight(
     execution_epoch: int,
     failure: RestartBudgetPreflightFailure,
 ) -> Any:
-    """Persist a restart preflight failure without invoking an adapter."""
+    """Persist a restart preflight failure without invoking an adapter.
 
+    Only the malformed-context failures come here; an exhausted budget is
+    routed to ``withhold_exhausted_restart`` by ``prepare_claimed_workflow``,
+    and that is where the operator's mail is sent (the restart adapter no
+    longer reserves, and so never learns the budget is gone).
+    """
+
+    outcome = failure.outcome
     workflow = step_bounds.record_attempt(
         workflow,
         failure.step,
         failure.step_index,
-        failure.outcome,
+        outcome,
     )
     result = executor._terminalize(
         workflow,
         incident,
         WorkflowStatus.FAILED,
         execution_epoch,
-        reason=failure.outcome.error,
+        reason=outcome.error,
         incident_state=IncidentState.ESCALATED,
     )
     LOGGER.warning(
@@ -366,30 +558,133 @@ def fail_restart_preflight(
 # The bounds in ``step_bounds`` stamp these when they, not the adapter, end a
 # step; a RESTART_WORKLOAD record carrying one never reached a submission.
 _WAITING_CAP_DETAIL = "step_waiting_timeout_seconds"
+# The restart adapter stamps this on every refusal, and every hold, it makes
+# before submitting anything; the regional path carries it verbatim from the
+# data plane's ``RemoteCommandResult.details`` into the step record.
+_NOT_SUBMITTED_DETAIL = "restart_submitted"
+# ``remote_status_source`` values of a FAILED remote command no adapter ever
+# ran: the cluster executor refused it before dispatch (its checks are
+# deterministic per command, so a later lease would have refused it too), or it
+# aged out PENDING because no executor ever claimed it.
+_NEVER_DISPATCHED_STATUS_SOURCES = frozenset(
+    {"executor-rejected", "unclaimed-deadline-exceeded"}
+)
+# ``remote_status_source`` values of a command the workflow cancelled while it
+# was PENDING or WAITING. Cancellation keeps the command's last report as its
+# ``result_details``, so those details say what the node was doing.
+_CANCELLED_STATUS_SOURCES = frozenset({"workflow-timeout", "workflow-preempted"})
+
+
+def _remote_command_is_before_submission(store: Any, command_id: str) -> bool:
+    """Judge a remote restart by the command as it is *now*.
+
+    The step record is last tick's snapshot: a hold it recorded may have been
+    lifted since, the command re-leased and the Job created, all before this
+    terminal write runs. So the live command decides. PENDING was never
+    leased; a WAITING or FAILED command whose current report carries the
+    adapter's marker (or a cancelled command that never reported) never
+    submitted; LEASED, SUCCEEDED and anything unreadable keep the budget.
+    """
+
+    try:
+        command = store.get_remote_command(command_id)
+    except Exception:  # noqa: BLE001 - an unreadable command is unknown; unknown keeps
+        return False
+    if command.status is RemoteCommandStatus.PENDING:
+        return True
+    if command.status is RemoteCommandStatus.WAITING:
+        return command.result_details.get(_NOT_SUBMITTED_DETAIL) is False
+    if command.status is RemoteCommandStatus.FAILED:
+        return (
+            command.result_details.get(_NOT_SUBMITTED_DETAIL) is False
+            or command.status_source in _NEVER_DISPATCHED_STATUS_SOURCES
+            or (
+                command.status_source in _CANCELLED_STATUS_SOURCES
+                and not command.result_details
+            )
+        )
+    return False
+
+
+def _wait_was_before_submission(details: dict[str, Any], store: Any) -> bool:
+    """Does a WAITING report (or the cap failure copied from one) prove that
+    the restart adapter had not submitted anything?
+
+    The adapter's own holds carry ``restart_submitted: False``. Two shapes
+    override or outrank that: a retryable adapter error is a WAITING the
+    *executor* answered for an exception that may have been raised after
+    ``create_namespaced_job`` (a 5xx on the second workload, a client
+    timeout after the API server persisted the Job), and a remote command
+    is judged live through the store (``_remote_command_is_before_submission``)
+    rather than by the status the record snapshotted. Without a command
+    pointer, a snapshotted LEASED keeps and a snapshotted PENDING releases.
+    Anything else says nothing, and nothing means keep.
+    """
+
+    if details.get("retryable_adapter_error"):
+        return False
+    command_id = details.get("remote_command_id")
+    if command_id:
+        return _remote_command_is_before_submission(store, str(command_id))
+    remote_status = details.get("remote_status")
+    if remote_status == RemoteCommandStatus.LEASED.value:
+        return False
+    if remote_status == RemoteCommandStatus.PENDING.value:
+        return True
+    return details.get(_NOT_SUBMITTED_DETAIL) is False
 
 
 def _restart_never_left_the_gate(
     record: WorkflowStepExecution,
     *,
+    store: Any,
     now: datetime,
     waiting_ttl: timedelta | None,
 ) -> bool:
     """Does this RESTART_WORKLOAD record show a restart that never happened?
 
-    The restart adapter answers WAITING only before it submits anything -- an
-    approval is pending, or the incident it depends on is not recovered -- so a
-    wait that outlived the step's cap, or that the cap already turned into a
-    failure, holds budget for a restart nobody made (F-C9). A remote command
-    that a cluster executor is running is the one shape that says nothing
-    about submission, and keeps its reservation.
+    Release needs positive evidence that nothing was submitted; a record that
+    says nothing keeps the budget spent, by decision (F-C9, Task 13 C-1).
+
+    A WAITING record older than ``waiting_ttl``, and a FAILED record the
+    waiting cap produced from one, release only when the wait was one of the
+    adapter's own pre-submission holds (``restart_submitted: False``) or the
+    remote command was never leased; a wait the executor answered for a
+    retryable adapter error, or whose remote command is LEASED, may hide a
+    Job that exists (``_wait_was_before_submission``). A remote command is
+    read live from the store, not from the record's snapshot: the hold may
+    have been lifted and the Job created since the record was written.
+
+    A FAILED record otherwise releases on the adapter's own marker (its
+    refusals carry it; the regional path copies it verbatim from the data
+    plane's ``RemoteCommandResult.details``), on a remote command no adapter
+    ever ran (executor-rejected, unclaimed), or on a cancelled command whose
+    last report carries the marker or that never left PENDING (no report at
+    all). A cancellation the node settled afterwards, an executor-internal or
+    configuration error, a stale-fence settle and a plain node failure keep
+    the budget spent.
     """
 
-    if str(record.details.get("remote_status") or "") == "RUNNING":
-        return False
+    details = record.details
     if record.status is WorkflowStepStatus.WAITING:
-        return waiting_ttl is not None and now - record.started_at >= waiting_ttl
-    if record.status is WorkflowStepStatus.FAILED:
-        return _WAITING_CAP_DETAIL in record.details
+        if waiting_ttl is None or now - record.started_at < waiting_ttl:
+            return False
+        return _wait_was_before_submission(details, store)
+    if record.status is not WorkflowStepStatus.FAILED:
+        return False
+    if _WAITING_CAP_DETAIL in details:
+        # ``bounded_waiting_outcome`` copies the last WAITING's details into
+        # this failure, so the same evidence rule applies.
+        return _wait_was_before_submission(details, store)
+    if details.get(_NOT_SUBMITTED_DETAIL) is False:
+        return True
+    source = details.get("remote_status_source")
+    if source in _NEVER_DISPATCHED_STATUS_SOURCES:
+        return True
+    if source in _CANCELLED_STATUS_SOURCES:
+        # ``RemoteActionCommand.result_details`` starts empty and nothing ever
+        # returns a command to PENDING: no report means no lease, no adapter.
+        return set(details) <= {"remote_status_source"}
     return False
 
 
@@ -441,7 +736,7 @@ def release_unattempted_restart_reservations(
             record is not None
             and step_index not in forced
             and not _restart_never_left_the_gate(
-                record, now=moment, waiting_ttl=waiting_ttl
+                record, store=store, now=moment, waiting_ttl=waiting_ttl
             )
         ):
             continue

@@ -36,6 +36,10 @@ def _deployment() -> dict:
         "metadata": {"name": "gpu-fault-api-ha"},
         "spec": {
             "replicas": 3,
+            "strategy": {
+                "type": "RollingUpdate",
+                "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 1},
+            },
             "selector": {"matchLabels": {"app": "gpu-fault-api-ha"}},
             "template": {
                 "metadata": {
@@ -44,9 +48,22 @@ def _deployment() -> dict:
                 },
                 "spec": {
                     "terminationGracePeriodSeconds": 120,
+                    "volumes": [
+                        {
+                            "name": "aurora-credentials",
+                            "secret": {"secretName": "gpu-fault-aurora"},
+                        }
+                    ],
                     "containers": [
                         {
                             "name": "api",
+                            "volumeMounts": [
+                                {
+                                    "name": "aurora-credentials",
+                                    "mountPath": "/etc/gpu-fault/aurora",
+                                    "readOnly": True,
+                                }
+                            ],
                             "args": [
                                 "if [ -x /opt/gpu-fault/control-plane/bin/python ]; "
                                 "then\n"
@@ -150,7 +167,7 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS"] == "30"
     assert ingress_env["GPU_FAULT_FAULT_REQUEST_BUDGET_SECONDS"] == "30"
     assert (
-        "--workers 4"
+        "--workers 4 "
         in (ingress["spec"]["template"]["spec"]["containers"][0]["args"][0])
     )
     assert (
@@ -182,6 +199,10 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         is None
     )
     assert worker["spec"]["replicas"] == 6
+    assert worker["spec"]["strategy"] == {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 1},
+    }
     assert _effective_env(items, worker)["PATH"].startswith(
         "/opt/gpu-fault/control-plane/bin:"
     ), "worker does not select the control-plane component venv"
@@ -189,7 +210,12 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     container = worker["spec"]["template"]["spec"]["containers"][0]
     assert container["name"] == "control-worker"
     assert "--port 8081" in container["args"][0]
+    assert "--workers 4 " in container["args"][0]
     assert "--limit-max-requests" not in container["args"][0]
+    assert container["resources"] == {
+        "requests": {"cpu": "3", "memory": "4Gi"},
+        "limits": {"cpu": "4", "memory": "6Gi"},
+    }
     assert (
         worker["spec"]["template"]["spec"]["topologySpreadConstraints"][0][
             "whenUnsatisfiable"
@@ -230,6 +256,7 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert worker_env["GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS"] == "0.1"
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS"] == "5"
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == "24"
+    assert worker_env["GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES"] == "24"
     assert worker_env["GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
@@ -326,6 +353,50 @@ def test_worker_replica_override_updates_notification_shards() -> None:
 
     assert worker["spec"]["replicas"] == 7
     assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == "28"
+    assert worker_env["GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES"] == "28"
+
+
+def test_every_role_runs_the_declared_uvicorn_worker_count() -> None:
+    """The worker count is the capacity model, so the render pins it per tier.
+
+    Ingress and control-worker run four uvicorn processes behind one port;
+    the telemetry spool runs one. Pools, consumer processes and notification
+    shards are ``replicas x workers``, and the Pod's /metrics is aggregated
+    over its live processes by ``gpu_fault.app.process_metrics`` so ADOT's
+    per-Pod scrape reads the whole Pod whichever process answers.
+    """
+
+    result = _render({"GPU_FAULT_CONTROL_WORKER_REPLICAS": "6"})
+    assert result.returncode == 0, result.stderr
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    expected = {
+        "gpu-fault-api-ha": 4,
+        "gpu-fault-control-worker": 4,
+        "gpu-fault-telemetry-spool-worker": 1,
+    }
+    assert set(expected) == set(ROLE_DEPLOYMENTS)
+    for name, workers in expected.items():
+        (container,) = items[name]["spec"]["template"]["spec"]["containers"]
+        command = container["args"][0]
+        assert command.count("--workers ") == 1, name
+        assert f"--workers {workers} " in command, name
+    worker = items["gpu-fault-control-worker"]
+    worker_env = _effective_env(items, worker)
+    processes = worker["spec"]["replicas"] * 4
+    assert worker_env["GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES"] == str(processes)
+    assert worker_env["GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS"] == str(processes)
+    ingress = items["gpu-fault-api-ha"]
+    ingress_pdb = items["gpu-fault-api-ha-pdb"]
+    worker_pdb = items["gpu-fault-control-worker-pdb"]
+    # Disruption and rolling budgets are one Pod at a time.
+    assert ingress["spec"]["replicas"] - ingress_pdb["spec"]["minAvailable"] == 1
+    assert worker_pdb["spec"]["maxUnavailable"] == 1
+    assert worker["spec"]["strategy"]["rollingUpdate"] == {
+        "maxUnavailable": 1,
+        "maxSurge": 1,
+    }
 
 
 def test_role_split_applies_common_administrator_tuning_to_all_roles() -> None:
@@ -456,7 +527,9 @@ def test_processor_pool_sizing_is_worker_tier_only() -> None:
     }
     ingress = items["gpu-fault-api-ha"]
     worker = items["gpu-fault-control-worker"]
-    assert _env_names(items, ingress).isdisjoint(POOL_ENV)
+    assert _env_names(items, ingress).isdisjoint(POOL_ENV), (
+        "ingress must not carry the worker pool variables"
+    )
     # Dropping them from ingress must not drop the tier that uses them,
     # which would quietly fall back to the 4-lane code default.
     assert set(POOL_ENV) <= _env_names(items, worker)
@@ -643,6 +716,8 @@ def test_role_split_verifier_rejects_pool_env_on_ingress(tmp_path) -> None:
         },
         "status": {"readyReplicas": 3},
     }
+    for item in (ingress, worker, spool):
+        _mount_aurora_credentials(item)
     stub = tmp_path / "kubectl"
     stub.write_text(
         "#!/bin/sh\n"
@@ -676,6 +751,230 @@ def test_role_split_verifier_rejects_pool_env_on_ingress(tmp_path) -> None:
     assert result.returncode == 1
     assert "GPU_FAULT_PROCESSOR_WORKERS" in result.stdout
     assert "capacity that does not exist" in result.stdout
+
+
+def _mount_aurora_secret(deployment: dict) -> None:
+    """Every role projects the Aurora Secret as files (CP-3); the verifier
+    fails a Deployment without the mount, so the stubs carry it."""
+
+    pod = deployment["spec"]["template"]["spec"]
+    pod.setdefault("volumes", []).append(
+        {"name": "aurora-credentials", "secret": {"secretName": "gpu-fault-aurora"}}
+    )
+    pod["containers"][0].setdefault("volumeMounts", []).append(
+        {
+            "name": "aurora-credentials",
+            "mountPath": "/etc/gpu-fault/aurora",
+            "readOnly": True,
+        }
+    )
+
+
+def _mount_aurora_credentials(deployment: dict) -> None:
+    """Project the Aurora Secret the way the base manifest does (CP-3)."""
+
+    pod = deployment["spec"]["template"]["spec"]
+    pod.setdefault("volumes", []).append(
+        {"name": "aurora-credentials", "secret": {"secretName": "gpu-fault-aurora"}}
+    )
+    pod["containers"][0].setdefault("volumeMounts", []).append(
+        {
+            "name": "aurora-credentials",
+            "mountPath": "/etc/gpu-fault/aurora",
+            "readOnly": True,
+        }
+    )
+
+
+def _verifier_stub(tmp_path, *, ingress_workers: int, worker_workers: int) -> Path:
+    ingress = {
+        "metadata": {"name": "gpu-fault-api-ha"},
+        "spec": {
+            "replicas": 3,
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "api",
+                            "args": [f"--port 8080 --workers {ingress_workers} --x"],
+                            "env": [
+                                {"name": "GPU_FAULT_SERVICE_ROLE", "value": "ingress"},
+                                {"name": "GPU_FAULT_TELEMETRY_SPOOL", "value": "false"},
+                                {
+                                    "name": "GPU_FAULT_POSTGRES_POOL_MAX_SIZE",
+                                    "value": "40",
+                                },
+                                {"name": "GPU_FAULT_STORE_IO_WORKERS", "value": "28"},
+                                {
+                                    "name": "GPU_FAULT_FAULT_STORE_IO_WORKERS",
+                                    "value": "8",
+                                },
+                                {
+                                    "name": "GPU_FAULT_EVIDENCE_STORE_IO_WORKERS",
+                                    "value": "4",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS",
+                                    "value": "8",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES",
+                                    "value": "4194304",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            },
+        },
+    }
+    worker = {
+        "metadata": {"name": "gpu-fault-control-worker"},
+        "spec": {
+            "replicas": 6,
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "control-worker",
+                            "args": [f"--port 8081 --workers {worker_workers} --x"],
+                            "env": [
+                                {"name": "GPU_FAULT_SERVICE_ROLE", "value": "worker"},
+                                {"name": "GPU_FAULT_PROCESSOR_WORKERS", "value": "24"},
+                            ],
+                        }
+                    ]
+                }
+            },
+        },
+        "status": {"readyReplicas": 6},
+    }
+    spool = {
+        "metadata": {"name": "gpu-fault-telemetry-spool-worker"},
+        "spec": {
+            "replicas": 0,
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "telemetry-spool-worker",
+                            "args": ["--port 8082 --workers 1 --x"],
+                            "env": [
+                                {
+                                    "name": "GPU_FAULT_SERVICE_ROLE",
+                                    "value": "spool-worker",
+                                },
+                                {"name": "GPU_FAULT_TELEMETRY_SPOOL", "value": "true"},
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES",
+                                    "value": "4194304",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES",
+                                    "value": "8388608",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES",
+                                    "value": "67108864",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_WORKERS",
+                                    "value": "8",
+                                },
+                                {
+                                    "name": "GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS",
+                                    "value": "64",
+                                },
+                                {
+                                    "name": (
+                                        "GPU_FAULT_TELEMETRY_SPOOL_NOTIFICATION_FALLBACK_SECONDS"
+                                    ),
+                                    "value": "5",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            },
+        },
+        "status": {"readyReplicas": 0},
+    }
+    for item in (ingress, worker, spool):
+        _mount_aurora_secret(item)
+    for item in (ingress, worker, spool):
+        _mount_aurora_credentials(item)
+    stub = tmp_path / "kubectl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "*gpu-fault-telemetry-spool-worker*)\n"
+        "cat <<'SPOOL'\n" + json.dumps(spool) + "\nSPOOL\n"
+        ";;\n"
+        "*gpu-fault-control-worker*)\n"
+        "cat <<'WORKER'\n" + json.dumps(worker) + "\nWORKER\n"
+        ";;\n"
+        "*)\n"
+        "cat <<'INGRESS'\n" + json.dumps(ingress) + "\nINGRESS\n"
+        ";;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _run_verifier(tmp_path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/verify_control_plane_role_split.py"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        },
+    )
+
+
+def test_role_split_verifier_accepts_the_declared_uvicorn_worker_counts(
+    tmp_path,
+) -> None:
+    _verifier_stub(tmp_path, ingress_workers=4, worker_workers=4)
+
+    result = _run_verifier(tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ingress 3 replicas on 8080, worker 6 replicas on 8081" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("ingress_workers", "worker_workers", "deployment"),
+    [
+        pytest.param(1, 4, "gpu-fault-api-ha", id="ingress-single-process"),
+        pytest.param(4, 2, "gpu-fault-control-worker", id="worker-two-processes"),
+    ],
+)
+def test_role_split_verifier_rejects_a_drifted_uvicorn_worker_count(
+    tmp_path, ingress_workers: int, worker_workers: int, deployment: str
+) -> None:
+    """A tier whose command disagrees with the capacity model fails the deploy.
+
+    Pools, consumer processes and notification shards are computed as
+    ``replicas x 4``; a ``kubectl edit`` that changes ``--workers`` silently
+    changes the shard cover and the connection budget the manifests assume.
+    """
+
+    _verifier_stub(
+        tmp_path, ingress_workers=ingress_workers, worker_workers=worker_workers
+    )
+
+    result = _run_verifier(tmp_path)
+
+    assert result.returncode == 1
+    assert f"{deployment} must run exactly 4 uvicorn processes per Pod" in result.stdout
 
 
 def test_application_rejects_unknown_service_role(monkeypatch) -> None:

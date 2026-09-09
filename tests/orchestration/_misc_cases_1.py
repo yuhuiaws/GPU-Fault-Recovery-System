@@ -737,6 +737,10 @@ def test_gpu_warning_runs_dcgm_diagnostic_and_failure_drains(
     )
     assert second[1].request_id == drain.request_id
     operations = [step.operation for step in drain.official_steps]
+    # The DRAIN successor mirrors the node-health DRAIN chain: the node stays
+    # quarantined (RMA class) and the chain ends in an explicit operator
+    # hand-off, so the incident reaches ESCALATED instead of parking in
+    # QUARANTINED with nobody told.
     assert operations == [
         WorkflowOperation.FREEZE_EVIDENCE,
         WorkflowOperation.MARK_UNSCHEDULABLE,
@@ -744,6 +748,7 @@ def test_gpu_warning_runs_dcgm_diagnostic_and_failure_drains(
         WorkflowOperation.QUARANTINE,
         WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
         WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.ESCALATE_SUPPORT,
     ]
     assert WorkflowOperation.RESTORE_SCHEDULING not in operations
     assert WorkflowOperation.RESTART_WORKLOAD not in operations

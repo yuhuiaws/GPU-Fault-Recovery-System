@@ -19,12 +19,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.resource_registry import sync_installation_resource_registry
+from gpu_fault.admin.site import RenderedSite
 
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -175,3 +179,79 @@ def is_pending_commit_diff(report: dict[str, Any], release_id: str) -> bool:
         and isinstance(report.get("state_sha256"), str)
         and len(str(report["state_sha256"])) == 64
     )
+
+
+def installation_resource_registry_record(
+    site: RenderedSite,
+) -> tuple[dict[str, Any], str | None]:
+    """Synchronize the installed-resource registry and describe the outcome.
+
+    For the driver's completion step, whose transaction is already committed:
+    the registry is a description of what was installed, so a failure to write it
+    (AWS discovery, one control-plane POST, a direct-Aurora fallback) is a
+    warning on the release record, not a failed release. The bootstrap path in
+    `cluster_join` keeps calling `sync_installation_resource_registry` directly
+    and fail-closed, because there the registry is the source the join reads.
+    Returns ``(record, warning)``; ``warning`` is ``None`` on success.
+    """
+
+    try:
+        path = sync_installation_resource_registry(site)
+    except Exception as exc:
+        warning = (
+            "installation resource registry not synchronized: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {"status": "UNAVAILABLE", "synced_at": utc_now(), "error": warning}, (
+            warning
+        )
+    return {"status": "SYNCED", "path": str(path), "synced_at": utc_now()}, None
+
+
+def finalize_quick_validation_evidence(
+    path: Path,
+    *,
+    release_id: str,
+    collect_diff: Callable[[], dict[str, Any]],
+) -> Path | None:
+    """Stamp the deploy's quick-validation evidence with the state it proved.
+
+    `rollout deploy` writes the evidence at `path` -- the canonical
+    `<state-dir>/quick-validation.json` that `gpu-fault-admin status` reads. It
+    becomes reusable only once the live release state is known to be the one the
+    probes ran against: a pending commit for `release_id`, or a clean NOOP. That
+    digest is written into the file (privately, atomically) and the path is
+    returned for `verify`. Evidence that cannot be vouched for is removed rather
+    than left where the next `status` would find it, report a fallback reason
+    and re-run every probe anyway.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("release_id") != release_id
+        ):
+            raise ValueError("quick validation evidence identity is invalid")
+        diff = collect_diff()
+        if not (is_pending_commit_diff(diff, release_id) or is_clean_noop_diff(diff)):
+            raise ValueError(
+                "post-deploy release state is neither a pending commit for "
+                f"{release_id} nor a clean NOOP"
+            )
+        value["release_state_sha256"] = diff["state_sha256"]
+        value["finalized_at"] = utc_now()
+        write_json_atomic(path, value)
+        path.chmod(0o600)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            "release-deploy: quick validation evidence was not reusable; "
+            f"full verification will run: {exc}",
+            file=sys.stderr,
+        )
+        path.unlink(missing_ok=True)
+        return None
+    return path

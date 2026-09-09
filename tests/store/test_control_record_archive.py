@@ -175,3 +175,164 @@ def test_a_failed_workflow_is_archived_only_after_its_failure_was_handled(store)
     assert store.get_incident("inc-failed-open").incident_id == "inc-failed-open"
     with pytest.raises(NotFoundError):
         store.get_incident("inc-failed-handled")
+
+
+# --------------------------------------------------------------------------
+# Control-plane review 2026-09-08, F-8: throughput and connections. ``run_once``
+# took 25 incidents an hour (~600/day) and opened two bare ``psycopg.connect``
+# per incident outside the store's pool; a year of backlog could never drain.
+
+
+def test_the_archiver_borrows_the_store_pool_and_never_connects_bare(
+    store, monkeypatch
+):
+    import psycopg
+
+    def no_bare_connections(*args, **kwargs):
+        raise AssertionError("archiver opened a connection outside the pool")
+
+    _old_incident(store, "inc-pooled", WorkflowStatus.SUCCEEDED)
+    s3 = _FakeS3()
+    archiver = ControlRecordArchiver(
+        POSTGRES_URL,
+        "s3://audit-bucket/control",
+        retention=timedelta(days=1),
+        s3_client=s3,
+        store=store,
+    )
+
+    # Scoped: the store fixture's own teardown truncates over a bare connection.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(psycopg, "connect", no_bare_connections)
+        archived = archiver.run_once()
+
+    assert len(archived) == 1 and len(s3.puts) == 1
+    assert archiver.archived_total == 1
+    with pytest.raises(NotFoundError):
+        store.get_incident("inc-pooled")
+
+
+def test_run_once_takes_batch_size_candidates_oldest_first(store):
+    for index in range(3):
+        incident = fault_incident(
+            f"inc-batch-{index}",
+            f"event-batch-{index}",
+            state=IncidentState.RECOVERED,
+            created_at=OLD - timedelta(hours=3 - index),
+            updated_at=OLD - timedelta(hours=3 - index),
+        )
+        store.save_incident(incident)
+    s3 = _FakeS3()
+    archiver = ControlRecordArchiver(
+        POSTGRES_URL,
+        "s3://audit-bucket/control",
+        retention=timedelta(days=1),
+        s3_client=s3,
+        store=store,
+        batch_size=2,
+    )
+
+    first = archiver.run_once()
+    assert len(first) == 2
+    assert "inc-batch-0" in first[0] and "inc-batch-1" in first[1]
+    assert store.get_incident("inc-batch-2").incident_id == "inc-batch-2"
+
+    assert len(archiver.run_once(limit=1)) == 1
+    assert archiver.run_once() == []
+    assert archiver.archived_total == 3
+
+
+def test_a_failing_upload_is_counted_and_does_not_end_the_round(store, caplog):
+    _old_incident(store, "inc-s3-broken", WorkflowStatus.SUCCEEDED)
+    _old_incident(store, "inc-s3-fine", WorkflowStatus.SUCCEEDED)
+
+    class _FlakyS3(_FakeS3):
+        def put_object(self, **kwargs) -> None:
+            if "inc-s3-broken" in kwargs["Key"]:
+                raise ConnectionError("s3 endpoint unreachable")
+            super().put_object(**kwargs)
+
+    s3 = _FlakyS3()
+    archiver = ControlRecordArchiver(
+        POSTGRES_URL,
+        "s3://audit-bucket/control",
+        retention=timedelta(days=1),
+        s3_client=s3,
+        store=store,
+    )
+
+    with caplog.at_level("ERROR", logger="gpu_fault.control_record_archive"):
+        archived = archiver.run_once()
+
+    assert len(archived) == 1 and "inc-s3-fine" in archived[0]
+    assert archiver.errors_total == {"ConnectionError": 1}
+    assert archiver.archived_total == 1
+    assert store.get_incident("inc-s3-broken").incident_id == "inc-s3-broken"
+    assert any("inc-s3-broken" in record.getMessage() for record in caplog.records)
+
+
+def test_the_candidate_predicate_matches_the_declared_index_shape():
+    """Agent 5 declares ``gpu_fault_incident_archive_candidate`` on
+    ``((payload->>'updated_at')) WHERE kind='incident'``; the query must
+    compare the same text expression, not a ``::timestamptz`` cast."""
+
+    from gpu_fault.control_record_archive import ARCHIVE_CANDIDATE_SQL
+
+    assert "i.kind='incident'" in ARCHIVE_CANDIDATE_SQL
+    assert "i.payload->>'updated_at' <= %s" in ARCHIVE_CANDIDATE_SQL
+    assert "ORDER BY i.payload->>'updated_at', i.key" in ARCHIVE_CANDIDATE_SQL
+    assert "::timestamptz" not in ARCHIVE_CANDIDATE_SQL
+
+
+# --------------------------------------------------------------------------
+# Final review, minor 9 / 10 (passive-terminal-simplify).
+
+
+def test_pre_cutover_diagnostic_and_triage_rows_are_still_swept_with_their_incident():
+    """Nothing decodes or cleans ``diagnostic``/``triage`` rows any more; the
+    archive is the only path that removes the ones written before the cutover."""
+
+    from gpu_fault.control_record_archive import RELATED_RECORDS_SQL
+
+    assert "kind IN ('diagnostic','triage')" in RELATED_RECORDS_SQL, (
+        "the archive bundle must keep selecting the pre-cutover kinds"
+    )
+
+
+def test_a_closed_successor_no_longer_holds_its_predecessor_out_of_the_archive(store):
+    """Every passive recovery names its containment workflow as predecessor;
+    a recovery that ended ESCALATED (FAILED, handled) must not pin the
+    containment incident for ever -- only an open successor still reads it."""
+
+    _old_incident(store, "inc-pred", WorkflowStatus.SUCCEEDED)
+    successor_incident = fault_incident(
+        "inc-succ",
+        "event-succ",
+        state=IncidentState.ESCALATED,
+        workflow_request_id="wf-succ",
+    )
+    store.save_incident_and_workflow(
+        successor_incident,
+        workflow_request(
+            "wf-succ",
+            "inc-succ",
+            status=WorkflowStatus.FAILED,
+            official_steps=[workflow_step(WorkflowOperation.RESTART_WORKLOAD)],
+            predecessor_workflow_id="wf-inc-pred",
+            failure_handled_at=OLD,
+        ),
+    )
+    s3 = _FakeS3()
+    archiver = _archiver(s3)
+
+    archived = archiver.run_once()
+
+    assert len(archived) == 1 and "inc-pred" in archived[0], (
+        "the containment behind a closed recovery is archived"
+    )
+    assert archiver.withheld_total == {}, "nothing was withheld"
+    with pytest.raises(NotFoundError):
+        store.get_incident("inc-pred")
+    assert store.get_incident("inc-succ").incident_id == "inc-succ", (
+        "the successor itself is recent and stays"
+    )

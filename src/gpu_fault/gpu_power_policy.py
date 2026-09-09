@@ -8,7 +8,6 @@ from gpu_fault.gpu_metric_models import (
 )
 from gpu_fault.models import RecoveryAction
 
-
 NVIDIA_DCGM_POLICY_VERSION = "nvidia-dcgm-health/v4.4.1"
 NVIDIA_DCGM_HEALTH_REFERENCE = (
     "https://docs.nvidia.com/datacenter/dcgm/latest/"

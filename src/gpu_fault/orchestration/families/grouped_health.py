@@ -6,15 +6,15 @@ from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    bounded_reasons,
     FaultIncident,
     RecoveryAction,
     WorkflowOperation,
     WorkflowRequest,
-    WorkflowStatus,
     WorkloadState,
+    bounded_reasons,
 )
 from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 
 
 @dataclass(frozen=True)
@@ -211,9 +211,14 @@ class GroupedHealthService:
                 "affected_workload_ids": context.workload_ids,
             }
         )
+        # A trial: the candidate is built by the node-health family and merged
+        # here under the attempt-group lock. The node-resource route ran a
+        # *nested* ``merge_attempt_fault_workflow`` under the node key inside
+        # that lock (C-12); the terminal-quarantine route was already skipped.
         incident, workflow = self.callbacks.ingest_node_health(
             finding,
             _skip_attempt_grouping=True,
+            _skip_node_resource_merge=True,
             _skip_terminal_quarantine_merge=True,
             _persist=False,
         )
@@ -383,11 +388,7 @@ class GroupedHealthService:
                 existing_incident.attempt_id == context.observation.attempt_id
             ),
         )
-        mutable = (
-            existing_workflow.status is WorkflowStatus.PENDING
-            and existing_workflow.execution_owner_id is None
-            and not existing_workflow.completed_step_indexes
-        )
+        mutable = workflow_is_mutable(existing_workflow)  # D-9 companion
         workflow, winner = self._apply_disposition(
             disposition,
             context,

@@ -20,7 +20,11 @@ from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin import bootstrap_services as admin_bootstrap_services
 from gpu_fault.admin import notification_bootstrap as admin_notification_bootstrap
 from gpu_fault.admin.bootstrap import _ensure_security_group
-from gpu_fault.admin.bootstrap_common import BootstrapError, BootstrapState
+from gpu_fault.admin.bootstrap_common import (
+    BootstrapError,
+    BootstrapState,
+    CommandRunner,
+)
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target,
     bootstrap_gpu_scope,
@@ -34,10 +38,15 @@ from gpu_fault.admin.bootstrap_site import site_identifier as _site_identifier
 from tests.admin._bootstrap_support import _cluster
 
 
+class _NoCommands(CommandRunner):
+    """Every step is patched; any command reaching the runner is a leak."""
+
+    def run(self, arguments, **_kwargs):
+        raise AssertionError(f"bootstrap ran an unpatched command: {arguments}")
+
+
 def test_solution_security_group_is_never_shared() -> None:
     class Runner:
-        dry_run = False
-
         def aws_json(self, *_args, **_kwargs):
             return {
                 "SecurityGroups": [
@@ -62,9 +71,27 @@ def test_public_nlb_subnets_are_dedicated_even_if_public_subnets_exist(
     monkeypatch,
 ) -> None:
     class Runner:
-        dry_run = True
+        """Plays a VPC whose only public subnets belong to someone else, and
+        answers the create calls with predictable ids."""
+
+        def __init__(self) -> None:
+            self.created_in: list[str] = []
+
+        def run(self, _arguments, **_kwargs) -> str:
+            return ""
+
+        def aws_text(self, _region, service, operation, *_arguments, **_kwargs):
+            if service == "ec2" and operation == "create-route-table":
+                return f"rtb-public-{len(self.created_in)}"
+            if service == "ec2" and operation == "associate-route-table":
+                return f"rtbassoc-public-{len(self.created_in)}"
+            raise AssertionError((service, operation))
 
         def aws_json(self, _region, service, operation, *arguments, **_kwargs):
+            if service == "ec2" and operation == "create-subnet":
+                zone = arguments[arguments.index("--availability-zone") + 1]
+                self.created_in.append(zone)
+                return {"Subnet": {"SubnetId": f"subnet-public-{len(self.created_in)}"}}
             if service == "ec2" and operation == "describe-subnets":
                 if "--subnet-ids" in arguments:
                     return {
@@ -97,6 +124,24 @@ def test_public_nlb_subnets_are_dedicated_even_if_public_subnets_exist(
                 }
             if service == "ec2" and operation == "describe-vpcs":
                 return {"Vpcs": [{"CidrBlock": "10.0.0.0/24"}]}
+            if service == "ec2" and operation == "describe-route-tables":
+                # The VPC main table routes to the internet gateway, so the
+                # shared subnets are public -- and still not ours.
+                return {
+                    "RouteTables": [
+                        {
+                            "RouteTableId": "rtb-main",
+                            "Associations": [{"Main": True}],
+                            "Routes": [
+                                {
+                                    "DestinationCidrBlock": "0.0.0.0/0",
+                                    "GatewayId": "igw-external",
+                                }
+                            ],
+                            "Tags": [],
+                        }
+                    ]
+                }
             if service == "ec2" and operation == "describe-internet-gateways":
                 return {
                     "InternetGateways": [
@@ -105,17 +150,17 @@ def test_public_nlb_subnets_are_dedicated_even_if_public_subnets_exist(
                 }
             raise AssertionError((service, operation, arguments))
 
-    monkeypatch.setattr(
-        admin_bootstrap, "_public_subnet", lambda *_args, **_kwargs: True
-    )
+    runner = Runner()
     result = admin_bootstrap._ensure_public_subnets(
-        Runner(), cluster=_cluster(), site_id="site-a"
+        runner, cluster=_cluster(), site_id="site-a"
     )
 
-    assert result["public_subnets"] == [
-        "subnet-dryrun-public-1",
-        "subnet-dryrun-public-2",
-    ], "external public subnets were reused"
+    assert result["public_subnets"] == ["subnet-public-1", "subnet-public-2"], (
+        "external public subnets were reused"
+    )
+    assert runner.created_in == ["us-east-1a", "us-east-1b"], (
+        "dedicated subnets were not created in the CPU EKS availability zones"
+    )
     assert result["internet_gateway"]["ownership"] == "EXTERNAL", (
         "the VPC-level internet gateway should remain external"
     )
@@ -255,11 +300,14 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
         "notification_routing",
         lambda *_a, **_k: ("admin@example.com", {}),
     )
+    kubeconfig_clusters: list[str] = []
     monkeypatch.setattr(
         admin_bootstrap,
-        "_ensure_kubeconfigs",
-        record(
-            "kubeconfigs", (tmp_path / "cpu.kubeconfig", tmp_path / "gpu.kubeconfig")
+        "_update_kubeconfig",
+        lambda _runner, *, cluster, path: (
+            kubeconfig_clusters.append(cluster.hyperpod_name)
+            if cluster.role == "gpu"
+            else None
         ),
     )
     monkeypatch.setattr(
@@ -284,24 +332,32 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
     )
+    # Both graph builders receive the baseline scope; the one run that follows
+    # answers for both former phases.
+    monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", record("foundation"))
+    monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record("platform"))
     monkeypatch.setattr(
         admin_bootstrap,
-        "run_foundation_tasks",
-        record(
-            "foundation",
-            {
-                "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
-                "aurora": {},
-                "monitoring_resources": {},
-                "nlb_network": {},
-                "pki": {},
-            },
-        ),
+        "run_bootstrap_tasks",
+        lambda **_keywords: {
+            "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
+            "aurora": {"cluster_id": "c"},
+            "aurora_ready": {"master_secret_arn": "arn:new"},
+            "monitoring_resources": {},
+            "nlb_network": {},
+            "pki": {},
+        },
     )
-    monkeypatch.setattr(
-        admin_bootstrap, "run_platform_prerequisite_tasks", record("platform")
-    )
-    monkeypatch.setattr(admin_bootstrap, "_site_document", record("site_document", {}))
+    documents: dict[str, object] = {}
+
+    def site_document(*_arguments, gpu_clusters=(), aurora=None, **_kwargs):
+        scopes["site_document"] = tuple(
+            cluster.hyperpod_name for cluster in gpu_clusters
+        )
+        documents["aurora"] = aurora
+        return {}
+
+    monkeypatch.setattr(admin_bootstrap, "_site_document", site_document)
     monkeypatch.setattr(
         admin_bootstrap,
         "finalize_bootstrap_site",
@@ -316,10 +372,14 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
             gpu_cluster_arns=(gpu_a.input_arn, gpu_b.input_arn),
             repository_root=tmp_path / "repo",
             state_dir=tmp_path / "state",
-            dry_run=True,
-        )
+        ),
+        runner=_NoCommands(),
     )
+    scopes["kubeconfigs"] = tuple(kubeconfig_clusters)
 
+    # The readiness task's master Secret ARN is merged over the foundation's
+    # ``aurora`` record before the site document is built.
+    assert documents["aurora"] == {"cluster_id": "c", "master_secret_arn": "arn:new"}
     baseline = (gpu_a.hyperpod_name,)
     assert scopes == {
         "release": baseline,
@@ -330,7 +390,9 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
         "site_document": baseline,
         "finalize": (gpu_a.hyperpod_name, gpu_b.hyperpod_name),
     }
-    assert namespaced == [None, gpu_a.context], (
+    # The CPU and GPU namespace chains run on their own threads, so only the
+    # set is deterministic.
+    assert sorted(namespaced, key=str) == sorted([None, gpu_a.context], key=str), (
         "a namespace was created outside the baseline GPU scope"
     )
 
@@ -520,20 +582,52 @@ def test_existing_site_rejects_cluster_identity_changes() -> None:
         }
     }
 
-    validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[gpu])
+    gpu_b = replace(
+        gpu,
+        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+        hyperpod_name="gpu-b",
+    )
 
-    with pytest.raises(BootstrapError, match="cluster identity differs"):
-        validate_existing_cluster_identity(
-            existing,
-            cpu=cpu,
-            gpu_clusters=[
-                replace(
-                    gpu,
-                    eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
-                    hyperpod_name="gpu-b",
-                )
+    assert (
+        validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[gpu]) == []
+    )
+    # A strict superset passes and yields the delta the deploy joins afterwards.
+    assert validate_existing_cluster_identity(
+        existing, cpu=cpu, gpu_clusters=[gpu, gpu_b]
+    ) == [gpu_b]
+
+    # A set that omits a managed cluster is a subset, however many new ones it
+    # adds: clusters leave a site only through remove-cluster.
+    with pytest.raises(BootstrapError, match="remove-cluster"):
+        validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[gpu_b])
+    with pytest.raises(BootstrapError, match="remove-cluster"):
+        validate_existing_cluster_identity(existing, cpu=cpu, gpu_clusters=[])
+
+
+def test_existing_site_rejects_a_different_cpu_cluster() -> None:
+    cpu = _cluster()
+    gpu = replace(
+        _cluster(),
+        role="gpu",
+        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+        hyperpod_name="gpu-a",
+    )
+    existing = {
+        "spec": {
+            "cpu": {"eksArn": cpu.eks_arn, "hyperpodClusterName": cpu.hyperpod_name},
+            "clusters": [
+                {"eksClusterArn": gpu.eks_arn, "hyperpodClusterName": gpu.hyperpod_name}
             ],
-        )
+        }
+    }
+    other_cpu = replace(
+        cpu,
+        eks_arn="arn:aws:eks:us-east-1:123456789012:cluster/control-2",
+        hyperpod_name="control-2",
+    )
+
+    with pytest.raises(BootstrapError, match="CPU cluster identity differs"):
+        validate_existing_cluster_identity(existing, cpu=other_cpu, gpu_clusters=[gpu])
 
 
 def test_initial_deploy_target_accepts_monotonic_membership_subset(

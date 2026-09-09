@@ -50,6 +50,89 @@ def test_health_report_exit_code_tracks_failures() -> None:
     assert CHECKS.report_exit_code(unhealthy) == 1
 
 
+def test_unconfirmed_sns_subscription_is_a_warning_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The confirmation gate moved to the first minute of ``deploy``; ``verify``
+    still names the topic nobody listens to, but as WARN: the report stays
+    healthy and exits 0."""
+
+    module = _checks_module()
+    for name in (
+        "_check_contexts",
+        "check_cpu_secrets",
+        "_check_cpu_workloads",
+        "check_email_notifications",
+        "check_aurora_refresh",
+        "check_adot_self_metrics",
+        "_verify_profile",
+        "run_read_only_verifiers",
+        "_check_runtime_component_identity",
+        "_check_control_api",
+        "_check_gpu_cluster",
+        "_check_nlb_runtime",
+        "_check_aurora",
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *_args, name=name, **_kwargs: module.CheckValue(name)
+        )
+
+    def aws_json(_release, arguments):
+        if arguments[:2] == ["amp", "describe-workspace"]:
+            return {"workspace": {"status": {"statusCode": "ACTIVE"}}}
+        if arguments[:2] == ["sns", "list-subscriptions-by-topic"]:
+            return {
+                "Subscriptions": [
+                    {
+                        "Protocol": "email",
+                        "Endpoint": "ops@example.com",
+                        "SubscriptionArn": "PendingConfirmation",
+                    }
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr(module, "_aws_json", aws_json)
+    monkeypatch.setattr(
+        MONITORING,
+        "decode_monitoring_configuration",
+        lambda *_a, **_k: ("groups: []\n", "route: {}\n"),
+    )
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="test-site",
+            clusters=[],
+            health=SimpleNamespace(
+                amp_workspace_id="ws-1",
+                sns_topic_arn="arn:aws:sns:us-east-1:123456789012:alerts",
+                amp_rule_namespace="gpu-fault",
+                require_confirmed_sns_subscription=True,
+            ),
+            notifications=SimpleNamespace(admin_email="ops@example.com"),
+        ),
+        runner=SimpleNamespace(run=lambda *_a, **_k: "verified"),
+    )
+
+    report = module.build_health_report(release, mode="verify")
+    finding = next(item for item in report["checks"] if item["name"] == "monitoring")
+
+    assert finding["status"] == "WARN"
+    assert "no confirmed subscription" in finding["summary"]
+    assert finding["details"]["confirmed_subscriptions"] == 0
+    assert report["healthy"] is True, "a warning does not fail verify"
+    assert report["summary"]["WARN"] == 1
+    assert module.report_exit_code(report) == 0
+
+    release.config.health.require_confirmed_sns_subscription = False
+    relaxed = module.build_health_report(release, mode="verify")
+    assert (
+        next(item for item in relaxed["checks"] if item["name"] == "monitoring")[
+            "status"
+        ]
+        == "PASS"
+    )
+
+
 def test_monitoring_rejects_duplicate_email_subscription_states() -> None:
     confirmed = {
         "Protocol": "email",
@@ -188,14 +271,102 @@ def test_email_check_validates_declared_routing_and_site_context(monkeypatch) ->
                 email_sender="sender@example.com",
                 email_recipients=("ops@example.com", "oncall@example.com"),
                 email_subject_prefix="[PROD]",
+                channel="ses",
             ),
         )
     )
 
     result = module.check_email_notifications(release)
 
+    assert result.details["channel"] == "ses"
     assert result.details["recipient_count"] == 2
     assert result.details["site_id"] == "site-a"
+
+
+SNS_TOPIC = "arn:aws:sns:us-west-2:123456789012:gpu-fault-alerts"
+
+
+def _sns_release(*, secret_values: dict[str, str], topic: str | None):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="site-a",
+            cpu_eks_arn="arn:aws:eks:us-west-2:123456789012:cluster/cpu",
+            health=SimpleNamespace(sns_topic_arn=topic),
+            notifications=SimpleNamespace(
+                allow_email=True,
+                acknowledge_external_alert_channel=False,
+                admin_email="owner@example.com",
+                email_sender=None,
+                email_recipients=(),
+                email_subject_prefix="[PROD]",
+                channel="sns",
+            ),
+        )
+    ), {
+        "data": {
+            key: base64.b64encode(value.encode()).decode()
+            for key, value in secret_values.items()
+        }
+    }
+
+
+def test_sns_email_check_needs_the_topic_and_site_context_but_no_ses(
+    monkeypatch,
+) -> None:
+    """On ``sns`` the check never asks SES anything: the topic is the channel
+    and the Secret only has to carry the site context every channel reads."""
+
+    module = _checks_module()
+    release, secret = _sns_release(
+        secret_values={
+            "email-subject-prefix": "[PROD]",
+            "site-id": "site-a",
+            "aws-account-id": "123456789012",
+        },
+        topic=SNS_TOPIC,
+    )
+
+    def no_aws(*_args, **_kwargs):
+        raise AssertionError("the sns channel must not reach SES")
+
+    monkeypatch.setattr(module, "_aws_json", no_aws)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+
+    result = module.check_email_notifications(release)
+
+    assert result.details == {
+        "enabled": True,
+        "channel": "sns",
+        "sns_topic_arn": SNS_TOPIC,
+        "site_id": "site-a",
+    }
+
+
+def test_sns_email_check_fails_without_a_topic_or_site_context(monkeypatch) -> None:
+    module = _checks_module()
+    monkeypatch.setattr(module, "_aws_json", lambda *_args, **_kwargs: {})
+    complete = {
+        "email-subject-prefix": "[PROD]",
+        "site-id": "site-a",
+        "aws-account-id": "123456789012",
+    }
+
+    release, secret = _sns_release(secret_values=complete, topic=None)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="sns_topic_arn"):
+        module.check_email_notifications(release)
+
+    release, secret = _sns_release(secret_values={"site-id": "site-a"}, topic=SNS_TOPIC)
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="aws-account-id"):
+        module.check_email_notifications(release)
+
+    release, secret = _sns_release(
+        secret_values={**complete, "site-id": "site-b"}, topic=SNS_TOPIC
+    )
+    monkeypatch.setattr(module, "_secret", lambda *_args, **_kwargs: secret)
+    with pytest.raises(CHECKS.ReleaseError, match="differs"):
+        module.check_email_notifications(release)
 
 
 def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
@@ -211,6 +382,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "_check_nlb_inputs",
         "_check_aurora",
         "check_aurora_refresh",
+        "check_control_record_archive_bucket",
         "check_email_notifications",
         "_check_monitoring",
         "workflow_safety_snapshot",
@@ -235,6 +407,7 @@ def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
         "nlb_inputs",
         "aurora",
         "aurora_credential_refresh",
+        "control_record_archive_bucket",
         "email_notifications",
         "monitoring",
         "workflow_safety",
@@ -371,6 +544,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "_check_cpu_workloads",
         "check_email_notifications",
         "check_aurora_refresh",
+        "check_adot_self_metrics",
         "_verify_profile",
         "run_read_only_verifiers",
         "_check_runtime_component_identity",
@@ -419,6 +593,7 @@ def test_health_report_uses_bounded_parallel_checks(monkeypatch) -> None:
         "cpu_workloads",
         "email_notifications",
         "aurora_credential_refresh",
+        "adot_self_metrics",
         "runtime_profile",
         "read_only_verifiers",
         "runtime_component_identity",
@@ -736,6 +911,7 @@ def test_gpu_cluster_check_is_pinned_to_the_node_wheel(monkeypatch) -> None:
         "_check_cpu_workloads",
         "check_email_notifications",
         "check_aurora_refresh",
+        "check_adot_self_metrics",
         "_verify_profile",
         "run_read_only_verifiers",
         "_check_runtime_component_identity",
@@ -788,9 +964,15 @@ def test_control_api_health_rejects_stuck_or_broken_commands(
 def test_certificate_hostname_matching_is_single_label() -> None:
     module = CHECKS
 
-    assert module._hostname_matches("control.example", "control.example")
-    assert module._hostname_matches("*.example", "control.example")
-    assert not module._hostname_matches("*.example", "nested.control.example")
+    assert module._hostname_matches("control.example", "control.example"), (
+        "an exact hostname matches itself"
+    )
+    assert module._hostname_matches("*.example", "control.example"), (
+        "a wildcard matches one label"
+    )
+    assert not module._hostname_matches("*.example", "nested.control.example"), (
+        "a wildcard must not span two labels"
+    )
 
 
 def _nlb_release(calls: list[str], *, certificate_status: str = "ISSUED"):
@@ -992,3 +1174,494 @@ def test_state_changing_aws_calls_are_never_cached() -> None:
     assert state.aws_read_only(["acm", "describe-certificate"]), "describe- is read"
     assert state.aws_read_only(["sesv2", "get-account"]), "get- is read"
     assert state.aws_read_only(["sns", "list-subscriptions-by-topic"]), "list- is read"
+
+
+def test_aurora_check_lists_only_the_site_cluster_instances(monkeypatch) -> None:
+    """``describe-db-instances`` is filtered to the site's cluster server-side.
+
+    Unfiltered, it returned every RDS instance in the region -- other systems'
+    databases included -- for this check to discard all but two.
+    """
+
+    module = CHECKS
+    calls: list[list[str]] = []
+
+    def aws_json(_release, arguments):
+        calls.append(list(arguments))
+        if arguments[1] == "describe-db-clusters":
+            return {"DBClusters": [{"Status": "available", "Endpoint": "w"}]}
+        return {
+            "DBInstances": [
+                {
+                    "DBInstanceIdentifier": f"gpu-fault-{index}",
+                    "DBClusterIdentifier": "gpu-fault-aurora",
+                    "DBInstanceStatus": "available",
+                }
+                for index in range(2)
+            ]
+        }
+
+    monkeypatch.setattr(module, "_aws_json", aws_json)
+    for name in (
+        "_check_tools",
+        "_check_local_inputs",
+        "_check_aws_identity",
+        "_check_contexts",
+        "_check_cpu_capacity",
+        "check_cpu_secrets",
+        "_check_load_balancer_controller",
+        "_check_nlb_inputs",
+        "check_aurora_refresh",
+        "check_email_notifications",
+        "_check_monitoring",
+        "workflow_safety_snapshot",
+    ):
+        monkeypatch.setattr(
+            module, name, lambda *args, name=name: module.CheckValue(name)
+        )
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            site_name="test-site",
+            health=SimpleNamespace(aurora_cluster_id="gpu-fault-aurora"),
+        )
+    )
+
+    report = module.build_preflight_report(release)
+
+    (aurora,) = [item for item in report["checks"] if item["name"] == "aurora"]
+    assert aurora["status"] == "PASS", aurora
+    assert [item["id"] for item in aurora["details"]["instances"]] == [
+        "gpu-fault-0",
+        "gpu-fault-1",
+    ]
+    instances_call = [call for call in calls if call[1] == "describe-db-instances"]
+    assert instances_call == [
+        [
+            "rds",
+            "describe-db-instances",
+            "--filters",
+            "Name=db-cluster-id,Values=gpu-fault-aurora",
+        ]
+    ]
+
+
+def test_quick_health_report_runs_only_the_cheap_checks(monkeypatch) -> None:
+    """The default ``status`` health: control-plane workloads and the API.
+
+    No GPU cluster, role split, NLB, Aurora or monitoring probe runs -- that is
+    the 44-call, 15-exec report ``status --full`` still produces. The document
+    keeps the health-report shape so every reader of ``status`` JSON works on
+    either, and says which one it is.
+    """
+
+    module = CHECKS
+    ran: list[str] = []
+
+    def check(name):
+        def run(*_args, **_kwargs):
+            ran.append(name)
+            return module.CheckValue(name)
+
+        return run
+
+    for name in (
+        "_check_cpu_workloads",
+        "_check_control_api",
+        "_check_contexts",
+        "check_cpu_secrets",
+        "_check_gpu_cluster",
+        "run_read_only_verifiers",
+        "_check_nlb_runtime",
+        "_check_aurora",
+        "_check_monitoring",
+    ):
+        monkeypatch.setattr(module, name, check(name))
+
+    report = module.build_quick_health_report(Release())
+
+    assert sorted(ran) == ["_check_control_api", "_check_cpu_workloads"]
+    assert report["mode"] == "status"
+    assert report["healthy"] is True
+    assert report["scope"] == "quick"
+    assert report["reused_validation_checks"] == []
+    assert [item["name"] for item in report["checks"]] == list(
+        module.QUICK_HEALTH_CHECKS
+    )
+    assert set(report) >= {"mode", "site_name", "healthy", "summary", "checks"}, (
+        "quick health must keep the health-report shape"
+    )
+
+
+# --- check_aurora_refresh judges the Secret's status file, not a rollout -------
+#
+# CP-3: running Pods reload the mounted Secret, so the refresher no longer rolls
+# any Deployment; the check must not expect a generation to advance. H1-2/H1-3:
+# the refresher writes last-refresh-status.json into the Secret on every run and
+# Jobs carry the ``app`` label, so a failed refresh is visible at preflight.
+
+
+def _aurora_cronjob(targets: list[str]) -> dict:
+    return {
+        "spec": {
+            "schedule": "17 * * * *",
+            "jobTemplate": {
+                "metadata": {"labels": {"app": "gpu-fault-aurora-credential-refresh"}},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {
+                                            "name": (
+                                                "GPU_FAULT_AURORA_RESTART_DEPLOYMENTS"
+                                            ),
+                                            "value": ",".join(targets),
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+        },
+        "status": {"lastSuccessfulTime": "2026-09-08T09:17:20Z"},
+    }
+
+
+def _aurora_role(targets: list[str]) -> dict:
+    return {
+        "rules": [
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "resourceNames": targets,
+                "verbs": ["get", "patch"],
+            }
+        ]
+    }
+
+
+def _aurora_secret(status: dict | None) -> dict:
+    data = {"postgres-url": "eA==", "master-secret-arn": "eQ=="}
+    if status is not None:
+        data["last-refresh-status.json"] = base64.b64encode(
+            json.dumps(status).encode()
+        ).decode()
+    return {"data": data}
+
+
+def _aurora_release(cronjob, role, secret, jobs=None):
+    class AuroraRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            if "role" in command:
+                return role
+            if "job" in command:
+                return {"items": jobs or []}
+            if "secret" in command:
+                return secret
+            return cronjob
+
+    return AuroraRelease()
+
+
+TARGETS = ["gpu-fault-api-ha", "gpu-fault-control-worker"]
+
+
+def _status(status: str, *, minutes_ago: int, error: str | None = None) -> dict:
+    finished = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return {
+        "status": status,
+        "finished_at": finished.isoformat(timespec="seconds"),
+        "error": error,
+        "rotated": False,
+        "restarted": False,
+        "reason": "secret already carries the AWSCURRENT password",
+    }
+
+
+def test_aurora_refresh_check_reports_a_fresh_ok_status() -> None:
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=20)),
+    )
+
+    value = module.check_aurora_refresh(release, require_success=True)
+
+    assert value.details["deployment_targets"] == TARGETS
+    status = value.details["last_refresh_status"]
+    assert status["status"] == "ok"
+    assert 19 * 60 <= status["age_seconds"] <= 21 * 60
+    assert value.details["restarts_deployments"] is False
+
+
+def test_aurora_refresh_check_fails_on_a_failed_status_even_at_preflight() -> None:
+    """The root cause used to surface only inside the release transaction."""
+
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(
+            _status(
+                "failed",
+                minutes_ago=5,
+                error="RuntimeError: managed secret has no password field",
+            )
+        ),
+    )
+
+    with pytest.raises(module.ReleaseError, match="no password field"):
+        module.check_aurora_refresh(release)
+
+
+def test_aurora_refresh_check_fails_a_verify_on_a_stale_status() -> None:
+    """Hourly schedule: three missed ticks with no status write means the
+    refresher is not running, whatever lastSuccessfulTime says."""
+
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=4 * 60)),
+    )
+
+    with pytest.raises(module.ReleaseError, match="stale"):
+        module.check_aurora_refresh(release, require_success=True)
+    # At preflight a stale status is reported, not fatal: the orchestrator runs
+    # the refresh Job itself before touching anything.
+    value = module.check_aurora_refresh(release)
+    assert value.details["last_refresh_status"]["stale"] is True
+
+
+def test_aurora_refresh_check_verify_requires_a_status_at_all() -> None:
+    module = _checks_module()
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS), _aurora_role(TARGETS), _aurora_secret(None)
+    )
+
+    with pytest.raises(module.ReleaseError, match="never recorded"):
+        module.check_aurora_refresh(release, require_success=True)
+    # Preflight tolerates an older refresher build that never wrote one.
+    value = module.check_aurora_refresh(release)
+    assert value.details["last_refresh_status"] is None
+
+
+def test_aurora_refresh_check_surfaces_the_latest_failed_job() -> None:
+    """H1-3: with the ``app`` label on the Job the branch finally sees Jobs."""
+
+    module = _checks_module()
+    jobs = [
+        {
+            "metadata": {
+                "name": "refresh-old",
+                "creationTimestamp": "2026-09-08T08:17:00Z",
+            },
+            "status": {"conditions": [{"type": "Complete", "status": "True"}]},
+        },
+        {
+            "metadata": {
+                "name": "refresh-new",
+                "creationTimestamp": "2026-09-08T09:17:00Z",
+            },
+            "status": {"conditions": [{"type": "Failed", "status": "True"}]},
+        },
+    ]
+    release = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=90)),
+        jobs=jobs,
+    )
+
+    with pytest.raises(module.ReleaseError, match="refresh-new"):
+        module.check_aurora_refresh(release)
+
+
+def test_aurora_refresh_check_lists_jobs_by_the_job_label() -> None:
+    module = _checks_module()
+    seen: list[tuple] = []
+    base = _aurora_release(
+        _aurora_cronjob(TARGETS),
+        _aurora_role(TARGETS),
+        _aurora_secret(_status("ok", minutes_ago=1)),
+    )
+    original = base._get_json
+
+    def recording(command):
+        seen.append(command)
+        return original(command)
+
+    base._get_json = recording
+    module.check_aurora_refresh(base)
+
+    job_commands = [command for command in seen if "job" in command]
+    assert job_commands and "app=gpu-fault-aurora-credential-refresh" in job_commands[0]
+
+
+def test_archive_bucket_check_requires_the_site_region(monkeypatch) -> None:
+    module = _checks_module()
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            aws_region="us-east-2",
+            retention=SimpleNamespace(
+                archive_s3_uri="s3://gpu-fault-control-records/site/archive"
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "us-east-2"}
+    )
+    value = module.check_control_record_archive_bucket(release)
+    assert value.details == {
+        "bucket": "gpu-fault-control-records",
+        "prefix": "site/archive",
+        "region": "us-east-2",
+    }
+
+    monkeypatch.setattr(
+        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "eu-west-1"}
+    )
+    with pytest.raises(module.ReleaseError, match="expected the site Region"):
+        module.check_control_record_archive_bucket(release)
+
+    release.config.retention.archive_s3_uri = "s3://bucket-only"
+    with pytest.raises(module.ReleaseError, match="s3://bucket/prefix"):
+        module.check_control_record_archive_bucket(release)
+
+    release.config.retention.archive_s3_uri = None
+    with pytest.raises(module.CheckSkipped):
+        module.check_control_record_archive_bucket(release)
+
+
+def test_adot_self_metrics_check_reads_the_live_collector() -> None:
+    module = _checks_module()
+    required = module.adot_self_metric_names()
+    assert "otelcol_process_memory_rss" in required, "the memory alert reads it"
+
+    class Runner:
+        def __init__(self, body: str) -> None:
+            self.body = body
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(self, command, capture=False, **_kwargs):
+            self.commands.append(tuple(command))
+            return self.body
+
+    class AdotRelease:
+        config = SimpleNamespace(namespace="gpu-fault-system")
+
+        def __init__(self, body: str) -> None:
+            self.runner = Runner(body)
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(_command):
+            return {
+                "items": [
+                    {
+                        "metadata": {"name": "gpu-fault-adot-1"},
+                        "status": {"phase": "Running"},
+                    }
+                ]
+            }
+
+    complete = "\n".join(
+        [f'# TYPE {name} gauge\n{name}{{x="y"}} 1' for name in sorted(required)]
+    )
+    release = AdotRelease(complete)
+    value = module.check_adot_self_metrics(release)
+    assert "gpu-fault-adot-1" in value.summary
+    assert "8889/proxy/metrics" in release.runner.commands[-1][-1]
+
+    with pytest.raises(module.ReleaseError, match="otelcol_process_memory_rss"):
+        module.check_adot_self_metrics(
+            AdotRelease(
+                complete.replace(
+                    "otelcol_process_memory_rss", "otelcol_process_memory_rss_bytes"
+                )
+            )
+        )
+
+
+def _cpu_node(name: str, pods_allocatable: int) -> dict:
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "allocatable": {"pods": str(pods_allocatable)},
+            "conditions": [{"type": "Ready", "status": "True"}],
+        },
+    }
+
+
+def _tenant_pod(node: str, app: str | None = None, phase: str = "Running") -> dict:
+    labels = {"app": app} if app else {}
+    return {
+        "metadata": {"name": f"{app or 'x'}-{node}", "labels": labels},
+        "spec": {"nodeName": node},
+        "status": {"phase": phase},
+    }
+
+
+def _capacity_release(nodes: list[dict], pods: list[dict], worker_replicas: int = 24):
+    class Release:
+        config = SimpleNamespace(
+            cpu_hyperpod_cluster_name="cpu",
+            admin_config=SimpleNamespace(
+                capacity=SimpleNamespace(
+                    control_worker_replicas=worker_replicas,
+                    telemetry_spool=SimpleNamespace(replicas=0),
+                )
+            ),
+        )
+
+        @staticmethod
+        def _cpu(*args):
+            return args
+
+        @staticmethod
+        def _get_json(command):
+            if "nodes" in command:
+                return {"items": nodes}
+            return {"items": pods}
+
+    return Release()
+
+
+def test_cpu_capacity_check_counts_pod_slots_for_single_process_pods() -> None:
+    """The control-plane Pods plus one rolling surge per role must fit the
+    free Pod slots of the Ready CPU nodes."""
+
+    from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
+
+    module = _checks_module()
+    nodes = [_cpu_node(f"n{i}", 29) for i in range(4)]
+    tenants = [_tenant_pod(f"n{i}", app=None) for i in range(4) for _ in range(9)]
+    # Control-plane Pods already running and terminal Pods do not occupy a slot.
+    tenants.append(_tenant_pod("n0", app="gpu-fault-control-worker"))
+    tenants.append(_tenant_pod("n0", app=None, phase="Succeeded"))
+
+    value = module._check_cpu_capacity(_capacity_release(nodes, tenants))
+
+    assert value.details["free_pod_slots"] == 80
+    assert value.details["required_pod_slots"] == INGRESS_REPLICAS + 24 + 2
+
+    crowded = tenants + [_tenant_pod("n1", app=None) for _ in range(60)]
+    with pytest.raises(module.ReleaseError, match="free Pod slots"):
+        module._check_cpu_capacity(_capacity_release(nodes, crowded))
+
+    with pytest.raises(module.ReleaseError, match="at least 3 Ready nodes"):
+        module._check_cpu_capacity(_capacity_release(nodes[:2], []))

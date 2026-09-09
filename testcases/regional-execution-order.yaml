@@ -21,7 +21,12 @@ phases:
     name: 启动配置守卫
     maintenance_window: 否
     entries:
-      - range: {prefix: BOOT, start: 1, end: 10}
+      # BOOT-006 is in do_not_run: the guard it drove ("regional control
+      # plane cannot run in-cluster quick diagnostics against its own EKS")
+      # was deleted with the quick-diagnostics path, so there is no switch
+      # left to set and nothing to refuse.
+      - range: {prefix: BOOT, start: 1, end: 5}
+      - range: {prefix: BOOT, start: 7, end: 10}
   - sequence: 2
     name: 身份边界
     maintenance_window: 分级
@@ -141,7 +146,15 @@ phases:
       - case: GF-REGIONAL-DESTR-020
         predecessor: GF-REGIONAL-DESTR-001
       - case: GF-REGIONAL-DESTR-021
+      - case: GF-REGIONAL-DESTR-023
+        predecessor: GF-REGIONAL-DESTR-001
+      - case: GF-REGIONAL-DESTR-024
     notes:
+      - DESTR-023 以 DESTR-001 PASS 为证据前置，在无任何受管作业、观测流全部过期、只剩 watcher 覆盖心跳的
+        真正空闲集群上再做一次真实 GPU reset，证明节点不因 UNKNOWN 被 BLOCKED；不改任何控制面或 watcher 设置。
+      - DESTR-024 以 DESTR-023 PASS 为前置，把 completion watcher 缩到 0 让心跳过期，注入同一 XID 46，
+        只允许 FREEZE/MARK_UNSCHEDULABLE/QUARANTINE 与 BLOCKED，不 quiesce、不 reset、不 reboot；watcher 由 detached
+        watchdog 兜底恢复，隔离只经 validated restore 工作流解除。
       - DESTR-020 以 DESTR-001 PASS 为证据前置，对一个 Kubernetes 与 fleet 都不认识的别名 node_id 走 API 重放的目录外 XID
         （SITE_SAFETY 隔离计划，无任何物理步骤），只证明 MARK_UNSCHEDULABLE 对 404 fail closed；别名没有 Node Agent 也没有
         provider 节点，任何 reset/reboot 都不可能被 arm；support 升级恰一次（containment_refused，只 FREEZE_EVIDENCE→ESCALATE_SUPPORT），链深度 ≤1。
@@ -215,11 +228,16 @@ phases:
       - case: GF-REGIONAL-COLLECT-013
       - case: GF-REGIONAL-COLLECT-014
       - case: GF-REGIONAL-COLLECT-016
+      - case: GF-REGIONAL-COLLECT-021
+        predecessor: GF-REGIONAL-COLLECT-016
       - case: GF-REGIONAL-COLLECT-017
+        predecessor: GF-REGIONAL-COLLECT-016
       - range: {prefix: COLLECT, start: 18, end: 20}
       - case: GF-REGIONAL-COLLECT-015
         predecessor: GF-REGIONAL-COLLECT-017
     notes:
+      - COLLECT-021 以 COLLECT-016 PASS 为证据前置：它复用 COLLECT-016 的托管训练夹具与宿主探针，
+        验证 Pod 先死、RESTART_APP XID 后到的竞态被判为 MONITOR_ONLY 且被动路径仍重启，排在 COLLECT-016 之后。
       - COLLECT-015 以 COLLECT-017 PASS 为证据前置（run_collector_destructive.py 的链），
         COLLECT-018..020 排在它前面只是为了让 reboot 最后发生。
       - COLLECT-009 的正式前置是 COLLECT-005：COLLECT-006/007 是 pytest 用例，不产出 cases/<id>/<id>.json 证据。
@@ -230,6 +248,10 @@ phases:
         drop-in 环境），不触碰 GPU；COLLECT-020 会 cordon 该节点做 DCGM 诊断再由 validation-first
         restore 恢复，需要维护窗口，且仍排在 COLLECT-015 的 reboot 之前。
 do_not_run:
+  - case: GF-REGIONAL-BOOT-006
+    reason: >-
+      它驱动的 in-cluster quick diagnostics 守卫已随该路径一起删除，
+      GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS 不再存在，用例作废。
   - case: GF-REGIONAL-DESTR-004
     reason: provider replace 已由架构与 IAM 明确禁止，该用例已作废。
   - case: GF-REGIONAL-AUTH-012

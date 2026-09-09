@@ -698,6 +698,16 @@ def _remote_waiting_state(
     store: InMemoryStore, operation: WorkflowOperation
 ) -> tuple[FaultIncident, WorkflowRequest, str]:
     incident, workflow = workflow_state(store, [operation])
+    if operation is WorkflowOperation.RESTART_WORKLOAD:
+        # An already-dispatched restart holds the reservation the preflight made
+        # on its first claim; dispatch signs it rather than reserving again.
+        parameters = workflow.official_steps[0].parameters
+        store.reserve_job_restart(
+            str(parameters["cluster_id"]),
+            str(parameters["job_id"]),
+            int(parameters["restart_budget"]),
+            f"{workflow.request_id}/0/{operation.value}",
+        )
     command_id = f"remote-waiting-{operation.value.lower()}"
     command = RemoteActionCommand(
         command_id=command_id,

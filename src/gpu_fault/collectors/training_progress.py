@@ -12,13 +12,12 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
-from gpu_fault.training_health import TrainingProgressHeartbeat
-
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import (
     EventSink,
     deliver_or_raise,
 )
+from gpu_fault.training_health import TrainingProgressHeartbeat
 
 LOGGER = logging.getLogger(__name__)
 

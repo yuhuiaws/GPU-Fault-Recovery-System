@@ -19,6 +19,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
+    STORE_POLL_SECONDS,
     CollectorAcceptanceFixture,
     collector_setting,
     select_workflow,
@@ -237,7 +238,8 @@ FOCUSED_TESTS = {
         "test_conflicting_or_untrusted_topology_fails_closed",
     ],
     "GF-REGIONAL-COLLECT-012": [
-        "tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity",
+        "tests/orchestration/test_misc.py::"
+        "test_restart_app_on_an_idle_node_does_not_open_a_workflow",
     ],
 }
 
@@ -1420,6 +1422,116 @@ def kmsg_record_errors(
     return errors
 
 
+def restart_app_monitor_only_errors(
+    decisions: list[dict[str, Any]],
+    workflows: list[dict[str, Any]],
+    incidents: list[dict[str, Any]],
+) -> list[str]:
+    """COLLECT-012: RESTART_APP on an idle node is MONITOR_ONLY, not a workflow.
+
+    Before 55272a0 the compiler wrapped this in STOP -> RESTART with no
+    workload id, hit the generic fail-closed path and quarantined the node
+    (SAFETY_PENDING -> BLOCKED). Now ``_direct_resolution`` returns
+    MONITOR_ONLY / NO_ACTION with the official action preserved: an INFO
+    marker and the investigatory notification, the incident closes RECOVERED,
+    and no workflow (hence no MARK_UNSCHEDULABLE) is ever planned.
+    """
+
+    errors: list[str] = []
+    decision = next(
+        (item for item in decisions if item.get("official_action") == "RESTART_APP"),
+        None,
+    )
+    if decision is None:
+        errors.append("no RESTART_APP decision for the injected XID")
+    else:
+        if decision.get("disposition") != "MONITOR_ONLY":
+            errors.append(
+                f"RESTART_APP disposition={decision.get('disposition')!r}, "
+                "expected MONITOR_ONLY"
+            )
+        if decision.get("action") != "NO_ACTION":
+            errors.append(
+                f"RESTART_APP action={decision.get('action')!r}, expected NO_ACTION"
+            )
+        if not any(
+            "no managed application to restart" in str(item)
+            for item in decision.get("reasons") or []
+        ):
+            errors.append(
+                f"RESTART_APP reasons do not name the idle-node rule: "
+                f"{decision.get('reasons')}"
+            )
+        if decision.get("workflow_request_id") is not None:
+            errors.append("RESTART_APP decision points at a workflow on an idle node")
+    if workflows:
+        errors.append(
+            "RESTART_APP on an idle node opened a workflow: "
+            f"{[item.get('status') for item in workflows]}"
+        )
+    if not any(item.get("state") == "RECOVERED" for item in incidents):
+        errors.append(
+            "no RECOVERED incident for the RESTART_APP XID: "
+            f"{[item.get('state') for item in incidents]}"
+        )
+    if any(item.get("workflow_request_id") for item in incidents):
+        errors.append("RESTART_APP incident opened a workflow on an idle node")
+    return errors
+
+
+def wait_monitor_only(
+    fixture: CollectorAcceptanceFixture,
+    marker: str,
+    *,
+    case_dir: Path,
+    minimum_evidence: int = 1,
+    timeout_seconds: int = 300,
+    observed_after: datetime | None = None,
+) -> dict[str, Any]:
+    """Poll until the RESTART_APP decision is recorded and the evidence has landed.
+
+    ``wait_marker`` keys on a *workflow* reaching a terminal status; a
+    MONITOR_ONLY decision opens none, so it would spin until timeout. The
+    decision (and the RECOVERED incident the store probe reads from it) is the
+    terminal signal here. Each poll is the light read; the evidence scan runs
+    only once the decision exists.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    timeline: list[dict[str, Any]] = []
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = fixture.store_snapshot(
+            marker, observed_after=observed_after, scan_evidence=False
+        )
+        decided = any(
+            item.get("official_action") == "RESTART_APP"
+            for item in last.get("decisions") or []
+        )
+        if decided:
+            last = fixture.store_snapshot(
+                marker, observed_after=observed_after, scan_evidence=True
+            )
+        timeline.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "decision_count": len(last.get("decisions") or []),
+                "evidence_count": len(last.get("evidence") or []),
+                "workflow_count": len(last.get("workflows") or []),
+                "incident_states": [
+                    item.get("state") for item in last.get("incidents") or []
+                ],
+            }
+        )
+        write_json_atomic(case_dir / "timeline.json", {"entries": timeline})
+        if decided and len(last.get("evidence") or []) >= minimum_evidence:
+            return last
+        time.sleep(STORE_POLL_SECONDS)
+    raise RegionalFixtureError(
+        f"RESTART_APP decision/evidence did not converge: {last}"
+    )
+
+
 def run_collect012(
     fixture: CollectorAcceptanceFixture,
     case_dir: Path,
@@ -1428,50 +1540,46 @@ def run_collect012(
     *,
     cleanup: CaseCleanup | None = None,
 ) -> dict[str, Any]:
-    cleanup = cleanup or CaseCleanup()
     baseline = fixture.snapshot()
     boot_id = str(baseline.get("boot_id") or "")
     markers = []
     states: list[dict[str, Any]] = []
-    restores = []
     errors: list[str] = []
-    # Samples 1 and 2 are the same XID 13 text written twice -- one marker, so
-    # the kernel lines are byte-identical: the second write must earn its own
-    # kmsg sequence (distinct evidence) and is expected to correlate into the
-    # first incident's BLOCKED workflow. Sample 3 is the second XID (31) and
-    # has to reach BLOCKED on its own. It cannot while the node is still
-    # quarantined by sample 1: MARK_UNSCHEDULABLE then fails with "node is
-    # already isolated by another incident/token" and the workflow is
-    # FAILED/ESCALATED, which is the ownership fence doing its job, not the
-    # RESTART_APP gate (observed 2026-09-06 02:42Z). So the node is restored
-    # through the validated path between the two XIDs, exactly as the cleanup
-    # does at the end.
+    # Samples 1 and 2 are the same XID 13 text written twice under one marker,
+    # so the kernel lines are byte-identical: the second write must earn its
+    # own kmsg sequence (distinct evidence). Sample 3 is the second XID (31),
+    # the most common MMU fault. Since a RESTART_APP on an idle node no longer
+    # quarantines it (55272a0), the node is never isolated between the two
+    # XIDs -- there is no ownership fence to restore around, so both inject
+    # straight through without a restore step.
     stamp = int(time.time())
     for offset, xid in enumerate((13, 13, 31), start=1):
-        if xid == 31 and states:
-            restores.append(
-                cleanup.restore(
-                    fixture,
-                    states[-1],
-                    profile_version=profile_version,
-                    reason="COLLECT-012 restore before the second XID",
-                )
-            )
         marker = (
             f"c012-13-{stamp}-a{attempt}"
             if xid == 13
             else f"c012-31-{stamp}-a{attempt}"
         )
         markers.append(marker)
-        state = inject_blocked_xid(
-            fixture,
-            case_dir / f"sample-{offset}",
-            xid=xid,
-            marker=marker,
-            message="RESTART_APP collector path",
-            minimum_evidence=2 if offset == 2 else 1,
+        gpu = fixture.snapshot()["gpu_inventory"][0]
+        injected_at = datetime.now(timezone.utc)
+        fixture.execute(
+            "write-xid",
+            "--xid",
+            str(xid),
+            "--marker",
+            marker,
+            "--pci-bdf",
+            str(gpu["pci_bdf"]),
+            "--message",
+            "RESTART_APP collector path",
         )
-        cleanup.register_state(fixture, state)
+        state = wait_monitor_only(
+            fixture,
+            marker,
+            case_dir=case_dir / f"sample-{offset}",
+            minimum_evidence=2 if offset == 2 else 1,
+            observed_after=injected_at,
+        )
         states.append(state)
     record_ids = {
         item.get("record_id")
@@ -1488,19 +1596,23 @@ def run_collect012(
         )
     )
     for state in states:
-        workflows = state.get("workflows") or []
-        if not workflows or workflows[0].get("status") != "BLOCKED":
-            errors.append("RESTART_APP without workload did not fail closed")
+        errors.extend(
+            restart_app_monitor_only_errors(
+                state.get("decisions") or [],
+                state.get("workflows") or [],
+                state.get("incidents") or [],
+            )
+        )
     after = fixture.snapshot()
     if after.get("boot_id") != baseline.get("boot_id"):
-        errors.append("node rebooted during the RESTART_APP fail-closed case")
+        errors.append("node rebooted during the RESTART_APP MONITOR_ONLY case")
     errors.extend(service_state_errors(baseline, after))
-    restores.append(
-        cleanup.restore(
-            fixture,
-            states[-1],
-            profile_version=profile_version,
-            reason="COLLECT-012 validated cleanup",
+    # No workflow ever held the node, so there is nothing to restore; the node
+    # must have stayed schedulable and untainted the whole time.
+    errors.extend(
+        node_isolation_errors(
+            fixture.regional.node_snapshot(fixture.node),
+            label="after the RESTART_APP XIDs",
         )
     )
     return {
@@ -1509,7 +1621,6 @@ def run_collect012(
         "markers": markers,
         "boot_id": boot_id,
         "record_ids": sorted(str(item) for item in record_ids if item),
-        "restore_workflows": restores,
     }
 
 
@@ -1530,7 +1641,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "GF-REGIONAL-COLLECT-009": "inject XID54 and write exact acknowledgement annotation",
             "GF-REGIONAL-COLLECT-010": "inject XID78 fail-closed quarantine only",
             "GF-REGIONAL-COLLECT-011": "append scope-dependent SXID on two nodes",
-            "GF-REGIONAL-COLLECT-012": "inject XID13/31 via real kmsg and restore quarantine",
+            "GF-REGIONAL-COLLECT-012": (
+                "inject XID13/31 via real kmsg; idle node reads MONITOR_ONLY, "
+                "no workflow, node untouched"
+            ),
         }[settings.case_id],
         "preflight_identity": {
             "release_id": preflight["release_id"],

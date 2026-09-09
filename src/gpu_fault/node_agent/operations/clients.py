@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from xml.etree import ElementTree as ET
 
-
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )

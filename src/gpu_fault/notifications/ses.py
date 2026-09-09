@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from gpu_fault.env import env_bool
 from gpu_fault.notifications.common import (
     AdvisoryNotification,
@@ -12,6 +14,10 @@ from gpu_fault.notifications.common import (
     StrictModel,
     model_validator,
     os,
+)
+from gpu_fault.notifications.delivery_context import (
+    body_with_context,
+    subject_with_context,
 )
 
 
@@ -71,6 +77,22 @@ class SesNotificationConfig(StrictModel):
 class SesEmailNotifier:
     """Read-only by default SES v2 notification adapter."""
 
+    # Bound on the in-process dedup hint. The cross-process truth is the
+    # ``notification_result`` row; this only saves a provider call when the
+    # same process sees the same key twice, so it is a hint, not a ledger,
+    # and does not need to remember every notification the process ever
+    # sent (control-plane review 2026-09-08, F-4).
+    RESULT_CACHE_LIMIT = 1024
+
+    # One ``send_email`` must finish well inside the 120 s delivery lease:
+    # botocore's defaults (60 s connect, 60 s read, legacy retries up to
+    # five attempts) let one hung call outlive the lease while ``send``
+    # held the process lock, and the next replica to claim the row mailed
+    # it again in parallel (F-4). 2 attempts x (5 + 20) s < 60 s.
+    CONNECT_TIMEOUT_SECONDS = 5
+    READ_TIMEOUT_SECONDS = 20
+    MAX_ATTEMPTS = 2
+
     def __init__(
         self,
         config: SesNotificationConfig,
@@ -78,54 +100,49 @@ class SesEmailNotifier:
     ) -> None:
         self.config = config
         self.client = client or self._create_client(config)
-        self._results: dict[str, NotificationResult] = {}
+        self._results: OrderedDict[str, NotificationResult] = OrderedDict()
         self._lock = RLock()
 
-    @staticmethod
-    def _create_client(config: SesNotificationConfig):
+    @classmethod
+    def _create_client(cls, config: SesNotificationConfig) -> SesV2Client:
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise RuntimeError("install gpu-fault-control-plane[hyperpod]") from exc
-        return boto3.client("sesv2", region_name=config.region_name)
+        client: SesV2Client = boto3.client(
+            "sesv2",
+            region_name=config.region_name,
+            config=Config(
+                connect_timeout=cls.CONNECT_TIMEOUT_SECONDS,
+                read_timeout=cls.READ_TIMEOUT_SECONDS,
+                retries={"max_attempts": cls.MAX_ATTEMPTS, "mode": "standard"},
+            ),
+        )
+        return client
+
+    def _remember(self, key: str, result: NotificationResult) -> None:
+        self._results[key] = result
+        self._results.move_to_end(key)
+        while len(self._results) > self.RESULT_CACHE_LIMIT:
+            self._results.popitem(last=False)
 
     def _subject(self, notification: AdvisoryNotification) -> str:
-        context = [
-            value
-            for value in (
-                self.config.subject_prefix,
-                (f"[site:{self.config.site_id}]" if self.config.site_id else None),
-                (
-                    f"[region:{self.config.region_name}]"
-                    if self.config.region_name
-                    else None
-                ),
-                (
-                    f"[account:{self.config.account_id}]"
-                    if self.config.account_id
-                    else None
-                ),
-            )
-            if value
-        ]
-        return " ".join([*context, notification.subject])
+        return subject_with_context(
+            notification,
+            subject_prefix=self.config.subject_prefix,
+            site_id=self.config.site_id,
+            region_name=self.config.region_name,
+            account_id=self.config.account_id,
+        )
 
     def _body(self, notification: AdvisoryNotification) -> str:
-        context = [
-            ("Site", self.config.site_id),
-            ("AWS Account", self.config.account_id),
-            ("Region", self.config.region_name),
-            ("Cluster", notification.cluster_name),
-        ]
-        if not any(value for _label, value in context[:-1]):
-            return notification.body_text
-        header = "\n".join(
-            [
-                "通知上下文",
-                *[f"- {label}: {value or 'UNKNOWN'}" for label, value in context],
-            ]
+        return body_with_context(
+            notification,
+            site_id=self.config.site_id,
+            account_id=self.config.account_id,
+            region_name=self.config.region_name,
         )
-        return f"{header}\n\n{notification.body_text}"
 
     def send(self, notification: AdvisoryNotification) -> NotificationResult:
         with self._lock:
@@ -167,7 +184,7 @@ class SesEmailNotifier:
                 status=NotificationStatus.SENT,
                 provider_message_id=response.get("MessageId"),
             )
-            self._results[notification.deduplication_key] = result
+            self._remember(notification.deduplication_key, result)
             return result
 
 
@@ -180,16 +197,3 @@ class DisabledNotificationNotifier:
             status=NotificationStatus.SKIPPED,
             reason="no notification delivery channel is configured",
         )
-
-
-def notification_notifier_from_environment():
-    sender = os.getenv("GPU_FAULT_EMAIL_SENDER")
-    recipients = os.getenv("GPU_FAULT_EMAIL_RECIPIENTS")
-    if not sender and not recipients:
-        return DisabledNotificationNotifier()
-    if not sender or not recipients:
-        raise ValueError(
-            "GPU_FAULT_EMAIL_SENDER and "
-            "GPU_FAULT_EMAIL_RECIPIENTS must be configured together"
-        )
-    return SesEmailNotifier(SesNotificationConfig.from_environment())

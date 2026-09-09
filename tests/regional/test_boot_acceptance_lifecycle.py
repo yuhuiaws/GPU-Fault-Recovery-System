@@ -4,7 +4,7 @@ The isolated bootstrap site (Aurora, NLB, AMP, ECR, IAM) used to survive every
 failure except a non-zero first deploy: a deploy timeout, a kubectl error or a
 FAIL verdict left it behind, and BOOT-018 -- the only other uninstall -- was
 then refused by the predecessor gate. These tests pin the cleanup, the BOOT-017
-reuse gate and the BOOT-018 verify comparison.
+reuse gate and the BOOT-018 ``status --full`` comparison.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def test_boot016_honours_retain_and_never_uninstalls_a_pass(
         "_boot016_verified_site",
         lambda command, state_dir, case_dir: (
             (state_dir / "site.yaml").write_text("x", encoding="utf-8"),
-            {"verdict": "PASS", "checks": {"verify_passed": True}},
+            {"verdict": "PASS", "checks": {"status_passed": True}},
         )[1],
     )
 
@@ -268,7 +268,7 @@ def test_boot017_is_partial_when_the_greenfield_run_cannot_be_evaluated(
     assert not admin_calls, "BOOT-017 no longer reruns admin status on the same site"
 
 
-# -- item 6: BOOT-018 compares verify against the release itself ---------------
+# -- item 6: BOOT-018 compares status --full against the release itself --------
 
 
 def _report(cpu_digest: str, gpu_digest: str) -> dict[str, Any]:
@@ -331,12 +331,12 @@ AGENTS = [
 ]
 
 
-def test_parse_verify_report_skips_wrapper_lines() -> None:
+def test_parse_status_report_skips_wrapper_lines() -> None:
     stdout = "using site /tmp/x\n" + json.dumps({"healthy": True}, indent=2) + "\n"
 
-    assert lifecycle.parse_verify_report(stdout) == {"healthy": True}
+    assert lifecycle.parse_status_report(stdout) == {"healthy": True}
     with pytest.raises(BootAcceptanceError, match="no JSON report"):
-        lifecycle.parse_verify_report("nothing here\n")
+        lifecycle.parse_status_report("nothing here\n")
 
 
 def test_runtime_identity_passes_only_when_every_replica_matches_the_release() -> None:

@@ -5,7 +5,6 @@ from enum import StrEnum
 from importlib import metadata
 from typing import Any
 
-
 LOGGER = logging.getLogger(__name__)
 
 

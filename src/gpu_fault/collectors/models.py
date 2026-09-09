@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from pydantic import Field
 
 from gpu_fault.models import StrictModel, WorkloadState

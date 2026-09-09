@@ -350,9 +350,12 @@ def check_deploy_host_venv(venv: Path) -> dict[str, Any]:
                 )
     elif dependency_identity_value is not None:
         raise DeployHostSetupError(f"deployment-host venv is incomplete: {venv}")
+    # The wheel carries the release engine the admin CLI imports at module
+    # level; before the venv is bound to a state directory the engine can only
+    # find ``deploy/`` through this variable (``gpu_fault_release.repository_root``).
     _run(
         [str(admin), "--help"],
-        env=_isolated_python_environment(),
+        env={**_isolated_python_environment(), "GPU_FAULT_REPOSITORY_ROOT": str(ROOT)},
         capture=True,
     )
     return {

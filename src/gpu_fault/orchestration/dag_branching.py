@@ -599,13 +599,22 @@ class DagBrancher:
         )
         if appended:
             self._reconnect_join(steps, tail, superseded)
+        # A replaced branch retires only what had not run. Its completed steps
+        # (isolate, quiesce, verify) are history, not retired work: listing them
+        # as superseded too overlapped ``completed_step_indexes`` and the
+        # invariant checker logged the overlap on every dispatch pass for the
+        # rest of the workflow (2819 ERROR lines in one live hour, DESTR-014
+        # 2026-09-08). ``BranchEscalator._exhaust`` and the executor's skip
+        # already exclude resolved steps; the join rewiring above still sees
+        # the whole replaced set.
+        retired = superseded - set(existing.completed_step_indexes)
         rank = self.arbiter.workflow_recovery_rank
         rewritten = existing.model_copy(
             update={
                 "dag_enabled": True,
                 "dag_revision": existing.dag_revision + 1,
                 "superseded_step_indexes": sorted(
-                    set(existing.superseded_step_indexes) | superseded
+                    set(existing.superseded_step_indexes) | retired
                 ),
                 "official_action": (
                     candidate.official_action
@@ -639,7 +648,7 @@ class DagBrancher:
                 "candidate_workflow_id": candidate.request_id,
                 "predecessor_step_index": predecessor_step_index,
                 "appended_indexes": list(appended),
-                "superseded_indexes": sorted(superseded),
+                "superseded_indexes": sorted(retired),
                 "join_dependencies": sorted(
                     {
                         dependency

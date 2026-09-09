@@ -7,6 +7,11 @@ window. The dispatcher applies it to a job workflow that has not started
 (``step_bounds.bounded_waiting_outcome`` on a WAITING outcome whose
 ``reason`` is ``NODE_UNDER_REMEDIATION``). Both read the same variable, both
 default to 240s, and the timing validator refuses a pair that disagrees.
+
+One exception (逻辑 6, last section): while the remediation the premise names
+is still open, the executor bounds the running restart by that remediation's
+own lifetime instead, so a repair that legitimately outlasts the window can
+finish and the restart it was waiting for still happens.
 """
 
 from __future__ import annotations
@@ -25,8 +30,18 @@ from gpu_fault.execution.config import (
     validate_timing_relationships,
 )
 from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.models import WorkflowEventCode, WorkflowOperation, WorkflowStepStatus
-from tests._builders import workflow_request, workflow_step, workflow_step_execution
+from gpu_fault.models import (
+    WorkflowEventCode,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
+from tests._builders import (
+    build_store,
+    workflow_request,
+    workflow_step,
+    workflow_step_execution,
+)
 
 KNOB = "GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS"
 RESTART_JOB = WorkflowOperation.RESTART_WORKLOAD
@@ -91,8 +106,11 @@ def test_the_validator_refuses_a_pair_whose_windows_differ():
 # --- the premise backstop's cap --------------------------------------------------
 
 
-def _executor(*, step_cap: int, busy_wait: float) -> SimpleNamespace:
+def _executor(*, step_cap: int, busy_wait: float, store=None) -> SimpleNamespace:
+    # No ``store`` by default: the cap must then fall back to today's window
+    # even when the WAITING details name a remediation it cannot look up.
     return SimpleNamespace(
+        store=store,
         config=ProductionExecutorConfig(
             enabled=True,
             executor_id="executor-rule-a",
@@ -101,7 +119,7 @@ def _executor(*, step_cap: int, busy_wait: float) -> SimpleNamespace:
             step_waiting_warning_seconds=step_cap // 2,
             step_waiting_timeout_overrides={},
             node_busy_wait_seconds=busy_wait,
-        )
+        ),
     )
 
 
@@ -247,3 +265,259 @@ def test_a_premise_timeout_is_recorded_under_its_own_event_code():
     assert step_bounds.attempt_event_code(generic) is (
         WorkflowEventCode.STEP_WAITING_TIMEOUT
     ), "a generic cap keeps its generic code"
+
+
+# --- an open remediation lifts the window to its own lifetime ------------------
+#
+# 逻辑 6: a GPU reset chain (quiesce window up to 420 s, fresh telemetry for
+# VALIDATE_GPU, RESTORE_SCHEDULING) or a reboot chain (HyperPod, up to 2700 s)
+# legitimately outlasts 240 s. While the remediation the premise names is still
+# open, the restart wait is bounded by that remediation's lifetime, not by the
+# node-busy window -- otherwise the restart fails just before the repair lands.
+
+REMEDIATION = "wf-node"
+
+
+def _store_with_remediation(
+    *, status: WorkflowStatus, lifetime_deadline_at: datetime | None
+):
+    store = build_store()
+    store.save_workflow(
+        workflow_request(
+            REMEDIATION,
+            "inc-node",
+            status=status,
+            official_steps=[
+                workflow_step(WorkflowOperation.RESET_GPU, node_ids=["node-a"])
+            ],
+            lifetime_deadline_at=lifetime_deadline_at,
+        )
+    )
+    return store
+
+
+def _premise_hold(*, remediation_workflow_id: str | None = REMEDIATION):
+    details: dict[str, object] = {"reason": HOLDING}
+    if remediation_workflow_id is not None:
+        details["remediation_workflow_id"] = remediation_workflow_id
+    return WorkflowStepOutcome.waiting(operation_id="restart-1", details=details)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING, WorkflowStatus.RUNNING],
+    ids=lambda status: status.value,
+)
+def test_an_open_remediation_with_lifetime_left_keeps_the_restart_waiting(
+    status: WorkflowStatus,
+):
+    now = datetime.now(timezone.utc)
+    store = _store_with_remediation(
+        status=status, lifetime_deadline_at=now + timedelta(hours=1)
+    )
+    workflow, step = _waiting_for(250)  # past the 240 s window
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+
+    assert bounded.status is WorkflowStepStatus.WAITING, bounded
+    assert bounded.details["reason"] == HOLDING, bounded.details
+    assert "step_waiting_timeout_seconds" not in bounded.details, bounded.details
+    assert bounded.details["remediation_workflow_id"] == REMEDIATION
+
+
+def test_an_open_remediation_outlasting_the_generic_step_cap_still_waits():
+    # A reboot chain: 2700 s of HyperPod time, far past the 600 s generic cap.
+    now = datetime.now(timezone.utc)
+    store = _store_with_remediation(
+        status=WorkflowStatus.RUNNING,
+        lifetime_deadline_at=now + timedelta(seconds=2700),
+    )
+    workflow, step = _waiting_for(1500)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+
+    assert bounded.status is WorkflowStepStatus.WAITING, bounded
+
+
+def test_a_remediation_past_its_own_lifetime_fails_the_restart_wait():
+    now = datetime.now(timezone.utc)
+    lifetime = now - timedelta(seconds=30)
+    store = _store_with_remediation(
+        status=WorkflowStatus.RUNNING, lifetime_deadline_at=lifetime
+    )
+    workflow, step = _waiting_for(300)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["reason"] == TIMEOUT, bounded.details
+    # The bound that fired is the remediation's lifetime, measured from when
+    # this step started waiting: 300 s ago, lifetime 30 s ago -> 270 s (269
+    # once the sub-second gap between the two clock reads is truncated).
+    assert bounded.details["step_waiting_timeout_seconds"] in (269, 270), (
+        bounded.details
+    )
+    assert bounded.details["step_waiting_seconds"] >= 300, bounded.details
+    assert bounded.details["remediation_lifetime_deadline_at"] == (
+        lifetime.isoformat()
+    ), bounded.details
+    assert bounded.details["remediation_workflow_id"] == REMEDIATION
+    assert bounded.error is not None and bounded.error.startswith(TIMEOUT), (
+        bounded.error
+    )
+    assert step_bounds.attempt_event_code(bounded) is (
+        WorkflowEventCode.NODE_REMEDIATION_TIMEOUT
+    )
+
+
+def test_a_remediation_whose_lifetime_ends_inside_the_window_keeps_the_window():
+    # The lifetime bound only ever extends the wait; it never shortens it below
+    # the node-busy window the dispatcher already granted.
+    now = datetime.now(timezone.utc)
+    store = _store_with_remediation(
+        status=WorkflowStatus.RUNNING, lifetime_deadline_at=now - timedelta(seconds=10)
+    )
+    workflow, step = _waiting_for(100)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+
+    assert bounded.status is WorkflowStepStatus.WAITING, bounded
+
+
+def test_an_open_remediation_without_a_lifetime_falls_back_to_the_step_cap():
+    # Not yet claimed, so ``claim_deadlines`` has not stamped a lifetime: the
+    # restart's own per-operation cap is the fallback, above the window.
+    store = _store_with_remediation(
+        status=WorkflowStatus.PENDING, lifetime_deadline_at=None
+    )
+    executor = _executor(step_cap=600, busy_wait=240.0, store=store)
+
+    inside, step = _waiting_for(500)
+    assert (
+        step_bounds.bounded_waiting_outcome(
+            executor, inside, step, 0, _premise_hold()
+        ).status
+        is WorkflowStepStatus.WAITING
+    )
+
+    past, step = _waiting_for(650)
+    bounded = step_bounds.bounded_waiting_outcome(
+        executor, past, step, 0, _premise_hold()
+    )
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["reason"] == TIMEOUT, bounded.details
+    assert bounded.details["step_waiting_timeout_seconds"] == 600, bounded.details
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.BLOCKED,
+        WorkflowStatus.SUPERSEDED,
+    ],
+    ids=lambda status: status.value,
+)
+def test_a_terminal_remediation_leaves_the_window_in_force(status: WorkflowStatus):
+    # Terminal: SUCCEEDED means the incident turns RECOVERED and the adapter
+    # proceeds; FAILED/BLOCKED the adapter refuses via INCIDENT_NOT_RECOVERABLE.
+    # Either way a WAITING premise that still names it gets today's window.
+    now = datetime.now(timezone.utc)
+    store = _store_with_remediation(
+        status=status, lifetime_deadline_at=now + timedelta(hours=1)
+    )
+    workflow, step = _waiting_for(250)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["reason"] == TIMEOUT, bounded.details
+    assert bounded.details["step_waiting_timeout_seconds"] == 240, bounded.details
+
+
+def test_a_hold_without_a_remediation_id_keeps_the_window():
+    # Regression guard: no ``remediation_workflow_id`` in the details -> the
+    # store is never consulted and the window fails the wait as before.
+    store = _store_with_remediation(
+        status=WorkflowStatus.RUNNING,
+        lifetime_deadline_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    workflow, step = _waiting_for(250)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=store),
+        workflow,
+        step,
+        0,
+        _premise_hold(remediation_workflow_id=None),
+    )
+
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["reason"] == TIMEOUT, bounded.details
+    assert bounded.details["step_waiting_timeout_seconds"] == 240, bounded.details
+
+
+def test_an_unreadable_remediation_fails_closed_to_the_window(caplog):
+    # The id names a workflow the store does not have (NotFoundError), or the
+    # store itself is down: both fall back to today's window.
+    missing = build_store()  # nothing saved
+    workflow, step = _waiting_for(250)
+
+    bounded = step_bounds.bounded_waiting_outcome(
+        _executor(step_cap=600, busy_wait=240.0, store=missing),
+        workflow,
+        step,
+        0,
+        _premise_hold(),
+    )
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["step_waiting_timeout_seconds"] == 240, bounded.details
+
+    class _Broken:
+        def get_workflow(self, request_id: str):
+            raise RuntimeError("store unavailable")
+
+    with caplog.at_level("WARNING", logger=step_bounds.LOGGER.name):
+        bounded = step_bounds.bounded_waiting_outcome(
+            _executor(step_cap=600, busy_wait=240.0, store=_Broken()),
+            workflow,
+            step,
+            0,
+            _premise_hold(),
+        )
+    assert bounded.status is WorkflowStepStatus.FAILED, bounded
+    assert bounded.details["step_waiting_timeout_seconds"] == 240, bounded.details
+    assert any("remediation" in record.getMessage() for record in caplog.records), (
+        caplog.text
+    )

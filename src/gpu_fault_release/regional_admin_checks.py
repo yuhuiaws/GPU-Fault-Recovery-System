@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release import repository_root
+from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
@@ -38,7 +40,7 @@ from gpu_fault_release.regional_validation_evidence import (
     quick_validation_evidence as _quick_validation_evidence,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 REQUIRED_TOOLS = ("aws", "kubectl", "helm", "jq", "openssl", "sha256sum", "python3")
 
 
@@ -50,6 +52,9 @@ class CheckSkipped(RuntimeError):
 class CheckValue:
     summary: str
     details: Any = None
+    # ``WARN`` is a finding that does not fail the report: something the
+    # operator should read, not something the deploy should stop on.
+    status: str = "PASS"
 
 
 def _check(
@@ -62,7 +67,7 @@ def _check(
         value = function()
         return {
             "name": name,
-            "status": "PASS",
+            "status": value.status,
             "summary": value.summary,
             "details": value.details,
         }
@@ -221,7 +226,37 @@ def _ready_nodes(document: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+CONTROL_PLANE_ROLE_APPS = frozenset(
+    {"gpu-fault-api-ha", "gpu-fault-control-worker", "gpu-fault-telemetry-spool-worker"}
+)
+# rollingUpdate maxSurge is 1 per role; the fleet must have room for one
+# surge Pod of every role that runs on top of the steady state.
+ROLLING_SURGE_PODS_PER_ROLE = 1
+MINIMUM_CPU_NODES = 3
+
+
+def _control_plane_pod_demand(release: Any) -> dict[str, int]:
+    from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
+
+    capacity = release.config.admin_config.capacity
+    return {
+        "gpu-fault-api-ha": int(INGRESS_REPLICAS),
+        "gpu-fault-control-worker": int(capacity.control_worker_replicas),
+        "gpu-fault-telemetry-spool-worker": int(capacity.telemetry_spool.replicas),
+    }
+
+
 def _check_cpu_capacity(release: Any) -> CheckValue:
+    """Ready CPU nodes and enough free Pod slots for the whole control-plane
+    fleet plus one rolling surge Pod per role.
+
+    HyperPod CPU nodes advertise ``allocatable.pods`` far below the EC2 ENI
+    table (29 on ml.c5.4xlarge with two ENI attachments), and other tenants
+    share the nodes, so the count is taken from the live nodes and Pods rather
+    than from a machine-type table. Control-plane Pods already running are not
+    counted as occupied: the rollout replaces them.
+    """
+
     document = release._get_json(
         release._cpu(
             "get",
@@ -232,13 +267,54 @@ def _check_cpu_capacity(release: Any) -> CheckValue:
         )
     )
     ready = _ready_nodes(document)
-    if len(ready) != 3:
+    if len(ready) < MINIMUM_CPU_NODES:
         raise ReleaseError(
-            f"CPU control plane requires exactly 3 Ready nodes, got {len(ready)}"
+            f"CPU control plane requires at least {MINIMUM_CPU_NODES} Ready nodes, "
+            f"got {len(ready)}"
+        )
+    pods = release._get_json(release._cpu("get", "pods", "-A", "-o", "json"))
+    occupied: dict[str, int] = {item["metadata"]["name"]: 0 for item in ready}
+    for pod in pods.get("items", []):
+        node = (pod.get("spec") or {}).get("nodeName")
+        if node not in occupied:
+            continue
+        if (pod.get("status") or {}).get("phase") in {"Succeeded", "Failed"}:
+            continue
+        labels = (pod.get("metadata") or {}).get("labels") or {}
+        if labels.get("app") in CONTROL_PLANE_ROLE_APPS:
+            continue
+        occupied[node] += 1
+    free_by_node = {
+        item["metadata"]["name"]: int(
+            ((item.get("status") or {}).get("allocatable") or {}).get("pods") or 0
+        )
+        - occupied[item["metadata"]["name"]]
+        for item in ready
+    }
+    demand = _control_plane_pod_demand(release)
+    surge = ROLLING_SURGE_PODS_PER_ROLE * sum(1 for count in demand.values() if count)
+    required = sum(demand.values()) + surge
+    free = sum(free_by_node.values())
+    details = {
+        "nodes": sorted(free_by_node),
+        "free_pod_slots": free,
+        "free_pod_slots_by_node": dict(sorted(free_by_node.items())),
+        "required_pod_slots": required,
+        "control_plane_pods": demand,
+        "rolling_surge_pods": surge,
+    }
+    if free < required:
+        raise ReleaseError(
+            f"CPU control plane needs {required} free Pod slots "
+            f"({sum(demand.values())} control-plane Pods + {surge} rolling surge) "
+            f"but the {len(ready)} Ready nodes have {free} "
+            f"({details['free_pod_slots_by_node']}); add CPU nodes or raise "
+            "the nodes' max-pods"
         )
     return CheckValue(
-        "CPU control plane has three Ready nodes",
-        {"nodes": sorted(item["metadata"]["name"] for item in ready)},
+        f"CPU control plane has {len(ready)} Ready nodes with {free} free Pod "
+        f"slots for {required}",
+        details,
     )
 
 
@@ -297,64 +373,13 @@ def check_email_notifications(release: Any) -> CheckValue:
                 {"enabled": False},
             )
         raise ReleaseError("no administrator notification channel is enabled")
-    if not config.admin_email or not config.email_sender or not config.email_recipients:
-        raise ReleaseError("email notification addresses are missing")
-    identity = _aws_json(
+    summary, details = check_notification_channel(
         release,
-        [
-            "sesv2",
-            "get-email-identity",
-            "--email-identity",
-            config.email_sender,
-        ],
+        aws_json=lambda arguments: _aws_json(release, arguments),
+        read_secret=lambda name: _secret(release, name),
+        decode_secret=_decode_secret,
     )
-    verified = bool(identity.get("VerifiedForSendingStatus")) or (
-        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
-    )
-    if not verified:
-        raise ReleaseError("SES sender identity is not verified")
-    account = _aws_json(release, ["sesv2", "get-account"])
-    if not bool(account.get("SendingEnabled")):
-        raise ReleaseError("SES sending is disabled")
-    secret = _secret(release, "gpu-fault-email").get("data") or {}
-    required = {
-        "email-sender",
-        "email-recipients",
-        "email-subject-prefix",
-        "site-id",
-        "aws-account-id",
-    }
-    if missing := sorted(required - set(secret)):
-        raise ReleaseError("gpu-fault-email is missing: " + ", ".join(missing))
-    sender = _decode_secret(secret["email-sender"]).decode()
-    recipients = tuple(
-        item.strip()
-        for item in _decode_secret(secret["email-recipients"]).decode().split(",")
-        if item.strip()
-    )
-    subject_prefix = _decode_secret(secret["email-subject-prefix"]).decode()
-    site_id = _decode_secret(secret["site-id"]).decode()
-    account_id = _decode_secret(secret["aws-account-id"]).decode()
-    expected_account_id = str(release.config.cpu_eks_arn).split(":")[4]
-    if (
-        sender != config.email_sender
-        or recipients != config.email_recipients
-        or subject_prefix != config.email_subject_prefix
-        or site_id != release.config.site_name
-        or account_id != expected_account_id
-    ):
-        raise ReleaseError("gpu-fault-email differs from the declared site addresses")
-    return CheckValue(
-        "SES administrator notification channel is configured",
-        {
-            "enabled": True,
-            "sender_verified": True,
-            "sending_enabled": True,
-            "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
-            "recipient_count": len(recipients),
-            "site_id": site_id,
-        },
-    )
+    return CheckValue(summary, details)
 
 
 def _check_load_balancer_controller(release: Any) -> CheckValue:
@@ -664,10 +689,17 @@ def _check_aurora(release: Any) -> CheckValue:
     cluster = clusters[0]
     if cluster.get("Status") != "available":
         raise ReleaseError(f"Aurora cluster {cluster_id} is {cluster.get('Status')}")
+    # Filtered server-side: without it every RDS instance in the region came
+    # back, most of them belonging to other systems, to be discarded here.
     instances = (
         _aws_json(
             release,
-            ["rds", "describe-db-instances"],
+            [
+                "rds",
+                "describe-db-instances",
+                "--filters",
+                f"Name=db-cluster-id,Values={cluster_id}",
+            ],
         ).get("DBInstances")
         or []
     )
@@ -755,8 +787,11 @@ def _check_monitoring(release: Any) -> CheckValue:
         for item in subscriptions
         if item.get("SubscriptionArn") not in {None, "PendingConfirmation"}
     ]
-    if health.require_confirmed_sns_subscription and not confirmed:
-        raise ReleaseError("SNS topic has no confirmed subscription")
+    # The confirmation gate moved to the first minute of ``gpu-fault-admin
+    # deploy`` (``notification_precheck``), where the operator can act on it.
+    # Here it is a warning: the report still names the topic nobody listens to,
+    # but a subscription that lapsed after the deploy does not fail ``verify``.
+    unconfirmed = health.require_confirmed_sns_subscription and not confirmed
     email_summary = monitoring_safety.email_subscription_summary(
         subscriptions,
         release.config.notifications.admin_email,
@@ -784,7 +819,12 @@ def _check_monitoring(release: Any) -> CheckValue:
             capture=True,
         )
     return CheckValue(
-        "AMP rules, Alertmanager and SNS destination are configured",
+        (
+            "AMP rules and Alertmanager are configured; SNS topic has no "
+            "confirmed subscription"
+            if unconfirmed
+            else "AMP rules, Alertmanager and SNS destination are configured"
+        ),
         {
             "workspace_id": health.amp_workspace_id,
             "workspace_status": status,
@@ -794,7 +834,61 @@ def _check_monitoring(release: Any) -> CheckValue:
             "email_subscription": email_summary,
             "verifier": verifier,
         },
+        status="WARN" if unconfirmed else "PASS",
     )
+
+
+# The refresher writes this key into the gpu-fault-aurora Secret on every run
+# (aurora_credential_refresh.write_refresh_status); the Pods' mount makes it
+# /etc/gpu-fault/aurora/last-refresh-status.json.
+AURORA_REFRESH_STATUS_KEY = "last-refresh-status.json"
+# Hourly schedule: three missed ticks without a status write means the
+# refresher is not running, whatever lastSuccessfulTime still says.
+AURORA_REFRESH_STATUS_MAX_AGE_SECONDS = 3 * 3600
+
+
+def _aurora_refresh_status(release: Any) -> dict[str, Any] | None:
+    """Decode the refresher's last status from the Secret, or ``None`` when an
+    older refresher build never wrote one. Only that key is read."""
+
+    data = _secret(release, "gpu-fault-aurora").get("data") or {}
+    encoded = data.get(AURORA_REFRESH_STATUS_KEY)
+    if not encoded:
+        return None
+    try:
+        payload = json.loads(_decode_secret(encoded).decode())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ReleaseError(
+            f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} is not JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ReleaseError(
+            f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} is not an object"
+        )
+    finished_at = payload.get("finished_at")
+    age_seconds: float | None = None
+    if isinstance(finished_at, str) and finished_at:
+        try:
+            finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ReleaseError(
+                f"gpu-fault-aurora {AURORA_REFRESH_STATUS_KEY} finished_at is not a "
+                f"timestamp: {finished_at!r}"
+            ) from exc
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - finished).total_seconds())
+    return {
+        "status": payload.get("status"),
+        "finished_at": finished_at,
+        "age_seconds": age_seconds,
+        "stale": age_seconds is None
+        or age_seconds > AURORA_REFRESH_STATUS_MAX_AGE_SECONDS,
+        "error": payload.get("error"),
+        "rotated": payload.get("rotated"),
+        "restarted": payload.get("restarted"),
+        "reason": payload.get("reason"),
+    }
 
 
 def check_aurora_refresh(
@@ -802,6 +896,18 @@ def check_aurora_refresh(
     *,
     require_success: bool = False,
 ) -> CheckValue:
+    """The credential refresher is installed, allowed to do its job, and its
+    last run went well.
+
+    CP-3: running Pods reload the mounted Secret, so the refresher no longer
+    rolls any Deployment and nothing here expects a generation to advance.
+    The verdict comes from the status the refresher writes into the Secret on
+    every run: a ``failed`` status is fatal even at preflight (H1-3's intent:
+    the root cause surfaces before the transaction), and ``require_success``
+    (post-deploy verify, after the orchestrator ran the refresh Job itself)
+    demands a fresh ``ok``.
+    """
+
     cronjob = release._get_json(
         release._cpu(
             "-n",
@@ -838,6 +944,16 @@ def check_aurora_refresh(
         raise ReleaseError(
             "Aurora credential refresh declares no database consumer deployments"
         )
+    restarts_deployments = (
+        str(environment.get("GPU_FAULT_AURORA_REFRESH_RESTART_DEPLOYMENTS") or "")
+        .strip()
+        .lower()
+        == "true"
+    ) or any(
+        "--restart-deployments" in (container.get("args") or [])
+        or "--restart-deployments" in (container.get("command") or [])
+        for container in containers
+    )
     role = release._get_json(
         release._cpu(
             "-n",
@@ -900,6 +1016,26 @@ def check_aurora_refresh(
                 "latest Aurora credential refresh Job failed: "
                 + latest.get("metadata", {}).get("name", "unknown")
             )
+    status = _aurora_refresh_status(release)
+    if status is not None and status["status"] != "ok":
+        raise ReleaseError(
+            "latest Aurora credential refresh failed"
+            + (f" at {status['finished_at']}" if status["finished_at"] else "")
+            + f": {status['error'] or status['status']}"
+        )
+    if require_success:
+        if status is None:
+            raise ReleaseError(
+                "Aurora credential refresh has never recorded a status in the "
+                f"gpu-fault-aurora Secret ({AURORA_REFRESH_STATUS_KEY}); the "
+                "installed refresher predates the status write or has not run"
+            )
+        if status["stale"]:
+            raise ReleaseError(
+                "Aurora credential refresh status is stale: last ok at "
+                f"{status['finished_at']} ({int(status['age_seconds'] or 0)}s ago, "
+                f"limit {AURORA_REFRESH_STATUS_MAX_AGE_SECONDS}s)"
+            )
     return CheckValue(
         "Aurora credential refresh CronJob is installed",
         {
@@ -907,7 +1043,124 @@ def check_aurora_refresh(
             "last_schedule_time": cronjob.get("status", {}).get("lastScheduleTime"),
             "last_successful_time": last_successful,
             "deployment_targets": list(targets),
+            "restarts_deployments": restarts_deployments,
+            "last_refresh_status": status,
         },
+    )
+
+
+ADOT_SELF_METRICS_PORT = 8889
+ADOT_POD_SELECTOR = "app=gpu-fault-adot"
+
+
+def check_control_record_archive_bucket(release: Any) -> CheckValue:
+    """The control-record archive target exists in this Region before the
+    workers that will archive into it roll out (control-plane review
+    2026-09-08, F-8 / Agent 10).
+
+    Retention is on: every control-worker reads
+    ``GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI`` (site.yaml ``spec.retention``)
+    and the archiver soft-fails
+    (keeps live rows, counts errors) when the bucket is missing. That failure
+    used to be discovered from an alert hours later; this check refuses the
+    release instead. Read-only: ``get-bucket-location`` is enough to prove the
+    bucket exists and sits in the site Region.
+    """
+
+    retention = getattr(release.config, "retention", None)
+    uri = str(getattr(retention, "archive_s3_uri", "") or "")
+    if not uri:
+        raise CheckSkipped(
+            "control record retention is off (site.yaml spec.retention not declared)"
+        )
+    parts = urlsplit(uri)
+    bucket = parts.netloc
+    prefix = parts.path.strip("/")
+    if parts.scheme != "s3" or not bucket or not prefix:
+        raise ReleaseError(
+            f"control record archive target must be s3://bucket/prefix, got {uri}"
+        )
+    location = _aws_json(
+        release, ["s3api", "get-bucket-location", "--bucket", bucket]
+    ).get("LocationConstraint")
+    region = str(location or "us-east-1")
+    if region != release.config.aws_region:
+        raise ReleaseError(
+            f"control record archive bucket {bucket} is in {region}, "
+            f"expected the site Region {release.config.aws_region}"
+        )
+    return CheckValue(
+        f"control record archive bucket {bucket} exists in {region}",
+        {"bucket": bucket, "prefix": prefix, "region": region},
+    )
+
+
+def adot_self_metric_names() -> set[str]:
+    """Every ``otelcol_*`` series the alert rules or the ADOT keep list rely on."""
+
+    names: set[str] = set()
+    for relative in (
+        "deploy/observability/amp-rules.yaml",
+        "deploy/observability/adot-control-plane.yaml",
+    ):
+        names.update(
+            re.findall(r"otelcol_[a-z0-9_]+", (ROOT / relative).read_text("utf-8"))
+        )
+    return names
+
+
+def check_adot_self_metrics(release: Any) -> CheckValue:
+    """The live ADOT collector exports every ``otelcol_*`` series the alerts
+    read (control-plane review 2026-09-08, H2-4).
+
+    The self-scrape metric names were taken from the exporter's no-suffix
+    convention; a collector image bump can rename them, and a rule that reads
+    a series that never exists is silent forever. Read through the API server
+    proxy because the collector image has no shell for ``kubectl exec``.
+    """
+
+    namespace = release.config.namespace
+    pods = (
+        release._get_json(
+            release._cpu(
+                "-n", namespace, "get", "pods", "-l", ADOT_POD_SELECTOR, "-o", "json"
+            )
+        ).get("items")
+        or []
+    )
+    running = [
+        str(pod["metadata"]["name"])
+        for pod in pods
+        if (pod.get("status") or {}).get("phase") == "Running"
+    ]
+    if not running:
+        raise ReleaseError("no running gpu-fault-adot Pod to read self metrics from")
+    raw = release.runner.run(
+        release._cpu(
+            "get",
+            "--raw",
+            f"/api/v1/namespaces/{namespace}/pods/{running[0]}"
+            f":{ADOT_SELF_METRICS_PORT}/proxy/metrics",
+        ),
+        capture=True,
+    )
+    exported = {
+        line.split("{", 1)[0].split(" ", 1)[0]
+        for line in str(raw or "").splitlines()
+        if line and not line.startswith("#")
+    }
+    required = adot_self_metric_names()
+    missing = sorted(name for name in required if name not in exported)
+    if missing:
+        raise ReleaseError(
+            "ADOT self-metrics endpoint does not export "
+            + ", ".join(missing)
+            + "; the collector image renamed them (suffix?) -- fix the keep "
+            "list and the rules before trusting the ADOT alerts"
+        )
+    return CheckValue(
+        f"ADOT {running[0]} exports all {len(required)} otelcol series the rules read",
+        {"pod": running[0], "series": sorted(required)},
     )
 
 
@@ -926,6 +1179,10 @@ def build_preflight_report(release: Any) -> dict[str, Any]:
         ("nlb_inputs", lambda: _check_nlb_inputs(release)),
         ("aurora", lambda: _check_aurora(release)),
         ("aurora_credential_refresh", lambda: check_aurora_refresh(release)),
+        (
+            "control_record_archive_bucket",
+            lambda: check_control_record_archive_bucket(release),
+        ),
         ("email_notifications", lambda: check_email_notifications(release)),
         ("monitoring", lambda: _check_monitoring(release)),
         (
@@ -992,8 +1249,12 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
                 + ", ".join(sorted(legacy))
             )
         details[name] = _deployment_readiness(item, name)
-    if details["gpu-fault-api-ha"]["replicas"] != 3:
-        raise ReleaseError("gpu-fault-api-ha must run exactly three replicas")
+    from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
+
+    if details["gpu-fault-api-ha"]["replicas"] != INGRESS_REPLICAS:
+        raise ReleaseError(
+            f"gpu-fault-api-ha must run exactly {INGRESS_REPLICAS} replicas"
+        )
     if details["gpu-fault-control-worker"]["replicas"] <= 0:
         raise ReleaseError("gpu-fault-control-worker is scaled to zero")
     if details["gpu-fault-adot"]["replicas"] <= 0:
@@ -1017,6 +1278,35 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
         raise ReleaseError("CPU external alert acknowledgement does not match site")
     details["email_enabled"] = release.config.notifications.allow_email
     return CheckValue("CPU control-plane workloads are at desired readiness", details)
+
+
+# The checks a default ``status`` runs. Together they answer "is the control
+# plane up and serving this release" from a handful of ``kubectl get`` calls and
+# one exec into the ingress Pod, where the full report also probes every GPU
+# cluster, the role split, the NLB, Aurora and AMP -- 44 kubectl calls including
+# 15 execs, about 44 seconds on production. The full report stays one flag away
+# (``status --full``) and is still what acceptance evidence records.
+QUICK_HEALTH_CHECKS = ("cpu_workloads", "control_api")
+
+
+def build_quick_health_report(release: Any) -> dict[str, Any]:
+    specifications = [
+        ("cpu_workloads", lambda: _check_cpu_workloads(release)),
+        ("control_api", lambda: _check_control_api(release)),
+    ]
+    assert tuple(name for name, _ in specifications) == QUICK_HEALTH_CHECKS
+    with _read_snapshot(release):
+        _prime_deployment_snapshot(release)
+        with ThreadPoolExecutor(max_workers=len(specifications)) as executor:
+            futures = [
+                executor.submit(_check, name, function)
+                for name, function in specifications
+            ]
+            checks = [future.result() for future in futures]
+    report = _report("status", release, checks)
+    report["scope"] = "quick"
+    report["reused_validation_checks"] = []
+    return report
 
 
 def run_read_only_verifiers(
@@ -1451,6 +1741,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             "aurora_credential_refresh",
             lambda: check_aurora_refresh(release, require_success=True),
         ),
+        ("adot_self_metrics", lambda: check_adot_self_metrics(release)),
         ("runtime_profile", lambda: _verify_profile(release)),
         (
             "read_only_verifiers",

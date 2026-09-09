@@ -12,19 +12,21 @@ from pydantic import Field, model_validator
 
 from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
-    GpuFindingState as GpuFindingState,
-    GpuHealthFinding as GpuHealthFinding,
     GpuHealthSeverity,
+)
+from gpu_fault.gpu_metric_models import (
+    GpuFindingState as GpuFindingState,
+)
+from gpu_fault.gpu_metric_models import (
+    GpuHealthFinding as GpuHealthFinding,
 )
 from gpu_fault.gpu_power_policy import (
     NVIDIA_DCGM_HEALTH_REFERENCE,
     NVIDIA_DCGM_POLICY_VERSION,
     power_violation_decision,
 )
-from gpu_fault.models import StrictModel, WorkloadState
-from gpu_fault.models import RecoveryAction
+from gpu_fault.models import RecoveryAction, StrictModel, WorkloadState
 from gpu_fault.policy import FaultPolicyDecision, XidEvent
-
 
 NVIDIA_GPU_MEMORY_POLICY_VERSION = "nvidia-gpu-memory-error-management/2026-07-26"
 NVIDIA_ROW_REMAP_REFERENCE = (

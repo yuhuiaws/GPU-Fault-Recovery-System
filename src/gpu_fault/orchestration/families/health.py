@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import logging
 from threading import RLock
 from typing import Callable
 
@@ -19,7 +19,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store import NotFoundError
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -250,7 +249,18 @@ class NodeHealthPlanBuilder:
             ]
             if finding.official_action == "RUN_FIELD_DIAGNOSTIC_FOR_RMA":
                 operations += [WorkflowOperation.RUN_FIELD_DIAGNOSTIC]
-            operations += [WorkflowOperation.VALIDATE_GPU]
+            # DRAIN findings are RMA-class (row-remap failure, DBE totals,
+            # NVLink error counters): NVIDIA's guidance is drain and replace,
+            # so there is deliberately no RESTORE_SCHEDULING and the node
+            # stays cordoned and tainted. The hand-off has to be explicit:
+            # ESCALATE_SUPPORT drafts the vendor ticket and ends the incident
+            # ESCALATED, the one state an operator may close by hand once
+            # the RMA is done. Without it the workflow ended SUCCEEDED with
+            # the node held forever and nobody told (logic item 8).
+            operations += [
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ]
         elif action is RecoveryAction.QUARANTINE:
             operations += [
                 WorkflowOperation.MARK_UNSCHEDULABLE,
@@ -668,6 +678,7 @@ class NodeHealthIngestionService:
                 skip_attempt_grouping,
                 skip_node_resource_merge,
                 skip_terminal_quarantine_merge,
+                persist=persist,
             )
             if routed is not None:
                 return routed
@@ -709,6 +720,8 @@ class NodeHealthIngestionService:
         skip_attempt: bool,
         skip_resource: bool,
         skip_terminal: bool,
+        *,
+        persist: bool = True,
     ) -> tuple[FaultIncident, WorkflowRequest | None] | None:
         existing = self.store.get_incident_by_event(finding.event_id)
         if existing is not None:
@@ -732,6 +745,10 @@ class NodeHealthIngestionService:
         covered = self.callbacks.active_workflow_covers_inventory_finding(finding)
         if covered is not None:
             incident, workflow = covered
+            if not persist:
+                # A trial run (the attempt-group candidate, C-12) reports the
+                # covering incumbent and writes nothing.
+                return incident, workflow
             self.store.link_event_to_incident(
                 finding.event_id,
                 incident.incident_id,

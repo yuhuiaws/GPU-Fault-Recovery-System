@@ -9,7 +9,6 @@ from gpu_fault.channel_registry import (
     NODE_LOG_PATH,
 )
 
-
 GPU_INVENTORY_BATCH_SIZE = 16
 GPU_METRICS_BATCH_SIZE = 8
 HOST_TELEMETRY_BATCH_SIZE = 8

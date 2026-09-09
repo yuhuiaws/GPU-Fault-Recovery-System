@@ -174,9 +174,13 @@ dirty工作区、个人clean commit或本地`origin/main`未指向当前commit�
 artifact清单。没有凭据、没有候选或API临时不可用时回退本地门禁；已经下载的候选若身份
 或签名不匹配则fail closed。
 
-本地production回退把静态/契约、普通pytest和PostgreSQL stress放在三个隔离cache目录中，
-按CPU容量自适应为1至3路执行；可用
-`GPU_FAULT_RELEASE_GATE_PARALLELISM=1..3`进一步收口。全部通过后才构建和检查artifact。
+本地production回退把静态/契约、普通pytest和PostgreSQL stress放在三个隔离cache目录中：
+先单独运行约1分钟的静态门禁，失败即停止、不再启动另外两个；静态通过后普通pytest与
+PostgreSQL stress并行，按CPU容量自适应为1至3路执行，可用
+`GPU_FAULT_RELEASE_GATE_PARALLELISM=1..3`进一步收口。任一并行门禁失败会终止其余门禁，
+并在进度输出之后以`release-gates: first failing gate: <name>`重印该门禁最后约20行。
+`release-build: release_source=…`在构建开头说明本次走的是本地完整门禁还是main CI候选。
+全部通过后才构建和检查artifact。
 门禁集合与原`make check`加stress相同，不会降低coverage floor或省略PostgreSQL stress。
 static分支内部继续把Ruff、mypy、compile、架构、代码契约、安全、部署配置、文档、
 YAML和Shell拆成最多10路；`GPU_FAULT_STATIC_GATE_PARALLELISM=1..10`可主动收口。
@@ -238,18 +242,19 @@ git status --short
 `HEAD == origin/main`时才尝试消费同commit签名main CI候选。
 
 真实Runtime Profile变化仍必须经过独立审批。首次四参数命令会写出
-`STATE_DIR/release-deploy/profile-plan.json`并停止；审核计划和变更单后执行：
+`STATE_DIR/release-deploy/profile-plan.json`并停止；审核计划和变更单后，在同一条deploy
+上带审批参数重跑：
 
 ```bash
-gpu-fault-admin approve-profile \
+gpu-fault-admin deploy \
   --state-dir "${STATE_DIR}" \
-  --plan-sha256 "$(jq -er '.plan_sha256' \
+  --approve-profile-plan "$(jq -er '.plan_sha256' \
     "${STATE_DIR}/release-deploy/profile-plan.json")" \
   --reference CHG-12345
 ```
 
-然后重新执行原四参数`gpu-fault-admin deploy`。审批记录绑定具体计划摘要和live
-Profile baseline，不通过隐藏deploy参数注入。发布失败且计划未变化时保留审批用于续跑；
+该命令先审批再继续同一部署，没有单独的审批动词。审批记录绑定具体计划摘要和live
+Profile baseline，只通过这一个显式参数进入。发布失败且计划未变化时保留审批用于续跑；
 模板或live baseline漂移时旧审批归档失效；verify、stability和commit全部成功后才消费
 审批并删除活动记录。
 

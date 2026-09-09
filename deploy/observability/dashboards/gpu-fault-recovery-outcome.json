@@ -1168,7 +1168,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "PENDING_TRIAGE is the backlog the alert watches.\n\nAlert GpuFaultCompletionPendingTriageBacklog (warning, for 30m, > 0): docs/管理员日常运维.md#gpufaultcompletionpendingtriagebacklog",
+      "description": "NO_ACTION and PLAN_CREATED are the only terminal statuses; a rising count is load, not backlog.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1180,7 +1180,7 @@
             "showPoints": "never",
             "spanNulls": false,
             "thresholdsStyle": {
-              "mode": "line"
+              "mode": "off"
             }
           },
           "thresholds": {
@@ -1189,10 +1189,6 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.0
               }
             ]
           },
@@ -1381,7 +1377,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Pooled connection demand over the pool ceiling; above 1 callers queue on checkout.\n\nAlert GpuFaultPostgresPoolOversubscribed (warning, for 10m, > 1): docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed",
+      "description": "Pooled connection demand over the pool ceiling; above 1 callers queue on checkout.\n\nAlert GpuFaultPostgresPoolOversubscribed (info, for 10m, > 1): docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1404,7 +1400,7 @@
                 "value": null
               },
               {
-                "color": "orange",
+                "color": "blue",
                 "value": 1.0
               }
             ]

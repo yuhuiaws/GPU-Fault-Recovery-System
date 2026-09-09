@@ -26,7 +26,9 @@
       "src/gpu_fault/admin/capacity_evidence.py",
       "src/gpu_fault/admin/config.py",
       "src/gpu_fault/admin/config_parser.py",
-      "src/gpu_fault/admin/site.py"
+      "src/gpu_fault/admin/operation_lock.py",
+      "src/gpu_fault/admin/site.py",
+      "src/gpu_fault/failure_domains.py"
     ],
     "module_floors": [
       {
@@ -140,7 +142,7 @@
       "tests/test_public_release.py",
       "tests/test_release_*.py",
       "tests/test_restore_ci_candidate.py",
-      "tests/test_staging_deploy.py"
+      "tests/test_staging_deploy*.py"
     ],
     "shared_files": [
       "tests/__init__.py",

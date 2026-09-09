@@ -93,15 +93,17 @@ def test_repeated_reads_inside_one_ttl_cost_one_scan() -> None:
     cache.workflows()
     cache.workflows()
 
+    # One workflow scan is two bounded reads (open statuses, newest terminal;
+    # G-2), shared for the TTL like the agent read.
     assert store.agent_calls == 1
-    assert store.workflow_calls == 1
+    assert store.workflow_calls == 2
 
     clock[0] = 11.0
     cache.agents()
     cache.workflows()
 
     assert store.agent_calls == 2
-    assert store.workflow_calls == 2
+    assert store.workflow_calls == 4
 
 
 def test_zero_ttl_disables_sharing_so_a_caller_can_demand_fresh_rows() -> None:
@@ -120,17 +122,19 @@ def test_workflow_scan_is_bounded_and_reports_its_truncation() -> None:
 
     scan = cache.workflows()
 
-    # One row past the budget is requested, which is how truncation is observed
-    # instead of guessed from a full page.
-    assert store.workflow_limits == [4]
-    assert len(scan.workflows) == 3
+    # One row past the budget is requested on each of the two slices (open
+    # statuses, then newest terminal; G-2), which is how truncation is observed
+    # instead of guessed from a full page. This fake ignores the status filter,
+    # so both slices see the same five rows and each is truncated to three.
+    assert store.workflow_limits == [4, 4]
+    assert len(scan.workflows) == 6
     assert scan.limit == 3
     assert scan.truncated is True
 
     cache.invalidate()
     within = MetricScanCache(store, workflow_limit=5, ttl_seconds=0.0).workflows()
 
-    assert len(within.workflows) == 5
+    assert len(within.workflows) == 10
     assert within.truncated is False
 
 

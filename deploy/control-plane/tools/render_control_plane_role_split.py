@@ -65,6 +65,17 @@ PROCESSOR_POOL_ENV = (
 SENSITIVE_ENV = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DEFAULT_ADMIN_CONFIG = default_admin_config()
 
+# Four uvicorn processes per Pod on the ingress and control-worker tiers
+# (the telemetry spool runs one). ADOT scrapes a Pod, not a process, so
+# the application aggregates /metrics over the Pod's live processes
+# through a shared /dev/shm directory (``gpu_fault.app.process_metrics``,
+# strategies in ``gpu_fault.app.metric_aggregation``); a scrape answered
+# by any process reads the whole Pod. The consumer-process invariant is
+# ``replicas x UVICORN_WORKERS_PER_POD`` and the verifier fails the deploy
+# if a tier's command says otherwise.
+UVICORN_WORKERS_PER_POD = 4
+SPOOL_UVICORN_WORKERS_PER_POD = 1
+
 
 def config_domain(name: str) -> str:
     domains = (
@@ -85,6 +96,7 @@ def config_domain(name: str) -> str:
             "notification",
             (
                 "GPU_FAULT_NOTIFICATION_",
+                "GPU_FAULT_SNS_",
                 "GPU_FAULT_SES_",
                 "GPU_FAULT_EMAIL_",
             ),
@@ -277,13 +289,21 @@ def configure_processor_retry(container: dict) -> None:
 def configure_worker_queue_coordination(
     worker: dict,
     *,
-    notification_shards: int,
+    consumer_processes: int,
 ) -> None:
+    # Both the process count and the shard count are replicas x uvicorn
+    # workers per Pod; the runtime refuses a shard count below the process
+    # count (a consumer without a shard never hears a notification).
     set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS", "5")
     set_env(
         worker,
+        "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES",
+        str(consumer_processes),
+    )
+    set_env(
+        worker,
         "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS",
-        str(notification_shards),
+        str(consumer_processes),
     )
     set_env(worker, "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", "1")
     set_env(worker, "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS", "30")
@@ -627,6 +647,48 @@ def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
         set_env(container, name, environment_text(value))
 
 
+# site.yaml spec.retention, forwarded by the release engine's apply
+# environment. Worker only: the archiver runs in the periodic services of
+# that tier, and the runtime refuses a positive retention without an S3 URI,
+# so a tier that cannot honour it must not be asked to validate it.
+CONTROL_RECORD_RETENTION_ENV = (
+    "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS",
+)
+
+
+def configure_control_record_retention(container: dict[str, Any]) -> None:
+    """Carry the retention variables when declared; leave none behind otherwise."""
+
+    for name in CONTROL_RECORD_RETENTION_ENV:
+        declared = os.getenv(name)
+        if declared is None or not declared.strip():
+            unset_env(container, name)
+        else:
+            set_env(container, name, declared.strip())
+
+
+# site.yaml spec.notifications.channel and the site's SNS topic, forwarded by
+# the release engine's apply (and rollback) environment. Every role: each
+# builds the notifier and runs the fail-closed alert-channel guard at startup.
+NOTIFICATION_CHANNEL_ENV = (
+    "GPU_FAULT_NOTIFICATION_CHANNEL",
+    "GPU_FAULT_SNS_TOPIC_ARN",
+)
+
+
+def configure_notification_channel(container: dict[str, Any]) -> None:
+    """Carry the channel variables when declared; leave none behind otherwise."""
+
+    for name in NOTIFICATION_CHANNEL_ENV:
+        declared = os.getenv(name)
+        if declared is None or not declared.strip():
+            unset_env(container, name)
+        else:
+            set_env(container, name, declared.strip())
+
+
 def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
     processor = config.processor
     workflow = config.workflow
@@ -678,6 +740,7 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
 def configure_base(container: dict, config: AdminConfig) -> None:
     configure_processor_retry(container)
     configure_admin_tuning(container, config)
+    configure_notification_channel(container)
 
 
 def parse_options() -> tuple[argparse.Namespace, AdminConfig]:
@@ -876,7 +939,7 @@ def main() -> None:
     replace_uvicorn_args(
         ingress,
         port=8080,
-        workers=4,
+        workers=UVICORN_WORKERS_PER_POD,
         backlog=8192,
         ingress=True,
     )
@@ -975,6 +1038,7 @@ def main() -> None:
     # pools exist on, so the value has to be visible next to the four
     # pools it sizes the defaults for.
     configure_worker_capacity(worker, admin_config)
+    configure_control_record_retention(worker)
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_WORKERS", "4")
     set_env(
         worker,
@@ -988,7 +1052,9 @@ def main() -> None:
     )
     configure_worker_queue_coordination(
         worker,
-        notification_shards=(admin_config.capacity.control_worker_replicas * 4),
+        consumer_processes=(
+            admin_config.capacity.control_worker_replicas * UVICORN_WORKERS_PER_POD
+        ),
     )
     set_env(
         worker,
@@ -1032,7 +1098,7 @@ def main() -> None:
     replace_uvicorn_args(
         worker,
         port=8081,
-        workers=4,
+        workers=UVICORN_WORKERS_PER_POD,
         backlog=1024,
         ingress=False,
     )
@@ -1204,7 +1270,7 @@ def main() -> None:
     replace_uvicorn_args(
         spool_worker,
         port=8082,
-        workers=1,
+        workers=SPOOL_UVICORN_WORKERS_PER_POD,
         backlog=1024,
         ingress=False,
     )

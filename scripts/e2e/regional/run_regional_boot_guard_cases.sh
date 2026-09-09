@@ -82,6 +82,12 @@ case_passed() {
 
 if (( BOOT_GUARD_START_CASE > 1 )); then
   for case_number in $(seq 1 $((BOOT_GUARD_START_CASE - 1))); do
+    # BOOT-006 is retired: the in-cluster quick-diagnostics guard it drove no
+    # longer exists, so no run of this script produces its evidence. The
+    # numbering of the surviving cases is unchanged.
+    if (( case_number == 6 )); then
+      continue
+    fi
     printf -v case_id 'GF-REGIONAL-BOOT-%03d' "${case_number}"
     evidence="${CASE_DIR}/${case_id}.txt"
     if ! case_passed "${evidence}"; then
@@ -415,16 +421,6 @@ if (( BOOT_GUARD_START_CASE <= 5 )); then
   pass_case
 fi
 
-if (( BOOT_GUARD_START_CASE <= 6 )); then
-  begin_case 6
-  reset_probe
-  apply_mutation set GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS true
-  assert_probe \
-    "regional control plane cannot run in-cluster quick diagnostics against its own EKS" |
-    tee -a "${CURRENT_EVIDENCE}"
-  pass_case
-fi
-
 if (( BOOT_GUARD_START_CASE <= 7 )); then
   begin_case 7
   probe_registry 31
@@ -547,7 +543,7 @@ for pod in $(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
       exec "${pod}" -- printenv |
       grep -E \
-        '^GPU_FAULT_(DEPLOYMENT_MODE|ENABLE_KUBERNETES_ADAPTER|ENABLE_NODE_ACTION_ADAPTER|ENABLE_HYPERPOD_ADAPTER|ENABLE_HYPERPOD_SPARE_FAILOVER|ENABLE_HYPERPOD_MANAGED_OBSERVER|ENABLE_AGENT_REGISTRY|ENABLE_QUICK_DIAGNOSTICS|HYPERPOD_CLUSTER|PROCESSOR_MODE)=' |
+        '^GPU_FAULT_(DEPLOYMENT_MODE|ENABLE_KUBERNETES_ADAPTER|ENABLE_NODE_ACTION_ADAPTER|ENABLE_HYPERPOD_ADAPTER|ENABLE_HYPERPOD_SPARE_FAILOVER|ENABLE_HYPERPOD_MANAGED_OBSERVER|ENABLE_AGENT_REGISTRY|HYPERPOD_CLUSTER|PROCESSOR_MODE)=' |
       sort
   )"
   printf '== %s\n%s\n' "${pod}" "${output}" |
@@ -571,7 +567,6 @@ expect_env 'GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false'
 expect_env 'GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false'
 expect_env 'GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER=true'
 expect_env 'GPU_FAULT_ENABLE_AGENT_REGISTRY=true'
-expect_env 'GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS=false'
 expect_env 'GPU_FAULT_PROCESSOR_MODE=active-active'
 if grep -q '^GPU_FAULT_HYPERPOD_CLUSTER=' <<<"${baseline_env}"; then
   fail_case "GPU_FAULT_HYPERPOD_CLUSTER must be absent in regional mode"

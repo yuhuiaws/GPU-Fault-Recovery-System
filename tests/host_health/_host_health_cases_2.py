@@ -399,7 +399,9 @@ def test_admin_can_acknowledge_transient_efa_spike(monkeypatch) -> None:
     evidence = context.store.list_raw_evidence(
         "cluster-a", node_id="node-a", attempt_id="attempt-a"
     )
-    assert any(item.kind.value == "ADMIN_ACTION" for item in evidence)
+    assert any(item.kind.value == "ADMIN_ACTION" for item in evidence), (
+        "the acknowledgement must leave an ADMIN_ACTION evidence item"
+    )
 
 
 def test_admin_can_accept_new_efa_baseline_and_stale_event_is_rejected(
@@ -470,7 +472,7 @@ def test_admin_can_accept_new_efa_baseline_and_stale_event_is_rejected(
         assert normal.json()["findings"] == []
         assert second_spike.json()["findings"][0]["event_id"].endswith(
             "-efa-traffic-spike"
-        )
+        ), "the second spike must open a fresh spike event"
         assert stale.status_code == 409
         assert "active SPIKE transition" in stale.json()["detail"]
 
@@ -528,11 +530,23 @@ def test_cpu_finding_requests_host_validation() -> None:
 
     async def scenario() -> None:
         async with asgi_client(context) as client:
+            # CPU saturation is sustain-gated (HOST_RESOURCE_SUSTAIN_SECONDS):
+            # the first breach arms the signal, the one held past the window
+            # mints the finding. The window runs on the control plane's
+            # receive clock (F-M2), so the batches carry ``received_at``.
+            first = await client.post(
+                "/v1/collector-events/host-telemetry",
+                json=telemetry("cpu-saturation-0", "cpu_usage_percent", 99)
+                .model_copy(update={"received_at": NOW})
+                .model_dump(mode="json"),
+            )
+            assert first.json()["incident_ids"] == []
+            held = NOW + timedelta(seconds=130)
             response = await client.post(
                 "/v1/collector-events/host-telemetry",
-                json=telemetry("cpu-saturation", "cpu_usage_percent", 99).model_dump(
-                    mode="json"
-                ),
+                json=telemetry("cpu-saturation-1", "cpu_usage_percent", 99, held)
+                .model_copy(update={"received_at": held})
+                .model_dump(mode="json"),
             )
 
         incident = context.store.get_incident(response.json()["incident_ids"][0])

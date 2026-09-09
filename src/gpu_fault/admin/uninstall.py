@@ -75,10 +75,34 @@ CPU_CLUSTER_BOUND_RESOURCE_KEYS = frozenset(
 
 @dataclass(frozen=True)
 class UninstallRequest:
+    """One uninstall.
+
+    ``cpu_disposition="keep"`` is a reinstall: the CPU cluster and the Aurora
+    cluster stay, so the site's incident, workflow and registry records (and
+    the quarantine taints keyed on those incident ids) survive to the next
+    ``deploy``, which adopts the existing cluster. ``reset_database`` is the
+    explicit opt-in to wipe Aurora on a reinstall. ``cpu_disposition="delete"``
+    is retirement: Aurora goes with the CPU cluster, and
+    ``final_snapshot_policy`` decides whether a final snapshot stays for audit.
+    """
+
     site: RenderedSite
     cpu_disposition: CpuDisposition
     confirmation: str
     final_snapshot_policy: FinalSnapshotPolicy = "retain"
+    reset_database: bool = False
+
+    def __post_init__(self) -> None:
+        if self.cpu_disposition == "keep" and self.final_snapshot_policy == "skip":
+            raise BootstrapError(
+                "--aurora-final-snapshot skip is only valid with --cpu-cluster "
+                "delete; a reinstall keeps the Aurora cluster"
+            )
+        if self.cpu_disposition == "delete" and self.reset_database:
+            raise BootstrapError(
+                "--reset-database is only valid with --cpu-cluster keep; "
+                "--cpu-cluster delete already deletes the Aurora cluster"
+            )
 
 
 def _required_confirmation(disposition: CpuDisposition) -> str:
@@ -267,6 +291,7 @@ def _effective_policy(
     resource: InstallationResource,
     *,
     cpu_disposition: CpuDisposition,
+    reset_database: bool = False,
     aurora_cluster_policy: InstallationResourceDeletePolicy | None = None,
 ) -> InstallationResourceDeletePolicy:
     if resource.resource_type in {"cpu_eks", "cpu_hyperpod"}:
@@ -280,6 +305,15 @@ def _effective_policy(
         and cpu_disposition == "delete"
     ):
         return InstallationResourceDeletePolicy.DELETE
+    if (
+        is_aurora_resource(resource)
+        and cpu_disposition == "keep"
+        and not reset_database
+    ):
+        # A reinstall keeps the database and everything the cluster stands on
+        # (subnet group, security group, parameter group, managed secret); the
+        # next deploy adopts the existing cluster.
+        return InstallationResourceDeletePolicy.PRESERVE
     if (
         resource.resource_type in {"aurora_instance", "rds_managed_secret"}
         and aurora_cluster_policy is not None
@@ -338,9 +372,12 @@ def _uninstall_state(
             "site_id": request.site.release_config["site_name"],
             "cpu_disposition": request.cpu_disposition,
             "final_snapshot_policy": request.final_snapshot_policy,
+            "reset_database": request.reset_database,
         }
         for key, item in expected.items():
-            if value.get(key) != item:
+            # A state file written before ``reset_database`` existed resumes as
+            # a plain reinstall.
+            if value.get(key, False if key == "reset_database" else None) != item:
                 raise BootstrapError(f"uninstall state {path} conflicts on {key}")
         return value
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -352,6 +389,7 @@ def _uninstall_state(
         "site_id": request.site.release_config["site_name"],
         "cpu_disposition": request.cpu_disposition,
         "final_snapshot_policy": request.final_snapshot_policy,
+        "reset_database": request.reset_database,
         "final_snapshot_identifier": snapshot_identifier,
         "phase": "STARTED",
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -400,6 +438,7 @@ def _load_or_export_registry(
             if _effective_policy(
                 resource,
                 cpu_disposition=request.cpu_disposition,
+                reset_database=request.reset_database,
             )
             is not InstallationResourceDeletePolicy.PRESERVE
             else InstallationResourceStatus.ACTIVE
@@ -474,6 +513,7 @@ def _verify_resources(
     resources: list[InstallationResource],
     *,
     cpu_disposition: CpuDisposition,
+    reset_database: bool = False,
     aurora_cluster_policy: InstallationResourceDeletePolicy | None = None,
 ) -> list[InstallationResource]:
     now = datetime.now(timezone.utc)
@@ -482,6 +522,7 @@ def _verify_resources(
         policy = _effective_policy(
             resource,
             cpu_disposition=cpu_disposition,
+            reset_database=reset_database,
             aurora_cluster_policy=aurora_cluster_policy,
         )
         exists = (
@@ -582,6 +623,7 @@ def _delete_aurora_last(
     cluster_policy = _effective_policy(
         cluster,
         cpu_disposition=request.cpu_disposition,
+        reset_database=request.reset_database,
     )
     if cluster_policy is InstallationResourceDeletePolicy.PRESERVE:
         inconsistent = [
@@ -590,6 +632,7 @@ def _delete_aurora_last(
             if _effective_policy(
                 resource,
                 cpu_disposition=request.cpu_disposition,
+                reset_database=request.reset_database,
                 aurora_cluster_policy=cluster_policy,
             )
             is not InstallationResourceDeletePolicy.PRESERVE
@@ -616,6 +659,7 @@ def _delete_aurora_last(
         policy = _effective_policy(
             resource,
             cpu_disposition=request.cpu_disposition,
+            reset_database=request.reset_database,
             aurora_cluster_policy=cluster_policy,
         )
         if policy is InstallationResourceDeletePolicy.PRESERVE:
@@ -699,6 +743,7 @@ def _uninstall_locked(
         cleaner,
         non_aurora,
         cpu_disposition=request.cpu_disposition,
+        reset_database=request.reset_database,
     )
     aurora_pending = [
         resource.model_copy(
@@ -708,6 +753,7 @@ def _uninstall_locked(
                     if _effective_policy(
                         resource,
                         cpu_disposition=request.cpu_disposition,
+                        reset_database=request.reset_database,
                     )
                     is not InstallationResourceDeletePolicy.PRESERVE
                     else InstallationResourceStatus.PRESERVED
@@ -743,11 +789,13 @@ def _uninstall_locked(
     aurora_policy = _effective_policy(
         aurora_cluster,
         cpu_disposition=request.cpu_disposition,
+        reset_database=request.reset_database,
     )
     verified = _verify_resources(
         cleaner,
         snapshot.resources,
         cpu_disposition=request.cpu_disposition,
+        reset_database=request.reset_database,
         aurora_cluster_policy=aurora_policy,
     )
     if final_snapshot is not None:
@@ -796,6 +844,12 @@ def _uninstall_locked(
         "cpu_cluster": request.cpu_disposition,
         "gpu_clusters": "preserved",
         "gpu_cluster_records_verified": gpu_records,
+        "aurora_cluster": (
+            "deleted"
+            if aurora_policy is InstallationResourceDeletePolicy.DELETE
+            else "preserved"
+        ),
+        "database_reset": request.reset_database,
         "aurora_deleted_last": (
             aurora_policy is InstallationResourceDeletePolicy.DELETE
         ),

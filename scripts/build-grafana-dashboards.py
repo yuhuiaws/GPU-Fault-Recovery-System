@@ -39,8 +39,10 @@ AMP_RULES = ROOT / "deploy" / "observability" / "amp-rules.yaml"
 # can see. ``collector_metrics.py`` is the one an earlier inventory forgot.
 EXPORTER_SOURCES = (
     "src/gpu_fault/app/metrics.py",
+    "src/gpu_fault/app/metric_contributors.py",
     "src/gpu_fault/app/metrics_sections.py",
     "src/gpu_fault/app/builtin_metric_contributors.py",
+    "src/gpu_fault/app/aurora_refresh_metrics.py",
     "src/gpu_fault/app/collector_metrics.py",
     "src/gpu_fault/completion_metrics_server.py",
 )
@@ -48,7 +50,7 @@ DATASOURCE = {"type": "prometheus", "uid": "gpu-fault-amp"}
 SCHEMA_VERSION = 39  # Grafana 10.4
 TAGS = ["gpu-fault"]
 RUNBOOK_DOCUMENT = "docs/管理员日常运维.md"
-SEVERITY_COLOR = {"critical": "red", "warning": "orange"}
+SEVERITY_COLOR = {"critical": "red", "warning": "orange", "info": "blue"}
 OK_COLOR = "green"
 PANEL_HEIGHT = 8
 PANELS_PER_LINE = 4

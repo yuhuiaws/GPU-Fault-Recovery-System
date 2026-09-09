@@ -706,3 +706,13 @@ def test_the_audit_column_list_is_the_ledger_table_minus_key_and_payload(
     assert set(verdicts.AUDIT_COLUMNS) <= set(probe.AUDIT_COLUMNS), sorted(
         set(verdicts.AUDIT_COLUMNS) - set(probe.AUDIT_COLUMNS)
     )
+
+
+def test_the_preflight_gates_on_the_fault_tier_not_routine_telemetry() -> None:
+    """A stale gpu-inventory lane leaves total depth at 1 for ~120 s; that is
+    routine telemetry, not work the restart's event would queue behind
+    (attempt 2, 2026-09-08)."""
+    routine = _preflight(queue={"depth": 1, "fault_backlog_depth": 0})
+    assert not any("processor queue" in e for e in routine), routine
+    fault = _preflight(queue={"depth": 0, "fault_backlog_depth": 2})
+    assert any("processor queue" in e for e in fault), fault

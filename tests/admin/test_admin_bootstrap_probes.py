@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -169,7 +170,7 @@ def test_healthy_iam_role_probe_performs_no_mutation(
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
@@ -236,15 +237,19 @@ def test_healthy_lbc_probe_skips_helm_and_iam_mutation(
 
         def run(self, arguments, **kwargs):
             calls.append((list(arguments), kwargs))
-            if "list-policy-tags" in arguments:
+            if "get-policy" in arguments:
+                # One read carries the tags; there is no list-policy-tags call.
                 return json.dumps(
                     {
-                        "Tags": [
-                            {
-                                "Key": admin_bootstrap_services.SITE_TAG_KEY,
-                                "Value": "site-a",
-                            }
-                        ]
+                        "Policy": {
+                            "Arn": policy_arn,
+                            "Tags": [
+                                {
+                                    "Key": admin_bootstrap_services.SITE_TAG_KEY,
+                                    "Value": "site-a",
+                                }
+                            ],
+                        }
                     }
                 )
             if "list-attached-role-policies" in arguments:
@@ -314,63 +319,60 @@ def test_healthy_lbc_probe_skips_helm_and_iam_mutation(
     )
 
 
-def test_healthy_sqs_probe_skips_policy_rewrite(
+def test_monitoring_resources_create_no_alerts_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The alerts SQS queue had no consumer; bootstrap creates the topic only.
+
+    Every AWS call the monitoring task makes is recorded: none may name the
+    ``sqs`` service, and the only subscription the topic gets is the email one.
+    """
+
     cpu = _cluster()
-    topic_arn = "arn:aws:sns:us-east-1:123456789012:topic-a"
-    queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/queue-a"
-    queue_arn = "arn:aws:sqs:us-east-1:123456789012:queue-a"
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "sns.amazonaws.com"},
-                "Action": "sqs:SendMessage",
-                "Resource": queue_arn,
-                "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}},
-            }
-        ],
-    }
-    calls = []
+    topic_arn = "arn:aws:sns:us-east-1:123456789012:gpu-fault-site-a-alerts"
+    calls: list[list[str]] = []
 
     class Runner:
         dry_run = False
 
         def run(self, arguments, **kwargs):
-            calls.append((list(arguments), kwargs))
-            if "list-queue-tags" in arguments:
-                return json.dumps(
-                    {"Tags": {admin_bootstrap_services.SITE_TAG_KEY: "site-a"}}
-                )
-            if "get-queue-attributes" in arguments:
-                return json.dumps(
-                    {
-                        "Attributes": {
-                            "QueueArn": queue_arn,
-                            "Policy": json.dumps(policy),
-                        }
-                    }
-                )
+            del kwargs
+            calls.append(list(arguments))
+            if "list-subscriptions-by-topic" in arguments:
+                return json.dumps({"Subscriptions": []})
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        admin_bootstrap_services,
+        "_ensure_amp_workspace",
+        lambda _runner, **_kwargs: ("ws-a", True),
+    )
+    monkeypatch.setattr(
+        admin_bootstrap_services,
+        "ensure_sns_topic",
+        lambda _runner, **_kwargs: (topic_arn, True, "a" * 32),
+    )
+    monkeypatch.setattr(
+        subprocess,
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0, stdout=queue_url, stderr=""
-        ),
+        lambda *_args, **_kwargs: pytest.fail("monitoring bootstrap shelled out"),
     )
 
-    result = admin_bootstrap_services.probe_sqs_queue(
-        Runner(), cpu=cpu, site_id="site-a", topic_arn=topic_arn
+    result = admin_bootstrap_services.ensure_monitoring_resources(
+        Runner(), state=None, cpu=cpu, site_id="site-a", alert_email=None
     )
 
-    assert result[:2] == (queue_url, queue_arn)
-    assert all(not options.get("mutate") for _command, options in calls), (
-        "healthy SQS probe rewrote queue state"
+    assert not any("sqs" in call for call in calls), (
+        f"monitoring bootstrap issued an SQS call: {calls}"
     )
+    assert not any("subscribe" in call for call in calls), (
+        f"monitoring bootstrap subscribed something other than the email: {calls}"
+    )
+    assert not any(key.startswith(("sqs_", "queue_")) for key in result), (
+        f"monitoring result still carries queue keys: {sorted(result)}"
+    )
+    assert result["sns_topic_arn"] == topic_arn
+    assert result["email_subscription_arn"] is None
 
 
 def test_parallel_bootstrap_ensures_only_after_probe_detects_drift(
@@ -515,6 +517,7 @@ def test_probe_before_ensure_tasks_survive_a_release_identity_change(
 PROBE_COVERED_TASKS = (
     "pod_identity_agent",
     "monitoring_install",
+    "aurora_ready",
     "aurora_refresh",
     "load_balancer_controller",
     "control_plane_role",
@@ -716,7 +719,7 @@ def test_healthy_monitoring_install_probe_runs_no_installer(
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
@@ -767,7 +770,7 @@ def test_monitoring_install_probe_requires_ensure_on_drift(
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
@@ -1120,9 +1123,7 @@ def test_pod_identity_agent_is_probed_once_per_run(
     monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
     calls: list[list[str]] = []
     runner = _control_plane_identity_runner(calls)
-    monkeypatch.setattr(
-        admin_bootstrap_services.subprocess, "run", _forbidden_subprocess(calls)
-    )
+    monkeypatch.setattr(subprocess, "run", _forbidden_subprocess(calls))
     arguments: dict[str, Any] = {
         "cpu": _cluster(),
         "cpu_kubeconfig": tmp_path / "cpu.kubeconfig",
@@ -1155,9 +1156,7 @@ def test_ensure_role_reads_each_role_once(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
     calls: list[list[str]] = []
     runner = _control_plane_identity_runner(calls)
-    monkeypatch.setattr(
-        admin_bootstrap_services.subprocess, "run", _forbidden_subprocess(calls)
-    )
+    monkeypatch.setattr(subprocess, "run", _forbidden_subprocess(calls))
 
     admin_bootstrap_services.probe_iam_role(
         runner,

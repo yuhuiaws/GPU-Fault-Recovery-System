@@ -21,6 +21,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     safe_name,
 )
+from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
@@ -67,6 +68,51 @@ def _target(
     if len(matches) != 1:
         raise BootstrapError(f"unknown cluster_id: {cluster_id}")
     return matches[0], [item for item in clusters if item["cluster_id"] != cluster_id]
+
+
+def resolve_cluster_id(
+    site: RenderedSite,
+    gpu_cluster_arn: str,
+    *,
+    discover: Callable[[str], tuple[str, str]] | None = None,
+) -> str:
+    """Map the ARN the administrator typed to the managed cluster's id.
+
+    The administrator names GPU clusters by ARN everywhere else (``deploy``,
+    ``join-cluster``); the internal ``cluster_id`` is derived at join time and
+    never shown as an input. An EKS ARN is matched against the site record
+    directly. A HyperPod ARN carries an opaque cluster id, not the name the
+    site stores, so it is resolved through ``discover`` (the same AWS lookup
+    ``join-cluster`` uses) to its EKS ARN and HyperPod name before matching.
+    """
+
+    arn = Arn.parse(gpu_cluster_arn)
+    if arn.service not in {"eks", "sagemaker"}:
+        raise BootstrapError("GPU cluster ARN must use the eks or sagemaker service")
+    clusters = [dict(item) for item in site.release_config["clusters"]]
+    eks_arn = gpu_cluster_arn.strip()
+    hyperpod_name = ""
+    if arn.service == "sagemaker":
+        if discover is None:
+            raise BootstrapError(
+                "a HyperPod ARN needs AWS discovery to resolve its EKS cluster"
+            )
+        eks_arn, hyperpod_name = discover(gpu_cluster_arn)
+    matches = [
+        item
+        for item in clusters
+        if item.get("eks_cluster_arn") == eks_arn
+        or (hyperpod_name and item.get("hyperpod_cluster_name") == hyperpod_name)
+    ]
+    if len(matches) == 1:
+        return str(matches[0]["cluster_id"])
+    managed = ", ".join(
+        str(item.get("eks_cluster_arn") or item.get("cluster_id")) for item in clusters
+    )
+    raise BootstrapError(
+        f"no managed GPU cluster matches {gpu_cluster_arn}; "
+        f"managed clusters: {managed or 'none'}"
+    )
 
 
 def _state(
@@ -1022,6 +1068,12 @@ def _sync_release_state(site: RenderedSite) -> None:
         raise BootstrapError("regional release state synchronization failed")
 
 
+def refresh_failure_domain_map(site: RenderedSite) -> None:
+    """Re-render the control-worker's failure-domain map for the remaining clusters."""
+
+    apply_failure_domain_map(site)
+
+
 def remove_cluster(
     request: RemoveClusterRequest,
     *,
@@ -1175,6 +1227,9 @@ def _remove_cluster_locked(
         repository_root=request.site.repository_root,
     )
     if not _done(state, "RELEASE_STATE_UPDATED"):
+        # Membership is final: drop the removed cluster from the failure-domain
+        # map the control-worker mounts before the release state moves on.
+        refresh_failure_domain_map(updated_site)
         _sync_release_state(updated_site)
         _complete(
             state_path,

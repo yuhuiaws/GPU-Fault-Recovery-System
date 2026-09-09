@@ -11,7 +11,6 @@ from pydantic import Field, field_validator, model_validator
 
 from gpu_fault.models import StrictModel
 
-
 RESOURCE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$")
 RESOURCE_ID_PATTERN = re.compile(r"^[^\s\x00-\x1f\x7f]{1,2048}$")
 SENSITIVE_KEY_PATTERN = re.compile(

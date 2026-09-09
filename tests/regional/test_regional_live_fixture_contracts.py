@@ -284,6 +284,10 @@ class _FakeStore:
             ),
         ]
 
+    def processor_fault_backlog_depth(self) -> int:
+        # The probe gates on the fault tier of the processor queue, not its depth.
+        return 0
+
     def list_xid_events(self, _cluster: str, _node: str, *, observed_after: Any):
         return [_Record(event_id="event-a", raw_message="marker-a", xid=79)]
 

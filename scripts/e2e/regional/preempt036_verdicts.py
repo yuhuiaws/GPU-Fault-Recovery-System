@@ -1,40 +1,49 @@
 """Seeding and verdicts for GF-REGIONAL-PREEMPT-036, without any I/O of its own.
 
-The case proves the operator path that closes a wedged workflow:
-``gpu-fault-admin workflow-reconcile --mode {compile-blocked,orphaned-commands,
-retired-generation}`` in ``--plan`` then ``--apply``. Three production incidents
-each held a release for hours because no such path existed, and each one has a
-different shape, so the case seeds one store per mode.
+The case proves that the dispatcher closes a wedged workflow on its own. Three
+production incidents each held a release for hours because the record that
+blocked it had no close path: a workflow BLOCKED at compile time with no
+executable owner, a FAILED workflow whose remote command stayed WAITING for
+thirteen hours, and a re-planned-away generation that kept being dispatched.
+Their first fix was an operator command (``workflow-reconcile --mode ...``);
+since 2026-09-08 every one of them is a Store predicate the dispatcher runs on
+``WorkflowDispatcher.sweep_stuck_records`` every tick, so the case seeds one
+store per shape and drives that method against it.
 
-Everything here is pure. The seeding functions take a Store and only call its
-public API -- no SQL, no DDL -- and the verdict functions take the JSON the real
-plan/apply entry points printed plus a read-back of the Store, and return a list
-of human-readable failures. The runner owns the parts that cannot be unit
-tested: provisioning a throwaway database, shipping the module source into a
+Everything here is pure in the sense that matters: the seeding functions take a
+Store and only call its public API -- no SQL, no DDL -- the sweep is the product's
+own dispatcher built from its public constructors, and the verdict functions take
+read-backs of the Store and the JSON the release probes printed and return a list
+of human-readable failures. The runner owns what cannot be unit tested:
+provisioning a throwaway database, running the shipped probe sources in a
 subprocess, and writing evidence.
 
-Two conventions the verdicts encode, because the reconcile code decides them and
-prose could drift from it:
+Two conventions the verdicts encode, because the product decides them and prose
+could drift from it:
 
-* ``actionable`` is ``eligible or cancellable``, not ``eligible``. A retired
-  generation with an open remote command is planned as *cancellable*: the apply
-  is allowed to cancel the command itself and then revoke. Reading only
-  ``eligible`` would call that record refused when the code applies it.
-* rerunning after a successful apply is not one contract but two.
-  ``compile-blocked`` and ``retired-generation`` re-plan the record as
-  ``already_closed`` / ``already_revoked`` and the apply is a no-op;
-  ``orphaned-commands`` writes no workflow, so the re-plan finds no open command
-  and the apply *refuses*. Both are correct; a single "rerun is idempotent"
-  assertion would be wrong for one of them.
+* the retired generation takes two passes -- its remote command is cancelled
+  first and the row is revoked only once the Store shows it settled -- so each
+  seed says how many ``passes`` it needs, and a pass after that changes nothing;
+* the audit lands where each sweep puts it. The compile-blocked close and the
+  orphan cancel append an ``OPERATOR_RECONCILED`` event with actor
+  ``dispatcher`` to the workflow they act on; the retired-generation revoke has
+  no operator to name, writes its audit into ``preemption_reason`` and the
+  incident's ``reasons``, and appends no operator event.
 """
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
+from gpu_fault.compile_blocked import CLOSE_MARKER, DISPATCHER_ACTOR
+from gpu_fault.execution.config import (
+    ProductionExecutorConfig,
+    WorkflowDispatcherConfig,
+)
+from gpu_fault.execution.dispatcher import WorkflowDispatcher
+from gpu_fault.execution.executor import ProductionWorkflowExecutor
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -45,72 +54,59 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.orphaned_commands import AUDIT_ACTION
 from gpu_fault.regional import RemoteActionCommand
 from gpu_fault.remote_command_models import RemoteCommandStatus
 
 CASE_ID = "GF-REGIONAL-PREEMPT-036"
-COMPILE_BLOCKED_MODE = "compile-blocked"
-ORPHANED_COMMANDS_MODE = "orphaned-commands"
-RETIRED_GENERATION_MODE = "retired-generation"
-MODES = (COMPILE_BLOCKED_MODE, ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE)
-REFERENCE = "CHG-PREEMPT-036"
+COMPILE_BLOCKED_SHAPE = "compile-blocked"
+ORPHANED_COMMANDS_SHAPE = "orphaned-commands"
+RETIRED_GENERATION_SHAPE = "retired-generation"
+SHAPES = (COMPILE_BLOCKED_SHAPE, ORPHANED_COMMANDS_SHAPE, RETIRED_GENERATION_SHAPE)
 CLUSTER_ID = "p036-cluster-a"
 NODE_ID = "p036-node-a"
 STEP_OWNER = "cluster-executor"
 POLICY_VERSION = "610"
 POLICY_SOURCE = "NVIDIA"
 CANCELLED_STATUS_SOURCE = "workflow-timeout"
-RERUN_NO_OP = "no-op"
-RERUN_REFUSED = "refused"
-# The modes whose apply cancels remote commands and must report the count.
-CANCELLING_MODES = frozenset({ORPHANED_COMMANDS_MODE, RETIRED_GENERATION_MODE})
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-
-# Every mode refuses an apply whose rebuilt digest differs from the approval,
-# but each spells it its own way, so the tamper verdict is per mode.
-DRIFT_REFUSALS = {
-    COMPILE_BLOCKED_MODE: "compile-blocked reconcile plan changed before apply",
-    ORPHANED_COMMANDS_MODE: "orphaned-commands reconcile plan changed before apply",
-    RETIRED_GENERATION_MODE: ("retired generation reconcile plan changed before apply"),
-}
-INELIGIBLE_REFUSALS = {
-    COMPILE_BLOCKED_MODE: (
-        "compile-blocked reconcile plan contains ineligible records"
-    ),
-    ORPHANED_COMMANDS_MODE: (
-        "orphaned-commands reconcile plan contains ineligible records"
-    ),
-    RETIRED_GENERATION_MODE: (
-        "retired generation reconcile plan contains ineligible records"
-    ),
-}
+SWEEPER_EXECUTOR_ID = "p036-sweeper"
+OPERATOR_RECONCILED_KIND = "OPERATOR_RECONCILED"
+OPERATOR_EVENT_KINDS = frozenset(
+    {OPERATOR_RECONCILED_KIND, "OPERATOR_RETIRED_GENERATION"}
+)
+OPEN_COMMAND_STATUSES = (
+    RemoteCommandStatus.PENDING.value,
+    RemoteCommandStatus.LEASED.value,
+    RemoteCommandStatus.WAITING.value,
+)
 
 
 @dataclass(frozen=True)
-class ModeSeed:
-    """What one mode's store holds, and what the mode must do to it."""
+class ShapeSeed:
+    """What one shape's store holds, and what the sweep must do to it."""
 
-    mode: str
-    plan_mode: str
-    apply_mode: str
+    shape: str
     workflow_ids: tuple[str, ...]
-    actionable_ids: tuple[str, ...]
-    refused_ids: tuple[str, ...]
-    plan_flags: Mapping[str, Mapping[str, bool]]
-    plan_reasons: Mapping[str, tuple[str, ...]]
-    refusal_substrings: Mapping[str, str]
-    approved_digest_field: str
-    settled_digest_differs: bool
+    incident_ids: tuple[str, ...]
+    closed_ids: tuple[str, ...]
+    untouched_ids: tuple[str, ...]
+    passes: int
+    statuses_before: Mapping[str, str]
     statuses_after: Mapping[str, str]
     reason_substrings: Mapping[str, tuple[str, ...]]
     preempted_by: Mapping[str, str]
+    incident_reason_substrings: Mapping[str, tuple[str, ...]]
+    event_kind: str | None
+    event_details: Mapping[str, Mapping[str, Any]]
     cancelled_command_ids: tuple[str, ...]
     untouched_command_ids: tuple[str, ...]
+    cancel_reason_substring: str
     blockers_before: tuple[str, ...]
     blockers_after: tuple[str, ...]
     resolved_blocked: tuple[str, ...]
-    rerun_contract: str
-    rerun_refusal: str
+    compile_blocked_before: tuple[str, ...]
+    compile_blocked_after: tuple[str, ...]
+    held_after: tuple[str, ...] = field(default=())
 
 
 def _step(
@@ -186,28 +182,25 @@ def _command(
         workflow=workflow,
         incident=incident,
         status=status,
-        lease_owner=None,
-        lease_expires_at=None,
         created_at=created_at,
         updated_at=created_at,
     )
 
 
-def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed:
-    """A workflow the compiler refused, next to one that belongs to ``--mode restore``.
+def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ShapeSeed:
+    """A workflow the compiler refused, next to one the restore reconcile owns.
 
-    Eligible: BLOCKED with ``no executable owner for efaDriverRemediation``, no
+    Closed: BLOCKED with ``no executable owner for efaDriverRemediation``, no
     step execution, no command, no source plan, incident settled -- the record
-    observed live on 2026-09-04, which ``workflow_safety`` counts as active
-    destructive work and which therefore blocks the release that would add the
-    missing owner.
+    observed live on 2026-09-04. The release preflight sets it aside as
+    ``compile_blocked`` (so the release carrying the sweep can roll past it) and
+    the sweep closes it on the first pass.
 
-    Refused twin: also BLOCKED, but it *was* plan-driven, so it carries a
-    ``source_plan_id`` and belongs to ``--mode restore``. Its incident already
-    RECOVERED through a successor that completed ``RESTORE_SCHEDULING``, which is
-    why ``workflow_safety`` reports it as ``resolved_blocked`` rather than a
-    blocker: the twin must survive this mode untouched *and* leave the blocker
-    list empty once the eligible record is closed.
+    Untouched twin: also BLOCKED, but it *was* plan-driven, so it carries a
+    ``source_plan_id`` and belongs to ``workflow-reconcile``. Its incident already
+    RECOVERED through a same-generation successor that completed
+    ``RESTORE_SCHEDULING``, which is why the preflight reports it as
+    ``resolved_blocked``: the twin must survive the sweep byte for byte.
     """
 
     stamp = now or datetime.now(timezone.utc)
@@ -222,6 +215,7 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         fencing_token=3,
         created_at=earlier,
     )
+    blocked_reason = "no executable owner for efaDriverRemediation"
     blocked = WorkflowRequest(
         request_id=blocked_id,
         incident_id=blocked_incident.incident_id,
@@ -229,7 +223,7 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         official_action="REMEDIATE_EFA_DRIVER",
         fencing_token=3,
         official_steps=_hardware_steps(WorkflowOperation.REMEDIATE_EFA_DRIVER),
-        blocked_reasons=["no executable owner for efaDriverRemediation"],
+        blocked_reasons=[blocked_reason],
         created_at=earlier,
         updated_at=earlier,
     )
@@ -245,7 +239,10 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         incident_id=twin_incident.incident_id,
         status=WorkflowStatus.BLOCKED,
         official_action="RESET_GPU",
-        fencing_token=2,
+        # Same generation as its successor: an older generation under an
+        # incident that moved on would be a retired generation, which the
+        # dispatcher revokes on its own -- a different shape from this one.
+        fencing_token=4,
         source_plan_id="p036cb-plan-1",
         official_steps=_hardware_steps(WorkflowOperation.RESET_GPU),
         blocked_reasons=["safety settled by a later workflow"],
@@ -271,32 +268,18 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
     store.save_incident_and_workflow(blocked_incident, blocked)
     store.save_incident_and_workflow(twin_incident, successor)
     store.save_workflow(twin)
-    return ModeSeed(
-        mode=COMPILE_BLOCKED_MODE,
-        plan_mode="compile-blocked-plan",
-        apply_mode="compile-blocked-apply",
-        workflow_ids=(blocked_id, twin_id),
-        actionable_ids=(blocked_id,),
-        refused_ids=(twin_id,),
-        plan_flags={
-            blocked_id: {
-                "eligible": True,
-                "already_closed": False,
-            },
-            twin_id: {
-                "eligible": False,
-                "already_closed": False,
-            },
+    return ShapeSeed(
+        shape=COMPILE_BLOCKED_SHAPE,
+        workflow_ids=(blocked_id, twin_id, successor_id),
+        incident_ids=(blocked_incident.incident_id, twin_incident.incident_id),
+        closed_ids=(blocked_id,),
+        untouched_ids=(twin_id, successor_id),
+        passes=1,
+        statuses_before={
+            blocked_id: WorkflowStatus.BLOCKED.value,
+            twin_id: WorkflowStatus.BLOCKED.value,
+            successor_id: WorkflowStatus.SUCCEEDED.value,
         },
-        plan_reasons={
-            blocked_id: (),
-            twin_id: ("workflow has a source recovery plan; use --mode restore",),
-        },
-        refusal_substrings={
-            twin_id: "workflow has a source recovery plan; use --mode restore",
-        },
-        approved_digest_field="settled_plan_sha256",
-        settled_digest_differs=False,
         statuses_after={
             blocked_id: WorkflowStatus.SUPERSEDED.value,
             twin_id: WorkflowStatus.BLOCKED.value,
@@ -304,34 +287,43 @@ def seed_compile_blocked(store: Any, *, now: datetime | None = None) -> ModeSeed
         },
         reason_substrings={
             blocked_id: (
-                f"operator reconciliation {REFERENCE}",
-                "closed compile-time BLOCKED workflow",
-                "no executable owner for efaDriverRemediation",
+                f"{DISPATCHER_ACTOR} reconciliation",
+                CLOSE_MARKER,
+                blocked_reason,
             ),
         },
         preempted_by={},
+        incident_reason_substrings={},
+        event_kind=OPERATOR_RECONCILED_KIND,
+        event_details={
+            blocked_id: {
+                "terminalization": CLOSE_MARKER,
+                "blocked_reasons": [blocked_reason],
+            }
+        },
         cancelled_command_ids=(),
         untouched_command_ids=(),
-        blockers_before=(blocked_id,),
+        cancel_reason_substring="",
+        blockers_before=(),
         blockers_after=(),
         resolved_blocked=(twin_id,),
-        rerun_contract=RERUN_NO_OP,
-        rerun_refusal="",
+        compile_blocked_before=(blocked_id,),
+        compile_blocked_after=(),
     )
 
 
-def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ModeSeed:
+def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ShapeSeed:
     """A command a FAILED workflow left WAITING, next to a live one that must not move.
 
-    Eligible: the 2026-09-05 shape -- ``CHECK_MECHANICALS`` still ``WAITING``
+    Closed: the 2026-09-05 shape -- ``CHECK_MECHANICALS`` still ``WAITING``
     thirteen hours after its workflow FAILED. The release upgrade refuses to
-    start while any command is open, so the orphan blocks the release that stops
-    orphans from forming.
+    start while any command is open, so the orphan blocked the release that
+    stops orphans from forming; the sweep cancels it on the first pass and
+    leaves the FAILED row as it was, with the cancel on its audit trail.
 
-    Refused twin: a RUNNING workflow with a ``WAITING`` ``RESET_GPU`` command.
+    Untouched twin: a RUNNING workflow with a ``WAITING`` ``RESET_GPU`` command.
     That command is live work only the executor holding its lease may settle, so
-    the plan must name it refused and its command must come out of the apply
-    byte-for-byte unchanged.
+    it must come out of the sweep byte for byte unchanged, however old.
     """
 
     stamp = now or datetime.now(timezone.utc)
@@ -421,59 +413,60 @@ def seed_orphaned_commands(store: Any, *, now: datetime | None = None) -> ModeSe
             created_at=earlier,
         )
     )
-    return ModeSeed(
-        mode=ORPHANED_COMMANDS_MODE,
-        plan_mode="orphaned-commands-plan",
-        apply_mode="orphaned-commands-apply",
+    return ShapeSeed(
+        shape=ORPHANED_COMMANDS_SHAPE,
         workflow_ids=(failed_id, running_id),
-        actionable_ids=(failed_id,),
-        refused_ids=(running_id,),
-        plan_flags={
-            failed_id: {"eligible": True},
-            running_id: {"eligible": False},
+        incident_ids=(failed_incident.incident_id, running_incident.incident_id),
+        closed_ids=(failed_id,),
+        untouched_ids=(running_id,),
+        passes=1,
+        statuses_before={
+            failed_id: WorkflowStatus.FAILED.value,
+            running_id: WorkflowStatus.RUNNING.value,
         },
-        plan_reasons={
-            failed_id: (),
-            running_id: (
-                "workflow is RUNNING; its open commands are live work",
-                "workflow still has an execution owner",
-            ),
-        },
-        refusal_substrings={
-            running_id: "workflow is RUNNING; its open commands are live work",
-        },
-        approved_digest_field="settled_plan_sha256",
-        settled_digest_differs=False,
         statuses_after={
             failed_id: WorkflowStatus.FAILED.value,
             running_id: WorkflowStatus.RUNNING.value,
         },
         reason_substrings={},
         preempted_by={},
+        incident_reason_substrings={},
+        event_kind=OPERATOR_RECONCILED_KIND,
+        event_details={
+            failed_id: {
+                "action": AUDIT_ACTION,
+                "command_ids": [orphan_command],
+                "cancelled_remote_commands": {
+                    "cancelled": 1,
+                    "cancellation_requested": 0,
+                },
+            }
+        },
         cancelled_command_ids=(orphan_command,),
         untouched_command_ids=(live_command,),
+        cancel_reason_substring=f"{DISPATCHER_ACTOR} reconciliation",
         blockers_before=(running_id,),
         blockers_after=(running_id,),
         resolved_blocked=(),
-        rerun_contract=RERUN_REFUSED,
-        rerun_refusal="workflow has no open remote commands",
+        compile_blocked_before=(),
+        compile_blocked_after=(),
     )
 
 
-def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ModeSeed:
+def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ShapeSeed:
     """A generation the incident re-planned away from, next to one that changed a node.
 
-    Eligible: the 2026-09-04 shape -- an older generation still RUNNING with an
+    Closed: the 2026-09-04 shape -- an older generation still RUNNING with an
     execution owner, a renewing lease and a remediation budget claim, being
     dispatched on a loop while the successor starves. It holds one ``WAITING``
-    remote command, so the plan reports it ``cancellable`` rather than
-    ``eligible``: the apply cancels the command and then revokes, which is the
-    two-pass hinge and the reason the case seeds a command here at all.
+    remote command, so the sweep takes two passes: the first cancels the
+    command, the second revokes the row once the Store shows it settled. That
+    hinge is the reason the case seeds a command here at all.
 
-    Refused twin: an even older generation that already completed ``RESET_GPU``.
-    Effect a later workflow would have to compensate for is the one blocker no
-    apply may clear, so it must reach a human and must still be a release blocker
-    afterwards.
+    Untouched twin: an even older generation that already completed
+    ``RESET_GPU``. Effect a later workflow would have to compensate for is the
+    one blocker no sweep may clear, so it must stay held for a human
+    (``held_after``) and must still be a release blocker afterwards.
     """
 
     stamp = now or datetime.now(timezone.utc)
@@ -559,36 +552,18 @@ def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ModeS
             created_at=earlier,
         )
     )
-    return ModeSeed(
-        mode=RETIRED_GENERATION_MODE,
-        plan_mode="retired-generation-plan",
-        apply_mode="retired-generation-apply",
-        workflow_ids=(retired_id, mutated_id),
-        actionable_ids=(retired_id,),
-        refused_ids=(mutated_id,),
-        plan_flags={
-            retired_id: {
-                "eligible": False,
-                "cancellable": True,
-                "already_revoked": False,
-            },
-            mutated_id: {
-                "eligible": False,
-                "cancellable": False,
-                "already_revoked": False,
-            },
+    return ShapeSeed(
+        shape=RETIRED_GENERATION_SHAPE,
+        workflow_ids=(retired_id, mutated_id, current_id),
+        incident_ids=(incident.incident_id,),
+        closed_ids=(retired_id,),
+        untouched_ids=(mutated_id, current_id),
+        passes=2,
+        statuses_before={
+            retired_id: WorkflowStatus.RUNNING.value,
+            mutated_id: WorkflowStatus.RUNNING.value,
+            current_id: WorkflowStatus.RUNNING.value,
         },
-        plan_reasons={
-            retired_id: (f"workflow has open remote commands: {command_id}",),
-            mutated_id: (
-                "workflow already completed destructive operations: RESET_GPU",
-            ),
-        },
-        refusal_substrings={
-            mutated_id: "workflow already completed destructive operations: RESET_GPU",
-        },
-        approved_digest_field="plan_sha256",
-        settled_digest_differs=True,
         statuses_after={
             retired_id: WorkflowStatus.SUPERSEDED.value,
             mutated_id: WorkflowStatus.RUNNING.value,
@@ -596,37 +571,80 @@ def seed_retired_generation(store: Any, *, now: datetime | None = None) -> ModeS
         },
         reason_substrings={
             retired_id: (
-                f"operator reconciliation {REFERENCE}",
                 f"revoked retired generation {retired_id}",
                 f"in favour of {current_id}",
+                "advanced to generation 5",
             ),
         },
         preempted_by={retired_id: current_id},
+        incident_reason_substrings={
+            incident.incident_id: (f"revoked retired generation {retired_id}",),
+        },
+        event_kind=None,
+        event_details={},
         cancelled_command_ids=(command_id,),
         untouched_command_ids=(),
+        cancel_reason_substring=f"revoked retired generation {retired_id}",
         blockers_before=(current_id, mutated_id, retired_id),
         blockers_after=(current_id, mutated_id),
         resolved_blocked=(),
-        rerun_contract=RERUN_NO_OP,
-        rerun_refusal="",
+        compile_blocked_before=(),
+        compile_blocked_after=(),
+        held_after=(mutated_id,),
     )
 
 
 SEEDERS = {
-    COMPILE_BLOCKED_MODE: seed_compile_blocked,
-    ORPHANED_COMMANDS_MODE: seed_orphaned_commands,
-    RETIRED_GENERATION_MODE: seed_retired_generation,
+    COMPILE_BLOCKED_SHAPE: seed_compile_blocked,
+    ORPHANED_COMMANDS_SHAPE: seed_orphaned_commands,
+    RETIRED_GENERATION_SHAPE: seed_retired_generation,
 }
 
 
-def seed_mode(mode: str, store: Any, *, now: datetime | None = None) -> ModeSeed:
+def seed_shape(shape: str, store: Any, *, now: datetime | None = None) -> ShapeSeed:
     try:
-        seeder = SEEDERS[mode]
+        seeder = SEEDERS[shape]
     except KeyError:
-        raise ValueError(f"unsupported workflow-reconcile mode: {mode}") from None
+        raise ValueError(f"unsupported stuck-workflow shape: {shape}") from None
     return seeder(store, now=now)
 
 
+# --------------------------------------------------------------------------- #
+# The product's own sweep, built from its public constructors
+# --------------------------------------------------------------------------- #
+def build_sweeper(store: Any) -> WorkflowDispatcher:
+    """A dispatcher with no adapters: it can sweep, and it cannot execute a step.
+
+    ``sweep_stuck_records`` is what the production dispatch loop runs before its
+    scan; calling it directly, rather than ``run_once``, keeps the seeded live
+    twins from being dispatched into an executor that has nothing to run them.
+    """
+
+    executor = ProductionWorkflowExecutor(
+        store,
+        [],
+        ProductionExecutorConfig(
+            enabled=True,
+            executor_id=SWEEPER_EXECUTOR_ID,
+            allowed_operations=frozenset(),
+        ),
+    )
+    return WorkflowDispatcher(store, executor, WorkflowDispatcherConfig(enabled=True))
+
+
+def sweep(store: Any, *, passes: int) -> list[list[str]]:
+    """Run the sweep ``passes`` times; per pass, the retired generations still held."""
+
+    sweeper = build_sweeper(store)
+    return [
+        sorted(sweeper.sweep_stuck_records(datetime.now(timezone.utc)))
+        for _ in range(passes)
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Read-backs
+# --------------------------------------------------------------------------- #
 def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
     """The fields the verdicts read, per workflow, from a fresh Store read."""
 
@@ -639,8 +657,6 @@ def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
             "preempted_by_workflow_id": workflow.preempted_by_workflow_id,
             "execution_owner_id": workflow.execution_owner_id,
             "fencing_token": workflow.fencing_token,
-            # The attributed audit trail (ARCH-I1): who wrote, under which
-            # approval, from which status. Judged by ``event_errors``.
             "events": [
                 {
                     "kind": event.kind.value,
@@ -656,140 +672,17 @@ def workflow_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
     return snapshot
 
 
-# --------------------------------------------------------------------------- #
-# ARCH-I1: the operator write is attributed
-# --------------------------------------------------------------------------- #
-OPERATOR_RECONCILED_KIND = "OPERATOR_RECONCILED"
-OPERATOR_RETIRED_GENERATION_KIND = "OPERATOR_RETIRED_GENERATION"
-OPERATOR_EVENT_KINDS = frozenset(
-    {OPERATOR_RECONCILED_KIND, OPERATOR_RETIRED_GENERATION_KIND}
-)
-# Which event kind each mode appends to the record it acts on, and whether the
-# record's status changes under it (orphaned-commands leaves the FAILED
-# workflow as it was and only records the cancel).
-EVENT_KIND_BY_MODE = {
-    COMPILE_BLOCKED_MODE: OPERATOR_RECONCILED_KIND,
-    ORPHANED_COMMANDS_MODE: OPERATOR_RECONCILED_KIND,
-    RETIRED_GENERATION_MODE: OPERATOR_RETIRED_GENERATION_KIND,
-}
-STATUS_BEFORE_BY_MODE = {
-    COMPILE_BLOCKED_MODE: WorkflowStatus.BLOCKED.value,
-    ORPHANED_COMMANDS_MODE: WorkflowStatus.FAILED.value,
-    RETIRED_GENERATION_MODE: WorkflowStatus.RUNNING.value,
-}
-UNKNOWN_ACTOR = "unknown-identity"
-
-
-def event_errors(
-    snapshot: Mapping[str, Any],
-    seed: ModeSeed,
-    *,
-    actor: str,
-    admin_plan_sha256: str,
-    approved_plan_sha256: str,
-) -> list[str]:
-    """Every record the mode wrote carries one attributed event; no other does.
-
-    The event is the per-record projection of ``applied.json``: the operator
-    (STS ARN or user@host, never ``unknown-identity`` when one was sent), the
-    reference, the runtime digest the apply was bound to, the admin-side digest
-    the operator approved, and the status the write moved the record from and
-    to. Refused twins and untouched siblings must carry none.
-    """
-
-    errors: list[str] = []
-    kind = EVENT_KIND_BY_MODE[seed.mode]
-    for request_id in seed.actionable_ids:
-        events = [
-            item
-            for item in (snapshot.get(request_id) or {}).get("events") or []
-            if item.get("kind") == kind
-        ]
-        if len(events) != 1:
-            errors.append(
-                f"{request_id}: {len(events)} {kind} event(s), expected exactly 1"
-            )
-            continue
-        event = events[0]
-        details = event.get("details") or {}
-        if event.get("actor") != actor or actor == UNKNOWN_ACTOR:
-            errors.append(
-                f"{request_id}: event actor is {event.get('actor')!r}, expected {actor!r}"
-            )
-        if details.get("reference") != REFERENCE:
-            errors.append(
-                f"{request_id}: event reference is {details.get('reference')!r}"
-            )
-        if details.get("admin_plan_sha256") != admin_plan_sha256:
-            errors.append(
-                f"{request_id}: event admin_plan_sha256 is "
-                f"{details.get('admin_plan_sha256')!r}, expected the operator's digest"
-            )
-        runtime_digest = str(details.get("plan_sha256") or "")
-        if _SHA256.fullmatch(runtime_digest) is None:
-            errors.append(f"{request_id}: event carries no runtime plan_sha256")
-        elif not seed.settled_digest_differs and runtime_digest != approved_plan_sha256:
-            errors.append(
-                f"{request_id}: event plan_sha256 {runtime_digest!r} is not the "
-                f"approved {approved_plan_sha256!r}"
-            )
-        expected_before = STATUS_BEFORE_BY_MODE[seed.mode]
-        if details.get("previous_status") != expected_before:
-            errors.append(
-                f"{request_id}: event previous_status is "
-                f"{details.get('previous_status')!r}, expected {expected_before!r}"
-            )
-        expected_after = seed.statuses_after[request_id]
-        if details.get("new_status") != expected_after or event.get("status") != (
-            expected_after
-        ):
-            errors.append(
-                f"{request_id}: event new_status is {details.get('new_status')!r}, "
-                f"expected {expected_after!r}"
-            )
-        if REFERENCE not in str(event.get("reason") or ""):
-            errors.append(f"{request_id}: event reason does not carry {REFERENCE!r}")
-    for request_id in seed.refused_ids:
-        stray = (snapshot.get(request_id) or {}).get("events") or []
-        if stray:
-            errors.append(
-                f"{request_id}: a refused record carries {len(stray)} operator event(s)"
-            )
-    return errors
-
-
-def rerun_event_errors(
-    before: Mapping[str, Any], after: Mapping[str, Any], seed: ModeSeed
-) -> list[str]:
-    """A no-op or refused rerun appends nothing to the audit trail."""
-
-    errors: list[str] = []
-    for request_id in seed.workflow_ids:
-        earlier = (before.get(request_id) or {}).get("events") or []
-        later = (after.get(request_id) or {}).get("events") or []
-        if len(later) != len(earlier):
-            errors.append(
-                f"{request_id}: the rerun changed the operator event count "
-                f"{len(earlier)} -> {len(later)}"
-            )
-    return errors
-
-
-def command_log_errors(
-    log_path: Any, *, state_dir: Any, kind: str = "mutating"
-) -> list[str]:
-    """ARCH-I3: a mutating admin command's console log lands under logs/<kind>/."""
-
-    if log_path is None:
-        return ["the admin command log was not opened (state directory refused)"]
-    path = str(log_path)
-    expected_parent = str(state_dir / "logs" / kind)
-    errors: list[str] = []
-    if not path.startswith(expected_parent):
-        errors.append(f"command log {path} is not under {expected_parent}")
-    if not path.endswith(".log"):
-        errors.append(f"command log {path} is not a .log file")
-    return errors
+def incident_snapshot(store: Any, incident_ids: Iterable[str]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for incident_id in incident_ids:
+        incident = store.get_incident(incident_id)
+        snapshot[incident_id] = {
+            "state": incident.state.value,
+            "workflow_request_id": incident.workflow_request_id,
+            "fencing_token": incident.fencing_token,
+            "reasons": list(incident.reasons),
+        }
+    return snapshot
 
 
 def command_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
@@ -809,178 +702,149 @@ def command_snapshot(store: Any, request_ids: Iterable[str]) -> dict[str, Any]:
     return snapshot
 
 
-def _plan_items(plan: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    return {
-        str(item["request_id"]): item
-        for item in plan.get("items") or []
-        if isinstance(item, Mapping)
-    }
-
-
-def plan_errors(plan: Mapping[str, Any], seed: ModeSeed) -> list[str]:
-    """Whether the plan named exactly the actionable records and refused the twin."""
-
-    errors: list[str] = []
-    if plan.get("mode") != seed.plan_mode:
-        errors.append(f"plan mode is {plan.get('mode')!r}, expected {seed.plan_mode!r}")
-    digest = str(plan.get("plan_sha256") or "")
-    if _SHA256.fullmatch(digest) is None:
-        errors.append("plan does not carry a sha256 digest")
-    items = _plan_items(plan)
-    if sorted(items) != sorted(seed.workflow_ids):
-        errors.append(
-            f"plan covers {sorted(items)}, expected {sorted(seed.workflow_ids)}"
-        )
-    for request_id, expected in seed.plan_flags.items():
-        item = items.get(request_id)
-        if item is None:
-            errors.append(f"{request_id}: plan has no item")
-            continue
-        for field, value in expected.items():
-            if item.get(field) is not value:
-                errors.append(
-                    f"{request_id}: plan {field} is {item.get(field)!r}, "
-                    f"expected {value!r}"
-                )
-    for request_id, substrings in seed.plan_reasons.items():
-        item = items.get(request_id) or {}
-        reasons = [str(value) for value in item.get("reasons") or []]
-        if not substrings:
-            if reasons:
-                errors.append(
-                    f"{request_id}: item was expected to carry no reasons, "
-                    f"got {reasons!r}"
-                )
-            continue
-        if len(reasons) != len(substrings):
-            errors.append(
-                f"{request_id}: item carries {len(reasons)} reasons, "
-                f"expected {len(substrings)}: {reasons!r}"
-            )
-        joined = " | ".join(reasons)
-        for substring in substrings:
-            if substring not in joined:
-                errors.append(
-                    f"{request_id}: reasons do not name {substring!r}, got {joined!r}"
-                )
-    return errors
-
-
-def refusal_errors(label: str, output: str, substring: str) -> list[str]:
-    """Whether a refusal that must happen happened, and named the right reason."""
-
-    if not substring:
-        return [f"{label}: no refusal substring was configured"]
-    if substring in output:
-        return []
-    return [f"{label}: refusal does not name {substring!r}, got {output.strip()!r}"]
-
-
-def apply_errors(
-    result: Mapping[str, Any],
-    seed: ModeSeed,
-    *,
-    approved_plan_sha256: str,
+# --------------------------------------------------------------------------- #
+# Verdicts
+# --------------------------------------------------------------------------- #
+def record_errors(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    seed: ShapeSeed,
 ) -> list[str]:
-    """Whether the apply did exactly what the approved plan said, and nothing else."""
-
-    errors: list[str] = []
-    if result.get("mode") != seed.apply_mode:
-        errors.append(
-            f"apply mode is {result.get('mode')!r}, expected {seed.apply_mode!r}"
-        )
-    if result.get("reference") != REFERENCE:
-        errors.append(f"apply reference is {result.get('reference')!r}")
-    applied = sorted(str(value) for value in result.get("applied_workflow_ids") or [])
-    if applied != sorted(seed.actionable_ids):
-        errors.append(
-            f"apply changed {applied}, expected {sorted(seed.actionable_ids)}"
-        )
-    if result.get("failed_workflow_ids"):
-        errors.append(f"apply reported failures for {result['failed_workflow_ids']}")
-    if result.get("failures"):
-        errors.append(f"apply reported failures {result['failures']}")
-    if result.get("records_deleted") != 0:
-        errors.append(f"apply deleted {result.get('records_deleted')!r} records")
-    bound = str(result.get(seed.approved_digest_field) or "")
-    if bound != approved_plan_sha256:
-        errors.append(
-            f"apply {seed.approved_digest_field} is {bound!r}, "
-            f"expected the approved {approved_plan_sha256!r}"
-        )
-    settled = str(result.get("settled_plan_sha256") or "")
-    if seed.settled_digest_differs and settled == approved_plan_sha256:
-        errors.append(
-            "apply settled the approved digest unchanged, so the cancel pass "
-            "left nothing to reconcile"
-        )
-    if not seed.settled_digest_differs and settled != approved_plan_sha256:
-        errors.append(
-            "apply settled a different plan than the approved digest: "
-            f"{settled!r} != {approved_plan_sha256!r}"
-        )
-    cancelled = result.get("cancelled_remote_commands")
-    if isinstance(cancelled, Mapping):
-        counted = sum(
-            int(counts.get("cancelled", 0))
-            for counts in cancelled.values()
-            if isinstance(counts, Mapping)
-        )
-        if counted != len(seed.cancelled_command_ids):
-            errors.append(
-                f"apply cancelled {counted} remote commands, "
-                f"expected {len(seed.cancelled_command_ids)}"
-            )
-    elif seed.mode in CANCELLING_MODES:
-        # These two modes exist to cancel commands; an apply result that does
-        # not say how many it cancelled cannot be judged, and used to slip
-        # through as "nothing to check".
-        errors.append(
-            "apply result carries no cancelled_remote_commands counters, "
-            f"expected {len(seed.cancelled_command_ids)} cancelled"
-        )
-    return errors
-
-
-def record_errors(snapshot: Mapping[str, Any], seed: ModeSeed) -> list[str]:
-    """Whether every workflow ended in the state the mode promises, refused ones included."""
+    """Every workflow ended where the shape promises; the twins did not move at all."""
 
     errors: list[str] = []
     for request_id, status in seed.statuses_after.items():
-        observed = (snapshot.get(request_id) or {}).get("status")
+        observed = (after.get(request_id) or {}).get("status")
         if observed != status:
             errors.append(f"{request_id}: status is {observed!r}, expected {status!r}")
     for request_id, substrings in seed.reason_substrings.items():
-        reason = str((snapshot.get(request_id) or {}).get("preemption_reason") or "")
+        reason = str((after.get(request_id) or {}).get("preemption_reason") or "")
         for substring in substrings:
             if substring not in reason:
                 errors.append(
                     f"{request_id}: preemption_reason does not carry {substring!r}"
                 )
     for request_id, successor in seed.preempted_by.items():
-        observed = (snapshot.get(request_id) or {}).get("preempted_by_workflow_id")
+        observed = (after.get(request_id) or {}).get("preempted_by_workflow_id")
         if observed != successor:
             errors.append(
                 f"{request_id}: preempted_by_workflow_id is {observed!r}, "
                 f"expected {successor!r}"
             )
-        if (snapshot.get(request_id) or {}).get("execution_owner_id") is not None:
+        if (after.get(request_id) or {}).get("execution_owner_id") is not None:
             errors.append(f"{request_id}: revoked record still holds an owner")
+    for request_id in seed.untouched_ids:
+        if before.get(request_id) != after.get(request_id):
+            errors.append(
+                f"{request_id}: an untouched record changed from "
+                f"{before.get(request_id)!r} to {after.get(request_id)!r}"
+            )
+    return errors
+
+
+def incident_errors(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    seed: ShapeSeed,
+) -> list[str]:
+    """The retired-generation audit lands on the incident; every other incident is untouched."""
+
+    errors: list[str] = []
+    for incident_id in seed.incident_ids:
+        substrings = seed.incident_reason_substrings.get(incident_id, ())
+        if not substrings:
+            if before.get(incident_id) != after.get(incident_id):
+                errors.append(
+                    f"{incident_id}: incident changed from {before.get(incident_id)!r} "
+                    f"to {after.get(incident_id)!r}"
+                )
+            continue
+        reasons = " | ".join((after.get(incident_id) or {}).get("reasons") or [])
+        for substring in substrings:
+            if substring not in reasons:
+                errors.append(
+                    f"{incident_id}: incident reasons do not carry {substring!r}"
+                )
+        for key in ("state", "workflow_request_id", "fencing_token"):
+            if (before.get(incident_id) or {}).get(key) != (
+                after.get(incident_id) or {}
+            ).get(key):
+                errors.append(f"{incident_id}: the sweep moved incident {key}")
+    return errors
+
+
+def event_errors(snapshot: Mapping[str, Any], seed: ShapeSeed) -> list[str]:
+    """Every record the sweep wrote carries exactly one dispatcher event; no other does.
+
+    The event names the actor (``dispatcher``), the status the write moved the
+    record from and to, and the shape's own details (what was closed, which
+    commands were cancelled). The retired-generation revoke declares no event
+    kind: its audit is judged by ``record_errors`` and ``incident_errors``.
+    """
+
+    errors: list[str] = []
+    if seed.event_kind is not None:
+        for request_id in seed.closed_ids:
+            events = [
+                item
+                for item in (snapshot.get(request_id) or {}).get("events") or []
+                if item.get("kind") == seed.event_kind
+            ]
+            if len(events) != 1:
+                errors.append(
+                    f"{request_id}: {len(events)} {seed.event_kind} event(s), "
+                    "expected exactly 1"
+                )
+                continue
+            event = events[0]
+            details = event.get("details") or {}
+            if event.get("actor") != DISPATCHER_ACTOR:
+                errors.append(
+                    f"{request_id}: event actor is {event.get('actor')!r}, "
+                    f"expected {DISPATCHER_ACTOR!r}"
+                )
+            if details.get("previous_status") != seed.statuses_before[request_id]:
+                errors.append(
+                    f"{request_id}: event previous_status is "
+                    f"{details.get('previous_status')!r}, expected "
+                    f"{seed.statuses_before[request_id]!r}"
+                )
+            expected_after = seed.statuses_after[request_id]
+            if details.get("new_status") != expected_after or event.get("status") != (
+                expected_after
+            ):
+                errors.append(
+                    f"{request_id}: event new_status is {details.get('new_status')!r}, "
+                    f"expected {expected_after!r}"
+                )
+            for key, value in seed.event_details.get(request_id, {}).items():
+                if details.get(key) != value:
+                    errors.append(
+                        f"{request_id}: event {key} is {details.get(key)!r}, "
+                        f"expected {value!r}"
+                    )
+    for request_id in seed.untouched_ids:
+        stray = (snapshot.get(request_id) or {}).get("events") or []
+        if stray:
+            errors.append(
+                f"{request_id}: an untouched record carries {len(stray)} "
+                "operator event(s)"
+            )
     return errors
 
 
 def command_errors(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
-    seed: ModeSeed,
+    seed: ShapeSeed,
 ) -> list[str]:
-    """Whether the orphans were failed with the expected source and the live one untouched."""
+    """The orphans were failed with the expected source and the live one untouched."""
 
     errors: list[str] = []
     for command_id in seed.cancelled_command_ids:
         observed = after.get(command_id)
         if observed is None:
-            errors.append(f"{command_id}: command is missing after the apply")
+            errors.append(f"{command_id}: command is missing after the sweep")
             continue
         if observed.get("status") != RemoteCommandStatus.FAILED.value:
             errors.append(
@@ -991,8 +855,10 @@ def command_errors(
                 f"{command_id}: status_source is {observed.get('status_source')!r}, "
                 f"expected {CANCELLED_STATUS_SOURCE!r}"
             )
-        if REFERENCE not in str(observed.get("error") or ""):
-            errors.append(f"{command_id}: error does not carry {REFERENCE!r}")
+        if seed.cancel_reason_substring not in str(observed.get("error") or ""):
+            errors.append(
+                f"{command_id}: error does not carry {seed.cancel_reason_substring!r}"
+            )
         if observed.get("lease_owner") is not None:
             errors.append(f"{command_id}: cancelled command still holds a lease")
     for command_id in seed.untouched_command_ids:
@@ -1004,73 +870,78 @@ def command_errors(
     return errors
 
 
+def held_errors(held_per_pass: Sequence[Sequence[str]], seed: ShapeSeed) -> list[str]:
+    """What the last pass still withheld from dispatch is exactly the operator's record."""
+
+    if len(held_per_pass) != seed.passes:
+        return [f"sweep ran {len(held_per_pass)} pass(es), expected {seed.passes}"]
+    held = sorted(str(value) for value in held_per_pass[-1])
+    if held != sorted(seed.held_after):
+        return [f"the last pass still holds {held}, expected {sorted(seed.held_after)}"]
+    return []
+
+
 def safety_errors(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
-    seed: ModeSeed,
+    seed: ShapeSeed,
 ) -> list[str]:
-    """Whether the release preflight stopped naming the records the mode closed.
+    """The release preflight stopped naming the records the sweep closed, and no other.
 
     ``blockers_after`` is not always empty and must not be asserted as empty. A
     successor generation that is genuinely running, and a record that already
     changed a node and therefore needs a human, are real blockers both before and
     after -- reporting them as cleared would be the bug this case exists to
-    prevent. What must hold is that every record the mode closed leaves the list
-    and nothing else does.
+    prevent. The compile-time record is never a blocker at all: the preflight
+    sets it aside as ``compile_blocked`` until the sweep closes it.
     """
 
     errors: list[str] = []
-    observed_before = sorted(str(value) for value in before.get("blockers") or [])
-    observed_after = sorted(str(value) for value in after.get("blockers") or [])
-    if observed_before != sorted(seed.blockers_before):
-        errors.append(
-            f"blockers before the apply are {observed_before}, "
-            f"expected {sorted(seed.blockers_before)}"
-        )
-    if observed_after != sorted(seed.blockers_after):
-        errors.append(
-            f"blockers after the apply are {observed_after}, "
-            f"expected {sorted(seed.blockers_after)}"
-        )
+    for name, values, expected in (
+        ("blockers before", before.get("blockers"), seed.blockers_before),
+        ("blockers after", after.get("blockers"), seed.blockers_after),
+        (
+            "compile_blocked before",
+            before.get("compile_blocked"),
+            seed.compile_blocked_before,
+        ),
+        (
+            "compile_blocked after",
+            after.get("compile_blocked"),
+            seed.compile_blocked_after,
+        ),
+        (
+            "resolved_blocked before",
+            before.get("resolved_blocked"),
+            seed.resolved_blocked,
+        ),
+        (
+            "resolved_blocked after",
+            after.get("resolved_blocked"),
+            seed.resolved_blocked,
+        ),
+    ):
+        observed = sorted(str(value) for value in values or [])
+        if observed != sorted(expected):
+            errors.append(f"{name} are {observed}, expected {sorted(expected)}")
     for name, values in (("before", before), ("after", after)):
-        count = values.get("blocker_count")
-        listed = len(values.get("blockers") or [])
-        if count != listed:
-            errors.append(f"blocker_count {name} is {count!r} for {listed} blockers")
-    resolved = sorted(str(value) for value in before.get("resolved_blocked") or [])
-    if resolved != sorted(seed.resolved_blocked):
-        errors.append(
-            f"resolved_blocked is {resolved}, expected {sorted(seed.resolved_blocked)}"
-        )
+        for key, count_key in (
+            ("blockers", "blocker_count"),
+            ("compile_blocked", "compile_blocked_count"),
+            ("resolved_blocked", "resolved_blocked_count"),
+        ):
+            count = values.get(count_key)
+            listed = len(values.get(key) or [])
+            if count != listed:
+                errors.append(f"{count_key} {name} is {count!r} for {listed} listed")
     cleared = set(seed.blockers_before) - set(seed.blockers_after)
-    if cleared and not cleared <= set(seed.actionable_ids):
+    cleared |= set(seed.compile_blocked_before) - set(seed.compile_blocked_after)
+    if cleared and not cleared <= set(seed.closed_ids):
         errors.append(
-            f"the seed expects records outside the plan to be cleared: "
-            f"{sorted(cleared - set(seed.actionable_ids))}"
+            "the seed expects records the sweep does not close to be cleared: "
+            f"{sorted(cleared - set(seed.closed_ids))}"
         )
     return errors
-
-
-def open_command_errors(
-    before: Mapping[str, Any],
-    after: Mapping[str, Any],
-    seed: ModeSeed,
-) -> list[str]:
-    """Whether the Store's open-command counters, the release gate, dropped by the orphans."""
-
-    errors: list[str] = []
-    expected = len(seed.cancelled_command_ids)
-    dropped = _open_commands(before) - _open_commands(after)
-    if dropped != expected:
-        errors.append(f"open remote commands dropped by {dropped}, expected {expected}")
-    return errors
-
-
-OPEN_COMMAND_STATUSES = (
-    RemoteCommandStatus.PENDING.value,
-    RemoteCommandStatus.LEASED.value,
-    RemoteCommandStatus.WAITING.value,
-)
 
 
 def _open_commands(stats: Mapping[str, Any]) -> int:
@@ -1082,62 +953,42 @@ def _open_commands(stats: Mapping[str, Any]) -> int:
     return sum(int(counters.get(name, 0)) for name in OPEN_COMMAND_STATUSES)
 
 
-def rerun_errors(
-    seed: ModeSeed,
-    *,
-    plan: Mapping[str, Any] | None,
-    result: Mapping[str, Any] | None,
-    output: str,
+def open_command_errors(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    seed: ShapeSeed,
 ) -> list[str]:
-    """Whether running the same command again is safe, in this mode's own terms."""
+    """The Store's open-command counters, the release gate, dropped by the orphans."""
 
-    if seed.rerun_contract == RERUN_REFUSED:
-        return refusal_errors("rerun", output, seed.rerun_refusal)
-    errors: list[str] = []
-    if plan is None or result is None:
-        return [f"rerun did not produce a plan and an apply: {output.strip()!r}"]
-    items = _plan_items(plan)
-    settled_key = (
-        "already_closed" if seed.mode == COMPILE_BLOCKED_MODE else "already_revoked"
-    )
-    settled_field = (
-        "already_closed_workflow_ids"
-        if seed.mode == COMPILE_BLOCKED_MODE
-        else "already_revoked_workflow_ids"
-    )
-    for request_id in seed.actionable_ids:
-        item = items.get(request_id) or {}
-        if item.get(settled_key) is not True:
-            errors.append(f"{request_id}: rerun plan {settled_key} is not True")
-    if result.get("applied_workflow_ids"):
-        errors.append(f"rerun changed {result['applied_workflow_ids']} a second time")
-    settled = sorted(str(value) for value in result.get(settled_field) or [])
-    if settled != sorted(seed.actionable_ids):
-        errors.append(
-            f"rerun {settled_field} is {settled}, "
-            f"expected {sorted(seed.actionable_ids)}"
-        )
-    return errors
+    expected = len(seed.cancelled_command_ids)
+    dropped = _open_commands(before) - _open_commands(after)
+    if dropped != expected:
+        return [f"open remote commands dropped by {dropped}, expected {expected}"]
+    return []
 
 
-def shipped_source_errors(evidence: Mapping[str, Any]) -> list[str]:
-    """Whether the text this run executed is the text the admin layer ships.
+def rerun_errors(
+    settled: Mapping[str, Mapping[str, Any]],
+    rerun: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """One more pass after the shape settled changes nothing, anywhere.
 
-    The runner records the digests; recording is not judging. A script that no
-    longer starts with the shipped module source is a driver executing something
-    other than what ``gpu-fault-admin workflow-reconcile`` sends into the Pod,
-    and the case would be proving the wrong code.
+    ``settled`` and ``rerun`` each map ``workflows`` / ``incidents`` /
+    ``commands`` to the snapshots taken after the last required pass and after
+    the extra one. Any difference -- a status, an appended event, an incident
+    reason -- means the sweep is not idempotent on that shape.
     """
 
     errors: list[str] = []
-    if evidence.get("starts_with_module_source") is not True:
-        errors.append(
-            "the executed script does not start with the shipped module source"
-        )
-    for field in ("script_sha256", "module_sha256", "driver_sha256"):
-        value = str(evidence.get(field) or "")
-        if _SHA256.fullmatch(value) is None:
-            errors.append(f"shipped-source evidence has no sha256 for {field}")
+    for kind in ("workflows", "incidents", "commands"):
+        earlier = settled.get(kind) or {}
+        later = rerun.get(kind) or {}
+        for key in sorted(set(earlier) | set(later)):
+            if earlier.get(key) != later.get(key):
+                errors.append(
+                    f"{kind}: the rerun changed {key} from {earlier.get(key)!r} "
+                    f"to {later.get(key)!r}"
+                )
     return errors
 
 

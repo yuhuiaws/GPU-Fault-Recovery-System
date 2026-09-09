@@ -8,8 +8,15 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+import gpu_fault.execution.restart_budget_preflight as restart_budget_preflight
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -28,10 +35,21 @@ from gpu_fault.regional_compatibility import (
     LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
 )
 from gpu_fault.remote_command_models import (
+    BatchedStep as BatchedStep,
+)
+from gpu_fault.remote_command_models import (
+    BatchedStepResult as BatchedStepResult,
+)
+from gpu_fault.remote_command_models import (
     RemoteCommandStatus as RemoteCommandStatus,
 )
 from gpu_fault.remote_command_models import (
     lease_deadline as lease_deadline,
+)
+from gpu_fault.remote_step_batching import (
+    RemoteStepBatchingPolicy,
+    batchable_steps,
+    covered_step_outcome,
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.shared.remote_helpers import workflow_step_space
@@ -414,6 +432,12 @@ class RemoteActionCommand(StrictModel):
     workflow: WorkflowRequest
     incident: FaultIncident
     restart_authorization: RestartAuthorization | None = None
+    # The steps after ``step`` that this command also carries (性能 C). The
+    # command's own ``step``/``step_index``/``idempotency_key`` stay the first
+    # of the run, so every reader that knows one step per command keeps
+    # working; the executor runs the run in order and keeps one entry per
+    # step under ``result_details["batched_results"]``.
+    batched_steps: list[BatchedStep] = Field(default_factory=list)
     status: RemoteCommandStatus = RemoteCommandStatus.PENDING
     lease_owner: str | None = None
     last_lease_owner: str | None = None
@@ -426,6 +450,48 @@ class RemoteActionCommand(StrictModel):
     status_source: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def covered_step_indexes(self) -> tuple[int, ...]:
+        return (self.step_index, *(item.step_index for item in self.batched_steps))
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_batched_steps(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Executors older than REMOTE_STEP_BATCHING_PROTOCOL_VERSION decode the
+        # claim response with ``extra="forbid"``; an always-present
+        # ``batched_steps: []`` would 422 every claim they make against a
+        # newer control plane, compound command or not. Rows written before the
+        # field existed decode to the empty default the same way.
+        data: dict[str, Any] = handler(self)
+        if not self.batched_steps:
+            data.pop("batched_steps", None)
+        return data
+
+
+class RemoteCommandProgress(StrictModel):
+    """Per-step progress of a compound command, posted between its steps.
+
+    Lease-fenced like a renewal: the executor that holds the lease is the only
+    one whose view of the node is current. The terminal result still carries
+    the complete ``batched_results``, so a progress post that never lands (an
+    older control plane answers 404) costs latency on the control-plane side,
+    never correctness.
+    """
+
+    executor_id: str = Field(min_length=1)
+    lease_token: str = Field(min_length=1)
+    batched_results: dict[str, BatchedStepResult] = Field(min_length=1)
+
+    @field_validator("batched_results")
+    @classmethod
+    def validate_step_indexes(
+        cls, value: dict[str, BatchedStepResult]
+    ) -> dict[str, BatchedStepResult]:
+        if any(not key.isdigit() for key in value):
+            raise ValueError("batched_results keys must be step indexes")
+        return value
 
 
 class RemoteCommandClaimRequest(StrictModel):
@@ -449,6 +515,13 @@ class RemoteCommandClaimRequest(StrictModel):
     execution_owners: list[str] = Field(default_factory=list, max_length=32)
     max_commands: int = Field(default=1, ge=1, le=25)
     lease_seconds: int = Field(default=60, ge=10, le=7200)
+    # Long-poll: how long the control plane may hold an empty claim for a
+    # PENDING command on this cluster before answering. 0 (and an executor
+    # that predates the field) is a single immediate claim. Additive optional
+    # request field, so no protocol version bump: the response is unchanged,
+    # and the control plane ships before the data plane (design §8.1). The
+    # server caps the wait below this bound.
+    wait_seconds: float = Field(default=0, ge=0, le=30)
 
     @model_validator(mode="after")
     def validate_execution_owners(
@@ -665,63 +738,52 @@ class RegionalRemoteWorkflowAdapter:
         *,
         owners: set[str],
         operations: set[WorkflowOperation] | None = None,
+        step_batching: RemoteStepBatchingPolicy | None = None,
     ) -> None:
         self.store = store
         self.owners = owners
         self.operations = operations or set(WorkflowOperation)
+        # None keeps one command per step: a caller that did not say which
+        # executor versions it admits has not proven they can run a compound
+        # command (``RemoteStepBatchingPolicy``).
+        self.step_batching = step_batching or RemoteStepBatchingPolicy.disabled()
         # How many dispatches were held because another command for the same
         # (workflow, step index, step space) was still open (item D5). Read by
         # the metrics family like the dispatcher's counters.
         self.open_sibling_holds_total = 0
+        # Compound commands this adapter minted, and the steps they carried
+        # beyond their head (性能 C); exported next to the hold counter.
+        self.batched_commands_total = 0
+        self.batched_steps_total = 0
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner in self.owners and step.operation in self.operations
 
     def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
-        try:
-            registration = self.store.get_regional_cluster(context.incident.cluster_id)
-        except NotFoundError:
-            return WorkflowStepOutcome.failed(
-                "incident cluster is not registered for remote execution"
-            )
-        allowed_namespaces = set(registration.allowed_namespaces)
-        if context.step.workload_ids and not allowed_namespaces:
-            return WorkflowStepOutcome.failed(
-                "regional cluster registration has no allowed workload namespaces"
-            )
-        for workload_id in context.step.workload_ids:
-            namespace = workload_id.split("/", 1)[0]
-            if allowed_namespaces and namespace not in allowed_namespaces:
-                return WorkflowStepOutcome.failed(
-                    "workflow targets a namespace outside the cluster "
-                    f"registration: {namespace}"
-                )
-        # The command_id covers action semantics, not DAG scheduling
-        # metadata. A health branch may rewrite branch/dependency fields
-        # while a physical command is in flight; treating that rewrite
-        # as a new command can submit the same mutation twice. Target,
-        # workload and parameter changes remain part of the identity.
-        identity_step = context.step.model_dump(mode="json")
-        identity_step["branch_id"] = None
-        identity_step["depends_on_step_indexes"] = []
-        if context.workflow.executes_safety_steps:
-            identity_step["command_step_space"] = "safety"
-        digest = hashlib.sha256(
-            "\x1f".join(
-                (
-                    context.workflow.request_id,
-                    str(context.step_index),
-                    str(context.workflow.fencing_token),
-                    context.idempotency_key,
-                    json.dumps(
-                        identity_step,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                )
-            ).encode()
-        ).hexdigest()[:24]
-        command_id = f"remote-{digest}"
+        refused = self._registration_refusal(context)
+        if refused is not None:
+            return refused
+        # A step an earlier compound command already carries must not mint a
+        # command of its own: the executor is running (or ran) it under that
+        # command's id, and a second command would be the same node action
+        # twice. Asked before the digest because the digest of a fresh
+        # dispatch of that step would name a different, brand-new command.
+        covering = self.store.find_remote_command_covering_step(
+            context.workflow.request_id,
+            context.step_index,
+            workflow_step_space(context.workflow),
+            fencing_token=context.workflow.fencing_token,
+        )
+        if covering is not None:
+            covered = covered_step_outcome(covering, context.step_index)
+            if covered is not None:
+                return covered
+        batched = (
+            batchable_steps(context, supports=self.supports)
+            if self.step_batching.active
+            else []
+        )
+        command_id = self._command_id(context, batched)
         # The open-command invariant (architecture review 2026-09-07, item D5):
         # the digest above changes whenever a merge rewrites the step's targets
         # or parameters, but the physical action the previous digest named may
@@ -752,67 +814,51 @@ class RegionalRemoteWorkflowAdapter:
                     "mutation_submitted_by_control_plane": False,
                 },
             )
-        restart_authorization = None
-        restart_reservation: tuple[str, str, str] | None = None
+        current: RemoteActionCommand | None = None
+        restart_authorization: RestartAuthorization | None = None
         if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
-            parameters = context.step.parameters
-            required = {
-                "cluster_id",
-                "job_id",
-                "source_attempt_id",
-                "source_gpu_count",
-                "restart_budget",
-            }
-            missing = required - set(parameters)
-            if missing:
-                return WorkflowStepOutcome.failed(
-                    "restart safety context is missing: " + ", ".join(sorted(missing))
+            # A command under this id that already SUCCEEDED or FAILED has its
+            # verdict, whatever happened to the restart reservation since (a
+            # terminal write, an operator restore). The reservation gate is
+            # for minting a command, not for reading one back.
+            current = self._settled_remote_command(command_id)
+            if current is None:
+                # The preflight is the only site that reserves restart budget;
+                # dispatch reads that reservation back and signs it for the
+                # data plane. A step without one fails closed instead of
+                # reserving here.
+                issued = restart_budget_preflight.issue_restart_authorization(
+                    self.store,
+                    context.incident,
+                    context.step,
+                    context.idempotency_key,
                 )
-            state, reserved = self.store.reserve_job_restart(
-                str(parameters["cluster_id"]),
-                str(parameters["job_id"]),
-                int(parameters["restart_budget"]),
-                context.idempotency_key,
+                if not isinstance(issued, RestartAuthorization):
+                    return issued
+                restart_authorization = issued
+        if current is None:
+            command = RemoteActionCommand(
+                command_id=command_id,
+                cluster_id=context.incident.cluster_id,
+                workflow_request_id=context.workflow.request_id,
+                incident_id=context.incident.incident_id,
+                step_index=context.step_index,
+                fencing_token=context.workflow.fencing_token,
+                idempotency_key=context.idempotency_key,
+                step=context.step,
+                workflow=context.workflow,
+                incident=context.incident,
+                restart_authorization=restart_authorization,
+                batched_steps=batched,
             )
-            if not reserved:
-                return WorkflowStepOutcome.failed(
-                    "restart budget exhausted for "
-                    f"{state.cluster_id}/{state.job_id}: "
-                    f"{state.restart_count}/{state.budget}",
-                    details={
-                        "reason": "RESTART_BUDGET_EXHAUSTED",
-                        "restart_count": state.restart_count,
-                        "restart_budget": state.budget,
-                    },
-                )
-            restart_reservation = (
-                state.cluster_id,
-                state.job_id,
-                context.idempotency_key,
-            )
-            restart_authorization = RestartAuthorization(
-                cluster_id=state.cluster_id,
-                job_id=state.job_id,
-                source_attempt_id=str(parameters["source_attempt_id"]),
-                source_gpu_count=int(parameters["source_gpu_count"]),
-                restart_budget=state.budget,
-                restart_count=state.restart_count,
-                reservation_id=context.idempotency_key,
-            )
-        command = RemoteActionCommand(
-            command_id=command_id,
-            cluster_id=context.incident.cluster_id,
-            workflow_request_id=context.workflow.request_id,
-            incident_id=context.incident.incident_id,
-            step_index=context.step_index,
-            fencing_token=context.workflow.fencing_token,
-            idempotency_key=context.idempotency_key,
-            step=context.step,
-            workflow=context.workflow,
-            incident=context.incident,
-            restart_authorization=restart_authorization,
-        )
-        current = self.store.ensure_remote_command(command)
+            current = self.store.ensure_remote_command(command)
+            if batched and current is command:
+                self.batched_commands_total += 1
+                self.batched_steps_total += len(batched)
+        if batched:
+            covered = covered_step_outcome(current, context.step_index)
+            if covered is not None:
+                return covered
         operation_id = f"remote/{current.command_id}"
         if current.status is RemoteCommandStatus.SUCCEEDED:
             return WorkflowStepOutcome.succeeded(
@@ -820,12 +866,23 @@ class RegionalRemoteWorkflowAdapter:
                 details=current.result_details,
             )
         if current.status is RemoteCommandStatus.FAILED:
-            if restart_reservation is not None:
-                self.store.release_job_restart(*restart_reservation)
+            # ``status_source`` rides along so the executor can tell a command
+            # the workflow itself cancelled (``workflow-preempted``,
+            # ``workflow-timeout``) from a node refusing the action (D-8).
             return WorkflowStepOutcome.failed(
                 current.error or "remote cluster action failed",
-                details=current.result_details,
+                details={
+                    **current.result_details,
+                    **(
+                        {"remote_status_source": current.status_source}
+                        if current.status_source is not None
+                        else {}
+                    ),
+                },
             )
+        # A RESTART_WORKLOAD hold on the data plane says ``restart_submitted``;
+        # carried here so the reservation release can judge a live wait.
+        restart_submitted = current.result_details.get("restart_submitted")
         return WorkflowStepOutcome.waiting(
             operation_id=operation_id,
             details={
@@ -833,5 +890,102 @@ class RegionalRemoteWorkflowAdapter:
                 "remote_cluster_id": current.cluster_id,
                 "remote_status": current.status.value,
                 "mutation_submitted_by_control_plane": False,
+                **(
+                    {"restart_submitted": restart_submitted}
+                    if restart_submitted is not None
+                    else {}
+                ),
             },
         )
+
+    def _settled_remote_command(self, command_id: str) -> RemoteActionCommand | None:
+        """The SUCCEEDED or FAILED command already stored under ``command_id``.
+
+        ``None`` when there is no command yet or it is still open; an open
+        command goes through ``ensure_remote_command`` like a new one.
+        """
+
+        try:
+            existing: RemoteActionCommand = self.store.get_remote_command(command_id)
+        except NotFoundError:
+            return None
+        if existing.status in (
+            RemoteCommandStatus.SUCCEEDED,
+            RemoteCommandStatus.FAILED,
+        ):
+            return existing
+        return None
+
+    def _registration_refusal(
+        self, context: WorkflowStepContext
+    ) -> WorkflowStepOutcome | None:
+        try:
+            registration = self.store.get_regional_cluster(context.incident.cluster_id)
+        except NotFoundError:
+            return WorkflowStepOutcome.failed(
+                "incident cluster is not registered for remote execution"
+            )
+        allowed_namespaces = set(registration.allowed_namespaces)
+        if context.step.workload_ids and not allowed_namespaces:
+            return WorkflowStepOutcome.failed(
+                "regional cluster registration has no allowed workload namespaces"
+            )
+        for workload_id in context.step.workload_ids:
+            namespace = workload_id.split("/", 1)[0]
+            if allowed_namespaces and namespace not in allowed_namespaces:
+                return WorkflowStepOutcome.failed(
+                    "workflow targets a namespace outside the cluster "
+                    f"registration: {namespace}"
+                )
+        return None
+
+    @staticmethod
+    def _identity_step(
+        step: WorkflowStepSpec, workflow: WorkflowRequest
+    ) -> dict[str, Any]:
+        # The command_id covers action semantics, not DAG scheduling
+        # metadata. A health branch may rewrite branch/dependency fields
+        # while a physical command is in flight; treating that rewrite
+        # as a new command can submit the same mutation twice. Target,
+        # workload and parameter changes remain part of the identity.
+        identity = step.model_dump(mode="json")
+        identity["branch_id"] = None
+        identity["depends_on_step_indexes"] = []
+        if workflow.executes_safety_steps:
+            identity["command_step_space"] = "safety"
+        return identity
+
+    def _command_id(
+        self, context: WorkflowStepContext, batched: list[BatchedStep]
+    ) -> str:
+        parts = [
+            context.workflow.request_id,
+            str(context.step_index),
+            str(context.workflow.fencing_token),
+            context.idempotency_key,
+            json.dumps(
+                self._identity_step(context.step, context.workflow),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ]
+        if batched:
+            # Only a compound command digests its passengers, so the id of a
+            # step dispatched alone is exactly what it was before batching
+            # existed: a command in flight across the upgrade keeps its name.
+            parts.append(
+                json.dumps(
+                    [
+                        {
+                            "step_index": item.step_index,
+                            "idempotency_key": item.idempotency_key,
+                            "step": self._identity_step(item.step, context.workflow),
+                        }
+                        for item in batched
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        digest = hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:24]
+        return f"remote-{digest}"

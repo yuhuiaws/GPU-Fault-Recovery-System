@@ -95,11 +95,22 @@ spec:
               value: active
             - name: GPU_FAULT_SERVICE_ROLE
               value: ingress
+            # Start-up fallback only. The env is captured when the Pod is
+            # created and never updated; the store reads the DSN through
+            # GPU_FAULT_STORE_URL_FILE below, which kubelet keeps in step with
+            # the Secret after every credential refresh (CP-3). Kept for one
+            # release so settings/admission/executor code that still reads
+            # the env before the store opens keeps working.
             - name: GPU_FAULT_STORE_URL
               valueFrom:
                 secretKeyRef:
                   name: gpu-fault-aurora
                   key: postgres-url
+            # The projected postgres-url key of the aurora-credentials mount.
+            # The pool re-reads it on every connect, so a rotated Aurora
+            # password reaches running replicas without a restart.
+            - name: GPU_FAULT_STORE_URL_FILE
+              value: /etc/gpu-fault/aurora/postgres-url
             # The Aurora DSN uses sslmode=verify-full, so the RDS CA bundle
             # mounted below must be readable here. Aligns with the path baked
             # into the DSN by gpu_fault.admin.bootstrap._aurora_dsn.
@@ -110,6 +121,14 @@ spec:
             - name: GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER
               value: "true"
             - name: GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION
+              value: "true"
+            # 性能 C: one compound remote command for a contiguous run of
+            # node-side steps on one node. Effective only once the release
+            # pins admit no executor older than protocol 3; the transition
+            # deploy keeps the previous version compatible, so batching turns
+            # itself on with the follow-up deploy. "false" restores one
+            # command per step.
+            - name: GPU_FAULT_REMOTE_STEP_BATCHING
               value: "true"
             - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
               value: "5"
@@ -368,12 +387,6 @@ spec:
               value: "3600"
             - name: GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS
               value: "86400"
-            - name: GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS
-              value: "true"
-            - name: GPU_FAULT_DCGM_EXPORTER_PORT
-              value: "9400"
-            - name: GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS
-              value: "10"
             - name: GPU_FAULT_NODE_AGENT_ENDPOINTS
               value: "{}"
             - name: GPU_FAULT_REQUIRED_AGENT_VERSION
@@ -451,7 +464,7 @@ spec:
                   key: compatible-regional-executor-compatibility-digests
                   optional: true
             # Optional on purpose, in both places at once: the ConfigMap is
-            # rendered by `gpu-fault-admin failure-domain-map` and carries the
+            # rendered by the release engine during the CPU apply and carries the
             # file path in its own `map-path` key, so a site without the map
             # runs without the per-failure-domain remediation tier, while a
             # site that ships one gets a worker that refuses to start on a
@@ -597,6 +610,14 @@ spec:
             - name: rds-ca-bundle
               mountPath: /etc/gpu-fault/rds
               readOnly: true
+            # The gpu-fault-aurora Secret as files: postgres-url (the DSN the
+            # pool re-reads on every connect) and last-refresh-status.json
+            # (written by the credential refresher, exported as a metric). No
+            # subPath: kubelet only propagates Secret updates to whole-volume
+            # mounts.
+            - name: aurora-credentials
+              mountPath: /etc/gpu-fault/aurora
+              readOnly: true
       volumes:
         - name: artifact
           configMap:
@@ -611,6 +632,9 @@ spec:
         - name: rds-ca-bundle
           configMap:
             name: gpu-fault-rds-ca-bundle
+        - name: aurora-credentials
+          secret:
+            secretName: gpu-fault-aurora
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     # The same tolerant wrapper the checks use: a release object that predates
     # the read cache, or a test double standing in for one, has no
@@ -15,6 +15,7 @@ from gpu_fault_release.regional_admin_checks import (
 )
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
+    build_quick_health_report,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
@@ -28,7 +29,7 @@ from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
 from gpu_fault_release.regional_release_reporting import build_release_status
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
 # The operator's consent to open a new transaction for a different candidate
 # over a fail-forward transaction that stopped in `failed`/`partial-convergence`.
@@ -178,8 +179,28 @@ def _refuse_foreign_candidate_resume(release: Any, state: dict[str, Any]) -> Non
     if not (_terminal_failed_transaction(state) and _foreign_candidate(release, state)):
         return
     raise ReleaseError(
-        f"release {state.get('release_id') or 'unknown'} stopped in phase "
-        f"{state.get('phase')} and the candidate {release.release_id} is a "
+        foreign_candidate_resume_message(
+            live_release_id=str(state.get("release_id") or ""),
+            phase=str(state.get("phase") or ""),
+            candidate_release_id=str(release.release_id),
+        )
+    )
+
+
+def foreign_candidate_resume_message(
+    *, live_release_id: str, phase: str, candidate_release_id: str
+) -> str:
+    """The refusal wording, shared with the deploy entry's first-minute check.
+
+    ``gpu-fault-admin deploy`` reads the live phase and the candidate id as soon
+    as the release is built and refuses there, before bootstrap re-validation
+    and the rollout; the engine repeats the check as the last line of defence.
+    Both say exactly this.
+    """
+
+    return (
+        f"release {live_release_id or 'unknown'} stopped in phase "
+        f"{phase or 'unknown'} and the candidate {candidate_release_id} is a "
         "different release; a failed fail-forward transaction only resumes the "
         "release that failed. To open a new transaction for the candidate on "
         "the last committed baseline, rerun the same deploy with "
@@ -568,7 +589,16 @@ def run_resume(release: Any) -> None:
     )
 
 
-def build_release_summary(release: Any) -> dict[str, Any]:
+def build_release_summary(
+    release: Any, *, state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The configured release beside the live one and what a deploy would do.
+
+    ``state`` is the live release state when the caller has already read it:
+    ``status`` reads the ConfigMap once for the health baseline, the summary
+    and the snapshot together, where it used to read it three times.
+    """
+
     result: dict[str, Any]
     try:
         result = build_release_status(release)
@@ -579,7 +609,8 @@ def build_release_summary(release: Any) -> dict[str, Any]:
         }
     result["mode"] = "release-summary"
     try:
-        state = release._load_state()
+        if state is None:
+            state = release._load_state()
         result["live_release"] = {
             "release_id": state.get("release_id"),
             "phase": state.get("phase"),
@@ -596,7 +627,11 @@ def build_release_summary(release: Any) -> dict[str, Any]:
     return result
 
 
-def build_full_status(release: Any) -> dict[str, Any]:
+def build_full_status(
+    release: Any, *, state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The full ``status`` report: every health check plus the release summary."""
+
     # One snapshot for both halves. `build_health_report` opens its own, and
     # everything `build_release_summary` reads -- the release state ConfigMap,
     # the live Deployments behind `next_deploy` -- the health checks have already
@@ -606,8 +641,122 @@ def build_full_status(release: Any) -> dict[str, Any]:
     # reported beside it, which is the whole point of a status output.
     with read_snapshot(release):
         health = build_health_report(release, mode="status")
-        result = build_release_summary(release)
+        result = build_release_summary(release, state=state)
+    return _status_result(result, health, scope="full")
+
+
+def build_status(release: Any, *, full: bool) -> dict[str, Any]:
+    """The ``status`` mode: one snapshot, one state read, quick or full.
+
+    The snapshot opens first so the single release-state read serves the
+    rolled-back health baseline, the summary and every check inside it. Before,
+    the baseline read the ConfigMap outside the snapshot and the summary read it
+    again inside.
+    """
+
+    with read_snapshot(release):
+        state = release._load_state()
+        release._apply_health_baseline(state)
+        if full:
+            return build_full_status(release, state=state)
+        return build_quick_status(release, state=state)
+
+
+def build_quick_status(
+    release: Any, *, state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The default ``status`` report: the release summary plus the cheap checks.
+
+    Same document shape as :func:`build_full_status` -- ``mode``, ``healthy``,
+    ``live_release``, ``configured_release``, ``next_deploy``, ``health`` -- so
+    every reader of the JSON works on either. Only ``health.checks`` is shorter,
+    and ``health_scope`` says which report this is.
+    """
+
+    with read_snapshot(release):
+        health = build_quick_health_report(release)
+        result = build_release_summary(release, state=state)
+    return _status_result(result, health, scope="quick")
+
+
+def _status_result(
+    result: dict[str, Any], health: dict[str, Any], *, scope: str
+) -> dict[str, Any]:
     result["mode"] = "status"
     result["healthy"] = health["healthy"]
     result["health"] = health
+    result["health_scope"] = scope
     return result
+
+
+def failing_checks(report: dict[str, Any]) -> list[str]:
+    """Names of the checks in a health or status report that did not pass."""
+
+    health = report.get("health")
+    checks = (health if isinstance(health, dict) else report).get("checks")
+    return [
+        str(item.get("name"))
+        for item in (checks if isinstance(checks, list) else [])
+        if isinstance(item, dict) and item.get("status") not in ("PASS", "SKIP")
+    ]
+
+
+def status_header_lines(report: dict[str, Any], *, json_destination: str) -> list[str]:
+    """The five lines an administrator reads before the JSON.
+
+    The status document runs past a thousand lines with ``healthy`` sorted to
+    the bottom. These name the verdict, the live release, what the next deploy
+    would do and which checks failed, then say where the whole document went.
+    """
+
+    live = report.get("live_release")
+    live = live if isinstance(live, dict) else {}
+    next_deploy = report.get("next_deploy")
+    next_deploy = next_deploy if isinstance(next_deploy, dict) else {}
+    health = report.get("health")
+    summary = (health if isinstance(health, dict) else {}).get("summary")
+    total = sum(summary.values()) if isinstance(summary, dict) else 0
+    failing = failing_checks(report)
+    next_kind = str(
+        next_deploy.get("kind") or report.get("next_deploy_error") or "unknown"
+    )
+    if next_deploy.get("resume"):
+        next_kind += f" (resume {next_deploy.get('action')})"
+    return [
+        f"healthy: {'yes' if report.get('healthy') else 'NO'}"
+        f" ({report.get('health_scope') or 'full'} health, {total} checks)",
+        f"live release: {live.get('release_id') or 'unknown'}"
+        f" phase={live.get('phase') or 'unknown'}"
+        f" committed={'yes' if live.get('transaction_committed') else 'no'}",
+        f"next deploy: {next_kind}",
+        "failing checks: " + (", ".join(failing) if failing else "none"),
+        f"full JSON report: {json_destination}",
+    ]
+
+
+FULL_REPORT_ENV = "GPU_FAULT_FULL_REPORT"
+
+
+def full_report_requested(environment: dict[str, str] | None = None) -> bool:
+    value = (environment if environment is not None else os.environ).get(
+        FULL_REPORT_ENV, ""
+    )
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+def compact_report(report: dict[str, Any]) -> dict[str, Any]:
+    """A health report with its passing checks folded to their names.
+
+    A passing preflight used to print about 250 lines of check details in the
+    middle of a deploy that nothing reads. Failures keep their details; the
+    full document is one ``--full`` (or ``GPU_FAULT_FULL_REPORT=1``) away.
+    """
+
+    checks = [item for item in (report.get("checks") or []) if isinstance(item, dict)]
+    return {
+        **report,
+        "checks": [item for item in checks if item.get("status") != "PASS"],
+        "passed_checks": [
+            str(item.get("name")) for item in checks if item.get("status") == "PASS"
+        ],
+    }

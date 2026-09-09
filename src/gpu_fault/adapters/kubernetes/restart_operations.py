@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from copy import deepcopy
 from typing import Any, Callable, Protocol
 
+from gpu_fault.adapters.common import (
+    ANNOTATION_APPROVE_GPU_COUNT_CHANGE,
+    ANNOTATION_RESTART_BUDGET,
+    ANNOTATION_RESTART_COUNT,
+    ANNOTATION_TARGET_GPU_COUNT,
+    LABEL_ATTEMPT_ID,
+    LABEL_JOB_ID,
+)
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -14,16 +22,6 @@ from gpu_fault.models import (
     WorkflowEventCode,
     WorkflowOperation,
     WorkflowStepStatus,
-)
-
-
-from gpu_fault.adapters.common import (
-    ANNOTATION_APPROVE_GPU_COUNT_CHANGE,
-    ANNOTATION_RESTART_BUDGET,
-    ANNOTATION_RESTART_COUNT,
-    ANNOTATION_TARGET_GPU_COUNT,
-    LABEL_ATTEMPT_ID,
-    LABEL_JOB_ID,
 )
 
 
@@ -65,24 +63,66 @@ class KubernetesRestartOperationsMixin:
     #: The premise this adapter is waiting on, kept beside the shared code.
     PREMISE_REASON_INCIDENT_NOT_RECOVERED = "INCIDENT_NOT_RECOVERED"
 
+    @staticmethod
+    def _rejected(error: str, **details: Any) -> WorkflowStepOutcome:
+        """A refusal made before any restart was submitted.
+
+        ``restart_submitted: False`` is what the control plane's terminal write
+        reads to hand the preflight's reservation back
+        (``release_unattempted_restart_reservations``): this adapter neither
+        reserves nor releases budget itself.
+        """
+
+        return WorkflowStepOutcome.failed(
+            error, details={**details, "restart_submitted": False}
+        )
+
     def _restart_guard(
         self,
         context: WorkflowStepContext,
         workloads: list[tuple[str, str, str, str, Any]],
     ) -> tuple[WorkflowStepOutcome | None, int | None]:
+        """Compare the step's ``RestartAuthorization`` with the step as signed.
+
+        The control plane reserves the job's restart budget in its preflight
+        and signs that reservation into the authorization; this guard checks
+        that the authorization describes the step in front of it, then reads
+        the workload's premises. ``(None, restart_count)`` clears the
+        restart; otherwise the outcome says why not.
+        """
+
         parameters = context.step.parameters
-        required = {
-            "cluster_id",
-            "job_id",
-            "source_attempt_id",
-            "source_gpu_count",
-            "restart_budget",
-        }
-        if not required.issubset(parameters):
+        authorization = context.request.restart_authorization
+        if authorization is None:
             return (
-                WorkflowStepOutcome.failed(
-                    "restart safety context is missing: "
-                    + ", ".join(sorted(required - set(parameters)))
+                self._rejected("restart safety guard requires a restart authorization"),
+                None,
+            )
+        # Compare the authorization with the parameters as the preflight
+        # signed them. The label and observation rewrites below refine the
+        # values the new Job is built from (a discovered attempt id, a GPU
+        # count the plan could not know), and would otherwise make a genuine
+        # authorization look forged.
+        signed = {
+            "cluster_id": str(parameters["cluster_id"]),
+            "job_id": str(parameters["job_id"]),
+            "source_attempt_id": str(parameters["source_attempt_id"]),
+            "source_gpu_count": int(parameters["source_gpu_count"]),
+            "restart_budget": int(parameters["restart_budget"]),
+            "reservation_id": context.idempotency_key,
+        }
+        actual = {
+            "cluster_id": authorization.cluster_id,
+            "job_id": authorization.job_id,
+            "source_attempt_id": authorization.source_attempt_id,
+            "source_gpu_count": authorization.source_gpu_count,
+            "restart_budget": authorization.restart_budget,
+            "reservation_id": authorization.reservation_id,
+        }
+        if actual != signed:
+            return (
+                self._rejected(
+                    "restart authorization does not match the workload safety context"
                 ),
                 None,
             )
@@ -102,13 +142,11 @@ class KubernetesRestartOperationsMixin:
             )
             if pinned:
                 return (
-                    WorkflowStepOutcome.failed(
+                    self._rejected(
                         "restart target is pinned to an avoided node: "
                         + ", ".join(pinned),
-                        details={
-                            "reason": "RESTART_TARGET_AVOIDED",
-                            "avoided_node_ids": pinned,
-                        },
+                        reason="RESTART_TARGET_AVOIDED",
+                        avoided_node_ids=pinned,
                     ),
                     None,
                 )
@@ -120,7 +158,7 @@ class KubernetesRestartOperationsMixin:
         expected_job_id = str(parameters["job_id"])
         if declared_job_ids and declared_job_ids != {expected_job_id}:
             return (
-                WorkflowStepOutcome.failed(
+                self._rejected(
                     "restart workload job identity does not match "
                     f"{expected_job_id}: " + ", ".join(sorted(declared_job_ids))
                 ),
@@ -133,7 +171,7 @@ class KubernetesRestartOperationsMixin:
         }
         if len(declared_attempt_ids) > 1:
             return (
-                WorkflowStepOutcome.failed(
+                self._rejected(
                     "restart workloads have inconsistent attempt IDs: "
                     + ", ".join(sorted(declared_attempt_ids))
                 ),
@@ -179,7 +217,7 @@ class KubernetesRestartOperationsMixin:
         if not count_matches and not approved:
             if self.notification_sink is None:
                 return (
-                    WorkflowStepOutcome.failed(
+                    self._rejected(
                         "restart GPU count changed without local "
                         "persistent notification support"
                     ),
@@ -210,88 +248,26 @@ class KubernetesRestartOperationsMixin:
                         "target_gpu_count": target_gpu_count,
                         "required_approval_annotation": approval,
                         "notification_id": (notification.notification_id),
+                        # A hold, not a submission: a workflow cancelled
+                        # while it waits here owes no restart budget.
+                        "restart_submitted": False,
                     },
                 ),
                 None,
             )
-
-        if self.store is None:
-            authorization = context.request.restart_authorization
-            if authorization is None:
-                return (
-                    WorkflowStepOutcome.failed(
-                        "restart safety guard requires regional authorization"
-                    ),
-                    None,
-                )
-            expected = {
-                "cluster_id": str(parameters["cluster_id"]),
-                "job_id": str(parameters["job_id"]),
-                "source_attempt_id": str(parameters["source_attempt_id"]),
-                "source_gpu_count": source_gpu_count,
-                "restart_budget": int(parameters["restart_budget"]),
-                "reservation_id": context.idempotency_key,
-            }
-            actual = {
-                "cluster_id": authorization.cluster_id,
-                "job_id": authorization.job_id,
-                "source_attempt_id": (authorization.source_attempt_id),
-                "source_gpu_count": (authorization.source_gpu_count),
-                "restart_budget": authorization.restart_budget,
-                "reservation_id": authorization.reservation_id,
-            }
-            if actual != expected:
-                return (
-                    WorkflowStepOutcome.failed(
-                        "regional restart authorization does not "
-                        "match the workload safety context"
-                    ),
-                    None,
-                )
-            return None, authorization.restart_count
-
-        state, reserved = self.store.reserve_job_restart(
-            str(parameters["cluster_id"]),
-            str(parameters["job_id"]),
-            int(parameters["restart_budget"]),
-            context.idempotency_key,
-        )
-        if not reserved:
-            notification = self.restart_email_builder.build_budget_exhausted(
-                cluster_id=state.cluster_id,
-                incident_id=context.incident.incident_id,
-                job_id=state.job_id,
-                attempt_id=str(parameters["source_attempt_id"]),
-                restart_count=state.restart_count,
-                restart_budget=state.budget,
-            )
-            notification = self.store.save_notification_if_absent(notification)
-            if self.alert_sender is not None:
-                self.alert_sender(notification.notification_id)
-            return (
-                WorkflowStepOutcome.failed(
-                    "restart budget exhausted for "
-                    f"{state.cluster_id}/{state.job_id}: "
-                    f"{state.restart_count}/{state.budget}",
-                    details={
-                        "reason": "RESTART_BUDGET_EXHAUSTED",
-                        "restart_count": state.restart_count,
-                        "restart_budget": state.budget,
-                        "notification_id": (notification.notification_id),
-                    },
-                ),
-                None,
-            )
-        return None, state.restart_count
+        return None, authorization.restart_count
 
     def _incident_premise(
         self, context: WorkflowStepContext
     ) -> WorkflowStepOutcome | None:
         """Honour ``requires_incident_state`` at execution time.
 
-        The planner's ``after_incident`` restart depends on the incident that
-        owns the nodes being ``RECOVERED``. Only the simulated executor read
-        that premise, so a production restart went ahead mid-repair (F-G5).
+        A restart planned after a repair depends on the incident that owns the
+        nodes being ``RECOVERED``. The compiler writes that premise onto the
+        step from ``RecoveryPlan.restart_after_incident_id``; both executors
+        read it -- the simulated one straight off the plan, this adapter off
+        the compiled step -- because for a while only the simulated executor
+        did, and a production restart went ahead mid-repair (F-G5).
         Not yet recovered: wait (the executor re-runs the step). Can never
         recover (quarantined, escalated): fail. Cannot be verified: fail
         closed rather than restart on an assumption.
@@ -312,21 +288,20 @@ class KubernetesRestartOperationsMixin:
             "remediation_workflow_id": remediation_workflow_id,
         }
         if state is None:
-            return WorkflowStepOutcome.failed(
+            return self._rejected(
                 f"cannot verify that incident {incident_id} is {required_state}: "
                 "no store or ownership provider can answer",
-                details={**details, "reason": "INCIDENT_STATE_UNVERIFIABLE"},
+                **details,
+                reason="INCIDENT_STATE_UNVERIFIABLE",
             )
         if state == required_state:
             return None
         if state in self._UNRECOVERABLE_INCIDENT_STATES:
-            return WorkflowStepOutcome.failed(
+            return self._rejected(
                 f"incident {incident_id} is {state}; it will never be "
                 f"{required_state}, so the workload cannot be restarted on its nodes",
-                details={
-                    **details,
-                    "reason": self.HOLD_REASON_INCIDENT_NOT_RECOVERABLE,
-                },
+                **details,
+                reason=self.HOLD_REASON_INCIDENT_NOT_RECOVERABLE,
             )
         return WorkflowStepOutcome.waiting(
             operation_id=context.idempotency_key,
@@ -334,6 +309,7 @@ class KubernetesRestartOperationsMixin:
                 **details,
                 "reason": self.HOLD_REASON_NODE_UNDER_REMEDIATION,
                 "premise_reason": self.PREMISE_REASON_INCIDENT_NOT_RECOVERED,
+                "restart_submitted": False,
             },
         )
 
@@ -450,6 +426,8 @@ class KubernetesRestartOperationsMixin:
             if expression not in expressions:
                 expressions.append(expression)
 
+    _HISTORICAL_RESTART_SCAN_LIMIT = 256
+
     def _observed_source_gpu_count(
         self, cluster_id: str, job_id: str, attempt_id: str
     ) -> int:
@@ -487,19 +465,26 @@ class KubernetesRestartOperationsMixin:
             }
             if gpu_uuids:
                 return len(gpu_uuids)
-        historical_counts = [
-            int(step.parameters["source_gpu_count"])
-            for workflow in self.store.list_workflows(limit=10000)
-            for step in workflow.official_steps
-            if (
-                step.operation is WorkflowOperation.RESTART_WORKLOAD
-                and step.parameters.get("cluster_id") == cluster_id
-                and step.parameters.get("job_id") == job_id
-                and step.parameters.get("source_attempt_id") == attempt_id
-                and int(step.parameters.get("source_gpu_count", 0)) > 0
-            )
-        ]
-        return max(historical_counts, default=0)
+        # Last resort: an earlier RESTART_WORKLOAD step for the same attempt
+        # already recorded the count. This used to list every workflow the
+        # store held (limit=10000) and walk every official step, inside the
+        # executor's restart path. A resubmitted restart is recent by
+        # construction, so a newest-first slice of a few hundred workflows
+        # is enough, and the newest matching step is the authoritative one
+        # (not the largest), so the scan stops at the first match.
+        for workflow in self.store.list_workflows(
+            limit=self._HISTORICAL_RESTART_SCAN_LIMIT, newest_first=True
+        ):
+            for step in workflow.official_steps:
+                if (
+                    step.operation is WorkflowOperation.RESTART_WORKLOAD
+                    and step.parameters.get("cluster_id") == cluster_id
+                    and step.parameters.get("job_id") == job_id
+                    and step.parameters.get("source_attempt_id") == attempt_id
+                    and int(step.parameters.get("source_gpu_count", 0)) > 0
+                ):
+                    return int(step.parameters["source_gpu_count"])
+        return 0
 
     def _restart_terminal_job(
         self,

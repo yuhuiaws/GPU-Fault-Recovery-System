@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,9 +72,15 @@ def test_verified_membership_evidence_rejects_runtime_drift() -> None:
         )
 
 
-def test_batch_commit_accepts_only_prior_candidate_activation(
+def test_commit_validation_checks_the_evidence_without_a_live_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A join takes three runtime snapshots: before and after the verify, and
+    the final one after activation. The commit gate between them is a check of
+    the recorded evidence against the transaction files, not a fourth and fifth
+    read of the control plane.
+    """
+
     source, candidate = _candidate_sites(tmp_path)
     baseline = _snapshot(
         states={"gpu-a": "ACTIVE", "gpu-b": "PENDING", "gpu-c": "PENDING"}
@@ -92,12 +99,11 @@ def test_batch_commit_accepts_only_prior_candidate_activation(
         batch_id="batch-a",
         verified_at=verified_at,
     )
-    current = _snapshot(
-        states={"gpu-a": "ACTIVE", "gpu-b": "ACTIVE", "gpu-c": "PENDING"},
-        generation=3,
-        state_sha256="d" * 64,
+    monkeypatch.setattr(
+        evidence,
+        "membership_runtime_snapshot",
+        lambda _site: pytest.fail("the commit gate re-read the live runtime"),
     )
-    monkeypatch.setattr(evidence, "membership_runtime_snapshot", lambda _site: current)
     state = {
         "source_site_sha256": source.source_sha256,
         "source_site_non_membership_sha256": (
@@ -106,7 +112,7 @@ def test_batch_commit_accepts_only_prior_candidate_activation(
         "completed_steps": ["SITE_UPDATED", "RELEASE_STATE_UPDATED"],
     }
 
-    observed = evidence.validate_verified_membership(
+    evidence.validate_verified_membership(
         evidence=record,
         state=state,
         current_site=source,
@@ -115,7 +121,42 @@ def test_batch_commit_accepts_only_prior_candidate_activation(
         now=verified_at + timedelta(seconds=30),
     )
 
-    assert observed["registry_generation"] == 3
+    with pytest.raises(BootstrapError, match="cluster set drifted"):
+        evidence.validate_verified_membership(
+            evidence={**record, "candidate_cluster_ids": ["gpu-a", "gpu-c"]},
+            state=state,
+            current_site=source,
+            candidate_site=candidate,
+            cluster_id="gpu-c",
+            now=verified_at + timedelta(seconds=30),
+        )
+
+
+def test_stale_verification_is_cleared_for_a_re_verify(tmp_path: Path) -> None:
+    """Expired evidence means "verify again", never "roll the data plane back"."""
+
+    verified_at = datetime.now(timezone.utc)
+    record = {"verified_at": verified_at.isoformat()}
+    assert not evidence.verification_is_stale(
+        record, now=verified_at + timedelta(seconds=30)
+    ), "evidence inside the window was treated as stale"
+    assert evidence.verification_is_stale(
+        record,
+        now=verified_at + timedelta(seconds=evidence.VERIFICATION_MAX_AGE_SECONDS + 1),
+    ), "evidence past the window was treated as fresh"
+    assert evidence.verification_is_stale({}), "missing evidence was treated as fresh"
+
+    state_path = tmp_path / "state.json"
+    state = {
+        "completed_steps": ["JOINED", "VERIFIED"],
+        "evidence": {"JOINED": {}, "VERIFIED": record},
+    }
+    evidence.clear_verified_step(state_path, state)
+
+    assert state["completed_steps"] == ["JOINED"]
+    assert "VERIFIED" not in state["evidence"]
+    written = json.loads(state_path.read_text(encoding="utf-8"))
+    assert written["completed_steps"] == ["JOINED"], "the cleared step was not saved"
 
 
 def test_join_verification_evidence_expires(
@@ -140,7 +181,7 @@ def test_join_verification_evidence_expires(
     )
     monkeypatch.setattr(evidence, "membership_runtime_snapshot", lambda _site: baseline)
 
-    with pytest.raises(BootstrapError, match="expired"):
+    with pytest.raises(evidence.JoinVerificationExpired, match="expired"):
         evidence.validate_verified_membership(
             evidence=record,
             state={

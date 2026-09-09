@@ -5,7 +5,6 @@ from typing import Any
 
 from gpu_fault.dcgm_diagnostic_analysis import dcgm_failures_are_configuration_only
 
-
 ANNOTATION_INCIDENT = "gpu-fault.io/incident-id"
 
 ANNOTATION_FENCING = "gpu-fault.io/fencing-token"

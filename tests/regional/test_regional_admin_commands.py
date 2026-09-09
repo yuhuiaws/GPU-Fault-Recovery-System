@@ -411,3 +411,169 @@ def test_deploy_allows_empty_cluster_set_after_completed_state(monkeypatch) -> N
     module.run_deploy(release)
 
     assert calls == ["noop"]
+
+
+def _status_release(reads: list[str]) -> SimpleNamespace:
+    def load_state():
+        reads.append("state")
+        return {
+            "release_id": "release-a",
+            "phase": "complete",
+            "transaction_committed": True,
+        }
+
+    return SimpleNamespace(
+        config=SimpleNamespace(site_name="test-site"), _load_state=load_state
+    )
+
+
+def _stub_summary(monkeypatch, module) -> None:
+    monkeypatch.setattr(
+        module,
+        "build_release_status",
+        lambda _release: {
+            "site_name": "test-site",
+            "configured_release": {"release_id": "release-a"},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: SimpleNamespace(
+            as_dict=lambda: {"kind": "NOOP", "changed": []}
+        ),
+    )
+
+
+def test_status_reads_the_release_state_once(monkeypatch) -> None:
+    """A pre-read state serves the health baseline and the summary together.
+
+    ``status`` used to read the release-state ConfigMap for the rolled-back
+    baseline, again for the summary, and the admin CLI once more before either.
+    The engine now reads it once and hands it down.
+    """
+
+    module = _admin_module()
+    reads: list[str] = []
+    release = _status_release(reads)
+    _stub_summary(monkeypatch, module)
+    monkeypatch.setattr(
+        module,
+        "build_quick_health_report",
+        lambda _release: {
+            "mode": "status",
+            "healthy": True,
+            "summary": {"PASS": 2, "WARN": 0, "FAIL": 0, "SKIP": 0},
+            "checks": [],
+            "scope": "quick",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "build_health_report",
+        lambda _release, *, mode: {
+            "mode": mode,
+            "healthy": True,
+            "summary": {"PASS": 12, "WARN": 0, "FAIL": 0, "SKIP": 0},
+            "checks": [],
+        },
+    )
+    state = {"release_id": "release-a", "phase": "complete"}
+
+    quick = module.build_quick_status(release, state=state)
+    full = module.build_full_status(release, state=state)
+
+    assert reads == [], "a state the caller read is not read again"
+    assert quick["health_scope"] == "quick" and full["health_scope"] == "full"
+    for report in (quick, full):
+        assert report["mode"] == "status"
+        assert report["healthy"] is True
+        assert report["live_release"]["release_id"] == "release-a"
+        assert report["next_deploy"] == {"kind": "NOOP", "changed": []}
+        assert set(report) >= {
+            "mode",
+            "healthy",
+            "health",
+            "live_release",
+            "configured_release",
+            "next_deploy",
+        }, "quick and full status share one document shape"
+    # Without a pre-read state each builder reads once, as before.
+    module.build_quick_status(release)
+    assert reads == ["state"]
+
+
+def test_status_header_names_verdict_release_next_deploy_and_failures() -> None:
+    module = _admin_module()
+    report = {
+        "healthy": False,
+        "health_scope": "quick",
+        "live_release": {
+            "release_id": "release-a",
+            "phase": "complete",
+            "transaction_committed": True,
+        },
+        "next_deploy": {"kind": "CONTROL_PLANE_ONLY", "resume": False},
+        "health": {
+            "summary": {"PASS": 1, "WARN": 0, "FAIL": 1, "SKIP": 0},
+            "checks": [
+                {"name": "cpu_workloads", "status": "PASS"},
+                {"name": "control_api", "status": "FAIL", "summary": "healthz"},
+            ],
+        },
+    }
+
+    lines = module.status_header_lines(report, json_destination="stdout")
+
+    assert lines == [
+        "healthy: NO (quick health, 2 checks)",
+        "live release: release-a phase=complete committed=yes",
+        "next deploy: CONTROL_PLANE_ONLY",
+        "failing checks: control_api",
+        "full JSON report: stdout",
+    ]
+    resumed = module.status_header_lines(
+        {**report, "next_deploy": {"kind": "FULL", "resume": True, "action": "commit"}},
+        json_destination="stdout (also in /var/log/status.log)",
+    )
+    assert resumed[2] == "next deploy: FULL (resume commit)"
+    assert resumed[4] == "full JSON report: stdout (also in /var/log/status.log)"
+    # A summary that failed before it could name the release still gets a header.
+    bare = module.status_header_lines(
+        {"healthy": True, "next_deploy_error": "state missing"},
+        json_destination="stdout",
+    )
+    assert bare[0] == "healthy: yes (full health, 0 checks)"
+    assert bare[1] == "live release: unknown phase=unknown committed=no"
+    assert bare[2] == "next deploy: state missing"
+    assert bare[3] == "failing checks: none"
+
+
+def test_compact_report_keeps_failures_and_names_the_passes() -> None:
+    module = _admin_module()
+    report = {
+        "mode": "preflight",
+        "healthy": False,
+        "summary": {"PASS": 2, "WARN": 0, "FAIL": 1, "SKIP": 0},
+        "checks": [
+            {"name": "tools", "status": "PASS", "summary": "ok", "details": {"a": 1}},
+            {"name": "aurora", "status": "FAIL", "summary": "down", "details": None},
+            {"name": "monitoring", "status": "PASS", "summary": "ok", "details": {}},
+        ],
+    }
+
+    compact = module.compact_report(report)
+
+    assert compact["checks"] == [report["checks"][1]]
+    assert compact["passed_checks"] == ["tools", "monitoring"]
+    assert compact["healthy"] is False and compact["summary"] == report["summary"]
+    assert report["checks"][0]["details"] == {"a": 1}, "the source report is untouched"
+
+
+def test_full_report_is_requested_by_environment() -> None:
+    module = _admin_module()
+
+    assert module.full_report_requested({}) is False
+    assert module.full_report_requested({module.FULL_REPORT_ENV: "0"}) is False
+    assert module.full_report_requested({module.FULL_REPORT_ENV: "1"}) is True
+    assert module.full_report_requested({module.FULL_REPORT_ENV: " true "}) is True

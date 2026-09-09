@@ -32,6 +32,7 @@ from gpu_fault.store.shared.record_models import record_models
 from gpu_fault.store.shared.remote_commands import SharedRemoteCommandMixin
 from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
 from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
+from gpu_fault.store.shared.wakeups import InProcessWakeupMixin, WakeupHub
 from gpu_fault.store.shared.workflow_records import SharedWorkflowRecordMixin
 from gpu_fault.store.shared.xid import SharedXidMixin, SharedXidSignalMixin
 from gpu_fault.store.sqlite.control_records import SqliteControlRecordMixin
@@ -76,6 +77,9 @@ class SqliteStore(
     SharedCompositionMixin,
     # The telemetry spool is not durable on SQLite; see the mixin docstring.
     MemoryTelemetrySpoolMixin,
+    # Wakeups: no trigger on SQLite, so ``_put`` publishes into a hub in this
+    # process; a listener in another process falls back to its poll.
+    InProcessWakeupMixin,
 ):
     """Durable single-writer store for active executor deployments.
 
@@ -115,6 +119,8 @@ class SqliteStore(
         self._lock = RLock()
         self._telemetry_spool = {}
         self._models = record_models()
+        self._wakeup_hub = WakeupHub()
+        self._pending_wakeups = []
         self.path = path
         # The state file holds tenant fault data and cluster tokens, so it
         # must never inherit a permissive process umask. Create the parent

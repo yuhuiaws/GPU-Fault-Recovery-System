@@ -18,7 +18,7 @@ from gpu_fault.models import CompletionDecision
 from gpu_fault.policy import XidEvent
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.store.contracts import ProcessorQueueCountStatus
-from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.errors import NotFoundError, StaleFencingTokenError
 from gpu_fault.store.shared.processor_helpers import PartialEnqueueError
 from gpu_fault.telemetry import CollectorStatus
 from gpu_fault.telemetry_models import TelemetryMetricLatest
@@ -143,10 +143,19 @@ class SharedCompositionMixin:
         return {scope: list(bucket.values()) for scope, bucket in grouped.items()}
 
     def complete_active_processor_requests_batch(self, completions):
-        return [
-            self.complete_active_processor_request(**completion)
-            for completion in completions
-        ]
+        """One answer per request: the completed row, or ``None`` when its
+        lease no longer validates (B-8). The Postgres statement answers this
+        way, so the coordinator's ``result is None`` branch has to be the
+        behaviour on every backend rather than an exception at the first
+        stale entry that hid the rest of the batch."""
+
+        results = []
+        for completion in completions:
+            try:
+                results.append(self.complete_active_processor_request(**completion))
+            except StaleFencingTokenError:
+                results.append(None)
+        return results
 
     @contextmanager
     def processor_batch_transaction(self) -> Iterator[None]:

@@ -45,7 +45,13 @@ def test_metric_contributors_render_in_registration_order(monkeypatch) -> None:
     registry.register("first", lambda _runtime: ["first 1"])
     registry.register("second", lambda _runtime: ["second 2"])
     assert registry.names == ("first", "second")
-    assert registry.render(object()) == ["first 1", "second 2"]
+    rendered = registry.render(object())
+    # The contributors in order, then the registry's own per-contributor error
+    # family (control-plane review 2026-09-08, G-8).
+    assert rendered[:2] == ["first 1", "second 2"]
+    assert rendered[2].startswith(
+        "# HELP gpu_fault_metrics_contributor_errors_total"
+    ), "the registry appends its own error family after the contributors"
 
 
 def test_duplicate_metric_contributor_fails_closed() -> None:
@@ -396,7 +402,7 @@ def test_collector_metrics_top_n_is_bounded() -> None:
         line.endswith(" 10")
         for line in lines
         if line.startswith("gpu_fault_collector_silent_nodes")
-    )
+    ), "the silent-node count must report all 10 rows"
     assert [row["node_id"] for row in snapshot._top_rows(rows)] == ["node-9", "node-8"]
 
 
@@ -408,7 +414,7 @@ def test_collector_metrics_snapshot_uses_shared_lease_and_record() -> None:
     owner.refresh()
     follower.refresh()
 
-    assert owner.lines()
+    assert owner.lines(), "the lease owner must render a snapshot"
     assert follower.lines() == owner.lines()
 
 

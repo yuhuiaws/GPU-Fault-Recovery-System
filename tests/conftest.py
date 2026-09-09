@@ -86,6 +86,10 @@ def block_cluster_binaries(request: pytest.FixtureRequest, monkeypatch) -> None:
 def processor_replay_secret(monkeypatch) -> None:
     for name in ("GPU_FAULT_DOC_IMPACT", "GPU_FAULT_DOC_IMPACT_REASON"):
         monkeypatch.delenv(name, raising=False)
+    # Tests that set POD_UID would otherwise share /metrics samples through
+    # the machine's /dev/shm and merge with other live test processes; a test
+    # that wants the sharing points the variable at its own tmp_path.
+    monkeypatch.setenv("GPU_FAULT_PROCESS_METRICS_DIR", "off")
     monkeypatch.setenv(
         "GPU_FAULT_PROCESSOR_REPLAY_SECRET", "test-processor-replay-secret-" + "r" * 32
     )

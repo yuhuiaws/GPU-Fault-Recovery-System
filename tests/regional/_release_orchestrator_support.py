@@ -25,6 +25,7 @@ __all__ = [
     "phase_release",
 ]
 REGION = "us-east-1"
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:gpu-fault"
 CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
 GPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
 

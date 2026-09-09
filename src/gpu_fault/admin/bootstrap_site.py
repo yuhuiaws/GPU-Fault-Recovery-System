@@ -367,10 +367,18 @@ def preserve_existing_site_contract(
     generated_spec = generated.get("spec")
     if not isinstance(existing_spec, dict) or not isinstance(generated_spec, dict):
         return generated
-    for key in ("release", "runtimeProfile"):
+    # ``retention`` is operator-declared (archive-first deletion); regenerating
+    # the site must not silently switch it back off.
+    for key in ("release", "runtimeProfile", "retention"):
         value = existing_spec.get(key)
         if isinstance(value, dict):
             generated_spec[key] = deepcopy(value)
+    # ``failureDomainLabels`` is the operator's declaration of which node labels
+    # name a failure domain (EC2 topology fleets); a regenerated site must not
+    # fall back to the default priority and silently re-render the map.
+    labels = existing_spec.get("failureDomainLabels")
+    if isinstance(labels, list) and labels:
+        generated_spec["failureDomainLabels"] = list(labels)
     # ``autoRollback`` is a policy the operator owns, not an identity this
     # generator derives. The release engine refuses automatic rollback across
     # non-transactional changes (endpoint, cluster registry, ADOT manifest or
@@ -413,9 +421,21 @@ def validate_existing_cluster_identity(
     cpu: ClusterIdentity,
     gpu_clusters: Sequence[ClusterIdentity],
     allow_gpu_subset: bool = False,
-) -> None:
+) -> list[ClusterIdentity]:
+    """Check the requested clusters against the site; return the GPU delta.
+
+    The requested GPU set may equal the site's or be a strict superset of it:
+    the extra clusters are returned so the deploy can join them after the
+    release (``deploy --gpu-cluster-arn NEW`` on top of the managed set is how a
+    cluster is added; ``join-cluster`` stays as an alias). A subset, or a
+    different CPU, is refused: clusters leave a site only through
+    ``remove-cluster``. ``allow_gpu_subset`` is kept for the initial-target
+    checkpoint path and means the same thing (the site may hold fewer clusters
+    than requested).
+    """
+
     if not site:
-        return
+        return []
     spec = site.get("spec")
     if not isinstance(spec, dict):
         raise BootstrapError("existing site has no valid cluster identity")
@@ -429,24 +449,31 @@ def validate_existing_cluster_identity(
     )
     requested_cpu = (cpu.eks_arn, cpu.hyperpod_name)
     existing_gpu = sorted(_site_gpu_keys(site))
-    requested_gpu = sorted(
-        (cluster.eks_arn, cluster.hyperpod_name) for cluster in gpu_clusters
-    )
-    gpu_identity_matches = (
-        set(existing_gpu).issubset(requested_gpu)
-        if allow_gpu_subset
-        else existing_gpu == requested_gpu
-    )
-    if (
-        existing_cpu != requested_cpu
-        or len(existing_gpu) != len(clusters_value)
-        or len(existing_gpu) != len(set(existing_gpu))
-        or not gpu_identity_matches
+    requested_gpu = sorted(_cluster_key(cluster) for cluster in gpu_clusters)
+    if len(existing_gpu) != len(clusters_value) or len(existing_gpu) != len(
+        set(existing_gpu)
     ):
+        raise BootstrapError("existing site has no valid cluster identity")
+    if existing_cpu != requested_cpu:
         raise BootstrapError(
-            "requested cluster identity differs from the existing site; "
-            "use join-cluster or remove-cluster for topology changes"
+            "requested CPU cluster identity differs from the existing site; "
+            "the CPU control plane of a site cannot change"
         )
+    missing = sorted(set(existing_gpu) - set(requested_gpu))
+    if missing:
+        raise BootstrapError(
+            "requested cluster identity differs from the existing site: the site "
+            "manages GPU clusters the command omits ("
+            + ", ".join(eks_arn or hyperpod for eks_arn, hyperpod in missing)
+            + "); deploy accepts the managed set or a superset of it, use "
+            "remove-cluster to detach a cluster"
+        )
+    existing_keys = set(existing_gpu)
+    return [
+        cluster
+        for cluster in gpu_clusters
+        if _cluster_key(cluster) not in existing_keys
+    ]
 
 
 def discover_bootstrap_scope(

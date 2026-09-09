@@ -12,6 +12,8 @@ __version__ = "0.10.0"
 # excluded so the digest is reproducible between a source checkout, an
 # installed site-packages copy and the contents of a wheel.
 _DIGESTED_SUFFIXES = frozenset({".py", ".yaml", ".yml", ".json"})
+# Local packages a distribution may install next to ``gpu_fault``; see module_digest.
+_SIBLING_PACKAGES = ("gpu_fault_release",)
 
 _MODULE_DIGEST: str | None = None
 
@@ -41,16 +43,33 @@ def module_digest(package_dir: str | Path | None = None) -> str:
         if package_dir is not None
         else Path(__file__).resolve().parent
     )
+    # A distribution that also ships a sibling local package (the deploy-host
+    # wheel carries ``gpu_fault_release`` so the admin CLI imports the release
+    # engine at its own version) is identified by both: the sibling's files are
+    # keyed under its package name and everything is hashed in one global key
+    # order -- exactly what ``scripts/component_wheels.package_digest`` does
+    # for the staged wheel, so the installed copy and the bundle manifest agree.
+    # A copy without the sibling (control plane, executor, node runtime) is
+    # unchanged.
+    entries: dict[str, Path] = {}
+    staged = [(root, "")]
+    staged.extend(
+        (root.parent / name, f"{name}/")
+        for name in _SIBLING_PACKAGES
+        if (root.parent / name).is_dir()
+    )
+    for base, prefix in staged:
+        for path in base.rglob("*"):
+            if path.is_dir() or "__pycache__" in path.parts:
+                continue
+            if path.suffix not in _DIGESTED_SUFFIXES:
+                continue
+            entries[prefix + path.relative_to(base).as_posix()] = path
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        if path.is_dir() or "__pycache__" in path.parts:
-            continue
-        if path.suffix not in _DIGESTED_SUFFIXES:
-            continue
-        relative = path.relative_to(root).as_posix()
+    for relative in sorted(entries):
         digest.update(relative.encode())
         digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(hashlib.sha256(entries[relative].read_bytes()).digest())
         digest.update(b"\n")
     value = digest.hexdigest()
     if package_dir is None:

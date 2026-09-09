@@ -172,6 +172,11 @@ spec:
             # access for no functional benefit.
             - name: GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS
               value: "2"
+            # Long-poll claim: the control plane holds an empty claim up to
+            # this long for a PENDING command. 0 restores pure polling at
+            # POLL_SECONDS (and drops the field from the request body).
+            - name: GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS
+              value: "20"
             - name: GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS
               value: "120"
             - name: GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE

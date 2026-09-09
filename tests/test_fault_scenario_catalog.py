@@ -94,7 +94,7 @@ def test_fault_scenario_catalog_is_complete_and_unique() -> None:
     assert all(
         "start" not in family and "end" not in family
         for family in raw["generated_test_families"]
-    )
+    ), "generated families carry no start/end range fields"
     assert {
         "xid-policy",
         "xid-collector",
@@ -122,7 +122,9 @@ def test_fault_scenario_catalog_is_complete_and_unique() -> None:
         "regional-preemption",
         "regional-collector",
         "regional-workload",
-    }.issubset({case["category"] for case in cases})
+    }.issubset({case["category"] for case in cases}), (
+        "the generated families must cover every catalog family"
+    )
 
 
 def test_every_automated_case_references_a_real_pytest_function() -> None:
@@ -263,9 +265,13 @@ def test_default_selection_excludes_destructive_manual_cases() -> None:
         include_live=False,
     )
 
-    assert selected
-    assert all(case["risk"] == "non-destructive" for case in selected)
-    assert all(case["automation"] == "pytest" for case in selected)
+    assert selected, "the default selection must not be empty"
+    assert all(case["risk"] == "non-destructive" for case in selected), (
+        "default selection is limited to non-destructive cases"
+    )
+    assert all(case["automation"] == "pytest" for case in selected), (
+        "default selection is limited to pytest-automated cases"
+    )
 
 
 def test_live_case_requires_explicit_opt_in() -> None:
@@ -294,7 +300,9 @@ def test_include_live_does_not_execute_an_unselected_command() -> None:
         include_live=True,
     )
 
-    assert all(case["automation"] != "command" for case in selected)
+    assert all(case["automation"] != "command" for case in selected), (
+        "include_live must never pull in command-automated cases"
+    )
 
 
 def test_also_case_adds_explicit_command_to_filtered_pytest_selection() -> None:
@@ -442,6 +450,7 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         "GF-REGIONAL-COLLECT-018": "run_collect018_rejected_event.py",
         "GF-REGIONAL-COLLECT-019": "run_collect019_nvidia_smi_hang.py",
         "GF-REGIONAL-COLLECT-020": "run_collect020_gpu_identity.py",
+        "GF-REGIONAL-COLLECT-021": ("run_collect021_late_xid_after_pod_death.py"),
         "GF-REGIONAL-COLLECT-015": "run_collector_destructive.py",
     }
     cases = {case["id"]: case for case in load_catalog(CATALOG)}
@@ -827,8 +836,10 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 181
-    assert all((case.get("evidence") or {}).get("verdict") for case in regional)
+    assert len(regional) == 184
+    assert all((case.get("evidence") or {}).get("verdict") for case in regional), (
+        "every regional case must record a verdict"
+    )
     # Membership, not equality. The equality form froze the catalog at "no
     # regional case has ever passed", so the first recorded PASS failed this
     # test rather than the catalog validator -- and the only way to keep it

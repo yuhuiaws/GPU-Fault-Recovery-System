@@ -15,20 +15,18 @@ from typing import Callable
 from pydantic import ValidationError
 
 from gpu_fault.channel_registry import GPU_INVENTORY_PATH
-from gpu_fault.gpu_metrics import (
-    GpuInventoryDevice,
-    GpuInventorySnapshot,
-    GpuMetricSample,
-    GpuMetricSource,
-)
-
-
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_or_raise,
+)
+from gpu_fault.gpu_metrics import (
+    GpuInventoryDevice,
+    GpuInventorySnapshot,
+    GpuMetricSample,
+    GpuMetricSource,
 )
 
 LOGGER = logging.getLogger(__name__)

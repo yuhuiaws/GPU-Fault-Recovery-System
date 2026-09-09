@@ -23,8 +23,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import (
+    EXECUTABLE_WORKFLOW_STATUSES,
     StepPhase,
     WorkflowEvent,
     WorkflowEventCode,
@@ -38,6 +40,7 @@ from gpu_fault.models import (
     execution_phase,
     record_workflow_event,
 )
+from gpu_fault.store.shared.errors import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,8 +53,13 @@ ATTEMPT_DETAIL_KEYS = (
     "gpu_reset_commit_attempt",
     "gpu_client_quiesce_attempt",
     "step_waiting_seconds",
+    "step_waiting_slow",
 )
 _ATTEMPT_DETAIL_STRING_LIMIT = 128
+# D-10: a WAITING attempt that differs from the previous one only in how long
+# it has waited says nothing new; the record carries the age, the event does
+# not need repeating. Every other allow-listed key is part of the identity.
+_ATTEMPT_VOLATILE_DETAIL_KEYS = frozenset({"step_waiting_seconds"})
 
 
 # Compensation that restores what the workflow itself stopped. It never
@@ -167,10 +175,12 @@ def bounded_waiting_outcome(
     # Rule A: a restart held on its ``requires_incident_state`` premise is a
     # job waiting on a node another remediation is repairing, and that wait
     # has one window -- the same ``node_busy_wait_seconds`` the dispatcher
-    # applies before the workflow starts. Past it the job is not restarted.
+    # applies before the workflow starts. Past it the job is not restarted --
+    # unless the remediation it names is still open, in which case the
+    # remediation's own lifetime is the bound (``_premise_hold_limit``).
     premise_hold = details.get("reason") == WorkflowEventCode.NODE_UNDER_REMEDIATION
     if premise_hold:
-        limit = min(limit, int(executor.config.node_busy_wait_seconds))
+        limit = _premise_hold_limit(executor, details, limit, since)
     details["step_waiting_seconds"] = waited
     if waited >= limit:
         LOGGER.error(
@@ -219,6 +229,81 @@ def bounded_waiting_outcome(
     return replace(outcome, details=details)
 
 
+def _premise_hold_limit(
+    executor: Any,
+    details: dict[str, Any],
+    step_limit: int,
+    since: datetime,
+) -> int:
+    """How long a restart may wait on its ``NODE_UNDER_REMEDIATION`` premise.
+
+    The node-busy window (240 s by default) is the right bound for a job
+    workflow that has not started: the dispatcher can still rewrite it into a
+    stop. It is the wrong bound once the ``after_incident`` restart is running
+    and the repair it waits for is real work in progress. A GPU reset chain
+    holds a maintenance window of up to seven minutes, then needs fresh
+    telemetry for VALIDATE_GPU and a RESTORE_SCHEDULING; a reboot chain waits
+    on HyperPod for up to forty-five minutes. Cut at 240 s, the restart failed
+    minutes before the repair landed and the job stayed down after a repair
+    that succeeded (逻辑 6).
+
+    So while the remediation the premise names is still open
+    (``EXECUTABLE_WORKFLOW_STATUSES``) the bound is that remediation's own
+    ``lifetime_deadline_at``, measured from when this step began waiting; a
+    remediation not yet claimed has no lifetime stamped and gets the restart's
+    per-operation cap as the fallback. Neither ever shortens the window the
+    dispatcher already granted. Once the remediation is terminal the adapter
+    settles the premise on its own (SUCCEEDED -> RECOVERED -> restart;
+    FAILED/BLOCKED -> INCIDENT_NOT_RECOVERABLE), so a WAITING that still
+    names it keeps today's window -- as does a hold with no
+    ``remediation_workflow_id``, or one whose record cannot be read. Failing
+    closed to the old cap is deliberate: a store outage must not turn a
+    bounded wait into an unbounded one.
+    """
+
+    window = int(executor.config.node_busy_wait_seconds)
+    remediation = _open_remediation(executor, details.get("remediation_workflow_id"))
+    if remediation is None:
+        return min(step_limit, window)
+    lifetime = remediation.lifetime_deadline_at
+    if lifetime is None:
+        return max(step_limit, window)
+    details["remediation_lifetime_deadline_at"] = lifetime.isoformat()
+    return max(window, int((lifetime - since).total_seconds()))
+
+
+def _open_remediation(executor: Any, request_id: Any) -> WorkflowRequest | None:
+    """The still-executable remediation workflow ``request_id`` names, or ``None``.
+
+    ``None`` covers every case the caller must treat as "keep today's cap": no
+    id on the hold, no store on this executor, a record the store does not
+    have (``NotFoundError`` -- the id was stamped from an incident whose
+    workflow has since been pruned), a store that cannot answer, or a record
+    that is already terminal.
+    """
+
+    if not request_id:
+        return None
+    store = getattr(executor, "store", None)
+    if store is None:
+        return None
+    try:
+        remediation: WorkflowRequest = store.get_workflow(str(request_id))
+    except NotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - the bound must still land on the old cap
+        LOGGER.warning(
+            "could not read the remediation workflow a restart premise waits on; "
+            "keeping the node-busy window: remediation_workflow=%s",
+            request_id,
+            exc_info=True,
+        )
+        return None
+    if remediation.status not in EXECUTABLE_WORKFLOW_STATUSES:
+        return None
+    return remediation
+
+
 def record_attempt(
     workflow: WorkflowRequest,
     step: WorkflowStepSpec,
@@ -238,8 +323,13 @@ def record_attempt(
     phase = execution_phase(workflow)
     previous = previous_execution(workflow, step, index)
     # The record below replaces this step's last one; the event is what keeps
-    # the attempts that came before it (RF-2).
-    workflow = _record_attempt_event(workflow, step, index, outcome, phase)
+    # the attempts that came before it (RF-2) -- unless this attempt is the
+    # same wait as the last one, polled again (D-10): a step waiting on a
+    # remote command is redispatched every tick, and one event per tick filled
+    # the bounded event list in twenty minutes and evicted the history the
+    # events exist to keep.
+    if not _same_wait(previous, outcome):
+        workflow = _record_attempt_event(workflow, step, index, outcome, phase)
     execution = WorkflowStepExecution(
         step_index=index,
         operation=step.operation,
@@ -278,6 +368,28 @@ def record_attempt(
             "step_executions": sorted(executions, key=lambda item: item.step_index),
             "updated_at": datetime.now(timezone.utc),
         }
+    )
+
+
+def _same_wait(
+    previous: WorkflowStepExecution | None, outcome: WorkflowStepOutcome
+) -> bool:
+    """Is ``outcome`` the wait ``previous`` already recorded, seen again?"""
+
+    if (
+        previous is None
+        or previous.status is not WorkflowStepStatus.WAITING
+        or outcome.status is not WorkflowStepStatus.WAITING
+        or previous.error != outcome.error
+        or previous.adapter_operation_id != outcome.adapter_operation_id
+    ):
+        return False
+    before = previous.details or {}
+    after = outcome.details or {}
+    return all(
+        before.get(key) == after.get(key)
+        for key in ATTEMPT_DETAIL_KEYS
+        if key not in _ATTEMPT_VOLATILE_DETAIL_KEYS
     )
 
 
@@ -398,29 +510,105 @@ def step_elapsed_since(
 
     ``started_at`` can predate the current execution window: a merged or branched
     workflow inherits the executions of the record it absorbed. So the window's
-    own start -- recoverable from the deadline, which is set once, to first-claim
-    plus the workflow budget -- is the floor. Clamping can only push the cap
-    later, never fire it early on inherited time.
+    own start (``execution_window_start``) is the floor. Clamping can only push
+    the cap later, never fire it early on inherited time.
     """
 
     since = previous.started_at
-    if workflow.execution_deadline is None:
+    window_start = execution_window_start(executor, workflow)
+    if window_start is None:
         return since
-    # Recover the window the deadline was stamped from -- with the same budget
-    # ``claim_deadlines`` used: the plain execution timeout, lifted for a
-    # workflow holding an operator-acknowledgement step (CHECK_MECHANICALS,
-    # floored at ``now + acknowledgement timeout``) or a node install (floored
-    # at the install ceiling plus the containment allowance, F2). Subtracting
-    # only the plain timeout from a floored deadline put the window start hours
-    # in the future and ``step_waiting_seconds`` went negative (-84599 observed
-    # live), so the step's age -- and the alert that watches the oldest waiting
-    # step -- reported a wait that never grew.
-    budget_seconds = executor.config.execution_budget_seconds(
-        step.operation for step in workflow.official_steps
-    )
-    window_start = workflow.execution_deadline - timedelta(seconds=budget_seconds)
-    # A window cannot start in the future: whatever stamped the deadline did so
-    # no later than now, so the clamp only ever restores a wait that the budget
-    # arithmetic above would otherwise deny.
+    # A window cannot start in the future: whatever stamped it did so no later
+    # than now, so the clamp only ever restores a wait that the arithmetic
+    # below would otherwise deny.
     window_start = min(window_start, datetime.now(timezone.utc))
     return max(since, window_start)
+
+
+def execution_window_start(executor: Any, workflow: WorkflowRequest) -> datetime | None:
+    """When this record's execution window opened, or ``None`` if unknown.
+
+    Three anchors say when the record was first claimed, and none of them can
+    be earlier than that moment, so the earliest one is the closest answer:
+
+    * the first ``CLAIM`` event -- written by the claim that leased the record
+      and kept at the head of the bounded event list; on a row that was already
+      running when CLAIM events were introduced it names a later claim;
+    * ``lifetime_deadline_at`` minus the lifetime ``claim_deadlines`` stamped it
+      with (F-N1) -- set once and inherited, except that an
+      operator-acknowledgement workflow re-floors it on every claim;
+    * ``execution_deadline`` minus the execution budget -- stable for a
+      sequential workflow, but re-stamped on every claim of a DAG workflow, so
+      for a DAG it is not read at all: it put the window start at the current
+      tick and ``step_waiting_seconds`` read 0 for every step of every
+      multi-node job workflow (control-plane review 2026-09-08, D-1).
+
+    A workflow holding an operator-acknowledgement step (CHECK_MECHANICALS) has
+    both deadlines floored at ``now + acknowledgement timeout`` at claim time;
+    subtracting only the plain budget put the window start ~24 h in the future
+    and ``step_waiting_seconds`` went negative (-84599 observed live), so the
+    same floor is applied to the budget here. A workflow holding a node install
+    has its execution deadline floored at the install ceiling plus the
+    containment allowance (F2), so that floor is applied to the execution
+    budget too: subtracting only the 1800 s timeout put the window start 700 s
+    in the future and the install's wait read 0 for as long.
+    """
+
+    anchors: list[datetime] = []
+    first_claim = next(
+        (
+            event.at
+            for event in workflow.events
+            if event.kind is WorkflowEventKind.CLAIM
+        ),
+        None,
+    )
+    if first_claim is not None:
+        anchors.append(first_claim)
+    acknowledgement = (
+        float(
+            getattr(
+                executor.config,
+                "operator_acknowledgement_timeout_seconds",
+                0,
+            )
+        )
+        if any(
+            step.operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+            for step in workflow.official_steps
+        )
+        else 0.0
+    )
+    if workflow.lifetime_deadline_at is not None:
+        is_job = workflow.dag_enabled or any(
+            step.operation is WorkflowOperation.RESTART_WORKLOAD
+            for step in workflow.official_steps
+        )
+        lifetime_seconds = float(
+            executor.config.job_workflow_lifetime_seconds
+            if is_job
+            else executor.config.node_workflow_lifetime_seconds
+        )
+        anchors.append(
+            workflow.lifetime_deadline_at
+            - timedelta(seconds=max(lifetime_seconds, acknowledgement))
+        )
+    if workflow.execution_deadline is not None and not workflow.dag_enabled:
+        # The budget ``claim_deadlines`` stamped: the plain timeout, floored at
+        # the acknowledgement window and -- for a workflow holding a node
+        # install -- at the install ceiling plus the containment allowance
+        # (F2). ``ProductionExecutorConfig.execution_budget_seconds`` is that
+        # arithmetic; a config double without it gets the acknowledgement
+        # floor alone.
+        execution_budget = getattr(executor.config, "execution_budget_seconds", None)
+        if execution_budget is not None:
+            budget_seconds = float(
+                execution_budget(step.operation for step in workflow.official_steps)
+            )
+        else:
+            budget_seconds = max(
+                float(executor.config.workflow_execution_timeout_seconds),
+                acknowledgement,
+            )
+        anchors.append(workflow.execution_deadline - timedelta(seconds=budget_seconds))
+    return min(anchors, default=None)

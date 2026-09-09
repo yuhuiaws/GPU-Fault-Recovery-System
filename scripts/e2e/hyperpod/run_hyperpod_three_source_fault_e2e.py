@@ -416,7 +416,6 @@ def main() -> int:
             "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER": "false",
             "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER": "false",
             "GPU_FAULT_ENABLE_AGENT_REGISTRY": "false",
-            "GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS": "false",
             "GPU_FAULT_ALLOW_EMAIL": "false",
             "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS": "5",
         }

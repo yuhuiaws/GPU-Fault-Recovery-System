@@ -1,7 +1,7 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
     HOST_RESOURCE_EVENT_EMAIL_TEMPLATE,
     HOST_RESOURCE_EVENT_TEMPLATE_VERSION,
+    AdvisoryNotification,
 )
 
 

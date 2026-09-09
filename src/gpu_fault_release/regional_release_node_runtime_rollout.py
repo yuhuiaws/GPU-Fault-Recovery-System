@@ -4,9 +4,6 @@ from collections.abc import Callable
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
-from gpu_fault_release.regional_release_rollout_cleanup import (
-    terminalize_stranded_cluster_rollouts,
-)
 from gpu_fault_release.regional_release_fleet_rollout import (
     FleetWaveContext,
     NodeRolloutPolicy,
@@ -23,6 +20,9 @@ from gpu_fault_release.regional_release_node_preflight import (
     NodeMutationPreflight,
     ensure_node_candidate_preflight,
     ensure_pre_node_mutation_barrier,
+)
+from gpu_fault_release.regional_release_rollout_cleanup import (
+    terminalize_stranded_cluster_rollouts,
 )
 
 

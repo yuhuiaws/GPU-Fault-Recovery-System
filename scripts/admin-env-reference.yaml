@@ -229,6 +229,8 @@ categories:
         description: "每个 worker 进程的 workflow 执行线程数。"
       - name: GPU_FAULT_DEFAULT_RESTART_BUDGET
         description: "任务未声明时的默认自动重启预算；按 cluster/job 持久化。"
+      - name: GPU_FAULT_REMOTE_STEP_BATCHING
+        description: "同一节点上连续的节点侧步骤（QUIESCE/VERIFY/RESET/RESTORE/TRIGGER_HEALTH_SNAPSHOT）合并成一条复合 remote command；默认 true，但只在 required/compatible pin 不再接纳协议 <3 的 Executor 时才真正生效。false 恢复一步一命令。"
       - name: GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS
         description: "PENDING remote command 长期无人领取后的死信时间。"
       - name: GPU_FAULT_REMOTE_COMMAND_RETENTION_SECONDS
@@ -266,7 +268,9 @@ categories:
       - name: GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS
         description: "Executor 领取 remote command 的 lease 时长。"
       - name: GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS
-        description: "无命令或控制面短暂不可达时的轮询间隔。"
+        description: "命令回 WAITING 时的空转间隔，也是控制面不可达时退避的起点；长轮询开启后空回答不再按它睡眠。"
+      - name: GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS
+        description: "claim 长轮询：控制面对空结果最多挂起的秒数（0–30，服务端上限 25）；0 关闭并退回纯轮询。"
 
   - title: Collector、DCGM 与 inventory
     description: >-
@@ -421,20 +425,28 @@ categories:
 
   - title: 通知、证据与保留
     description: >-
-      业务通知走 Aurora outbox + SES；AMP/SNS 是控制面自身指标告警。notification 已
-      QUEUED 不等于已送达，必须看到 SENT 和 provider message ID。
+      业务通知走 Aurora outbox，再由 dispatcher 发到站点 SNS topic（默认 channel=sns，
+      与 AMP 指标告警共用同一个 topic 和同一封订阅确认邮件），或按站点声明改走 SES
+      （channel=ses）。notification 已 QUEUED 不等于已送达，必须看到 SENT 和 provider
+      message ID。
     variables:
       - name: GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL
         production: false（生产不得开启）
         description: "无外发通知通道时是否仅记录。只允许应急兼容，生产保持 false。"
+      - name: GPU_FAULT_NOTIFICATION_CHANNEL
+        production: 由 site.yaml 的 spec.notifications.channel 渲染（新站点 sns）
+        description: "业务通知通道：sns（站点 SNS topic，纯文本）、ses（已验证发件身份）或 disabled（只入库）。未声明时按有 topic ARN → sns、有 SES 地址对 → ses 推断。"
+      - name: GPU_FAULT_SNS_TOPIC_ARN
+        production: 由 site.yaml 的 spec.health.snsTopicArn 渲染
+        description: "channel=sns 时发布业务通知的 SNS topic ARN；控制面 role 只对它持有 sns:Publish。"
       - name: GPU_FAULT_ALLOW_EMAIL
-        description: "是否允许本方案通过 SES 实际发送邮件。"
+        description: "是否实际外发业务通知（SNS 或 SES）。channel=sns 时默认 true，设 false 为总闸。"
       - name: GPU_FAULT_EMAIL_SENDER
-        production: 由 site.yaml 的已验证 SES identity 注入
-        description: "SES 发件身份；与管理员联系人和接收列表是三个独立概念。"
+        production: channel=ses 时由 site.yaml 的已验证 SES identity 注入
+        description: "SES 发件身份，仅 channel=ses 使用；与管理员联系人和接收列表是三个独立概念。"
       - name: GPU_FAULT_EMAIL_RECIPIENTS
-        production: 由 site.yaml 的 emailRecipients 注入
-        description: "逗号分隔的业务通知接收人列表。"
+        production: channel=ses 时由 site.yaml 的 emailRecipients 注入
+        description: "逗号分隔的业务通知接收人列表，仅 channel=ses 使用。"
       - name: GPU_FAULT_EMAIL_SUBJECT_PREFIX
         description: "邮件环境/站点前缀，不替代正文中的 site、Region、account 和 cluster。"
       - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY
@@ -454,8 +466,22 @@ categories:
       - name: GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE
         description: "每节点 raw evidence 数量上限。"
       - name: GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS
-        description: "incident/workflow archive-first 保留天数；0 表示不自动归档删除。"
+        description: "incident/workflow archive-first 保留天数；默认 0 = 关闭，永不归档删除。不直接设置：在 site.yaml 声明 spec.retention.controlRecordRetentionDays 后重跑 deploy --state-dir，只渲染进 control-worker。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI
-        description: "archive-first 目标 S3 URI；配置后先写归档并校验 SHA，再删 live rows。"
+        description: "archive-first 目标 S3 URI（保留天数 >0 时必填）；先写归档并校验 SHA，再删 live rows。来自 site.yaml spec.retention.archiveS3Uri；deploy 同时给控制面角色加该前缀的 s3:PutObject。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS
-        description: "控制记录归档扫描周期。"
+        description: "控制记录归档扫描周期；来自 site.yaml spec.retention.archiveIntervalSeconds，缺省 3600。"
+      - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE
+        production: "200"
+        description: "每轮归档扫描最多处理的 incident 数；≤0 报错。单条归档失败计入 errors_total 并继续，不中断本轮。"
+      - name: GPU_FAULT_MARKER_RETENTION_SECONDS
+        description: "非活动 marker 的保留秒数（默认 30 天）；≤0 关闭清理。incident 仍存在的 marker 不删，随归档器打包。"
+      - name: GPU_FAULT_NOTIFICATION_RETENTION_SECONDS
+        description: "终态通知记录保留秒数（默认 30 天）；≤0 关闭清理。delivery 仍在 PENDING/RETRY/LEASED 或 incident 仍存在的不删。"
+      - name: GPU_FAULT_COMPLETION_RECORD_RETENTION_SECONDS
+        description: "completion event/decision 记录保留秒数（默认 30 天）；≤0 关闭清理。仍被 incident 引用的不删。"
+      - name: GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS
+        description: "区域 registry 成员心跳记录的保留秒数（默认 1 天）；≤0 关闭清理。仅 regional 角色运行该清扫。"
+      - name: GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS
+        production: "600"
+        description: "LEASED 远程命令租约过期后，栅栏不再匹配的命令被清扫为 FAILED(stale-fence) 前的宽限秒数（D-9）。"

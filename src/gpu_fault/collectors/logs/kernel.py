@@ -21,12 +21,11 @@ from gpu_fault.channel_registry import (
     COLLECTOR_HEALTH_PATH,
     NVIDIA_KERNEL_PATH,
 )
-
-from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.logs.fabric_manager import (
     SXID_SUMMARY_PATTERN,
 )
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
+from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.telemetry import CollectorKind
 

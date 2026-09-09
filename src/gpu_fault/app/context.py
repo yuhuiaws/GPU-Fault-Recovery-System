@@ -19,9 +19,6 @@ from gpu_fault.adapters import (
 from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
-from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
-from gpu_fault.execution.branch_escalation import BranchEscalator
-from gpu_fault.execution.config import validate_timing_from_environment
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.execution import (
@@ -31,6 +28,8 @@ from gpu_fault.execution import (
     WorkflowDispatcherConfig,
     managed_recovery_timeout_seconds,
 )
+from gpu_fault.execution.branch_escalation import BranchEscalator
+from gpu_fault.execution.config import validate_timing_from_environment
 from gpu_fault.execution.executor import TerminalHook
 from gpu_fault.fleet import (
     BarrierCoordinator,
@@ -71,9 +70,11 @@ from gpu_fault.models import (
 from gpu_fault.notification_service import AdvisoryNotificationService
 from gpu_fault.notifications import notification_notifier_from_environment
 from gpu_fault.orchestration import IncidentOrchestrator
+from gpu_fault.orchestration.incident_closure import IncidentClosureService
 from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
+from gpu_fault.remote_step_batching import RemoteStepBatchingPolicy
 from gpu_fault.regional_registry import (
     configured_regional_registrations,
     regional_registry_config_sha256,
@@ -85,7 +86,6 @@ from gpu_fault.spare_health import HyperPodSpareHealthController
 from gpu_fault.store import (
     InMemoryStore,
     PostgresStore,
-    SimulatedDiagnosticAdapter,
     SqliteStore,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
@@ -145,17 +145,6 @@ class _LazyClusterObservers(dict[str, Any]):
 _pod_process_owner = pod_process_owner
 
 
-def _pending_triage_deadline() -> timedelta:
-    """How long a decision may sit in PENDING_TRIAGE before the watchdog closes
-    it (F-G2 (4)). The service refuses a non-positive deadline; refusing it
-    here names the variable the operator has to fix."""
-
-    seconds = float(os.getenv("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS", "900"))
-    if seconds <= 0:
-        raise ValueError("GPU_FAULT_PENDING_TRIAGE_DEADLINE_SECONDS must be positive")
-    return timedelta(seconds=seconds)
-
-
 class ApplicationContext:
     def __init__(
         self,
@@ -171,15 +160,12 @@ class ApplicationContext:
         barrier_coordinator: BarrierCoordinator | None = None,
     ) -> None:
         self.store: ControlPlaneStore = store if store is not None else InMemoryStore()
-        self.diagnostics = SimulatedDiagnosticAdapter(self.store)
         self.evidence = EvidenceService.from_environment(self.store)
         self.policy = GpuFaultPolicyEngine()
         self.completion = CompletionService(
             self.store,
-            self.diagnostics,
             evidence_service=self.evidence,
             marker_ttl_seconds=self.policy.policy.marker_ttl_seconds,
-            pending_triage_deadline=_pending_triage_deadline(),
         )
         self.xid_correlation = XidCorrelationCoordinator(
             self.store,
@@ -294,6 +280,11 @@ class ApplicationContext:
         register_spare_reservation_release(
             self.workflow_executor, production_adapters or []
         )
+        # DESTR-018 product gap: a restore that frees a node closes the
+        # ESCALATED incidents waiting on it; the same service backs the
+        # operator close (POST /v1/incidents/{id}/close).
+        self.incident_closure = IncidentClosureService(self.store)
+        self.workflow_executor.on_terminal.append(self.incident_closure.on_terminal)
         self.workflow_executor.fleet_registry = fleet_registry
         self.workflow_executor.branch_escalator = _branch_escalator(self.orchestrator)
         self.execution_token = execution_token
@@ -439,6 +430,9 @@ class ApplicationContext:
             notification_sender=context.advisory_notifications.send,
         )
         register_spare_reservation_release(context.workflow_executor, adapters)
+        context.workflow_executor.on_terminal.append(
+            context.incident_closure.on_terminal
+        )
         context.workflow_executor.fleet_registry = context.fleet_registry
         context.workflow_executor.branch_escalator = _branch_escalator(
             context.orchestrator
@@ -488,12 +482,16 @@ class ApplicationContext:
                 store_url,
                 archive_uri,
                 retention=timedelta(days=retention_days),
+                # Borrow the store's pool instead of two bare connections
+                # per incident (control-plane review 2026-09-08, F-8).
+                store=store,
             )
         # An active control plane executes real recovery actions, so a
         # step that fails, a command no executor claims, or a workflow
-        # that stalls has to reach a human. Path A (SES) is the only
-        # channel the control plane itself owns; path B (metrics -> AMP ->
-        # SNS) lives in an optional collector this process cannot see. The
+        # that stalls has to reach a human. Path A (the site SNS topic, or
+        # SES for a site that opted in) is the only channel the control
+        # plane itself owns; path B (metrics -> AMP -> SNS) lives in an
+        # optional collector this process cannot see. The
         # deployed configuration had ALLOW_EMAIL=false, the dispatcher off
         # and the collector at replicas=0, which means no alert existed
         # anywhere -- a silently unexecuted recovery was indistinguishable
@@ -504,8 +502,9 @@ class ApplicationContext:
                 raise RuntimeError(
                     "active executor has no external alert channel: "
                     + context.advisory_notifications.describe_delivery_mode()
-                    + ". Configure GPU_FAULT_EMAIL_SENDER/"
-                    "GPU_FAULT_EMAIL_RECIPIENTS with "
+                    + ". Configure GPU_FAULT_SNS_TOPIC_ARN (or "
+                    "GPU_FAULT_NOTIFICATION_CHANNEL=ses with "
+                    "GPU_FAULT_EMAIL_SENDER/GPU_FAULT_EMAIL_RECIPIENTS) with "
                     "GPU_FAULT_ALLOW_EMAIL=true (and either "
                     "GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED=true or "
                     "GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY=false), or "
@@ -529,42 +528,14 @@ class ApplicationContext:
             context.regional_registry_secret_sha256 = regional_registry_config_sha256(
                 configured_regional_registrations(settings.regional_cluster_values)
             )
-        if settings.quick_diagnostics_enabled:
-            try:
-                from kubernetes import client
-                from kubernetes import config as kube_config
-                from kubernetes.config.config_exception import (
-                    ConfigException,
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "quick diagnostics requires the collectors extra"
-                ) from exc
-            try:
-                kube_config.load_incluster_config()
-            except ConfigException:
-                kube_config.load_kube_config()
-            context.diagnostics = KubernetesDcgmDiagnosticAdapter(
-                context.store,
-                client.CoreV1Api(),
-                dcgm_port=int(os.getenv("GPU_FAULT_DCGM_EXPORTER_PORT", "9400")),
-                timeout_seconds=int(
-                    os.getenv(
-                        "GPU_FAULT_QUICK_DIAGNOSTIC_TIMEOUT_SECONDS",
-                        "10",
-                    )
-                ),
-            )
         context.completion = CompletionService(
             context.store,
-            context.diagnostics,
             evidence_service=context.evidence,
             workflow_compiler=PassiveWorkflowCompiler(
                 context.store,
                 evidence_owner=settings.evidence_owner,
             ),
             marker_ttl_seconds=context.policy.policy.marker_ttl_seconds,
-            pending_triage_deadline=_pending_triage_deadline(),
         )
         return context
 
@@ -697,7 +668,9 @@ class ApplicationContext:
         if context.regional_mode:
             remote_owners = set(settings.remote_execution_owners)
             regional_remote_adapter = RegionalRemoteWorkflowAdapter(
-                context.store, owners=remote_owners
+                context.store,
+                owners=remote_owners,
+                step_batching=RemoteStepBatchingPolicy.from_environment(),
             )
             adapters.append(regional_remote_adapter)
         if not context.regional_mode and settings.node_action_adapter_enabled:

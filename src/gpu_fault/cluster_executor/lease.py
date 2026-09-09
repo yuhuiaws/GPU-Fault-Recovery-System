@@ -4,7 +4,8 @@
 renewer thread, read by the executing thread through the node-action lease
 guard. ``CommandLifecycle`` is the layer that runs one command under that
 lease -- the renewer thread, the execution cap, the abandoned-worker hold and
-the bounded result report -- and hands the claim loop one status per command.
+the bounded result report -- and hands the claim loop one ``CommandOutcome``
+per command.
 It holds no per-command state of its own: the stop event, the watch, the
 renewer and the abandoned slot are created inside ``run`` for each command,
 and the executor's configuration and counters are read live through
@@ -17,7 +18,7 @@ from __future__ import annotations
 import logging
 import random
 from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from gpu_fault.adapters.node_action.lease_guard import active_lease_guard
 from gpu_fault.cluster_executor.regional_client import (
@@ -91,6 +92,59 @@ EXECUTION_TIMEOUT_UNKNOWN_STATUS_SOURCE = "executor-execution-timeout-outcome-un
 ABANDONED_WORKER_HOLD_REASON = "abandoned after the execution cap"
 # How often the guard thread checks whether an abandoned worker came back.
 _ABANDONED_WORKER_POLL_SECONDS = 0.25
+
+# The ``status_source`` ``retryable_transport_result`` stamps on a WAITING
+# result. It is the one retryable class that names this executor's own
+# connectivity rather than the target's; the network-degraded back-off keys on
+# it alone.
+TRANSPORT_RETRYABLE_SOURCE = "executor-retryable-transport"
+
+# The keys a retryable WAITING report adds on top of the adapter's own record.
+# They describe one failed attempt by one executor, not the operation, so the
+# replay hands the adapter its record without them (a dead replica's
+# ``executor_id`` otherwise travels with the command for its whole life). The
+# control-plane variant (a 5xx from behind the regional proxy) is a retryable
+# attempt of the same kind, so its ``status_code`` is stripped with the rest.
+RETRYABLE_MARKER_KEYS = frozenset(
+    {
+        "retryable_transport_error",
+        "retryable_adapter_error",
+        "retryable_control_plane_error",
+        "reason",
+        "executor_id",
+        "exception_type",
+        "adapter_error",
+        "status_code",
+    }
+)
+
+
+def adapter_facing_details(details: dict[str, Any]) -> dict[str, Any]:
+    """A command's recorded details as the adapter should see them on replay."""
+
+    if not (
+        details.get("retryable_transport_error")
+        or details.get("retryable_adapter_error")
+        or details.get("retryable_control_plane_error")
+    ):
+        return dict(details)
+    return {
+        key: value for key, value in details.items() if key not in RETRYABLE_MARKER_KEYS
+    }
+
+
+class CommandOutcome(NamedTuple):
+    """What ``_execute_and_report`` tells ``run_once`` about one command.
+
+    ``transport_degraded`` is True when the command ended WAITING because this
+    executor could not reach the target on transport grounds -- the signal that
+    this Pod's network, not the work, is the problem. A result the lifecycle
+    could not post still reports it: the network that failed the action is the
+    same network the report went over.
+    """
+
+    status: RemoteCommandStatus
+    transport_degraded: bool
 
 
 def _retryable_report_failure(exc: BaseException) -> bool:
@@ -206,7 +260,7 @@ class CommandLifecycle:
     """Run one claimed command under its lease and report its verdict once.
 
     Everything between ``run_once`` handing over a claimed command and one
-    ``RemoteCommandStatus`` coming back: the renewer thread, the execution cap
+    ``CommandOutcome`` coming back: the renewer thread, the execution cap
     (``_execute_within_deadline``), the verdict for a command this executor gave
     up on, the lease hold over a thread that may still be mutating, and the
     bounded, lease-aware result report. The command itself is executed by the
@@ -217,7 +271,7 @@ class CommandLifecycle:
     def __init__(self, executor: ClusterActionExecutor) -> None:
         self.executor = executor
 
-    def run(self, command: RemoteActionCommand) -> RemoteCommandStatus:
+    def run(self, command: RemoteActionCommand) -> CommandOutcome:
         stop = Event()
         watch = CommandLeaseWatch(
             lease_seconds=self.executor.lease_seconds,
@@ -258,14 +312,18 @@ class CommandLifecycle:
                     result.status.value,
                     watch.hold_reason(),
                 )
-                return RemoteCommandStatus.WAITING
+                # The lease was lost, not the network refused: the withheld
+                # result is already reclaimable, so this is not counted as a
+                # transport-degraded cycle.
+                return CommandOutcome(RemoteCommandStatus.WAITING, False)
+            transport_degraded = result.status_source == TRANSPORT_RETRYABLE_SOURCE
             reported = self._report_result(command, result, watch)
             if not reported:
                 # The action ran but its verdict never landed. WAITING keeps
                 # this cycle off the fast path (the command is still open on
                 # the control plane) instead of claiming that it advanced.
-                return RemoteCommandStatus.WAITING
-            return result.status
+                return CommandOutcome(RemoteCommandStatus.WAITING, transport_degraded)
+            return CommandOutcome(result.status, transport_degraded)
         finally:
             worker = abandoned.get("worker")
             if worker is not None and not reported and not watch.lost():

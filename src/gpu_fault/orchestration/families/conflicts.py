@@ -2,20 +2,21 @@ from __future__ import annotations
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    IncidentState,
-    lifetime_exceeded,
-    resolved_step_indexes,
     FaultIncident,
+    IncidentState,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
+    lifetime_exceeded,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     NODE_EXCLUSIVE_OPERATIONS,
     OPERATION_RESOURCE_CLAIMS,
     TRANSIENT_GPU_INVENTORY_OPERATIONS,
 )
+from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 from gpu_fault.store import NotFoundError
 
 
@@ -86,6 +87,11 @@ class NodeConflictService:
                 # the merge target so the event is recorded on this incident
                 # instead of opening a new remediation.
                 return incident, workflow
+            if incident is not None and never_executed_operator_block(workflow):
+                # C-03: the pair stays the merge target so ``disposition`` can
+                # replace the never-run block in place under its own id,
+                # instead of leaving it behind as a second record on the node.
+                return incident, workflow
             return None, None
         return incident, workflow
 
@@ -115,6 +121,11 @@ class NodeConflictService:
             if (
                 workflow.request_id in exclude_request_ids
                 or not self.claims_node_exclusively(workflow.official_steps)
+                # C-03: a BLOCKED(NEEDS_OPERATOR) row that never ran a step
+                # holds nothing on the node; naming it as the incumbent made
+                # every successor's ``predecessor_workflow_id`` point at a row
+                # the dispatcher treats as open forever (F-A4).
+                or never_executed_operator_block(workflow)
             ):
                 continue
             if candidate_claims is not None:

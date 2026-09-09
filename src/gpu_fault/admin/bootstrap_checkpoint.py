@@ -45,6 +45,36 @@ BOOTSTRAP_TASK_ASSETS = (
     "deploy/observability/amp-alertmanager.yaml",
     "deploy/control-plane/regional/aurora-credential-refresh.yaml",
 )
+# ``resources`` key holding the EKS ARN -> HyperPod ARN map the first discovery
+# learned. An EKS ARN on the command line has no HyperPod name in it, so without
+# the map every deploy lists and describes every HyperPod cluster in the region
+# to find the one owning it. The map is a hint, not an identity: discovery
+# re-describes the hinted cluster and falls back to the inventory when the
+# orchestrator no longer matches, and ``bind_initial_deploy_target`` still
+# validates the resolved identity against the site.
+HYPERPOD_HINTS = "hyperpod_by_eks"
+
+
+def load_hyperpod_hints(state_dir: Path) -> dict[str, str]:
+    """The persisted EKS -> HyperPod map, read before ``BootstrapState`` can be
+    opened (the site id that opens it is itself a product of discovery)."""
+
+    path = state_dir / "bootstrap-state.json"
+    if not path.is_file():
+        return {}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    resources = document.get("resources") if isinstance(document, dict) else None
+    hints = resources.get(HYPERPOD_HINTS) if isinstance(resources, dict) else None
+    if not isinstance(hints, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in hints.items()
+        if isinstance(key, str) and isinstance(value, str) and value
+    }
 
 
 def _file_sha256(path: Path) -> str | None:
@@ -186,12 +216,9 @@ def bind_bootstrap_inputs(
     images = release.get("images")
     images = images if isinstance(images, Mapping) else {}
     control_plane_wheel_sha256 = _manifest_wheel_sha256(root, manifest)
-    notification_identity = {
-        "admin_email": request.alert_email,
-        "email_sender": request.email_sender,
-        "email_recipients": list(request.email_recipients),
-        "email_subject_prefix": request.email_subject_prefix,
-    }
+    # Sender and recipient are the administrator address (see
+    # ``resolve_notification_routing``), so the address is the whole identity.
+    notification_identity = {"admin_email": request.alert_email}
     payload = {
         "schema_version": 1,
         "cpu": cpu_identity,
@@ -227,7 +254,7 @@ def bind_bootstrap_inputs(
 
         That is only safe for a task whose completion is re-proved on every
         deploy. `bootstrap_tasks.py` revalidates `pod_identity_agent`,
-        `monitoring_install`, `aurora_refresh`, `node_keys:*`,
+        `monitoring_install`, `aurora_ready`, `aurora_refresh`, `node_keys:*`,
         `load_balancer_controller`, `control_plane_role`, `email_notifications`,
         `monitoring_resources` and `executor_role:*` through a read-only probe
         that enters ensure on detected drift, so for those the probe is the
@@ -280,6 +307,9 @@ def bind_bootstrap_inputs(
             "aurora",
             {"admin_config_sha256": payload["admin_config_sha256"]},
         ),
+        # Instances available and the control-plane Secret present: nothing
+        # static decides it, so the probe is its only trigger (like the add-on).
+        "aurora_ready": task_digest("aurora_ready", {"eks_arn": cpu.eks_arn}),
         "load_balancer_controller": task_digest(
             "load_balancer_controller", {"eks_arn": cpu.eks_arn}
         ),
@@ -301,9 +331,8 @@ def bind_bootstrap_inputs(
             gpu_identity=gpu_identity,
             dashboards=dashboard_asset_digests(root),
             grafana={
-                "enabled": request.grafana_enabled,
                 "workspace_id": request.grafana_workspace_id,
-                "create": request.grafana_create,
+                "viewer": request.grafana_viewer,
             },
         ),
     }

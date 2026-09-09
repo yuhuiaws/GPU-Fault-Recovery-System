@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import json
 import logging
 from datetime import datetime
+from typing import Any, Callable
 
-
+from gpu_fault.collectors.sinks import CollectorError
 from gpu_fault.host_health import (
     HostMetricSample,
 )
-
-
-from gpu_fault.collectors.sinks import CollectorError
 
 LOGGER = logging.getLogger(__name__)
 

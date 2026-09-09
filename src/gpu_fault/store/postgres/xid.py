@@ -264,21 +264,52 @@ class PostgresXidMixin:
             return []
         keys = [item[0] for item in items]
         unique_keys = list(dict.fromkeys(keys))
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT key, payload
-                FROM gpu_fault_objects
-                WHERE kind='health_signal_state'
-                  AND key=ANY(%s)
-                FOR UPDATE
-                """,
-                (unique_keys,),
+        # One transaction for read, decision and write (G-5). On the autocommit
+        # pool the FOR UPDATE below released its row locks before the caller
+        # saw the rows, and a key with no row yet has nothing to lock at all,
+        # so two workers deciding the same signal both read "inactive" and both
+        # emitted, or the slower one overwrote the fresher state. The advisory
+        # locks are the ones ``mark_health_signal_notified`` takes through
+        # ``_state_transaction`` (same key text), taken in sorted order so two
+        # batches sharing keys cannot deadlock.
+        with self._db.transaction():
+            with self._db.cursor() as cursor:
+                for signal_key in sorted(unique_keys):
+                    cursor.execute(
+                        """
+                        SELECT pg_advisory_xact_lock(
+                            hashtextextended(%s, 0)
+                        )
+                        """,
+                        (f"health_signal_state/{signal_key}",),
+                    )
+                cursor.execute(
+                    """
+                    SELECT key, payload
+                    FROM gpu_fault_objects
+                    WHERE kind='health_signal_state'
+                      AND key=ANY(%s)
+                    FOR UPDATE
+                    """,
+                    (unique_keys,),
+                )
+                current_by_key = {
+                    key: self._decode("health_signal_state", payload)
+                    for key, payload in cursor.fetchall()
+                }
+            return self._decide_health_signal_transitions(
+                items, current_by_key, received_at=received_at
             )
-            current_by_key = {
-                key: self._decode("health_signal_state", payload)
-                for key, payload in cursor.fetchall()
-            }
+
+    def _decide_health_signal_transitions(
+        self,
+        items: Sequence[tuple[str, bool, datetime, float]],
+        current_by_key: dict[str, HealthSignalState],
+        *,
+        received_at: datetime | None,
+    ) -> list[bool]:
+        """The decision and the write, inside the caller's locked transaction."""
+
         results: list[bool] = []
         final_by_key: dict[str, HealthSignalState] = {}
         for (

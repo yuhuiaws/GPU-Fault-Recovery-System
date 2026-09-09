@@ -1,44 +1,59 @@
 """Keep the Aurora connection Secret in step with a rotated master password.
 
 Aurora clusters created with ``--manage-master-user-password`` have RDS
-rotate the master password on a schedule (7 days by default). The control
-plane reads its DSN from the ``gpu-fault-aurora`` Secret exactly once, when
-``PostgresStore.__init__`` builds the connection pool, so a rotation does not
-disturb running replicas. It breaks the *next* restart instead: whatever
-triggers it (a rollout, an eviction, a node cycle, a probe restart) the new
-process authenticates with the stale password and dies, which surfaces as
-every replica in ``CrashLoopBackOff`` hours or days after the rotation.
+rotate the master password on a schedule (7 days by default). Every
+control-plane Pod mounts the ``gpu-fault-aurora`` Secret as files under
+``/etc/gpu-fault/aurora`` and the connection pool reads ``postgres-url`` from
+there on every connect (``GPU_FAULT_STORE_URL_FILE``, CP-3), so the only thing
+a rotation needs is for the Secret to be brought up to date: kubelet rewrites
+the projected file in every running Pod within its sync period and the next
+reconnect authenticates with the new password. Nothing restarts.
 
-This module closes that gap. It reads ``AWSCURRENT`` from Secrets Manager,
-splices the password into the existing DSN, writes the Secret when the two
-actually differ, and reconciles every database-consuming Deployment so the
-new password reaches ``GPU_FAULT_STORE_URL`` (an ``env`` from
-``secretKeyRef`` is not hot-reloaded).
+Before that mount existed the DSN was a frozen ``env`` from a ``secretKeyRef``.
+"Running replicas are unaffected" was never true: every connection the pool
+recycled after a rotation (``max_idle`` 300 s, ``max_lifetime`` 3600 s)
+reconnected with the old password, psycopg_pool retried for 300 s per slot and
+then gave it up, and each replica degraded to ``PoolTimeout``/503 until this
+job rolled it -- while every NEW Pod died in ``CrashLoopBackOff``.
 
-Two properties matter for running this unattended in production:
+This module reads ``AWSCURRENT`` from Secrets Manager, splices the password
+into the existing DSN, and writes the Secret when the two actually differ.
+It no longer rolls the Deployments; ``--restart-deployments`` (default off)
+keeps that behaviour for a site whose Pods do not mount the Secret yet.
+
+Three properties matter for running this unattended in production:
 
 * **Validate before switching.** The candidate DSN is opened against the
   database first. A refresher that cannot tell a good password from a bad one
   is free to replace a working Secret with a broken one, turning a rotation
   into an outage of its own making.
-* **Resume partial rollouts.** The Secret and Deployment pod templates carry
-  the same refresh token. If a Kubernetes API failure interrupts the rollout
-  after the Secret write, the next attempt restarts only the missing targets.
-* **Do nothing when converged.** Restarting replicas is the only disruptive
-  step, so an already-current Secret whose targets carry the same refresh
-  token produces no patch.
+* **Report every run.** The outcome -- ok or failed, when, why -- is written
+  into the same Secret as ``last-refresh-status.json``. The mount turns it
+  into ``/etc/gpu-fault/aurora/last-refresh-status.json`` in every Pod and the
+  control plane exports its age as
+  ``gpu_fault_aurora_credential_refresh_last_success_age_seconds`` (H1-2),
+  so a refresher that has been failing for days is an alert, not a surprise
+  at the next rotation.
+* **Converge, do not repeat.** The rollout token is a digest of the candidate
+  DSN (H1-4), so two refreshers racing (the hourly tick and a release
+  preflight Job) agree on it; with restarts enabled a Deployment already
+  carrying that token is left alone.
 
-Discovered as ``GF-REGIONAL-BOOT-016`` 附带发现 2.
+Discovered as ``GF-REGIONAL-BOOT-016`` 附带发现 2; reworked for CP-3.
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from gpu_fault.logging_setup import configure_logging
@@ -50,6 +65,12 @@ DEFAULT_SECRET_NAME = "gpu-fault-aurora"
 DEFAULT_SECRET_KEY = "postgres-url"
 DEFAULT_DEPLOYMENT = "gpu-fault-api-ha"
 RESTART_ANNOTATION = "gpu-fault.aws/aurora-credential-refreshed-at"
+# Written into the Secret on every run; the Deployment's aurora-credentials
+# mount makes it /etc/gpu-fault/aurora/last-refresh-status.json in every Pod.
+STATUS_KEY = "last-refresh-status.json"
+RESTART_SWITCH_ENV = "GPU_FAULT_AURORA_REFRESH_RESTART_DEPLOYMENTS"
+
+_DSN_IN_TEXT = re.compile(r"(postgres(?:ql)?://[^:/\s]+:)[^@\s]+@")
 
 
 @dataclass(frozen=True)
@@ -84,6 +105,19 @@ def replace_password(dsn: str, password: str) -> str:
     if parts.port:
         netloc = f"{netloc}:{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def rollout_token_for(dsn: str) -> str:
+    """Deterministic token for ``dsn``: concurrent refreshers converge on it
+    and it leaks nothing about the password (H1-4)."""
+
+    return hashlib.sha256(dsn.encode()).hexdigest()[:16]
+
+
+def _redact_text(text: str) -> str:
+    """Blank the password in any DSN embedded in free text (error messages)."""
+
+    return _DSN_IN_TEXT.sub(r"\1***@", text)
 
 
 def _redact(dsn: str) -> str:
@@ -180,16 +214,21 @@ def refresh_once(
     region_name: str,
     timestamp: str,
     expected_secret_arn: str | None = None,
-    verify=verify_dsn,
-    fetch_password=read_current_password,
+    verify=None,
+    fetch_password=None,
+    restart_deployments: bool = False,
 ) -> RefreshResult:
     """Bring ``secret_name`` up to date with the rotated master password.
 
     ``verify`` and ``fetch_password`` are injected so the decision logic can
-    be tested without AWS or a database.
+    be tested without AWS or a database. ``restart_deployments`` is the
+    compatibility switch: running Pods reload the mounted Secret, so by
+    default no Deployment is touched.
     """
-    import base64
-
+    # Resolved at call time so a test (or an operator shim) can replace the
+    # module's verifier and password source.
+    verify = verify or verify_dsn
+    fetch_password = fetch_password or read_current_password
     secret = core.read_namespaced_secret(secret_name, namespace)
     data = secret.data or {}
     if secret_key not in data:
@@ -209,6 +248,10 @@ def refresh_once(
     secret_arn = expected_secret_arn or stored_secret_arn
     arn_changed = secret_arn != stored_secret_arn
     rollout_token = _annotations(secret).get(RESTART_ANNOTATION)
+    if not restart_deployments:
+        # Without restarts there is no rollout to resume; a token left by an
+        # earlier restarting build must not make a converged Secret look busy.
+        rollout_token = None
 
     candidate = replace_password(current_dsn, fetch_password(secret_arn, region_name))
     password_changed = candidate != current_dsn
@@ -234,7 +277,7 @@ def refresh_once(
     updates = {"master-secret-arn": base64.b64encode(secret_arn.encode()).decode()}
     if password_changed:
         updates[secret_key] = base64.b64encode(candidate.encode()).decode()
-        rollout_token = timestamp
+        rollout_token = rollout_token_for(candidate)
     if password_changed or arn_changed:
         patch: dict[str, object] = {"data": updates}
         if password_changed:
@@ -245,9 +288,9 @@ def refresh_once(
             patch,
         )
 
-    # GPU_FAULT_STORE_URL comes from a secretKeyRef, so the running replicas
-    # keep the old value until their pods are replaced. maxUnavailable=1 plus
-    # the PodDisruptionBudget keeps a quorum serving through the rollout.
+    # Running Pods read the DSN from the mounted Secret file on every connect;
+    # kubelet delivers the new value within its sync period. Rolling the
+    # Deployments is only for a site that still injects the DSN as an env.
     restarted_targets = (
         _reconcile_deployments(
             apps,
@@ -255,13 +298,15 @@ def refresh_once(
             targets=targets,
             rollout_token=rollout_token,
         )
-        if rollout_token is not None
+        if restart_deployments and rollout_token is not None
         else ()
     )
     rotated = password_changed or arn_changed
     restarted = bool(restarted_targets)
-    if password_changed:
+    if password_changed and restarted:
         reason = "credentials updated and deployments reconciled"
+    elif password_changed:
+        reason = "credentials updated; running replicas reload the mounted Secret"
     elif arn_changed and restarted:
         reason = "managed secret ARN updated and deployment rollout resumed"
     elif arn_changed:
@@ -277,11 +322,78 @@ def refresh_once(
     )
 
 
-def main() -> None:
-    from datetime import datetime, timezone
+def write_refresh_status(
+    core: Any,
+    *,
+    namespace: str,
+    secret_name: str,
+    status: str,
+    finished_at: str,
+    error: str | None,
+    rotated: bool,
+    restarted: bool,
+    reason: str | None,
+) -> None:
+    """Record this run's outcome as ``STATUS_KEY`` in the Secret (H1-2).
 
+    Only that one key is patched; ``postgres-url`` and ``master-secret-arn``
+    are never touched here. Error text is redacted so a DSN quoted by a driver
+    exception cannot land in the Secret's status.
+    """
+
+    payload = {
+        "status": status,
+        "finished_at": finished_at,
+        "error": _redact_text(error) if error is not None else None,
+        "rotated": rotated,
+        "restarted": restarted,
+        "reason": reason,
+    }
+    core.patch_namespaced_secret(
+        secret_name,
+        namespace,
+        {
+            "data": {
+                STATUS_KEY: base64.b64encode(
+                    json.dumps(payload, sort_keys=True).encode()
+                ).decode()
+            }
+        },
+    )
+
+
+def load_kubernetes_clients() -> tuple[Any, Any]:
     from kubernetes import client, config
 
+    config.load_incluster_config()
+    return client.CoreV1Api(), client.AppsV1Api()
+
+
+def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="gpu-fault-aurora-credential-refresh",
+        description=(
+            "Copy the AWSCURRENT Aurora master password into the gpu-fault-aurora "
+            "Secret; running Pods reload it from their mount."
+        ),
+    )
+    parser.add_argument(
+        "--restart-deployments",
+        action="store_true",
+        default=(os.environ.get(RESTART_SWITCH_ENV, "false").strip().lower() == "true"),
+        help=(
+            "Also roll the database-consuming Deployments after a rotation "
+            "(compatibility for Pods that do not mount the Secret; default off, "
+            f"or {RESTART_SWITCH_ENV}=true)."
+        ),
+    )
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    from datetime import datetime, timezone
+
+    arguments = _parse_arguments(argv)
     configure_logging()
     region_name = (
         os.environ.get("GPU_FAULT_AWS_REGION")
@@ -291,10 +403,9 @@ def main() -> None:
     ).strip()
     if not region_name:
         raise RuntimeError("AWS_REGION is required")
-    config.load_incluster_config()
-    core = client.CoreV1Api()
-    apps = client.AppsV1Api()
+    core, apps = load_kubernetes_clients()
     namespace = os.environ.get("GPU_FAULT_NAMESPACE", DEFAULT_NAMESPACE)
+    secret_name = os.environ.get("GPU_FAULT_AURORA_SECRET", DEFAULT_SECRET_NAME)
     deployments = tuple(
         item.strip()
         for item in os.environ.get(
@@ -314,9 +425,7 @@ def main() -> None:
                 core,
                 apps,
                 namespace=namespace,
-                secret_name=os.environ.get(
-                    "GPU_FAULT_AURORA_SECRET", DEFAULT_SECRET_NAME
-                ),
+                secret_name=secret_name,
                 secret_key=os.environ.get(
                     "GPU_FAULT_AURORA_SECRET_KEY", DEFAULT_SECRET_KEY
                 ),
@@ -327,6 +436,7 @@ def main() -> None:
                 expected_secret_arn=(
                     os.environ.get("GPU_FAULT_AURORA_MASTER_SECRET_ARN") or None
                 ),
+                restart_deployments=arguments.restart_deployments,
             )
             break
         except Exception as exc:
@@ -339,7 +449,21 @@ def main() -> None:
             if attempt < max_attempts:
                 time.sleep(min(2 ** (attempt - 1), 30))
     else:
-        observed_at = datetime.now(timezone.utc).isoformat()
+        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            write_refresh_status(
+                core,
+                namespace=namespace,
+                secret_name=secret_name,
+                status="failed",
+                finished_at=observed_at,
+                error=f"{type(last_error).__name__}: {last_error}",
+                rotated=False,
+                restarted=False,
+                reason=None,
+            )
+        except Exception:
+            LOGGER.exception("failed to record the Aurora credential refresh status")
         try:
             core.create_namespaced_event(
                 namespace,
@@ -353,14 +477,13 @@ def main() -> None:
                     "involvedObject": {
                         "apiVersion": "v1",
                         "kind": "Secret",
-                        "name": os.environ.get(
-                            "GPU_FAULT_AURORA_SECRET",
-                            DEFAULT_SECRET_NAME,
-                        ),
+                        "name": secret_name,
                         "namespace": namespace,
                     },
                     "reason": "AuroraCredentialRefreshFailed",
-                    "message": (f"{type(last_error).__name__}: {last_error}"),
+                    "message": _redact_text(
+                        f"{type(last_error).__name__}: {last_error}"
+                    ),
                     "type": "Warning",
                     "source": {"component": "gpu-fault-aurora-refresh"},
                     "firstTimestamp": observed_at,
@@ -374,6 +497,17 @@ def main() -> None:
             raise RuntimeError(
                 "aurora credential refresh failed after retries"
             ) from last_error
+    write_refresh_status(
+        core,
+        namespace=namespace,
+        secret_name=secret_name,
+        status="ok",
+        finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        error=None,
+        rotated=result.rotated,
+        restarted=result.restarted,
+        reason=result.reason,
+    )
     LOGGER.info(
         "aurora credential refresh: rotated=%s restarted=%s (%s)",
         result.rotated,

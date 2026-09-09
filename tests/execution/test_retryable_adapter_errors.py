@@ -203,8 +203,10 @@ def test_retry_limit_exhaustion_falls_through_to_the_failed_path():
     assert record.details.get("retryable_adapter_error") is True, record.details
     assert record.details.get("attempt") == 2, record.details
     assert "ApiException" in (record.error or ""), record.error
-    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED, (
-        "past the bound the last error escalates like any adapter failure"
+    # A FREEZE-only workflow is diagnostic-only: its failure closes the
+    # incident RECOVERED ("diagnostic inconclusive") rather than ESCALATED.
+    assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED, (
+        "past the bound the last error ends the workflow like any adapter failure"
     )
 
 
@@ -240,8 +242,9 @@ def test_a_definitive_adapter_exception_still_fails_the_step_at_once():
     assert result.status is WorkflowStatus.FAILED, result
     assert record.status is WorkflowStepStatus.FAILED, record
     assert "retryable_adapter_error" not in record.details, record.details
-    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED, (
-        "a definitive adapter failure still escalates at once"
+    # Diagnostic-only workflow (FREEZE alone): the incident ends RECOVERED.
+    assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED, (
+        "a definitive adapter failure still ends the workflow at once"
     )
 
 

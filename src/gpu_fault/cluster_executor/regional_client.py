@@ -36,12 +36,14 @@ from gpu_fault.fleet import (
 from gpu_fault.hyperpod import HyperPodSubmissionRecord
 from gpu_fault.models import AdvisoryNotification
 from gpu_fault.regional import (
+    BatchedStepResult,
     RegionalExecutorReadinessRequest,
     RemoteActionCommand,
     RemoteAdvisoryNotificationRequest,
     RemoteCommandClaim,
     RemoteCommandClaimRequest,
     RemoteCommandLeaseRenewal,
+    RemoteCommandProgress,
     RemoteCommandResult,
     RemoteCommandStatus,
     RemoteEvidenceCaptureRequest,
@@ -147,7 +149,7 @@ class RegionalExecutorClient:
             raise ClusterExecutorError(f"{name} must not contain control characters")
         return cleaned
 
-    def _send(self, request: Request) -> bytes:
+    def _send(self, request: Request, *, timeout_seconds: float | None = None) -> bytes:
         """One control-plane round trip; every failure becomes one exception type.
 
         Only ``HTTPError`` used to be converted, so every caller of this client
@@ -158,12 +160,17 @@ class RegionalExecutorClient:
         LEASED until it expired and was executed a second time. A failure with
         no answer at all carries ``status_code=None``, which is what callers
         read as "no verdict from the control plane, safe to retry".
+        ``timeout_seconds`` overrides the client's timeout for one request: a
+        long-poll claim the control plane is allowed to hold must not be
+        mistaken for a stalled one.
         """
 
         try:
             with urlopen(
                 request,
-                timeout=self.timeout_seconds,
+                timeout=(
+                    self.timeout_seconds if timeout_seconds is None else timeout_seconds
+                ),
                 ssl_context=self.ssl_context,
             ) as response:
                 body: bytes = response.read()
@@ -179,7 +186,13 @@ class RegionalExecutorClient:
                 f"regional control plane request failed: {type(exc).__name__}: {exc}"
             ) from exc
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         request = Request(
             self.base_url + path,
             data=json.dumps(payload, separators=(",", ":"), default=str).encode(),
@@ -190,7 +203,7 @@ class RegionalExecutorClient:
             },
             method="POST",
         )
-        return json.loads(self._send(request) or b"{}")
+        return json.loads(self._send(request, timeout_seconds=timeout_seconds) or b"{}")
 
     def _get(self, path: str) -> Any:
         request = Request(
@@ -210,7 +223,18 @@ class RegionalExecutorClient:
         execution_owners: list[str] | None = None,
         max_commands: int,
         lease_seconds: int,
+        wait_seconds: float = 0,
     ) -> list[RemoteActionCommand]:
+        """Claim up to ``max_commands``; with ``wait_seconds > 0`` the control
+        plane may hold an empty claim that long for a command to arrive.
+
+        A disabled wait leaves the field out of the body altogether -- the
+        request models forbid unknown fields, so this is what lets the
+        executor keep claiming from a control plane that predates the
+        long-poll. The HTTP timeout grows by the wait so a held request is
+        not mistaken for a stalled one.
+        """
+
         payload = RemoteCommandClaimRequest(
             executor_id=executor_id,
             executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
@@ -219,11 +243,19 @@ class RegionalExecutorClient:
             execution_owners=execution_owners or [],
             max_commands=max_commands,
             lease_seconds=lease_seconds,
+            wait_seconds=wait_seconds,
         )
-        response = self._post(
-            "/v1/regional/executors/claim",
-            payload.model_dump(mode="json"),
-        )
+        if wait_seconds > 0:
+            response = self._post(
+                "/v1/regional/executors/claim",
+                payload.model_dump(mode="json"),
+                timeout_seconds=self.timeout_seconds + wait_seconds,
+            )
+        else:
+            response = self._post(
+                "/v1/regional/executors/claim",
+                payload.model_dump(mode="json", exclude={"wait_seconds"}),
+            )
         return self._claimed_commands(response)
 
     def _claimed_commands(self, response: dict[str, Any]) -> list[RemoteActionCommand]:
@@ -337,6 +369,31 @@ class RegionalExecutorClient:
         response = self._post(
             f"/v1/regional/executors/{command.command_id}/result",
             result.model_dump(mode="json"),
+        )
+        return RemoteActionCommand.model_validate(response)
+
+    def progress(
+        self,
+        command: RemoteActionCommand,
+        executor_id: str,
+        batched_results: dict[str, dict[str, Any]],
+    ) -> RemoteActionCommand:
+        """Report the settled steps of a compound command (性能 C)."""
+
+        if not command.lease_token:
+            raise ClusterExecutorError(
+                "cannot report progress on a command without a lease token"
+            )
+        response = self._post(
+            f"/v1/regional/executors/{command.command_id}/progress",
+            RemoteCommandProgress(
+                executor_id=executor_id,
+                lease_token=command.lease_token,
+                batched_results={
+                    index: BatchedStepResult.model_validate(entry)
+                    for index, entry in batched_results.items()
+                },
+            ).model_dump(mode="json"),
         )
         return RemoteActionCommand.model_validate(response)
 

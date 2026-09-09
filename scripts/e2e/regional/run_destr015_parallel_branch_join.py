@@ -41,6 +41,7 @@ from scripts.e2e.regional import (  # noqa: E402
     run_destr009_workload_restart as workload_case,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    processor_queue_backlog,
     write_json_atomic,
 )
 from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
@@ -194,7 +195,7 @@ def preflight_errors(
         errors.append("gpuReset is not OWN by the Node Agent")
     if (profile or {}).get("warnings"):
         errors.append("runtime profile has warnings")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty")

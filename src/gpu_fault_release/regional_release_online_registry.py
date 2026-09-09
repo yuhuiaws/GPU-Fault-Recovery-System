@@ -38,10 +38,17 @@ def _request(
     return value
 
 
-def _registrations(
+def current_registrations(
     release: Any,
     lifecycle_overrides: dict[str, str],
 ) -> list[dict[str, Any]]:
+    """The bootstrap Secret's entries as the registry API takes them.
+
+    Plaintext ``token`` values become ``token_sha256`` here; ``rotate-token``
+    reads this to publish a revision that differs from the Secret in exactly
+    one cluster's digests.
+    """
+
     result = []
     for source in registry(release):
         item = dict(source)
@@ -64,7 +71,7 @@ def _registration(
 ) -> dict[str, Any]:
     matches = [
         item
-        for item in _registrations(release, {})
+        for item in current_registrations(release, {})
         if str(item["cluster_id"]) == cluster_id
     ]
     if len(matches) != 1:
@@ -74,7 +81,7 @@ def _registration(
     return matches[0]
 
 
-def _publish_and_wait(
+def publish_registry_revision(
     release: Any,
     *,
     path: str,
@@ -111,11 +118,11 @@ def publish_current_registry(
     lifecycle_overrides: dict[str, str] | None = None,
     timeout_seconds: float = 300,
 ) -> dict[str, Any]:
-    return _publish_and_wait(
+    return publish_registry_revision(
         release,
         path="/v1/regional/registry/revisions",
         payload={
-            "registrations": _registrations(
+            "registrations": current_registrations(
                 release,
                 lifecycle_overrides or {},
             ),
@@ -163,7 +170,7 @@ def transition_join_registry(
     reason: str,
     timeout_seconds: float = 300,
 ) -> dict[str, Any]:
-    return _publish_and_wait(
+    return publish_registry_revision(
         release,
         path=f"/v1/regional/registry/clusters/{cluster_id}/transition",
         payload={

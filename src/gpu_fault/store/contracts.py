@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -10,6 +12,7 @@ from typing import (
     Iterable,
     Mapping,
     Protocol,
+    Sequence,
     TypedDict,
     runtime_checkable,
 )
@@ -26,7 +29,6 @@ if TYPE_CHECKING:
         AdvisoryNotification,
         CompletionDecision,
         DecisionStatus,
-        DiagnosticRequest,
         EfaTrafficState,
         EffectiveRuntimeProfile,
         FaultIncident,
@@ -38,7 +40,6 @@ if TYPE_CHECKING:
         NotificationStatus,
         RecoveryPlan,
         TerminalEvent,
-        TriageReport,
         WorkflowEvent,
         WorkflowRequest,
         WorkflowStatus,
@@ -309,7 +310,13 @@ class WorkflowStore(Protocol):
         self,
         incident: FaultIncident,
         workflow: WorkflowRequest,
-    ) -> None: ...
+        *,
+        extra_event_ids: Sequence[str] = (),
+    ) -> None:
+        """Write the pair and link ``incident.event_id`` plus every
+        ``extra_event_ids`` member event in the same transaction (control-plane
+        review 2026-09-08, C-10)."""
+        ...
 
     def reconcile_restored_workflow(
         self,
@@ -357,9 +364,12 @@ class WorkflowStore(Protocol):
         incident: FaultIncident,
         *,
         expected: FaultIncident | None = None,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         """Write one incident row and its event link without overwriting a row
         that has moved (architecture review 2026-09-07, item D1).
+        ``extra_event_ids`` are linked to the incident in the same transaction
+        (control-plane review 2026-09-08, C-09).
 
         Without ``expected`` the write is version-guarded like
         ``save_workflow``: a missing row is inserted; an existing row is
@@ -496,6 +506,22 @@ class WorkflowStore(Protocol):
 
         The mirror image of ``list_orphan_workflows``: a pointer to a record that
         was never persisted or has been cleaned up. Read-only.
+        """
+        ...
+
+    def list_incidents_by_state(
+        self,
+        cluster_id: str,
+        states: Collection[IncidentState],
+        *,
+        node_ids: set[str] | None = None,
+        limit: int = ACTIVE_WORKFLOW_INCIDENTS_LIMIT,
+    ) -> list[FaultIncident]:
+        """Incidents of ``cluster_id`` in one of ``states``, newest
+        ``updated_at`` first, optionally only those naming one of ``node_ids``
+        (an empty set matches nothing). Independent of any workflow row: the
+        incidents this serves (``IncidentClosureService``) are ESCALATED behind
+        a workflow that already ended. Read-only.
         """
         ...
 
@@ -653,6 +679,37 @@ class WorkflowStore(Protocol):
         """
         ...
 
+    def find_remote_command_covering_step(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        fencing_token: int,
+    ) -> RemoteActionCommand | None:
+        """The compound command (``batched_steps`` non-empty) of generation
+        ``fencing_token`` whose covered steps include ``step_index`` -- an open
+        one first, else the newest terminal one -- or ``None``. Commands that
+        carry a single step are never returned: their identity is their digest
+        and ``find_open_remote_command`` already guards them (性能 C)."""
+        ...
+
+    def record_remote_command_progress(
+        self,
+        cluster_id: str,
+        command_id: str,
+        executor_id: str,
+        lease_token: str,
+        *,
+        batched_results: dict[str, Any],
+    ) -> RemoteActionCommand:
+        """Merge per-step results of a compound command into
+        ``result_details["batched_results"]`` while it is LEASED by
+        ``executor_id`` under ``lease_token`` (``WorkflowLeaseError`` otherwise).
+        One read-modify-write under the command's own lock; the lease is not
+        extended (renewal owns that) and the status does not change."""
+        ...
+
     def cancel_remote_commands_for_workflow(
         self,
         workflow_request_id: str,
@@ -668,6 +725,17 @@ class WorkflowStore(Protocol):
     ) -> bool: ...
 
     def get_remote_command(self, command_id: str) -> RemoteActionCommand: ...
+
+    def expire_stale_fenced_remote_commands(
+        self,
+        *,
+        lease_expired_before: datetime,
+        limit: int,
+    ) -> int:
+        """Fail LEASED commands whose lease lapsed before ``lease_expired_before``
+        while their workflow sits at another ``fencing_token`` (control-plane
+        review 2026-09-08, D-9): ``status_source="stale-fence"``."""
+        ...
 
     def list_remote_commands(
         self,
@@ -774,32 +842,12 @@ class CompletionStore(Protocol):
         self, cluster_id: str, attempt_id: str
     ) -> CompletionDecision: ...
 
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        """Decisions in ``status``, oldest first.
-
-        A decision carries no timestamp of its own, so its age is that of the
-        diagnostic request it points at (``diagnostic_request_id`` ->
-        ``DiagnosticRequest.created_at``). With ``older_than`` only decisions
-        whose request was created at or before it are returned; a decision
-        whose request cannot be found is returned too -- nothing can ever
-        report on it, so it is stale by definition (F-G2 (4)).
-        """
-        ...
-
     def decision_status_counts(self) -> dict[DecisionStatus, int]: ...
 
     def count_completion_events_without_decision(self) -> int:
         """Terminal event rows with no decision row: the poisoned shape of
         P0-48B, exported as a gauge (F-G2 (6))."""
         ...
-
-    def save_diagnostic(self, request: DiagnosticRequest) -> None: ...
 
     def save_plan(
         self,
@@ -818,10 +866,6 @@ class CompletionStore(Protocol):
         ...
 
     def get_plan(self, plan_id: str) -> RecoveryPlan: ...
-
-    def save_triage_report(self, report: TriageReport) -> None: ...
-
-    def get_diagnostic(self, request_id: str) -> DiagnosticRequest: ...
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile: ...
 
@@ -877,6 +921,54 @@ class TelemetryStore(Protocol):
         ...
 
 
+class WakeupChannel(StrEnum):
+    """The two NOTIFY channels that wake a poller before its next interval.
+
+    The workflow dispatcher scans on a 5 s poll and the data-plane executor
+    claims on a 2 s poll, so each remediation step paid 5-10 s of pure waiting
+    and an eight-step chain lost about a minute.
+    The processor queue solved the same problem with
+    ``pg_notify('gpu_fault_processor_queue')``; these are the same mechanism
+    for the two remaining pollers. Both names are also the literal channel
+    names in the ``gpu_fault_objects`` trigger (``ddl_wakeups.py``).
+    """
+
+    # A workflow row became executable, or an executable row changed in a way
+    # the dispatcher scan orders on (status, not_before, merge_revision,
+    # execution_owner_id, fencing_token). Payload: ``request_id``,
+    # ``cluster_id``, ``status``, ``not_before``.
+    WORKFLOW_DISPATCH = "gpu_fault_workflow_dispatch"
+    # A remote command was created or changed status (PENDING, LEASED,
+    # WAITING, SUCCEEDED, FAILED). Payload: ``command_id``, ``cluster_id``,
+    # ``workflow_request_id``, ``status``. One channel for both consumers:
+    # the executor claim filters on PENDING, the dispatcher on the terminal
+    # statuses that let a WAITING step advance.
+    REMOTE_COMMAND = "gpu_fault_remote_command"
+
+
+@runtime_checkable
+class WakeupStore(Protocol):
+    def run_wakeup_listener(
+        self,
+        channel: WakeupChannel,
+        stop_event: threading.Event,
+        on_notification: Callable[[dict[str, Any]], None],
+        *,
+        timeout_seconds: float = 1.0,
+        on_state: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Block until ``stop_event`` is set, calling ``on_notification`` with
+        every wakeup payload published on ``channel``.
+
+        Wakeups are hints, not state: delivery is best-effort on every backend
+        (PostgreSQL drops NOTIFY across a reconnect, the in-process hub drops
+        the oldest entries past its bound), so a consumer keeps its polling
+        fallback and treats a payload as "scan now", never as the row itself.
+        ``on_state`` reports connected / disconnected transitions when given.
+        """
+        ...
+
+
 @runtime_checkable
 class NotificationStore(Protocol):
     def save_notification_if_absent(
@@ -913,6 +1005,10 @@ class NotificationStore(Protocol):
     def get_notification_result(
         self, notification_id: str
     ) -> NotificationResult | None: ...
+
+    def get_notification_delivery(
+        self, notification_id: str
+    ) -> NotificationDelivery | None: ...
 
     def enqueue_notification_delivery(
         self,
@@ -962,6 +1058,7 @@ class ControlPlaneStore(
     CompletionStore,
     TelemetryStore,
     NotificationStore,
+    WakeupStore,
     Protocol,
 ):
     """Structural contract consumed by the application layer."""

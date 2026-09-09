@@ -9,13 +9,20 @@ exited 0 in two minutes as UNCHANGED -- the release engine, and with it the
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from scripts import release_deploy, staging_deploy, staging_live_evidence
+from scripts import (
+    release_deploy,
+    release_deploy_profile,
+    staging_deploy,
+    staging_live_evidence,
+)
 
 
 def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -204,9 +211,13 @@ def test_release_deploy_profile_plan_json_is_read_only(
         lambda _site: {"runtime_profile_sha256": "3" * 64},
     )
     monkeypatch.setattr(release_deploy, "plan_runtime_profile", planner)
-    for name in ("verify_attestation", "execute_release", "write_profile_plan"):
+    for module, name in (
+        (release_deploy, "verify_attestation"),
+        (release_deploy, "execute_release"),
+        (release_deploy_profile, "write_profile_plan"),
+    ):
         monkeypatch.setattr(
-            release_deploy,
+            module,
             name,
             lambda *_a, **_k: pytest.fail(f"{name} ran during a read-only plan"),
         )
@@ -229,3 +240,276 @@ def test_release_deploy_profile_plan_json_is_read_only(
     monkeypatch.setattr(release_deploy, "read_live_release_state", missing)
     assert release_deploy.main(["--site", str(site_file), "--profile-plan-json"]) == 0
     assert seen["live"] is None
+
+
+# --- The success record built from the release driver's own files ---------
+#
+# ``apply_source_deploy`` used to end an APPLICATION_RELEASE with a second
+# ``gpu-fault-admin status`` (about 45 seconds) only to read back the release
+# the driver had just committed and summarized. The record is now assembled
+# from ``release-deploy/<id>/state.json`` and ``release-summary.json``; the
+# next run compares it key for key with its own live reading, so the two
+# constructions must agree exactly.
+
+RELEASE_ID = "release-20260908-abc123"
+STATE_SHA = "e" * 64
+PROFILE_SHA = "f" * 64
+POLICY_DIGEST = "c" * 64
+
+
+def _release_summary() -> dict[str, object]:
+    # The shape ``rollout release-summary`` prints, trimmed to what is read.
+    return {
+        "mode": "release-summary",
+        "site_name": "site",
+        "configured_release": {"release_id": RELEASE_ID},
+        "configured_runtime_profile": {
+            "version": "hyperpod-v2",
+            "source_sha256": PROFILE_SHA,
+            "policy_sha256": POLICY_DIGEST,
+        },
+        "live_release": {
+            "release_id": RELEASE_ID,
+            "phase": "complete",
+            "transaction_committed": True,
+            "release_lifecycle": None,
+            "state_sha256": STATE_SHA,
+            "schema_change_acceptance": None,
+        },
+        "next_deploy": {"kind": "NOOP", "changed": []},
+    }
+
+
+def _write_release_record(
+    state_dir: Path,
+    *,
+    release_id: str = RELEASE_ID,
+    phase: str = "COMPLETED",
+    summary: dict[str, object] | None = None,
+) -> Path:
+    record_dir = state_dir / "release-deploy" / release_id
+    record_dir.mkdir(parents=True)
+    summary_path = record_dir / "release-summary.json"
+    summary_path.write_text(
+        json.dumps(summary if summary is not None else _release_summary(), indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    # The fields ``release_deploy.py`` writes on the way to COMPLETED that the
+    # record reader consults; the real file carries the plan and images too.
+    state = {
+        "schema_version": 1,
+        "release_id": release_id,
+        "phase": phase,
+        "profile_change": {
+            "kind": "UNCHANGED",
+            "changes": [],
+            "policy_digest": POLICY_DIGEST,
+            "source_sha256": PROFILE_SHA,
+        },
+        "verification": {
+            "status": "PASSED",
+            "path": str(record_dir / "verification-report.json"),
+            "summary": {"PASS": 12, "WARN": 0, "FAIL": 0, "SKIP": 0},
+        },
+        "release_summary": {
+            "status": "AVAILABLE",
+            "path": str(summary_path),
+            "sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+            "next_deploy": {"kind": "NOOP", "changed": []},
+        },
+    }
+    record = record_dir / "state.json"
+    record.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    return record
+
+
+def _status_report() -> dict[str, object]:
+    return {**_release_summary(), "mode": "status", "healthy": True, "health": {}}
+
+
+def test_release_record_evidence_equals_the_live_status_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    _write_release_record(state_dir)
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[1] == "status", command
+        return _completed(json.dumps(_status_report()))
+
+    monkeypatch.setattr(staging_live_evidence.subprocess, "run", run)
+    # The planner's reading of the live Profile: the live state's
+    # ``runtime_profile_sha256`` is what the engine wrote at commit, i.e. the
+    # configured Profile's source digest, and the policy digest is the plan's.
+    monkeypatch.setattr(
+        staging_live_evidence,
+        "runtime_profile_policy_evidence",
+        lambda *_a, **_k: {
+            "runtime_profile_sha256": PROFILE_SHA,
+            "runtime_profile_policy_digest": POLICY_DIGEST,
+        },
+    )
+
+    from_status = staging_live_evidence.collect_live_deploy_evidence(
+        repository_root=tmp_path / "snapshot",
+        state_dir=state_dir,
+        venv=tmp_path / "venv",
+    )
+    from_record = staging_live_evidence.live_evidence_from_release_record(
+        state_dir=state_dir
+    )
+
+    assert from_record == from_status
+    assert from_record["release_id"] == RELEASE_ID
+    assert from_record["state_sha256"] == STATE_SHA
+    assert staging_live_evidence.successful_source_live_matches(
+        {"live": from_record}, from_status
+    ), "the next run must recognize the record as its own live reading"
+
+
+def test_release_record_evidence_reads_the_newest_completed_record(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    older = _write_release_record(state_dir, release_id="release-old")
+    newer = _write_release_record(state_dir, release_id="release-new")
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newer, (1_700_000_100, 1_700_000_100))
+
+    assert staging_live_evidence.latest_release_record(state_dir) == newer
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    (
+        (lambda state, _summary: state.update(phase="FAILED"), "not COMPLETED"),
+        (
+            lambda state, _summary: state.update(verification={"status": "SKIPPED"}),
+            "no passed verification",
+        ),
+        (
+            lambda state, _summary: state.update(
+                release_summary={"status": "UNAVAILABLE"}
+            ),
+            "no release summary",
+        ),
+        (
+            lambda _state, summary: summary["next_deploy"].update(
+                kind="CONTROL_PLANE_ONLY"
+            ),
+            "committed NOOP release",
+        ),
+        (
+            lambda _state, summary: summary["live_release"].update(
+                transaction_committed=False
+            ),
+            "committed NOOP release",
+        ),
+        (
+            lambda state, _summary: state.update(release_id="somebody-else"),
+            "disagree on the release",
+        ),
+    ),
+)
+def test_release_record_evidence_refuses_an_unfinished_release(
+    tmp_path: Path, mutate, reason: str
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    record = _write_release_record(state_dir)
+    state = json.loads(record.read_text(encoding="utf-8"))
+    summary_path = record.parent / "release-summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    mutate(state, summary)
+    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    state["release_summary"]["sha256"] = hashlib.sha256(
+        summary_path.read_bytes()
+    ).hexdigest()
+    record.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+    with pytest.raises(staging_live_evidence.LiveEvidenceError, match=reason):
+        staging_live_evidence.live_evidence_from_release_record(state_dir=state_dir)
+
+
+def test_release_record_evidence_requires_the_summary_the_record_names(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    record = _write_release_record(state_dir)
+    summary_path = record.parent / "release-summary.json"
+    summary_path.write_text(
+        json.dumps(_release_summary()) + "\n# edited\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        staging_live_evidence.LiveEvidenceError, match="does not match its record"
+    ):
+        staging_live_evidence.live_evidence_from_release_record(state_dir=state_dir)
+
+    (state_dir / "release-deploy").rename(state_dir / "gone")
+    with pytest.raises(staging_live_evidence.LiveEvidenceError, match="no release"):
+        staging_live_evidence.live_evidence_from_release_record(state_dir=state_dir)
+
+
+def test_pre_deploy_gate_accepts_the_quick_status_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-deploy reading is the default ``status``: summary + cheap checks.
+
+    It is ``mode: status`` with ``health_scope: quick`` and no GPU-cluster or
+    role-split checks; the classification only needs the live release identity
+    and a healthy control plane.
+    """
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "site.yaml").write_text("kind: RegionalSite\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        staging_live_evidence,
+        "runtime_profile_policy_evidence",
+        lambda *_a, **_k: {
+            "runtime_profile_sha256": PROFILE_SHA,
+            "runtime_profile_policy_digest": POLICY_DIGEST,
+        },
+    )
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        report = {
+            **_status_report(),
+            "health_scope": "quick",
+            "health": {
+                "mode": "status",
+                "scope": "quick",
+                "healthy": True,
+                "checks": [
+                    {"name": "cpu_workloads", "status": "PASS"},
+                    {"name": "control_api", "status": "PASS"},
+                ],
+            },
+        }
+        return _completed(json.dumps(report))
+
+    monkeypatch.setattr(staging_live_evidence.subprocess, "run", run)
+
+    evidence = staging_live_evidence.collect_live_deploy_evidence(
+        repository_root=tmp_path / "snapshot",
+        state_dir=state_dir,
+        venv=tmp_path / "venv",
+    )
+
+    assert evidence["release_id"] == RELEASE_ID
+    status_command = commands[0]
+    assert status_command[1:] == ["status", "--state-dir", str(state_dir)], (
+        "the gate runs the default (quick) status, not --full"
+    )

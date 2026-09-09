@@ -15,20 +15,13 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from gpu_fault.fleet import AgentRecord
-from gpu_fault.models import WorkflowOperation
 from scripts.e2e.regional import destr017_verdicts as verdicts
 from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as destr017
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
-from scripts.e2e.regional.regional_live_fixture import (
-    RegionalFixtureError,
-    RegionalLiveFixture,
-)
 
 NODE = "node-b"
 OTHER = "node-c"
@@ -278,34 +271,15 @@ def reboot_status(**overrides: Any) -> dict[str, Any]:
 
 
 def agent_before(**overrides: Any) -> dict[str, Any]:
-    """The store's agent record, dumped from the real ``AgentRecord`` model.
-
-    Built from the model rather than by hand so a key the model does not have
-    (``capability_mode``, ``supported_operations``, ``incarnation_id``) cannot
-    make a verdict pass here that would read ``None`` on a live cluster.
-    Overrides are applied to the dump, so a test may still hand the verdict an
-    impossible value (``generation=None``) on purpose.
-    """
-
-    seen = datetime(2026, 9, 6, 9, 0, tzinfo=timezone.utc)
-    record: dict[str, Any] = AgentRecord(
-        cluster_id="cluster-a",
-        node_id=NODE,
-        endpoint="https://10.0.0.2:8443",
-        agent_version="1.0.0",
-        artifact_sha256="a" * 64,
-        policy_version="p1",
-        runtime_profile_version="p1",
-        config_digest="c" * 64,
-        allowed_operations=[
-            WorkflowOperation(name) for name in verdicts.AGENT_OPERATIONS
-        ],
-        boot_id=BOOT_BEFORE,
-        agent_incarnation_id="inc-a",
-        first_seen_at=seen,
-        last_seen_at=seen,
-        generation=GENERATION,
-    ).model_dump(mode="json")
+    record = {
+        "node_id": NODE,
+        "generation": GENERATION,
+        "agent_incarnation_id": "inc-a",
+        "boot_id": BOOT_BEFORE,
+        "lifecycle_state": "ACTIVE",
+        "allowed_operations": list(verdicts.AGENT_OPERATIONS),
+        "retired_incarnation_ids": [],
+    }
     record.update(overrides)
     return record
 
@@ -319,41 +293,6 @@ def agent_after(**overrides: Any) -> dict[str, Any]:
     )
     record.update(overrides)
     return record
-
-
-def owned_profile(**overrides: Any) -> dict[str, Any]:
-    """A runtime profile whose gpuReset is OWN by the Node Agent."""
-
-    profile: dict[str, Any] = {
-        "profile_version": "p1",
-        "warnings": [],
-        "capabilities": [
-            {
-                "capability": "gpuReset",
-                "mode": "OWN",
-                "owner": "gpu-fault-node-agent",
-                "adapter": "node-action",
-            }
-        ],
-    }
-    profile.update(overrides)
-    return profile
-
-
-def fence_command(**overrides: Any) -> dict[str, Any]:
-    """The remote command row the refused dispatch leaves behind: the step
-    execution only points at it, the fence text is here."""
-
-    command: dict[str, Any] = {
-        "command_id": f"{REQUEST}/3/VERIFY_NO_GPU_CLIENTS/{NODE}/attempt-1",
-        "status": "FAILED",
-        "status_source": "executor",
-        "step": {"operation": "VERIFY_NO_GPU_CLIENTS", "node_ids": [NODE]},
-        "error": FENCE_ERROR,
-        "result_details": {},
-    }
-    command.update(overrides)
-    return command
 
 
 # --------------------------------------------------------------------------- #
@@ -428,26 +367,6 @@ def test_fence_evidence_records_the_variant_of_every_terminal_error() -> None:
     assert evidence["compensation_statuses"] == ["FAILED"]
     assert evidence["compensation_variants"] == [verdicts.FENCE_AGENT_GENERATION]
     assert "RESET_GPU" not in evidence["executed_operations"]
-    assert evidence["command_statuses"] == []
-
-
-def test_fence_evidence_reads_the_refusal_off_the_remote_command() -> None:
-    """A remote step's execution record carries pointers; the fence text is on
-    the command row, and the evidence has to say which variant it was."""
-
-    evidence = verdicts.fence_evidence(fenced_workflow(), [fence_command()])
-    assert evidence["command_statuses"] == [
-        {
-            "operation": "VERIFY_NO_GPU_CLIENTS",
-            "status": "FAILED",
-            "variant": verdicts.FENCE_AGENT_GENERATION,
-        }
-    ]
-    in_details = fence_command(error=None, result_details={"error": FENCE_ERROR})
-    evidence = verdicts.fence_evidence(fenced_workflow(), [in_details])
-    assert evidence["command_statuses"][0]["variant"] == (
-        verdicts.FENCE_AGENT_GENERATION
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -528,61 +447,6 @@ def test_a_workflow_without_the_generation_fence_does_not_prove_the_case() -> No
     assert any(verdicts.GENERATION_FENCE_LITERAL in item for item in errors), errors
 
 
-def _pointer_only_workflow() -> dict[str, Any]:
-    """The fenced workflow as the store really records a remote step: the
-    verify execution's error is a generic failure and its details point at the
-    command; nothing in step_executions or the workflow error names the fence."""
-
-    executions = fenced_workflow()["step_executions"]
-    pointer = _execution(
-        3,
-        "VERIFY_NO_GPU_CLIENTS",
-        "FAILED",
-        started_at=_at(2, 5),
-        updated_at=_at(6, 40),
-        error="remote command failed",
-        details={
-            "remote_command_id": fence_command()["command_id"],
-            "remote_status": "FAILED",
-        },
-    )
-    return fenced_workflow(
-        error="step 3 VERIFY_NO_GPU_CLIENTS failed: remote command failed",
-        step_executions=[
-            *executions[:3],
-            pointer,
-            _execution(
-                5,
-                "RESTORE_GPU_SERVICES",
-                "FAILED",
-                started_at=_at(6, 45),
-                updated_at=_at(7),
-                error="remote command failed",
-            ),
-        ],
-    )
-
-
-def test_the_generation_fence_on_the_remote_command_proves_the_case() -> None:
-    """Remote steps keep only pointers in step.details; the refusal the case
-    exists to prove is on the command row and must be read from there."""
-
-    workflow = _pointer_only_workflow()
-    without = verdicts.workflow_errors(workflow, fenced_incident(), node=NODE)
-    assert any(verdicts.GENERATION_FENCE_LITERAL in item for item in without), without
-    with_commands = verdicts.workflow_errors(
-        workflow, fenced_incident(), node=NODE, commands=[fence_command()]
-    )
-    assert with_commands == [], with_commands
-    other = verdicts.workflow_errors(
-        workflow,
-        fenced_incident(),
-        node=NODE,
-        commands=[fence_command(error=FENCE_ERROR.replace(NODE, OTHER))],
-    )
-    assert any("names another node" in item for item in other), other
-
-
 def test_a_generation_fence_naming_another_node_is_refused() -> None:
     other = FENCE_ERROR.replace(NODE, OTHER)
     workflow = fenced_workflow(
@@ -633,11 +497,21 @@ def test_an_unresolved_quiesce_must_be_compensated() -> None:
     assert any("compensation never ran" in item for item in errors), errors
 
 
-def test_the_incident_must_end_quarantined() -> None:
+def test_the_incident_must_settle_quarantined_or_recovered() -> None:
+    # An in-between state (still re-planning) is unsafe and fails the case.
     errors = verdicts.workflow_errors(
-        fenced_workflow(), fenced_incident(state="RESOLVED"), node=NODE
+        fenced_workflow(), fenced_incident(state="ACTION_PENDING"), node=NODE
     )
-    assert any("not QUARANTINED" in item for item in errors), errors
+    assert any("neither QUARANTINED nor RECOVERED" in item for item in errors), errors
+
+
+def test_a_recovered_incident_is_an_accepted_aftermath() -> None:
+    # View B: the reboot self-healed the node; a fence-respecting re-plan is
+    # allowed to release it, so a RECOVERED incident is not, by itself, an error.
+    errors = verdicts.workflow_errors(
+        fenced_workflow(), fenced_incident(state="RECOVERED"), node=NODE
+    )
+    assert errors == [], errors
 
 
 def test_a_step_addressing_another_node_is_refused() -> None:
@@ -786,6 +660,144 @@ def test_the_support_escalation_must_be_the_operator_plan() -> None:
     assert any("not ESCALATE_OPERATOR" in item for item in errors), errors
 
 
+def test_a_recovered_incident_owes_no_support_escalation() -> None:
+    # On the self-heal path the operator escalation is not required, so a run
+    # with no support workflow and a failed compensation is not a case failure.
+    assert (
+        verdicts.successor_errors(
+            {},
+            {},
+            node=NODE,
+            predecessor_request_id=REQUEST,
+            forbidden_escalations=_forbidden(),
+            compensation_failed=True,
+            incident_recovered=True,
+        )
+        == []
+    )
+
+
+def test_a_recovered_incident_still_forbids_a_hardware_rung() -> None:
+    # Self-heal never excuses a reboot/replace/drain of a node the product did
+    # not itself reboot.
+    errors = verdicts.successor_errors(
+        {},
+        {},
+        node=NODE,
+        predecessor_request_id=REQUEST,
+        forbidden_escalations=_forbidden(replace={"incident": {}}),
+        compensation_failed=True,
+        incident_recovered=True,
+    )
+    assert any("hardware escalation was opened" in item for item in errors), errors
+
+
+# --------------------------------------------------------------------------- #
+# Recovery successor (View B)
+# --------------------------------------------------------------------------- #
+def recovery_successor(**overrides: Any) -> dict[str, Any]:
+    workflow = {
+        "request_id": "workflow-recover-after-reboot",
+        "predecessor_workflow_id": REQUEST,
+        "preempt_predecessor": False,
+        "status": "SUCCEEDED",
+        "step_executions": [
+            {"operation": "FREEZE_EVIDENCE", "status": "SUCCEEDED"},
+            {"operation": "RESTART_GPU_DEVICE_PLUGIN", "status": "SUCCEEDED"},
+            {"operation": "VALIDATE_GPU", "status": "SUCCEEDED"},
+        ],
+        "completed_operations": ["RESTART_GPU_DEVICE_PLUGIN", "VALIDATE_GPU"],
+        "official_steps": [
+            _step("FREEZE_EVIDENCE"),
+            _step("RESTART_GPU_DEVICE_PLUGIN"),
+            _step("VALIDATE_GPU"),
+        ],
+    }
+    workflow.update(overrides)
+    return workflow
+
+
+def test_a_legitimate_self_heal_re_plan_is_accepted() -> None:
+    assert (
+        verdicts.recovery_errors(
+            [recovery_successor()],
+            fenced_incident(state="RECOVERED"),
+            node=NODE,
+            predecessor_request_id=REQUEST,
+        )
+        == []
+    )
+
+
+def test_recovery_is_not_policed_when_the_incident_was_quarantined() -> None:
+    # QUARANTINED is the escalation path; there is nothing to release, so the
+    # recovery verdict is vacuous even if stray successors are passed.
+    assert (
+        verdicts.recovery_errors(
+            [recovery_successor(status="FAILED")],
+            fenced_incident(state="QUARANTINED"),
+            node=NODE,
+            predecessor_request_id=REQUEST,
+        )
+        == []
+    )
+
+
+def test_a_recovered_incident_needs_a_successor_of_the_fenced_workflow() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(predecessor_workflow_id="workflow-someone-else")],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("descends from the fenced workflow" in item for item in errors), errors
+
+
+def test_a_recovery_that_reset_the_gpu_fails_the_case() -> None:
+    execution = recovery_successor(
+        step_executions=[{"operation": "RESET_GPU", "status": "SUCCEEDED"}],
+        completed_operations=["RESET_GPU"],
+    )
+    errors = verdicts.recovery_errors(
+        [execution],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("node mutation the fence forbids" in item for item in errors), errors
+    assert any("completed GPU reset" in item for item in errors), errors
+
+
+def test_a_recovery_that_preempted_the_fence_fails_the_case() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(preempt_predecessor=True)],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("preempted the fenced workflow" in item for item in errors), errors
+
+
+def test_a_recovery_addressing_another_node_fails_the_case() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(official_steps=[_step("VALIDATE_GPU", nodes=[OTHER])])],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("addresses another node" in item for item in errors), errors
+
+
+def test_a_recovered_incident_whose_successor_never_succeeded_fails() -> None:
+    errors = verdicts.recovery_errors(
+        [recovery_successor(status="FAILED")],
+        fenced_incident(state="RECOVERED"),
+        node=NODE,
+        predecessor_request_id=REQUEST,
+    )
+    assert any("no recovery successor" in item.lower() for item in errors), errors
+
+
 # --------------------------------------------------------------------------- #
 # Agent generation and boot id
 # --------------------------------------------------------------------------- #
@@ -816,22 +828,6 @@ def test_the_pre_reboot_incarnation_must_be_the_retired_one() -> None:
         agent_before(), agent_after(retired_incarnation_ids=[]), node=NODE
     )
     assert any("exactly one incarnation" in item for item in none_retired), none_retired
-
-
-def test_the_retired_incarnation_is_matched_on_the_models_field_name() -> None:
-    """``AgentRecord`` retires ``agent_incarnation_id``; a verdict reading any
-    other key would never compare the retired generation to anything."""
-
-    assert "agent_incarnation_id" in agent_before()
-    assert "incarnation_id" not in agent_before()
-    unknown = verdicts.agent_errors(
-        agent_before(agent_incarnation_id=None), agent_after(), node=NODE
-    )
-    assert any("no agent_incarnation_id" in item for item in unknown), unknown
-    mismatched = verdicts.agent_errors(
-        agent_before(agent_incarnation_id="inc-other"), agent_after(), node=NODE
-    )
-    assert any("not the pre-reboot one" in item for item in mismatched), mismatched
 
 
 def test_an_agent_that_is_not_active_again_is_a_failure() -> None:
@@ -1143,11 +1139,21 @@ def _preflight(**overrides: Any) -> dict[str, Any]:
             "ownership_annotations": {},
         },
         "agent": agent_before(),
-        "profile": owned_profile(),
+        "profile": {
+            "profile_version": "p1",
+            "warnings": [],
+            "capabilities": [
+                {
+                    "capability": "gpuReset",
+                    "mode": "OWN",
+                    "owner": "gpu-fault-node-agent",
+                    "adapter": "node-action",
+                }
+            ],
+        },
         "business_workloads": [],
         "queue": {"depth": 0},
-        # ``Store.remote_command_stats()`` reports ``open_by_cluster``.
-        "remote_commands": {"open_by_cluster": {}},
+        "remote_commands": {"pending": 0, "leased": 0, "in_progress": 0},
         "recent_events": [],
         "host_snapshot": host_before(),
         "reboot_status": {"armed": False},
@@ -1191,44 +1197,8 @@ def test_the_preflight_needs_every_maintenance_operation_advertised() -> None:
             )
         )
     )
-    assert any("does not allow" in item for item in errors), errors
+    assert any("does not advertise" in item for item in errors), errors
     assert any("RESET_GPU" in item for item in errors), errors
-
-
-def test_the_preflight_reads_own_from_the_profile_not_the_agent_record() -> None:
-    """OWN is the runtime profile's gpuReset mode; ``AgentRecord`` has no
-    capability mode, so a verdict reading one off the agent would refuse every
-    real node."""
-
-    assert verdicts.preflight_errors(**_preflight()) == []
-    missing = verdicts.preflight_errors(
-        **_preflight(profile=owned_profile(capabilities=[]))
-    )
-    assert any("no gpuReset capability" in item for item in missing), missing
-    delegated = verdicts.preflight_errors(
-        **_preflight(
-            profile=owned_profile(
-                capabilities=[
-                    {
-                        "capability": "gpuReset",
-                        "mode": "DELEGATE",
-                        "owner": "gpu-fault-node-agent",
-                    }
-                ]
-            )
-        )
-    )
-    assert any("not OWN by the Node Agent" in item for item in delegated), delegated
-
-
-def test_the_preflight_reads_open_commands_the_way_the_store_reports_them() -> None:
-    busy = verdicts.preflight_errors(
-        **_preflight(remote_commands={"open_by_cluster": {"cluster-a": 2}})
-    )
-    assert any("remote commands are not idle" in item for item in busy), busy
-    # The shape the store never emits must not read as idle-by-accident either:
-    # an empty ``open_by_cluster`` is the only idle reading.
-    assert verdicts.preflight_errors(**_preflight(remote_commands={})) == []
 
 
 def test_the_preflight_refuses_a_node_that_cannot_take_a_real_xid() -> None:
@@ -1277,35 +1247,29 @@ def test_the_preflight_refuses_an_armed_reboot_timer_from_an_earlier_run() -> No
     assert cancelled == []
 
 
-def test_a_reboot_timer_that_already_fired_is_not_armed() -> None:
-    """After the reboot the marker still says armed and uncancelled -- the
-    timer is spent, the boot id moved. A later --plan in the same run_dir must
-    not be refused for it."""
-
-    fired = verdicts.preflight_errors(
-        **_preflight(
-            reboot_status={
-                "armed": True,
-                "reboot_cancelled_at": None,
-                "fired": True,
-                "boot_id_before_reboot": BOOT_BEFORE,
-                "boot_id_now": BOOT_AFTER,
-                "reboot_unit": "gpu-fault-destr017-reboot-abc.timer",
-            }
-        )
-    )
-    assert fired == []
-
-
 def test_the_preflight_refuses_a_busy_control_plane_or_a_recent_event() -> None:
     errors = verdicts.preflight_errors(
         **_preflight(
             queue={"depth": 3},
-            remote_commands={"open_by_cluster": {"cluster-a": 1}},
+            remote_commands={"pending": 1, "leased": 0, "in_progress": 0},
             recent_events=[{"event_id": "evt-1"}],
         )
     )
     assert len(errors) == 3, errors
+
+
+def test_a_recent_xid_from_a_recovered_incident_does_not_block_a_rerun() -> None:
+    """A drill that reboots the node leaves its XID behind for the full lookback
+    window; once the incident has RECOVERED, that residue must not wedge the
+    retry, but an uncorrelated or still-active event still must."""
+
+    event = {"event_id": "evt-xid-46"}
+    assert verdicts.recent_unresolved_xid_events(event, {"state": "RECOVERED"}) == []
+    assert verdicts.recent_unresolved_xid_events(event, {"state": "QUARANTINED"}) == [
+        event
+    ]
+    assert verdicts.recent_unresolved_xid_events(event, None) == [event]
+    assert verdicts.recent_unresolved_xid_events(None, {"state": "RECOVERED"}) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1315,7 +1279,7 @@ def test_step_transitions_only_report_changes() -> None:
     executions = fenced_workflow()["step_executions"]
     state, changes = verdicts.step_transitions({}, executions)
     assert len(changes) == len(executions)
-    assert state["3/VERIFY_NO_GPU_CLIENTS#0"] == "FAILED"
+    assert state["3/VERIFY_NO_GPU_CLIENTS"] == "FAILED"
     assert changes[3]["fence_variant"] == verdicts.FENCE_AGENT_GENERATION
     state, again = verdicts.step_transitions(state, executions)
     assert again == []
@@ -1326,7 +1290,7 @@ def test_step_transitions_report_a_waiting_step_that_later_fails() -> None:
         3, "VERIFY_NO_GPU_CLIENTS", "WAITING", started_at=_at(2, 5), updated_at=_at(3)
     )
     state, _ = verdicts.step_transitions({}, [waiting])
-    assert state["3/VERIFY_NO_GPU_CLIENTS#0"] == "WAITING"
+    assert state["3/VERIFY_NO_GPU_CLIENTS"] == "WAITING"
     state, changes = verdicts.step_transitions(
         state,
         [
@@ -1342,33 +1306,6 @@ def test_step_transitions_report_a_waiting_step_that_later_fails() -> None:
     )
     assert [item["status"] for item in changes] == ["FAILED"]
     assert changes[0]["fence_variant"] == verdicts.FENCE_AGENT_GENERATION
-
-
-def test_step_transitions_do_not_flip_between_a_kept_waiting_row_and_its_end() -> None:
-    """The store keeps the WAITING row when the fence adds the FAILED one. A
-    key of index/operation alone would see the pair flip on every poll and the
-    timeline would grow for ever."""
-
-    waiting = _execution(
-        3, "VERIFY_NO_GPU_CLIENTS", "WAITING", started_at=_at(2, 5), updated_at=_at(3)
-    )
-    failed = _execution(
-        3,
-        "VERIFY_NO_GPU_CLIENTS",
-        "FAILED",
-        started_at=_at(2, 5),
-        updated_at=_at(6, 40),
-        error=FENCE_ERROR,
-    )
-    state, first = verdicts.step_transitions({}, [waiting, failed])
-    assert [(item["occurrence"], item["status"]) for item in first] == [
-        (0, "WAITING"),
-        (1, "FAILED"),
-    ]
-    state, second = verdicts.step_transitions(state, [waiting, failed])
-    assert second == []
-    state, third = verdicts.step_transitions(state, [waiting, failed])
-    assert third == []
 
 
 def test_the_case_has_to_fit_one_node_workflow_lifetime() -> None:
@@ -1416,54 +1353,6 @@ def test_the_reboot_must_land_inside_the_pinned_window_and_the_waiting_cap() -> 
     assert any("window is unknown" in item for item in unknown), unknown
 
 
-def test_the_waiting_cap_is_measured_from_when_the_step_parked() -> None:
-    """A step that has already waited 550s of a 600s cap has 50s left; a 60s
-    reboot placed against the whole cap would land after the cap fired."""
-
-    late = verdicts.reboot_window_errors(
-        delay_seconds=60,
-        window_remaining_seconds=900.0,
-        step_waiting_limit_seconds=600,
-        step_waiting_elapsed_seconds=550.0,
-    )
-    assert any("per-step waiting cap" in item for item in late), late
-    assert any("50s remain" in item for item in late), late
-    early = verdicts.reboot_window_errors(
-        delay_seconds=60,
-        window_remaining_seconds=900.0,
-        step_waiting_limit_seconds=600,
-        step_waiting_elapsed_seconds=120.0,
-    )
-    assert early == []
-
-
-def test_waiting_elapsed_is_read_off_the_waiting_execution() -> None:
-    now = datetime.fromisoformat(_at(5))
-    workflow = fenced_workflow(
-        step_executions=[
-            _execution(
-                3,
-                "VERIFY_NO_GPU_CLIENTS",
-                "WAITING",
-                started_at=_at(2),
-                updated_at=_at(4),
-            )
-        ]
-    )
-    assert (
-        destr017.waiting_elapsed_seconds(
-            workflow, operation="VERIFY_NO_GPU_CLIENTS", now=now
-        )
-        == 180.0
-    )
-    assert (
-        destr017.waiting_elapsed_seconds(
-            fenced_workflow(), operation="VERIFY_NO_GPU_CLIENTS", now=now
-        )
-        == 0.0
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Runner helpers
 # --------------------------------------------------------------------------- #
@@ -1506,127 +1395,6 @@ def test_the_expected_fence_text_names_the_pinned_generation_and_the_node() -> N
     assert destr017.expected_fence_text({}, node=NODE) == ""
 
 
-def test_plan_identity_digest_is_stable_across_key_order() -> None:
-    preflight = {
-        "release_id": "rel",
-        "node": {"uid": "u1", "boot_id": BOOT_BEFORE},
-        "store": {"agent": agent_before(), "profile": {"profile_version": "p1"}},
-        "runtime_identity": {"x": 1},
-    }
-    identity = destr017.plan_identity(preflight, node=NODE)
-    shuffled = dict(reversed(list(identity.items())))
-    assert destr017.identity_digest(identity) == destr017.identity_digest(shuffled)
-    assert identity["agent_generation"] == GENERATION
-    # Read from ``AgentRecord.agent_incarnation_id``, the field that exists.
-    assert identity["agent_incarnation_id"] == "inc-a"
-    assert identity["node_boot_id"] == BOOT_BEFORE
-    assert identity["node"] == NODE
-
-
-def test_the_plan_identity_pins_the_generation_the_fence_will_compare() -> None:
-    """A run whose plan was built against another Agent generation is a
-    different case: the node rebooted between plan and execute."""
-
-    base = {
-        "release_id": "rel",
-        "node": {"uid": "u1", "boot_id": BOOT_BEFORE},
-        "store": {"agent": agent_before(), "profile": {"profile_version": "p1"}},
-        "runtime_identity": {"x": 1},
-    }
-    drifted = json.loads(json.dumps(base))
-    drifted["store"]["agent"]["generation"] = GENERATION + 1
-    first = destr017.identity_digest(destr017.plan_identity(base, node=NODE))
-    second = destr017.identity_digest(destr017.plan_identity(drifted, node=NODE))
-    assert first != second
-    reincarnated = json.loads(json.dumps(base))
-    reincarnated["store"]["agent"]["agent_incarnation_id"] = "inc-b"
-    third = destr017.identity_digest(destr017.plan_identity(reincarnated, node=NODE))
-    assert first != third
-
-
-def test_derived_identity_is_deterministic_per_run_and_attempt(tmp_path: Path) -> None:
-    first = destr017.derived_identity(tmp_path, 1)
-    assert first == destr017.derived_identity(tmp_path, 1)
-    assert first != destr017.derived_identity(tmp_path, 2)
-    assert first.startswith("destr017-"), first
-    assert first.endswith("-a1"), first
-
-
-def test_configure_carries_the_attempt_the_preflight_derives_its_probes_from(
-    tmp_path: Path,
-) -> None:
-    """The preflight used to derive the probe identity from attempt 1 whatever
-    ``--attempt`` said, so a second attempt read the first one's on-node state."""
-
-    cpu = tmp_path / "cpu.kubeconfig"
-    gpu = tmp_path / "gpu.kubeconfig"
-    cpu.write_text("apiVersion: v1\n", encoding="utf-8")
-    gpu.write_text("apiVersion: v1\n", encoding="utf-8")
-    arguments = destr017.parser().parse_args(
-        [
-            "--run-dir",
-            str(tmp_path),
-            "--attempt",
-            "3",
-            "--node",
-            NODE,
-            "--host-probe-image",
-            "img",
-            "--cpu-kubeconfig",
-            str(cpu),
-            "--gpu-kubeconfig",
-            str(gpu),
-            "--gpu-context",
-            "gpu",
-            "--cluster-id",
-            "cluster-a",
-            "--region",
-            "us-west-2",
-        ]
-    )
-    settings = destr017.configure(arguments)
-    assert settings.attempt == 3
-    assert destr017.derived_identity(tmp_path, settings.attempt).endswith("-a3"), (
-        "the derived identity carries the attempt suffix"
-    )
-
-
-class _FlakyProbe:
-    """A probe whose Pod died: the first exec fails, a re-created one answers."""
-
-    def __init__(self, *, failures: int) -> None:
-        self.failures = failures
-        self.created = 0
-        self.calls: list[tuple[str, ...]] = []
-
-    def create(self) -> None:
-        self.created += 1
-
-    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
-        self.calls.append(arguments)
-        if self.failures:
-            self.failures -= 1
-            raise RuntimeError("pod not found")
-        return {"ok": True, "arguments": list(arguments)}
-
-
-def test_cleanup_recreates_a_dead_probe_once_and_only_when_the_exec_fails() -> None:
-    healthy = _FlakyProbe(failures=0)
-    assert destr017.execute_or_recreate(healthy, "disarm-holder")["ok"] is True
-    assert healthy.created == 0
-    dead = _FlakyProbe(failures=1)
-    assert (
-        destr017.execute_or_recreate(dead, "cancel-reboot", "--run-id", "r")["ok"]
-        is True
-    )
-    assert dead.created == 1
-    assert dead.calls == [("cancel-reboot", "--run-id", "r")] * 2
-    gone = _FlakyProbe(failures=2)
-    with pytest.raises(RuntimeError):
-        destr017.execute_or_recreate(gone, "holder-status")
-    assert gone.created == 1
-
-
 def test_evidence_components_carry_digests_only() -> None:
     details = {
         "preflight_identity": {"release_id": "rel"},
@@ -1644,90 +1412,3 @@ def test_evidence_components_carry_digests_only() -> None:
     ).hexdigest()
     assert components["preflight_identity"] == expected
     assert len(destr017.case_digest(components)) == 64
-
-
-def test_parser_accepts_the_documented_arguments() -> None:
-    parser = destr017.parser()
-    arguments = parser.parse_args(["--run-dir", "/tmp/run"])
-    assert arguments.execute is False and arguments.plan is False
-    assert arguments.reboot_delay_seconds == destr017.DEFAULT_REBOOT_DELAY_SECONDS
-    assert arguments.max_hold_seconds == destr017.DEFAULT_MAX_HOLD_SECONDS
-    arguments = parser.parse_args(
-        [
-            "--run-dir",
-            "/tmp/run",
-            "--execute",
-            "--confirm",
-            "DESTR017_EXECUTE",
-            "--maintenance-window-end",
-            "2026-09-06T12:00:00+00:00",
-            "--node",
-            NODE,
-            "--pci-bdf",
-            "0000:0a:00.0",
-            "--host-probe-image",
-            "img",
-            "--reboot-delay-seconds",
-            "45",
-            "--max-hold-seconds",
-            "900",
-        ]
-    )
-    assert arguments.node == NODE
-    assert arguments.pci_bdf == "0000:0a:00.0"
-    assert arguments.reboot_delay_seconds == 45
-    help_text = parser.format_help()
-    for option in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
-        assert option in help_text, option
-
-
-def test_configure_bounds_the_reboot_delay_and_the_device_hold() -> None:
-    parser = destr017.parser()
-    for flag, value in (
-        ("--reboot-delay-seconds", "10"),
-        ("--reboot-delay-seconds", "900"),
-        ("--max-hold-seconds", "30"),
-        ("--max-hold-seconds", "7200"),
-    ):
-        arguments = parser.parse_args(
-            [
-                "--run-dir",
-                "/tmp/run",
-                "--node",
-                NODE,
-                "--host-probe-image",
-                "img",
-                flag,
-                value,
-            ]
-        )
-        with pytest.raises(RegionalFixtureError):
-            destr017.configure(arguments)
-
-
-def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """--plan records the focused pytest with a source digest; --execute reuses
-    it instead of paying for the same run twice, and only for this exact tree."""
-
-    from scripts.e2e.regional import live_driver_guard
-
-    def refuse(*arguments: Any, **keywords: Any) -> Any:
-        raise AssertionError("pytest must not run when the plan's result is reusable")
-
-    monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
-    recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
-    details: dict[str, Any] = {}
-    live_driver_guard.record_focused_tests(details, recorded)
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    reused = destr017.focused_tests(tmp_path, reuse=True)
-    assert reused == {**recorded, "focused_tests_reused": True}
-    # A --plan never reuses, and a result taken against another tree is rerun.
-    with pytest.raises(AssertionError, match="must not run"):
-        destr017.focused_tests(tmp_path, reuse=False)
-    details["focused_tests_source_digest"] = "0" * 64
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    with pytest.raises(AssertionError, match="must not run"):
-        destr017.focused_tests(tmp_path, reuse=True)

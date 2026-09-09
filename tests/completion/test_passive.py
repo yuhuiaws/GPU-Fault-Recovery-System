@@ -23,8 +23,6 @@ from gpu_fault.models import (
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
     WorkflowOperation,
     WorkflowStatus,
     recovery_action_sort_key,
@@ -295,36 +293,6 @@ def test_recovery_action_rank_is_exhaustive_and_deterministic() -> None:
         [RecoveryAction.QUARANTINE, RecoveryAction.DRAIN], key=recovery_action_sort_key
     )
     assert left is right is RecoveryAction.QUARANTINE
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-def test_triage_operator_escalation_beats_workload_restart(
-    failed_event: TerminalEvent, reverse: bool
-) -> None:
-    findings = [
-        TriageFinding(
-            node_id="node-a",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.ESCALATE_OPERATOR,
-        ),
-        TriageFinding(
-            node_id="node-a",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.RESTART_WORKLOAD,
-        ),
-    ]
-    if reverse:
-        findings.reverse()
-
-    plan = PlanBuilder().from_triage(
-        failed_event, findings, default_simulated_profile()
-    )
-
-    assert [step.action for step in plan.steps] == [
-        RecoveryAction.MARK_UNSCHEDULABLE,
-        RecoveryAction.QUARANTINE,
-        RecoveryAction.ESCALATE_OPERATOR,
-    ]
 
 
 def test_missing_terminal_capability_keeps_containment_and_support(

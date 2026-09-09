@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import Field, field_validator
 
+from gpu_fault.channel_registry import ATTEMPT_COVERAGE_PATH as _ATTEMPT_COVERAGE_PATH
+
 # ``CollectorKind`` and the producer view are rows of the collector registry;
 # they keep their historical import path here.
 from gpu_fault.collector_registry import (
@@ -139,10 +141,13 @@ class EvidenceService:
         return record
 
 
-#: Where the Completion Watcher posts :class:`WorkloadCoverageHeartbeat`. It is
-#: deliberately not a ``CHANNEL_REGISTRY`` channel: the heartbeat carries no
-#: attempt, needs no receipt and is superseded by the next pass.
-ATTEMPT_COVERAGE_PATH = "/v1/attempts/coverage"
+#: Where the Completion Watcher posts :class:`WorkloadCoverageHeartbeat`. The
+#: path is registered in ``CHANNEL_REGISTRY`` as a ROUTINE latest-wins channel
+#: (tier 100, coalesced per cluster, outside the fault reserve): the heartbeat
+#: carries no attempt, needs no receipt and is superseded by the next pass. The
+#: literal lives in ``channel_registry`` so the route and the channel cannot
+#: drift apart.
+ATTEMPT_COVERAGE_PATH = _ATTEMPT_COVERAGE_PATH
 
 
 class WorkloadCoverageHeartbeat(StrictModel):
@@ -265,6 +270,19 @@ class WorkloadContext(StrictModel):
 
 
 class WorkloadTopologyService:
+    # How many of a cluster's newest attempt observations one ``resolve`` reads
+    # from the store. Matching looks ``max_age_seconds`` (two minutes) back and
+    # coverage is decided by the newest observation alone, so the week of
+    # attempts the table retains has nothing to add; before this bound every
+    # fault event materialised all of them and filtered in Python, O(events x
+    # attempts) on a busy cluster (性能 2). The store keeps one row per attempt,
+    # so 512 is 512 distinct attempts observed inside two minutes on one
+    # cluster -- far above what a watcher scan reports, so the bound is a
+    # ceiling on pathological churn rather than something the loop reaches.
+    # Too small would drop in-window attempts (a missed ACTIVE); too large only
+    # costs the rows it fetches, so it errs generously.
+    OBSERVATION_SCAN_LIMIT = 512
+
     def __init__(
         self,
         store,
@@ -395,7 +413,18 @@ class WorkloadTopologyService:
         ``observations`` lets a caller that resolves several nodes of the
         same cluster in one go read the cluster's observations once
         instead of once per node; the age filter below is what bounds
-        staleness either way.
+        staleness either way. Such a list is taken as given, in any order.
+
+        Without it the store is read newest-first and bounded to
+        ``OBSERVATION_SCAN_LIMIT`` rows. That is safe because the answer only
+        depends on the freshest rows: ``covered`` needs one observation within
+        ``freshness_seconds``, which the newest either is or nothing is; and a
+        match needs an observation within ``max_age_seconds``, so the walk
+        stops at the first one older than that -- every later row is older
+        still (``newest_first`` orders by ``observed_at`` in every store).
+        Observations slightly *ahead* of ``observed_at`` (clock skew between
+        watcher and collector) have a negative age, sort first, and match as
+        they always did.
 
         ``workload_state`` fails closed: IDLE needs fresh coverage of the
         cluster that simply does not name this node. Coverage is either a fresh
@@ -403,19 +432,37 @@ class WorkloadTopologyService:
         ``freshness_seconds``) or -- for a cluster that is running nothing at
         all, and therefore publishes no observation -- the watcher's own
         full-pass heartbeat within ``coverage_freshness_seconds`` that saw
-        nothing running at all. A cluster
-        with neither -- the watcher down, the feed stale -- is UNKNOWN, which
-        the compilers treat as "someone may be using it" (design: monitoring
-        loss is Unknown; ARCH-E2E-1 finding 2, completion-watcher F4).
+        nothing running at all (``_covered_by_heartbeat``). A cluster with
+        neither -- the watcher down, the cluster silent, a stale feed -- is
+        UNKNOWN, which the compilers treat as "someone may be using it"
+        (design: monitoring loss is Unknown; ARCH-E2E-1 finding 2,
+        completion-watcher F4).
         """
 
+        # A caller-supplied list carries no ordering promise, so it is scanned
+        # whole; only the store read below is known to be newest-first.
+        newest_first = observations is None
         if observations is None:
-            observations = self.store.list_attempt_observations(cluster_id)
-        covered = any(
-            (observed_at - observation.observed_at).total_seconds()
-            <= self.freshness_seconds
-            for observation in observations
-        ) or self._covered_by_heartbeat(cluster_id, observed_at)
+            observations = [
+                state.observation
+                for state in self.store.list_attempt_observation_states(
+                    cluster_id,
+                    limit=self.OBSERVATION_SCAN_LIMIT,
+                    newest_first=True,
+                )
+            ]
+        if newest_first:
+            covered = bool(observations) and (
+                (observed_at - observations[0].observed_at).total_seconds()
+                <= self.freshness_seconds
+            )
+        else:
+            covered = any(
+                (observed_at - observation.observed_at).total_seconds()
+                <= self.freshness_seconds
+                for observation in observations
+            )
+        covered = covered or self._covered_by_heartbeat(cluster_id, observed_at)
         workloads: list[str] = []
         jobs: list[str] = []
         attempts: list[str] = []
@@ -424,7 +471,12 @@ class WorkloadTopologyService:
         profiles: list[str] = []
         for observation in observations:
             age = (observed_at - observation.observed_at).total_seconds()
-            if age > self.max_age_seconds or observation.workload_phase not in {
+            if age > self.max_age_seconds:
+                if newest_first:
+                    # Newest-first: everything after this row is older still.
+                    break
+                continue
+            if observation.workload_phase not in {
                 WorkloadPhase.PENDING,
                 WorkloadPhase.RUNNING,
             }:

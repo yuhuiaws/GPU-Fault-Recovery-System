@@ -9,13 +9,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
-from gpu_fault.models import WorkloadState
-from gpu_fault.host_health import (
-    HostMetricSample,
-    HostTelemetryBatch,
-)
-
-
 from gpu_fault.collectors.cloud.cloudwatch import HMA_KEYS
 from gpu_fault.collectors.gpu.discovery import (
     INSTANCE_ACCELERATOR_COUNTS,
@@ -27,6 +20,11 @@ from gpu_fault.collectors.sinks import (
     EventSink,
     deliver_or_raise,
 )
+from gpu_fault.host_health import (
+    HostMetricSample,
+    HostTelemetryBatch,
+)
+from gpu_fault.models import WorkloadState
 
 LOGGER = logging.getLogger(__name__)
 

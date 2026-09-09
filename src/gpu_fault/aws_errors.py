@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 #: ``botocore.exceptions`` classes that mean "no usable credentials" or
 #: "the SDK cannot work out where/who to be". Every one of these is
 #: raised before a request is signed, so none of them can be a transient

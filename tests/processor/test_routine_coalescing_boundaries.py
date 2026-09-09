@@ -127,3 +127,42 @@ def test_routine_sample_coalesces_only_with_its_own_path(processor_store) -> Non
     assert processor_store.get_processor_request(other_channel.request_id).path == (
         "/v1/collector-events/gpu-metrics"
     )
+
+
+def test_coalescing_keeps_the_pending_rows_retry_schedule(processor_store) -> None:
+    """B-5: a fresh sample carries ``retry_count=0`` / ``not_before=None`` and
+    must not reset the backoff a failed execution left on the pending row."""
+
+    from datetime import datetime, timedelta, timezone
+
+    first, _ = _enqueue(
+        processor_store, "/v1/collector-events/host-telemetry", _summary()
+    )
+    [claimed] = processor_store.claim_active_processor_requests(
+        "worker-a",
+        now=datetime.now(timezone.utc),
+        lease_duration=timedelta(seconds=120),
+        limit=1,
+    )
+    not_before = datetime.now(timezone.utc) + timedelta(seconds=30)
+    processor_store.release_active_processor_request(
+        claimed.request_id,
+        "worker-a",
+        claimed.leader_epoch,
+        claimed.lease_token,
+        not_before=not_before,
+        retry_count=2,
+    )
+
+    merged, reason = _enqueue(
+        processor_store,
+        "/v1/collector-events/host-telemetry",
+        b'{"node_id":"node-a","summary":true,"seq":2}',
+    )
+
+    assert reason == "coalesced"
+    assert merged.request_id == first.request_id
+    stored = processor_store.get_processor_request(first.request_id)
+    assert stored.retry_count == 2
+    assert stored.not_before == not_before
+    assert b'"seq":2' in stored.body()

@@ -3,8 +3,10 @@
 Each is one flag on the public command and one environment variable the engine
 reads. The deploy is a chain of processes that each inherit their environment,
 so the CLI sets the variable once and never threads a new argument through the
-source preparer, the inner CLI or the release driver. An explicit environment
-value always wins over the flag, as with the other release-engine variables.
+source preparer, the inner CLI or the release driver. The flag on the command
+wins; the environment is consulted only when no flag was given (a stale
+``export`` from an earlier session must not override what the operator typed,
+and the child processes inherit it unchanged anyway).
 
 The variable spellings mirror the engine's constants
 (``regional_schema_change``, ``regional_admin_commands``,
@@ -15,7 +17,6 @@ not depend on the release engine package. Tests pin each pair equal.
 from __future__ import annotations
 
 import argparse
-import os
 
 ACCEPT_SCHEMA_CHANGE_ENV = "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE"
 SCHEMA_CHANGE_SNAPSHOT_MODE = "snapshot"
@@ -38,8 +39,6 @@ def schema_change_environment(arguments: argparse.Namespace) -> dict[str, str]:
     on an ordinary release is harmless.
     """
 
-    if os.environ.get(ACCEPT_SCHEMA_CHANGE_ENV, "").strip():
-        return {}
     if getattr(arguments, "accept_schema_change_without_snapshot", False):
         return {ACCEPT_SCHEMA_CHANGE_ENV: SCHEMA_CHANGE_NO_SNAPSHOT_MODE}
     if getattr(arguments, "accept_schema_change", False):
@@ -60,8 +59,6 @@ def supersede_environment(arguments: argparse.Namespace) -> dict[str, str]:
     habit.
     """
 
-    if os.environ.get(SUPERSEDE_FAILED_TRANSACTION_ENV, "").strip():
-        return {}
     if getattr(arguments, "supersede_failed_transaction", False):
         return {SUPERSEDE_FAILED_TRANSACTION_ENV: "1"}
     return {}
@@ -80,8 +77,6 @@ def inflight_installs_environment(arguments: argparse.Namespace) -> dict[str, st
     refusing.
     """
 
-    if os.environ.get(ALLOW_INFLIGHT_INSTALLS_ENV, "").strip():
-        return {}
     if getattr(arguments, "allow_inflight_installs", False):
         return {ALLOW_INFLIGHT_INSTALLS_ENV: "1"}
     return {}

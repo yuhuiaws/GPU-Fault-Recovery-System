@@ -107,7 +107,15 @@ def test_an_unrecognised_internal_error_leaves_the_workflow_executable() -> None
     )
 
 
-def test_a_record_that_cannot_be_validated_is_blocked_as_internal_error() -> None:
+def test_a_validation_error_raised_by_an_adapter_is_not_proof_the_record_is_bad() -> (
+    None
+):
+    """Control-plane review 2026-09-08, D-5. A pydantic decode failure under
+    ``execute()`` is raised for a plan row, a remote command's snapshot or an
+    adapter's own model as readily as for the workflow row -- a rolling release
+    makes exactly that happen -- so it no longer blocks. Only the decode of the
+    workflow row itself does (``test_blocking_internal_errors.py``)."""
+
     store = build_store()
     incident, workflow = workflow_state(store, [OP])
     try:
@@ -124,13 +132,16 @@ def test_a_record_that_cannot_be_validated_is_blocked_as_internal_error() -> Non
     first = dispatcher.run_once()
     second = dispatcher.run_once()
 
-    blocked = store.get_workflow(workflow.request_id)
-    assert blocked.status is WorkflowStatus.BLOCKED
-    assert blocked.blocked_kind is BlockedKind.INTERNAL_ERROR
-    assert "dispatcher internal error: ValidationError" in blocked.blocked_reasons[-1]
-    assert first.failed == 1
-    assert second.scanned == 0
-    assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+    current = store.get_workflow(workflow.request_id)
+    assert current.status is WorkflowStatus.PENDING
+    assert current.blocked_kind is None
+    assert current.not_before is not None
+    assert first.internal_errors == 1
+    assert first.failed == 0
+    assert second.filtered.get("not_before") == 1
+    assert (
+        store.get_incident(incident.incident_id).state is IncidentState.ACTION_PENDING
+    )
 
 
 # ---------------------------------------------------------------- F-A4

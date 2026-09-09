@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.node_agent.ledger import LEDGER_SCHEMA_VERSION
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
 
 CASE_ID = "GF-REGIONAL-DESTR-019"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-010"
@@ -148,7 +149,7 @@ def preflight_errors(
         errors.append("target Node Agent has no generation")
     if profile.get("warnings"):
         errors.append("runtime profile has warnings")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty")

@@ -109,8 +109,8 @@ def test_completion_decision_and_incident_state_gauges_count_store_rows(
             cluster_id="cluster-a",
             attempt_id="attempt-1",
             event_key="cluster-a/attempt-1/TrainingAttemptTerminal",
-            status=DecisionStatus.PENDING_TRIAGE,
-            reason="triage submitted",
+            status=DecisionStatus.NO_ACTION,
+            reason="no fault evidence",
         )
     )
     context.store.save_incident(
@@ -123,7 +123,7 @@ def test_completion_decision_and_incident_state_gauges_count_store_rows(
     text = _scrape(app)
 
     for line in (
-        'gpu_fault_completion_decisions{status="PENDING_TRIAGE"} 1',
+        'gpu_fault_completion_decisions{status="NO_ACTION"} 1',
         'gpu_fault_completion_decisions{status="PLAN_CREATED"} 0',
         'gpu_fault_incidents_by_state{state="ESCALATED"} 2',
         'gpu_fault_incidents_by_state{state="DETECTED"} 0',

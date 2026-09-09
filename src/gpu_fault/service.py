@@ -1,35 +1,26 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
-from typing import NoReturn
-
 import logging
 from datetime import datetime, timedelta, timezone
 
+from gpu_fault.markers import marker_is_diagnostic, retire_markers_for_incident
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
-    EffectiveRuntimeProfile,
     FaultIncident,
     IncidentState,
     NodeMarker,
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
-    TriageReport,
+    TerminalStatus,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
     recovery_action_sort_key,
 )
-from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.planner import PlanBuilder
-from gpu_fault.ports import DiagnosticPort
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.telemetry import (
@@ -42,38 +33,21 @@ from gpu_fault.watcher import (
     failure_containment_ids,
 )
 
-QUICK_CHECKS = [
-    "gpu-enumeration",
-    "dcgm-passive-health",
-    "xid-sxid-window",
-    "ecc-row-remap",
-    "nvlink-pcie",
-    "rdma-network",
-    "host-mce-oom",
-]
 LOGGER = logging.getLogger(__name__)
-
-
-class CompletionPendingError(RuntimeError):
-    pass
 
 
 class CompletionService:
     def __init__(
         self,
         store: ControlPlaneStore,
-        diagnostics: DiagnosticPort,
         planner: PlanBuilder | None = None,
         workflow_compiler=None,
         marker_window: timedelta = timedelta(minutes=10),
         evidence_service: EvidenceService | None = None,
         marker_ttl_seconds: int | None = None,
-        pending_triage_deadline: timedelta = timedelta(minutes=15),
     ) -> None:
         if marker_window <= timedelta(0):
             raise ValueError("marker_window must be positive")
-        if pending_triage_deadline <= timedelta(0):
-            raise ValueError("pending_triage_deadline must be positive")
         if (
             marker_ttl_seconds is not None
             and marker_window.total_seconds() > marker_ttl_seconds
@@ -88,15 +62,11 @@ class CompletionService:
                 f"exceed the marker TTL ({marker_ttl_seconds}s)"
             )
         self.store = store
-        self.diagnostics = diagnostics
         self.planner = planner or PlanBuilder()
         self.workflow_compiler = workflow_compiler
         self.marker_window = marker_window
         self.marker_ttl_seconds = marker_ttl_seconds
         self.evidence_service = evidence_service
-        # How long a decision may wait in PENDING_TRIAGE before
-        # ``reconcile_pending_triage`` expires it into a conservative plan.
-        self.pending_triage_deadline = pending_triage_deadline
         # No process lock (F-G2 / P1-62G): active-active replicas serialize
         # on ``store.completion_transaction(event_key)`` instead, which is
         # also what makes the event row and its decision one write.
@@ -104,6 +74,95 @@ class CompletionService:
     def add_marker(self, marker: NodeMarker) -> NodeMarker:
         self.store.add_marker(marker)
         return marker
+
+    def _ensure_containment(
+        self,
+        *,
+        cluster_id: str,
+        job_id: str,
+        attempt_id: str,
+        runtime_profile_version: str,
+        workload_ids: list[str],
+        node_ids: list[str],
+        gpu_uuids: list[str],
+        reasons: list[str],
+    ) -> tuple[FaultIncident, WorkflowRequest, bool]:
+        """Create or retrieve containment incident and workflow for a failure.
+
+        Builds a passive-containment-v1 incident with STOP_WORKLOAD action and
+        a two-step workflow (FREEZE_EVIDENCE, STOP_WORKLOADS). Shared by both
+        the failure-detected handler and the terminal handler (when a terminal
+        arrives before its failure-detected event).
+
+        Args:
+            cluster_id: Target cluster
+            job_id: Job identifier, persisted on the incident so a user
+                stop of the job can find and withdraw its workflows
+            attempt_id: Attempt identifier
+            runtime_profile_version: Runtime profile version
+            workload_ids: Workload identifiers to stop
+            node_ids: Affected node identifiers
+            gpu_uuids: Affected GPU UUIDs
+            reasons: Human-readable reason strings for the incident
+
+        Returns:
+            Tuple of (incident, workflow, created) where created is True if
+            this call created the incident, False if it already existed.
+        """
+        event_key = f"{cluster_id}/{attempt_id}/TrainingAttemptFailureDetected"
+        incident_id, workflow_id = failure_containment_ids(event_key)
+
+        def build() -> tuple[FaultIncident, WorkflowRequest]:
+            now = datetime.now(timezone.utc)
+            workflow = WorkflowRequest(
+                request_id=workflow_id,
+                incident_id=incident_id,
+                runtime_profile_version=runtime_profile_version,
+                status=WorkflowStatus.PENDING,
+                official_action="STOP_WORKLOAD",
+                fencing_token=1,
+                official_steps=[
+                    WorkflowStepSpec(
+                        operation=(WorkflowOperation.FREEZE_EVIDENCE),
+                        execution_owner=("gpu-fault-control-plane"),
+                        node_ids=node_ids,
+                        gpu_uuids=gpu_uuids,
+                        workload_ids=workload_ids,
+                    ),
+                    WorkflowStepSpec(
+                        operation=(WorkflowOperation.STOP_WORKLOADS),
+                        execution_owner=("gpu-fault-kubernetes-adapter"),
+                        node_ids=node_ids,
+                        gpu_uuids=gpu_uuids,
+                        workload_ids=workload_ids,
+                        parameters={"termination_initiator_incident_id": incident_id},
+                    ),
+                ],
+                created_at=now,
+                updated_at=now,
+            )
+            incident = FaultIncident(
+                incident_id=incident_id,
+                event_id=event_key,
+                event_type=("TRAINING_ATTEMPT_FAILURE_DETECTED"),
+                cluster_id=cluster_id,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                node_ids=node_ids,
+                gpu_uuids=gpu_uuids,
+                policy_version="passive-containment-v1",
+                policy_source="completion-watcher",
+                official_action="STOP_WORKLOAD",
+                effective_action=RecoveryAction.STOP_WORKLOAD,
+                state=IncidentState.ACTION_PENDING,
+                workflow_request_id=workflow_id,
+                reasons=reasons,
+                created_at=now,
+                updated_at=now,
+            )
+            return incident, workflow
+
+        return self.store.create_incident_workflow_if_absent(event_key, build)
 
     def handle_failure_detected(
         self, event: FailureDetectedEvent
@@ -113,78 +172,39 @@ class CompletionService:
         self.store.get_profile(event.runtime_profile_version)
         if not event.workload_ids:
             raise ValueError("failure detection requires owning workload IDs")
-        incident_id, workflow_id = failure_containment_ids(event.event_key)
 
-        def build() -> tuple[FaultIncident, WorkflowRequest]:
-            now = datetime.now(timezone.utc)
-            workflow = WorkflowRequest(
-                request_id=workflow_id,
-                incident_id=incident_id,
-                runtime_profile_version=(event.runtime_profile_version),
-                status=WorkflowStatus.PENDING,
-                official_action="STOP_WORKLOAD",
-                fencing_token=1,
-                official_steps=[
-                    WorkflowStepSpec(
-                        operation=(WorkflowOperation.FREEZE_EVIDENCE),
-                        execution_owner=("gpu-fault-control-plane"),
-                        node_ids=event.node_ids,
-                        gpu_uuids=event.gpu_uuids,
-                        workload_ids=event.workload_ids,
-                    ),
-                    WorkflowStepSpec(
-                        operation=(WorkflowOperation.STOP_WORKLOADS),
-                        execution_owner=("gpu-fault-kubernetes-adapter"),
-                        node_ids=event.node_ids,
-                        gpu_uuids=event.gpu_uuids,
-                        workload_ids=event.workload_ids,
-                        parameters={"termination_initiator_incident_id": (incident_id)},
-                    ),
-                ],
-                created_at=now,
-                updated_at=now,
-            )
-            incident = FaultIncident(
-                incident_id=incident_id,
-                event_id=event.event_key,
-                event_type=("TRAINING_ATTEMPT_FAILURE_DETECTED"),
-                cluster_id=event.cluster_id,
-                node_ids=event.node_ids,
-                gpu_uuids=event.gpu_uuids,
-                policy_version="passive-containment-v1",
-                policy_source="completion-watcher",
-                official_action="STOP_WORKLOAD",
-                effective_action=RecoveryAction.STOP_WORKLOAD,
-                state=IncidentState.ACTION_PENDING,
-                workflow_request_id=workflow_id,
-                reasons=[
-                    event.reason,
-                    (f"first_failed_rank={event.first_failed_rank}"),
-                    f"exit_code={event.exit_code}",
-                    *[
-                        (
-                            "workload log capture failed: "
-                            f"{item.get('namespace', '')}/"
-                            f"{item.get('pod_name', '')}: "
-                            f"{item['capture_error']}"
-                        )
-                        if item.get("capture_error")
-                        else (
-                            "workload log evidence: "
-                            f"{item.get('record_id')}"
-                            + (f" ({item.get('s3_uri')})" if item.get("s3_uri") else "")
-                        )
-                        for item in event.workload_log_snapshots
-                    ],
-                ],
-                created_at=now,
-                updated_at=now,
-            )
-            return incident, workflow
+        reasons = [
+            event.reason,
+            f"first_failed_rank={event.first_failed_rank}",
+            f"exit_code={event.exit_code}",
+            *[
+                (
+                    "workload log capture failed: "
+                    f"{item.get('namespace', '')}/"
+                    f"{item.get('pod_name', '')}: "
+                    f"{item['capture_error']}"
+                )
+                if item.get("capture_error")
+                else (
+                    "workload log evidence: "
+                    f"{item.get('record_id')}"
+                    + (f" ({item.get('s3_uri')})" if item.get("s3_uri") else "")
+                )
+                for item in event.workload_log_snapshots
+            ],
+        ]
 
-        incident, workflow, created = self.store.create_incident_workflow_if_absent(
-            event.event_key, build
+        incident, workflow, created = self._ensure_containment(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=event.workload_ids,
+            node_ids=event.node_ids,
+            gpu_uuids=event.gpu_uuids,
+            reasons=reasons,
         )
+
         if self.evidence_service is not None:
             for snapshot in event.workload_log_snapshots:
                 if (
@@ -220,19 +240,32 @@ class CompletionService:
         )
 
     def handle_terminal(self, event: TerminalEvent) -> CompletionDecision:
-        explicit_initiator, passive_containment = self._containment_gate(event)
+        """Decide a terminal event immediately, whatever its containment is doing.
+
+        The terminal used to be held (an HTTP conflict the data plane retried)
+        while the attempt's passive containment workflow was open or not yet
+        persisted.
+        That queued the cluster's terminal events behind one stuck STOP
+        (P0-62C) and left the decision to a retry loop. Now the containment
+        is created here when it is missing, and the recovery workflow names it
+        as ``predecessor_workflow_id``, so the dispatcher sequences
+        stop-then-restart without anyone waiting.
+        """
+
         existing = self.store.get_decision_by_event(event.event_key)
         if existing is not None:
             return existing.model_copy(update={"duplicate": True})
         self.store.get_profile(event.runtime_profile_version)
+        explicit_initiator, passive_containment = self._containment_context(
+            event, self._ensure_terminal_containment(event)
+        )
 
         # Everything persisted about this event -- the event row, the plan
-        # with its incident and workflow, the diagnostic request, the
-        # decision -- is written inside one store transaction keyed by the
-        # event (F-G2 (3)(5)). On PostgreSQL that is one advisory lock and
-        # one commit: a second replica deciding the same event waits, and a
-        # crash mid-way leaves no event row without a decision (P0-48B).
-        # The only remote call, quick-triage submission, comes after it.
+        # with its incident and workflow, the decision -- is written inside
+        # one store transaction keyed by the event (F-G2 (3)(5)). On
+        # PostgreSQL that is one advisory lock and one commit: a second
+        # replica deciding the same event waits, and a crash mid-way leaves
+        # no event row without a decision (P0-48B).
         with self.store.completion_transaction(event.event_key):
             existing = self.store.get_decision_by_event(event.event_key)
             if existing is not None:
@@ -248,29 +281,100 @@ class CompletionService:
                     "redelivery: event_key=%s",
                     event.event_key,
                 )
-            decision, triage_request = self._decide(
-                event, explicit_initiator, passive_containment
+            decision = self._decide(
+                event,
+                explicit_initiator,
+                passive_containment,
+                predecessor_workflow_id=(
+                    passive_containment.workflow_request_id
+                    if passive_containment is not None
+                    else None
+                ),
             )
             self.store.save_decision(decision)
-        if triage_request is None:
-            return decision
-        return self._submit_quick_triage(decision, triage_request)
+        return decision
 
-    def _containment_gate(
+    def _passive_event_key(self, event: TerminalEvent) -> str:
+        """The failure-detected event key the passive containment is keyed by."""
+
+        return f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
+
+    def _ensure_terminal_containment(
         self, event: TerminalEvent
-    ) -> tuple[FaultIncident | None, FaultIncident | None]:
-        """Hold the terminal event while its passive containment is open.
+    ) -> FaultIncident | None:
+        """The passive containment incident for this attempt (its
+        ``workflow_request_id`` is the recovery's predecessor), created here
+        when a failure terminal arrives before (or without) its
+        failure-detected event.
 
-        Returns the explicitly named initiator incident (if any) and the
-        passive containment incident (if any). Raises
-        ``CompletionPendingError`` -- a 409 to the data plane, which retries
-        -- while the containment workflow is still open.
+        Runs before the completion transaction: it is its own idempotent
+        store transaction keyed by the passive event id, and a second replica
+        racing on it gets ``created=False``. Only a FAILED or TIMED_OUT
+        terminal creates one: a STOPPED terminal is a user stop unless a
+        containment already exists (rule A / PREEMPT-033), however its ranks
+        exited, and SUCCEEDED has nothing to stop. Nor is one created for a
+        terminal with no workload ids (nothing to stop) or for a terminal
+        another incident's workflow stopped (``_decide`` answers NO_ACTION for
+        it). An existing incident whose workflow pointer is missing (the
+        dirty link ``_duplicate_event_records`` repairs) falls through so the
+        store rebuilds the workflow instead of leaving the recovery unchained.
         """
 
-        expected_passive_incident, _ = failure_containment_ids(
-            f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
+        existing = self.store.get_incident_by_event(self._passive_event_key(event))
+        if existing is not None and existing.workflow_request_id:
+            return existing
+        if existing is None:
+            if (
+                event.terminal_status
+                not in {TerminalStatus.FAILED, TerminalStatus.TIMED_OUT}
+                or not event.workload_ids
+            ):
+                return None
+            passive_incident_id, _ = failure_containment_ids(
+                self._passive_event_key(event)
+            )
+            if event.termination_initiator_incident_id not in (
+                None,
+                passive_incident_id,
+            ):
+                return None
+        incident, _workflow, _created = self._ensure_containment(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=list(event.workload_ids),
+            node_ids=sorted({item.node_id for item in event.allocation}),
+            gpu_uuids=sorted(
+                {gpu for item in event.allocation for gpu in item.gpu_uuids}
+            ),
+            reasons=[
+                f"terminal {event.terminal_status.value} reported before "
+                "failure detection",
+                *[
+                    f"rank {item.rank} exit_code={item.exit_code}"
+                    for item in event.rank_exit_status
+                    if item.exit_code
+                ],
+            ],
         )
-        explicit_initiator = None
+        return incident
+
+    def _containment_context(
+        self, event: TerminalEvent, passive: FaultIncident | None
+    ) -> tuple[FaultIncident | None, FaultIncident | None]:
+        """The explicitly named initiator incident (if any) and the passive
+        containment incident (if any) for this attempt.
+
+        ``passive`` is the attempt's containment as ``_ensure_terminal_containment``
+        found or created it -- one store read that also yields the recovery's
+        predecessor. It is resolved by the attempt, not only through the
+        terminal's initiator annotation: the DESTR-015 tombstone race can lose
+        that annotation on a job our own containment stopped, and the store
+        knows better than the tombstone.
+        """
+
+        explicit_initiator: FaultIncident | None = None
         if event.termination_initiator_incident_id:
             try:
                 explicit_initiator = self.store.get_incident(
@@ -278,46 +382,14 @@ class CompletionService:
                 )
             except NotFoundError:
                 explicit_initiator = None
-        if (
-            event.termination_initiator_incident_id == expected_passive_incident
-            and explicit_initiator is None
-        ):
-            raise CompletionPendingError(
-                "passive containment incident is not persisted yet: "
-                f"{expected_passive_incident}"
-            )
         passive_containment = (
             explicit_initiator
             if (
                 explicit_initiator is not None
                 and explicit_initiator.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
             )
-            else self.store.get_incident_by_event(
-                f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
-            )
+            else passive
         )
-        if (
-            passive_containment is not None
-            and passive_containment.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
-            and passive_containment.workflow_request_id
-        ):
-            containment = self.store.get_workflow(
-                passive_containment.workflow_request_id
-            )
-            if containment.status not in {
-                WorkflowStatus.SUCCEEDED,
-                WorkflowStatus.FAILED,
-                WorkflowStatus.SUPERSEDED,
-            }:
-                # Open (or BLOCKED awaiting an operator): the terminal
-                # event is retried later. A containment that FAILED or
-                # was SUPERSEDED will never succeed; answering 409 forever
-                # queued the whole cluster's terminal events behind it
-                # (P0-62C).
-                raise CompletionPendingError(
-                    "passive containment workflow is not complete: "
-                    f"{containment.request_id}/{containment.status.value}"
-                )
         return explicit_initiator, passive_containment
 
     def _decide(
@@ -325,32 +397,34 @@ class CompletionService:
         event: TerminalEvent,
         explicit_initiator: FaultIncident | None,
         passive_containment: FaultIncident | None,
-    ) -> tuple[CompletionDecision, DiagnosticRequest | None]:
+        *,
+        predecessor_workflow_id: str | None = None,
+    ) -> CompletionDecision:
         """Decide a terminal event. Runs inside the completion transaction.
 
-        Returns the decision and, when quick triage is needed, the diagnostic
-        request to submit *after* the transaction commits. The request is
-        persisted here so the decision's ``diagnostic_request_id`` resolves
-        (and ages) even if the submission itself fails.
+        Returns the decision. Explicit foreign initiator → NO_ACTION; user stop
+        or success → NO_ACTION and withdraw; trusted marker → marker plan; no
+        allocation → evidence + escalate; otherwise one budgeted restart. A
+        STOPPED terminal is a user stop only when no passive containment
+        exists for the attempt: with one, the stop was ours, tagged or not.
+        Every compiled plan chains behind ``predecessor_workflow_id`` (the
+        containment workflow) so the dispatcher orders stop-then-restart.
         """
 
         if event.termination_initiator_incident_id and (
             explicit_initiator is None
             or explicit_initiator.event_type != "TRAINING_ATTEMPT_FAILURE_DETECTED"
         ):
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.NO_ACTION,
-                    reason=(
-                        "termination was initiated by incident "
-                        f"{event.termination_initiator_incident_id}; "
-                        "continue that workflow without recursive recovery"
-                    ),
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.NO_ACTION,
+                reason=(
+                    "termination was initiated by incident "
+                    f"{event.termination_initiator_incident_id}; "
+                    "continue that workflow without recursive recovery"
                 ),
-                None,
             )
 
         passive_failure_stop = (
@@ -366,15 +440,12 @@ class CompletionService:
                 else "training attempt succeeded"
             )
             self._withdraw_job_workflows(event, reason)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.NO_ACTION,
-                    reason=reason,
-                ),
-                None,
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.NO_ACTION,
+                reason=reason,
             )
 
         matched = self._live_matching_markers(event)
@@ -395,326 +466,119 @@ class CompletionService:
                 and incident.workflow_request_id
                 and self._workflow_owns_workload_restart(incident.workflow_request_id)
             ):
-                return (
-                    CompletionDecision(
-                        cluster_id=event.cluster_id,
-                        attempt_id=event.attempt_id,
-                        event_key=event.event_key,
-                        status=DecisionStatus.NO_ACTION,
-                        reason=(
-                            "workload recovery is already owned by "
-                            "the existing incident workflow; observe "
-                            "that workflow without a second restart"
-                        ),
-                        matched_marker_ids=[item.marker_id for item in matched],
+                return CompletionDecision(
+                    cluster_id=event.cluster_id,
+                    attempt_id=event.attempt_id,
+                    event_key=event.event_key,
+                    status=DecisionStatus.NO_ACTION,
+                    reason=(
+                        "workload recovery is already owned by "
+                        "the existing incident workflow; observe "
+                        "that workflow without a second restart"
                     ),
-                    None,
+                    matched_marker_ids=[item.marker_id for item in matched],
                 )
             plan = (
                 self.planner.after_incident(event, incident, profile)
                 if incident is not None
                 else self.planner.from_marker(event, selected, profile)
             )
-            plan = self._save_plan(plan, event)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.PLAN_CREATED,
-                    reason=(
-                        "trusted allocation marker matched; "
-                        + (
-                            "node remediation is owned by the existing "
-                            "incident and only workload recovery was planned"
-                            if incident is not None
-                            else "reused existing incident action"
-                        )
-                    ),
-                    matched_marker_ids=[item.marker_id for item in matched],
-                    recovery_plan_id=plan.plan_id,
+            plan = self._save_plan(
+                self._premised_on_containment(plan, passive_containment),
+                event,
+                predecessor_workflow_id=predecessor_workflow_id,
+            )
+            return CompletionDecision(
+                cluster_id=event.cluster_id,
+                attempt_id=event.attempt_id,
+                event_key=event.event_key,
+                status=DecisionStatus.PLAN_CREATED,
+                reason=(
+                    "trusted allocation marker matched; "
+                    + (
+                        "node remediation is owned by the existing "
+                        "incident and only workload recovery was planned"
+                        if incident is not None
+                        else "reused existing incident action"
+                    )
                 ),
-                None,
+                matched_marker_ids=[item.marker_id for item in matched],
+                recovery_plan_id=plan.plan_id,
             )
 
         if not event.allocation:
             profile = self.store.get_profile(event.runtime_profile_version)
             plan = self.planner.from_missing_allocation(event, profile)
-            plan = self._save_plan(plan, event)
-            return (
-                CompletionDecision(
-                    cluster_id=event.cluster_id,
-                    attempt_id=event.attempt_id,
-                    event_key=event.event_key,
-                    status=DecisionStatus.PLAN_CREATED,
-                    reason=(
-                        "allocation snapshot is missing; triage is "
-                        "inconclusive and automatic restart is blocked"
-                    ),
-                    recovery_plan_id=plan.plan_id,
-                ),
-                None,
+            plan = self._save_plan(
+                plan, event, predecessor_workflow_id=predecessor_workflow_id
             )
-
-        node_ids = sorted({item.node_id for item in event.allocation})
-        request = DiagnosticRequest(
-            cluster_id=event.cluster_id,
-            attempt_id=event.attempt_id,
-            node_ids=node_ids,
-            checks=QUICK_CHECKS,
-        )
-        self.store.save_diagnostic(request)
-        return (
-            CompletionDecision(
+            return CompletionDecision(
                 cluster_id=event.cluster_id,
                 attempt_id=event.attempt_id,
                 event_key=event.event_key,
-                status=DecisionStatus.PENDING_TRIAGE,
-                reason=(
-                    "no trusted marker matched the allocation; quick triage requested"
-                ),
-                diagnostic_request_id=request.request_id,
+                status=DecisionStatus.PLAN_CREATED,
+                reason="allocation snapshot is missing; automatic restart is blocked",
+                recovery_plan_id=plan.plan_id,
+            )
+
+        profile = self.store.get_profile(event.runtime_profile_version)
+        plan = self._save_plan(
+            self._premised_on_containment(
+                self.planner.without_hardware_evidence(event, profile),
+                passive_containment,
             ),
-            request,
+            event,
+            predecessor_workflow_id=predecessor_workflow_id,
+        )
+        return CompletionDecision(
+            cluster_id=event.cluster_id,
+            attempt_id=event.attempt_id,
+            event_key=event.event_key,
+            status=DecisionStatus.PLAN_CREATED,
+            reason=(
+                "no trusted marker matched the allocation; restarting once "
+                "within the job restart budget"
+                if plan.trigger == "no-hardware-evidence:RESTART"
+                else "no trusted marker matched and the profile cannot restart "
+                "the workload; escalated to an operator"
+            ),
+            recovery_plan_id=plan.plan_id,
         )
 
-    def _submit_quick_triage(
-        self, decision: CompletionDecision, request: DiagnosticRequest
-    ) -> CompletionDecision:
-        """Submit quick triage after the PENDING_TRIAGE decision is committed.
-
-        A failed submission is logged, not raised: the decision is already
-        durable and ``reconcile_pending_triage`` owns it from here. Re-raising
-        would only make the data plane redeliver an event that is now a
-        duplicate.
-        """
-
-        try:
-            operation_id = self.diagnostics.submit(request)
-        except Exception:
-            LOGGER.exception(
-                "quick triage submission failed for %s; the decision stays "
-                "PENDING_TRIAGE until reconcile_pending_triage expires it",
-                decision.event_key,
-            )
-            return decision
-        if operation_id != request.request_id:
-            LOGGER.warning(
-                "diagnostic adapter returned operation %s for request %s; the "
-                "decision keeps the request id",
-                operation_id,
-                request.request_id,
-            )
-        # ``result`` is the seam of adapters that diagnose synchronously
-        # (the DCGM adapter); asynchronous ones report via /v1/triage-results.
-        result = getattr(self.diagnostics, "result", None)
-        report = result(operation_id) if result is not None else None
-        return self.handle_triage(report) if report is not None else decision
-
-    def handle_triage(self, report: TriageReport) -> CompletionDecision:
-        request = self.store.get_diagnostic(report.request_id)
-        if (
-            report.cluster_id is not None and request.cluster_id != report.cluster_id
-        ) or request.attempt_id != report.attempt_id:
-            self._reject_triage(
-                report, "triage report cluster/attempt does not match request"
-            )
-        if request.cluster_id is None:
-            self._reject_triage(report, "diagnostic request has no cluster identity")
-        report = report.model_copy(update={"cluster_id": request.cluster_id})
-        event_key = f"{request.cluster_id}/{report.attempt_id}/TrainingAttemptTerminal"
-        with self.store.completion_transaction(event_key):
-            decision = self.store.get_decision_by_attempt(
-                request.cluster_id, report.attempt_id
-            )
-            if decision.status is DecisionStatus.PLAN_CREATED:
-                return decision.model_copy(update={"duplicate": True})
-            if decision.status is not DecisionStatus.PENDING_TRIAGE:
-                self._reject_triage(report, "attempt is not waiting for quick triage")
-
-            expected_nodes = set(request.node_ids)
-            report_nodes = {item.node_id for item in report.findings}
-            if not report_nodes.issubset(expected_nodes):
-                self._reject_triage(
-                    report, "triage report contains nodes outside the allocation"
-                )
-
-            event = self.store.get_event_by_attempt(
-                request.cluster_id, report.attempt_id
-            )
-            profile = self.store.get_profile(event.runtime_profile_version)
-            plan = self.planner.from_triage(event, report.findings, profile)
-            self.store.save_triage_report(report)
-            plan = self._save_plan(plan, event)
-            updated = decision.model_copy(
-                update={
-                    "status": DecisionStatus.PLAN_CREATED,
-                    "reason": f"quick triage resolved as {plan.trigger}",
-                    "recovery_plan_id": plan.plan_id,
-                }
-            )
-            self.store.save_decision(updated)
-            return updated
-
-    @staticmethod
-    def _reject_triage(report: TriageReport, message: str) -> NoReturn:
-        # A rejected report is a 422 the data plane does not retry; without
-        # this line the control plane kept no trace of it (P1-62F (c)).
-        LOGGER.error(
-            "triage report rejected: %s (request=%s attempt=%s)",
-            message,
-            report.request_id,
-            report.attempt_id,
-        )
-        raise ValueError(message)
-
-    def reconcile_pending_triage(
-        self,
-        *,
-        now: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        """Expire decisions stuck in PENDING_TRIAGE (F-G2 (4) / P1-48E).
-
-        A decision leaves PENDING_TRIAGE only when a triage report arrives.
-        If it never does -- diagnostic pod evicted, report rejected with a
-        422 the data plane does not retry, submission failed -- the attempt
-        neither restarts nor escalates and nothing shows it. After
-        ``pending_triage_deadline`` each such decision is closed with the
-        conservative plan of ``from_missing_allocation`` (collect evidence,
-        escalate to an operator, automatic restart blocked); a synchronous
-        adapter's late result is applied instead when it is available.
-        """
-
-        observed = now or datetime.now(timezone.utc)
-        stale = self.store.list_decisions_by_status(
-            DecisionStatus.PENDING_TRIAGE,
-            older_than=observed - self.pending_triage_deadline,
-            limit=limit,
-        )
-        resolved: list[CompletionDecision] = []
-        for decision in stale:
-            try:
-                updated = self._expire_pending_triage(decision, observed)
-            except Exception:  # noqa: BLE001 - one attempt must not block the rest
-                LOGGER.exception(
-                    "could not expire PENDING_TRIAGE decision %s", decision.event_key
-                )
-                continue
-            if updated is not None:
-                resolved.append(updated)
-        return resolved
-
-    def _expire_pending_triage(
-        self, decision: CompletionDecision, now: datetime
-    ) -> CompletionDecision | None:
-        # The diagnostics adapter is read *before* the transaction: the body of
-        # a store transaction must be pure computation, and an HTTP adapter
-        # here held the ``completion/<key>`` advisory lock and a pooled
-        # connection for its full latency (store review 2026-09-07, item D).
-        # The decision is read once outside for the request id, then re-read
-        # under the lock, which decides whether the pre-fetched report is used.
-        current = self.store.get_decision_by_event(decision.event_key)
-        if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
-            return None
-        report: TriageReport | None = None
-        result: Callable[[str], TriageReport | None] | None = getattr(
-            self.diagnostics, "result", None
-        )
-        if result is not None and current.diagnostic_request_id:
-            report = result(current.diagnostic_request_id)
-        with self.store.completion_transaction(decision.event_key):
-            current = self.store.get_decision_by_event(decision.event_key)
-            if current is None or current.status is not DecisionStatus.PENDING_TRIAGE:
-                return None
-            if report is not None:
-                # ``handle_triage`` writes, so it stays inside the transaction.
-                try:
-                    return self.handle_triage(report)
-                except ValueError:
-                    LOGGER.exception(
-                        "late triage result for %s is unusable; expiring",
-                        decision.event_key,
-                    )
-            event = self.store.get_event_by_attempt(
-                current.cluster_id, current.attempt_id
-            )
-            profile = self.store.get_profile(event.runtime_profile_version)
-            deadline = int(self.pending_triage_deadline.total_seconds())
-            reason = (
-                f"quick triage did not report within {deadline}s; expired by the "
-                "control plane, automatic restart blocked"
-            )
-            self._record_triage_timeout(current, reason, now)
-            plan = self._save_plan(self._timeout_plan(event, profile, reason), event)
-            updated = current.model_copy(
-                update={
-                    "status": DecisionStatus.PLAN_CREATED,
-                    "reason": reason,
-                    "recovery_plan_id": plan.plan_id,
-                }
-            )
-            self.store.save_decision(updated)
-            LOGGER.warning(
-                "PENDING_TRIAGE decision %s expired into plan %s",
-                decision.event_key,
-                plan.plan_id,
-            )
-            return updated
-
-    def _record_triage_timeout(
-        self, decision: CompletionDecision, reason: str, now: datetime
-    ) -> None:
-        """Leave an INCONCLUSIVE report for the request that never reported,
-        so the audit trail shows why the plan exists."""
-
-        if not decision.diagnostic_request_id:
-            return
-        try:
-            request = self.store.get_diagnostic(decision.diagnostic_request_id)
-        except NotFoundError:
-            return
-        if not request.node_ids:
-            return
-        self.store.save_triage_report(
-            TriageReport(
-                request_id=request.request_id,
-                cluster_id=request.cluster_id,
-                attempt_id=request.attempt_id,
-                findings=[
-                    TriageFinding(
-                        node_id=node_id,
-                        outcome=TriageOutcome.INCONCLUSIVE,
-                        reason=reason,
-                    )
-                    for node_id in request.node_ids
-                ],
-                completed_at=now,
-            )
-        )
-
-    def _timeout_plan(
-        self, event: TerminalEvent, profile: EffectiveRuntimeProfile, reason: str
+    def _premised_on_containment(
+        self, plan: RecoveryPlan, passive_containment: FaultIncident | None
     ) -> RecoveryPlan:
-        # Same conservative shape as a missing allocation: collect evidence,
-        # escalate, no automatic restart. A control-plane timeout is not
-        # evidence against the nodes, so nothing is quarantined.
-        plan = self.planner.from_missing_allocation(event, profile)
+        """Gate the restart on how the containment ended, not only on when.
+
+        ``predecessor_workflow_id`` makes the dispatcher order the recovery
+        after the containment workflow; it says nothing about how that
+        workflow ended. A STOP that FAILED leaves the containment incident
+        ESCALATED and the old Pods may still hold the GPUs, so the restart
+        must not run beside them. Naming the containment incident as
+        ``restart_after_incident_id`` makes the compiler write
+        ``requires_incident_state=RECOVERED`` onto the RESTART_WORKLOAD step
+        and the data-plane guard refuse, fail-closed, once that can never be
+        met. A plan that already carries a premise (``after_incident``: the
+        node repair the restart waits on) keeps it; the model has one.
+        """
+
+        if passive_containment is None or plan.restart_after_incident_id:
+            return plan
         return plan.model_copy(
-            update={
-                "trigger": "quick-triage:TIMEOUT",
-                "steps": [
-                    step.model_copy(
-                        update={"parameters": {**step.parameters, "reason": reason}}
-                    )
-                    for step in plan.steps
-                ],
-            }
+            update={"restart_after_incident_id": passive_containment.incident_id}
         )
 
-    def _save_plan(self, plan: RecoveryPlan, event: TerminalEvent) -> RecoveryPlan:
+    def _save_plan(
+        self,
+        plan: RecoveryPlan,
+        event: TerminalEvent,
+        *,
+        predecessor_workflow_id: str | None = None,
+    ) -> RecoveryPlan:
         if self.workflow_compiler is not None:
-            plan = self.workflow_compiler.compile(plan, event)
+            plan = self.workflow_compiler.compile(
+                plan, event, predecessor_workflow_id=predecessor_workflow_id
+            )
         self.store.save_plan(plan)
         return plan
 
@@ -737,7 +601,16 @@ class CompletionService:
             return
         now = datetime.now(timezone.utc)
         for incident, workflow in pairs:
-            if incident.attempt_id not in (None, event.attempt_id):
+            if (
+                incident.attempt_id not in (None, event.attempt_id)
+                and incident.event_type != "TRAINING_ATTEMPT_TERMINAL"
+            ):
+                # An orchestration incident about another attempt of the job
+                # is left alone. A passive recovery incident is only ever a
+                # restart of this job: its own attempt's terminal is already
+                # decided (that is what created it), so the only STOPPED or
+                # SUCCEEDED that can reach here for its job is a later
+                # attempt's -- and that means the job is gone (F-N1 §7).
                 continue
             if workflow.workload_withdrawn_at is not None or not any(
                 step.operation is WorkflowOperation.RESTART_WORKLOAD
@@ -784,6 +657,9 @@ class CompletionService:
         (``active=False``) so it stops matching and stops disqualifying the
         node as a spare. An incident about this attempt, or one that names no
         attempt, still matches: that is the pinned after-incident restart.
+
+        A diagnostic marker (see ``marker_is_diagnostic``) that names a stored
+        incident is skipped: it observes the node, it does not repair it.
         """
         live: list[NodeMarker] = []
         for marker in self._matching_markers(event):
@@ -794,6 +670,14 @@ class CompletionService:
                 incident = self.store.get_incident(marker.incident_id)
             except NotFoundError:
                 live.append(marker)
+                continue
+            if marker_is_diagnostic(marker):
+                LOGGER.info(
+                    "diagnostic marker %s of incident %s does not own attempt %s",
+                    marker.marker_id,
+                    incident.incident_id,
+                    event.attempt_id,
+                )
                 continue
             if (
                 incident.attempt_id is None
@@ -815,7 +699,7 @@ class CompletionService:
                 incident.incident_id,
                 reason=(
                     f"incident recovered for attempt {incident.attempt_id}; "
-                    f"terminal of attempt {event.attempt_id} goes to triage"
+                    f"terminal of attempt {event.attempt_id} is decided without it"
                 ),
                 retired_by="completion-service",
             )

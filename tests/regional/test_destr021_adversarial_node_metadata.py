@@ -486,6 +486,7 @@ def test_a_failed_or_never_run_restore_fails() -> None:
 def _report(**overrides: Any) -> dict[str, Any]:
     report = {
         "patches": 400,
+        "elapsed_seconds": 200.0,
         "conflicts": 3,
         "stopped": True,
         "cleared": True,
@@ -499,10 +500,23 @@ def test_the_writer_report_passes_when_the_race_was_real_and_cleaned() -> None:
     assert verdicts.writer_errors(_report()) == [], "intended"
 
 
+def test_the_writer_is_judged_by_coverage_not_by_the_requested_cadence() -> None:
+    """Live 2026-09-08: 34 patches in 62.9 s (one every 1.85 s) spanned a 26 s
+    workflow whose node-writing steps each took 5 s or more; that race was
+    real even though the 0.5 s request was never achievable from the host."""
+    live = _report(patches=34, elapsed_seconds=62.944)
+    assert verdicts.writer_errors(live) == [], live
+    assert verdicts.writer_achieved_interval(live) == pytest.approx(1.851, abs=0.01)
+    assert (
+        verdicts.writer_achieved_interval({"patches": 0, "elapsed_seconds": 5}) is None
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "fragment"),
     [
-        ({"patches": 5}, "race was not real"),
+        ({"patches": 5, "elapsed_seconds": 2.5}, "race was not real"),
+        ({"patches": 20, "elapsed_seconds": 100.0}, "pass between ticks"),
         ({"stopped": False}, "did not stop"),
         ({"cleared": False}, "was not cleared"),
         ({"exceeded_max_seconds": True}, "hard bound"),

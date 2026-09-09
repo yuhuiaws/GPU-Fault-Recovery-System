@@ -73,7 +73,13 @@ def test_operator_document_layers_publish_a_single_normal_path() -> None:
     assert "gpu-fault-admin join-cluster" in daily
     assert "gpu-fault-admin remove-cluster" in daily
     assert "gpu-fault-admin uninstall" in daily
-    assert "--cpu-cluster-arn" in daily, "legacy online uninstall is undocumented"
+    uninstall_section = daily.split("## 3. ", 1)[1].split("\n## 4. ", 1)[0]
+    assert "--cpu-cluster-arn" not in uninstall_section, (
+        "the ARN discovery branch of uninstall was removed with legacy_site"
+    )
+    assert "--reset-database" in uninstall_section, (
+        "the explicit database wipe must be documented next to keep mode"
+    )
     assert "installation_resource" in daily
     assert "delete_policy_residuals" in daily
     assert "--cpu-cluster delete" in daily

@@ -185,25 +185,25 @@ class Aws:
 
     def _describe_route_tables(self, argv: Sequence[str]) -> dict[str, Any]:
         filters = _filters(argv)
+        tables = list(self.route_tables)
         if "association.subnet-id" in filters:
             subnet_id = filters["association.subnet-id"][0]
-            return {
-                "RouteTables": [
-                    table
-                    for table in self.route_tables
-                    if any(
-                        item.get("SubnetId") == subnet_id
-                        for item in table["Associations"]
-                    )
-                ]
-            }
-        return {
-            "RouteTables": [
+            tables = [
                 table
-                for table in self.route_tables
+                for table in tables
+                if any(
+                    item.get("SubnetId") == subnet_id for item in table["Associations"]
+                )
+            ]
+        if "association.main" in filters:
+            tables = [
+                table
+                for table in tables
                 if any(item.get("Main") for item in table["Associations"])
             ]
-        }
+        if "vpc-id" in filters:
+            tables = [table for table in tables if table["VpcId"] in filters["vpc-id"]]
+        return {"RouteTables": tables}
 
     def _describe_vpcs(self, _argv: Sequence[str]) -> dict[str, Any]:
         return {
@@ -274,12 +274,11 @@ def _network(
     aws: Aws,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    dry_run: bool = False,
     gpu_clusters: Sequence[ClusterIdentity] = (),
 ) -> dict[str, Any]:
     monkeypatch.setattr(admin_bootstrap.subprocess, "run", aws)
     return _ensure_nlb_network(
-        CommandRunner(dry_run=dry_run),
+        CommandRunner(),
         cpu=_cluster(),
         gpu_clusters=list(gpu_clusters) or [_gpu("gpu-a", "vpc-gpu-a")],
         site_id=SITE_ID,
@@ -321,6 +320,25 @@ def test_an_already_prepared_vpc_is_reused_without_touching_anything(
     assert result["vpc_id"] == VPC
     assert aws.mutations() == ["authorize-security-group-ingress"], (
         "an existing network was rebuilt instead of reused"
+    )
+
+
+def test_the_route_tables_are_read_once_per_vpc_not_per_subnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four subnets used to cost up to eight route-table describes (the explicit
+    association, then the main table as a fallback, per subnet); the VPC's
+    tables fit in one page, so one read indexed in memory answers them all."""
+
+    aws = _prepared()
+
+    _network(aws, monkeypatch)
+
+    reads = aws.matching("describe-route-tables")
+    assert len(reads) == 1, [" ".join(argv) for argv in reads]
+    assert _filters(reads[0]) == {"vpc-id": [VPC]}, "the read was not scoped to the VPC"
+    assert len(aws.matching("describe-subnets")) == 1, (
+        "the EKS subnets were described again although the VPC read had them"
     )
 
 
@@ -693,32 +711,6 @@ def test_an_internet_gateway_created_by_someone_else_is_recorded_external(
         "vpc_id": VPC,
     }
     assert "create-internet-gateway" not in aws.mutations()
-
-
-def test_a_dry_run_reports_the_plan_without_creating_anything(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``--dry-run`` is what an operator reads before authorizing a bootstrap.
-
-    It has to answer the same questions -- how many subnets, which gateway, which
-    ingress addresses -- while leaving the account untouched, including the ingress
-    rules.
-    """
-
-    aws = Aws()
-
-    result = _network(aws, monkeypatch, dry_run=True)
-
-    assert aws.mutations() == [], "a dry run mutated the account"
-    assert result["public_subnets"] == [
-        "subnet-dryrun-public-1",
-        "subnet-dryrun-public-2",
-    ]
-    assert result["internet_gateway"]["internet_gateway_id"] == f"igw-dryrun-{SITE_ID}"
-    assert result["security_group"].startswith("sg-dryrun-"), (
-        "the dry run reported a real security group id"
-    )
-    assert result["gpu_nat_eips"] == [GPU_A_EIP]
 
 
 def test_the_nlb_name_is_a_stable_short_name_for_the_site(

@@ -2,25 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from gpu_fault.execution import (
-    WorkflowStepContext,
-    WorkflowStepOutcome,
-)
-from gpu_fault.telemetry import (
-    EvidenceService,
-)
-from gpu_fault.models import (
-    WorkflowOperation,
-    WorkflowStepSpec,
-)
-from gpu_fault.operation_registry import (
-    OperationAdapter,
-    operations_for_adapter,
-)
-from gpu_fault.notifications import (
-    Nvlink74MechanicalEmailBuilder,
-    RestartGuardEmailBuilder,
-)
 from gpu_fault.adapters.kubernetes.node_operations import KubernetesNodeOperationsMixin
 from gpu_fault.adapters.kubernetes.primitives import (
     KubernetesPrimitivesMixin,
@@ -31,6 +12,25 @@ from gpu_fault.adapters.kubernetes.restart_operations import (
 )
 from gpu_fault.adapters.kubernetes.workload_operations import (
     KubernetesWorkloadOperationsMixin,
+)
+from gpu_fault.execution import (
+    WorkflowStepContext,
+    WorkflowStepOutcome,
+)
+from gpu_fault.models import (
+    WorkflowOperation,
+    WorkflowStepSpec,
+)
+from gpu_fault.notifications import (
+    Nvlink74MechanicalEmailBuilder,
+    RestartGuardEmailBuilder,
+)
+from gpu_fault.operation_registry import (
+    OperationAdapter,
+    operations_for_adapter,
+)
+from gpu_fault.telemetry import (
+    EvidenceService,
 )
 
 

@@ -11,7 +11,6 @@ from gpu_fault.store.shared.errors import (
     is_retryable_store_unavailable,
 )
 
-
 T = TypeVar("T")
 
 

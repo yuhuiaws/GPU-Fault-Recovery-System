@@ -46,11 +46,24 @@ class PeriodicServiceConfig:
     # F-D5: how often LEASED processor rows whose lease lapsed go back to
     # PENDING outside the claim window.
     lease_reclaim_interval: float = 30.0
-    # F-G2 (4): how often decisions stuck in PENDING_TRIAGE are re-examined.
-    pending_triage_interval: float = 60.0
     # F-D10 (P1-75F): how often the processor counter table is compared with
     # the queue rows it summarises. A full-table count, so never per scrape.
     counter_drift_interval: float = 60.0
+    # Control-plane review 2026-09-08, F-8: incidents one archive round may
+    # take, and retention for the kinds that had no cleanup path at all --
+    # inactive markers, terminal notifications (with their delivery, result
+    # and dedup link), completion records (decision + event) and registry
+    # heartbeat rows of processes that are gone. A non-positive retention
+    # switches that sweep off.
+    archive_batch_size: int = 200
+    marker_retention: float = 2592000.0
+    notification_retention: float = 2592000.0
+    completion_record_retention: float = 2592000.0
+    registry_member_retention: float = 86400.0
+    # Control-plane review 2026-09-08, D-9: a LEASED remote command whose
+    # lease lapsed this long ago while its workflow moved to another
+    # fencing_token is failed with status_source="stale-fence".
+    remote_stale_fence_grace: float = 600.0
 
     def __post_init__(self) -> None:
         # The env reference generator infers a variable's kind from the
@@ -60,11 +73,13 @@ class PeriodicServiceConfig:
             raise ValueError(
                 "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS must be positive"
             )
-        if self.pending_triage_interval <= 0:
-            raise ValueError("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS must be positive")
         if self.counter_drift_interval <= 0:
             raise ValueError(
                 "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS must be positive"
+            )
+        if self.archive_batch_size <= 0:
+            raise ValueError(
+                "GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE must be positive"
             )
 
     @classmethod
@@ -153,7 +168,9 @@ class PeriodicServiceConfig:
             archive_interval=float(
                 value(
                     "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS",
-                    "3600",
+                    # 25 incidents an hour could never drain a backlog; 200
+                    # every 10 min can (F-8).
+                    "600",
                 )
             ),
             silence_interval=float(
@@ -166,11 +183,26 @@ class PeriodicServiceConfig:
             lease_reclaim_interval=float(
                 os.getenv("GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS", "30")
             ),
-            pending_triage_interval=float(
-                os.getenv("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS", "60")
-            ),
             counter_drift_interval=float(
                 os.getenv("GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS", "60")
+            ),
+            archive_batch_size=int(
+                os.getenv("GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE", "200")
+            ),
+            marker_retention=float(
+                os.getenv("GPU_FAULT_MARKER_RETENTION_SECONDS", "2592000")
+            ),
+            notification_retention=float(
+                os.getenv("GPU_FAULT_NOTIFICATION_RETENTION_SECONDS", "2592000")
+            ),
+            completion_record_retention=float(
+                os.getenv("GPU_FAULT_COMPLETION_RECORD_RETENTION_SECONDS", "2592000")
+            ),
+            registry_member_retention=float(
+                os.getenv("GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS", "86400")
+            ),
+            remote_stale_fence_grace=float(
+                os.getenv("GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS", "600")
             ),
         )
 
@@ -207,8 +239,6 @@ class PeriodicServiceRunner:
         self._cleanup_rotation = 0
         # F-D5: LEASED rows whose lease lapsed and were handed back to PENDING.
         self.processor_expired_leases_reclaimed_total: int = 0
-        # F-G2 (4): PENDING_TRIAGE decisions the watchdog moved on.
-        self.completion_pending_triage_reconciled_total: int = 0
         # F-D10 (P1-75F): the last measured gap between queue rows and the
         # counter table, and the clusters whose counters disagree. Gauges
         # refreshed by the drift job; a scrape only reads them.
@@ -240,7 +270,6 @@ class PeriodicServiceRunner:
         "archive",
         "silence",
         "lease_reclaim",
-        "pending_triage",
         "counter_drift",
     )
 
@@ -261,12 +290,20 @@ class PeriodicServiceRunner:
             try:
                 ran = getattr(self, f"_run_{name}")(now)
             except Exception:
+                # The job body raised inside ``_run_scheduled`` (which logged
+                # the traceback and rescheduled it) or ``_run_<name>`` itself
+                # did. Either way it is a failure of this job: counted and
+                # stamped here, and ``job_last_run`` is deliberately *not*
+                # refreshed -- that gauge is what the stall alert reads, and a
+                # job failing every round must look stalled, not freshly run
+                # (control-plane review 2026-09-08, F-1).
                 self.periodic_job_errors_total[name] = (
                     self.periodic_job_errors_total.get(name, 0) + 1
                 )
                 self.job_error_last_seen_timestamp_seconds[name] = time.time()
-                LOGGER.exception("periodic service %s failed; continuing", name)
-                ran = True
+                LOGGER.warning("periodic service %s failed; continuing", name)
+                now = time.monotonic()
+                continue
             if ran:
                 now = time.monotonic()
                 self.job_last_run_timestamp_seconds[name] = time.time()
@@ -280,9 +317,6 @@ class PeriodicServiceRunner:
             "cleanup_job_errors_total": dict(self.cleanup_job_errors_total),
             "processor_expired_leases_reclaimed_total": (
                 self.processor_expired_leases_reclaimed_total
-            ),
-            "completion_pending_triage_reconciled_total": (
-                self.completion_pending_triage_reconciled_total
             ),
             "processor_counter_drift_abs": self.processor_counter_drift_abs,
             "processor_counter_mismatched_clusters": (
@@ -325,6 +359,14 @@ class PeriodicServiceRunner:
         the start of the tick, so a job that ran for 20 s was due again 20 s
         early -- the interval is the gap between runs, not between starts
         (F-F2). Returns whether the job ran.
+
+        A body that raises is logged with its traceback, rescheduled a full
+        interval out, and the exception is re-raised so ``run_all_due`` counts
+        it against the job. Swallowing it here made every real failure mode
+        -- store outages inside the reclaim, watchdog and drift jobs --
+        invisible to ``periodic_job_errors_total`` and its alert, while the
+        ``ran=True`` return refreshed ``job_last_run`` as if the job had
+        succeeded (control-plane review 2026-09-08, F-1).
         """
 
         if not self._due(key, now, interval):
@@ -333,6 +375,7 @@ class PeriodicServiceRunner:
             body()
         except Exception:
             LOGGER.exception(failure_message)
+            raise
         finally:
             self.next_run[key] = time.monotonic() + interval
         return True
@@ -509,7 +552,54 @@ class PeriodicServiceRunner:
                     limit=cfg.cleanup_batch_size,
                 ),
             ),
-        ]
+        ] + self._unbounded_kind_cleanup_jobs()
+
+    def _unbounded_kind_cleanup_jobs(self) -> list[CleanupJob]:
+        """Retention for the kinds that had none (F-8 / G-9).
+
+        Each sweep keeps anything an existing incident still references --
+        the archiver bundles those with the incident (F-I1) -- and takes only
+        rows in a terminal state: inactive markers, notifications whose
+        delivery is SENT/DEAD (never PENDING/RETRY/LEASED) and completion
+        decisions whose attempt event aged out.
+        """
+
+        cfg = self.config
+        jobs: list[CleanupJob] = []
+        if cfg.marker_retention > 0:
+            jobs.append(
+                (
+                    "inactive_markers",
+                    lambda: self.context.store.cleanup_inactive_markers(
+                        older_than=datetime.now(timezone.utc)
+                        - timedelta(seconds=cfg.marker_retention),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
+        if cfg.notification_retention > 0:
+            jobs.append(
+                (
+                    "notifications",
+                    lambda: self.context.store.cleanup_terminal_notifications(
+                        older_than=datetime.now(timezone.utc)
+                        - timedelta(seconds=cfg.notification_retention),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
+        if cfg.completion_record_retention > 0:
+            jobs.append(
+                (
+                    "completion_records",
+                    lambda: self.context.store.cleanup_completion_records(
+                        older_than=datetime.now(timezone.utc)
+                        - timedelta(seconds=cfg.completion_record_retention),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
+        return jobs
 
     def _regional_cleanup_jobs(self) -> list[CleanupJob]:
         cfg = self.config
@@ -531,6 +621,31 @@ class PeriodicServiceRunner:
                 ),
             ),
         ]
+        if cfg.registry_member_retention > 0:
+            # One heartbeat row per process (POD_UID:pid); every rolling
+            # update left the old ones behind for good, and the readiness
+            # convergence check listed the whole kind (F-5 / F-8).
+            jobs.append(
+                (
+                    "registry_members",
+                    lambda: self.context.store.cleanup_stale_regional_registry_members(
+                        older_than=datetime.now(timezone.utc)
+                        - timedelta(seconds=cfg.registry_member_retention),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
+        if cfg.remote_stale_fence_grace > 0:
+            jobs.append(
+                (
+                    "stale_fence_remote_commands",
+                    lambda: self.context.store.expire_stale_fenced_remote_commands(
+                        lease_expired_before=datetime.now(timezone.utc)
+                        - timedelta(seconds=cfg.remote_stale_fence_grace),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
         if cfg.remote_claim_deadline > 0:
             jobs.insert(
                 1,
@@ -597,7 +712,7 @@ class PeriodicServiceRunner:
             return False
 
         def archive() -> None:
-            archived = archiver.run_once()
+            archived = archiver.run_once(limit=self.config.archive_batch_size)
             if archived:
                 LOGGER.info(
                     "archived %s terminal incident audit bundles",
@@ -662,34 +777,6 @@ class PeriodicServiceRunner:
             self.config.lease_reclaim_interval,
             reclaim,
             "processor lease reclaim failed",
-        )
-
-    def _run_pending_triage(self, now: float) -> bool:
-        """Close decisions stuck in PENDING_TRIAGE past their deadline (F-G2 (4)).
-
-        A triage submission that never reported left the decision, and with
-        it the incident, waiting forever; the watchdog existed on the service
-        but nothing called it.
-        """
-
-        def reconcile() -> None:
-            moved = self.context.completion.reconcile_pending_triage(
-                now=datetime.now(timezone.utc),
-                limit=self.config.cleanup_batch_size,
-            )
-            if moved:
-                self.completion_pending_triage_reconciled_total += len(moved)
-                LOGGER.warning(
-                    "closed %s decisions stuck in PENDING_TRIAGE past the deadline",
-                    len(moved),
-                )
-
-        return self._run_scheduled(
-            "completion-pending-triage",
-            now,
-            self.config.pending_triage_interval,
-            reconcile,
-            "pending triage reconciliation failed",
         )
 
     def _run_counter_drift(self, now: float) -> bool:

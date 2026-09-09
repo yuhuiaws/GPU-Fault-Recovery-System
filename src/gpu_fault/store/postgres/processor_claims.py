@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
+import re
 import secrets
 from datetime import datetime, timedelta
+from functools import lru_cache
+from typing import Any, Callable
 
-from gpu_fault.processor.models import (
-    ROUTINE_PRIORITY,
-    STARVED_ROUTINE_PRIORITY,
-)
 from gpu_fault.channel_registry import (
     CHANNEL_REGISTRY,
     FAULT_CHANNEL_PATHS,
 )
+from gpu_fault.processor.models import (
+    ROUTINE_PRIORITY,
+    STARVED_ROUTINE_PRIORITY,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
-
 
 # The lane fairness rules below have to know which queue rows are faults.
 # Membership comes from the channel registry so that registering a new
@@ -84,34 +84,51 @@ _CLAIM_ELIGIBLE_SQL = """\
             AND retry_barrier.not_before > %(now)s
       )
       AND (
-          %(include_all)s
-          OR candidate.payload->>'path'=ANY(%(included)s)
-      )
-      AND (
-          %(exclude_none)s
-          OR NOT (
-              candidate.payload->>'path'=ANY(%(excluded)s)
-          )
-      )
-      AND (
           lane.ordering_key IS NULL
           OR lane.lease_expires_at <= %(now)s
       )
+{path_filter}"""
+
+# The path filter of a sub-window. A dedicated pool's claim names its path
+# (7 of the 8 sub-claims per cycle do), and that path is rendered as one
+# equality literal per sub-window so the planner walks
+# gpu_fault_processor_queue_path_priority_claim ((payload->>'path'),
+# priority, created_at, request_id) in claim order and stops at the LIMIT.
+# ``= ANY(array)`` on the leading column gave a Bitmap scan of the whole path
+# backlog and a top-N sort instead, so the claim's cost grew with the path's
+# depth - the shape F-D2 removed for the unfiltered window (B-3 / G-3). The
+# fault stream excludes the dedicated paths; that stays a residual filter on
+# the priority_claim walk, which is still an ordered index walk.
+_PATH_EQUALS_SQL = """\
+      AND candidate.payload->>'path'={path_literal}
+"""
+_PATH_EXCLUDES_SQL = """\
+      AND NOT (
+          candidate.payload->>'path'=ANY(%(excluded)s)
+      )
 """
 
-# The window is the union of two index walks (F-D2): the best rows by raw
-# priority, plus the oldest routine rows past the starvation threshold. The
-# second walk is what lets a starved routine row enter a window that fresher
-# evidence rows would otherwise fill on every claim; before it, the 49
-# promotion ran only over rows the first walk had already admitted. Both
-# walks stop at the window limit, so the claim's cost stays bounded by the
-# window rather than by queue depth. Duplicates collapse in candidate_ids.
-_CLAIM_ACTIVE_PROCESSOR_SQL = f"""\
-WITH claim_window AS MATERIALIZED (
+# Every path the claim can be asked for is a registered route; anything else
+# is rejected before it reaches the statement text.
+_PATH_LITERAL_PATTERN = re.compile(r"^/[A-Za-z0-9/_.-]*$")
+
+
+def _path_literal(path: str) -> str:
+    if not _PATH_LITERAL_PATTERN.match(path):
+        raise ValueError(f"processor claim path is not a route: {path!r}")
+    return "'" + path + "'"
+
+
+def _claim_sub_windows(path_filter: str) -> str:
+    """The two index walks of F-D2 for one path filter: the best rows by raw
+    priority, plus the oldest routine rows past the starvation threshold."""
+
+    eligible = _CLAIM_ELIGIBLE_SQL.format(path_filter=path_filter)
+    return f"""\
     (
         SELECT
 {_CLAIM_WINDOW_COLUMNS_SQL}
-{_CLAIM_ELIGIBLE_SQL}
+{eligible}
         ORDER BY
             candidate.priority,
             candidate.created_at,
@@ -122,14 +139,40 @@ WITH claim_window AS MATERIALIZED (
     (
         SELECT
 {_CLAIM_WINDOW_COLUMNS_SQL}
-{_CLAIM_ELIGIBLE_SQL}
+{eligible}
           AND candidate.priority={ROUTINE_PRIORITY}
           AND candidate.created_at <= %(routine_starvation_before)s
         ORDER BY
             candidate.created_at,
             candidate.request_id
         LIMIT %(window_limit)s
-    )
+    )"""
+
+
+@lru_cache(maxsize=64)
+def _claim_window_sql(included: tuple[str, ...], excluded: bool) -> str:
+    if included:
+        return "\n    UNION ALL\n".join(
+            _claim_sub_windows(
+                _PATH_EQUALS_SQL.format(path_literal=_path_literal(path))
+            )
+            for path in included
+        )
+    return _claim_sub_windows(_PATH_EXCLUDES_SQL if excluded else "")
+
+
+# The window is the union of two index walks per path filter (F-D2): the
+# best rows by raw priority, plus the oldest routine rows past the starvation
+# threshold. The second walk is what lets a starved routine row enter a
+# window that fresher evidence rows would otherwise fill on every claim;
+# before it, the 49 promotion ran only over rows the first walk had already
+# admitted. Every walk stops at the window limit, so the claim's cost stays
+# bounded by the window (times the number of included paths) rather than by
+# queue depth. Duplicates collapse in candidate_ids. The window text is
+# rendered per (include_paths, exclude_paths) by ``_claim_window_sql``.
+_CLAIM_ACTIVE_PROCESSOR_SQL = f"""\
+WITH claim_window AS MATERIALIZED (
+{{claim_window}}
 ),
 candidate_ids AS MATERIALIZED (
     SELECT DISTINCT ON (claim_window.ordering_key)
@@ -578,6 +621,7 @@ class PostgresProcessorClaimsMixin:
                                 )
             """
         sql = _CLAIM_ACTIVE_PROCESSOR_SQL.format(
+            claim_window=_claim_window_sql(tuple(included), bool(excluded)),
             payload_update=payload_update,
             effective_payload=self._processor_queue_effective_payload("updated"),
         )
@@ -586,9 +630,6 @@ class PostgresProcessorClaimsMixin:
             "routine_starvation_before": (
                 now - timedelta(seconds=routine_starvation_seconds)
             ),
-            "include_all": not included,
-            "included": included,
-            "exclude_none": not excluded,
             "excluded": excluded,
             "window_limit": window_limit,
             "limit": limit,

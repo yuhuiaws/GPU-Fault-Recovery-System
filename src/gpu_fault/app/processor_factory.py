@@ -17,7 +17,6 @@ from gpu_fault.processor import (
     ProcessorStaleSettings,
 )
 
-
 LOGGER = logging.getLogger(__name__)
 
 

@@ -1,14 +1,17 @@
 """A restart reservation follows the restart, not the record (F-C9).
 
 Planning reserves a job's restart budget for every pending RESTART_WORKLOAD
-step. The restart adapter only ever answers WAITING *before* it submits
-anything (an approval is pending, or the incident is not recovered yet), so a
-reservation behind a wait that never ended is budget spent on a restart that
-never happened. Two fixes are pinned here:
+step. The restart adapter's own holds (an approval is pending, or the incident
+is not recovered yet) come *before* it submits anything and say so with
+``restart_submitted: False``, so a reservation behind such a wait that never
+ended is budget spent on a restart that never happened. A wait the executor
+answered for a retryable adapter error, or a remote command a data-plane
+executor holds LEASED, may hide a Job that exists and keeps its budget. Two
+fixes are pinned here:
 
 * a WAITING restart record older than the step's waiting cap, or one the cap
   already turned into a failure, releases its reservation when the workflow
-  terminalizes;
+  terminalizes -- when the wait proves nothing was submitted;
 * the safety and official phases reserve under different ids, so a
   safety-phase restart at index N cannot be mistaken for the official one.
 """
@@ -107,7 +110,8 @@ def test_a_waiting_restart_older_than_the_ttl_is_released() -> None:
         _restart_only_workflow(store),
         WorkflowStepStatus.WAITING,
         age=CAP + timedelta(minutes=1),
-        details={"approval_required": True},
+        # The adapter's approval hold: it says nothing was submitted.
+        details={"approval_required": True, "restart_submitted": False},
     )
     _reserve(store, workflow)
 
@@ -149,13 +153,57 @@ def test_a_restart_the_waiting_cap_failed_is_released_without_a_ttl() -> None:
         _restart_only_workflow(store),
         WorkflowStepStatus.FAILED,
         age=CAP,
-        details={"step_waiting_seconds": 601, "step_waiting_timeout_seconds": 600},
+        # The cap copied the hold's details into its failure.
+        details={
+            "step_waiting_seconds": 601,
+            "step_waiting_timeout_seconds": 600,
+            "reason": "GPU_COUNT_CHANGED",
+            "restart_submitted": False,
+        },
     )
     _reserve(store, workflow)
 
     release_unattempted_restart_reservations(store, workflow)
 
     assert _restart_count(store) == 0
+
+
+def test_a_capped_wait_on_a_retryable_error_keeps_its_reservation() -> None:
+    """A 5xx after ``create_namespaced_job`` waits, and the cap fails it: the
+    Job may exist, so the cap alone is not evidence of a restart never made."""
+
+    store = build_store()
+    workflow = _with_restart_record(
+        _restart_only_workflow(store),
+        WorkflowStepStatus.FAILED,
+        age=CAP,
+        details={
+            "step_waiting_seconds": 601,
+            "step_waiting_timeout_seconds": 600,
+            "reason": "RETRYABLE_ADAPTER_ERROR",
+            "retryable_adapter_error": True,
+        },
+    )
+    _reserve(store, workflow)
+
+    release_unattempted_restart_reservations(store, workflow)
+
+    assert _restart_count(store) == 1
+
+
+def test_a_waiting_restart_without_evidence_keeps_its_reservation() -> None:
+    store = build_store()
+    workflow = _with_restart_record(
+        _restart_only_workflow(store),
+        WorkflowStepStatus.WAITING,
+        age=CAP + timedelta(minutes=1),
+        details={"reason": "RETRYABLE_ADAPTER_ERROR", "retryable_adapter_error": True},
+    )
+    _reserve(store, workflow)
+
+    release_unattempted_restart_reservations(store, workflow, waiting_ttl=CAP)
+
+    assert _restart_count(store) == 1
 
 
 def test_a_restart_the_adapter_itself_failed_keeps_its_reservation() -> None:
@@ -174,18 +222,41 @@ def test_a_restart_the_adapter_itself_failed_keeps_its_reservation() -> None:
 
 
 def test_a_remote_restart_still_running_keeps_its_reservation() -> None:
+    """A LEASED command is on a data-plane executor now; its last report (here
+    a hold) may already be behind the Job it is creating."""
+
     store = build_store()
     workflow = _with_restart_record(
         _restart_only_workflow(store),
         WorkflowStepStatus.WAITING,
         age=timedelta(days=1),
-        details={"remote_status": "RUNNING", "remote_command_id": "cmd-1"},
+        details={
+            "remote_status": "LEASED",
+            "remote_command_id": "cmd-1",
+            "restart_submitted": False,
+        },
     )
     _reserve(store, workflow)
 
     release_unattempted_restart_reservations(store, workflow, waiting_ttl=CAP)
 
     assert _restart_count(store) == 1
+
+
+def test_a_remote_restart_nobody_claimed_is_released_after_the_ttl() -> None:
+    store = build_store()
+    workflow = _with_restart_record(
+        _restart_only_workflow(store),
+        WorkflowStepStatus.WAITING,
+        age=timedelta(days=1),
+        # No command pointer to read live; the snapshot says never leased.
+        details={"remote_status": "PENDING"},
+    )
+    _reserve(store, workflow)
+
+    release_unattempted_restart_reservations(store, workflow, waiting_ttl=CAP)
+
+    assert _restart_count(store) == 0
 
 
 def test_the_waiting_cap_on_a_restart_frees_the_budget_end_to_end() -> None:
@@ -205,9 +276,14 @@ def test_the_waiting_cap_on_a_restart_frees_the_budget_end_to_end() -> None:
         execution_deadline=now + timedelta(minutes=10),
     )
     store.save_workflow(workflow)
+    # A WAITING restart record means its adapter already reserved (D-10: the
+    # claim no longer re-reserves an attempted restart).
+    _reserve(store, workflow)
+    # The adapter's approval hold, as it reports it: nothing submitted.
     adapter = _KeyRecordingAdapter(
         WorkflowStepOutcome.waiting(
-            operation_id="approval", details={"approval_required": True}
+            operation_id="approval",
+            details={"approval_required": True, "restart_submitted": False},
         )
     )
     executor = active_workflow_executor(store, [adapter], {RESTART})
@@ -218,6 +294,46 @@ def test_the_waiting_cap_on_a_restart_frees_the_budget_end_to_end() -> None:
     assert result.status is WorkflowStatus.FAILED
     assert persisted.step_executions[-1].status is WorkflowStepStatus.FAILED
     assert _restart_count(store) == 0
+
+
+def test_the_waiting_cap_on_a_retrying_restart_keeps_the_budget_end_to_end() -> None:
+    """The same cap, but the wait is the executor's retry of an adapter error
+    that may have followed ``create_namespaced_job``: FAILED, budget kept."""
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    workflow = copy_model(
+        _with_restart_record(
+            _restart_only_workflow(store),
+            WorkflowStepStatus.WAITING,
+            age=timedelta(minutes=20),
+            details={
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "retryable_adapter_error": True,
+            },
+        ),
+        status=WorkflowStatus.RUNNING,
+        execution_deadline=now + timedelta(minutes=10),
+    )
+    store.save_workflow(workflow)
+    _reserve(store, workflow)
+    adapter = _KeyRecordingAdapter(
+        WorkflowStepOutcome.waiting(
+            operation_id="retry",
+            details={
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "retryable_adapter_error": True,
+            },
+        )
+    )
+    executor = active_workflow_executor(store, [adapter], {RESTART})
+
+    result = execute_workflow(executor, workflow.request_id)
+
+    persisted = store.get_workflow(workflow.request_id)
+    assert result.status is WorkflowStatus.FAILED
+    assert persisted.step_executions[-1].status is WorkflowStepStatus.FAILED
+    assert _restart_count(store) == 1
 
 
 def _two_phase_workflow(store: InMemoryStore) -> WorkflowRequest:

@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from gpu_fault.app import default_simulated_profile
+from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.markers import SPARE_BLOCKING_ACTIONS
 from gpu_fault.models import (
     CapabilityMode,
@@ -26,8 +26,6 @@ from gpu_fault.models import (
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
-    TriageFinding,
-    TriageOutcome,
     WorkflowOperation,
 )
 from gpu_fault.passive import ACTION_OPERATION, PassiveWorkflowCompiler
@@ -185,37 +183,6 @@ def test_missing_workload_stop_falls_back_to_containment(
     assert plan.steps[-1].parameters["blocked_action"] == "REBOOT_NODE"
 
 
-def test_triage_failure_scopes_each_node_to_its_own_gpus_and_action(
-    failed_event: TerminalEvent,
-) -> None:
-    """Two failed nodes used to share one action and every GPU of both."""
-    event = copy_model(failed_event, workload_ids=["training/pytorchjob/train"])
-    findings = [
-        TriageFinding(
-            node_id="node-a",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.RESET_GPU,
-        ),
-        TriageFinding(
-            node_id="node-b",
-            outcome=TriageOutcome.FAIL,
-            proposed_action=RecoveryAction.REBOOT_NODE,
-        ),
-    ]
-
-    plan = PlanBuilder().from_triage(event, findings, default_simulated_profile())
-
-    by_action = {step.action: step for step in plan.steps}
-    assert by_action[RecoveryAction.RESET_GPU].node_ids == ["node-a"]
-    assert by_action[RecoveryAction.RESET_GPU].gpu_uuids == ["GPU-a"]
-    assert by_action[RecoveryAction.REBOOT_NODE].node_ids == ["node-b"]
-    assert by_action[RecoveryAction.REBOOT_NODE].gpu_uuids == ["GPU-b"]
-    restarts = [s for s in plan.steps if s.action is RecoveryAction.RESTART_WORKLOAD]
-    assert len(restarts) == 1
-    assert plan.steps[-1] is restarts[0]
-    assert plan.avoid_node_ids == ["node-a", "node-b"]
-
-
 def test_after_incident_defers_avoidance_and_reuse_to_execution(
     failed_event: TerminalEvent,
 ) -> None:
@@ -234,10 +201,44 @@ def test_after_incident_defers_avoidance_and_reuse_to_execution(
     assert plan.avoid_node_ids == []
     step = plan.steps[0]
     assert step.action is RecoveryAction.RESTART_WORKLOAD
-    assert step.parameters["reuse_allocation"] is True
-    assert step.parameters["requires_incident_state"] == "RECOVERED"
-    assert step.parameters["incident_id"] == "inc-pending"
-    assert step.parameters["incident_node_ids"] == ["node-a"]
+    assert step.parameters == {}
+    assert plan.restart_after_incident_id == "inc-pending"
+
+
+def test_compiler_derives_the_incident_premise_from_the_plan(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """The premise belongs to execution, so the compiler writes it.
+
+    The planner only names the incident the restart waits on; turning that
+    into the step's ``requires_incident_state`` parameters here keeps the
+    adapter reading the incident at execution time (F-G5). The stored
+    incident is what counts: the compiler re-reads it, so a node the
+    incident grew after the plan was built is still avoided.
+    """
+    stored = fault_incident(
+        "inc-pending",
+        "event-pending",
+        node_ids=["node-a", "node-z"],
+        state=IncidentState.ACTION_PENDING,
+    )
+    context.store.save_incident(stored)
+    plan = PlanBuilder().after_incident(
+        failed_event,
+        copy_model(stored, node_ids=["node-a"]),
+        default_simulated_profile(),
+    )
+
+    compiled = PassiveWorkflowCompiler(context.store).compile(plan, failed_event)
+    workflow = context.store.get_workflow(compiled.workflow_request_id)
+    restart = workflow.official_steps[-1]
+
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD
+    assert restart.parameters["requires_incident_state"] == "RECOVERED"
+    assert restart.parameters["incident_id"] == "inc-pending"
+    assert restart.parameters["incident_node_ids"] == ["node-a", "node-z"]
+    assert restart.parameters["restart_budget"] == failed_event.restart_budget
+    assert "reuse_allocation" not in restart.parameters
 
 
 def test_avoid_node_ids_reach_the_compiled_restart_step(

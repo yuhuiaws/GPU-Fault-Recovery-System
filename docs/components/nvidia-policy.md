@@ -72,9 +72,13 @@ PYTHONPATH=src python tools/generate_nvidia_xid_policy.py --check
 `BatchRebootClusterNodes` 执行。该映射不表示 EC2 stop/start；stop/start 和
 节点 replacement 的宿主机放置、本地存储及身份语义仍是独立动作。
 
-`CONTACT_SUPPORT`、`CHECK_MECHANICALS`、`UPDATE_SWFW` 和尚未实现的专用
-workflow 不会被粗略替换成另一个“官方动作”，而是保留原始动作、返回
-`BLOCKED_WORKFLOW`，并通过独立的 `safety_action=QUARANTINE` 阻止继续调度。
+`CONTACT_SUPPORT`、`CHECK_MECHANICALS`、`UPDATE_SWFW` 不会被粗略替换成另一个
+“官方动作”：策略保留原始动作并返回 EXECUTABLE，由 workflow 编译器分别落成
+`ESCALATE_SUPPORT`（固定模板邮件，不隔离）、`CHECK_MECHANICALS`（通知并等待人工确认）
+和含 `UPDATE_SOFTWARE_FIRMWARE` 的停机链。没有注册 resolver 的其他 workflow 名保留
+原始动作、返回 `BLOCKED_WORKFLOW`，并通过独立的 `safety_action=QUARANTINE` 阻止
+继续调度。逐 XID 的判定与步骤见
+[故障类别与处置动作总表](../故障类别与处置动作总表.md)。
 
 未知 XID 使用 `SITE_SAFETY` 来源和 `safety_action=QUARANTINE`，明确表示它是本系统的 fail-closed
 安全策略，不是 NVIDIA Catalog 建议。
@@ -87,8 +91,9 @@ GB300 属于 GB200 列。
 ## 已实现的官方 workflow
 
 - XID 45：先持久化为 `PENDING_CORRELATION`，等待 30 秒窗口闭合；伴随其他 XID
-  时复用主 XID 的 incident/workflow，solo 时保留 `RESTART_FM` 并阻塞，直到
-  Fabric Manager executor 可用。共享 Store lease 支持 HA、乱序到达和 Pod 重启。
+  时复用最严重伴随 XID 的 incident/workflow，solo 时保留 `RESTART_FM` 并编译为
+  `RESTART_FABRIC_MANAGER`，由 Node Agent 的 `fabricManagerRestart` 能力执行。共享
+  Store lease 支持 HA、乱序到达和 Pod 重启。
 - XID 48：solo 执行 `RESET_GPU`；伴随 XID 63/64 时执行
   `DRAIN_AND_RESET`。
 - XID 94/95：分别保存 application/all-applications containment；XID 95 在 reset
@@ -105,8 +110,11 @@ SXID 恢复依据 Fabric Manager User Guide：
 - non-fatal：信息性，保持监控。
 - fatal access link：必须已解析 affected GPU 和 workload participating GPUs，
   然后停止任务并 reset 整组 GPU。
-- fatal trunk 或 always-fatal：要求完整 GPU/NVSwitch/FM 协调流程；当前没有该
-  executor，因此返回 `BLOCKED_WORKFLOW`，不会错误执行单 GPU reset。
+- fatal trunk 与 10003/19084：要求 fabric_partition 和完整节点 GPU inventory，齐备时
+  执行 `RESET_ALL_GPUS_AND_NVSWITCHES`（Node Agent `fabricReset` 能力，多节点 barrier），
+  缺一即 `BLOCKED_MISSING_EVIDENCE`，不会退化成单 GPU reset。
+- always-fatal（Table 23 钉死的 20 码）：执行 `REBOOT_NODE`，事前 cordon 并停止任务；
+  事件声明 Always-Fatal 但不在表内时阻塞。
 - B200/B300：传统 fatal/non-fatal SXID 不适用，要求 DCGM/NVSDM telemetry。
 
 SXID 的 `classification_source` 必须是 `NVIDIA_FABRIC_MANAGER`，否则因证据来源

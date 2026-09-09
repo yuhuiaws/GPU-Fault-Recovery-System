@@ -155,6 +155,62 @@ def test_replacing_a_branch_records_the_retired_indexes():
     assert event.details["steps_digest"] != _rewrites(dag)[-1].details["steps_digest"]
 
 
+def test_replacing_a_branch_keeps_its_completed_steps_out_of_superseded():
+    """A replaced branch retires only what had not run.
+
+    The in-place escalation replaces node-b's whole branch, but the steps that
+    already completed (isolate, quiesce, verify) are history, not retired work;
+    listing them as superseded too made ``completed_step_indexes`` and
+    ``superseded_step_indexes`` overlap and the invariant checker logged
+    "step indexes both completed and superseded" on every dispatch pass for
+    the rest of the workflow -- 2819 ERROR lines in one live hour (DESTR-014,
+    2026-09-08). ``BranchEscalator._exhaust`` and the executor's skip already
+    exclude resolved steps; the brancher must agree.
+    """
+    from gpu_fault.execution.invariants import workflow_invariant_violations
+
+    brancher = DagBrancher(RecoveryArbiter())
+    dag = brancher.append_parallel_job_branch(
+        _running_dag(), _job_workflow("node-b", "wf-reset-b")
+    )
+    branch = brancher.node_branch_step_indexes(dag, "node-b")
+    done = min(branch)
+    dag = copy_model(
+        dag,
+        completed_step_indexes=[*dag.completed_step_indexes, done],
+        completed_operations=[
+            *dag.completed_operations,
+            dag.official_steps[done].operation,
+        ],
+        step_executions=[
+            workflow_step_execution(
+                done, dag.official_steps[done].operation, WorkflowStepStatus.SUCCEEDED
+            )
+        ],
+    )
+
+    replaced = brancher.replace_parallel_job_branch(
+        dag, _job_workflow("node-b", "wf-reboot-b", REBOOT), "node-b"
+    )
+
+    assert done in replaced.completed_step_indexes, replaced.completed_step_indexes
+    assert done not in replaced.superseded_step_indexes, (
+        replaced.superseded_step_indexes
+    )
+    assert not set(replaced.completed_step_indexes) & set(
+        replaced.superseded_step_indexes
+    ), "completed and superseded overlap"
+    assert set(branch) - {done} <= set(replaced.superseded_step_indexes), (
+        replaced.superseded_step_indexes
+    )
+    event = _rewrites(replaced)[-1]
+    assert done not in event.details["superseded_indexes"], event.details
+    assert not any(
+        "both completed and superseded" in item
+        for item in workflow_invariant_violations(replaced)
+    ), workflow_invariant_violations(replaced)
+
+
 def test_queueing_a_branch_successor_records_the_predecessor_step():
     brancher = DagBrancher(RecoveryArbiter())
     dag = brancher.append_parallel_job_branch(

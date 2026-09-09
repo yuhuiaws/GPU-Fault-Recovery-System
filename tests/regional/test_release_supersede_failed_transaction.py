@@ -335,13 +335,21 @@ def test_the_flag_travels_to_the_source_preparer_as_environment(
     assert ADMIN.supersede_requested(calls[-1]["extra_environment"]) is True
 
 
-def test_an_explicit_supersede_variable_wins_over_the_flag(
+def test_the_flag_wins_over_a_stale_supersede_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(ENV, "1")
-    arguments = admin_cli.parser().parse_args(["deploy", FLAG, "--state-dir", "/tmp/x"])
+    """A leftover ``export`` must not decide consent; the command line does.
 
-    assert admin_cli.supersede_environment(arguments) == {}
+    With the flag the variable is set from the flag; without it nothing is
+    added and the inherited environment (whatever it says) travels unchanged.
+    """
+
+    monkeypatch.setenv(ENV, "1")
+    with_flag = admin_cli.parser().parse_args(["deploy", FLAG, "--state-dir", "/tmp/x"])
+    without = admin_cli.parser().parse_args(["deploy", "--state-dir", "/tmp/x"])
+
+    assert admin_cli.supersede_environment(with_flag) == {ENV: "1"}
+    assert admin_cli.supersede_environment(without) == {}
 
 
 # --- the engine ------------------------------------------------------------

@@ -12,20 +12,10 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import GPU_METRICS_PATH
-from gpu_fault.env import env_bool
-from gpu_fault.gpu_metrics import (
-    GpuMetricBatch,
-    GpuMetricSample,
-    GpuMetricSource,
-    GpuMetricsThresholds,
-)
-
-
 from gpu_fault.collectors.gpu.inventory_cadence import (
     GpuInventoryCadence,
     TemperatureLimitProbe,
 )
-from gpu_fault.transport.http_client import urlopen
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
 from gpu_fault.collectors.scheduling import next_stable_phase
@@ -35,6 +25,14 @@ from gpu_fault.collectors.sinks import (
     deliver_or_raise,
 )
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
+from gpu_fault.env import env_bool
+from gpu_fault.gpu_metrics import (
+    GpuMetricBatch,
+    GpuMetricSample,
+    GpuMetricSource,
+    GpuMetricsThresholds,
+)
+from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
 

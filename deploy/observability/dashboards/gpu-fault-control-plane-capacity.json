@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "One series per scraped Pod across api-ha, control-worker and telemetry-spool-worker.\n\nAlert GpuFaultControlPlaneMetricsMissing (critical, for 5m): docs/管理员日常运维.md#gpufaultcontrolplanemetricsmissing",
+      "description": "One series per scraped Pod across api-ha, control-worker and telemetry-spool-worker.\n\nAlert GpuFaultControlPlaneMetricsMissing (critical, for 5m): docs/管理员日常运维.md#gpufaultcontrolplanemetricsmissing\n\nAlert GpuFaultControlPlaneReplicaScrapeFailing (critical, for 5m): docs/管理员日常运维.md#gpufaultcontrolplanereplicascrapefailing",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -58,7 +58,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 8,
         "x": 0,
         "y": 1
       },
@@ -91,6 +91,159 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Scrapes on which one /metrics contributor raised and its families were skipped while the rest still rendered (G-8).\n\nAlert GpuFaultMetricsContributorFailing (warning, for 10m, > 3): docs/管理员日常运维.md#gpufaultmetricscontributorfailing",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (pod, contributor) (increase(gpu_fault_metrics_contributor_errors_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[10m]))",
+          "instant": false,
+          "legendFormat": "{{pod}} {{contributor}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "/metrics contributor failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Whether each control-worker's queue consumer loop is alive and how long since it last started a claim cycle; a dead or wedged loop kept the health gauge at 1 before B-6.\n\nAlert GpuFaultProcessorConsumerStalled (critical, for 2m, > 30): docs/管理员日常运维.md#gpufaultprocessorconsumerstalled",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 30.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (pod) (gpu_fault_processor_consumer_running{pod=~\"gpu-fault-control-worker-.*\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{pod}} running",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (pod) (gpu_fault_processor_consumer_last_cycle_age_seconds{pod=~\"gpu-fault-control-worker-.*\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{pod}} last cycle age (s)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Processor consumer loop liveness",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -98,7 +251,470 @@
         "x": 0,
         "y": 9
       },
-      "id": 3,
+      "id": 5,
+      "panels": [],
+      "title": "PostgreSQL pool and credentials",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Callers blocked on pool checkout right now; sustained above 0 the pool is saturated or losing slots (G-7).\n\nAlert GpuFaultPostgresPoolCheckoutQueueing (warning, for 2m, > 0): docs/管理员日常运维.md#gpufaultpostgrespoolcheckoutqueueing",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 10
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (service_role, pod) (gpu_fault_postgres_pool_requests_waiting{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{service_role}} {{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "PostgreSQL pool callers waiting",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Failed attempts to open a pooled connection: a rotated password the Secret has not caught up with, or a failover (G-7 / CP-3).\n\nAlert GpuFaultPostgresPoolConnectionErrors (critical, for 5m, > 0): docs/管理员日常运维.md#gpufaultpostgrespoolconnectionerrors",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 10
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (service_role, pod) (increase(gpu_fault_postgres_pool_connections_errors_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
+          "instant": false,
+          "legendFormat": "{{service_role}} {{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "PostgreSQL pool connection errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Seconds since the hourly refresher CronJob last published the Aurora master password, and whether its latest run succeeded, from the status file in the mounted Secret (H1-2).\n\nAlert GpuFaultAuroraCredentialRefreshStale (warning, for 15m, > 10800): docs/管理员日常运维.md#gpufaultauroracredentialrefreshstale\n\nAlert GpuFaultAuroraCredentialRefreshFailing (critical, for 15m): docs/管理员日常运维.md#gpufaultauroracredentialrefreshfailing",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10800.0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 10
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_success_age_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} last success age (s)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_aurora_credential_refresh_last_run_ok{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} last run ok",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Aurora credential refresh",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 9,
+      "panels": [],
+      "title": "Control-loop review counters",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "LEASED remote commands whose workflow moved to another fencing token and whose lease lapsed unreported, failed by the periodic sweep with status_source=stale-fence (D-9).\n\nAlert GpuFaultRemoteCommandStaleFenceSwept (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 19
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (control_plane_cluster, region) (increase(gpu_fault_periodic_cleanup_rows_total{job=\"stale_fence_remote_commands\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[30m]))",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stale-fence remote command sweeps",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Outbox deliveries whose provider call or bookkeeping raised; the row was released for retry and the batch continued (F-3).\n\nAlert GpuFaultNotificationDeliveryErrors (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultnotificationdeliveryerrors",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 19
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (control_plane_cluster, region) (increase(gpu_fault_notification_delivery_errors_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[15m]))",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Notification delivery errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Archive candidates that failed with an exception other than a safety refusal, by exception type (F-8).\n\nAlert GpuFaultControlRecordArchiveErrors (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultcontrolrecordarchiveerrors",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 19
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (control_plane_cluster, region, reason) (increase(gpu_fault_control_record_archive_errors_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[1h]))",
+          "instant": false,
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Control-record archive errors",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "id": 13,
       "panels": [],
       "title": "Processor queue",
       "type": "row"
@@ -148,9 +764,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 10
+        "y": 28
       },
-      "id": 4,
+      "id": 14,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -219,9 +835,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 10
+        "y": 28
       },
-      "id": 5,
+      "id": 15,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -290,9 +906,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 10
+        "y": 28
       },
-      "id": 6,
+      "id": 16,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -357,9 +973,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 10
+        "y": 28
       },
-      "id": 7,
+      "id": 17,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -393,9 +1009,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 36
       },
-      "id": 8,
+      "id": 18,
       "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
@@ -437,9 +1053,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 19
+        "y": 37
       },
-      "id": 9,
+      "id": 19,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -504,9 +1120,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 19
+        "y": 37
       },
-      "id": 10,
+      "id": 20,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -540,9 +1156,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 45
       },
-      "id": 11,
+      "id": 21,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -588,9 +1204,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 28
+        "y": 46
       },
-      "id": 12,
+      "id": 22,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -623,7 +1239,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "In-flight Store calls over the per-process admission capacity. api-ha and control-worker run four uvicorn workers behind one port, so each scrape samples one of four processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
+      "description": "In-flight Store calls over the Pod's admission capacity. api-ha and control-worker run four uvicorn workers behind one port; /metrics sums both gauges over the Pod's live processes.\n\nAlert GpuFaultStoreIoSaturated (warning, for 5m, > 0.9): docs/管理员日常运维.md#gpufaultstoreiosaturated",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -659,9 +1275,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 28
+        "y": 46
       },
-      "id": 13,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -730,9 +1346,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 28
+        "y": 46
       },
-      "id": 14,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -766,9 +1382,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 54
       },
-      "id": 15,
+      "id": 25,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -814,9 +1430,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 37
+        "y": 55
       },
-      "id": 16,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -885,9 +1501,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 37
+        "y": 55
       },
-      "id": 17,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -956,9 +1572,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 37
+        "y": 55
       },
-      "id": 18,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1003,9 +1619,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 63
       },
-      "id": 19,
+      "id": 29,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -1038,9 +1654,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 46
+        "y": 64
       },
-      "id": 20,
+      "id": 30,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -1112,9 +1728,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 46
+        "y": 64
       },
-      "id": 21,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1183,9 +1799,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 46
+        "y": 64
       },
-      "id": 22,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1254,9 +1870,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 54
+        "y": 72
       },
-      "id": 23,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1325,9 +1941,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 54
+        "y": 72
       },
-      "id": 24,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1361,9 +1977,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 80
       },
-      "id": 25,
+      "id": 35,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -1409,9 +2025,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 63
+        "y": 81
       },
-      "id": 26,
+      "id": 36,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1480,9 +2096,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 63
+        "y": 81
       },
-      "id": 27,
+      "id": 37,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1547,9 +2163,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 63
+        "y": 81
       },
-      "id": 28,
+      "id": 38,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1614,9 +2230,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 89
       },
-      "id": 29,
+      "id": 39,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1681,9 +2297,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 89
       },
-      "id": 30,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1728,9 +2344,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 97
       },
-      "id": 31,
+      "id": 41,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -1776,9 +2392,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 98
       },
-      "id": 32,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1822,7 +2438,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Fault events the processor refused; sampled from one of four worker processes per scrape.\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected",
+      "description": "Fault events the processor refused, per worker Pod (summed over the Pod's four processes by /metrics).\n\nAlert GpuFaultProcessorFaultEventsRejected (warning, for 0m, > 0): docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1858,9 +2474,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 98
       },
-      "id": 33,
+      "id": 43,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1929,9 +2545,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 98
       },
-      "id": 34,
+      "id": 44,
       "options": {
         "legend": {
           "displayMode": "list",

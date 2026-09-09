@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
 from gpu_fault.models import (
-    WorkflowStepStatus,
     WorkflowStepSpec,
-)
-from gpu_fault.operation_registry import (
-    OperationAdapter,
-    operations_for_adapter,
+    WorkflowStepStatus,
 )
 from gpu_fault.notifications import (
     HardwareEscalationEmailBuilder,
     Nvlink74SupportEmailBuilder,
+)
+from gpu_fault.operation_registry import (
+    OperationAdapter,
+    operations_for_adapter,
 )
 
 

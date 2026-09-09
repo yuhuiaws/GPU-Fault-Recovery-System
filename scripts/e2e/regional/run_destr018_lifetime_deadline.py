@@ -52,8 +52,6 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
-    record_focused_tests,
-    reusable_focused_tests,
     run_standard_case,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -108,9 +106,6 @@ WORKER_METRICS_PORT = 8081
 WORKER_APP = env_window.DEPLOYMENT
 WORKFLOW_TIMEOUT_SECONDS = 1200
 ABSORB_TIMEOUT_SECONDS = 300
-# The support workflow's QUARANTINE step runs after the reset workflow has
-# already gone FAILED; the node is polled this long for the taint.
-QUARANTINE_TIMEOUT_SECONDS = 300
 
 METRICS_PROBE = r"""
 import json
@@ -122,6 +117,34 @@ with urllib.request.urlopen(
     f"http://127.0.0.1:{port}/metrics", timeout=15
 ) as response:
     print(json.dumps({"metrics": response.read().decode()}))
+"""
+
+OPEN_INCIDENTS = r"""
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+from gpu_fault.app import ApplicationContext
+
+store = ApplicationContext.from_environment().store
+cluster_id, node_id = sys.argv[1:3]
+since = datetime.now(timezone.utc) - timedelta(days=7)
+found = {}
+for event in store.list_xid_events(cluster_id, node_id, observed_after=since):
+    incident = store.get_incident_by_event(event.event_id)
+    if incident is None or incident.state.value == "RECOVERED":
+        continue
+    found.setdefault(
+        incident.incident_id,
+        {
+            "incident_id": incident.incident_id,
+            "state": incident.state.value,
+            "xid": event.xid,
+            "workflow_request_id": incident.workflow_request_id,
+            "observed_at": str(event.observed_at),
+        },
+    )
+print(json.dumps({"open_incidents": sorted(found.values(), key=lambda i: i["incident_id"])}))
 """
 
 ESCALATION_CHAIN = r"""
@@ -179,6 +202,10 @@ class Settings:
     predecessor_path: Path
     lifetime_seconds: int
     execution_timeout_seconds: int
+    step_timeout_seconds: int
+    managed_recovery_seconds: int
+    step_warning_seconds: int
+    lease_duration_seconds: int
     hold_seconds: int
 
     def environment(self) -> dict[str, str]:
@@ -194,9 +221,21 @@ class Settings:
         }
 
     def assignments(self) -> dict[str, str]:
+        """The full compressed knob set the window opens with.
+
+        The node lifetime alone is not a bootable config: the control plane
+        refuses a lifetime below the step ceilings, the managed-recovery window
+        or the lease (execution/config.py), so all six are lowered together.
+        ``env_window.assignment_errors`` re-checks the ordering.
+        """
+
         return {
             env_window.LIFETIME_VARIABLE: str(self.lifetime_seconds),
             env_window.EXECUTION_TIMEOUT_VARIABLE: str(self.execution_timeout_seconds),
+            env_window.STEP_TIMEOUT_VARIABLE: str(self.step_timeout_seconds),
+            env_window.MANAGED_RECOVERY_VARIABLE: str(self.managed_recovery_seconds),
+            env_window.STEP_WARNING_VARIABLE: str(self.step_warning_seconds),
+            env_window.LEASE_DURATION_VARIABLE: str(self.lease_duration_seconds),
         }
 
 
@@ -224,23 +263,15 @@ def configure(arguments: argparse.Namespace) -> Settings:
         predecessor_path=predecessor,
         lifetime_seconds=int(arguments.lifetime_seconds),
         execution_timeout_seconds=int(arguments.execution_timeout_seconds),
+        step_timeout_seconds=int(arguments.step_timeout_seconds),
+        managed_recovery_seconds=int(arguments.managed_recovery_seconds),
+        step_warning_seconds=int(arguments.step_warning_seconds),
+        lease_duration_seconds=int(arguments.lease_duration_seconds),
         hold_seconds=int(arguments.hold_seconds),
     )
 
 
-def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
-    """Run the focused pytest, or reuse the --plan's result in --execute.
-
-    ``reuse`` is set by the execution path only: the result recorded in
-    ``plan.json`` is taken when it passed against exactly this source tree
-    (``reusable_focused_tests`` compares the digest), so the same tests are
-    not paid for twice minutes apart; any edit in between forces a rerun.
-    """
-
-    if reuse:
-        recorded = reusable_focused_tests(case_dir / "plan.json")
-        if recorded is not None:
-            return {**recorded, "focused_tests_reused": True}
+def focused_tests(case_dir: Path) -> dict[str, Any]:
     command = [
         sys.executable,
         "-m",
@@ -314,11 +345,14 @@ def observed_cadence(survey: dict[str, Any]) -> float | None:
 
 
 def observed_step_cap(survey: dict[str, Any]) -> int | None:
-    """The waiting ceiling the deployed control plane puts on the WAITING step.
+    """The pre-window waiting ceiling the deployed control plane reads.
 
-    It has to stay *above* the compressed lifetime: a step that is capped first
-    fails the step, not the workflow, and the case would be measuring the wrong
-    bound.
+    Recorded as evidence of the state the drill borrowed. It is *not* the cap
+    the margin arithmetic is judged against: the env window compresses the step
+    timeout to the lifetime for the run, so the margin is computed against
+    ``settings.step_timeout_seconds``. This survey runs before the window opens,
+    so on a clean deployment the variable is unset and this returns the shipped
+    600s default; a ``None`` means ready replicas disagree, i.e. a half-rollout.
     """
 
     value = agreed_number(survey, STEP_TIMEOUT_VARIABLE, DEFAULT_STEP_CAP_SECONDS)
@@ -330,6 +364,7 @@ def identity_errors(
     after: dict[str, Any],
     *,
     worker_generation_delta: int,
+    allow_worker_template_change: bool = False,
 ) -> list[str]:
     """Judge a runtime identity across a deliberate control-worker rollout.
 
@@ -341,12 +376,24 @@ def identity_errors(
     that the env was restored exactly and not merely to an equivalent-looking
     list. Only the two generation counters are allowed to move, and only by the
     number of writes the window made.
+
+    ``allow_worker_template_change`` is for the one comparison taken *while the
+    window is open*: setting the managed env vars is the whole point of the
+    window, so the worker's ``template_sha256`` is expected to differ there and
+    must not be read as drift. The invariant that only the managed env changed
+    is still carried by ``release_state`` equality (image/wheel/manifest
+    digests), by the env-window record's own open decision, and above all by the
+    close comparison, which restores ``allow_worker_template_change=False`` and
+    so proves the digest returned to its pre-window value.
     """
 
     errors: list[str] = []
     if after.get("release_state") != before.get("release_state"):
         errors.append("regional release state identity drifted")
     counters = ("generation", "observed_generation")
+    worker_volatile = (
+        (*counters, "template_sha256") if allow_worker_template_change else counters
+    )
     for plane, deployments in (before.get("deployments") or {}).items():
         current_plane = (after.get("deployments") or {}).get(plane) or {}
         for name, expected in deployments.items():
@@ -359,10 +406,14 @@ def identity_errors(
                     errors.append(f"{plane} deployment {name} identity drifted")
                 continue
             stable = {
-                key: value for key, value in observed.items() if key not in counters
+                key: value
+                for key, value in observed.items()
+                if key not in worker_volatile
             }
             if stable != {
-                key: value for key, value in expected.items() if key not in counters
+                key: value
+                for key, value in expected.items()
+                if key not in worker_volatile
             }:
                 errors.append(
                     f"{env_window.DEPLOYMENT} differs from the pre-window "
@@ -439,12 +490,37 @@ def preflight_errors(
         errors.append("gpuReset is not OWN by the Node Agent")
     if (state.get("profile") or {}).get("warnings"):
         errors.append("runtime profile has warnings")
-    if int((state.get("queue") or {}).get("depth") or 0):
+    queue = state.get("queue") or {}
+    # The env window rolls the control-worker Deployment, so the gate must be
+    # clear of any processor work that a worker roll could disrupt -- the
+    # reserved fault tier (control-plane actions and device events). Routine
+    # telemetry (gpu-inventory, evidence) sits above that tier, is idempotent
+    # across a roll, and a single gpu-inventory lane can livelock on a stale
+    # fencing token for ~120s, so gating on total depth flaps this preflight for
+    # a condition the roll is indifferent to. Fall back to total depth if an
+    # older snapshot carries no fault-tier reading.
+    if "fault_backlog_depth" in queue:
+        fault_backlog = int(queue.get("fault_backlog_depth") or 0)
+        if fault_backlog:
+            errors.append(
+                f"processor fault-tier backlog is not empty ({fault_backlog})"
+            )
+    elif int(queue.get("depth") or 0):
         errors.append("processor queue is not empty")
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")
     if state.get("event") is not None:
         errors.append("target node has a recent XID event")
+    # A lifetime failure hands its incident to an operator (F-N1) and the
+    # node-scoped merge records every later fault on that incident, planning
+    # nothing, until it is closed. A rerun on a node still carrying one merges
+    # record-only and can prove nothing (attempt 10, 2026-09-08).
+    for item in state.get("open_incidents") or []:
+        errors.append(
+            f"target node carries an open incident {item.get('incident_id')} "
+            f"({item.get('state')}, XID {item.get('xid')}); close it through a "
+            "validated restore first"
+        )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     errors.extend(env_window.assignment_errors(settings.assignments()))
@@ -455,7 +531,9 @@ def preflight_errors(
                 "is open that this run did not record"
             )
     # The arithmetic that decides whether the drill can prove anything, judged
-    # against the cadence the deployed control plane actually reads.
+    # against the cadence the deployed control plane actually reads and the
+    # in-window step cap the drill will run under (the window compresses the
+    # step timeout to the lifetime), not the pre-window default.
     cap = observed_step_cap(survey)
     if cap is None:
         errors.append(
@@ -467,34 +545,29 @@ def preflight_errors(
             lifetime_seconds=settings.lifetime_seconds,
             execution_timeout_seconds=settings.execution_timeout_seconds,
             cadence_seconds=observed_cadence(survey),
-            step_waiting_cap_seconds=cap
-            if cap is not None
-            else verdicts.STEP_WAITING_CAP_SECONDS,
+            step_waiting_cap_seconds=settings.step_timeout_seconds,
         )
     )
     return errors
 
 
-def read_only_preflight(
-    settings: Settings,
-    case_dir: Path,
-    *,
-    reuse_focused_tests: bool = False,
-) -> dict[str, Any]:
+def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     fixture = RegionalLiveFixture(settings.regional)
     state = fixture.store_snapshot(
         node=settings.node,
         observed_after=datetime.now(timezone.utc) - timedelta(minutes=10),
     )
+    state["open_incidents"] = (
+        fixture.cpu_python(
+            OPEN_INCIDENTS, settings.regional.cluster_id, settings.node
+        ).get("open_incidents")
+        or []
+    )
     node = fixture.node_snapshot(settings.node)
     workloads = fixture.business_workloads(settings.node)
     survey = env_window.survey(fixture)
-    tests = focused_tests(case_dir, reuse=reuse_focused_tests)
-    predecessor = predecessor_evidence(
-        settings.predecessor_path,
-        PREDECESSOR_CASE_ID,
-        **fixture.evidence_identity(),
-    )
+    tests = focused_tests(case_dir)
+    predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     errors = preflight_errors(settings, state, node, workloads, tests, survey)
     if not predecessor["valid"]:
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
@@ -533,17 +606,18 @@ def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
-    details: dict[str, Any] = {
+    return {
         "risk": "live-service-action",
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
         "mutation": (
             "open a temporary env window on the CPU-plane "
-            f"{env_window.DEPLOYMENT} Deployment "
-            f"({env_window.LIFETIME_VARIABLE}="
-            f"{settings.lifetime_seconds}, "
-            f"{env_window.EXECUTION_TIMEOUT_VARIABLE}="
-            f"{settings.execution_timeout_seconds}); hold one GPU device open "
+            f"{env_window.DEPLOYMENT} Deployment, compressing the workflow "
+            f"lifetime to {settings.lifetime_seconds}s and lowering the "
+            "execution timeout, step timeout, managed-recovery window, step "
+            "warning and lease in lockstep so the control plane still boots "
+            f"({json.dumps(settings.assignments(), sort_keys=True)}); "
+            "hold one GPU device open "
             "with a transient systemd unit; write one synthetic XID 46 and one "
             "XID 79 to the real host /dev/kmsg; let the workflow quiesce GPU "
             "services and lose its lifetime while verifying clients"
@@ -575,13 +649,6 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         },
         "preflight": preflight,
     }
-    # The --plan's focused-test result is recorded with a source digest so
-    # --execute can reuse it instead of paying for the same run twice.
-    record_focused_tests(
-        details,
-        dict(preflight.get("focused_tests") or {"passed": False}),
-    )
-    return details
 
 
 def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
@@ -593,7 +660,7 @@ def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
 
 
 @dataclass
-class LiveRun:
+class _LiveRun:
     settings: Settings
     regional: RegionalLiveFixture
     case_dir: Path
@@ -636,7 +703,7 @@ def _probe(settings: Settings, run_id: str, script: Path) -> HostProbeFixture:
     )
 
 
-def _open_window(run: LiveRun) -> dict[str, Any]:
+def _open_window(run: _LiveRun) -> dict[str, Any]:
     report = env_window.survey(run.regional)
     record = env_window.open_window(
         run.window,
@@ -652,7 +719,7 @@ def _open_window(run: LiveRun) -> dict[str, Any]:
     return record
 
 
-def _arm_holder(run: LiveRun, device: str) -> dict[str, Any]:
+def arm_holder(run: _LiveRun, device: str) -> dict[str, Any]:
     armed = run.holder.execute(
         "arm-holder",
         "--device",
@@ -673,8 +740,6 @@ def _arm_holder(run: LiveRun, device: str) -> dict[str, Any]:
         "holder-status",
         "--run-id",
         run.holder.settings.run_id,
-        "--device",
-        device,
         timeout=60,
     )
     write_json_atomic(run.case_dir / "holder-status.json", status)
@@ -687,7 +752,7 @@ def _arm_holder(run: LiveRun, device: str) -> dict[str, Any]:
     return status
 
 
-def _absorb(run: LiveRun, target_bdf: str) -> dict[str, Any]:
+def _absorb(run: _LiveRun, target_bdf: str) -> dict[str, Any]:
     """XID 79 on the same node, after the lifetime failure."""
 
     marker = f"{run.marker}-absorb"
@@ -711,8 +776,7 @@ def _absorb(run: LiveRun, target_bdf: str) -> dict[str, Any]:
             observed_after=started,
             queue_attempts=1,
         )
-        # The event row lands before the merge; the verdicts judge the merge.
-        if verdicts.absorb_settled(snapshot):
+        if snapshot.get("event"):
             break
         time.sleep(5)
     write_json_atomic(run.case_dir / "absorb-state.json", snapshot)
@@ -723,17 +787,17 @@ def _prepare_live_run(
     settings: Settings,
     run_dir: Path,
     attempt: int,
-) -> LiveRun:
+) -> _LiveRun:
     case_dir = run_dir / "cases" / CASE_ID
     case_dir.mkdir(parents=True, exist_ok=True)
-    preflight = read_only_preflight(settings, case_dir, reuse_focused_tests=True)
+    preflight = read_only_preflight(settings, case_dir)
     if preflight["errors"]:
         raise RegionalFixtureError(
             "preflight failed: " + "; ".join(preflight["errors"])
         )
     verify_plan_identity(case_dir, preflight)
     run_id = f"destr018-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
-    run = LiveRun(
+    run = _LiveRun(
         settings=settings,
         regional=RegionalLiveFixture(settings.regional),
         case_dir=case_dir,
@@ -755,7 +819,7 @@ def _prepare_live_run(
     return run
 
 
-def _baseline_host(run: LiveRun, maintenance_window_end: datetime) -> None:
+def _baseline_host(run: _LiveRun, maintenance_window_end: datetime) -> None:
     """Create both probes, snapshot the idle node and pick the target GPU."""
 
     run.injector.create()
@@ -782,7 +846,7 @@ def _baseline_host(run: LiveRun, maintenance_window_end: datetime) -> None:
         raise RegionalFixtureError("approved maintenance window ended before injection")
 
 
-def _open_and_arm(run: LiveRun) -> None:
+def _open_and_arm(run: _LiveRun) -> None:
     """The env window first (it rolls the worker Deployment), then the
     holder, both before the fault is written."""
 
@@ -795,18 +859,19 @@ def _open_and_arm(run: LiveRun) -> None:
         run.preflight["runtime_identity"],
         in_window_identity,
         worker_generation_delta=1,
+        allow_worker_template_change=True,
     )
     if drift:
         raise RegionalFixtureError(
-            "the open env window changed more than the two managed "
-            f"variables: {'; '.join(drift)}"
+            "the open env window changed the control-worker in a way beyond its "
+            f"managed timing variables: {'; '.join(drift)}"
         )
     run.in_window_identity = in_window_identity
     run.metrics_before = worker_metrics(run.regional)
-    _arm_holder(run, run.device)
+    arm_holder(run, run.device)
 
 
-def _inject_and_observe(run: LiveRun) -> dict[str, Any]:
+def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
     run.injected_at = datetime.now(timezone.utc)
     injection = run.injector.execute(
         "write-xid46",
@@ -833,7 +898,7 @@ def _inject_and_observe(run: LiveRun) -> dict[str, Any]:
     return state
 
 
-def _control_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
+def _control_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
     workflow = state.get("workflow") or {}
     incident = state.get("incident") or {}
     commands = state.get("commands") or []
@@ -856,7 +921,7 @@ def _control_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _host_snapshot(run: LiveRun, name: str) -> dict[str, Any]:
+def _host_snapshot(run: _LiveRun, name: str) -> dict[str, Any]:
     if run.injected_at is None:
         raise RegionalFixtureError("host snapshots follow the injection")
     snapshot = run.injector.execute(
@@ -871,7 +936,7 @@ def _host_snapshot(run: LiveRun, name: str) -> dict[str, Any]:
     return snapshot
 
 
-def _data_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
+def _data_plane_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
     """Ledger, kernel journal and the cadence the run actually saw."""
 
     after_host = _host_snapshot(run, "host-after.json")
@@ -899,16 +964,13 @@ def _data_plane_errors(run: LiveRun, state: dict[str, Any]) -> list[str]:
                 lifetime_seconds=run.settings.lifetime_seconds,
                 execution_timeout_seconds=run.settings.execution_timeout_seconds,
                 cadence_seconds=float(run.cadence_sample["min_gap_seconds"]),
-                step_waiting_cap_seconds=int(
-                    run.preflight["observed_step_cap_seconds"]
-                    or verdicts.STEP_WAITING_CAP_SECONDS
-                ),
+                step_waiting_cap_seconds=run.settings.step_timeout_seconds,
             )
         )
     return errors
 
 
-def _escalation_and_absorb_errors(run: LiveRun) -> list[str]:
+def _escalation_and_absorb_errors(run: _LiveRun) -> list[str]:
     """The hand-off to the operator, the node's quarantine, and the later
     XID 79 that must be absorbed record-only."""
 
@@ -920,7 +982,7 @@ def _escalation_and_absorb_errors(run: LiveRun) -> list[str]:
         ((escalation.get("incident") or {}).get("incident_id")) or ""
     )
     errors.extend(verdicts.escalation_errors(escalation, node=settings.node))
-    node_after = _wait_for_quarantine(run, escalation)
+    node_after = regional.node_snapshot(settings.node)
     write_json_atomic(case_dir / "node-after.json", node_after)
     errors.extend(verdicts.quarantine_errors(node_after))
 
@@ -942,8 +1004,6 @@ def _escalation_and_absorb_errors(run: LiveRun) -> list[str]:
                 run.workflow_request_id,
                 f"workflow-support-after-{run.workflow_request_id}",
             },
-            started_after=run.injected_at,
-            node=settings.node,
         )
     )
     absorb_ledger = _host_snapshot(run, "host-after-absorb.json")
@@ -958,50 +1018,16 @@ def _escalation_and_absorb_errors(run: LiveRun) -> list[str]:
     return errors
 
 
-def _wait_for_quarantine(run: LiveRun, escalation: dict[str, Any]) -> dict[str, Any]:
-    """Poll the node until the taint lands or the support workflow is terminal.
-
-    The escalation's QUARANTINE step runs asynchronously after the reset
-    workflow has gone FAILED; reading the taint the instant the workflow ends
-    fails a correct run.
-    """
-
-    deadline = time.monotonic() + QUARANTINE_TIMEOUT_SECONDS
-    support = escalation.get("workflow") or {}
-    node_after: dict[str, Any] = {}
-    while True:
-        node_after = run.regional.node_snapshot(run.settings.node)
-        if verdicts.quarantine_settled(node_after, support):
-            return node_after
-        if time.monotonic() >= deadline:
-            return node_after
-        time.sleep(5)
-        support = (
-            run.regional.cpu_python(ESCALATION_CHAIN, run.workflow_request_id).get(
-                "workflow"
-            )
-            or {}
-        )
-
-
-def _provider_and_metric_errors(run: LiveRun) -> tuple[list[str], dict[str, Any]]:
+def _provider_and_metric_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     if run.injected_at is None:
         raise RegionalFixtureError("provider events follow the injection")
-    ended_at = datetime.now(timezone.utc)
-    provider = run.regional.provider_events(run.injected_at, ended_at)
-    # A negative CloudTrail claim cannot be settled inside the delivery window;
-    # it is recorded as provisional and re-checked by DESTR-013.
-    provisional = run.regional.provider_events_provisional(ended_at)
-    write_json_atomic(
-        run.case_dir / "provider-events.json",
-        {"events": provider, "provisional": provisional},
-    )
+    provider = run.regional.provider_events(run.injected_at, datetime.now(timezone.utc))
+    write_json_atomic(run.case_dir / "provider-events.json", {"events": provider})
     errors: list[str] = []
     if provider:
         errors.append("provider mutation appeared during the lifetime drill")
     metrics = verdicts.metric_evidence(run.metrics_before, worker_metrics(run.regional))
     errors.extend(verdicts.metric_errors(metrics))
-    metrics["provider_events"] = {"count": len(provider), "provisional": provisional}
     return errors, metrics
 
 
@@ -1033,13 +1059,11 @@ def execute_case(
         errors.extend(provider_errors)
         result.update(
             {
-                **run.regional.evidence_identity(),
                 "verdict": "PASS" if not errors else "FAIL",
                 "errors": errors,
                 "marker": run.marker,
                 "incident_id": run.incident_id,
                 "support_incident_id": run.support_incident_id,
-                "provider_events": metrics.get("provider_events"),
                 "workflow_request_id": run.workflow_request_id,
                 "injected_at": run.injected_at.isoformat() if run.injected_at else None,
                 "cancelled_at": run.t_cancel.isoformat() if run.t_cancel else None,
@@ -1056,9 +1080,9 @@ def execute_case(
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        cleanup_result = cleanup(run)
-        result["cleanup"] = cleanup_result
-        if cleanup_result["errors"]:
+        cleanup = _cleanup(run)
+        result["cleanup"] = cleanup
+        if cleanup["errors"]:
             result["verdict"] = "FAIL"
     write_json_atomic(run.case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
@@ -1071,26 +1095,12 @@ def _refuse_residual_map(residuals: dict[str, bool]) -> dict[str, bool]:
     return residuals
 
 
-def known_incidents(run: LiveRun) -> list[str]:
-    """The incidents this run owns, owner first.
-
-    The support escalation takes the node's isolation over from the failed
-    reset workflow and adds the quarantine taint, so it is the owner a restore
-    has to name first; the reset incident is closed after it, on the no-op
-    path, so it does not stay ESCALATED pointing at a healthy node.
-    """
-
-    return [item for item in (run.support_incident_id, run.incident_id) if item]
-
-
-def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
+def _restore_isolated_node(run: _LiveRun) -> dict[str, Any]:
     """Release the isolation through a validated restore, never by hand.
 
-    Runs *after* the env window has closed: a restore workflow created inside
-    the window inherits the compressed lifetime and can fail on it. Both
-    incidents are restored, as DESTR-017 does -- the support incident owns the
-    taint, and the reset incident must not be left ESCALATED over a node
-    nobody isolates any more.
+    The taint is owned by whichever incident quarantined the node -- the
+    support escalation if it got that far, otherwise the reset incident -- so
+    both are offered to the validation-first workflow in that order.
     """
 
     snapshot = run.regional.node_snapshot(run.settings.node)
@@ -1102,40 +1112,87 @@ def restore_isolated_node(run: LiveRun) -> dict[str, Any]:
             for taint in snapshot.get("taints") or []
         )
     )
-    report: dict[str, Any] = {"isolated": isolated}
-    ordered = known_incidents(run)
-    if isolated and not ordered:
+    if not isolated:
+        return {"isolated": False}
+    candidates = [item for item in (run.support_incident_id, run.incident_id) if item]
+    if not candidates:
         raise RegionalFixtureError("the node is isolated but no incident is known")
     warm = WarmSpareLiveFixture(run.regional, "")
-    for incident_id in ordered:
-        warm.wait_incident_idle(incident_id)
-        created = warm.create_restore_workflow(
-            incident_id=incident_id,
-            node=run.settings.node,
-            profile_version=run.profile_version,
-            reason=f"{CASE_ID} validated cleanup",
-        )
+    failures: list[str] = []
+    for incident_id in candidates:
+        try:
+            warm.wait_incident_idle(incident_id)
+            created = warm.create_restore_workflow(
+                incident_id=incident_id,
+                node=run.settings.node,
+                profile_version=run.profile_version,
+                reason=f"{CASE_ID} validated cleanup",
+            )
+        except Exception as exc:  # noqa: BLE001 - try the next owner
+            failures.append(f"{incident_id}: {type(exc).__name__}: {exc}")
+            continue
         restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
-        report[incident_id] = restored.get("status")
         if restored.get("status") != "SUCCEEDED":
             raise RegionalFixtureError(
-                f"validated restore for {incident_id} did not succeed: "
+                f"{run.settings.node} restore workflow did not succeed: "
                 f"{restored.get('status')}"
             )
-    return report
+        return {
+            "isolated": True,
+            "incident_id": incident_id,
+            "restore": restored.get("status"),
+            "refused": failures,
+        }
+    raise RegionalFixtureError(
+        f"no incident could carry the validated restore: {failures}"
+    )
 
 
-def _wait_incidents_idle(run: LiveRun) -> dict[str, Any]:
-    """No workflow of this run may still be running when the Deployment rolls."""
+def close_reset_incident(run: _LiveRun) -> dict[str, Any]:
+    """Land the reset incident RECOVERED once the node is restored.
 
+    The lifetime failure hands the incident to an operator (F-N1); from then
+    on the node-scoped merge records every later fault on it and plans nothing
+    until it is closed. Restoring the node through the *support* incident does
+    not close it: attempt 10 (2026-09-08) injected a fresh XID and got merged
+    record-only into attempt 9's incident. The same validated restore, run
+    through the reset incident, is the sanctioned way to close it.
+    """
+
+    if not run.incident_id:
+        return {"closed": False, "reason": "no reset incident recorded"}
     warm = WarmSpareLiveFixture(run.regional, "")
-    waited = {}
-    for incident_id in known_incidents(run):
-        waited[incident_id] = warm.wait_incident_idle(incident_id)
-    return {"idle": sorted(waited)}
+    before = warm.incident_by_id(run.incident_id)
+    if before.get("state") == "RECOVERED":
+        return {"closed": False, "state": "RECOVERED"}
+    warm.wait_incident_idle(run.incident_id)
+    created = warm.create_restore_workflow(
+        incident_id=run.incident_id,
+        node=run.settings.node,
+        profile_version=run.profile_version,
+        reason=f"{CASE_ID} close the lifetime-escalated reset incident",
+    )
+    restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+    if restored.get("status") != "SUCCEEDED":
+        raise RegionalFixtureError(
+            f"the restore closing {run.incident_id} did not succeed: "
+            f"{restored.get('status')}"
+        )
+    after = warm.incident_by_id(run.incident_id)
+    if after.get("state") != "RECOVERED":
+        raise RegionalFixtureError(
+            f"{run.incident_id} is still {after.get('state')} after a successful "
+            "validated restore"
+        )
+    return {
+        "closed": True,
+        "previous_state": before.get("state"),
+        "workflow_request_id": created["workflow_request_id"],
+        "state": after.get("state"),
+    }
 
 
-def _close_window(run: LiveRun) -> dict[str, Any]:
+def _close_window(run: _LiveRun) -> dict[str, Any]:
     record = env_window.close_window(
         run.window,
         run.regional,
@@ -1145,7 +1202,7 @@ def _close_window(run: LiveRun) -> dict[str, Any]:
     return env_window.without_survey(record)
 
 
-def cleanup(run: LiveRun) -> dict[str, Any]:
+def _cleanup(run: _LiveRun) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
 
     def guard(label: str, action: Any) -> None:
@@ -1165,14 +1222,11 @@ def cleanup(run: LiveRun) -> dict[str, Any]:
                 timeout=120,
             ),
         )
-    # Then quiescence, then the window: the Deployment may roll only once no
-    # workflow of this run is in flight -- and the restore has to be created
-    # *after* the window closed, or it inherits the compressed lifetime and can
-    # fail on the very deadline this case exists to prove.
-    guard("incidents_idle", lambda: _wait_incidents_idle(run))
+    guard("restore_isolated_node", lambda: _restore_isolated_node(run))
+    guard("close_reset_incident", lambda: close_reset_incident(run))
+    # Only now may the Deployment roll again.
     if run.window_opened:
         guard("close_env_window", lambda: _close_window(run))
-    guard("restore_isolated_node", lambda: restore_isolated_node(run))
     for label, probe in (("holder", run.holder), ("injector", run.injector)):
         guard(
             f"probe_cleanup_{label}",
@@ -1183,7 +1237,7 @@ def cleanup(run: LiveRun) -> dict[str, Any]:
     return result
 
 
-def _verify_restored_identity(run: LiveRun) -> dict[str, Any]:
+def _verify_restored_identity(run: _LiveRun) -> dict[str, Any]:
     """The deployment the drill borrowed, given back exactly.
 
     Two writes if the window was opened and closed, one if the run died with it
@@ -1212,7 +1266,7 @@ def _verify_restored_identity(run: LiveRun) -> dict[str, Any]:
     return current
 
 
-def _final_node(run: LiveRun) -> dict[str, Any]:
+def _final_node(run: _LiveRun) -> dict[str, Any]:
     snapshot = run.regional.node_snapshot(run.settings.node)
     if snapshot["ready"] != "True":
         raise RegionalFixtureError("target node is not Ready after cleanup")
@@ -1256,8 +1310,47 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=verdicts.EXECUTION_TIMEOUT_SECONDS,
         help=(
-            "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS; must be at or above "
-            "the lifetime, or the execution deadline fires first"
+            "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS; must equal the "
+            "lifetime -- below it the execution deadline fires first, above it "
+            "claim_deadlines truncates it to the lifetime"
+        ),
+    )
+    value.add_argument(
+        "--step-timeout-seconds",
+        type=int,
+        default=verdicts.STEP_TIMEOUT_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS; the control plane refuses "
+            "a step waiting ceiling above the lifetime, so this is compressed to "
+            "the lifetime so the step's own cap cannot fire before the lifetime"
+        ),
+    )
+    value.add_argument(
+        "--managed-recovery-seconds",
+        type=int,
+        default=verdicts.MANAGED_RECOVERY_SECONDS,
+        help=(
+            "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS; pinned to the "
+            "step timeout (from_mapping forbids it below the step timeout, "
+            "validate_timing forbids it above the lifetime)"
+        ),
+    )
+    value.add_argument(
+        "--step-warning-seconds",
+        type=int,
+        default=verdicts.STEP_WARNING_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS; must stay below the step "
+            "timeout (from_mapping)"
+        ),
+    )
+    value.add_argument(
+        "--lease-duration-seconds",
+        type=int,
+        default=verdicts.LEASE_DURATION_SECONDS,
+        help=(
+            "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS; must stay below the "
+            "execution timeout (validate_timing_relationships)"
         ),
     )
     value.add_argument(

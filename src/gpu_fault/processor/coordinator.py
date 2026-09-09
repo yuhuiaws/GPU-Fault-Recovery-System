@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from threading import Event, RLock, Thread
+from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -25,8 +26,6 @@ from gpu_fault.channel_registry import (
     channel_for_path,
     paths_for_pool,
 )
-from gpu_fault.transport.http_client import urlopen
-from gpu_fault.processor.metrics import ProcessorMetricsMixin
 from gpu_fault.processor.batching import (
     GPU_INVENTORY_BATCH_SIZE,
     GPU_METRICS_BATCH_SIZE,
@@ -34,8 +33,17 @@ from gpu_fault.processor.batching import (
     telemetry_batch_size,
 )
 from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin
+from gpu_fault.processor.metrics import ProcessorMetricsMixin
+from gpu_fault.processor.models import (
+    ProcessorLeadership,
+    ProcessorRequest,
+    processor_partition_id,
+)
+from gpu_fault.processor.rejected_events import record_replay_completion
 from gpu_fault.processor.replay_completion import (
     finalize_replay_response,
+    reschedule_retryable_response,
+    retry_disposition,
 )
 from gpu_fault.processor.settings import (
     TELEMETRY_SPOOL_REPLAY_BATCH_MAX_ITEMS,
@@ -45,11 +53,7 @@ from gpu_fault.processor.settings import (
     ProcessorStaleSettings,
 )
 from gpu_fault.processor.telemetry_spool import TelemetrySpoolCoordinatorMixin
-from gpu_fault.processor.models import (
-    ProcessorLeadership,
-    ProcessorRequest,
-    processor_partition_id,
-)
+from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
 
@@ -243,6 +247,7 @@ class ProcessorCoordinator(
         self.spool_dropped_total = 0
         self.spool_abandoned_total = 0
         self.spool_errors_total = 0
+        self.spool_stale_completed_total = 0
         self.spool_direct_replay_total = 0
         self.spool_http_replay_total = 0
         self.spool_replay_seconds_sum = 0.0
@@ -250,6 +255,13 @@ class ProcessorCoordinator(
         self._spool_in_flight_bytes = 0
         self._spool_in_flight_max_bytes = 0
         self._spool_consumer_running = False
+        # B-6: liveness of the ``run_processor`` consumer loop. The spool
+        # consumer had a flag for ``/livez``; the queue consumer had none, so
+        # a loop that died left the Pod Ready with nothing claiming.
+        self._processor_consumer_running = False
+        self._consumer_last_cycle_monotonic: float | None = None
+        self._consumer_cycles_total = 0
+        self._consumer_cycle_errors_total = 0
         self._spool_work_available = Event()
         self._spool_notifications_enabled = False
         self._spool_notifications_received_total = 0
@@ -359,6 +371,34 @@ class ProcessorCoordinator(
     def spool_consumer_running(self) -> bool:
         with self._state_lock:
             return self._spool_consumer_running
+
+    @property
+    def processor_consumer_running(self) -> bool:
+        """Whether the ``run_processor`` consumer loop is alive (B-6)."""
+
+        with self._state_lock:
+            return self._processor_consumer_running
+
+    @property
+    def consumer_last_cycle_age_seconds(self) -> float | None:
+        """Seconds since the consumer loop last started a cycle; ``None``
+        before its first one."""
+
+        with self._state_lock:
+            last = self._consumer_last_cycle_monotonic
+        if last is None:
+            return None
+        return max(0.0, time.monotonic() - last)
+
+    def consumer_is_live(self, *, max_cycle_age_seconds: float) -> bool:
+        """The consumer thread is running and cycled recently. The loop's
+        longest voluntary wait is the notification fallback / idle backoff,
+        so a bound of a few multiples of that separates "idle" from "wedged"."""
+
+        if not self.processor_consumer_running:
+            return False
+        age = self.consumer_last_cycle_age_seconds
+        return age is not None and age <= max_cycle_age_seconds
 
     @property
     def unhealthy_reason(self) -> str | None:
@@ -613,160 +653,181 @@ class ProcessorCoordinator(
             if count > 0
         }
         futures: dict[str, set[Future]] = {name: set() for name in pools}
+        with self._state_lock:
+            self._processor_consumer_running = True
+            self._consumer_last_cycle_monotonic = time.monotonic()
         try:
             while not self._stop.is_set():
                 with self._state_lock:
-                    notification_streams = set(self._notification_pending_streams)
-                    self._notification_pending_streams.clear()
-                if "*" in notification_streams:
-                    self._stream_idle_until.clear()
-                    self._stream_idle_interval.clear()
-                else:
-                    for stream in notification_streams:
-                        self._stream_idle_until.pop(stream, None)
-                        self._stream_idle_interval.pop(stream, None)
-                self._check_execution_deadlines()
-                for name, pool_futures in futures.items():
-                    completed = {future for future in pool_futures if future.done()}
-                    for future in completed:
-                        try:
-                            future.result()
-                        except Exception:
-                            LOGGER.exception(
-                                "processor %s request execution failed",
-                                name,
-                            )
-                    pool_futures.difference_update(completed)
-                self._set_processor_fault_pressure(bool(futures.get("fault")))
-                if not self.is_healthy():
-                    self._stop.wait(self.poll_seconds)
-                    continue
-                leadership = self.leadership
-                if not self.active_consumers and (
-                    leadership is None or not self.is_leader()
-                ):
-                    self._stop.wait(self.poll_seconds)
-                    continue
-                available = {
-                    name: self.worker_counts[name] - len(pool_futures)
-                    for name, pool_futures in futures.items()
-                }
-                total_available = sum(available.values())
-                # An empty claim while workers are still executing earlier
-                # rows means "every eligible lane is leased", not "the queue
-                # is idle" - so the idle backoff must not grow to seconds.
-                self._pools_busy = any(
-                    pool_futures for pool_futures in futures.values()
-                )
-                if total_available <= 0:
-                    self._stop.wait(self.poll_seconds)
-                    continue
+                    self._consumer_last_cycle_monotonic = time.monotonic()
+                    self._consumer_cycles_total += 1
                 try:
-                    lease_seconds = min(
-                        self.request_lease_seconds,
-                        self.request_max_execution_seconds,
-                    )
-                    if self.active_consumers:
-                        requests = self._claim_active_by_pool(
-                            available,
-                            lease_duration=timedelta(seconds=lease_seconds),
-                        )
-                    else:
-                        requests = self.store.claim_processor_requests(
-                            self.owner_id,
-                            leadership.epoch,
-                            now=datetime.now(timezone.utc),
-                            lease_duration=timedelta(seconds=lease_seconds),
-                            limit=total_available,
-                        )
-                        self._claim_saturated = len(requests) >= total_available
-                    self.register_claimed_requests(requests)
-                    observation_requests = []
-                    telemetry_requests: dict[
-                        tuple[str, str], list[ProcessorRequest]
-                    ] = {}
-                    for item in requests:
-                        pool_name = self._pool_for_request(item)
-                        if pool_name == "observation":
-                            observation_requests.append(item)
-                            continue
-                        if (
-                            pool_name in {"gpu", "host"}
-                            and item.path in BATCHABLE_CHANNEL_PATHS
-                        ):
-                            telemetry_requests.setdefault(
-                                (pool_name, item.path), []
-                            ).append(item)
-                            continue
-                        if available[pool_name] <= 0:
-                            self._release(item)
-                            continue
-                        futures[pool_name].add(
-                            pools[pool_name].submit(self._process, item)
-                        )
-                        available[pool_name] -= 1
-                    while observation_requests:
-                        batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
-                        del observation_requests[: len(batch)]
-                        if available["observation"] <= 0:
-                            for item in batch:
-                                self._release(item)
-                            continue
-                        futures["observation"].add(
-                            pools["observation"].submit(
-                                self._process_observation_batch,
-                                batch,
-                            )
-                        )
-                        available["observation"] -= 1
-                    for (
-                        pool_name,
-                        path,
-                    ), pending in telemetry_requests.items():
-                        batch_size = telemetry_batch_size(path)
-                        while pending:
-                            batch = pending[:batch_size]
-                            del pending[: len(batch)]
-                            if available[pool_name] <= 0:
-                                for item in batch:
-                                    self._release(item)
-                                continue
-                            futures[pool_name].add(
-                                pools[pool_name].submit(
-                                    self._process_telemetry_batch,
-                                    batch,
-                                )
-                            )
-                            available[pool_name] -= 1
-                    for item in requests:
-                        LOGGER.info(
-                            "processor request claimed "
-                            "request_id=%s path=%s lane=%s owner=%s "
-                            "epoch=%s lease_expires_at=%s",
-                            item.request_id,
-                            item.path,
-                            item.ordering_key(),
-                            self.owner_id,
-                            item.leader_epoch,
-                            item.lease_expires_at.isoformat()
-                            if item.lease_expires_at
-                            else None,
-                        )
-                    if not requests or not self._claim_saturated:
-                        # Nothing claimed, or no claim filled its limit:
-                        # either way the next round would re-run the
-                        # claim query against the same drained or
-                        # lane-blocked backlog. Sleep one poll interval
-                        # so the query rate stays bounded; a consumer
-                        # that is keeping up never gets here.
-                        self._wait_for_work(self._next_claim_wait_seconds())
+                    self._run_processor_cycle(pools, futures)
                 except Exception:
-                    LOGGER.exception("processor request cycle failed")
+                    # The claim half of the cycle has its own handler below;
+                    # this one covers the bookkeeping half (deadline sweep,
+                    # future reaping, notification streams), which used to
+                    # run outside any ``try`` and took the thread with it on
+                    # the first exception (B-6).
+                    with self._state_lock:
+                        self._consumer_cycle_errors_total += 1
+                    LOGGER.exception("processor consumer cycle failed")
                     self._stop.wait(self.poll_seconds)
         finally:
+            with self._state_lock:
+                self._processor_consumer_running = False
             for pool in pools.values():
                 pool.shutdown(wait=True, cancel_futures=True)
             self.release_unstarted_claims()
+
+    def _run_processor_cycle(
+        self,
+        pools: dict[str, ThreadPoolExecutor],
+        futures: dict[str, set[Future[Any]]],
+    ) -> None:
+        with self._state_lock:
+            notification_streams = set(self._notification_pending_streams)
+            self._notification_pending_streams.clear()
+        if "*" in notification_streams:
+            self._stream_idle_until.clear()
+            self._stream_idle_interval.clear()
+        else:
+            for stream in notification_streams:
+                self._stream_idle_until.pop(stream, None)
+                self._stream_idle_interval.pop(stream, None)
+        self._check_execution_deadlines()
+        for name, pool_futures in futures.items():
+            completed = {future for future in pool_futures if future.done()}
+            for future in completed:
+                try:
+                    future.result()
+                except Exception:
+                    LOGGER.exception(
+                        "processor %s request execution failed",
+                        name,
+                    )
+            pool_futures.difference_update(completed)
+        self._set_processor_fault_pressure(bool(futures.get("fault")))
+        if not self.is_healthy():
+            self._stop.wait(self.poll_seconds)
+            return
+        leadership = self.leadership
+        if not self.active_consumers and (leadership is None or not self.is_leader()):
+            self._stop.wait(self.poll_seconds)
+            return
+        available = {
+            name: self.worker_counts[name] - len(pool_futures)
+            for name, pool_futures in futures.items()
+        }
+        total_available = sum(available.values())
+        # An empty claim while workers are still executing earlier
+        # rows means "every eligible lane is leased", not "the queue
+        # is idle" - so the idle backoff must not grow to seconds.
+        self._pools_busy = any(pool_futures for pool_futures in futures.values())
+        if total_available <= 0:
+            self._stop.wait(self.poll_seconds)
+            return
+        try:
+            lease_seconds = min(
+                self.request_lease_seconds,
+                self.request_max_execution_seconds,
+            )
+            if self.active_consumers:
+                requests = self._claim_active_by_pool(
+                    available,
+                    lease_duration=timedelta(seconds=lease_seconds),
+                )
+            else:
+                # Guarded above: without active consumers a missing
+                # leadership already returned.
+                assert leadership is not None
+                requests = self.store.claim_processor_requests(
+                    self.owner_id,
+                    leadership.epoch,
+                    now=datetime.now(timezone.utc),
+                    lease_duration=timedelta(seconds=lease_seconds),
+                    limit=total_available,
+                )
+                self._claim_saturated = len(requests) >= total_available
+            self.register_claimed_requests(requests)
+            observation_requests = []
+            telemetry_requests: dict[tuple[str, str], list[ProcessorRequest]] = {}
+            for item in requests:
+                pool_name = self._pool_for_request(item)
+                if pool_name == "observation":
+                    observation_requests.append(item)
+                    continue
+                if (
+                    pool_name in {"gpu", "host"}
+                    and item.path in BATCHABLE_CHANNEL_PATHS
+                ):
+                    telemetry_requests.setdefault((pool_name, item.path), []).append(
+                        item
+                    )
+                    continue
+                if available[pool_name] <= 0:
+                    self._release(item)
+                    continue
+                futures[pool_name].add(pools[pool_name].submit(self._process, item))
+                available[pool_name] -= 1
+            while observation_requests:
+                batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
+                del observation_requests[: len(batch)]
+                if available["observation"] <= 0:
+                    for item in batch:
+                        self._release(item)
+                    continue
+                futures["observation"].add(
+                    pools["observation"].submit(
+                        self._process_observation_batch,
+                        batch,
+                    )
+                )
+                available["observation"] -= 1
+            for (
+                pool_name,
+                path,
+            ), pending in telemetry_requests.items():
+                batch_size = telemetry_batch_size(path)
+                while pending:
+                    batch = pending[:batch_size]
+                    del pending[: len(batch)]
+                    if available[pool_name] <= 0:
+                        for item in batch:
+                            self._release(item)
+                        continue
+                    futures[pool_name].add(
+                        pools[pool_name].submit(
+                            self._process_telemetry_batch,
+                            batch,
+                        )
+                    )
+                    available[pool_name] -= 1
+            for item in requests:
+                LOGGER.info(
+                    "processor request claimed "
+                    "request_id=%s path=%s lane=%s owner=%s "
+                    "epoch=%s lease_expires_at=%s",
+                    item.request_id,
+                    item.path,
+                    item.ordering_key(),
+                    self.owner_id,
+                    item.leader_epoch,
+                    item.lease_expires_at.isoformat()
+                    if item.lease_expires_at
+                    else None,
+                )
+            if not requests or not self._claim_saturated:
+                # Nothing claimed, or no claim filled its limit:
+                # either way the next round would re-run the
+                # claim query against the same drained or
+                # lane-blocked backlog. Sleep one poll interval
+                # so the query rate stays bounded; a consumer
+                # that is keeping up never gets here.
+                self._wait_for_work(self._next_claim_wait_seconds())
+        except Exception:
+            LOGGER.exception("processor request cycle failed")
+            self._stop.wait(self.poll_seconds)
 
     def _telemetry_spool_batch_bytes(self, items: list) -> int:
         return 16 + sum(self._telemetry_spool_item_bytes(item) + 1 for item in items)
@@ -1049,8 +1110,11 @@ class ProcessorCoordinator(
         if not parsed:
             return
         started = {item.request_id: time.monotonic() for item, _ in parsed}
-        for item, _ in parsed:
-            self._request_started(item)
+        deadline = min(self._request_started(item) for item, _ in parsed)
+        renewal_stop, renewal_thread = self._start_batch_renewal(
+            [item for item, _ in parsed], renewal_stop_deadline=deadline
+        )
+        disposed: set[str] = set()
         try:
             self.store.save_attempt_observations_batch(
                 [observation for _, observation in parsed]
@@ -1071,27 +1135,24 @@ class ProcessorCoordinator(
             ]
             results = self.store.complete_active_processor_requests_batch(completions)
             for (item, _), result in zip(parsed, results, strict=True):
+                disposed.add(item.request_id)
                 if result is None:
-                    raise ValueError("stale processor lane fencing token")
+                    # Only this row's lease failed to validate; the rest of
+                    # the statement committed (B-9).
+                    self._release_fenced_batch_item(item, started[item.request_id])
+                    continue
                 self._observe_processing(
                     "success",
                     time.monotonic() - started[item.request_id],
                 )
         except Exception:
-            for item, _ in parsed:
-                try:
-                    self._release(item, failure="batch execution raised")
-                except Exception:
-                    LOGGER.exception(
-                        "observation batch release failed request_id=%s",
-                        item.request_id,
-                    )
-                self._observe_processing(
-                    "error",
-                    time.monotonic() - started[item.request_id],
-                )
+            self._release_batch_after_failure(
+                [item for item, _ in parsed if item.request_id not in disposed],
+                started,
+            )
             raise
         finally:
+            self._stop_batch_renewal(renewal_stop, renewal_thread)
             for item, _ in parsed:
                 self._request_finished(item.request_id)
 
@@ -1100,8 +1161,10 @@ class ProcessorCoordinator(
         if not items:
             return
         started = {item.request_id: time.monotonic() for item in items}
-        for item in items:
-            self._request_started(item)
+        deadline = min(self._request_started(item) for item in items)
+        renewal_stop, renewal_thread = self._start_batch_renewal(
+            items, renewal_stop_deadline=deadline
+        )
         request = urllib_request.Request(
             self.local_url + "/v1/internal/processor/telemetry-batch",
             data=json.dumps(
@@ -1124,6 +1187,7 @@ class ProcessorCoordinator(
             },
             method="POST",
         )
+        disposed: set[str] = set()
         try:
             with urlopen(
                 request,
@@ -1131,52 +1195,139 @@ class ProcessorCoordinator(
             ) as response:
                 body = json.loads(response.read())
             by_id = {item["request_id"]: item for item in body.get("results", [])}
-            completions = []
             for item in items:
-                result = by_id.get(item.request_id)
-                if result is None:
+                if by_id.get(item.request_id) is None:
                     raise ValueError("telemetry batch response omitted request")
+            completions = []
+            to_complete: list[tuple[ProcessorRequest, int, bytes]] = []
+            for item in items:
+                result = by_id[item.request_id]
+                status = int(result["status"])
+                # A retryable status on one item is that item's retry, with
+                # the same accounting as a replayed request (B-4); the rest
+                # of the batch is committed as usual.
+                if retry_disposition(self, item, status=status) == "retry":
+                    disposed.add(item.request_id)
+                    reschedule_retryable_response(self, item, status=status)
+                    self._observe_processing(
+                        "error", time.monotonic() - started[item.request_id]
+                    )
+                    continue
+                encoded = json.dumps(result["body"], separators=(",", ":")).encode()
+                to_complete.append((item, status, encoded))
                 completions.append(
                     {
                         "request_id": item.request_id,
                         "owner_id": self.owner_id,
                         "lane_epoch": item.leader_epoch,
                         "lease_token": item.lease_token,
-                        "response_status": result["status"],
+                        "response_status": status,
                         "response_content_type": "application/json",
-                        "response_body_base64": base64.b64encode(
-                            json.dumps(
-                                result["body"],
-                                separators=(",", ":"),
-                            ).encode()
-                        ).decode("ascii"),
+                        "response_body_base64": base64.b64encode(encoded).decode(
+                            "ascii"
+                        ),
                     }
                 )
-            completed = self.store.complete_active_processor_requests_batch(completions)
-            for item, result in zip(items, completed, strict=True):
+            completed = (
+                self.store.complete_active_processor_requests_batch(completions)
+                if completions
+                else []
+            )
+            for (item, status, encoded), result in zip(
+                to_complete, completed, strict=True
+            ):
+                disposed.add(item.request_id)
                 if result is None:
-                    raise ValueError("stale processor lane fencing token")
+                    # Only this row's lease failed to validate; the rest of
+                    # the statement committed (B-9).
+                    self._release_fenced_batch_item(item, started[item.request_id])
+                    continue
+                # The row is committed with this status as its final answer;
+                # book it where an operator can see it (G1).
+                record_replay_completion(self, item, status=status, body=encoded)
                 self._observe_processing(
                     "success",
                     time.monotonic() - started[item.request_id],
                 )
         except Exception:
-            for item in items:
-                try:
-                    self._release(item, failure="batch execution raised")
-                except Exception:
-                    LOGGER.exception(
-                        "telemetry batch release failed request_id=%s",
-                        item.request_id,
-                    )
-                self._observe_processing(
-                    "error",
-                    time.monotonic() - started[item.request_id],
-                )
+            self._release_batch_after_failure(
+                [item for item in items if item.request_id not in disposed],
+                started,
+            )
             raise
         finally:
+            self._stop_batch_renewal(renewal_stop, renewal_thread)
             for item in items:
                 self._request_finished(item.request_id)
+
+    def _start_batch_renewal(
+        self,
+        items: list[ProcessorRequest],
+        *,
+        renewal_stop_deadline: float,
+    ) -> tuple[Event, Thread | None]:
+        """Renew every lease of a batch while its handler runs (B-4).
+
+        The single-request path has had this since F-D5; the batch paths
+        ran up to 64 requests against a lease that expired exactly at the
+        execution deadline, so a slow handler completed into a fence.
+        """
+
+        stop = Event()
+        if not self.active_consumers or not items:
+            return stop, None
+        thread = Thread(
+            target=self._renew_active_requests,
+            args=(list(items), stop, renewal_stop_deadline),
+            name=f"gpu-fault-processor-renew-batch-{items[0].request_id}",
+            daemon=True,
+        )
+        thread.start()
+        return stop, thread
+
+    def _stop_batch_renewal(self, stop: Event, thread: Thread | None) -> None:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=self.request_renew_seconds + 1)
+
+    def _release_fenced_batch_item(
+        self, item: ProcessorRequest, started: float
+    ) -> None:
+        LOGGER.warning(
+            "processor batch completion fenced request_id=%s path=%s lane=%s "
+            "owner=%s epoch=%s",
+            item.request_id,
+            item.path,
+            item.ordering_key(),
+            self.owner_id,
+            item.leader_epoch,
+        )
+        try:
+            self._release(item, failure="stale processor lane fencing token")
+        except Exception:
+            LOGGER.exception(
+                "processor batch release after fence failed request_id=%s",
+                item.request_id,
+            )
+        self._observe_processing("error", time.monotonic() - started)
+
+    def _release_batch_after_failure(
+        self,
+        items: list[ProcessorRequest],
+        started: dict[str, float],
+    ) -> None:
+        for item in items:
+            try:
+                self._release(item, failure="batch execution raised")
+            except Exception:
+                LOGGER.exception(
+                    "processor batch release failed request_id=%s",
+                    item.request_id,
+                )
+            self._observe_processing(
+                "error",
+                time.monotonic() - started[item.request_id],
+            )
 
     @staticmethod
     def _payload_observed_at(payload: dict) -> datetime | None:
@@ -1386,53 +1537,74 @@ class ProcessorCoordinator(
         stop: Event,
         deadline: float,
     ) -> None:
-        while not stop.wait(self.request_renew_seconds):
+        self._renew_active_requests([item], stop, deadline)
+
+    def _renew_active_requests(
+        self,
+        items: list[ProcessorRequest],
+        stop: Event,
+        deadline: float,
+    ) -> None:
+        """Renew the leases of ``items`` until stopped, fenced or past deadline.
+
+        One thread per execution (single request or batch). A request whose
+        renewal is fenced drops out of the set; the loop ends when the set is
+        empty. A transient store error must not abandon the lease while the
+        handler keeps running (F-D5): it is counted and retried on the next
+        tick.
+        """
+
+        pending = list(items)
+        while pending and not stop.wait(self.request_renew_seconds):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._mark_execution_deadline_exceeded(item)
+                for item in pending:
+                    self._mark_execution_deadline_exceeded(item)
                 return
-            try:
-                renewed = self.store.renew_active_processor_request(
-                    item.request_id,
-                    self.owner_id,
-                    item.leader_epoch,
-                    item.lease_token,
-                    lease_duration=timedelta(
-                        seconds=min(
-                            self.request_lease_seconds,
-                            remaining,
-                        )
-                    ),
-                )
-            except Exception:
-                # A transient store error must not abandon the lease while the
-                # handler keeps running (F-D5): count it and try again on the
-                # next tick; only a fence ends the renewal.
-                with self._state_lock:
-                    self._renewal_errors_total += 1
-                LOGGER.exception(
-                    "processor request renewal failed; retrying "
-                    "request_id=%s path=%s lane=%s owner=%s epoch=%s",
-                    item.request_id,
-                    item.path,
-                    item.ordering_key(),
-                    self.owner_id,
-                    item.leader_epoch,
-                )
-                continue
-            if not renewed:
-                with self._state_lock:
-                    self._renewal_fenced_total += 1
-                LOGGER.warning(
-                    "processor request renewal fenced "
-                    "request_id=%s path=%s lane=%s owner=%s epoch=%s",
-                    item.request_id,
-                    item.path,
-                    item.ordering_key(),
-                    self.owner_id,
-                    item.leader_epoch,
-                )
-                return
+            still_leased: list[ProcessorRequest] = []
+            for item in pending:
+                try:
+                    renewed = self.store.renew_active_processor_request(
+                        item.request_id,
+                        self.owner_id,
+                        item.leader_epoch,
+                        item.lease_token,
+                        lease_duration=timedelta(
+                            seconds=min(
+                                self.request_lease_seconds,
+                                remaining,
+                            )
+                        ),
+                    )
+                except Exception:
+                    with self._state_lock:
+                        self._renewal_errors_total += 1
+                    LOGGER.exception(
+                        "processor request renewal failed; retrying "
+                        "request_id=%s path=%s lane=%s owner=%s epoch=%s",
+                        item.request_id,
+                        item.path,
+                        item.ordering_key(),
+                        self.owner_id,
+                        item.leader_epoch,
+                    )
+                    still_leased.append(item)
+                    continue
+                if not renewed:
+                    with self._state_lock:
+                        self._renewal_fenced_total += 1
+                    LOGGER.warning(
+                        "processor request renewal fenced "
+                        "request_id=%s path=%s lane=%s owner=%s epoch=%s",
+                        item.request_id,
+                        item.path,
+                        item.ordering_key(),
+                        self.owner_id,
+                        item.leader_epoch,
+                    )
+                    continue
+                still_leased.append(item)
+            pending = still_leased
 
     def _execute(self, item: ProcessorRequest, *, deadline: float) -> None:
         started = time.monotonic()

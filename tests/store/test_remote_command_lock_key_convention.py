@@ -48,7 +48,11 @@ PER_COMMAND_KEY = re.compile(r'f"remote_command/\{(?:[\w.]*command_id|key)\}"')
 SQL_BULK_KEY = "'remote_command/' || command_id"
 # The two sweep-level keys; they serialise sweepers against each other and are
 # only acceptable together with the row discipline checked below.
-SWEEP_KEYS = {'"remote_command/cleanup"', '"remote_command/unclaimed-expiry"'}
+SWEEP_KEYS = {
+    '"remote_command/cleanup"',
+    '"remote_command/unclaimed-expiry"',
+    '"remote_command/stale-fence"',
+}
 
 LITERAL = re.compile(r"""(f?"remote_command/[^"]*"|'remote_command/'\s*\|\|\s*\w+)""")
 
@@ -103,15 +107,18 @@ def test_the_writer_set_is_the_reviewed_one(name: str) -> None:
             "cancel_remote_commands_for_workflow",
             "cleanup_terminal_remote_commands",
             "expire_unclaimed_remote_commands",
+            "expire_stale_fenced_remote_commands",
         },
         "shared": {
             "ensure_remote_command",
             "renew_remote_command_lease",
+            "record_remote_command_progress",
             "complete_remote_command",
         },
         "sqlite": {
             "claim_remote_commands",
             "expire_unclaimed_remote_commands",
+            "expire_stale_fenced_remote_commands",
             "cleanup_terminal_remote_commands",
             "cancel_remote_commands_for_workflow",
             "cancel_remote_command",
@@ -139,7 +146,7 @@ def _serialisation(body: str) -> str:
             return "terminal-cleanup"
     if '"remote_command/cleanup"' in body and "RemoteCommandStatus.SUCCEEDED" in body:
         return "terminal-cleanup"
-    if '"remote_command/unclaimed-expiry"' in body:
+    if any(key in body for key in SWEEP_KEYS - {'"remote_command/cleanup"'}):
         return "sweep-key-only"
     return "none"
 

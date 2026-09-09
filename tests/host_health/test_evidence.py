@@ -112,7 +112,8 @@ def test_host_batch_is_correlated_to_attempt_and_archived() -> None:
                 json=host_telemetry_batch(
                     "host-correlated",
                     NOW,
-                    [HostMetricSample(name="cpu_usage_percent", value=99)],
+                    # An immediate rule: CPU saturation is sustain-gated now.
+                    [HostMetricSample(name="swap_used_percent", value=90)],
                     node_id="node-0",
                 ).model_dump(mode="json"),
             )

@@ -14,9 +14,9 @@ from gpu_fault.models import (
 )
 from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
 from gpu_fault.policy import (
+    NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
     ActionDisposition,
     FaultPolicyDecision,
-    NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
     SxidClassification,
     SxidEvent,
     XidEvent,
@@ -447,6 +447,19 @@ class WorkflowBuilder:
         if operation is WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE:
             return {"target_firmware_version": (self.target_firmware_version)}
         if operation is WorkflowOperation.RESTART_WORKLOAD:
+            # The XID usually kills the process, so by the time the event is
+            # ingested the watcher may already hold the Pod as terminated and
+            # the [-30 s, +120 s] window finds no live container on the node.
+            # With no fallback the step carried source_gpu_count=0, which
+            # _restart_guard read as a GPU count change and waited for an
+            # approval that can never be produced; the regional executor has
+            # no store to recover the count from. The detector already named
+            # the GPUs, so hand them over the same way the node-health family
+            # does.
+            if isinstance(event, XidEvent):
+                event_gpu_uuids = [event.gpu_uuid] if event.gpu_uuid else []
+            else:
+                event_gpu_uuids = list(event.participating_gpu_uuids)
             return self.restart_step_parameters(
                 event.cluster_id,
                 event.affected_workload_ids,
@@ -456,6 +469,7 @@ class WorkflowBuilder:
                 # control-plane clocks; the node's observed_at is not (F-B8).
                 observed_at=event.ingested_at or event.observed_at,
                 node_id=event.node_id,
+                fallback_gpu_uuids=event_gpu_uuids or list(incident.gpu_uuids),
             )
         return {}
 

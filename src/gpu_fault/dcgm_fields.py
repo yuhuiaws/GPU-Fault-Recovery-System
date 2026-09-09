@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 DCGM_FABRIC_CANONICAL_GROUPS = {
     "nvlink_crc": frozenset(
         {

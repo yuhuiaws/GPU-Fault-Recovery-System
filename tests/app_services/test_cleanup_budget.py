@@ -47,6 +47,14 @@ def _config(**overrides) -> PeriodicServiceConfig:
         silence_interval=60.0,
         silent_after={kind: 300.0 for kind in CollectorKind},
         silent_alert_interval=3600.0,
+        # The budget arithmetic below is pinned to the four original local
+        # jobs; the F-8 sweeps (markers, notifications, completion records,
+        # registry members) have their own tests in
+        # test_cleanup_unbounded_kinds.py.
+        marker_retention=0.0,
+        notification_retention=0.0,
+        completion_record_retention=0.0,
+        registry_member_retention=0.0,
     )
     return replace(base, **overrides)
 

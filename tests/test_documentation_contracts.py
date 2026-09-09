@@ -456,8 +456,7 @@ def test_developer_manual_documents_every_runtime_profile_capability() -> None:
         )
     for value in (
         "templateSource",
-        "gpu-fault-admin approve-profile",
-        "--plan-sha256",
+        "--approve-profile-plan",
         "profile-plan.json",
         "site_identity",
         "cpu_eks_arn",
@@ -575,7 +574,7 @@ def test_root_readme_separates_developer_and_admin_deployment() -> None:
         "--state-dir /secure/gpu-fault-staging",
         "--admin-email <operations-email>",
         "`staging_only`",
-        "--plan-sha256",
+        "--approve-profile-plan",
         "release-ref",
         "不提供",
         "完整生产门禁",
@@ -608,24 +607,39 @@ def test_admin_profile_approval_guide_closes_the_review_loop() -> None:
 
     for value in (
         "## 1. 最短操作路径",
-        "## 7. 完整命令模板",
         "site_identity.cpu_eks_arn",
         "site_identity_sha256",
-        "--plan-sha256",
+        "--approve-profile-plan <plan_sha256>",
+        "--reference CHG-12345",
         "profile-approvals/<plan_sha256>/",
         "UNKNOWN_BASELINE",
         "SUPERSEDED",
         "CONSUMED",
         "ALREADY_APPLIED",
         "不手工创建",
-        "GPU_CLUSTER_ARNS=(",
-        "APPROVED_PLAN_SHA256",
-        "Stop: approve this plan externally",
-        'test -f "${PLAN_FILE}" || exit "${DEPLOY_RC}"',
+        "没有第三步",
     ):
         assert value in guide, f"Profile approval guide omits {value}"
     assert "PROFILE_APPROVAL=" not in guide
     assert "--profile-approval" not in guide
+    # The two-step flow retired the approve-profile verb, the jq digest lookup
+    # and the wrapper script that existed to survive the six-step flow.
+    assert "gpu-fault-admin approve-profile" not in guide
+    assert "--plan-sha256" not in guide
+    assert "jq -er" not in guide
+    assert "APPROVED_PLAN_SHA256" not in guide
+    for path in ("管理员快速部署.md", "管理员日常运维.md"):
+        operator_doc = (DOCS / path).read_text(encoding="utf-8")
+        assert "--approve-profile-plan <plan_sha256>" in operator_doc, (
+            f"{path} does not show the deploy rerun that approves the plan"
+        )
+        assert "jq -er '.plan_sha256'" not in operator_doc, (
+            f"{path} still makes the operator dig the digest out with jq"
+        )
+    quickstart = (DOCS / "管理员快速部署.md").read_text(encoding="utf-8")
+    assert "gpu-fault-admin approve-profile" not in quickstart, (
+        "the quickstart still tells the operator to run the removed approve-profile verb"
+    )
     assert "docs/管理员Profile变更审批.md" in builder
     assert "[Runtime Profile变更审批](管理员Profile变更审批.md)" in index
 

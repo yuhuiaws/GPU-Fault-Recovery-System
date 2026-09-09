@@ -40,7 +40,11 @@ def _attempts(workflow):
     ]
 
 
-def test_three_waits_then_success_keep_one_record_and_four_attempt_events():
+def test_three_waits_then_success_keep_one_record_and_three_attempt_events():
+    """The second wait differs from the first only in ``step_waiting_seconds``:
+    the same wait polled again, folded into the first event (D-10). The third
+    names another reason and is recorded."""
+
     workflow = _workflow()
     step = workflow.official_steps[0]
     waits = (
@@ -62,26 +66,19 @@ def test_three_waits_then_success_keep_one_record_and_four_attempt_events():
     assert len(workflow.step_executions) == 1, workflow.step_executions
     assert workflow.step_executions[0].status is WorkflowStepStatus.SUCCEEDED
     attempts = _attempts(workflow)
-    assert [event.details["attempt"] for event in attempts] == [1, 2, 3, 4]
-    assert [event.status for event in attempts] == [
-        "WAITING",
-        "WAITING",
-        "WAITING",
-        "SUCCEEDED",
-    ]
+    assert [event.details["attempt"] for event in attempts] == [1, 2, 3]
+    assert [event.status for event in attempts] == ["WAITING", "WAITING", "SUCCEEDED"]
     assert [event.code for event in attempts] == [
-        WorkflowEventCode.STEP_WAITING,
         WorkflowEventCode.STEP_WAITING,
         WorkflowEventCode.STEP_WAITING,
         WorkflowEventCode.STEP_SUCCEEDED,
     ]
-    assert [event.details.get("reason") for event in attempts[:3]] == [
-        "NODE_BUSY",
+    assert [event.details.get("reason") for event in attempts[:2]] == [
         "NODE_BUSY",
         "AGENT_LAG",
     ]
-    assert attempts[1].details["step_waiting_seconds"] == 30
-    assert attempts[2].details["gpu_reset_commit_attempt"] == 2
+    assert attempts[0].details["step_waiting_seconds"] == 0
+    assert attempts[1].details["gpu_reset_commit_attempt"] == 2
     assert all("payload" not in event.details for event in attempts), (
         "whole outcome details must never be copied into an event"
     )

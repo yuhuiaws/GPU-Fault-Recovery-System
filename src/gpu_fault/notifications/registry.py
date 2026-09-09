@@ -7,6 +7,9 @@ from typing import Any
 from gpu_fault.notifications.dcgm_diagnostic import (
     DcgmDiagnosticEmailBuilder,
 )
+from gpu_fault.notifications.diagnostic_inconclusive import (
+    DiagnosticInconclusiveEmailBuilder,
+)
 from gpu_fault.notifications.efa_rdma import EfaRdmaEventEmailBuilder
 from gpu_fault.notifications.hardware_escalation import (
     HardwareEscalationEmailBuilder,
@@ -55,6 +58,7 @@ class NotificationKind(StrEnum):
     FABRIC_RESET_COMPLETED = "FABRIC_RESET_COMPLETED"
     GPU_RESET_COMPLETED = "GPU_RESET_COMPLETED"
     DCGM_DIAGNOSTIC = "DCGM_DIAGNOSTIC"
+    DIAGNOSTIC_INCONCLUSIVE = "DIAGNOSTIC_INCONCLUSIVE"
     HARDWARE_ESCALATION = "HARDWARE_ESCALATION"
     NVLINK74_SUPPORT = "NVLINK74_SUPPORT"
     NVLINK74_MECHANICAL = "NVLINK74_MECHANICAL"
@@ -113,6 +117,9 @@ NOTIFICATION_REGISTRY = {
     ),
     NotificationKind.DCGM_DIAGNOSTIC: NotificationDefinition(
         DcgmDiagnosticEmailBuilder
+    ),
+    NotificationKind.DIAGNOSTIC_INCONCLUSIVE: NotificationDefinition(
+        DiagnosticInconclusiveEmailBuilder
     ),
     NotificationKind.HARDWARE_ESCALATION: NotificationDefinition(
         HardwareEscalationEmailBuilder

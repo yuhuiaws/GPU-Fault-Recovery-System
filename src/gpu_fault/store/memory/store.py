@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from threading import RLock
 
+from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
-    DiagnosticRequest,
     EfaTrafficAdminDecision,
     EfaTrafficState,
     EffectiveRuntimeProfile,
@@ -18,19 +18,9 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
     WorkflowRequest,
     XidMetricBaseline,
 )
-from gpu_fault.installation_resources import InstallationResource
-from gpu_fault.store.shared.compositions import SharedCompositionMixin
-from gpu_fault.store.shared.efa import SharedEfaTrafficRulesMixin
-from gpu_fault.store.shared.errors import (
-    EfaTrafficAdminConflict as EfaTrafficAdminConflict,
-    NotFoundError as NotFoundError,
-    WorkflowLeaseError as WorkflowLeaseError,
-)
-from gpu_fault.store.shared.xid import SharedXidSignalMixin
 from gpu_fault.store.memory.control_records import MemoryControlRecordMixin
 from gpu_fault.store.memory.efa import MemoryEfaTrafficMixin
 from gpu_fault.store.memory.fleet import MemoryFleetMixin
@@ -42,6 +32,24 @@ from gpu_fault.store.memory.telemetry import MemoryTelemetryMixin
 from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
 from gpu_fault.store.memory.workflows import MemoryWorkflowMixin
 from gpu_fault.store.memory.xid import MemoryXidMixin
+from gpu_fault.store.shared.compositions import SharedCompositionMixin
+from gpu_fault.store.shared.efa import SharedEfaTrafficRulesMixin
+from gpu_fault.store.shared.errors import (
+    EfaTrafficAdminConflict as EfaTrafficAdminConflict,
+)
+from gpu_fault.store.shared.errors import (
+    NotFoundError as NotFoundError,
+)
+from gpu_fault.store.shared.errors import (
+    WorkflowLeaseError as WorkflowLeaseError,
+)
+from gpu_fault.store.shared.xid import SharedXidSignalMixin
+from gpu_fault.store.shared.wakeups import (
+    InProcessWakeupMixin,
+    WakeupHub,
+    observed_remote_command_rows,
+    observed_workflow_rows,
+)
 
 
 class InMemoryStore(
@@ -61,6 +69,9 @@ class InMemoryStore(
     SharedEfaTrafficRulesMixin,
     SharedXidSignalMixin,
     SharedCompositionMixin,
+    # Wakeups: the workflow and remote-command tables below are observed
+    # dicts that publish into the hub on assignment, the in-process row trigger.
+    InProcessWakeupMixin,
 ):
     """Thread-safe store for tests and single-process tooling.
 
@@ -73,18 +84,19 @@ class InMemoryStore(
 
     def __init__(self) -> None:
         self._lock = RLock()
+        self._wakeup_hub = WakeupHub()
         self._events: dict[str, TerminalEvent] = {}
         self._decisions: dict[str, CompletionDecision] = {}
         self._attempt_event_keys: dict[tuple[str, str], str] = {}
         self._markers: dict[str, NodeMarker] = {}
-        self._diagnostics: dict[str, DiagnosticRequest] = {}
-        self._triage_reports: dict[str, TriageReport] = {}
         self._plans: dict[str, RecoveryPlan] = {}
         self._profiles: dict[str, EffectiveRuntimeProfile] = {}
         self._installation_resources: dict[str, InstallationResource] = {}
         self._incidents: dict[str, FaultIncident] = {}
         self._incident_by_event: dict[str, str] = {}
-        self._workflows: dict[str, WorkflowRequest] = {}
+        self._workflows: dict[str, WorkflowRequest] = observed_workflow_rows(
+            self._wakeup_hub
+        )
         self._notifications: dict[str, AdvisoryNotification] = {}
         self._collector_metrics_snapshot = None
         self._notification_by_deduplication_key: dict[str, str] = {}
@@ -115,7 +127,7 @@ class InMemoryStore(
         self._regional_registry_revisions = {}
         self._regional_registry_head = None
         self._regional_registry_members = {}
-        self._remote_commands = {}
+        self._remote_commands = observed_remote_command_rows(self._wakeup_hub)
         self._processor_leadership = None
         self._periodic_task_leases = {}
         self._processor_lanes = {}
@@ -130,14 +142,3 @@ class InMemoryStore(
         self._xid_correlations = {}
         self._xid74_occurrence_states = {}
         self._xid74_counted_events: set[tuple[str, tuple]] = set()
-
-
-class SimulatedDiagnosticAdapter:
-    def __init__(self, store: InMemoryStore) -> None:
-        self.store = store
-        self.submitted: list[str] = []
-
-    def submit(self, request: DiagnosticRequest) -> str:
-        self.store.save_diagnostic(request)
-        self.submitted.append(request.request_id)
-        return request.request_id

@@ -18,7 +18,6 @@ from gpu_fault.models import (
 from gpu_fault.recovery_actions import RECOVERY_ACTION_PROFILES
 from gpu_fault.store import NotFoundError
 
-
 #: Derived from the one recovery-action table shared with the spare-blocking
 #: set in :mod:`gpu_fault.markers`; see :mod:`gpu_fault.recovery_actions`.
 ACTION_OPERATION: dict[RecoveryAction, WorkflowOperation] = {
@@ -63,7 +62,21 @@ class PassiveWorkflowCompiler:
         self.store = store
         self.evidence_owner = evidence_owner
 
-    def compile(self, plan: RecoveryPlan, event: TerminalEvent) -> RecoveryPlan:
+    def compile(
+        self,
+        plan: RecoveryPlan,
+        event: TerminalEvent,
+        *,
+        predecessor_workflow_id: str | None = None,
+    ) -> RecoveryPlan:
+        """Compile ``plan`` into an incident and a PENDING workflow.
+
+        ``predecessor_workflow_id`` names the attempt's passive containment
+        workflow when the completion service knows one: the dispatcher holds
+        the recovery while that predecessor is open, which replaced the HTTP
+        conflict the terminal used to be answered with.
+        """
+
         if plan.workflow_request_id:
             return plan
         now = datetime.now(timezone.utc)
@@ -110,6 +123,11 @@ class PassiveWorkflowCompiler:
             ),
             event_type="TRAINING_ATTEMPT_TERMINAL",
             cluster_id=event.cluster_id,
+            # ``_withdraw_job_workflows`` finds the workflows of a stopped job
+            # through the incident's ``job_id``; without it a pending passive
+            # restart survived the user's stop and ran anyway (F-N1 §7).
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
             node_ids=sorted({item.node_id for item in event.allocation}),
             gpu_uuids=sorted(
                 {gpu for item in event.allocation for gpu in item.gpu_uuids}
@@ -128,6 +146,7 @@ class PassiveWorkflowCompiler:
         workflow = WorkflowRequest(
             incident_id=incident.incident_id,
             source_plan_id=plan.plan_id,
+            predecessor_workflow_id=predecessor_workflow_id,
             runtime_profile_version=plan.runtime_profile_version,
             status=WorkflowStatus.PENDING,
             official_action=incident.official_action,
@@ -218,6 +237,18 @@ class PassiveWorkflowCompiler:
                     # The plan's only isolation lever for a node it does not
                     # trust; the Kubernetes restart adapter reads it (F-G5).
                     parameters["avoid_node_ids"] = sorted(set(plan.avoid_node_ids))
+                if plan.restart_after_incident_id:
+                    # The planner only names the incident the restart waits on;
+                    # deriving the premise here keeps the adapter reading the
+                    # incident's state at execution time, not plan time (F-G5).
+                    premise = self.store.get_incident(plan.restart_after_incident_id)
+                    parameters.update(
+                        {
+                            "requires_incident_state": IncidentState.RECOVERED.value,
+                            "incident_id": premise.incident_id,
+                            "incident_node_ids": sorted(premise.node_ids),
+                        }
+                    )
             steps.append(
                 WorkflowStepSpec(
                     operation=operation,

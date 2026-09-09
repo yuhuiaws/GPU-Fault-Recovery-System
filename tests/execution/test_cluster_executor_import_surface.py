@@ -1,12 +1,12 @@
 """The ``gpu_fault.cluster_executor`` package keeps the module's public surface.
 
 ``cluster_executor.py`` was split along its layers (wire client, lease
-lifecycle, command dispatch, claim loop, process bootstrap). Everything that
-imported a name from ``gpu_fault.cluster_executor`` before -- the console
-scripts in ``pyproject.toml``, the regional e2e drivers, the tests -- must
-keep working unchanged, each layer must import on its own without pulling the
-package into a cycle, and the log lines must keep the logger name operators
-filter on.
+lifecycle, command dispatch, compound-command batching, claim loop, process
+bootstrap). Everything that imported a name from ``gpu_fault.cluster_executor``
+before -- the console scripts in ``pyproject.toml``, the regional e2e drivers,
+the tests -- must keep working unchanged, each layer must import on its own
+without pulling the package into a cycle, and the log lines must keep the
+logger name operators filter on.
 """
 
 from __future__ import annotations
@@ -23,7 +23,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = "gpu_fault.cluster_executor"
-LAYERS = ("regional_client", "lease", "dispatch", "executor", "bootstrap", "metrics")
+LAYERS = (
+    "regional_client",
+    "lease",
+    "dispatch",
+    "batching",
+    "executor",
+    "bootstrap",
+    "metrics",
+)
 # The names the module published before the split, as importers spell them.
 PUBLIC_NAMES = (
     "ABANDONED_WORKER_HOLD_REASON",

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from threading import RLock
 
 from gpu_fault.models import (
+    BlockedKind,
     FaultIncident,
     IncidentState,
     RecoveryAction,
@@ -94,7 +95,18 @@ class ResetOperationService:
                 }
             )
             profile_version = representative.runtime_profile_version
-            profile = self.store.get_profile(profile_version)
+            profile = None
+            profile_errors: list[str] = []
+            try:
+                profile = self.store.get_profile(profile_version)
+            except NotFoundError:
+                # Every other family compiles a missing profile into a
+                # BLOCKED(NEEDS_OPERATOR) plan; here ``NotFoundError`` left
+                # the route as a 500 and the data plane isolated the batch
+                # (C-10).
+                profile_errors.append(
+                    "runtime profile does not exist: " + str(profile_version)
+                )
             operations = self.builder.official_operations(representative, decisions[0])
             official_steps, errors = self.builder.compile_steps(
                 operations,
@@ -177,6 +189,16 @@ class ResetOperationService:
                 gpu_uuids,
                 workload_ids,
             )
+            errors = [*profile_errors, *errors]
+            if not errors:
+                status = WorkflowStatus.PENDING
+            elif safety_steps and not safety_errors:
+                status = WorkflowStatus.SAFETY_PENDING
+            else:
+                # Nothing can run, not even the safety plan: an operator
+                # decides (the same shape ``coordinator._build_workflow``
+                # produces).
+                status = WorkflowStatus.BLOCKED
             errors.extend(safety_errors)
             workflow = WorkflowRequest(
                 request_id=derived_record_id(
@@ -184,16 +206,18 @@ class ResetOperationService:
                 ),
                 incident_id=incident_id,
                 runtime_profile_version=profile_version,
-                status=(
-                    WorkflowStatus.PENDING
-                    if not errors
-                    else WorkflowStatus.SAFETY_PENDING
-                ),
+                status=status,
                 official_action="RESET_GPU",
                 fencing_token=1,
                 safety_steps=safety_steps,
                 official_steps=scoped_steps,
-                blocked_reasons=errors,
+                blocked_reasons=list(dict.fromkeys(errors)),
+                safety_only=status is WorkflowStatus.SAFETY_PENDING,
+                blocked_kind=(
+                    BlockedKind.NEEDS_OPERATOR
+                    if status is WorkflowStatus.BLOCKED
+                    else None
+                ),
                 created_at=now,
                 updated_at=now,
             )
@@ -203,6 +227,8 @@ class ResetOperationService:
                         IncidentState.ACTION_PENDING
                         if workflow.status is WorkflowStatus.PENDING
                         else IncidentState.SAFETY_PENDING
+                        if workflow.status is WorkflowStatus.SAFETY_PENDING
+                        else IncidentState.ESCALATED
                     ),
                     "workflow_request_id": workflow.request_id,
                 }
@@ -211,9 +237,11 @@ class ResetOperationService:
             # ``incident.event_id`` (the batch id) itself, the member events are
             # linked below. Two blind autocommit writes let a crash between them
             # leave an orphan workflow (store review 2026-09-07, item B).
-            self.store.save_incident_and_workflow(incident, workflow)
-            for event in batch.events:
-                self.store.link_event_to_incident(event.event_id, incident.incident_id)
+            self.store.save_incident_and_workflow(
+                incident,
+                workflow,
+                extra_event_ids=[event.event_id for event in batch.events],
+            )
             return incident, workflow
 
     def _workflow_if_present(self, request_id: str | None) -> WorkflowRequest | None:

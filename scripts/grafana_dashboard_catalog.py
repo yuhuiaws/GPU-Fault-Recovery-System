@@ -23,6 +23,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from grafana_dashboard_review_panels import (
+    COLLECTOR_MEMORY_PANEL,
+    CONSUMER_LIVENESS_PANEL,
+    CONTRIBUTOR_FAILURES_PANEL,
+    POOL_AND_CREDENTIAL_PANELS,
+    REVIEW_COUNTER_PANELS,
+)
+
 CONTROL_PLANE_SELECTOR = (
     'control_plane_cluster=~"$control_plane_cluster",region=~"$region"'
 )
@@ -184,9 +192,9 @@ def _store_io_panel() -> Panel:
         ),
         unit="percentunit",
         description=(
-            "In-flight Store calls over the per-process admission capacity. "
-            "api-ha and control-worker run four uvicorn workers behind one port, "
-            "so each scrape samples one of four processes."
+            "In-flight Store calls over the Pod's admission capacity. api-ha "
+            "and control-worker run four uvicorn workers behind one port; "
+            "/metrics sums both gauges over the Pod's live processes."
         ),
     )
 
@@ -411,6 +419,7 @@ TELEMETRY_PIPELINE = Dashboard(
                     ),
                     unit="percentunit",
                 ),
+                COLLECTOR_MEMORY_PANEL,
             ),
         ),
         Row(
@@ -516,8 +525,12 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                         "and telemetry-spool-worker."
                     ),
                 ),
+                CONTRIBUTOR_FAILURES_PANEL,
+                CONSUMER_LIVENESS_PANEL,
             ),
         ),
+        Row("PostgreSQL pool and credentials", POOL_AND_CREDENTIAL_PANELS),
+        Row("Control-loop review counters", REVIEW_COUNTER_PANELS),
         Row("Processor queue", _queue_depth_panels()),
         Row(
             "Metric scan truncation",
@@ -810,8 +823,8 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                         ),
                     ),
                     description=(
-                        "Fault events the processor refused; sampled from one of "
-                        "four worker processes per scrape."
+                        "Fault events the processor refused, per worker Pod "
+                        "(summed over the Pod's four processes by /metrics)."
                     ),
                 ),
                 Panel(
@@ -1334,7 +1347,10 @@ RECOVERY_OUTCOME = Dashboard(
                             "{{status}}",
                         ),
                     ),
-                    description="PENDING_TRIAGE is the backlog the alert watches.",
+                    description=(
+                        "NO_ACTION and PLAN_CREATED are the only terminal "
+                        "statuses; a rising count is load, not backlog."
+                    ),
                 ),
                 Panel(
                     "Completion events without a decision",

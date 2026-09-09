@@ -7,9 +7,26 @@ import time
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[2]
+from gpu_fault_release import repository_root
+
+ROOT = repository_root()
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
+QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 QUICK_VALIDATION_MAX_AGE_SECONDS = 600
+
+
+def quick_validation_evidence_path(state_dir: Path) -> Path:
+    """The one place a deploy's quick-validation evidence lives.
+
+    `state_dir` is the managed state directory -- the one holding `site.yaml`.
+    The release driver finalizes the evidence here and the admin `status`
+    command reads it from here; both derive the path from this function, so the
+    two can no longer drift apart (they did: the driver kept the file under its
+    per-release directory, `status` looked at the root, and every report re-ran
+    every probe).
+    """
+
+    return state_dir.expanduser().resolve() / QUICK_VALIDATION_EVIDENCE_FILE
 
 
 def canonical_sha256(value: object) -> str:

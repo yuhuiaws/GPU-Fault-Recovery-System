@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-
 from gpu_fault.dcgm_diagnostic_analysis import (
     build_dcgm_recommendations,
     dcgm_failures_are_configuration_only,

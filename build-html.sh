@@ -54,6 +54,7 @@ pandoc \
   docs/管理员环境变量参考.md \
   docs/环境变量参考.md \
   docs/故障模拟测试手册.md \
+  docs/故障类别与处置动作总表.md \
   docs/区域用例索引.md \
   docs/区域模式端到端验收测试用例.md \
   docs/性能压测验收方案.md \

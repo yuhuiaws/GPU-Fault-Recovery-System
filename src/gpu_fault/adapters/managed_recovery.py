@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,

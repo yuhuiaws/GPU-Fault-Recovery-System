@@ -4,7 +4,6 @@ import re
 from collections import defaultdict
 from typing import Any
 
-
 MAX_FINDINGS = 100
 MAX_MESSAGES_PER_FINDING = 20
 MAX_MESSAGE_LENGTH = 512
@@ -328,7 +327,7 @@ def dcgm_failures_are_configuration_only(
 
     Used to keep a healthy node in service when the only thing DCGM
     objects to is host configuration (e.g. persistence mode disabled),
-    which otherwise fails the quick diagnostic on every node forever.
+    which otherwise fails the DCGM diagnostic on every node forever.
     """
     failures = [finding for finding in findings if finding.get("status") == "FAIL"]
     if not failures:

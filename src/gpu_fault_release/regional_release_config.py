@@ -10,8 +10,10 @@ from typing import Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
+from gpu_fault_release import repository_root
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
 MAX_UPGRADE_PARALLEL_CLUSTERS = 8
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
@@ -306,19 +308,49 @@ class RegionalHealthConfig:
         )
 
 
+NOTIFICATION_CHANNEL_SNS = "sns"
+NOTIFICATION_CHANNEL_SES = "ses"
+NOTIFICATION_CHANNELS = (NOTIFICATION_CHANNEL_SNS, NOTIFICATION_CHANNEL_SES)
+NOTIFICATION_ENVIRONMENT = (
+    "GPU_FAULT_NOTIFICATION_CHANNEL",
+    "GPU_FAULT_SNS_TOPIC_ARN",
+)
+
+
 @dataclass(frozen=True)
 class RegionalNotificationConfig:
+    """``notifications`` from the release config: ``site.yaml`` ``spec.notifications``.
+
+    ``channel`` defaults the way the site does: a release config written before
+    the key existed carries an ``email_sender`` and stays on ``ses``, so a
+    rollback onto such a record keeps the channel it shipped with; anything
+    else is ``sns``. On ``sns`` only ``admin_email`` is required.
+    """
+
     allow_email: bool = False
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
+    channel: str = NOTIFICATION_CHANNEL_SNS
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
         if not value:
             return cls()
+        channel = value.get("channel")
+        if channel is None:
+            channel = (
+                NOTIFICATION_CHANNEL_SES
+                if value.get("email_sender")
+                else NOTIFICATION_CHANNEL_SNS
+            )
+        elif not isinstance(channel, str) or channel not in NOTIFICATION_CHANNELS:
+            raise ReleaseError(
+                "notifications.channel must be one of "
+                + ", ".join(NOTIFICATION_CHANNELS)
+            )
         allow_email = bool(value.get("allow_email", True))
         acknowledge = bool(value.get("acknowledge_external_alert_channel", False))
         admin_email = (
@@ -347,8 +379,12 @@ class RegionalNotificationConfig:
             raise ReleaseError(
                 "notifications must allow email or acknowledge an external alert channel"
             )
-        if allow_email and (
-            admin_email is None or email_sender is None or not email_recipients
+        if allow_email and channel == NOTIFICATION_CHANNEL_SNS and admin_email is None:
+            raise ReleaseError("SNS notifications require notifications.admin_email")
+        if (
+            allow_email
+            and channel == NOTIFICATION_CHANNEL_SES
+            and (admin_email is None or email_sender is None or not email_recipients)
         ):
             raise ReleaseError(
                 "email notifications require notifications.admin_email "
@@ -361,6 +397,7 @@ class RegionalNotificationConfig:
             email_sender=email_sender,
             email_recipients=email_recipients,
             email_subject_prefix=subject_prefix,
+            channel=channel,
         )
 
 
@@ -675,6 +712,76 @@ def load_release_artifacts(
     )
 
 
+RETENTION_ENVIRONMENT = (
+    "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI",
+    "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS",
+)
+
+
+@dataclass(frozen=True)
+class RegionalRetentionConfig:
+    """``retention`` from the release config: ``site.yaml`` ``spec.retention``.
+
+    Off unless the days are positive; the runtime default is ``0`` and the
+    worker then never archives or deletes a control record. Rendered into the
+    control-worker environment only when on, so a site that never declared it
+    keeps exactly the environment it had.
+    """
+
+    control_record_retention_days: int = 0
+    archive_s3_uri: str | None = None
+    archive_interval_seconds: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.control_record_retention_days > 0
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> RegionalRetentionConfig:
+        if not value:
+            return cls()
+        days = value.get("control_record_retention_days", 0)
+        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+            raise ReleaseError(
+                "retention.control_record_retention_days must be an integer >= 0"
+            )
+        uri = value.get("archive_s3_uri")
+        uri = required_text(uri, "retention.archive_s3_uri") if uri else None
+        if uri is not None and not uri.startswith("s3://"):
+            raise ReleaseError("retention.archive_s3_uri must be an s3:// URI")
+        if days > 0 and uri is None:
+            raise ReleaseError(
+                "retention.archive_s3_uri is required when "
+                "control_record_retention_days > 0"
+            )
+        interval = value.get("archive_interval_seconds")
+        if interval is not None and (
+            isinstance(interval, bool) or not isinstance(interval, int) or interval < 1
+        ):
+            raise ReleaseError(
+                "retention.archive_interval_seconds must be a positive integer"
+            )
+        return cls(
+            control_record_retention_days=days,
+            archive_s3_uri=uri,
+            archive_interval_seconds=interval,
+        )
+
+    def environment(self) -> dict[str, str]:
+        """The control-worker variables; empty while retention is off."""
+
+        if not self.enabled or self.archive_s3_uri is None:
+            return {}
+        values = {
+            RETENTION_ENVIRONMENT[0]: str(self.control_record_retention_days),
+            RETENTION_ENVIRONMENT[1]: self.archive_s3_uri,
+        }
+        if self.archive_interval_seconds is not None:
+            values[RETENTION_ENVIRONMENT[2]] = str(self.archive_interval_seconds)
+        return values
+
+
 @dataclass(frozen=True)
 class ReleaseConfig:
     site_name: str
@@ -713,6 +820,10 @@ class ReleaseConfig:
     notifications: RegionalNotificationConfig
     admin_config: AdminConfig
     auto_rollback: bool = True
+    # Node label keys that name a failure domain, finest first. Read by the
+    # failure-domain ConfigMap render and by the fleet rollout's per-domain cap.
+    failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
+    retention: RegionalRetentionConfig = RegionalRetentionConfig()
 
     def for_rollback(
         self,
@@ -726,6 +837,23 @@ class ReleaseConfig:
             admin_config=admin_config or self.admin_config,
             auto_rollback=False,
         )
+
+    def notification_environment(self) -> dict[str, str]:
+        """The control-plane variables naming the alert channel, on every role.
+
+        Each role builds the notifier and runs the fail-closed "no alert
+        channel" guard at startup, so the channel and (for ``sns``) the site
+        topic must reach all three; a rollback rendered without them would
+        leave a worker that cannot start.
+        """
+
+        values = {NOTIFICATION_ENVIRONMENT[0]: self.notifications.channel}
+        if (
+            self.notifications.channel == NOTIFICATION_CHANNEL_SNS
+            and self.health.sns_topic_arn
+        ):
+            values[NOTIFICATION_ENVIRONMENT[1]] = self.health.sns_topic_arn
+        return values
 
     @classmethod
     def load(cls, path: Path) -> ReleaseConfig:
@@ -900,7 +1028,26 @@ class ReleaseConfig:
             notifications=notifications,
             admin_config=admin_config,
             auto_rollback=bool(value.get("auto_rollback", True)),
+            failure_domain_labels=failure_domain_labels(
+                value.get("failure_domain_labels")
+            ),
+            retention=RegionalRetentionConfig.from_mapping(
+                dict(value.get("retention") or {})
+            ),
         )
+
+
+def failure_domain_labels(value: object) -> tuple[str, ...]:
+    """``failure_domain_labels`` from the release config, or the built-in priority."""
+
+    if value is None:
+        return FAILURE_DOMAIN_LABELS
+    if not isinstance(value, list) or not value:
+        raise ReleaseError("failure_domain_labels must be a non-empty list")
+    labels = tuple(required_text(item, "failure_domain_labels[]") for item in value)
+    if len(set(labels)) != len(labels):
+        raise ReleaseError("failure_domain_labels values must be unique")
+    return labels
 
 
 def render_nlb_manifest(config: ReleaseConfig, text: str) -> str:

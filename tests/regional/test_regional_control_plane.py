@@ -7,7 +7,7 @@ from ._regional_control_plane_cases_1 import (
     test_empty_namespace_allowlist_fails_closed,
     test_executor_protocol_gate_blocks_before_command_lease,
     test_executor_readiness_rejects_an_executor_that_cannot_claim,
-    test_failed_remote_restart_releases_restart_budget,
+    test_failed_remote_restart_leaves_the_reservation_to_terminalization,
     test_hyperpod_submission_reservation_is_exclusive,
     test_hyperpod_submissions_are_cluster_scoped,
     test_regional_api_authenticates_cluster_and_rejects_spoofing,

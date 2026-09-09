@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 import time
 from threading import RLock
+from typing import Any
 
 from gpu_fault.processor.models import ProcessorRequest
 
@@ -44,7 +43,11 @@ class ProcessorMetricsMixin:
     _retry_rescheduled_total: int
     _processor_fault_pressure_activations_total: Any
     _processor_fault_pressure_active: Any
-    _spool_consumer_running: Any
+    _spool_consumer_running: bool
+    _processor_consumer_running: bool
+    _consumer_last_cycle_monotonic: Any
+    _consumer_cycles_total: Any
+    _consumer_cycle_errors_total: Any
     _spool_fallback_polls_total: Any
     _spool_fault_backlog_depth: Any
     _spool_fault_pressure_active: Any
@@ -82,6 +85,7 @@ class ProcessorMetricsMixin:
     spool_direct_replay_total: Any
     spool_dropped_total: Any
     spool_errors_total: Any
+    spool_stale_completed_total: int
     spool_http_replay_total: Any
     spool_released_total: Any
     spool_replay_seconds_max: Any
@@ -239,6 +243,7 @@ class ProcessorMetricsMixin:
                     "dropped": self.spool_dropped_total,
                     "abandoned": self.spool_abandoned_total,
                     "errors": self.spool_errors_total,
+                    "stale_completed": self.spool_stale_completed_total,
                     "direct_replay": self.spool_direct_replay_total,
                     "http_replay": self.spool_http_replay_total,
                     "replay_seconds_sum": (self.spool_replay_seconds_sum),
@@ -263,6 +268,19 @@ class ProcessorMetricsMixin:
                     "fallback_polls": (self._spool_fallback_polls_total),
                     "notification_fallback_seconds": (
                         self.telemetry_spool_notification_fallback_seconds
+                    ),
+                },
+                # B-6: liveness of the queue consumer loop, for ``/livez`` and
+                # the "process up, claim rounds flat" alert. ``last_cycle_age
+                # _seconds`` is measured from the start of the latest cycle.
+                "consumer": {
+                    "running": int(self._processor_consumer_running),
+                    "cycles": self._consumer_cycles_total,
+                    "cycle_errors": self._consumer_cycle_errors_total,
+                    "last_cycle_age_seconds": (
+                        max(0.0, observed - self._consumer_last_cycle_monotonic)
+                        if self._consumer_last_cycle_monotonic is not None
+                        else -1.0
                     ),
                 },
                 "healthy": int(self._unhealthy_reason is None),

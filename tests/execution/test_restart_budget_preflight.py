@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from gpu_fault.execution import (
     ProductionWorkflowExecutor,
@@ -9,15 +11,25 @@ from gpu_fault.execution import (
     WorkflowStepOutcome,
 )
 from gpu_fault.execution.restart_budget_preflight import (
+    issue_restart_authorization,
     release_unattempted_restart_reservations,
 )
 from gpu_fault.models import (
     IncidentState,
+    RestartAuthorization,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
     WorkflowStepStatus,
+)
+from gpu_fault.regional import (
+    RegionalClusterRegistration,
+    RegionalRemoteWorkflowAdapter,
+    RemoteActionCommand,
+    RemoteCommandResult,
+    RemoteCommandStatus,
+    cluster_token_sha256,
 )
 from gpu_fault.store import InMemoryStore
 from tests._builders import (
@@ -43,17 +55,26 @@ class RecordingAdapter:
         self,
         store: InMemoryStore,
         outcomes: dict[WorkflowOperation, WorkflowStepOutcome] | None = None,
+        *,
+        expected_reservations: list[str] | None = None,
     ) -> None:
         self.store = store
         self.outcomes = outcomes or {}
         self.calls: list[WorkflowOperation] = []
+        # The reservation every step must see while it runs: the preflight's
+        # own by default; an exhausted budget keeps the earlier one only.
+        self.expected_reservations = (
+            ["workflow-a/2/RESTART_WORKLOAD"]
+            if expected_reservations is None
+            else expected_reservations
+        )
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == "owner-a"
 
     def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         state = self.store.get_restart_budget("cluster-a", "training-a")
-        assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+        assert state.reservation_ids == self.expected_reservations
         self.calls.append(context.step.operation)
         return self.outcomes.get(
             context.step.operation, WorkflowStepOutcome.succeeded()
@@ -61,7 +82,10 @@ class RecordingAdapter:
 
 
 def _state(
-    store: InMemoryStore, *, restart_parameters: dict[str, object] | None = None
+    store: InMemoryStore,
+    *,
+    restart_parameters: dict[str, object] | None = None,
+    operations: tuple[WorkflowOperation, ...] = OPERATIONS,
 ) -> WorkflowRequest:
     incident = fault_incident(
         "incident-a",
@@ -92,7 +116,7 @@ def _state(
                 if operation is WorkflowOperation.RESTART_WORKLOAD
                 else {},
             )
-            for operation in OPERATIONS
+            for operation in operations
         ],
         created_at=NOW,
         updated_at=NOW,
@@ -112,25 +136,40 @@ def _request() -> WorkflowExecutionRequest:
     return WorkflowExecutionRequest(expected_fencing_token=1)
 
 
-def test_exhausted_budget_fails_before_any_adapter_call() -> None:
+def test_exhausted_budget_withholds_the_restart_and_runs_the_rest() -> None:
+    # 逻辑 4: an exhausted budget used to fail the whole workflow before its
+    # first step. Now only the restart is withheld -- recorded FAILED up front,
+    # never reserved, never executed -- and the other steps still run; the
+    # workflow ends FAILED because the job was stopped and not restarted (see
+    # test_restart_budget_exhausted_preflight for the full chain).
     store = build_store()
     store.reserve_job_restart("cluster-a", "training-a", 1, "previous-restart")
     workflow = _state(store)
-    adapter = RecordingAdapter(store)
+    adapter = RecordingAdapter(store, expected_reservations=["previous-restart"])
 
     result = _executor(store, adapter).execute(workflow.request_id, _request())
 
     persisted = store.get_workflow(workflow.request_id)
     assert result.status is WorkflowStatus.FAILED
-    assert adapter.calls == []
-    assert persisted.completed_step_indexes == []
-    assert len(persisted.step_executions) == 1
-    execution = persisted.step_executions[0]
+    assert adapter.calls == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    assert persisted.completed_step_indexes == [0, 1]
+    restart = [
+        item
+        for item in persisted.step_executions
+        if item.operation is WorkflowOperation.RESTART_WORKLOAD
+    ]
+    assert len(restart) == 1
+    execution = restart[0]
     assert execution.step_index == 2
     assert execution.status is WorkflowStepStatus.FAILED
     assert execution.details["reason"] == ("RESTART_BUDGET_EXHAUSTED")
     assert "1/1" in execution.error
     assert store.list_remote_commands() == []
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.reservation_ids == ["previous-restart"]
 
 
 def test_missing_restart_context_fails_before_stop() -> None:
@@ -234,3 +273,782 @@ def test_cancelled_waiting_restart_releases_reservation() -> None:
     state = store.get_restart_budget("cluster-a", "training-a")
     assert state.restart_count == 0
     assert state.reservation_ids == []
+
+
+def test_issue_authorization_requires_an_existing_reservation() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+        },
+    )
+
+    missing = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+    assert isinstance(missing, WorkflowStepOutcome), missing
+    assert missing.status is WorkflowStepStatus.FAILED
+    assert missing.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert missing.details["reservation_id"] == "wf/0/RESTART_WORKLOAD"
+
+    store.reserve_job_restart("cluster-a", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+    granted = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+    assert isinstance(granted, RestartAuthorization), granted
+    assert granted.reservation_id == "wf/0/RESTART_WORKLOAD"
+    assert granted.restart_count == 1
+    assert granted.restart_budget == 1
+    assert granted.source_gpu_count == 8
+    assert granted.source_attempt_id == "train-1-a1"
+
+
+def test_issue_authorization_rejects_a_step_from_another_cluster() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-b",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+        },
+    )
+    # Even a reservation on the step's own cluster does not make it the
+    # incident's restart: the gate trusts the incident over the plan.
+    store.reserve_job_restart("cluster-b", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    assert isinstance(outcome, WorkflowStepOutcome), outcome
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error == (
+        "restart safety context cluster does not match incident: cluster-b != cluster-a"
+    )
+    assert outcome.details == {
+        "reason": "RESTART_CLUSTER_MISMATCH",
+        "restart_cluster_id": "cluster-b",
+        "incident_cluster_id": "cluster-a",
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reserved"),
+    [
+        ({"source_gpu_count": "eight"}, True),
+        ({"restart_budget": "one"}, False),
+        ({"restart_budget": None}, True),
+    ],
+)
+def test_issue_authorization_fails_closed_on_a_malformed_numeric_parameter(
+    overrides: dict[str, object], reserved: bool
+) -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+            **overrides,
+        },
+    )
+    if reserved:
+        store.reserve_job_restart("cluster-a", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    # A malformed plan is a FAILED step with a reason, not an adapter traceback.
+    assert isinstance(outcome, WorkflowStepOutcome), outcome
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error is not None
+    assert outcome.error.startswith("restart safety context is invalid: "), (
+        outcome.error
+    )
+    assert outcome.details["reason"] == "RESTART_SAFETY_CONTEXT_INVALID"
+
+
+def test_issue_authorization_rejects_a_reservation_held_by_another_step() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 2,
+        },
+    )
+    store.reserve_job_restart("cluster-a", "train-1", 2, "other-wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    # The budget row exists but this step's reservation is not on it: still
+    # fail closed, and say how much of the budget is spoken for.
+    assert isinstance(outcome, WorkflowStepOutcome), outcome
+    assert outcome.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert outcome.details["restart_count"] == 1
+    assert outcome.details["restart_budget"] == 2
+
+
+def test_issue_authorization_reports_missing_safety_context() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "restart_budget": 1,
+        },
+    )
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    assert isinstance(outcome, WorkflowStepOutcome), outcome
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error == (
+        "restart safety context is missing: source_attempt_id, source_gpu_count"
+    )
+    assert outcome.details["reason"] == "RESTART_SAFETY_CONTEXT_MISSING"
+    assert outcome.details["missing_parameters"] == [
+        "source_attempt_id",
+        "source_gpu_count",
+    ]
+
+
+class AuthorizationRecordingAdapter(RecordingAdapter):
+    """Records the authorization each step's request carried."""
+
+    def __init__(self, store: InMemoryStore) -> None:
+        super().__init__(store)
+        self.authorizations: list[RestartAuthorization | None] = []
+
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        self.authorizations.append(context.request.restart_authorization)
+        return super().execute(context)
+
+
+def test_dispatch_hands_the_preflight_reservation_to_the_restart_adapter() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = AuthorizationRecordingAdapter(store)
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert result.status is WorkflowStatus.SUCCEEDED
+    assert adapter.authorizations == [
+        None,
+        None,
+        RestartAuthorization(
+            cluster_id="cluster-a",
+            job_id="training-a",
+            source_attempt_id="attempt-a",
+            source_gpu_count=1,
+            restart_budget=1,
+            restart_count=1,
+            reservation_id="workflow-a/2/RESTART_WORKLOAD",
+        ),
+    ]
+    # Signing the reservation is a read: the preflight's row is untouched.
+    assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+
+
+class ReleasingAdapter:
+    """Drops the restart reservation mid-workflow.
+
+    Stands in for a release that raced dispatch (a reaper, an operator
+    restore) so the test can see what the restart step does when the
+    preflight's reservation is no longer there to sign.
+    """
+
+    def __init__(self, store: InMemoryStore) -> None:
+        self.store = store
+        self.calls: list[WorkflowOperation] = []
+
+    def supports(self, step: WorkflowStepSpec) -> bool:
+        return step.execution_owner == "owner-a"
+
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        self.calls.append(context.step.operation)
+        if context.step.operation is WorkflowOperation.STOP_WORKLOADS:
+            self.store.release_job_restart(
+                "cluster-a", "training-a", "workflow-a/2/RESTART_WORKLOAD"
+            )
+        return WorkflowStepOutcome.succeeded()
+
+
+def test_dispatch_fails_closed_when_the_reservation_is_gone() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = ReleasingAdapter(store)
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    persisted = store.get_workflow(workflow.request_id)
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert result.status is WorkflowStatus.FAILED
+    # The restart adapter never ran: dispatch does not reserve on its behalf.
+    assert adapter.calls == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    execution = [item for item in persisted.step_executions if item.step_index == 2][-1]
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert execution.details["reason"] == "RESTART_RESERVATION_MISSING"
+    assert execution.details["reservation_id"] == "workflow-a/2/RESTART_WORKLOAD"
+    assert state.restart_count == 0
+    assert state.reservation_ids == []
+
+
+def test_exhausted_budget_mails_the_operator_from_the_preflight() -> None:
+    store = build_store()
+    store.reserve_job_restart("cluster-a", "training-a", 1, "previous-restart")
+    workflow = _state(store)
+    # The budget keeps only the earlier restart's reservation; the repair
+    # steps still run beside the withheld restart and see exactly that.
+    adapter = RecordingAdapter(store, expected_reservations=["previous-restart"])
+    sent: list[str] = []
+    active = active_workflow_executor(
+        store, [adapter], OPERATIONS, notification_sender=sent.append
+    )
+
+    result = active.execute(workflow.request_id, _request())
+
+    notifications = store.list_notifications()
+    execution = next(
+        record
+        for record in store.get_workflow(workflow.request_id).step_executions
+        if record.step_index == 2
+    )
+    assert result.status is WorkflowStatus.FAILED
+    # Only the restart is withheld: the chain's other steps go ahead.
+    assert adapter.calls == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    assert execution.details["reason"] == "RESTART_BUDGET_EXHAUSTED"
+    # The budget-exhausted mail is the preflight's: one notification, sent
+    # once, and the step record points at it.
+    assert len(notifications) == 1
+    (notification,) = notifications
+    assert notification.deduplication_key == (
+        "cluster-a/training-a/restart-budget-exhausted/1"
+    )
+    assert notification.incident_id == "incident-a"
+    assert "training-a" in notification.subject
+    assert "1 次上限" in notification.subject
+    assert "attempt-a" in notification.body_text
+    assert sent == [notification.notification_id]
+    assert execution.details["notification_id"] == notification.notification_id
+
+
+def test_a_restart_the_adapter_refused_hands_its_reservation_back() -> None:
+    """In-process: a guard refusal (``restart_submitted: False``) is released.
+
+    The adapter no longer reserves or releases budget itself, so the only
+    thing that tells the terminal write "no restart was ever submitted" is the
+    marker every guard rejection carries.
+    """
+
+    store = build_store()
+    workflow = _state(store)
+    adapter = RecordingAdapter(
+        store,
+        {
+            WorkflowOperation.RESTART_WORKLOAD: WorkflowStepOutcome.failed(
+                "restart authorization does not match the workload safety context",
+                details={"restart_submitted": False},
+            )
+        },
+    )
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert result.status is WorkflowStatus.FAILED
+    assert adapter.calls == list(OPERATIONS)
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert execution.details["restart_submitted"] is False
+    assert state.restart_count == 0
+    assert state.reservation_ids == []
+
+
+def test_a_restart_that_failed_after_submission_keeps_its_reservation() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = RecordingAdapter(
+        store,
+        {
+            WorkflowOperation.RESTART_WORKLOAD: WorkflowStepOutcome.failed(
+                "job create timed out", details={"reason": "RESTART_CREATE_TIMEOUT"}
+            )
+        },
+    )
+
+    result = _executor(store, adapter).execute(workflow.request_id, _request())
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert result.status is WorkflowStatus.FAILED
+    # Without the marker the restart may have happened: the budget stays spent.
+    assert state.restart_count == 1
+    assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]
+
+
+def test_a_remote_restart_the_data_plane_refused_hands_its_reservation_back() -> None:
+    """Regional: the guard's marker rides ``RemoteCommandResult.details``.
+
+    The cluster executor forwards the adapter's ``outcome.details`` verbatim;
+    the regional adapter spreads ``result_details`` into the step's FAILED
+    outcome, so the same marker reaches the terminal write.
+    """
+
+    store = build_store()
+    store.save_regional_cluster(
+        RegionalClusterRegistration(
+            cluster_id="cluster-a",
+            region="us-west-2",
+            hyperpod_cluster_name="hp-cluster-a",
+            eks_cluster_arn="arn:aws:eks:us-west-2:123456789012:cluster/cluster-a",
+            token_sha256=cluster_token_sha256("cluster-a-token-" + "0" * 32),
+            allowed_namespaces=["training"],
+            agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
+        )
+    )
+    workflow = _state(store, operations=(WorkflowOperation.RESTART_WORKLOAD,))
+    remote = RegionalRemoteWorkflowAdapter(store, owners={"owner-a"})
+    active = active_workflow_executor(store, [remote], OPERATIONS)
+
+    dispatched = active.execute(workflow.request_id, _request())
+    command = store.claim_remote_commands(
+        "cluster-a",
+        "executor-a",
+        limit=1,
+        lease_seconds=60,
+        execution_owners={"owner-a"},
+    )[0]
+    store.complete_remote_command(
+        "cluster-a",
+        command.command_id,
+        RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=RemoteCommandStatus.FAILED,
+            error="restart authorization does not match the workload safety context",
+            details={"restart_submitted": False},
+        ),
+    )
+    ended = active.execute(workflow.request_id, _request())
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert dispatched.status is WorkflowStatus.RUNNING
+    assert command.restart_authorization is not None
+    assert command.restart_authorization.reservation_id == (
+        "workflow-a/0/RESTART_WORKLOAD"
+    )
+    assert ended.status is WorkflowStatus.FAILED
+    assert execution.status is WorkflowStepStatus.FAILED
+    assert execution.details["restart_submitted"] is False
+    assert state.restart_count == 0
+    assert state.reservation_ids == []
+
+
+def test_a_remote_hold_carries_its_marker_into_the_waiting_step_record() -> None:
+    """The data plane's WAITING hold says ``restart_submitted: False``; the
+    regional adapter carries it onto the WAITING step record so the TTL rule
+    can judge a live remote wait the same way as an in-process one."""
+
+    store = build_store()
+    store.save_regional_cluster(
+        RegionalClusterRegistration(
+            cluster_id="cluster-a",
+            region="us-west-2",
+            hyperpod_cluster_name="hp-cluster-a",
+            eks_cluster_arn="arn:aws:eks:us-west-2:123456789012:cluster/cluster-a",
+            token_sha256=cluster_token_sha256("cluster-a-token-" + "0" * 32),
+            allowed_namespaces=["training"],
+            agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
+        )
+    )
+    workflow = _state(store, operations=(WorkflowOperation.RESTART_WORKLOAD,))
+    remote = RegionalRemoteWorkflowAdapter(store, owners={"owner-a"})
+    active = active_workflow_executor(store, [remote], OPERATIONS)
+
+    active.execute(workflow.request_id, _request())
+    command = store.claim_remote_commands(
+        "cluster-a",
+        "executor-a",
+        limit=1,
+        lease_seconds=60,
+        execution_owners={"owner-a"},
+    )[0]
+    store.complete_remote_command(
+        "cluster-a",
+        command.command_id,
+        RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=RemoteCommandStatus.WAITING,
+            details={"reason": "GPU_COUNT_CHANGED", "restart_submitted": False},
+        ),
+    )
+    polled = active.execute(workflow.request_id, _request())
+
+    record = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert polled.status is WorkflowStatus.RUNNING
+    assert record.status is WorkflowStepStatus.WAITING
+    assert record.details["remote_status"] == "WAITING"
+    assert record.details["restart_submitted"] is False
+
+
+@pytest.mark.parametrize(
+    ("details", "released"),
+    [
+        # The data-plane guard refused before submitting anything.
+        ({"restart_submitted": False, "reason": "RESTART_TARGET_AVOIDED"}, True),
+        # No adapter ever ran: refused by the executor, or never claimed.
+        ({"remote_status_source": "executor-rejected"}, True),
+        ({"remote_status_source": "unclaimed-deadline-exceeded"}, True),
+        # Cancelled while PENDING: no report at all, so no lease and no adapter.
+        ({"remote_status_source": "workflow-timeout"}, True),
+        ({"remote_status_source": "workflow-preempted"}, True),
+        # Cancelled while WAITING on one of the adapter's own holds.
+        (
+            {
+                "remote_status_source": "workflow-preempted",
+                "restart_submitted": False,
+                "reason": "GPU_COUNT_CHANGED",
+            },
+            True,
+        ),
+        # Submitted, then a 5xx made the executor answer WAITING, then the
+        # workflow cancelled: the Job may exist. Keep.
+        (
+            {
+                "remote_status_source": "workflow-timeout",
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "retryable_adapter_error": True,
+            },
+            False,
+        ),
+        # A LEASED command cancelled mid-flight settles with the node's last
+        # word; only the adapter's own marker proves nothing was submitted.
+        (
+            {
+                "remote_status_source": "completed-after-cancellation",
+                "post_cancellation_status": "WAITING",
+                "restart_submitted": False,
+            },
+            True,
+        ),
+        (
+            {
+                "remote_status_source": "completed-after-cancellation",
+                "post_cancellation_status": "WAITING",
+                "retryable_adapter_error": True,
+            },
+            False,
+        ),
+        (
+            {
+                "remote_status_source": "completed-after-cancellation",
+                "post_cancellation_status": "SUCCEEDED",
+            },
+            False,
+        ),
+        # The waiting cap copied the last WAITING's details into its failure:
+        # a hold releases, a retryable error after a possible submit keeps, a
+        # LEASED remote command keeps, a never-leased PENDING one releases,
+        # and the cap alone proves nothing.
+        (
+            {
+                "step_waiting_timeout_seconds": 600,
+                "reason": "GPU_COUNT_CHANGED",
+                "restart_submitted": False,
+            },
+            True,
+        ),
+        (
+            {
+                "step_waiting_timeout_seconds": 600,
+                "reason": "RETRYABLE_ADAPTER_ERROR",
+                "retryable_adapter_error": True,
+            },
+            False,
+        ),
+        (
+            {
+                "step_waiting_timeout_seconds": 600,
+                "remote_status": "LEASED",
+                "restart_submitted": False,
+            },
+            False,
+        ),
+        ({"step_waiting_timeout_seconds": 600, "remote_status": "PENDING"}, True),
+        (
+            {
+                "step_waiting_timeout_seconds": 600,
+                "remote_status": "WAITING",
+                "restart_submitted": False,
+            },
+            True,
+        ),
+        ({"step_waiting_timeout_seconds": 600, "remote_status": "WAITING"}, False),
+        ({"step_waiting_timeout_seconds": 600}, False),
+        # Nothing here says whether the restart was submitted: keep it spent.
+        ({"remote_status_source": "executor-internal-error"}, False),
+        ({"remote_status_source": "executor-configuration-error"}, False),
+        ({"remote_status_source": "stale-fence"}, False),
+        ({"reason": "RESTART_CREATE_TIMEOUT"}, False),
+        ({}, False),
+    ],
+)
+def test_terminal_release_reads_what_a_failed_restart_record_proves(
+    details: dict[str, object], released: bool
+) -> None:
+    store = build_store()
+    workflow = _state(store)
+    store.reserve_job_restart(
+        "cluster-a", "training-a", 1, "workflow-a/2/RESTART_WORKLOAD"
+    )
+    workflow = copy_model(
+        workflow,
+        step_executions=[
+            workflow_step_execution(
+                2,
+                WorkflowOperation.RESTART_WORKLOAD,
+                WorkflowStepStatus.FAILED,
+                details=details,
+            )
+        ],
+    )
+
+    release_unattempted_restart_reservations(store, workflow)
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.restart_count == (0 if released else 1)
+    assert state.reservation_ids == (
+        [] if released else ["workflow-a/2/RESTART_WORKLOAD"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("details", "released"),
+    [
+        # The adapter's own holds say nothing was submitted.
+        ({"reason": "GPU_COUNT_CHANGED", "restart_submitted": False}, True),
+        ({"reason": "NODE_UNDER_REMEDIATION", "restart_submitted": False}, True),
+        # A retryable adapter error may have been raised after the Job was
+        # created; the executor's wait is not the adapter's hold.
+        ({"reason": "RETRYABLE_ADAPTER_ERROR", "retryable_adapter_error": True}, False),
+        # Remote pointers: PENDING was never leased; LEASED is on an executor
+        # now (its last report may be a hold it has moved past); WAITING is
+        # judged by the data plane's marker.
+        ({"remote_status": "PENDING"}, True),
+        ({"remote_status": "LEASED", "restart_submitted": False}, False),
+        ({"remote_status": "WAITING", "restart_submitted": False}, True),
+        ({"remote_status": "WAITING"}, False),
+        # A pointer at a command the store cannot find: unknown keeps.
+        (
+            {
+                "remote_status": "PENDING",
+                "remote_command_id": "cmd-gone",
+                "restart_submitted": False,
+            },
+            False,
+        ),
+        ({}, False),
+    ],
+)
+def test_the_waiting_ttl_releases_only_a_wait_that_proves_no_submission(
+    details: dict[str, object], released: bool
+) -> None:
+    store = build_store()
+    workflow = _state(store)
+    store.reserve_job_restart(
+        "cluster-a", "training-a", 1, "workflow-a/2/RESTART_WORKLOAD"
+    )
+    started = datetime.now(timezone.utc) - timedelta(hours=1)
+    workflow = copy_model(
+        workflow,
+        step_executions=[
+            workflow_step_execution(
+                2,
+                WorkflowOperation.RESTART_WORKLOAD,
+                WorkflowStepStatus.WAITING,
+                started_at=started,
+                updated_at=started,
+                details=details,
+            )
+        ],
+    )
+
+    release_unattempted_restart_reservations(
+        store, workflow, waiting_ttl=timedelta(minutes=10)
+    )
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.restart_count == (0 if released else 1)
+
+
+def _remote_restart_command(
+    store: InMemoryStore,
+    workflow: WorkflowRequest,
+    *,
+    leased: bool,
+    report: dict[str, object] | None = None,
+) -> str:
+    """A remote command for the workflow's RESTART step, in the given state:
+    PENDING, LEASED, or LEASED then reported WAITING with ``report``."""
+
+    incident = store.get_incident(workflow.incident_id)
+    command = RemoteActionCommand(
+        command_id="remote-restart",
+        cluster_id="cluster-a",
+        workflow_request_id=workflow.request_id,
+        incident_id=incident.incident_id,
+        step_index=2,
+        fencing_token=workflow.fencing_token,
+        idempotency_key="workflow-a/2/RESTART_WORKLOAD",
+        step=workflow.official_steps[2],
+        workflow=workflow,
+        incident=incident,
+    )
+    store.ensure_remote_command(command)
+    if leased or report is not None:
+        claimed = store.claim_remote_commands(
+            "cluster-a", "executor-a", limit=1, lease_seconds=60
+        )[0]
+        if report is not None:
+            store.complete_remote_command(
+                "cluster-a",
+                command.command_id,
+                RemoteCommandResult(
+                    lease_token=claimed.lease_token,
+                    status=RemoteCommandStatus.WAITING,
+                    details=report,
+                ),
+            )
+    return command.command_id
+
+
+@pytest.mark.parametrize(
+    ("leased", "report", "released"),
+    [
+        # Never leased: no adapter ran.
+        (False, None, True),
+        # On a data-plane executor right now: whatever the record snapshotted,
+        # the hold may have been lifted and the Job created since.
+        (True, None, False),
+        # Reported WAITING on a hold: still before submission.
+        (True, {"reason": "GPU_COUNT_CHANGED", "restart_submitted": False}, True),
+        # Reported WAITING without the marker: may be past a submission.
+        (True, {"reason": "RETRYABLE_ADAPTER_ERROR"}, False),
+    ],
+    ids=["pending", "leased", "waiting-on-hold", "waiting-unmarked"],
+)
+def test_the_waiting_ttl_reads_the_live_remote_command_not_the_snapshot(
+    leased: bool, report: dict[str, object] | None, released: bool
+) -> None:
+    store = build_store()
+    workflow = _state(store)
+    store.reserve_job_restart(
+        "cluster-a", "training-a", 1, "workflow-a/2/RESTART_WORKLOAD"
+    )
+    command_id = _remote_restart_command(store, workflow, leased=leased, report=report)
+    started = datetime.now(timezone.utc) - timedelta(hours=1)
+    # The record is last tick's snapshot: a hold, marker included, with the
+    # command still WAITING. What the command is *now* decides.
+    workflow = copy_model(
+        workflow,
+        step_executions=[
+            workflow_step_execution(
+                2,
+                WorkflowOperation.RESTART_WORKLOAD,
+                WorkflowStepStatus.WAITING,
+                started_at=started,
+                updated_at=started,
+                adapter_operation_id=f"remote/{command_id}",
+                details={
+                    "remote_command_id": command_id,
+                    "remote_status": "WAITING",
+                    "restart_submitted": False,
+                },
+            )
+        ],
+    )
+
+    release_unattempted_restart_reservations(
+        store, workflow, waiting_ttl=timedelta(minutes=10)
+    )
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.restart_count == (0 if released else 1)
+
+
+class HoldThenRaiseAdapter(RecordingAdapter):
+    """Holds the restart once (approval wait), then raises a retryable error.
+
+    Stands in for a restart whose second attempt created the Job and then hit
+    a 5xx: the retry record must not inherit the hold's "nothing submitted".
+    """
+
+    def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
+        self.calls.append(context.step.operation)
+        if context.step.operation is not WorkflowOperation.RESTART_WORKLOAD:
+            return WorkflowStepOutcome.succeeded()
+        if self.calls.count(WorkflowOperation.RESTART_WORKLOAD) == 1:
+            return WorkflowStepOutcome.waiting(
+                operation_id=context.idempotency_key,
+                details={"reason": "GPU_COUNT_CHANGED", "restart_submitted": False},
+            )
+        raise ReadTimeoutError("api server read timed out after the create")
+
+
+class ReadTimeoutError(Exception):
+    """Shaped like ``urllib3.exceptions.ReadTimeoutError`` for the classifier."""
+
+    __module__ = "urllib3.exceptions"
+
+
+def test_a_retry_after_a_hold_does_not_inherit_the_hold_marker() -> None:
+    store = build_store()
+    workflow = _state(store)
+    adapter = HoldThenRaiseAdapter(store)
+    active = _executor(store, adapter)
+
+    held = active.execute(workflow.request_id, _request())
+    retried = active.execute(workflow.request_id, _request())
+
+    record = store.get_workflow(workflow.request_id).step_executions[-1]
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert held.status is WorkflowStatus.RUNNING
+    assert retried.status is WorkflowStatus.RUNNING
+    assert record.step_index == 2
+    assert record.status is WorkflowStepStatus.WAITING
+    assert record.details["retryable_adapter_error"] is True
+    assert "restart_submitted" not in record.details
+    # The wait is still live; the budget stays reserved.
+    assert state.reservation_ids == ["workflow-a/2/RESTART_WORKLOAD"]

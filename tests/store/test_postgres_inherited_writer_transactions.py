@@ -73,6 +73,8 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        # Two round-trips (_get_optional + _put), both under _state_transaction.
+        "record_remote_command_progress",
         "record_xid74_occurrences",
         "release_job_restart",
         "renew_remote_command_lease",
@@ -82,7 +84,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_barrier",
         "save_collector_metrics_snapshot",
         "save_decision",
-        "save_diagnostic",
         "save_fleet_deployment",
         "save_hyperpod_node_identity",
         "save_hyperpod_submission",
@@ -91,7 +92,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_profile",
         "save_regional_cluster",
         "save_regional_registry_member",
-        "save_triage_report",
         "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
     }

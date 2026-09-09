@@ -4,8 +4,10 @@ import json
 import logging
 import os
 import zlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import wraps
+from typing import Any, Callable
 
 from fastapi import HTTPException
 
@@ -22,6 +24,7 @@ from gpu_fault.async_store import (
 from gpu_fault.channel_registry import CHANNEL_REGISTRY
 from gpu_fault.env import env_bool
 from gpu_fault.processor import ProcessorCoordinator
+from gpu_fault.processor.settings import ProcessorPoolSettings
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
 
 LOGGER = logging.getLogger(__name__)
@@ -62,6 +65,56 @@ def max_compressed_request_bytes(max_bytes: int) -> int:
         + blocks * DEFLATE_STORED_BLOCK_OVERHEAD_BYTES
         + GZIP_ENVELOPE_SLACK_BYTES
     )
+
+
+def declared_body_oversize(headers: Mapping[str, str], max_bytes: int) -> bool:
+    """Whether the announced ``Content-Length`` already exceeds the budget.
+
+    Shared by the two hops that read a body -- the regional cluster
+    authentication middleware and processor dispatch -- so that whichever runs
+    first refuses to buffer an announced flood (A-3). A compressed body is held
+    to :func:`max_compressed_request_bytes`; the decoder stays authoritative
+    for the decompressed size. No usable declaration (chunked, malformed) means
+    the post-decode check decides.
+    """
+
+    try:
+        length = int(headers.get("Content-Length", ""))
+    except ValueError:
+        return False
+    limit = (
+        max_compressed_request_bytes(max_bytes)
+        if headers.get("Content-Encoding", "").strip()
+        else max_bytes
+    )
+    return length > limit
+
+
+class NulInRequestBody(ValueError):
+    """The JSON body carries a ``\\u0000`` escape (E-3).
+
+    PostgreSQL ``jsonb`` refuses a NUL in a string (SQLSTATE 22P05), so a body
+    that decodes fine here would fail the statement that stores it -- and in
+    the telemetry spool that statement is one ``INSERT`` for a stripe of up to
+    64 requests from unrelated clusters. Refusing it at the edge with a 422
+    (terminal for the sink, which dead-letters it) keeps one node's kernel log
+    line from failing 63 other requests every collection cycle.
+    """
+
+
+def _contains_nul(value: object) -> bool:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            if "\x00" in current:
+                return True
+        elif isinstance(current, dict):
+            stack.extend(current.keys())
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return False
 
 
 def inflate_bounded(body: bytes, max_bytes: int) -> bytes:
@@ -123,6 +176,13 @@ class PostgresPoolCapacity:
     demand_by_consumer: dict[str, int]
     unpooled_connections: int
 
+    # Connections the steady consumers must leave free: one for the
+    # ``/metrics`` scrape, one for a route that goes straight to the store
+    # (heartbeat, receipt poll). An estimate that came out exactly equal to
+    # ``pool_max`` used to pass, and the registry refresh -- the readiness
+    # criterion -- then queued 10 s behind saturated store threads (A-5).
+    REQUIRED_HEADROOM = 2
+
     @property
     def demand(self) -> int:
         return sum(self.demand_by_consumer.values())
@@ -130,6 +190,16 @@ class PostgresPoolCapacity:
     @property
     def oversubscription_ratio(self) -> float:
         return self.demand / self.pool_max if self.pool_max > 0 else float("inf")
+
+    @property
+    def headroom(self) -> int:
+        """Connections left once every steady consumer holds one."""
+
+        return self.pool_max - self.demand
+
+    @property
+    def has_headroom(self) -> bool:
+        return self.headroom >= self.REQUIRED_HEADROOM
 
 
 @dataclass
@@ -154,6 +224,7 @@ class AdmissionRuntime:
     spool_max_item_bytes: int
     spool_rejections: dict[str, int]
     spool_admitted_by_path: dict[str, int]
+    decode_rejections: dict[str, int]
     store_io: AsyncStoreExecutor
     decode_io: AsyncStoreExecutor
     fault_store_io: AsyncStoreExecutor
@@ -186,7 +257,10 @@ class AdmissionRuntimeFactory:
             **executors,
             **batchers,
             decode_json_body=self._decode_json_body(limits["max_request_bytes"]),
-            bounded_io_endpoint=self._bounded_endpoint(executors["store_io"]),
+            bounded_io_endpoint=self._bounded_endpoint(
+                executors["store_io"],
+                retry_after_seconds=limits["retry_after_seconds"],
+            ),
         )
 
     def limits(self) -> dict:
@@ -333,6 +407,10 @@ class AdmissionRuntimeFactory:
             "spool_max_item_bytes": spool_item_bytes,
             "spool_rejections": {"global": 0, "cluster": 0},
             "spool_admitted_by_path": {},
+            # Bodies refused by the decoder for reasons that are neither size
+            # nor syntax: today only a NUL escape (E-3). Rendered on /metrics
+            # as ``gpu_fault_ingress_decode_rejections_total{reason=...}``.
+            "decode_rejections": {"nul": 0},
             "_spool_partitions": partitions,
         }
 
@@ -397,6 +475,15 @@ class AdmissionRuntimeFactory:
         role against a pool of 8, so it never warned in the one role where the
         processor threads, the workflow dispatcher and the periodic runner are
         the consumers that actually queue on checkout.
+
+        Every entry is a thread family that exists in that role (see
+        ``lifespan.py`` / ``lifespan_workers.py``), sized as the coordinator
+        sizes it: the processor pools come from ``ProcessorPoolSettings``,
+        not from the ``GPU_FAULT_PROCESSOR_WORKERS`` budget they are carved
+        from (G-7: 24 declared, 14 started). Per-request lease renewal
+        threads are deliberately not listed -- they hold a connection for one
+        statement every few seconds and are bounded by the pool threads that
+        spawn them -- which is part of why the baseline keeps two spare.
         """
 
         if not os.getenv("GPU_FAULT_STORE_URL", "").startswith("postgres"):
@@ -408,8 +495,17 @@ class AdmissionRuntimeFactory:
         queued_processor = (
             env("GPU_FAULT_PROCESSOR_MODE", "direct").strip().lower() == "active-active"
         )
+        regional = env("GPU_FAULT_DEPLOYMENT_MODE", "").strip().lower() == "regional"
         background_services = service_role in {"all", "worker"}
-        processor_workers = int(env("GPU_FAULT_PROCESSOR_WORKERS", "4"))
+        try:
+            pools = ProcessorPoolSettings.from_environment()
+        except ValueError:
+            # An invalid split fails the processor factory in the roles that
+            # start one; an estimate must not be what fails a role that does
+            # not. Fall back to the budget, the pre-G-7 reading.
+            pools = ProcessorPoolSettings(
+                worker_count=max(1, int(env("GPU_FAULT_PROCESSOR_WORKERS", "4")))
+            )
         demand: dict[str, int] = {}
         if service_role in {"all", "ingress", "worker"}:
             demand["store_io_general"] = int(env("GPU_FAULT_STORE_IO_WORKERS", "8"))
@@ -423,7 +519,9 @@ class AdmissionRuntimeFactory:
                     env("GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS", "16")
                 )
         if background_services and queued_processor:
-            demand["processor_workers"] = processor_workers
+            # ``gpu-fault-processor-inbox`` claims; the pools execute.
+            demand["processor_claim_loop"] = 1
+            demand["processor_workers"] = sum(pools.worker_counts().values())
         if background_services and env_bool(
             "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER", True
         ):
@@ -432,6 +530,16 @@ class AdmissionRuntimeFactory:
             )
         if background_services:
             demand["periodic_services"] = 1
+            demand["xid_correlation"] = 1
+            demand["notification_dispatcher"] = 1
+            if queued_processor:
+                demand["processor_diagnostics"] = 1
+        # Started by ``lifespan.py`` in every role, 30 s lease + snapshot read.
+        demand["collector_metrics_snapshot"] = 1
+        if regional:
+            # 1 s ``refresh_once``: two reads and a member write, in every
+            # role; its failure is what fails ``/healthz``.
+            demand["regional_registry"] = 1
         if (
             spool_enabled
             and queued_processor
@@ -440,7 +548,7 @@ class AdmissionRuntimeFactory:
             demand["telemetry_spool_replay"] = int(
                 env(
                     "GPU_FAULT_TELEMETRY_SPOOL_WORKERS",
-                    str(max(1, processor_workers // 4) * 2),
+                    str(pools.default_pool * 2),
                 )
             )
         unpooled = 0
@@ -457,11 +565,13 @@ class AdmissionRuntimeFactory:
             demand_by_consumer=demand,
             unpooled_connections=unpooled,
         )
-        if estimate.demand > pool_max:
+        if not estimate.has_headroom:
             LOGGER.warning(
-                "postgres pool max %s is smaller than the %s connections the %s "
-                "role can hold at once (%s); callers will queue on checkout",
+                "postgres pool max %s leaves fewer than %s spare connections "
+                "beyond the %s the %s role can hold at once (%s); the registry "
+                "refresh and /metrics will queue on checkout",
                 pool_max,
+                PostgresPoolCapacity.REQUIRED_HEADROOM,
                 estimate.demand,
                 service_role,
                 ", ".join(f"{name}={count}" for name, count in demand.items()),
@@ -595,18 +705,32 @@ class AdmissionRuntimeFactory:
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("JSON request body must be an object")
+            # A raw NUL byte is a control character inside a string and
+            # ``json.loads`` already rejects it; only the escape gets
+            # through. The bytes search is the cheap gate, the walk
+            # confirms it, so ``"\\\\u0000"`` (an escaped backslash) does
+            # not cost a legitimate log line its batch.
+            if b"\\u0000" in body and _contains_nul(payload):
+                raise NulInRequestBody(
+                    "JSON request body contains a NUL character (\\u0000), "
+                    "which PostgreSQL jsonb cannot store"
+                )
             return body, payload
 
         return decode
 
     @staticmethod
-    def _bounded_endpoint(store_io):
-        def decorate(function):
+    def _bounded_endpoint(
+        store_io: AsyncStoreExecutor, *, retry_after_seconds: int = 2
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        retry_after = {"Retry-After": str(retry_after_seconds)}
+
+        def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
             @wraps(function)
-            async def wrapped(*args, **kwargs):
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
                 report_processor_replay_phase(f"store_io_admission:{function.__name__}")
 
-                def invoke():
+                def invoke() -> Any:
                     report_processor_replay_phase(f"handler:{function.__name__}")
                     return function(*args, **kwargs)
 
@@ -624,7 +748,7 @@ class AdmissionRuntimeFactory:
                             if isinstance(exc, RequestDeadlineExceeded)
                             else "store I/O capacity exceeded"
                         ),
-                        headers={"Retry-After": "2"},
+                        headers=retry_after,
                     ) from exc
 
             return wrapped

@@ -7,18 +7,20 @@ maintenance window and then restored exactly. The operator chooses two values:
 * ``GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS`` -- lowered so a node
   workflow held WAITING reaches its hard lifetime inside the window instead of
   an hour later.
-* ``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`` -- pinned at or above the
-  lifetime, because ``restart_budget_preflight.claim_deadlines`` stamps
+* ``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`` -- pinned at the lifetime,
+  because ``restart_budget_preflight.claim_deadlines`` stamps
   ``min(execution, lifetime)``: an execution timeout *below* the lifetime makes
   the workflow fail as a plain execution-deadline miss with
   ``details.workflow_lifetime_exceeded=false``, which is the opposite of what
-  the case exists to prove.
+  the case exists to prove, and one *above* the lifetime is truncated to it.
 
 The rest of the timing set moves in lockstep, derived from those two
 (``lockstep_assignments``), because ``execution.config.
 validate_timing_relationships`` fails the control plane closed at boot when the
-set is inconsistent -- a window that lowered the lifetime alone CrashLooped
-every worker replica:
+set is inconsistent -- a window that lowered the lifetime alone (step ceilings
+and managed recovery left at 600 s/1800 s) CrashLoopBackOff'd every worker
+replica on the live run, and the rollout never converged. An explicit ``--set``
+of a derived variable wins over the derivation and is judged the same way:
 
 * every per-step waiting ceiling must be at or below the node lifetime
   (``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS``,
@@ -38,8 +40,10 @@ every worker replica:
 
 The rendered set is checked with the control plane's own validator before the
 window opens (``assignment_errors``), judged against the shipped defaults for
-everything the window does not set. No variable is ever raised above its shipped
-default; the two operator-chosen values keep their historical 60..3600 s range.
+everything the window does not set, so an inconsistent ``--set`` is rejected on
+the command line instead of surfacing as an opaque rollout timeout mid case. No
+variable is ever raised above its shipped default; the two operator-chosen
+values keep their historical 60..3600 s range.
 
 All of them live on the CPU-plane ``gpu-fault-control-worker`` Deployment, which is
 where the workflow executor and the single-instance dispatch lease run
@@ -84,6 +88,7 @@ from gpu_fault.execution.config import (  # noqa: E402
 )
 from gpu_fault.models import WorkflowOperation  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -129,6 +134,9 @@ SHIPPED_DEFAULTS: dict[str, str] = {
     LEASE_DURATION_VARIABLE: str(_SHIPPED.lease_duration_seconds),
 }
 ALLOWED_VARIABLES = tuple(SHIPPED_DEFAULTS)
+# Not window-settable; the validator judges twice the managed-recovery window
+# (one escalated branch) against it.
+JOB_LIFETIME_SECONDS = _SHIPPED.job_workflow_lifetime_seconds
 # The two the operator chooses; the rest are derived from them.
 CHOSEN_VARIABLES = (LIFETIME_VARIABLE, EXECUTION_TIMEOUT_VARIABLE)
 # Reported alongside the window so a case can do its timing arithmetic against
@@ -275,7 +283,10 @@ def assignment_errors(assignments: dict[str, str]) -> list[str]:
     timeout below the lifetime therefore fires first and reports a plain
     execution-deadline miss, so a window that compresses the lifetime without
     keeping the execution timeout at or above it silently changes which
-    contract the run proves.
+    contract the run proves. Likewise a step waiting cap set *below* a
+    compressed lifetime ends the WAITING step before the lifetime does, and the
+    run proves the step cap; the derivation never does that, so this only
+    catches an explicit ``--set``.
 
     The completed set is then given to the control plane's own boot-time
     validator (``validate_timing_from_environment``), judged against the
@@ -286,16 +297,26 @@ def assignment_errors(assignments: dict[str, str]) -> list[str]:
     errors: list[str] = []
     lifetime = assignments.get(LIFETIME_VARIABLE)
     timeout = assignments.get(EXECUTION_TIMEOUT_VARIABLE)
+    step = assignments.get(STEP_TIMEOUT_VARIABLE)
     if lifetime is not None and timeout is not None and int(timeout) < int(lifetime):
         errors.append(
             f"{EXECUTION_TIMEOUT_VARIABLE}={timeout} is below "
             f"{LIFETIME_VARIABLE}={lifetime}; the execution deadline would fire "
             "first and the failure would not carry workflow_lifetime_exceeded"
         )
+    if lifetime is not None and step is not None and int(step) < int(lifetime):
+        errors.append(
+            f"{STEP_TIMEOUT_VARIABLE}={step} is below {LIFETIME_VARIABLE}={lifetime}; "
+            "the WAITING step's own cap could end the wait before the workflow "
+            "lifetime does"
+        )
     try:
         validate_timing_from_environment(complete_assignments(assignments))
     except (WorkflowExecutionError, RuntimeError) as exc:
-        errors.append(f"the control plane would refuse this window at boot: {exc}")
+        errors.append(
+            "the control plane would refuse to boot with this window "
+            f"(execution/config.py): {exc}"
+        )
     return errors
 
 
@@ -440,19 +461,32 @@ def replica_env(
     result: list[dict[str, Any]] = []
     literal = ",".join(repr(str(name)) for name in names)
     for pod in regional.ready_pods(plane, deployment):
-        output = regional.kubectl(
-            plane,
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{literal}]}}))",
-            timeout=60,
-        )
+        name = str(pod["name"])
+        try:
+            output = regional.kubectl(
+                plane,
+                "exec",
+                name,
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{literal}]}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            # Every window open and close rolls the control-worker Deployment,
+            # so a replica can be terminated between ``ready_pods`` listing it
+            # and this exec (observed live 2026-09-08: the pod was NotFound at
+            # exec time). Such a pod is no longer a ready replica; drop it and
+            # let the caller (``converge``) re-poll the settling set instead of
+            # failing the whole survey on a transient. Any other exec failure
+            # is a real error and still propagates.
+            if replica_vanished(error):
+                continue
+            raise
         result.append(
             {
-                "pod": str(pod["name"]),
+                "pod": name,
                 "values": json.loads(output.splitlines()[-1]),
             }
         )
@@ -604,13 +638,34 @@ def close_window(
                 sort_keys=True,
             )
         )
-    expected = {
-        name: (item["value"] if item["present"] else None)
-        for name, item in baseline["variables"].items()
-    }
-    record["replicas_after_close"] = converge(settings, regional, expected, sleep=sleep)
+    record["replicas_after_close"] = converge(
+        settings, regional, restored_expectation(record), sleep=sleep
+    )
     write_json_atomic(settings.baseline, record)
     return record
+
+
+def restored_expectation(record: dict[str, Any]) -> dict[str, str | None]:
+    """What every replica must read once the window is closed.
+
+    Not "None for every variable the baseline did not carry inline": two of
+    the six (managed recovery, lease) reach the worker through ``envFrom``
+    ConfigMaps, so a restored replica legitimately reads 1800/180 for them and
+    a None expectation can never converge -- observed live 2026-09-08, where
+    every close spun to its rollout timeout after the Deployment had already
+    been restored. The pre-window survey recorded what the replicas actually
+    read; that is the restore target. A record written without a survey falls
+    back to the inline baseline.
+    """
+
+    baseline = record["baseline"]["variables"]
+    replicas = (record.get("pre_window_survey") or {}).get("replicas") or []
+    if replicas:
+        return {name: observed_value(replicas, name) for name in baseline}
+    return {
+        name: (item["value"] if item["present"] else None)
+        for name, item in baseline.items()
+    }
 
 
 def without_survey(record: dict[str, Any]) -> dict[str, Any]:

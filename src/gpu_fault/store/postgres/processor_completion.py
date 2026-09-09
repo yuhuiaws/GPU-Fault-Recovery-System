@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Callable, TypedDict
-
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Event as ThreadEvent
+from typing import Any, Callable, TypedDict
 
-from gpu_fault.store.shared.time import (
-    utc_text as _utc_text,
-)
 from gpu_fault.store.postgres.processor_completion_runtime import (
     complete_cluster_groups,
 )
 from gpu_fault.store.shared.errors import StaleFencingTokenError
 from gpu_fault.store.shared.group_commit import submit_group_commit
+from gpu_fault.store.shared.time import (
+    utc_text as _utc_text,
+)
 
 
 class _CompletionEntry(TypedDict):

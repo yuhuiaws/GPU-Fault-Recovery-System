@@ -221,6 +221,9 @@ def build_rollback_environment(
     environment = {
         **os.environ,
         **admin_config_renderer_environment(rollback_config.admin_config),
+        # A rolled-back role without its alert channel would fail the
+        # startup guard, so the channel travels with the rollback too.
+        **rollback_config.notification_environment(),
         "KUBECONFIG": rollback_config.cpu_kubeconfig,
         "GPU_FAULT_AWS_REGION": rollback_config.aws_region,
         "GPU_FAULT_NAMESPACE": rollback_config.namespace,

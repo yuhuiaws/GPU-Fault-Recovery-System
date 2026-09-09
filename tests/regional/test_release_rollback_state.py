@@ -246,7 +246,14 @@ def test_schema_job_manifest_change_keeps_automatic_rollback_available() -> None
         ORCHESTRATION.rollback_release(release, state={"metadata": {}})
 
 
-def test_database_schema_change_still_requires_rollback_compatibility() -> None:
+def test_database_schema_change_still_requires_rollback_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This is the *unaccepted* path. The release gate's pytest inherits the
+    # deploy's environment, and ``deploy --accept-schema-change`` exports
+    # GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE there (deploy #18, 2026-09-09):
+    # with it set the engine took the accepted branch against this fake config.
+    monkeypatch.delenv("GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE", raising=False)
     release = SimpleNamespace(
         config=SimpleNamespace(auto_rollback=True),
         state={"release_diff": {"changed": ["database_schema"]}},

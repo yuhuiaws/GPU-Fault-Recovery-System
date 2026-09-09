@@ -46,6 +46,7 @@ from gpu_fault.app.lifespan import (
 from gpu_fault.app.metric_scan_cache import MetricScanCache
 from gpu_fault.app.metrics import (
     get_app_runtime,
+    process_local_metric_lines,
 )
 from gpu_fault.app.metrics import (
     router as metrics_router,
@@ -64,6 +65,7 @@ from gpu_fault.app.middleware.dispatch import (
     install_processor_dispatch,
 )
 from gpu_fault.app.processor_factory import ProcessorFactory
+from gpu_fault.app.remote_command_wakeups import RemoteCommandWakeupHub
 from gpu_fault.app.routes.admin import (
     AdminRouterDependencies,
     get_admin_dependencies,
@@ -391,8 +393,13 @@ def _configure_service_runtime(
             event_loop_lag=event_loop_lag,
             collector_metrics_snapshot=collector_metrics_snapshot,
             regional_registry_runtime=regional_auth_registry,
+            process_metrics_render=process_local_metric_lines,
         )
     )
+    # Long-poll claim wakeups (``remote_command_wakeups.py``): one lazily
+    # started LISTEN thread per process, closed when the lifespan exits.
+    remote_command_wakeups = RemoteCommandWakeupHub(ctx.store)
+    lifespan = remote_command_wakeups.wrap_lifespan(lifespan)
     return (
         regional_auth_registry,
         service_role,
@@ -407,6 +414,7 @@ def _configure_service_runtime(
         collector_metrics_snapshot,
         lifespan,
         local_processor_diagnostics,
+        remote_command_wakeups,
     )
 
 
@@ -418,6 +426,10 @@ def _install_regional_auth(
     decode_io,
     decode_json_body,
     processor_max_request_bytes,
+    *,
+    fault_decode_io=None,
+    is_fault_path=None,
+    admission=None,
 ):
     registry = ExplicitAuthorizationRegistry()
     registry.load(app.routes)
@@ -471,6 +483,12 @@ def _install_regional_auth(
             decode_json_body=decode_json_body,
             payload_cluster_ids=payload_cluster_ids,
             processor_max_request_bytes=processor_max_request_bytes,
+            # A-3 / A-4 / A-8 / E-3 (control-plane review 2026-09-08)
+            fault_decode_io=fault_decode_io,
+            is_fault_path=is_fault_path,
+            dispatch_state=admission.dispatch_state if admission else None,
+            decode_rejections=admission.decode_rejections if admission else None,
+            retry_after_seconds=admission.retry_after_seconds if admission else 2,
         ),
     )
 
@@ -555,6 +573,7 @@ def _install_core_routes(
             executor_compatibility=(
                 RegionalExecutorCompatibilityPolicy.from_mapping(os.environ)
             ),
+            remote_command_wakeups=app.state.remote_command_wakeups,
         )
     )
     app.include_router(regional_router)
@@ -600,6 +619,7 @@ def _install_core_routes(
         dispatch_state=dispatch_state,
         collector_metrics_snapshot=collector_metrics_snapshot,
         metric_scan_cache=MetricScanCache(ctx.store),
+        decode_rejections=admission.decode_rejections,
     )
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)
@@ -768,9 +788,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         os.getenv("GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS", "5")
     )
     processor = ProcessorFactory(
-        ctx,
-        mode=processor_mode,
-        exit_grace_seconds=processor_exit_grace_seconds,
+        ctx, mode=processor_mode, exit_grace_seconds=processor_exit_grace_seconds
     ).build()
     admission = AdmissionRuntimeFactory(ctx, processor).build()
     processor_max_queue_depth = admission.max_queue_depth
@@ -815,6 +833,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         collector_metrics_snapshot,
         lifespan,
         local_processor_diagnostics,
+        remote_command_wakeups,
     ) = _configure_service_runtime(
         ctx,
         processor,
@@ -842,6 +861,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
+    app.state.remote_command_wakeups = remote_command_wakeups
     app.state.context = ctx
     app.state.processor = processor
     app.state.processor_replay_tracker = processor_replay_tracker
@@ -873,8 +893,8 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         "/v1/advisory-notifications/",
         "/v1/workflows/",
         WORKLOAD_OBSERVATIONS_PATH,
+        # Also covers ATTEMPT_COVERAGE_PATH, the watcher's coverage heartbeat.
         "/v1/attempts/",
-        "/v1/triage-results",
         "/v1/recovery-plans/",
         "/v1/fleet/deployments",
         "/v1/fleet/agents/",
@@ -928,6 +948,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
             replay_authorized=processor_replay_authorized,
             returns_processor_receipt=returns_processor_receipt,
             is_fault_ingress_path=is_fault_path,
+            decode_rejections=admission.decode_rejections,
             decode_json_body=decode_json_body,
             processor_max_queue_depth=processor_max_queue_depth,
             processor_max_cluster_queue_depth=(processor_max_cluster_queue_depth),
@@ -998,6 +1019,9 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         decode_io,
         decode_json_body,
         processor_max_request_bytes,
+        fault_decode_io=fault_decode_io,
+        is_fault_path=is_fault_path,
+        admission=admission,
     )
 
     install_ingress_backpressure(

@@ -62,6 +62,13 @@ class Kubectl:
             self.inputs.append(stdin)
         line = " ".join(argv)
         if "jsonpath={.data.node-action-secret}" in line:
+            if not self.present:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    f'Error from server (NotFound): secrets "{SECRET}" not found',
+                )
             encoded = base64.b64encode(self.master.encode()).decode()
             return subprocess.CompletedProcess(argv, 0, encoded, "")
         if "deployment,daemonset" in line:
@@ -174,6 +181,31 @@ def test_a_re_run_reads_the_existing_master_instead_of_replacing_it(
 
     assert master_file.read_text(encoding="utf-8") == EXISTING_MASTER
     assert kubectl.applied_secrets() == [], "an existing base Secret was overwritten"
+    assert len(kubectl.matching(SECRET)) == 1, (
+        "the Secret was read twice (an existence probe and then the value)"
+    )
+
+
+def test_an_unreachable_api_server_is_not_read_as_a_missing_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only NotFound means absent. A failed read that is answered with a fresh
+    Secret would mint a second fleet master over the one every node holds."""
+
+    class Unreachable(Kubectl):
+        def __call__(self, arguments, **keywords):
+            argv = [str(item) for item in arguments]
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
+            )
+
+    kubectl = Unreachable(present=True)
+
+    with pytest.raises(BootstrapError, match="Unable to connect"):
+        _secrets(kubectl, monkeypatch, tmp_path)
+
+    assert kubectl.applied_secrets() == [], "a new base Secret was minted blind"
 
 
 def test_the_secret_values_never_reach_the_command_log(

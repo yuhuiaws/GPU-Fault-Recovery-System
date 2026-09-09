@@ -44,6 +44,11 @@ NOTIFICATION_CONFIG_SHA256="$(
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
 FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
+# Content digest of the failure-domain ConfigMap the release engine applied
+# just before this script; stamped on the control-worker pod template so the
+# worker rolls exactly when the map it mounts changed. Empty means "not
+# rendered" (dry run) and leaves the existing stamp alone.
+FAILURE_DOMAIN_MAP_SHA256="${GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256:-}"
 ROLE_TARGETS="$(
     printf '%s' \
         "${GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS:-spool,worker,ingress}"
@@ -99,6 +104,11 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
     "${PRESERVE_ROLE_CONFIG_MAPS}" == "false" ]] || {
     echo "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS must be true or false" >&2
     exit 2
+}
+[[ -z "${FAILURE_DOMAIN_MAP_SHA256}" ||
+    "${FAILURE_DOMAIN_MAP_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256 must be a lowercase SHA-256" >&2
+    exit 1
 }
 [[ "${FORCE_ROLE_RESTART}" == "true" ||
     "${FORCE_ROLE_RESTART}" == "false" ]] || {
@@ -637,6 +647,24 @@ stamp_release() {
         )"
 }
 
+stamp_failure_domain_map() {
+    [[ -n "${FAILURE_DOMAIN_MAP_SHA256}" ]] || return 0
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" patch deployment \
+        gpu-fault-control-worker --type=merge -p "$(
+            jq -nc --arg sha "${FAILURE_DOMAIN_MAP_SHA256}" '{
+                spec: {
+                    template: {
+                        metadata: {
+                            annotations: {
+                                "gpu-fault.io/failure-domain-map-sha256": $sha
+                            }
+                        }
+                    }
+                }
+            }'
+        )"
+}
+
 stamp_admin_config_metadata() {
     local deployment
     for deployment in \
@@ -765,6 +793,12 @@ wait_for_rollout() {
 }
 
 wait_for_spool_drain() {
+    # E-1: this runs after ingress has already rolled to spool=false, and an
+    # ingress with spool admission off reports depth/leased as 0 whatever the
+    # table holds -- the old gate passed on its first poll and the spool tier
+    # was scaled away with rows still queued. Read the tier whose spool is
+    # still enabled (the spool-worker), and when none of its Pods is Running
+    # count the table directly from a control-worker Pod.
     local timeout="${GPU_FAULT_TELEMETRY_SPOOL_DRAIN_TIMEOUT_SECONDS:-300}"
     local deadline
     local pod
@@ -779,29 +813,50 @@ wait_for_spool_drain() {
     while ((SECONDS < deadline)); do
         pod="$(
             kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
-                -l app=gpu-fault-api-ha \
+                -l app=gpu-fault-telemetry-spool-worker \
                 --field-selector=status.phase=Running \
-                -o jsonpath='{.items[0].metadata.name}'
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
         )"
-        [[ -n "${pod}" ]] || {
-            echo "cannot inspect telemetry spool drain without a Running ingress Pod" >&2
-            return 1
-        }
-        metrics="$(
-            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
-                /opt/gpu-fault/control-plane/bin/python -c \
-                'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
-        )"
-        depth="$(
-            awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
-                <<<"${metrics}" |
-                tail -n 1
-        )"
-        leased="$(
-            awk '$1=="gpu_fault_telemetry_spool_leased"{print int($2)}' \
-                <<<"${metrics}" |
-                tail -n 1
-        )"
+        if [[ -n "${pod}" ]]; then
+            metrics="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
+                    /opt/gpu-fault/control-plane/bin/python -c \
+                    'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
+            )"
+            depth="$(
+                awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
+                    <<<"${metrics}" |
+                    tail -n 1
+            )"
+            leased="$(
+                awk '$1=="gpu_fault_telemetry_spool_leased"{print int($2)}' \
+                    <<<"${metrics}" |
+                    tail -n 1
+            )"
+        else
+            # No consumer Pod to ask: count the rows themselves. A leased row
+            # is still a row, so a zero here covers depth and leased at once.
+            pod="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod \
+                    -l app=gpu-fault-control-worker \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath='{.items[0].metadata.name}'
+            )"
+            [[ -n "${pod}" ]] || {
+                echo "cannot inspect telemetry spool drain without a Running spool-worker or control-worker Pod" >&2
+                return 1
+            }
+            depth="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
+                    /opt/gpu-fault/control-plane/bin/python -c \
+                    'import os, pathlib, psycopg
+dsn_file = os.environ.get("GPU_FAULT_STORE_URL_FILE", "")
+dsn = pathlib.Path(dsn_file).read_text().strip() if dsn_file and os.path.exists(dsn_file) else os.environ["GPU_FAULT_STORE_URL"]
+with psycopg.connect(dsn, connect_timeout=10) as connection:
+    print(connection.execute("SELECT count(*) FROM gpu_fault_telemetry_spool").fetchone()[0])'
+            )"
+            leased="0"
+        fi
         if [[ "${depth:-}" == "0" && "${leased:-}" == "0" ]]; then
             return 0
         fi
@@ -898,6 +953,7 @@ apply_worker_role() {
     stamp_release \
         gpu-fault-control-worker \
         "${ADMIN_CONFIG_WORKER_SHA256}"
+    stamp_failure_domain_map
     if [[ "${RELOAD_RELEASE_METADATA}" == "true" ||
         "${FORCE_ROLE_RESTART}" == "true" ]]; then
         kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout restart \
@@ -979,4 +1035,26 @@ GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
 GPU_FAULT_RELEASE_ID="${RELEASE_ID}" \
 GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE="${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" \
-    "${SCRIPT_DIR}/verify-control-plane-role-split.sh"
+    python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"
+
+# Record the CPU-plane resources this apply produced. The regional engine sets
+# GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY=false on the rollouts that refresh
+# the registry themselves; every other caller syncs here.
+SYNC_REGISTRY="${GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY:-true}"
+[[ "${SYNC_REGISTRY}" == "true" || "${SYNC_REGISTRY}" == "false" ]] || {
+    echo "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY must be true or false" >&2
+    exit 2
+}
+if [[ "${SYNC_REGISTRY}" == "true" ]]; then
+    registry_args=(
+        --plane cpu
+        --namespace "${NAMESPACE}"
+        --release-id "${RELEASE_ID}"
+    )
+    if [[ -n "${KUBECONFIG_PATH}" ]]; then
+        registry_args+=(--kubeconfig "${KUBECONFIG_PATH}")
+    fi
+    PYTHONDONTWRITEBYTECODE=1 python3 \
+        "${SCRIPT_DIR}/sync_installed_resource_registry.py" \
+        "${registry_args[@]}"
+fi

@@ -1,7 +1,7 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
     EFA_RDMA_EVENT_EMAIL_TEMPLATE,
     EFA_RDMA_EVENT_TEMPLATE_VERSION,
+    AdvisoryNotification,
 )
 
 

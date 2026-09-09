@@ -34,7 +34,11 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     ReadOnlyProbeRunner,
 )
-from gpu_fault.admin.grafana import GRAFANA_ENV, GrafanaSettings
+from gpu_fault.admin.grafana import (
+    GRAFANA_VIEWER_ENV,
+    GRAFANA_WORKSPACE_ID_ENV,
+    GrafanaSettings,
+)
 from gpu_fault.admin.resource_registry import build_installation_snapshot
 from gpu_fault.admin.site import SiteConfigError, load_site
 from gpu_fault.installation_resources import (
@@ -76,9 +80,19 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
         admin_bootstrap_services, "provision_node_action_keys", lambda *_a, **_k: {}
     )
 
-    bootstrap_tasks.run_platform_prerequisite_tasks(
-        runner=CommandRunner(dry_run=True),
-        state=BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE),
+    # The platform graph reads its foundation inputs from the state at task
+    # start, so the two it depends on are recorded as an earlier run would have.
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
+    state.record(
+        "monitoring_resources",
+        {"workspace_id": "ws-a", "sns_topic_arn": "arn:aws:sns:x:1:t"},
+    )
+    state.complete("monitoring_resources")
+    state.record("aurora", {})
+    state.complete("aurora")
+    bootstrap_tasks.platform_task_graph(
+        runner=CommandRunner(),
+        state=state,
         repository_root=tmp_path,
         cpu=_cluster(),
         gpu_clusters=[_gpu("gpu-a")],
@@ -86,15 +100,14 @@ def test_platform_tasks_hand_the_grafana_settings_to_install_monitoring(
         gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
         namespace="gpu-fault-system",
         site_id=SITE,
-        monitoring={"workspace_id": "ws-a", "sns_topic_arn": "arn:aws:sns:x:1:t"},
         adot_image="adot@sha256:bbb",
         alert_email="ops@example.com",
         release_manifest=tmp_path / "release.json",
         runtime_image="runtime@sha256:aaa",
-        aurora={},
         fleet_master_file=tmp_path / "fleet-master",
+        ensure_aurora_ready=lambda *_a, **_k: {},
         grafana=settings,
-    )
+    ).run(state=state)
 
     assert received and received[0]["grafana"] == settings
 
@@ -189,7 +202,7 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
             raise AssertionError(arguments)
 
     monkeypatch.setattr(
-        admin_bootstrap_services.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
     )
@@ -224,7 +237,7 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
 
 
 def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     cpu = _cluster()
     gpu_a = _gpu("gpu-a")
@@ -236,7 +249,14 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
         platform.append(keywords)
         keywords["state"].record(
             "monitoring_install",
-            {"grafana": {"status": "PROVISIONED", "workspace_id": "g-persisted"}},
+            {
+                "grafana": {
+                    "status": "PROVISIONED",
+                    "workspace_id": "g-persisted",
+                    "region": "us-east-1",
+                    "dashboards_url": "https://g-persisted.grafana-workspace/d",
+                }
+            },
         )
 
     def record_document(**keywords: Any) -> dict[str, Any]:
@@ -268,11 +288,7 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
         "notification_routing",
         lambda *_a, **_k: ("admin@example.com", {}),
     )
-    monkeypatch.setattr(
-        admin_bootstrap,
-        "_ensure_kubeconfigs",
-        lambda *_a, **_k: (tmp_path / "cpu.kubeconfig", tmp_path / "gpu.kubeconfig"),
-    )
+    monkeypatch.setattr(admin_bootstrap, "_update_kubeconfig", lambda *_a, **_k: None)
     monkeypatch.setattr(admin_bootstrap, "_ensure_namespace", lambda *_a, **_k: None)
     monkeypatch.setattr(
         admin_bootstrap, "_initial_secure_files", lambda **_k: ({}, tmp_path / "secure")
@@ -289,9 +305,12 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_aurora_capacity", lambda _state_dir: None
     )
+    monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", lambda **_k: None)
+    # The platform graph builder is what receives the resolved Grafana settings.
+    monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record_platform)
     monkeypatch.setattr(
         admin_bootstrap,
-        "run_foundation_tasks",
+        "run_bootstrap_tasks",
         lambda **_k: {
             "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
             "aurora": {},
@@ -299,9 +318,6 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
             "nlb_network": {},
             "pki": {},
         },
-    )
-    monkeypatch.setattr(
-        admin_bootstrap, "run_platform_prerequisite_tasks", record_platform
     )
     monkeypatch.setattr(admin_bootstrap, "_site_document", record_document)
     monkeypatch.setattr(
@@ -318,7 +334,6 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
             gpu_cluster_arns=(gpu_a.input_arn,),
             repository_root=tmp_path / "repo",
             state_dir=tmp_path / "state",
-            dry_run=True,
         )
     )
 
@@ -327,16 +342,19 @@ def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(
     assert isinstance(settings, GrafanaSettings), (
         "the platform tasks did not receive resolved Grafana settings"
     )
-    assert settings.enabled is True
     assert settings.workspace_id == "g-persisted"
     assert settings.workspace_id_is_operator_input is False, (
         "an id read back from site.yaml was treated as this command's input"
     )
     (document_call,) = documents
-    assert document_call["grafana_health"] == {
-        "grafanaEnabled": True,
-        "grafanaWorkspaceId": "g-persisted",
-    }
+    assert document_call["grafana_health"] == {"grafanaWorkspaceId": "g-persisted"}
+    err = capsys.readouterr().err
+    assert "Grafana dashboards:" in err, (
+        "the deploy did not say where the dashboards are"
+    )
+    assert "aws grafana update-permissions" in err and "g-persisted" in err, (
+        "the deploy did not print the exact permission command for the workspace"
+    )
 
 
 # --- checkpoint ------------------------------------------------------------------
@@ -390,7 +408,7 @@ def test_monitoring_install_reruns_when_a_dashboard_or_the_grafana_options_chang
         '{"uid": "a", "v": 2}', encoding="utf-8"
     )
     edited = _bind(tmp_path, root)
-    disabled = _bind(tmp_path, root, request_overrides={"grafana_enabled": False})
+    viewer = _bind(tmp_path, root, request_overrides={"grafana_viewer": "u-42"})
     pinned = _bind(
         tmp_path, root, request_overrides={"grafana_workspace_id": "g-5b81a13d97"}
     )
@@ -399,8 +417,8 @@ def test_monitoring_install_reruns_when_a_dashboard_or_the_grafana_options_chang
     assert baseline["monitoring_install"] != edited["monitoring_install"], (
         "monitoring_install ignores a changed dashboard"
     )
-    assert edited["monitoring_install"] != disabled["monitoring_install"], (
-        "monitoring_install ignores --grafana disabled"
+    assert edited["monitoring_install"] != viewer["monitoring_install"], (
+        "monitoring_install ignores a new --grafana-viewer"
     )
     assert edited["monitoring_install"] != pinned["monitoring_install"], (
         "monitoring_install ignores a new --grafana-workspace-id"
@@ -484,6 +502,42 @@ def test_registry_carries_the_grafana_workspace_from_bootstrap_state(
     ]
 
 
+def test_a_workspace_the_deploy_created_is_registered_for_uninstall_to_delete(
+    tmp_path: Path,
+) -> None:
+    """First deploy created the workspace, so ``uninstall --cpu-cluster delete``
+    must remove it: the record is CREATED/DELETE and its role goes after it."""
+
+    site = load_site(site_file(tmp_path))
+    state = {
+        "site_id": "test-site",
+        "resources": {
+            "monitoring_install": {
+                "grafana": {
+                    "status": "PROVISIONED",
+                    "workspace_id": "g-created01",
+                    "ownership": "CREATED",
+                    "role_name": "gpu-fault-test-site-grafana",
+                    "role_arn": "arn:aws:iam::123456789012:role/gpu-fault-test-site-grafana",
+                    "role_ownership": "CREATED",
+                    "service_account_id": "7",
+                }
+            }
+        },
+    }
+
+    snapshot = build_installation_snapshot(site, state, {})
+    by_key = {resource.resource_key: resource for resource in snapshot.resources}
+
+    workspace = by_key["aws/grafana/workspace"]
+    assert workspace.ownership is InstallationResourceOwnership.CREATED
+    assert workspace.delete_policy is InstallationResourceDeletePolicy.DELETE
+    assert workspace.dependencies == ["aws/grafana/workspace-role"]
+    assert by_key["aws/grafana/workspace-role"].delete_policy is (
+        InstallationResourceDeletePolicy.DELETE
+    )
+
+
 # --- CLI -----------------------------------------------------------------------------
 
 
@@ -508,7 +562,8 @@ def test_public_deploy_carries_the_grafana_options_to_the_source_preparer(
         admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
     )
     monkeypatch.delenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, raising=False)
-    monkeypatch.delenv(GRAFANA_ENV, raising=False)
+    monkeypatch.delenv(GRAFANA_WORKSPACE_ID_ENV, raising=False)
+    monkeypatch.delenv(GRAFANA_VIEWER_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     base = _deploy_arguments("--state-dir", str(tmp_path / "state"))
 
@@ -519,28 +574,33 @@ def test_public_deploy_carries_the_grafana_options_to_the_source_preparer(
             admin_cli.parser().parse_args(
                 [
                     *base,
-                    "--grafana",
-                    "disabled",
                     "--grafana-workspace-id",
                     "g-5b81a13d97",
+                    "--grafana-viewer",
+                    "u-42",
                 ]
             )
         )
         == 0
     )
     assert calls[-1]["extra_environment"] == {
-        "GPU_FAULT_ADMIN_GRAFANA": "disabled",
-        "GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID": "g-5b81a13d97",
+        GRAFANA_WORKSPACE_ID_ENV: "g-5b81a13d97",
+        GRAFANA_VIEWER_ENV: "u-42",
     }
 
 
-def test_deploy_help_documents_the_grafana_options(capsys) -> None:
+def test_deploy_help_documents_the_grafana_options_and_the_mode_flag_is_gone(
+    capsys,
+) -> None:
     with pytest.raises(SystemExit):
         admin_cli.parser().parse_args(["deploy", "--help"])
 
     help_text = capsys.readouterr().out
-    assert "--grafana {enabled,disabled,create}" in help_text
     assert "--grafana-workspace-id WORKSPACE_ID" in help_text
+    assert "--grafana-viewer SSO_USER_ID" in help_text
+    assert "--grafana {" not in help_text, "the enabled/disabled/create mode is back"
+    with pytest.raises(SystemExit):
+        admin_cli.parser().parse_args(_deploy_arguments("--grafana", "disabled"))
 
 
 def test_the_inner_deploy_builds_the_bootstrap_request_from_the_options(
@@ -563,15 +623,10 @@ def test_the_inner_deploy_builds_the_bootstrap_request_from_the_options(
         "run",
         lambda arguments, **_k: subprocess.CompletedProcess(arguments, 0),
     )
-    monkeypatch.setattr(
-        admin_cli, "_configure_site_notifications", lambda site, **_kwargs: site
-    )
-    monkeypatch.setattr(
-        admin_cli,
-        "sync_installation_resource_registry",
-        lambda _site: tmp_path / "installation-resources.json",
-    )
-    monkeypatch.delenv(GRAFANA_ENV, raising=False)
+    # The release that follows the bootstrap is not under test here.
+    monkeypatch.setattr(admin_cli, "_run_automatic_release", lambda **_k: 0)
+    monkeypatch.delenv(GRAFANA_WORKSPACE_ID_ENV, raising=False)
+    monkeypatch.delenv(GRAFANA_VIEWER_ENV, raising=False)
     arguments = argparse.Namespace(
         command="deploy",
         file=None,
@@ -584,12 +639,11 @@ def test_the_inner_deploy_builds_the_bootstrap_request_from_the_options(
         impact_base="origin/release",
         prepared_source_release=True,
         show_effective_config=False,
-        grafana="create",
         grafana_workspace_id="g-5b81a13d97",
+        grafana_viewer="u-42",
     )
 
     assert admin_cli.run(arguments) == 0
     (request,) = requests
-    assert request.grafana_enabled is True
-    assert request.grafana_create is True
     assert request.grafana_workspace_id == "g-5b81a13d97"
+    assert request.grafana_viewer == "u-42"

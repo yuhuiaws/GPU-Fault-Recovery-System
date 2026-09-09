@@ -186,7 +186,6 @@ def regional_environment(monkeypatch, tmp_path) -> None:
         ),
     )
     monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER", "false")
-    monkeypatch.setenv("GPU_FAULT_ENABLE_QUICK_DIAGNOSTICS", "false")
     monkeypatch.setenv("GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER", "false")
     monkeypatch.setenv("GPU_FAULT_ENABLE_HYPERPOD_ADAPTER", "false")
     monkeypatch.delenv("GPU_FAULT_HYPERPOD_CLUSTER", raising=False)

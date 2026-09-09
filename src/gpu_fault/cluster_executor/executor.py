@@ -5,8 +5,9 @@ one on its own thread through ``CommandLifecycle`` (lease renewal, execution
 cap, result report) and ``CommandDispatch`` (validation, preflight, adapter,
 failure classification), keeps the counters every layer increments, writes the
 readiness and liveness breadcrumbs the container probes read, and turns
-SIGTERM into "stop claiming, let the leases lapse". ``SpareReservationSweep``
-is the one piece of housekeeping the loop runs between claims.
+SIGTERM into "stop claiming, let the leases lapse". The
+``SpareReservationSweep`` (``gpu_fault.spare_reservation_sweep``) is the one
+piece of housekeeping the loop runs between claims.
 """
 
 from __future__ import annotations
@@ -26,18 +27,19 @@ from gpu_fault.cluster_executor.dispatch import CommandDispatch
 from gpu_fault.cluster_executor.lease import (
     DEFAULT_MAX_EXECUTION_SECONDS,
     CommandLifecycle,
+    CommandOutcome,
 )
 from gpu_fault.cluster_executor.metrics import ClusterExecutorMetrics
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
 )
-from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
 from gpu_fault.regional import (
     RemoteActionCommand,
     RemoteCommandResult,
     RemoteCommandStatus,
 )
+from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
 # carries ``%(name)s`` and operators filter on ``gpu_fault.cluster_executor``, so
@@ -67,85 +69,86 @@ DEFAULT_LIVENESS_INTERVAL_SECONDS = 15.0
 LIVENESS_STALE_AFTER_SECONDS = 300
 
 
-# ARCH-A4b: the regional executor has no store, so a stale warm-spare
-# reservation can only be judged by its timestamp. One day mirrors the
-# control-plane controller's default; five minutes between sweeps is far
-# below the TTL and costs one node list per sweep.
-SPARE_RESERVATION_TTL_SECONDS = 86400.0
-SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS = 300.0
+def transport_degraded_idle_delay(
+    *,
+    cycles: int,
+    backoff_after: int,
+    poll_seconds: float,
+    cap: float,
+) -> float:
+    """Idle wait after ``cycles`` consecutive network-degraded run_once cycles.
 
-
-class SpareReservationSweep:
-    """Reclaim warm-spare reservations whose owner can no longer be asked.
-
-    The control plane's ``HyperPodSpareHealthController`` reads the owning
-    workflow from its store; the regional executor is storeless, so
-    ``SpareReservationReclaimer`` runs here with ``store=None`` and only the
-    ``reserved-at`` TTL decides. A reservation without that annotation is kept
-    (no evidence of staleness), and a spare running GPU pods is never touched.
+    Below ``backoff_after`` the executor keeps polling normally. At and past it
+    the wait doubles each further degraded cycle (capped at ``cap``), so an
+    executor that can reach the control plane but not the target stops
+    re-claiming the commands it cannot progress and a replica whose network
+    works claims them instead.
     """
 
-    def __init__(
-        self,
-        coordinator: HyperPodSpareCoordinator,
-        *,
-        ttl_seconds: float = SPARE_RESERVATION_TTL_SECONDS,
-        interval_seconds: float = SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS,
-        now: Callable[[], datetime] | None = None,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
-        if interval_seconds <= 0:
-            raise ValueError("interval_seconds must be positive")
-        from gpu_fault.spare_health import SpareReservationReclaimer
+    over = cycles - backoff_after
+    if over < 0:
+        return poll_seconds
+    return min(cap, poll_seconds * (1 << min(over + 1, 8)))
 
-        self.coordinator = coordinator
-        self.interval_seconds = interval_seconds
-        self.clock = clock
-        self.reclaimer = SpareReservationReclaimer(
-            coordinator,
-            None,
-            now=now or (lambda: datetime.now(timezone.utc)),
-            ttl_seconds=ttl_seconds,
+
+def _validate_settings(
+    *,
+    poll_seconds: float,
+    claim_wait_seconds: float,
+    lease_seconds: int,
+    batch_size: int,
+    max_concurrent_commands: int,
+    claim_backoff_max_seconds: float,
+    lease_renewal_failure_limit: int,
+    transport_degraded_backoff_after: int,
+    max_execution_seconds: float,
+    liveness_interval_seconds: float,
+) -> None:
+    """Refuse an executor configuration at construction, before the first claim.
+
+    The bounds mirror the control plane's request models where one exists
+    (``claim_wait_seconds`` is the protocol field's 0..30) and the operational
+    envelope otherwise.
+    """
+
+    if poll_seconds <= 0:
+        raise ClusterExecutorError("cluster executor poll seconds must be positive")
+    if not 0 <= claim_wait_seconds <= 30:
+        raise ClusterExecutorError(
+            "cluster executor claim wait seconds must be between 0 and 30"
         )
-        self.reclaimed_total = 0
-        self._next_due: float | None = None
-
-    def due(self) -> bool:
-        return self._next_due is None or self.clock() >= self._next_due
-
-    def run(self) -> list[str]:
-        """Sweep every spare-labelled node once; returns the nodes released."""
-
-        self._next_due = self.clock() + self.interval_seconds
-        released: list[str] = []
-        for node in self.coordinator.lifecycle.list_nodes(enrich=True):
-            if (
-                node.kubernetes_labels.get(self.coordinator.spare_label)
-                != self.coordinator.spare_label_value
-            ):
-                continue
-            node_name = self.coordinator._kubernetes_node_name(node)
-            if node_name is None:
-                continue
-            kubernetes_node = self.coordinator.core.read_node(node_name)
-            reservation = self.coordinator._annotation(kubernetes_node)
-            if not reservation:
-                continue
-            reason = self.reclaimer.reason(node_name, kubernetes_node, reservation)
-            if reason is None:
-                continue
-            self.coordinator.release([node_name], reservation)
-            self.reclaimed_total += 1
-            released.append(node_name)
-            LOGGER.warning(
-                "reclaimed stale spare reservation: node=%s incident=%s reason=%s",
-                node_name,
-                reservation,
-                reason,
-            )
-        return released
+    if not 10 <= lease_seconds <= 7200:
+        raise ClusterExecutorError(
+            "cluster executor lease seconds must be between 10 and 7200"
+        )
+    if not 1 <= batch_size <= 25:
+        raise ClusterExecutorError(
+            "cluster executor batch size must be between 1 and 25"
+        )
+    if not 1 <= max_concurrent_commands <= 25:
+        raise ClusterExecutorError(
+            "cluster executor concurrency must be between 1 and 25"
+        )
+    if claim_backoff_max_seconds < poll_seconds:
+        raise ClusterExecutorError(
+            "claim backoff max must not be less than poll seconds"
+        )
+    if not 1 <= lease_renewal_failure_limit <= 100:
+        raise ClusterExecutorError(
+            "cluster executor lease renewal failure limit must be between 1 and 100"
+        )
+    if not 1 <= transport_degraded_backoff_after <= 100:
+        raise ClusterExecutorError(
+            "cluster executor transport degraded backoff must be between 1 and 100"
+        )
+    if not 0 < max_execution_seconds <= 86400:
+        raise ClusterExecutorError(
+            "cluster executor max execution seconds must be between 0 and 86400"
+        )
+    if liveness_interval_seconds <= 0:
+        raise ClusterExecutorError(
+            "cluster executor liveness interval seconds must be positive"
+        )
 
 
 class ClusterActionExecutor:
@@ -157,6 +160,7 @@ class ClusterActionExecutor:
         executor_id: str,
         allowed_namespaces: set[str],
         poll_seconds: float = 2,
+        claim_wait_seconds: float = 0,
         lease_seconds: int = 120,
         batch_size: int = 5,
         max_concurrent_commands: int = 5,
@@ -165,43 +169,27 @@ class ClusterActionExecutor:
         claim_state_path: str | None = None,
         liveness_state_path: str | None = None,
         lease_renewal_failure_limit: int = 3,
+        transport_degraded_backoff_after: int = 3,
         max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
         liveness_interval_seconds: float = (DEFAULT_LIVENESS_INTERVAL_SECONDS),
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         spare_reservation_sweep: SpareReservationSweep | None = None,
     ) -> None:
-        if poll_seconds <= 0:
-            raise ClusterExecutorError("cluster executor poll seconds must be positive")
-        if not 10 <= lease_seconds <= 7200:
-            raise ClusterExecutorError(
-                "cluster executor lease seconds must be between 10 and 7200"
-            )
-        if not 1 <= batch_size <= 25:
-            raise ClusterExecutorError(
-                "cluster executor batch size must be between 1 and 25"
-            )
-        if not 1 <= max_concurrent_commands <= 25:
-            raise ClusterExecutorError(
-                "cluster executor concurrency must be between 1 and 25"
-            )
-        if claim_backoff_max_seconds < poll_seconds:
-            raise ClusterExecutorError(
-                "claim backoff max must not be less than poll seconds"
-            )
-        if not 1 <= lease_renewal_failure_limit <= 100:
-            raise ClusterExecutorError(
-                "cluster executor lease renewal failure limit must be between 1 and 100"
-            )
-        if not 0 < max_execution_seconds <= 86400:
-            raise ClusterExecutorError(
-                "cluster executor max execution seconds must be between 0 and 86400"
-            )
-        if liveness_interval_seconds <= 0:
-            raise ClusterExecutorError(
-                "cluster executor liveness interval seconds must be positive"
-            )
+        _validate_settings(
+            poll_seconds=poll_seconds,
+            claim_wait_seconds=claim_wait_seconds,
+            lease_seconds=lease_seconds,
+            batch_size=batch_size,
+            max_concurrent_commands=max_concurrent_commands,
+            claim_backoff_max_seconds=claim_backoff_max_seconds,
+            lease_renewal_failure_limit=lease_renewal_failure_limit,
+            transport_degraded_backoff_after=transport_degraded_backoff_after,
+            max_execution_seconds=max_execution_seconds,
+            liveness_interval_seconds=liveness_interval_seconds,
+        )
         self.lease_renewal_failure_limit = lease_renewal_failure_limit
+        self.transport_degraded_backoff_after = transport_degraded_backoff_after
         self.max_execution_seconds = max_execution_seconds
         self.liveness_interval_seconds = liveness_interval_seconds
         self.clock = clock
@@ -219,6 +207,11 @@ class ClusterActionExecutor:
         # cluster fails the adapter's confirmation gate.
         self.confirm_cluster_name = confirm_cluster_name
         self.poll_seconds = poll_seconds
+        # Long-poll: how long the control plane may hold an empty claim. While
+        # positive, run() goes straight back into claim() after an empty
+        # answer -- the server already waited -- and poll_seconds only paces a
+        # held (WAITING) command and the transport backoff. 0 is pure polling.
+        self.claim_wait_seconds = claim_wait_seconds
         self.lease_seconds = lease_seconds
         self.batch_size = batch_size
         self.max_concurrent_commands = max_concurrent_commands
@@ -261,6 +254,18 @@ class ClusterActionExecutor:
         # 409/429/5xx, urllib3 timeouts) reported WAITING instead of FAILED
         # (ARCH-B1 reached from the regional topology).
         self.retryable_adapter_errors_total = 0
+        # Actions that failed on this executor's own connectivity (gaierror,
+        # refused connection, timeout reaching the target): WAITING as retryable
+        # transport. Unlike adapter/control-plane retryables, the executor's
+        # network is the problem, not the target's -- see _idle_delay.
+        self.retryable_transport_errors_total = 0
+        # Compound commands run, the steps they carried, and progress posts
+        # the control plane did not accept (性能 C). The terminal result
+        # carries every step's verdict, so a failed progress post costs the
+        # control plane latency, never a step.
+        self.batched_commands_total = 0
+        self.batched_steps_total = 0
+        self.batched_progress_failures_total = 0
         # Commands abandoned at ``max_execution_seconds`` (a counter), and the
         # threads still stuck behind them (a gauge: Python cannot kill a
         # thread, so an operator has to see them accumulate).
@@ -288,6 +293,11 @@ class ClusterActionExecutor:
         # takes the idle path when it did not, so a held command polls at
         # poll_seconds instead of as fast as the control plane will answer.
         self.last_cycle_advanced = True
+        # Whole cycles in a row that advanced nothing and failed at least one
+        # command on this executor's own connectivity. A streak, not a total:
+        # written only by the claim loop (never through ``increment``), read
+        # by ``_idle_delay`` and the breadcrumb.
+        self.consecutive_transport_degraded_cycles = 0
         # The readiness probe runs in a separate process (kubectl exec),
         # so the claim timestamp has to leave this one. Written to the
         # container filesystem, not the store: the default regional
@@ -434,6 +444,13 @@ class ClusterActionExecutor:
             "cancellations_observed_total": (self.cancellations_observed_total),
             "barrier_unavailable_holds_total": (self.barrier_unavailable_holds_total),
             "retryable_adapter_errors_total": self.retryable_adapter_errors_total,
+            "retryable_transport_errors_total": (self.retryable_transport_errors_total),
+            "consecutive_transport_degraded_cycles": (
+                self.consecutive_transport_degraded_cycles
+            ),
+            "batched_commands_total": self.batched_commands_total,
+            "batched_steps_total": self.batched_steps_total,
+            "batched_progress_failures_total": self.batched_progress_failures_total,
             "execution_timeouts_total": self.execution_timeouts_total,
             "stuck_executions": self.stuck_executions,
             "abandoned_lease_holds_total": (self.abandoned_lease_holds_total),
@@ -487,6 +504,7 @@ class ClusterActionExecutor:
                 execution_owners=self.execution_owners,
                 max_commands=self.batch_size,
                 lease_seconds=self.lease_seconds,
+                wait_seconds=self.claim_wait_seconds,
             )
         except Exception as exc:
             # Tag the phase for run()'s log. Everything after this point either
@@ -530,7 +548,7 @@ class ClusterActionExecutor:
                     )
                     self.metrics.in_flight(len(pending))
                     self._record_liveness()
-                statuses = [future.result() for future in futures]
+                outcomes = [future.result() for future in futures]
             finally:
                 # Never wait: a worker that abandoned a stuck command has
                 # returned, but the thread it abandoned may still be inside a
@@ -543,11 +561,28 @@ class ClusterActionExecutor:
             # second across two replicas, and 759 identical log lines a
             # minute. Waiting is not progress, so it takes the idle path.
             self.last_cycle_advanced = any(
-                status is not RemoteCommandStatus.WAITING for status in statuses
+                outcome.status is not RemoteCommandStatus.WAITING
+                for outcome in outcomes
             )
+            # A whole cycle that advanced nothing and failed at least one
+            # command on this executor's own connectivity is a degraded
+            # cycle: run() backs off once enough of them stack up, so the
+            # command this executor keeps releasing lands on a replica whose
+            # network works. Any progress, or a WAITING that was the target's
+            # fault (an adapter 5xx, a control-plane 503), clears the streak.
+            if not self.last_cycle_advanced and any(
+                outcome.transport_degraded for outcome in outcomes
+            ):
+                self.consecutive_transport_degraded_cycles += 1
+            else:
+                self.consecutive_transport_degraded_cycles = 0
+        else:
+            # An empty claim round trip proves the control-plane route works
+            # and leaves nothing blocked, so it is not a degraded cycle.
+            self.consecutive_transport_degraded_cycles = 0
         return len(commands)
 
-    def _execute_and_report(self, command: RemoteActionCommand) -> RemoteCommandStatus:
+    def _execute_and_report(self, command: RemoteActionCommand) -> CommandOutcome:
         """One command, start to reported: never raises into ``run_once``.
 
         Anything that leaves this method comes back out of ``future.result()``
@@ -570,7 +605,7 @@ class ClusterActionExecutor:
                 command.command_id,
                 command.cluster_id,
             )
-            return RemoteCommandStatus.WAITING
+            return CommandOutcome(RemoteCommandStatus.WAITING, False)
 
     def sweep_spare_reservations(self) -> None:
         """Run the periodic spare sweep when due; never raises (ARCH-A4b)."""
@@ -629,13 +664,28 @@ class ClusterActionExecutor:
                     )
                 time.sleep(delay)
                 continue
+            if count == 0 and self.claim_wait_seconds > 0:
+                # The control plane held this claim for up to
+                # claim_wait_seconds already; sleeping again would only add
+                # latency to the next command.
+                continue
             if count == 0 or not self.last_cycle_advanced:
-                time.sleep(self.poll_seconds)
+                time.sleep(self._idle_delay())
         self.metrics.loop_iteration(alive=False)
         LOGGER.warning(
             "regional cluster executor stopped claiming: executor=%s reason=%s",
             self.executor_id,
             self._stop_reason,
+        )
+
+    def _idle_delay(self) -> float:
+        """How long run() waits before the next claim when nothing advanced."""
+
+        return transport_degraded_idle_delay(
+            cycles=self.consecutive_transport_degraded_cycles,
+            backoff_after=self.transport_degraded_backoff_after,
+            poll_seconds=self.poll_seconds,
+            cap=self.claim_backoff_max_seconds,
         )
 
     def _execute(self, command: RemoteActionCommand) -> RemoteCommandResult:

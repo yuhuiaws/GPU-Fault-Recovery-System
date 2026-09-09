@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from gpu_fault.admin.rollback_alignment import reconcile_rollback_management
+from gpu_fault.admin.rollback_command import (
+    align_rolled_back_management as _align_rolled_back_management,
+)
 
 
 # Mirrors ``regional_schema_change.ACCEPT_SCHEMA_CHANGE_ENV`` (pinned equal by
@@ -125,17 +128,17 @@ def align_rolled_back_management(
     live_state: dict[str, Any],
     run_release_mode: RunReleaseMode,
 ) -> None:
-    aligned_root = reconcile_rollback_management(
-        site_file,
-        live_state,
-        site_before=prepared.state_dir / "site.before.yaml",
-        source=f"rollback:{prepared.release_id}",
-    )
-    run_release_mode(
-        site_file,
-        mode="sync-state",
-        root=aligned_root,
+    # The same alignment `gpu-fault-admin deploy --rollback` runs after a manual
+    # rollback (`gpu_fault.admin.rollback_command`); the reconcile is passed
+    # through this module's own name so it stays the seam tests replace here.
+    _align_rolled_back_management(
+        prepared,
+        site_file=site_file,
+        root=root,
         environment=environment,
+        live_state=live_state,
+        run_release_mode=run_release_mode,
+        reconcile=reconcile_rollback_management,
     )
 
 

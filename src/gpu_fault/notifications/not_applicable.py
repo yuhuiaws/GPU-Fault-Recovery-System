@@ -1,7 +1,7 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
     NOT_APPLICABLE_EMAIL_TEMPLATE,
     NOT_APPLICABLE_TEMPLATE_VERSION,
+    AdvisoryNotification,
 )
 
 

@@ -14,7 +14,9 @@ from gpu_fault.store.postgres.fleet import PostgresFleetMixin
 from gpu_fault.store.postgres.gpu_telemetry import PostgresGpuTelemetryMixin
 from gpu_fault.store.postgres.notifications import PostgresNotificationMixin
 from gpu_fault.store.postgres.pool import (
+    STORE_URL_FILE_ENV,
     PooledPostgresDatabase,
+    StoreCredentials,
     open_writer_pool,
 )
 from gpu_fault.store.postgres.processor_admin import PostgresProcessorAdminMixin
@@ -32,6 +34,7 @@ from gpu_fault.store.postgres.record_cas import PostgresRecordCasMixin
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
 from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
 from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
+from gpu_fault.store.postgres.wakeups import PostgresWakeupMixin
 from gpu_fault.store.postgres.workflows import PostgresWorkflowMixin
 from gpu_fault.store.postgres.xid import PostgresXidMixin
 from gpu_fault.store.shared.compositions import SharedCompositionMixin
@@ -72,6 +75,7 @@ class PostgresStore(
     PostgresGpuTelemetryMixin,
     PostgresCollectorTelemetryMixin,
     PostgresTelemetrySpoolMixin,
+    PostgresWakeupMixin,
     PostgresProcessorAdminMixin,
     PostgresProcessorAdmissionMixin,
     PostgresProcessorClaimsMixin,
@@ -119,7 +123,13 @@ class PostgresStore(
         except ImportError as exc:
             raise RuntimeError("install gpu-fault-control-plane[postgres]") from exc
         self._models = record_models()
-        self.url = url
+        # The DSN is read through the mounted Secret file when the Deployment
+        # provides one (CP-3): a rotated Aurora password reaches this process
+        # on the next reconnect instead of on the next restart. ``url`` stays
+        # the start-up fallback for sites that still inject only the env.
+        self.credentials = StoreCredentials(
+            url, path=os.getenv(STORE_URL_FILE_ENV, "").strip() or None
+        )
         self.hot_state_mode = (
             (
                 hot_state_mode
@@ -216,14 +226,14 @@ class PostgresStore(
             pool_kwargs["max_lifetime"] = pool_max_lifetime_seconds
         self._pool = open_writer_pool(
             ConnectionPool,
-            url,
+            self.credentials,
             min_size=pool_min_size,
             max_size=pool_max_size,
             timeout=pool_timeout_seconds,
             kwargs=connection_kwargs,
             **pool_kwargs,
         )
-        self._db = PooledPostgresDatabase(self._pool)
+        self._db = PooledPostgresDatabase(self._pool, credentials=self.credentials)
         configure_processor_completion_runtime(self, pool_max_size)
         self._processor_completion_condition = Condition()
         self._processor_completion_queue = []
@@ -243,6 +253,13 @@ class PostgresStore(
                 )
             self._pool.close()
             raise
+
+    @property
+    def url(self) -> str:
+        """The current DSN: the mounted Secret file when present, else the
+        start-up value. Side connections (LISTEN) reconnect through this."""
+
+        return self.credentials.conninfo()
 
 
 if TYPE_CHECKING:

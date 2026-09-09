@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-
 COLLECTOR_EVENT_PREFIX = "/v1/collector-events/"
 
 
@@ -104,6 +103,10 @@ NODE_LOG_PATH = "/v1/collector-events/node-logs"
 COLLECTOR_HEALTH_PATH = "/v1/collector-events/collector-health"
 WORKLOAD_OBSERVATIONS_PATH = "/v1/workload-observations"
 TRAINING_PROGRESS_PATH = "/v1/training-progress"
+#: Where the Completion Watcher posts ``telemetry.WorkloadCoverageHeartbeat``:
+#: one statement per completed full pass that saw nothing running, at most one
+#: per watcher interval. ``telemetry.ATTEMPT_COVERAGE_PATH`` is the same path.
+ATTEMPT_COVERAGE_PATH = "/v1/attempts/coverage"
 
 
 CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
@@ -210,6 +213,19 @@ CHANNEL_REGISTRY: dict[str, ProcessorChannel] = {
         lane=ChannelLane.ATTEMPT,
         receipt=True,
     ),
+    # One heartbeat per cluster per idle pass; the payload names no attempt or
+    # node, so its ordering key is the cluster and latest-wins keeps a single
+    # pending row per cluster however often the watcher passes. The row is
+    # superseded by design, so an older heartbeat losing to a newer one is the
+    # intended outcome, not a lost write.
+    ATTEMPT_COVERAGE_PATH: ProcessorChannel(
+        path=ATTEMPT_COVERAGE_PATH,
+        priority_mode=ChannelPriorityMode.ROUTINE,
+        pool=ChannelPool.OBSERVATION,
+        lane=ChannelLane.ATTEMPT,
+        latest_wins=True,
+        receipt=True,
+    ),
 }
 
 COLLECTOR_CHANNEL_PATHS = frozenset(
@@ -247,6 +263,12 @@ CONTROL_PLANE_ACTION_PATH_PREFIXES = (
     "/v1/recovery-plans/",
 )
 FAULT_PATH_PREFIXES = DEVICE_EVENT_PATH_PREFIXES + CONTROL_PLANE_ACTION_PATH_PREFIXES
+# Paths under a fault prefix that are not faults. The coverage heartbeat lives
+# under ``/v1/attempts/`` with the attempt lifecycle events but is weak,
+# self-superseding evidence: it is queued on its registered ROUTINE, latest-wins
+# channel and served from the ordinary ingress capacity, never from the
+# reserved fault tier a storm's cure is claimed from.
+NON_FAULT_PATH_EXCEPTIONS = frozenset({ATTEMPT_COVERAGE_PATH})
 
 
 def validate_channel_registry() -> None:
@@ -301,6 +323,8 @@ def channel_for_path(path: str) -> ProcessorChannel | None:
 
 
 def is_fault_path(path: str) -> bool:
+    if path in NON_FAULT_PATH_EXCEPTIONS:
+        return False
     channel = channel_for_path(path)
     return bool(
         path.startswith(FAULT_PATH_PREFIXES)
@@ -309,6 +333,8 @@ def is_fault_path(path: str) -> bool:
 
 
 def is_control_plane_action_path(path: str) -> bool:
+    if path in NON_FAULT_PATH_EXCEPTIONS:
+        return False
     return path.startswith(CONTROL_PLANE_ACTION_PATH_PREFIXES)
 
 

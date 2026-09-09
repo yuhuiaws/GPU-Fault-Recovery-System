@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import yaml
@@ -250,3 +251,83 @@ def test_dispatch_thread_survives_an_exception_from_the_health_check() -> None:
     finally:
         stop.set()
         workers.PeriodicServiceRunner = original  # type: ignore[misc]
+
+
+# --- B-6: the worker role's consumer loop is a liveness criterion --------------
+
+
+def _worker_livez(processor) -> Any:
+    from gpu_fault.app.routes.admin import AdminRouterDependencies, livez
+
+    return asyncio.run(
+        livez(
+            AdminRouterDependencies(
+                context=SimpleNamespace(),
+                processor=processor,
+                processor_mode="active-active",
+                service_role="worker",
+                environment={"GPU_FAULT_SERVICE_ROLE": "worker"},
+                regional_registry_runtime=None,
+            )
+        )
+    )
+
+
+def _consumer(*, running: bool, age: float | None, live: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        active_consumers=True,
+        spool_consumer_running=True,
+        processor_consumer_running=running,
+        consumer_last_cycle_age_seconds=age,
+        consumer_is_live=lambda *, max_cycle_age_seconds: live,
+        processor_notification_fallback_seconds=5.0,
+    )
+
+
+def test_livez_fails_when_the_processor_consumer_thread_exited() -> None:
+    """``gpu-fault-processor-inbox`` died: Pod stayed Ready, claimed nothing."""
+
+    response = _worker_livez(_consumer(running=False, age=12.0, live=False))
+
+    assert response.status_code == 503
+    assert "processor-consumer" in response.body.decode()
+
+
+def test_livez_fails_when_the_processor_consumer_is_wedged() -> None:
+    response = _worker_livez(_consumer(running=True, age=600.0, live=False))
+
+    assert response.status_code == 503
+
+
+def test_livez_gives_the_consumer_a_start_up_grace() -> None:
+    """Before the first cycle there is nothing to be stale about."""
+
+    payload = _worker_livez(_consumer(running=False, age=None, live=False))
+
+    assert payload["status"] == "alive", payload
+
+
+def test_livez_is_alive_while_the_consumer_cycles() -> None:
+    payload = _worker_livez(_consumer(running=True, age=0.5, live=True))
+
+    assert payload["status"] == "alive", payload
+    assert payload["dead_threads"] == []
+
+
+def test_livez_ignores_the_consumer_outside_the_worker_role() -> None:
+    from gpu_fault.app.routes.admin import AdminRouterDependencies, livez
+
+    payload = asyncio.run(
+        livez(
+            AdminRouterDependencies(
+                context=SimpleNamespace(),
+                processor=_consumer(running=False, age=12.0, live=False),
+                processor_mode="active-active",
+                service_role="ingress",
+                environment={},
+                regional_registry_runtime=None,
+            )
+        )
+    )
+
+    assert payload["status"] == "alive", payload

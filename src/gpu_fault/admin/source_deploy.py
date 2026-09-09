@@ -94,6 +94,7 @@ def run_source_deploy(
     impact_base: str,
     current_directory: Path,
     extra_environment: Mapping[str, str] | None = None,
+    wait_for_email_confirmation: int = 0,
 ) -> int:
     repository_root = resolve_source_repository(
         state_dir,
@@ -121,6 +122,10 @@ def run_source_deploy(
             "--quiet",
         )
     )
+    if wait_for_email_confirmation > 0:
+        command.extend(
+            ("--wait-for-email-confirmation", str(wait_for_email_confirmation))
+        )
     completed = subprocess.run(
         command,
         cwd=repository_root,

@@ -5,7 +5,15 @@ from dataclasses import dataclass
 from typing import Mapping
 
 LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 1
-CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 2
+# Version 3 understands a compound command (``RemoteActionCommand.batched_steps``)
+# and reports per-step progress on ``POST .../{command_id}/progress``. The claim
+# response gained a field an older executor's ``extra="forbid"`` model would
+# refuse, so this is a version bump rather than the additive-request-field path
+# ``wait_seconds`` took (design §8.1): the control plane only mints compound
+# commands once every accepted executor version is at least this one, and the
+# claim never hands a compound command to an executor that advertised less.
+CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION = 3
+REMOTE_STEP_BATCHING_PROTOCOL_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,19 @@ class RegionalExecutorCompatibilityPolicy:
             required_compatibility_digest=compatibility_digest,
             compatible_compatibility_digests=compatible_compatibility,
         )
+
+    @property
+    def minimum_accepted_version(self) -> int:
+        """The oldest executor protocol this control plane still admits.
+
+        The required and compatible pins are the control plane's declared
+        knowledge of what is deployed (a rolling upgrade widens them, the
+        follow-up deploy narrows them again), so a feature that needs every
+        executor to understand a new response field gates on this value rather
+        than on the version of whichever executor happens to claim next.
+        """
+
+        return min({self.required_version, *self.compatible_versions})
 
     def rejection_reason(
         self,

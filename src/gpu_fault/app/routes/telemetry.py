@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-from gpu_fault.app.authorization import authorization_bucket
-
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+from gpu_fault.app.authorization import authorization_bucket
+from gpu_fault.async_store import (
+    AsyncStoreExecutor,
+    StoreIoCapacityExceeded,
+)
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     collector_silent_thresholds,
     required_collectors_for_agent,
-)
-from gpu_fault.async_store import (
-    AsyncStoreExecutor,
-    StoreIoCapacityExceeded,
 )
 from gpu_fault.gpu_metrics import (
     GpuHealthFinding,

@@ -29,7 +29,6 @@ from gpu_fault.dataplane_metrics import (
 from gpu_fault.cluster_executor.executor import (
     LIVENESS_STALE_AFTER_SECONDS,
     ClusterActionExecutor,
-    SpareReservationSweep,
 )
 from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
 from gpu_fault.cluster_executor.metrics import loop_breadcrumb_is_fresh
@@ -48,6 +47,7 @@ from gpu_fault.hyperpod import (
 )
 from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
 from gpu_fault.logging_setup import configure_logging
+from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
 # carries ``%(name)s`` and operators filter on ``gpu_fault.cluster_executor``, so
@@ -256,40 +256,53 @@ def executor_from_environment() -> ClusterActionExecutor:
         executor_id=executor_id,
         allowed_namespaces=namespaces,
         spare_reservation_sweep=sweep,
-        poll_seconds=float(
-            os.getenv(
-                "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
-                "2",
-            )
-        ),
-        lease_seconds=int(
-            os.getenv(
-                "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS",
-                "120",
-            )
-        ),
-        batch_size=int(os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE", "5")),
-        max_concurrent_commands=int(
-            os.getenv(
-                "GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS",
-                "5",
-            )
-        ),
         # Only set when this executor actually owns HyperPod mutations.
         # Left None otherwise so an unexpectedly routed RESTART_NODE or
         # REPLACE_NODE fails the adapter's confirmation gate instead of
         # confirming itself.
         confirm_cluster_name=(hyperpod_confirm_cluster),
-        lease_renewal_failure_limit=int(
+        **_claim_loop_settings_from_environment(),
+    )
+
+
+def _claim_loop_settings_from_environment() -> dict[str, float | int]:
+    """The ``GPU_FAULT_CLUSTER_EXECUTOR_*`` knobs that pace the claim loop.
+
+    Every value is validated by ``ClusterActionExecutor`` itself, so a bad
+    setting fails at startup with the executor's own message.
+    """
+
+    return {
+        "poll_seconds": float(
+            os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS", "2")
+        ),
+        # 20 s long-poll by default; 0 restores pure polling and leaves the
+        # field out of the claim body for a control plane that predates it.
+        "claim_wait_seconds": float(
+            os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS", "20")
+        ),
+        "lease_seconds": int(
+            os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS", "120")
+        ),
+        "batch_size": int(os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE", "5")),
+        "max_concurrent_commands": int(
+            os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS", "5")
+        ),
+        "lease_renewal_failure_limit": int(
             os.getenv("GPU_FAULT_CLUSTER_EXECUTOR_LEASE_FAILURE_LIMIT", "3")
         ),
-        max_execution_seconds=float(
+        "transport_degraded_backoff_after": int(
+            os.getenv(
+                "GPU_FAULT_CLUSTER_EXECUTOR_TRANSPORT_DEGRADED_BACKOFF_AFTER", "3"
+            )
+        ),
+        "max_execution_seconds": float(
             os.getenv(
                 "GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS",
                 str(DEFAULT_MAX_EXECUTION_SECONDS),
             )
         ),
-    )
+    }
 
 
 def readiness_probe() -> int:

@@ -29,6 +29,10 @@ from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from gpu_fault.models import NodeMarker, RecoveryAction, WorkflowStatus
+from gpu_fault.operation_registry import (
+    DESTRUCTIVE_OPERATIONS,
+    NODE_WIDE_RECOVERY_OPERATIONS,
+)
 from gpu_fault.recovery_actions import RECOVERY_ACTION_PROFILES
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +50,44 @@ SPARE_BLOCKING_ACTIONS: frozenset[RecoveryAction] = frozenset(
     for action, profile in RECOVERY_ACTION_PROFILES.items()
     if profile.blocks_spare
 )
+
+#: Recommended actions that only observe a node: evidence capture,
+#: diagnostics, validation. Derived from the operation registry -- the
+#: action compiles to an operation that is neither destructive nor
+#: node-wide -- so a new action cannot be advisory here and mutating there.
+#: A marker recommending one of these says "look at this node", never "this
+#: node is being repaired": it must not make its incident the owner of a
+#: failed attempt's recovery (the terminal is decided as if the marker
+#: were absent), and it must not hold a restart behind the incident's
+#: ``RECOVERED`` gate.
+DIAGNOSTIC_ACTIONS: frozenset[RecoveryAction] = frozenset(
+    action
+    for action, profile in RECOVERY_ACTION_PROFILES.items()
+    if profile.operation is not None
+    and profile.operation not in DESTRUCTIVE_OPERATIONS
+    and profile.operation not in NODE_WIDE_RECOVERY_OPERATIONS
+)
+
+
+def marker_is_diagnostic(marker: NodeMarker) -> bool:
+    """Whether ``marker`` observes the node rather than asking to change it.
+
+    The completion service used to let any matching marker make its incident
+    the owner of a failed attempt's recovery, planning a restart gated on that
+    incident reaching ``RECOVERED``. For a WARNING ``RUN_DIAGNOSTICS`` marker
+    (CPU at 98 % for two minutes) that gate guarded nothing: the diagnostic
+    workflow never repaired anything, and the marker outlived the incident
+    until its TTL, so the job could not restart for an hour. A diagnostic
+    marker that names a stored incident is therefore skipped there and the
+    terminal is decided without it (a budgeted restart when nothing else
+    matches); the marker itself stays live, it is still a valid observation.
+    A marker without a stored incident is not affected:
+    it still plans the diagnostic it asks for through ``from_marker``.
+
+    A marker with no recommended action is treated as the strongest action
+    (``QUARANTINE``) everywhere else, so it is not diagnostic here either.
+    """
+    return marker.recommended_action in DIAGNOSTIC_ACTIONS
 
 
 @runtime_checkable

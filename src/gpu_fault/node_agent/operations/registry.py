@@ -5,7 +5,6 @@ from gpu_fault.operation_registry import (
     operations_for_adapter,
 )
 
-
 OPERATION_HANDLERS: dict[WorkflowOperation, str] = {
     WorkflowOperation.COLLECT_HUNG_TRIAGE: "_collect_hung_triage",
     WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE: ("_collect_diagnostic_bundle"),

@@ -11,6 +11,7 @@ from gpu_fault.attempt_observation_state import (
     terminal_attempt_observation_state,
 )
 from gpu_fault.models import TerminalEvent
+from gpu_fault.store.shared.group_commit import submit_group_commit
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -18,7 +19,6 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
 from gpu_fault.training_models import TrainingProgressState
-from gpu_fault.store.shared.group_commit import submit_group_commit
 
 LOGGER = logging.getLogger(__name__)
 

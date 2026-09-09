@@ -14,7 +14,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, current_thread, get_native_id
 
-
 LOGGER = logging.getLogger(__name__)
 
 

@@ -2,29 +2,26 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
-
 from gpu_fault.app import ApplicationContext
-from gpu_fault.diagnostics import KubernetesDcgmDiagnosticAdapter
 from gpu_fault.models import (
     DecisionStatus,
     IncidentState,
     MarkerScope,
     NodeMarker,
+    RankExitStatus,
     RecoveryAction,
     Severity,
     TerminalEvent,
     TerminalStatus,
-    TriageFinding,
-    TriageOutcome,
-    TriageReport,
     WorkflowOperation,
     WorkflowStatus,
 )
-from gpu_fault.service import CompletionPendingError
+from gpu_fault.passive import PassiveWorkflowCompiler
+from gpu_fault.service import CompletionService
 from gpu_fault.telemetry import EvidenceKind
 from gpu_fault.watcher import (
     AllocationCompleteness,
+    FailureContainmentDecision,
     FailureDetectedEvent,
     failure_containment_ids,
 )
@@ -53,6 +50,15 @@ def marker(
     )
 
 
+def compiled_completion(context: ApplicationContext) -> CompletionService:
+    """The production wiring: plans are compiled into workflows (see
+    ``ApplicationContext.from_settings``); the bare fixture has no compiler."""
+
+    return CompletionService(
+        context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
+    )
+
+
 def test_unrelated_marker_does_not_match(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
@@ -65,10 +71,11 @@ def test_unrelated_marker_does_not_match(
     )
 
     decision = context.completion.handle_terminal(failed_event)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
     assert decision.matched_marker_ids == []
-    assert decision.diagnostic_request_id
+    assert plan.trigger == "no-hardware-evidence:RESTART"
 
 
 def test_failure_detection_creates_idempotent_containment_workflow(
@@ -143,7 +150,7 @@ def test_failure_detection_persists_workload_log_snapshot(
     assert evidence[0].payload["tail"] == "training output"
 
 
-def test_passive_containment_terminal_continues_to_triage(
+def test_passive_containment_terminal_continues_to_recovery(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
     containment = context.completion.handle_failure_detected(
@@ -170,11 +177,13 @@ def test_passive_containment_terminal_continues_to_triage(
     context.store.save_workflow(copy_model(workflow, status=WorkflowStatus.SUCCEEDED))
 
     decision = context.completion.handle_terminal(terminal)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
-def test_emergency_stopped_terminal_continues_to_triage(
+def test_emergency_stopped_terminal_continues_to_recovery(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
     containment = context.completion.handle_failure_detected(
@@ -203,40 +212,22 @@ def test_emergency_stopped_terminal_continues_to_triage(
     )
 
     decision = context.completion.handle_terminal(terminal)
+    plan = context.store.get_plan(decision.recovery_plan_id)
 
-    assert decision.status is DecisionStatus.PENDING_TRIAGE
-
-
-def test_passive_terminal_waits_for_incident_creation(
-    context: ApplicationContext, failed_event: TerminalEvent
-) -> None:
-    attempt_id = "train-123-passive-race"
-    incident_id, _ = failure_containment_ids(
-        (f"{failed_event.cluster_id}/{attempt_id}/TrainingAttemptFailureDetected")
-    )
-    terminal = copy_model(
-        failed_event,
-        attempt_id=attempt_id,
-        terminal_status=TerminalStatus.STOPPED,
-        termination_initiator_incident_id=incident_id,
-    )
-
-    with pytest.raises(CompletionPendingError, match="incident is not persisted yet"):
-        context.completion.handle_terminal(terminal)
-
-    assert context.store.get_decision_by_event(terminal.event_key) is None
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
-def test_terminal_waits_for_passive_containment(
+def test_terminal_during_open_containment_chains_recovery_behind_it(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
-    context.completion.handle_failure_detected(
+    containment = context.completion.handle_failure_detected(
         FailureDetectedEvent(
             cluster_id=failed_event.cluster_id,
             job_id=failed_event.job_id,
             attempt_id=failed_event.attempt_id,
             detected_at=ended_at,
-            runtime_profile_version=(failed_event.runtime_profile_version),
+            runtime_profile_version=failed_event.runtime_profile_version,
             workload_ids=["training/pytorchjob/distributed-training"],
             node_ids=["node-a", "node-b"],
             gpu_uuids=["GPU-a", "GPU-b"],
@@ -244,16 +235,239 @@ def test_terminal_waits_for_passive_containment(
             node_id="node-a",
             exit_code=1,
             reason="critical container exited non-zero",
-            allocation_completeness=(AllocationCompleteness.COMPLETE),
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    assert (
+        context.store.get_workflow(containment.workflow_request_id).status
+        is WorkflowStatus.PENDING
+    )
+
+    decision = compiled_completion(context).handle_terminal(failed_event)
+
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    recovery = context.store.get_workflow(plan.workflow_request_id)
+    assert recovery.predecessor_workflow_id == containment.workflow_request_id
+
+
+def test_failed_terminal_before_failure_detection_creates_the_containment(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    incident_id, workflow_id = failure_containment_ids(
+        f"{failed_event.cluster_id}/{failed_event.attempt_id}/TrainingAttemptFailureDetected"
+    )
+    event = copy_model(
+        failed_event, workload_ids=["training/pytorchjob/distributed-training"]
+    )
+
+    decision = compiled_completion(context).handle_terminal(event)
+
+    containment = context.store.get_workflow(workflow_id)
+    assert [step.operation for step in containment.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    assert context.store.get_incident(incident_id).event_type == (
+        "TRAINING_ATTEMPT_FAILURE_DETECTED"
+    )
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert (
+        context.store.get_workflow(plan.workflow_request_id).predecessor_workflow_id
+        == workflow_id
+    )
+    assert plan.restart_after_incident_id == incident_id, (
+        "the restart is premised on the containment it was created with"
+    )
+    containment_incident = context.store.get_incident(incident_id)
+    assert (containment_incident.job_id, containment_incident.attempt_id) == (
+        event.job_id,
+        event.attempt_id,
+    ), "the terminal-created containment names the job and attempt it stops"
+    late = context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            detected_at=event.ended_at,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=event.workload_ids,
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    assert late.duplicate is True
+
+
+def test_untagged_stop_after_passive_containment_is_our_own_stop(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """DESTR-015: the tombstone can lose the initiator annotation; the store knows."""
+    context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=failed_event.cluster_id,
+            job_id=failed_event.job_id,
+            attempt_id=failed_event.attempt_id,
+            detected_at=ended_at,
+            runtime_profile_version=failed_event.runtime_profile_version,
+            workload_ids=["training/pytorchjob/distributed-training"],
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    stopped = copy_model(
+        failed_event,
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = compiled_completion(context).handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
+
+
+def test_untagged_stop_with_failing_ranks_and_no_containment_is_a_user_stop(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """Rule (2) / PREEMPT-033: a user STOPPED whose containers went out non-zero
+    is still a user stop. Only a FAILED/TIMED_OUT terminal mints a containment;
+    a STOPPED one never does, however its ranks exited."""
+
+    stopped = copy_model(
+        failed_event,
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[
+            RankExitStatus(
+                rank=0, exit_code=143, node_id="node-a", finished_at=ended_at
+            )
+        ],
+        workload_ids=["training/pytorchjob/distributed-training"],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = compiled_completion(context).handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.NO_ACTION
+    assert decision.recovery_plan_id is None
+    assert (
+        context.store.get_incident_by_event(
+            f"{stopped.cluster_id}/{stopped.attempt_id}/TrainingAttemptFailureDetected"
+        )
+        is None
+    )
+
+
+def _detected_failure(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> FailureContainmentDecision:
+    return context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=failed_event.cluster_id,
+            job_id=failed_event.job_id,
+            attempt_id=failed_event.attempt_id,
+            detected_at=ended_at,
+            runtime_profile_version=failed_event.runtime_profile_version,
+            workload_ids=["training/pytorchjob/distributed-training"],
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
         )
     )
 
-    with pytest.raises(
-        CompletionPendingError, match="containment workflow is not complete"
-    ):
-        context.completion.handle_terminal(failed_event)
 
-    assert context.store.get_decision_by_event(failed_event.event_key) is None
+def test_recovery_after_a_containment_is_premised_on_the_containment_outcome(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """Final review F-2: a containment whose STOP failed leaves the incident
+    ESCALATED and the old Pods may still hold the GPUs; the restart must read
+    that outcome at execution time instead of running as soon as the
+    predecessor stops being open."""
+
+    containment = _detected_failure(context, failed_event, ended_at)
+
+    decision = compiled_completion(context).handle_terminal(failed_event)
+
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.restart_after_incident_id == containment.incident_id, (
+        "the plan names the containment incident as the restart premise"
+    )
+    restart = context.store.get_workflow(plan.workflow_request_id).official_steps[-1]
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD, (
+        "the last compiled step is the restart"
+    )
+    assert restart.parameters["requires_incident_state"] == (
+        IncidentState.RECOVERED.value
+    ), "the compiler derived the incident premise onto the step"
+    assert restart.parameters["incident_id"] == containment.incident_id, (
+        "the premise names the containment incident"
+    )
+
+
+def test_recovery_without_a_containment_carries_no_incident_premise(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    decision = compiled_completion(context).handle_terminal(failed_event)
+
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.restart_after_incident_id is None, (
+        "no containment exists, so nothing gates the restart"
+    )
+    restart = context.store.get_workflow(plan.workflow_request_id).official_steps[-1]
+    assert "requires_incident_state" not in restart.parameters, (
+        "no premise is compiled without a containment"
+    )
+
+
+def test_a_user_stop_of_a_later_attempt_withdraws_the_pending_passive_restart(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """Final review F-3 / F-N1 §7: the compiled recovery incident must name
+    its job, or ``_withdraw_job_workflows`` cannot find the restart it owns
+    and a job the user stopped is restarted anyway."""
+
+    completion = compiled_completion(context)
+    first = completion.handle_terminal(failed_event)
+    plan = context.store.get_plan(first.recovery_plan_id)
+    incident = context.store.get_incident(plan.incident_id)
+    assert (incident.job_id, incident.attempt_id) == (
+        failed_event.job_id,
+        failed_event.attempt_id,
+    ), "the compiled recovery incident names the job and attempt it restarts"
+    stopped = copy_model(
+        failed_event,
+        attempt_id="train-123-a2",
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = completion.handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.NO_ACTION, "a user stop plans nothing"
+    workflow = context.store.get_workflow(plan.workflow_request_id)
+    assert workflow.workload_withdrawn_at is not None, (
+        "the pending passive restart of the stopped job is withdrawn"
+    )
+    assert "stop" in (workflow.workload_withdrawn_reason or ""), (
+        "the withdrawal names the user stop"
+    )
 
 
 def test_matching_marker_reuses_incident_and_is_idempotent(
@@ -282,83 +496,25 @@ def test_matching_marker_reuses_incident_and_is_idempotent(
     ]
 
 
-def test_quick_triage_pass_restarts_once_on_same_allocation(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+def test_no_marker_restarts_once_within_budget(
+    context: ApplicationContext, failed_event: TerminalEvent
 ) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=30),
-        findings=[
-            TriageFinding(node_id="node-a", outcome=TriageOutcome.PASS),
-            TriageFinding(node_id="node-b", outcome=TriageOutcome.PASS),
-        ],
+    service = CompletionService(
+        context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
     )
 
-    decision = context.completion.handle_triage(report)
-    plan = context.store.get_plan(decision.recovery_plan_id)
+    decision = service.handle_terminal(failed_event)
 
     assert decision.status is DecisionStatus.PLAN_CREATED
-    assert plan.trigger == "quick-triage:PASS"
+    assert "restart budget" in decision.reason
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.trigger == "no-hardware-evidence:RESTART"
     assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
-    assert plan.steps[0].parameters["reuse_allocation"] is True
-
-
-def test_quick_triage_failure_creates_hardware_action(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
-) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=30),
-        findings=[
-            TriageFinding(
-                node_id="node-a",
-                outcome=TriageOutcome.FAIL,
-                failed_checks=["gpu-enumeration"],
-                proposed_action=RecoveryAction.REPLACE_NODE,
-            )
-        ],
-    )
-
-    decision = context.completion.handle_triage(report)
-    plan = context.store.get_plan(decision.recovery_plan_id)
-
-    assert RecoveryAction.REPLACE_NODE in {step.action for step in plan.steps}
-    assert plan.avoid_node_ids == ["node-a"]
-
-
-def test_inconclusive_quarantines_and_moves_workload(
-    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
-) -> None:
-    pending = context.completion.handle_terminal(failed_event)
-    report = TriageReport(
-        request_id=pending.diagnostic_request_id,
-        attempt_id=failed_event.attempt_id,
-        completed_at=ended_at + timedelta(seconds=60),
-        findings=[
-            TriageFinding(
-                node_id="node-a",
-                outcome=TriageOutcome.INCONCLUSIVE,
-                reason="DCGM timeout",
-            ),
-            TriageFinding(node_id="node-b", outcome=TriageOutcome.PASS),
-        ],
-    )
-
-    decision = context.completion.handle_triage(report)
-    plan = context.store.get_plan(decision.recovery_plan_id)
-
-    assert plan.trigger == "quick-triage:INCONCLUSIVE"
-    assert plan.avoid_node_ids == ["node-a"]
-    assert [step.action for step in plan.steps] == [
-        RecoveryAction.MARK_UNSCHEDULABLE,
-        RecoveryAction.QUARANTINE,
-        RecoveryAction.RESTART_WORKLOAD,
-    ]
-    assert plan.steps[-1].parameters["reuse_allocation"] is False
+    workflow = context.store.get_workflow(plan.workflow_request_id)
+    restart = workflow.official_steps[-1]
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD
+    assert restart.parameters["restart_budget"] == failed_event.restart_budget
+    assert restart.parameters["job_id"] == failed_event.job_id
 
 
 def test_stopped_attempt_does_not_restart(
@@ -455,7 +611,6 @@ def test_missing_allocation_blocks_automatic_restart(
     plan = context.store.get_plan(decision.recovery_plan_id)
 
     assert decision.status is DecisionStatus.PLAN_CREATED
-    assert decision.diagnostic_request_id is None
     assert plan.trigger == "allocation-missing:INCONCLUSIVE"
     assert plan.avoid_node_ids == []
     assert [step.action for step in plan.steps] == [
@@ -480,30 +635,3 @@ def test_diagnostic_marker_creates_diagnostic_plan(
         RecoveryAction.RUN_DIAGNOSTICS,
     ]
     assert plan.avoid_node_ids == ["node-a"]
-
-
-def test_production_diagnostic_result_creates_plan_immediately(
-    context: ApplicationContext, failed_event: TerminalEvent
-) -> None:
-    class Core:
-        def read_node(self, _):
-            return {
-                "status": {
-                    "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                }
-            }
-
-    adapter = KubernetesDcgmDiagnosticAdapter(
-        context.store,
-        Core(),
-        fetcher=lambda _url, _timeout: ('DCGM_FI_DEV_GPU_TEMP{gpu="0"} 42\n'),
-    )
-    context.diagnostics = adapter
-    context.completion = type(context.completion)(context.store, adapter)
-
-    decision = context.completion.handle_terminal(failed_event)
-
-    assert decision.status is DecisionStatus.PLAN_CREATED
-    plan = context.store.get_plan(decision.recovery_plan_id)
-    assert plan.trigger == "quick-triage:PASS"

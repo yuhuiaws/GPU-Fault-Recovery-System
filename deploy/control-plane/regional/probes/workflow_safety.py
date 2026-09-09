@@ -2,11 +2,12 @@
 
 Request: nothing on stdin.
 Response: one JSON object on stdout with ``blockers`` / ``blocker_count``,
-``resolved_blocked`` / ``resolved_blocked_count`` and ``abandoned_generation`` /
-``abandoned_generation_count``.
+``resolved_blocked`` / ``resolved_blocked_count``, ``abandoned_generation`` /
+``abandoned_generation_count`` and ``compile_blocked`` / ``compile_blocked_count``.
 
 A destructive workflow that is still non-terminal is a reason not to touch the
-fleet. Two kinds of record are not:
+fleet. Three kinds of record are not (the third, ``compile_blocked``, is
+explained at its predicate below):
 
 ``resolved_by_restore`` -- BLOCKED is also where a workflow ends up when a
 *later* workflow already recovered the incident and restored scheduling: a
@@ -44,6 +45,7 @@ from typing import Any
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
 from gpu_fault.operation_registry import DESTRUCTIVE_OPERATIONS
+from gpu_fault.remote_command_models import RemoteCommandStatus
 
 STATUSES = {
     WorkflowStatus.PENDING,
@@ -116,9 +118,54 @@ def main() -> None:
             and successor.fencing_token == incident.fencing_token
         )
 
+    def compile_blocked(workflow: Any) -> bool:
+        # A workflow the compiler refused before any step ran: BLOCKED with the
+        # compiler's ``blocked_reasons``, never claimed (a claim bumps
+        # ``execution_epoch``), no step, no completed operation, no owner, no
+        # source plan, no budget claim, no open remote command, and an incident
+        # that has settled (RECOVERED / ESCALATED) so nobody waits on it. It
+        # never changed a node and cannot. The dispatcher closes it on its
+        # sweep; the release carrying that sweep has to roll past it first.
+        # Inlined like ``abandoned_generation`` and for the same reason; the
+        # product copy is ``gpu_fault.compile_blocked.compile_blocked_reasons``.
+        if (
+            workflow.status is not WorkflowStatus.BLOCKED
+            or not workflow.blocked_reasons
+            or workflow.execution_epoch
+            or workflow.step_executions
+            or workflow.completed_step_indexes
+            or workflow.completed_operations
+            or workflow.execution_owner_id
+            or workflow.source_plan_id
+            or workflow.remediation_budget_claims
+        ):
+            return False
+        try:
+            incident = store.get_incident(workflow.incident_id)
+        except Exception:
+            return False
+        if incident.state not in (IncidentState.RECOVERED, IncidentState.ESCALATED):
+            return False
+        try:
+            commands = store.list_remote_commands(
+                workflow_request_ids=[workflow.request_id]
+            )
+        except Exception:
+            return False
+        return not any(
+            command.status
+            in (
+                RemoteCommandStatus.PENDING,
+                RemoteCommandStatus.LEASED,
+                RemoteCommandStatus.WAITING,
+            )
+            for command in commands
+        )
+
     blockers: list[str] = []
     resolved: list[str] = []
     abandoned: list[str] = []
+    compile_time: list[str] = []
     for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in workflow.official_steps
@@ -128,6 +175,8 @@ def main() -> None:
             resolved.append(workflow.request_id)
         elif abandoned_generation(workflow):
             abandoned.append(workflow.request_id)
+        elif compile_blocked(workflow):
+            compile_time.append(workflow.request_id)
         else:
             blockers.append(workflow.request_id)
     print(
@@ -139,6 +188,8 @@ def main() -> None:
                 "resolved_blocked_count": len(resolved),
                 "abandoned_generation": abandoned[:100],
                 "abandoned_generation_count": len(abandoned),
+                "compile_blocked": compile_time[:100],
+                "compile_blocked_count": len(compile_time),
             },
             sort_keys=True,
         )

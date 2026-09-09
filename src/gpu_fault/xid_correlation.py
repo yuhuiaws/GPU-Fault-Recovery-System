@@ -6,6 +6,7 @@ from threading import Event
 from typing import Callable
 from uuid import uuid4
 
+from gpu_fault.models import RecoveryAction, Severity
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
@@ -15,8 +16,6 @@ from gpu_fault.policy import (
     XidEvent,
     parse_xid154_action,
 )
-from gpu_fault.models import RecoveryAction, Severity
-
 
 LOGGER = logging.getLogger(__name__)
 

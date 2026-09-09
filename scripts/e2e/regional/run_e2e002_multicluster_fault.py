@@ -171,7 +171,7 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
         "tests/regional/test_regional_control_plane.py::"
         "test_attempt_index_is_cluster_scoped",
         "tests/regional/test_regional_control_plane.py::"
-        "test_failed_remote_restart_releases_restart_budget",
+        "test_failed_remote_restart_leaves_the_reservation_to_terminalization",
     ]
     completed = RegionalLiveFixture.run(command, cwd=ROOT, check=False, timeout=300)
     path = case_dir / "focused-tests.log"

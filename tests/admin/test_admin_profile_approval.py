@@ -364,3 +364,132 @@ def test_an_approval_written_before_the_field_existed_still_resolves(
     assert resolved.approver_identity is None, (
         "an older record has no approver; it must not be invented"
     )
+
+
+def test_inline_approval_from_the_deploy_rerun_binds_the_pending_plan(
+    tmp_path: Path,
+) -> None:
+    """``deploy --approve-profile-plan SHA --reference REF`` replaces the verb.
+
+    The rerun approves in-process with the same lock, approver and archive the
+    ``approve-profile`` command used, so the deploy that follows resolves the
+    record as EXACT and consumes it.
+    """
+
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+
+    record = admin_profile_approval.approve_profile_plan_inline(
+        tmp_path, plan_sha256=f" {plan['plan_sha256']} ", reference="CHG-12345"
+    )
+
+    assert record["plan_sha256"] == plan["plan_sha256"]
+    assert record["reference"] == "CHG-12345"
+    assert record["approver_identity"] == TEST_OPERATOR_ARN, (
+        "the inline approval must name the STS caller like the verb did"
+    )
+    assert admin_profile_approval.profile_approval_path(tmp_path).is_file(), (
+        "inline approval left no active approval for the deploy to resolve"
+    )
+    archive = admin_profile_approval.profile_approval_archive_path(
+        tmp_path, str(plan["plan_sha256"])
+    )
+    assert json.loads((archive / "plan.json").read_text()) == plan
+    assert json.loads((archive / "approval.json").read_text()) == record
+    resolved = admin_profile_approval.resolve_profile_approval(
+        tmp_path, current_plan=plan
+    )
+    assert resolved is not None
+    assert resolved.relation == "EXACT"
+
+
+def test_inline_approval_is_refused_when_no_plan_is_pending(tmp_path: Path) -> None:
+    with pytest.raises(
+        admin_profile_approval.ProfileApprovalError, match="no pending Profile plan"
+    ):
+        admin_profile_approval.approve_profile_plan_inline(
+            tmp_path, plan_sha256="a" * 64, reference="CHG-12345"
+        )
+
+    assert not admin_profile_approval.profile_approval_path(tmp_path).exists(), (
+        "a blind --approve-profile-plan on a first run created an approval"
+    )
+
+
+def test_inline_approval_refusal_names_the_pending_digest(tmp_path: Path) -> None:
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+
+    with pytest.raises(admin_profile_approval.ProfileApprovalError) as raised:
+        admin_profile_approval.approve_profile_plan_inline(
+            tmp_path, plan_sha256="f" * 64, reference="CHG-12345"
+        )
+
+    assert str(plan["plan_sha256"]) in str(raised.value), (
+        "the refusal must tell the operator which digest is actually pending"
+    )
+    assert "f" * 64 in str(raised.value)
+    assert not admin_profile_approval.profile_approval_path(tmp_path).exists(), (
+        "a mismatched --approve-profile-plan created an active approval"
+    )
+
+
+def test_inline_approval_rejects_a_malformed_digest_before_touching_state(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, plan)
+
+    with pytest.raises(
+        admin_profile_approval.ProfileApprovalError, match="approve-profile-plan"
+    ):
+        admin_profile_approval.approve_profile_plan_inline(
+            tmp_path, plan_sha256="not-a-digest", reference="CHG-12345"
+        )
+
+    assert not admin_profile_approval.profile_approval_path(tmp_path).exists(), (
+        "a malformed --approve-profile-plan created an active approval"
+    )
+
+
+def test_inline_approval_of_a_replacement_plan_archives_the_stale_one(
+    tmp_path: Path,
+) -> None:
+    original = _plan()
+    admin_profile_approval.write_profile_plan(tmp_path, original)
+    admin_profile_approval.approve_profile_plan_inline(
+        tmp_path, plan_sha256=str(original["plan_sha256"]), reference="CHG-1"
+    )
+    replacement = _plan(
+        desired_version="profile-v3",
+        policy_digest="6" * 64,
+        source_sha256="7" * 64,
+        snapshot_sha256="8" * 64,
+        changes=["nodeReboot: mode OBSERVE->OWN"],
+    )
+    admin_profile_approval.supersede_profile_approval(
+        tmp_path, replacement_plan=replacement, reason="pending plan changed"
+    )
+
+    with pytest.raises(admin_profile_approval.ProfileApprovalError) as raised:
+        admin_profile_approval.approve_profile_plan_inline(
+            tmp_path, plan_sha256=str(original["plan_sha256"]), reference="CHG-2"
+        )
+    assert str(replacement["plan_sha256"]) in str(raised.value), (
+        "re-approving the old digest must point at the new pending plan"
+    )
+
+    record = admin_profile_approval.approve_profile_plan_inline(
+        tmp_path, plan_sha256=str(replacement["plan_sha256"]), reference="CHG-2"
+    )
+
+    assert record["plan_sha256"] == replacement["plan_sha256"]
+    stale = admin_profile_approval.profile_approval_archive_path(
+        tmp_path, str(original["plan_sha256"])
+    )
+    superseded = json.loads((stale / "superseded.json").read_text())
+    assert superseded["status"] == "SUPERSEDED"
+    assert superseded["replacement_plan_sha256"] == replacement["plan_sha256"]
+    assert json.loads((stale / "approval.json").read_text())["reference"] == "CHG-1"

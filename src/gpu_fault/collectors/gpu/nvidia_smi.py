@@ -13,13 +13,6 @@ from pathlib import Path
 from typing import Callable
 
 from gpu_fault.channel_registry import GPU_METRICS_PATH
-from gpu_fault.gpu_metrics import (
-    GpuMetricBatch,
-    GpuMetricSample,
-    GpuMetricSource,
-)
-
-
 from gpu_fault.collectors.gpu.inventory_cadence import (
     GpuInventoryCadence,
     TemperatureLimitProbe,
@@ -31,6 +24,11 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_or_raise,
+)
+from gpu_fault.gpu_metrics import (
+    GpuMetricBatch,
+    GpuMetricSample,
+    GpuMetricSource,
 )
 
 LOGGER = logging.getLogger(__name__)

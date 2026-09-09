@@ -6,7 +6,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )

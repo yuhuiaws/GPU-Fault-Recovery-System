@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import os
 import logging
+import os
 import subprocess
 from typing import Callable
-
-
-from gpu_fault.models import WorkloadState
 
 from gpu_fault.collectors.gpu.discovery import (
     GpuProductDiscoveryUnavailable,
@@ -21,6 +18,7 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     HttpEventSink,
 )
+from gpu_fault.models import WorkloadState
 
 LOGGER = logging.getLogger(__name__)
 

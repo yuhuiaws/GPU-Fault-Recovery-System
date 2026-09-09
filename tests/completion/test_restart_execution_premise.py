@@ -1,8 +1,10 @@
-"""The Kubernetes restart adapter reads the planner's two safety premises (F-G5).
+"""Both executors read the two safety premises of a restart (F-G5).
 
 ``requires_incident_state`` was honoured only by the simulated executor, so a
 production restart went ahead while the incident it depended on was still
-being repaired. ``avoid_node_ids`` had no reader at all.
+being repaired. ``avoid_node_ids`` had no reader at all. Today the Kubernetes
+adapter reads both from the compiled step, and the simulated executor reads
+the incident premise from ``RecoveryPlan.restart_after_incident_id``.
 """
 
 from __future__ import annotations
@@ -10,14 +12,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from gpu_fault.adapters import KubernetesWorkflowAdapter
+from gpu_fault.adapters import KubernetesWorkflowAdapter, SimulatedRecoveryExecutor
+from gpu_fault.app import default_simulated_profile
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
+    PlanStatus,
+    RestartAuthorization,
+    TerminalEvent,
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.planner import PlanBuilder
 from gpu_fault.regional import RemoteIncidentOwnershipReport
 from tests._builders import (
     build_store,
@@ -112,13 +119,28 @@ def restart_context(extra_parameters: dict[str, Any]) -> WorkflowStepContext:
         created_at=NOW,
         updated_at=NOW,
     )
+    parameters = step.parameters
+    idempotency_key = "workflow-derived/0/RESTART_WORKLOAD"
+    # The authorization the preflight signs from its reservation; the guard
+    # compares it against the step before reading either premise.
+    authorization = RestartAuthorization(
+        cluster_id=str(parameters["cluster_id"]),
+        job_id=str(parameters["job_id"]),
+        source_attempt_id=str(parameters["source_attempt_id"]),
+        source_gpu_count=int(parameters["source_gpu_count"]),
+        restart_budget=int(parameters["restart_budget"]),
+        restart_count=1,
+        reservation_id=idempotency_key,
+    )
     return WorkflowStepContext(
         workflow=workflow,
         incident=incident,
         step=step,
         step_index=0,
-        request=WorkflowExecutionRequest(expected_fencing_token=1),
-        idempotency_key="workflow-derived/0/RESTART_WORKLOAD",
+        request=WorkflowExecutionRequest(
+            expected_fencing_token=1, restart_authorization=authorization
+        ),
+        idempotency_key=idempotency_key,
     )
 
 
@@ -147,6 +169,8 @@ def test_restart_waits_until_the_source_incident_is_recovered() -> None:
     assert waiting.details["reason"] == "NODE_UNDER_REMEDIATION"
     assert waiting.details["premise_reason"] == "INCIDENT_NOT_RECOVERED"
     assert waiting.details["incident_state"] == "ACTION_PENDING"
+    # The hold is pre-submission; a cancelled wait hands its budget back.
+    assert waiting.details["restart_submitted"] is False
     assert batch.created == {}
 
     store.save_incident(copy_model(source, state=IncidentState.RECOVERED))
@@ -254,3 +278,44 @@ def test_restart_keeps_the_new_attempt_off_avoided_nodes() -> None:
             ]
         }
     ]
+
+
+def test_simulated_executor_reads_the_premise_from_the_plan(
+    failed_event: TerminalEvent,
+) -> None:
+    """The premise moved off the plan step, so its reader had to move too.
+
+    The simulated executor read ``requires_incident_state`` from the plan
+    step's parameters. Once the compiler became the only writer of that
+    parameter the gate stopped firing without failing anything:
+    ``/v1/recovery-plans/{id}/simulate`` reported SUCCEEDED, and stored
+    ``PlanStatus.SUCCEEDED``, for a plan whose incident was still being
+    repaired.
+    """
+    store = build_store()
+    incident = fault_incident(
+        "inc-premise",
+        "event-premise",
+        node_ids=["node-a"],
+        state=IncidentState.ACTION_PENDING,
+    )
+    store.save_incident(incident)
+    plan = PlanBuilder().after_incident(
+        failed_event, incident, default_simulated_profile()
+    )
+    store.save_plan(plan)
+    executor = SimulatedRecoveryExecutor(store)
+
+    held = executor.execute(plan)
+
+    assert held.status is PlanStatus.FAILED
+    assert held.error is not None
+    assert "inc-premise" in held.error
+    assert "ACTION_PENDING" in held.error
+    assert store.get_plan(plan.plan_id).status is PlanStatus.FAILED
+
+    store.save_incident(copy_model(incident, state=IncidentState.RECOVERED))
+    released = executor.execute(plan)
+
+    assert released.status is PlanStatus.SUCCEEDED
+    assert store.get_plan(plan.plan_id).status is PlanStatus.SUCCEEDED

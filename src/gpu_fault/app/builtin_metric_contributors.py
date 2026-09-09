@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from collections.abc import Container, Sequence
 from datetime import datetime, timedelta, timezone
 
-from gpu_fault.app.metric_scan_cache import metric_scan_cache
+from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.collector_requirements import agent_is_current
 from gpu_fault.execution import ProductionExecutorConfig
@@ -21,7 +21,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.store.contracts import ControlPlaneStore
 
-
 # Upper bound on the rows either orphan inspection decodes per scrape; the
 # gauges saturate there rather than let a pathological table grow the render.
 ORPHAN_INSPECTION_LIMIT = 10_000
@@ -37,7 +36,11 @@ def remote_command_metric_lines(
     context = runtime.context
     if not context.regional_mode:
         return []
-    remote = context.store.remote_command_stats()
+    # A whole-kind GROUP BY per scrape (G-12); shared across scrapes for the
+    # scan cache's TTL like the other fleet-level aggregates.
+    remote = metric_scan_cache(runtime).shared(
+        "remote_command_stats", context.store.remote_command_stats
+    )
     lines = [
         "# HELP gpu_fault_remote_command_total Remote cluster commands by status.",
         "# TYPE gpu_fault_remote_command_total gauge",
@@ -119,15 +122,28 @@ def _open_sibling_hold_lines(context: object) -> list[str]:
 
     executor = getattr(context, "workflow_executor", None)
     adapters = getattr(executor, "adapters", None) if executor is not None else None
-    held = 0
+    totals = {
+        "open_sibling_holds_total": 0,
+        "batched_commands_total": 0,
+        "batched_steps_total": 0,
+    }
     for adapter in adapters or ():
-        value = getattr(adapter, "open_sibling_holds_total", None)
-        if isinstance(value, int):
-            held += value
+        for name in totals:
+            value = getattr(adapter, name, None)
+            if isinstance(value, int):
+                totals[name] += value
     return [
         "# HELP gpu_fault_remote_command_open_sibling_holds_total dispatches held because another command for the same workflow step was still open (ARCH-D5).",
         "# TYPE gpu_fault_remote_command_open_sibling_holds_total counter",
-        f"gpu_fault_remote_command_open_sibling_holds_total {held}",
+        f"gpu_fault_remote_command_open_sibling_holds_total {totals['open_sibling_holds_total']}",
+        # 性能 C: one compound command replaces one command per node-side
+        # step; the steps counter is how many round trips it saved.
+        "# HELP gpu_fault_remote_command_batched_commands_total compound remote commands minted for a contiguous run of node-side steps.",
+        "# TYPE gpu_fault_remote_command_batched_commands_total counter",
+        f"gpu_fault_remote_command_batched_commands_total {totals['batched_commands_total']}",
+        "# HELP gpu_fault_remote_command_batched_steps_total workflow steps carried by a compound remote command beyond its head step.",
+        "# TYPE gpu_fault_remote_command_batched_steps_total counter",
+        f"gpu_fault_remote_command_batched_steps_total {totals['batched_steps_total']}",
     ]
 
 
@@ -176,12 +192,26 @@ def regional_registry_metric_lines(runtime: AppRuntime) -> list[str]:
     if registry_runtime is None:
         return []
     role = _escape_label(str(getattr(registry_runtime, "service_role", "")))
-    return [
+    lines = [
         "# HELP gpu_fault_regional_registry_secret_drift 1 when the regional registry Secret this process started from differs from the durable registry head, which is authoritative; republish the registry from the release config to reconcile (ARCH-H2).",
         "# TYPE gpu_fault_regional_registry_secret_drift gauge",
         "gpu_fault_regional_registry_secret_drift"
         f'{{service_role="{role}"}} {int(bool(registry_runtime.secret_drift()))}',
     ]
+    # A-7: the last refresh error is a gauge, not a readiness criterion -- one
+    # closed connection (~1/min baseline) used to fail /healthz for the process.
+    status = getattr(registry_runtime, "status", None)
+    report = status() if callable(status) else None
+    if isinstance(report, dict) and "error" in report:
+        lines.extend(
+            [
+                "# HELP gpu_fault_regional_registry_refresh_error 1 while this process's latest regional registry refresh failed; readiness no longer flips on it while the snapshot is fresh (control-plane review 2026-09-08, A-7).",
+                "# TYPE gpu_fault_regional_registry_refresh_error gauge",
+                "gpu_fault_regional_registry_refresh_error"
+                f'{{service_role="{role}"}} {int(bool(report.get("error")))}',
+            ]
+        )
+    return lines
 
 
 def _unresolved_fault_signal_lines(service: object) -> list[str]:
@@ -377,6 +407,17 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             f"gpu_fault_hardware_escalation_containment_refused_total {getattr(escalation, 'containment_refused_escalations_total', 0) if escalation else 0}",
         ]
     )
+    closure = getattr(ctx, "incident_closure", None)
+    lines.extend(
+        [
+            "# HELP gpu_fault_incident_operator_closed_total ESCALATED incidents an operator closed RECOVERED through POST /v1/incidents/{id}/close or gpu-fault-admin workflow-reconcile --close-incident (DESTR-018 product gap).",
+            "# TYPE gpu_fault_incident_operator_closed_total counter",
+            f"gpu_fault_incident_operator_closed_total {getattr(closure, 'operator_closed_total', 0) if closure else 0}",
+            "# HELP gpu_fault_incident_auto_closed_by_restore_total ESCALATED incidents closed RECOVERED because a later workflow restored every node they named (DESTR-018 product gap).",
+            "# TYPE gpu_fault_incident_auto_closed_by_restore_total counter",
+            f"gpu_fault_incident_auto_closed_by_restore_total {getattr(closure, 'auto_closed_by_restore_total', 0) if closure else 0}",
+        ]
+    )
     store = getattr(ctx, "store", None)
     archiver = getattr(ctx, "control_record_archiver", None)
     lines.extend(
@@ -420,6 +461,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         _notification_dispatch_lines(getattr(ctx, "advisory_notifications", None))
     )
     snapshot = periodic.metrics_snapshot() if periodic is not None else {}
+    lines.extend(_control_loop_review_lines(dispatcher, archiver))
     lines.extend(_periodic_reconciliation_lines(snapshot))
     lines.extend(_processor_counter_mode_lines(store))
     lines.extend(
@@ -461,6 +503,50 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     return lines
 
 
+def _labelled_counter(
+    name: str, help_text: str, label: str, values: object
+) -> list[str]:
+    lines = [f"# HELP {name} {help_text}", f"# TYPE {name} counter"]
+    if isinstance(values, dict):
+        for key, count in sorted(values.items()):
+            lines.append(f'{name}{{{label}="{_escape_label(str(key))}"}} {int(count)}')
+    return lines
+
+
+def _control_loop_review_lines(dispatcher: object, archiver: object) -> list[str]:
+    """Counters the control-plane review 2026-09-08 added (D-4, F-8).
+
+    Each is a failure that used to be a log line and nothing else: a dispatcher
+    sweep path that raised, an archiver run that failed on one incident. The
+    archiver's success count sits beside its errors so a rate of zero can be
+    told from a retention that is switched off.
+    """
+
+    lines = _labelled_counter(
+        "gpu_fault_workflow_dispatch_sweep_errors_total",
+        "Dispatcher sweep paths (abandoned generation, placement hold, node-busy hold/timeout, internal-error block/release) that raised and were counted rather than aborting the cycle, by path (D-4).",
+        "path",
+        getattr(dispatcher, "sweep_errors_total", None) if dispatcher else None,
+    )
+    archived = getattr(archiver, "archived_total", None) if archiver else None
+    lines.extend(
+        [
+            "# HELP gpu_fault_control_record_archive_archived_total Incidents the archiver bundled to S3 and deleted, with their records (F-8).",
+            "# TYPE gpu_fault_control_record_archive_archived_total counter",
+            f"gpu_fault_control_record_archive_archived_total {int(archived) if isinstance(archived, int) else 0}",
+        ]
+    )
+    lines.extend(
+        _labelled_counter(
+            "gpu_fault_control_record_archive_errors_total",
+            "Archiver candidates that failed with an exception other than a safety refusal, by exception type; the run continued with the next candidate (F-8).",
+            "reason",
+            getattr(archiver, "errors_total", None) if archiver else None,
+        )
+    )
+    return lines
+
+
 def _notification_dispatch_lines(service: object) -> list[str]:
     """What the notification dispatcher gave up on, and when it last ran
     (ARCH-E E1/E3). Per process: only replicas that drain the outbox move
@@ -489,6 +575,13 @@ def _notification_dispatch_lines(service: object) -> list[str]:
         "# TYPE gpu_fault_notification_dispatch_last_cycle_timestamp_seconds gauge",
         "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds "
         f"{read('last_cycle_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_notification_delivery_errors_total Outbox deliveries whose bookkeeping or provider call raised; the row was released for retry and the batch continued (control-plane review 2026-09-08, F-3).",
+        "# TYPE gpu_fault_notification_delivery_errors_total counter",
+        f"gpu_fault_notification_delivery_errors_total {read('delivery_errors_total', 0)}",
+        "# HELP gpu_fault_notification_delivery_error_last_seen_timestamp_seconds Unix time this process last hit a delivery error; 0 if never (F-3).",
+        "# TYPE gpu_fault_notification_delivery_error_last_seen_timestamp_seconds gauge",
+        "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds "
+        f"{read('delivery_error_last_seen_timestamp_seconds', 0.0):.3f}",
     ]
 
 
@@ -528,6 +621,23 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
         "# HELP gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds Unix time this process last started a workflow dispatch cycle, lease held or not; 0 on replicas whose dispatcher never ran (ARCH-E E3).",
         "# TYPE gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds gauge",
         f"gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds {read('last_cycle_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds Unix time this process last turned a store wakeup into an early dispatch scan (see gpu_fault_workflow_dispatch_wakeups_total); 0 if never (ARCH-E E4).",
+        "# TYPE gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds {read('wakeup_last_seen_timestamp_seconds', 0.0):.3f}",
+        "# HELP gpu_fault_workflow_dispatch_wakeups_total Store wakeups this process turned into an early dispatch scan, by channel; a remote-command payload counts only on SUCCEEDED/FAILED, the statuses that let a WAITING step advance (性能 A).",
+        "# TYPE gpu_fault_workflow_dispatch_wakeups_total counter",
+        *_dispatch_wakeup_channel_lines(
+            "gpu_fault_workflow_dispatch_wakeups_total",
+            getattr(dispatcher, "wakeups_total", None),
+            0,
+        ),
+        "# HELP gpu_fault_workflow_dispatch_wakeup_listener_connected 1 while this process's LISTEN thread for the wakeup channel is connected, 0 while the dispatcher is polling only for it; any disconnected process makes the Pod's value 0.",
+        "# TYPE gpu_fault_workflow_dispatch_wakeup_listener_connected gauge",
+        *_dispatch_wakeup_channel_lines(
+            "gpu_fault_workflow_dispatch_wakeup_listener_connected",
+            getattr(dispatcher, "wakeup_listener_connected", None),
+            False,
+        ),
         "# HELP gpu_fault_workflow_dispatch_filtered_total Rows a dispatch cycle scanned and set aside, by reason, summed over the process (F-L1).",
         "# TYPE gpu_fault_workflow_dispatch_filtered_total counter",
     ]
@@ -542,6 +652,25 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
     return lines
+
+
+# Both channels are always rendered, zero included, so an alert on a channel
+# that never connected has a sample to read (same reason as
+# ``DISPATCH_FILTER_REASONS``).
+DISPATCH_WAKEUP_CHANNELS = ("remote_command", "workflow_dispatch")
+
+
+def _dispatch_wakeup_channel_lines(
+    family: str, values: object, default: int | bool
+) -> list[str]:
+    totals: dict[str, int] = dict.fromkeys(DISPATCH_WAKEUP_CHANNELS, int(default))
+    if isinstance(values, dict):
+        for channel, value in values.items():
+            totals[str(channel)] = int(value)
+    return [
+        f'{family}{{channel="{_escape_label(channel)}"}} {count}'
+        for channel, count in sorted(totals.items())
+    ]
 
 
 def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
@@ -592,9 +721,8 @@ def _periodic_liveness_lines(snapshot: dict[str, object]) -> list[str]:
 
 def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
     """The reconciliation jobs the periodic runner grew in batch 3: lease
-    reclaim (F-D5), the PENDING_TRIAGE watchdog (F-G2 (4)) and processor
-    counter drift (F-D10). The drift gauges are refreshed by the job, so a
-    scrape never counts the queue table."""
+    reclaim (F-D5) and processor counter drift (F-D10). The drift gauges are
+    refreshed by the job, so a scrape never counts the queue table."""
 
     def read(name: str) -> int:
         value = snapshot.get(name, 0)
@@ -604,9 +732,6 @@ def _periodic_reconciliation_lines(snapshot: dict[str, object]) -> list[str]:
         "# HELP gpu_fault_processor_expired_leases_reclaimed_total LEASED processor requests whose lease had lapsed and were handed back to PENDING by the periodic reclaim (F-D5).",
         "# TYPE gpu_fault_processor_expired_leases_reclaimed_total counter",
         f"gpu_fault_processor_expired_leases_reclaimed_total {read('processor_expired_leases_reclaimed_total')}",
-        "# HELP gpu_fault_completion_pending_triage_reconciled_total Decisions stuck in PENDING_TRIAGE past the deadline that the watchdog closed (F-G2).",
-        "# TYPE gpu_fault_completion_pending_triage_reconciled_total counter",
-        f"gpu_fault_completion_pending_triage_reconciled_total {read('completion_pending_triage_reconciled_total')}",
         "# HELP gpu_fault_processor_counter_drift_abs Absolute gap between incomplete processor queue rows and the per-cluster counter table, as of the last drift scan (F-D10).",
         "# TYPE gpu_fault_processor_counter_drift_abs gauge",
         f"gpu_fault_processor_counter_drift_abs {read('processor_counter_drift_abs')}",
@@ -652,8 +777,7 @@ def _processor_counter_mode_lines(store: object) -> list[str]:
 def completion_state_metric_lines(runtime: AppRuntime) -> list[str]:
     """Where the completion path and the incidents stand, as gauges (F-L1).
 
-    A decision that stays PENDING_TRIAGE is a triage that never reported; a
-    terminal event without a decision is the poisoned shape of P0-48B; the
+    A terminal event without a decision is the poisoned shape of P0-48B; the
     ESCALATED incident bucket is the operator queue; a CRITICAL GPU finding
     closed without an incident is the one deliberate exception of F-M1.
     Each is a server-side count, never a decode of the rows.
@@ -738,6 +862,15 @@ def postgres_pool_metric_lines(runtime: AppRuntime) -> list[str]:
             f"gpu_fault_postgres_unpooled_connections {estimate.unpooled_connections}",
         ]
     )
+    headroom = getattr(estimate, "headroom", None)
+    if isinstance(headroom, int):
+        lines.extend(
+            [
+                "# HELP gpu_fault_postgres_pool_headroom_connections Pool ceiling minus the estimated connection demand; negative means the role's threads outnumber its pool (control-plane review 2026-09-08, A-5).",
+                "# TYPE gpu_fault_postgres_pool_headroom_connections gauge",
+                f"gpu_fault_postgres_pool_headroom_connections {headroom}",
+            ]
+        )
     return lines
 
 
@@ -980,6 +1113,42 @@ def _remediation_budget_lines(
     return lines
 
 
+def _orphan_inspection_counts(
+    runtime: AppRuntime, cache: MetricScanCache
+) -> tuple[int, int]:
+    """The orphan inspection (F-B3 (4)): bounded server-side reads.
+
+    A PENDING record younger than the aggregation window plus the processor
+    drain wait is still normal churn, so those are excluded before counting.
+    Both inspections walk a whole kind (the missing-workflow anti-join read
+    every incident on every scrape, G-2), so they are shared across scrapes
+    for the scan cache's TTL rather than re-run per scrape per process.
+    """
+
+    store = runtime.context.store
+    orchestrator = runtime.context.orchestrator
+    orphan_grace = timedelta(
+        seconds=orchestrator.multi_node_aggregation_window_max_seconds
+        + orchestrator.processor_drain_max_wait_seconds
+    )
+    orphans = cache.shared(
+        "orphan_workflows",
+        lambda: len(
+            store.list_orphan_workflows(
+                created_before=datetime.now(timezone.utc) - orphan_grace,
+                limit=ORPHAN_INSPECTION_LIMIT,
+            )
+        ),
+    )
+    dangling = cache.shared(
+        "dangling_incident_pointers",
+        lambda: len(
+            store.list_incidents_with_missing_workflow(limit=ORPHAN_INSPECTION_LIMIT)
+        ),
+    )
+    return orphans, dangling
+
+
 def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     store = runtime.context.store
     scan = metric_scan_cache(runtime).workflows()
@@ -993,22 +1162,9 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     # the status gauge counts every workflow ever persisted, so its BLOCKED
     # bucket never falls just because the node came back.
     blocked_unreconciled = store.blocked_workflows_without_verified_restore()
-    # The orphan inspection (F-B3 (4)): bounded server-side reads. A PENDING
-    # record younger than the aggregation window plus the processor drain wait
-    # is still normal churn, so those are excluded before counting.
-    orchestrator = runtime.context.orchestrator
-    orphan_grace = timedelta(
-        seconds=orchestrator.multi_node_aggregation_window_max_seconds
-        + orchestrator.processor_drain_max_wait_seconds
-    )
-    orphan_workflows = len(
-        store.list_orphan_workflows(
-            created_before=datetime.now(timezone.utc) - orphan_grace,
-            limit=ORPHAN_INSPECTION_LIMIT,
-        )
-    )
-    dangling_incident_pointers = len(
-        store.list_incidents_with_missing_workflow(limit=ORPHAN_INSPECTION_LIMIT)
+    cache = metric_scan_cache(runtime)
+    orphan_workflows, dangling_incident_pointers = _orphan_inspection_counts(
+        runtime, cache
     )
     step_statuses: Counter[tuple[str, str]] = Counter()
     terminal_durations: dict[str, list[float]] = defaultdict(list)
@@ -1177,11 +1333,11 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         )
     )
 
-    lines.extend(_notification_lines(store))
+    lines.extend(_notification_lines(store, cache))
 
     stale_agents = sum(
         1
-        for agent in metric_scan_cache(runtime).agents()
+        for agent in cache.agents()
         if getattr(agent.lifecycle_state, "value", agent.lifecycle_state) == "ACTIVE"
         and not agent_is_current(agent, observed_at=now)
     )
@@ -1195,17 +1351,20 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     return lines
 
 
-def _notification_lines(store: ControlPlaneStore) -> list[str]:
+def _notification_lines(store: ControlPlaneStore, cache: MetricScanCache) -> list[str]:
     """Render the business notification families from the Store aggregate.
 
     Read from ``notification_status_counts`` rather than the workflow detail
     scan, so the outbox depth stays exact on a table larger than the scan
-    budget.
+    budget. Both aggregates are whole-kind LEFT JOIN GROUP BYs over kinds with
+    no retention (F-6), so they are shared across scrapes for the cache TTL.
     """
 
     statuses = {
         status.value: count
-        for status, count in store.notification_status_counts().items()
+        for status, count in cache.shared(
+            "notification_status_counts", store.notification_status_counts
+        ).items()
     }
     lines = [
         "# HELP gpu_fault_notification_total Persisted business notifications by delivery result.",
@@ -1234,7 +1393,9 @@ def _notification_lines(store: ControlPlaneStore) -> list[str]:
     # reads the result rows, which are terminal verdicts; a notification being
     # retried has none, so the queue the dispatcher is actually working was
     # invisible and its age unmeasured.
-    delivery = store.notification_delivery_stats()
+    delivery = cache.shared(
+        "notification_delivery_stats", store.notification_delivery_stats
+    )
     lines.extend(
         [
             "# HELP gpu_fault_notification_delivery_total Notification outbox rows by delivery state as the outbox treats them: a row whose result is already SENT counts as SENT, a SKIPPED verdict on an undelivered row counts as DEAD (ARCH-E E1).",

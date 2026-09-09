@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 
 def metrics_label_value(value: str) -> str:
@@ -614,6 +615,7 @@ def render_runtime_metrics_two(
     processor_queue_bypass_enabled,
     processor_queue_bypass_paths,
     processor_queue_bypasses_by_path,
+    scan_cache=None,
 ):
     for path in sorted(processor_queue_bypass_paths):
         escaped_path = path.replace("\\", "\\\\").replace('"', '\\"')
@@ -627,21 +629,29 @@ def render_runtime_metrics_two(
         f"{1 if processor_queue_bypass_enabled else 0}"
     )
     # Same reasoning: emitted in both arms so the diff has a baseline.
-    # The depth is only read from the store when the spool is on -
-    # a scrape should not pay for a table nothing is writing to.
-    spool = (
-        ctx.store.telemetry_spool_stats()
-        if telemetry_spool_enabled
-        else {
-            "depth": 0,
-            "leased": 0,
-            "oldest_age_seconds": 0.0,
-            "by_cluster": {},
-            "payload_bytes": 0,
-            "leased_bytes": 0,
-        }
-    )
-    return spool
+    #
+    # The depth is the table's, whether or not this role admits to the spool
+    # (E-1). The drain gate that scales the spool worker to zero reads
+    # ``gpu_fault_telemetry_spool_depth`` from the ingress Pods, which by then
+    # have already been rolled to GPU_FAULT_TELEMETRY_SPOOL=false; a constant
+    # 0 here made the gate pass on its first poll and abandoned every row
+    # still in the table. With the spool off nothing writes the table, so the
+    # read is shared for the scan cache's TTL (G-12) rather than run per
+    # scrape; with it on, the owning role reads live as before.
+    empty = {
+        "depth": 0,
+        "leased": 0,
+        "oldest_age_seconds": 0.0,
+        "by_cluster": {},
+        "payload_bytes": 0,
+        "leased_bytes": 0,
+    }
+    stats = getattr(ctx.store, "telemetry_spool_stats", None)
+    if not callable(stats):
+        return empty
+    if telemetry_spool_enabled or scan_cache is None:
+        return stats()
+    return scan_cache.shared("telemetry_spool_stats", stats)
 
 
 def render_spool_metrics_one(
@@ -831,6 +841,12 @@ def render_spool_metrics_two(
             "# TYPE gpu_fault_telemetry_spool_dropped_total counter",
             "gpu_fault_telemetry_spool_dropped_total "
             f"{spool_runtime.get('dropped', 0)}",
+            "# HELP gpu_fault_telemetry_spool_stale_completed_total "
+            "Spooled samples completed without replay because they were "
+            "already stale when claimed (control-plane review 2026-09-08, E-7).",
+            "# TYPE gpu_fault_telemetry_spool_stale_completed_total counter",
+            "gpu_fault_telemetry_spool_stale_completed_total "
+            f"{spool_runtime.get('stale_completed', 0)}",
             "# HELP gpu_fault_telemetry_spool_errors_total "
             "Replay batches that raised an internal exception.",
             "# TYPE gpu_fault_telemetry_spool_errors_total counter",
@@ -964,7 +980,163 @@ def render_capacity_metrics(lines: list[str]) -> None:
     )
 
 
-def render_pool_metrics(lines, pool_metrics, runtime):
+# psycopg_pool.get_stats() and StoreCredentials counters, as
+# ``PooledPostgresDatabase.metrics_snapshot`` names them (G-7 / CP-3). Rendered
+# only when the snapshot carries the key, so a SQLite or memory store publishes
+# none of them rather than a fabricated zero. Per process: which Pod is losing
+# pool slots is the point, so the alerts on these carry ``pod``.
+_POOL_STAT_FAMILIES = (
+    (
+        "pool_size",
+        "gpu_fault_postgres_pool_size",
+        "gauge",
+        "Connections the pool currently holds, idle or checked out (psycopg_pool get_stats pool_size).",
+    ),
+    (
+        "pool_available",
+        "gpu_fault_postgres_pool_available",
+        "gauge",
+        "Idle pooled connections ready for checkout (get_stats pool_available).",
+    ),
+    (
+        "requests_waiting",
+        "gpu_fault_postgres_pool_requests_waiting",
+        "gauge",
+        "Callers blocked on checkout right now because every pooled connection is in use (get_stats requests_waiting).",
+    ),
+    (
+        "requests_errors_total",
+        "gpu_fault_postgres_pool_requests_errors_total",
+        "counter",
+        "Checkouts that failed, typically PoolTimeout after the pool timeout (get_stats requests_errors).",
+    ),
+    (
+        "connections_errors_total",
+        "gpu_fault_postgres_pool_connections_errors_total",
+        "counter",
+        "Attempts to open a pooled connection that failed; rises when the server refuses the credentials after a password rotation or during a failover (get_stats connections_errors).",
+    ),
+    (
+        "connections_lost_total",
+        "gpu_fault_postgres_pool_connections_lost_total",
+        "counter",
+        "Pooled connections found broken and discarded (get_stats connections_lost).",
+    ),
+    (
+        "credential_source_file",
+        "gpu_fault_postgres_credential_source_file",
+        "gauge",
+        "1 when the pool reads its DSN from the mounted Secret file, 0 when it still uses the start-up environment value (CP-3).",
+    ),
+    (
+        "credential_rotations_total",
+        "gpu_fault_postgres_credential_rotations_total",
+        "counter",
+        "Times the mounted Secret file carried a different DSN than the pool was using (CP-3).",
+    ),
+    (
+        "credential_read_failures_total",
+        "gpu_fault_postgres_credential_read_failures_total",
+        "counter",
+        "Attempts to read the mounted Secret file that found it missing or empty (CP-3).",
+    ),
+    (
+        "credential_authentication_failures_total",
+        "gpu_fault_postgres_credential_authentication_failures_total",
+        "counter",
+        "Handshakes the server refused for bad credentials; each triggers a re-read of the Secret file (CP-3).",
+    ),
+    (
+        "credential_reconnect_failures_total",
+        "gpu_fault_postgres_credential_reconnect_failures_total",
+        "counter",
+        "Pool slots given up after reconnect_timeout; each triggers a re-read of the Secret file and a pool check (CP-3).",
+    ),
+)
+
+
+# ``processor.metrics_snapshot()["consumer"]`` (control-plane review 2026-09-08,
+# B-6): the queue consumer loop had no liveness signal of its own, so a process
+# whose loop had died or wedged kept reporting healthy. Per replica.
+_CONSUMER_FAMILIES = (
+    (
+        "running",
+        "gpu_fault_processor_consumer_running",
+        "gauge",
+        "1 while this replica's processor consumer loop thread is alive (B-6).",
+        "{value}",
+    ),
+    (
+        "last_cycle_age_seconds",
+        "gpu_fault_processor_consumer_last_cycle_age_seconds",
+        "gauge",
+        "Seconds since this replica's consumer loop started its latest cycle; -1 before the first cycle (B-6).",
+        "{value:.3f}",
+    ),
+    (
+        "cycle_errors",
+        "gpu_fault_processor_consumer_cycle_errors_total",
+        "counter",
+        "Consumer loop cycles that raised in their notification/deadline/reaping half and were skipped rather than killing the thread (B-6).",
+        "{value}",
+    ),
+    (
+        "cycles",
+        "gpu_fault_processor_consumer_cycles_total",
+        "counter",
+        "Consumer loop cycles this replica has run (B-6).",
+        "{value}",
+    ),
+)
+
+
+def _render_consumer_metrics(lines: list[str], runtime: object) -> None:
+    consumer = runtime.get("consumer") if isinstance(runtime, dict) else None
+    if not isinstance(consumer, dict):
+        return
+    for key, name, kind, help_text, fmt in _CONSUMER_FAMILIES:
+        value = consumer.get(key)
+        if value is None:
+            continue
+        lines.extend(
+            [
+                f"# HELP {name} {help_text}",
+                f"# TYPE {name} {kind}",
+                f"{name} {fmt.format(value=value)}",
+            ]
+        )
+
+
+def _render_decode_rejections(lines: list[str], app_runtime: object) -> None:
+    """``AdmissionRuntime.decode_rejections`` (E-3): bodies refused at decode
+    for a reason the sinks treat as terminal, by reason. The factory hands the
+    same dict to the middlewares and (once wired) to the runtime; absent means
+    this build does not carry it and nothing is rendered."""
+
+    rejections = getattr(app_runtime, "decode_rejections", None)
+    if not isinstance(rejections, dict):
+        return
+    lines.extend(
+        [
+            "# HELP gpu_fault_ingress_decode_rejections_total Request bodies rejected at decode with 422 by reason; 'nul' is a JSON \\u0000 escape jsonb cannot store, which the sinks treat as terminal (control-plane review 2026-09-08, E-3).",
+            "# TYPE gpu_fault_ingress_decode_rejections_total counter",
+        ]
+    )
+    for reason, count in sorted(rejections.items()):
+        escaped = str(reason).replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(
+            f'gpu_fault_ingress_decode_rejections_total{{reason="{escaped}"}} {int(count)}'
+        )
+
+
+def render_pool_metrics(
+    lines: list[str],
+    pool_metrics: dict[str, Any],
+    runtime: Any,
+    app_runtime: object | None = None,
+) -> None:
+    _render_consumer_metrics(lines, runtime)
+    _render_decode_rejections(lines, app_runtime)
     lines.extend(
         [
             "# HELP gpu_fault_postgres_pool_checkout_wait_seconds "
@@ -978,6 +1150,17 @@ def render_pool_metrics(lines, pool_metrics, runtime):
             f"{pool_metrics['checkout_max_seconds']:.6f}",
         ]
     )
+    for key, name, kind, help_text in _POOL_STAT_FAMILIES:
+        value = pool_metrics.get(key)
+        if value is None:
+            continue
+        lines.extend(
+            [
+                f"# HELP {name} {help_text}",
+                f"# TYPE {name} {kind}",
+                f"{name} {int(value)}",
+            ]
+        )
     for outcome, count in runtime["processed"].items():
         lines.append(
             "gpu_fault_processor_requests_processed_total"

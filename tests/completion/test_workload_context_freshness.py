@@ -68,6 +68,15 @@ def test_a_store_without_coverage_heartbeats_resolves_unknown() -> None:
         def list_attempt_observations(self, _cluster_id: str) -> list:
             return []
 
+        def list_attempt_observation_states(
+            self,
+            _cluster_id: str | None = None,
+            *,
+            limit: int | None = None,
+            newest_first: bool = False,
+        ) -> list:
+            return []
+
     context = _topology(ObservationOnlyStore()).resolve(CLUSTER, "node-1", NOW)
 
     assert context.workload_state == "UNKNOWN", (
@@ -315,6 +324,15 @@ def test_a_stored_heartbeat_with_a_naive_stamp_reads_as_no_coverage(caplog) -> N
         def list_attempt_observations(self, _cluster_id: str) -> list:
             return []
 
+        def list_attempt_observation_states(
+            self,
+            _cluster_id: str | None = None,
+            *,
+            limit: int | None = None,
+            newest_first: bool = False,
+        ) -> list:
+            return []
+
         def get_workload_coverage_heartbeat(self, cluster_id: str):
             # model_construct: exactly what a payload written before the model
             # required a timezone deserialises to.
@@ -363,6 +381,15 @@ def test_a_row_that_goes_bad_again_is_reported_again(caplog) -> None:
             self.heartbeat = bad
 
         def list_attempt_observations(self, _cluster_id: str) -> list:
+            return []
+
+        def list_attempt_observation_states(
+            self,
+            _cluster_id: str | None = None,
+            *,
+            limit: int | None = None,
+            newest_first: bool = False,
+        ) -> list:
             return []
 
         def get_workload_coverage_heartbeat(self, _cluster_id: str):
@@ -414,3 +441,78 @@ def test_a_heartbeat_behind_the_stored_row_is_counted_and_reported(caplog) -> No
         f"look like, so it is counted: {topology.coverage_heartbeats_rejected_total}"
     )
     assert "refused a coverage heartbeat" in caplog.text, caplog.text
+
+
+# --- coverage heartbeat, the control-plane review's cases (c152aef) ------------
+#
+# The 2026-09-08 control-plane review added the same heartbeat independently,
+# with a model that carried ``scanned_at`` / ``attempt_count`` and read *any*
+# fresh heartbeat as coverage. Its cases are kept here on the data-plane
+# review's model; the one whose premise differs is reconciled below and says so.
+
+
+def test_a_fresh_coverage_heartbeat_makes_an_unobserved_node_idle() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=30)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "IDLE", (
+        "the watcher scanned the cluster and found nothing: the node is idle"
+    )
+    assert context.attempt_ids == []
+
+
+def test_a_stale_coverage_heartbeat_leaves_the_node_unknown() -> None:
+    store = build_store()
+    topology = _topology(store, freshness_seconds=600)
+    topology.observe_coverage(_heartbeat(observed_at=NOW - timedelta(seconds=601)))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", (
+        "a heartbeat older than the freshness window is a dead watcher"
+    )
+
+
+def test_a_coverage_heartbeat_never_makes_a_node_active() -> None:
+    """A heartbeat names no node and no job, so it can never answer ACTIVE.
+
+    The control-plane review's version of this case expected IDLE for a
+    heartbeat that saw three attempts running. The data-plane review decided
+    otherwise (``test_a_heartbeat_that_saw_workload_running_is_not_coverage``):
+    a pass that saw workload the resolver cannot see means the observation feed
+    is lossy, and IDLE would let a plan reboot a training node without a
+    checkpoint. So the answer is UNKNOWN -- still never ACTIVE, and still
+    without a job or attempt the heartbeat cannot know about.
+    """
+
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW, watched_attempts=3))
+
+    context = topology.resolve(CLUSTER, "node-1", NOW)
+
+    assert context.workload_state == "UNKNOWN", context
+    assert context.job_ids == []
+    assert context.attempt_ids == []
+
+
+def test_an_older_heartbeat_does_not_overwrite_a_newer_one() -> None:
+    store = build_store()
+    newer = _heartbeat(observed_at=NOW)
+    older = _heartbeat(observed_at=NOW - timedelta(seconds=45))
+
+    assert store.save_workload_coverage_heartbeat(newer) is True
+    assert store.save_workload_coverage_heartbeat(older) is False
+    assert store.get_workload_coverage_heartbeat(CLUSTER) == newer
+
+
+def test_coverage_is_per_cluster() -> None:
+    store = build_store()
+    topology = _topology(store)
+    topology.observe_coverage(_heartbeat(observed_at=NOW))
+
+    assert topology.resolve("cluster-b", "node-1", NOW).workload_state == "UNKNOWN"
+    assert store.get_workload_coverage_heartbeat("cluster-b") is None

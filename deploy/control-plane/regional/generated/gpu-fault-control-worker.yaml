@@ -258,6 +258,9 @@ spec:
         - mountPath: /etc/gpu-fault/rds
           name: rds-ca-bundle
           readOnly: true
+        - mountPath: /etc/gpu-fault/aurora
+          name: aurora-credentials
+          readOnly: true
         envFrom:
         - configMapRef:
             name: gpu-fault-control-worker-config-core
@@ -309,3 +312,6 @@ spec:
       - configMap:
           name: gpu-fault-rds-ca-bundle
         name: rds-ca-bundle
+      - name: aurora-credentials
+        secret:
+          secretName: gpu-fault-aurora

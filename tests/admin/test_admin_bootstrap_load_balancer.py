@@ -64,6 +64,8 @@ class Runner:
     """Answers the read-only queries and records everything else."""
 
     dry_run = False
+    # Set per test by ``_stub_processes`` (whether IAM already has our policy).
+    policy_exists_default = False
 
     def __init__(
         self,
@@ -75,12 +77,16 @@ class Runner:
         policy_tags: list[dict[str, str]] | None = None,
         attached: Sequence[str] = (),
         policy_bytes: bytes = POLICY_BYTES,
+        policy_exists: bool | None = None,
     ) -> None:
         self.deployments = deployments or []
         self.deployment_error = deployment_error
         self.chart_version = chart_version
         self.values = values if values is not None else _values()
         self.policy_tags = policy_tags if policy_tags is not None else []
+        self.policy_exists = (
+            policy_exists if policy_exists is not None else self.policy_exists_default
+        )
         self.attached = tuple(attached)
         self.policy_bytes = policy_bytes
         self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
@@ -102,14 +108,20 @@ class Runner:
             return json.dumps({"chart": {"metadata": {"version": self.chart_version}}})
         if command[0] == "helm" and "values" in command:
             return json.dumps(self.values)
-        if "list-policy-tags" in command:
-            return json.dumps({"Tags": self.policy_tags})
         return ""
 
     def aws_json(self, _region: str, *arguments: str, **_keywords: Any) -> Any:
         self.calls.append((("aws", *arguments), {}))
         if "list-attached-role-policies" in arguments:
             return {"AttachedPolicies": [{"PolicyArn": arn} for arn in self.attached]}
+        if "get-policy" in arguments:
+            if not self.policy_exists:
+                raise BootstrapError(
+                    "command failed (254): aws: An error occurred (NoSuchEntity) "
+                    "when calling the GetPolicy operation: Policy not found"
+                )
+            # The policy read carries its tags: one call decides ownership too.
+            return {"Policy": {"Arn": POLICY_ARN, "Tags": list(self.policy_tags)}}
         return {}
 
     def commands(self) -> list[tuple[str, ...]]:
@@ -156,14 +168,19 @@ def _stub_collaborators(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_processes(
     monkeypatch: pytest.MonkeyPatch, *, helm: tuple[int, str], policy_exists: bool
 ) -> None:
+    """Helm is the one probe still answered at the process boundary; the IAM
+    policy is read through the runner, so ``policy_exists`` is handed to the
+    next ``Runner`` built by the test through the module default below."""
+
     returncode, stderr = helm
 
     def run(arguments: Sequence[str], **_keywords: Any) -> SimpleNamespace:
         if arguments[0] == "helm":
             return SimpleNamespace(returncode=returncode, stderr=stderr)
-        return SimpleNamespace(returncode=0 if policy_exists else 254, stderr="")
+        raise AssertionError(f"a read bypassed the runner: {list(arguments)}")
 
     monkeypatch.setattr(lbc.subprocess, "run", run)
+    monkeypatch.setattr(Runner, "policy_exists_default", policy_exists)
 
 
 def _ensure(runner: Runner, tmp_path: Path) -> dict[str, Any]:

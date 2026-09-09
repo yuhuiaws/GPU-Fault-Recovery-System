@@ -176,17 +176,44 @@ def test_control_plane_roles_and_adot_have_disruption_protection() -> None:
         item for item in adot_documents if item.get("kind") == "PodDisruptionBudget"
     )
 
+    # Four uvicorn processes per Pod on the ingress and worker tiers; the
+    # Pod's /metrics is aggregated over them by the application, so the
+    # shape is a capacity model, not a scrape concern.
     assert ingress["spec"]["replicas"] == 3, "ingress HA requires three replicas"
+    assert container(ingress)["resources"] == {
+        "requests": {"cpu": "4", "memory": "4Gi"},
+        "limits": {"cpu": "8", "memory": "8Gi"},
+    }
+    assert ingress["spec"]["strategy"]["rollingUpdate"] == {
+        "maxUnavailable": 1,
+        "maxSurge": 1,
+    }
     assert ingress_pdb["spec"]["minAvailable"] == 2, "ingress PDB lost quorum"
     assert ingress_pdb["spec"]["selector"]["matchLabels"] == {
         "app": "gpu-fault-api-ha"
     }, "ingress PDB selects the wrong pods"
     assert worker["spec"]["replicas"] == 6
+    assert container(worker)["resources"] == {
+        "requests": {"cpu": "3", "memory": "4Gi"},
+        "limits": {"cpu": "4", "memory": "6Gi"},
+    }
+    assert worker["spec"]["strategy"]["rollingUpdate"] == {
+        "maxUnavailable": 1,
+        "maxSurge": 1,
+    }
     assert worker_pdb["spec"]["maxUnavailable"] == 1
     assert worker_pdb["spec"]["selector"]["matchLabels"] == {
         "app": "gpu-fault-control-worker"
     }
+    for role, workers in ((ingress, 4), (worker, 4), (spool, 1)):
+        command = container(role)["args"][0]
+        assert command.count("--workers ") == 1, role["metadata"]["name"]
+        assert f"--workers {workers} " in command, role["metadata"]["name"]
     assert spool["spec"]["replicas"] == 0
+    assert spool["spec"]["strategy"]["rollingUpdate"] == {
+        "maxUnavailable": 1,
+        "maxSurge": 1,
+    }
     assert container(spool)["resources"] == {
         "requests": {"cpu": "1", "memory": "2Gi"},
         "limits": {"cpu": "4", "memory": "4Gi"},
@@ -446,7 +473,7 @@ def test_regional_restart_covers_every_running_role_in_order() -> None:
     ingress = script.index("gpu-fault-api-ha")
     assert spool < worker < ingress
     assert "replicas == 0" in script
-    assert "verify-control-plane-role-split.sh" in script
+    assert "verify_control_plane_role_split.py" in script
     assert "set KUBECONFIG" in script
 
 

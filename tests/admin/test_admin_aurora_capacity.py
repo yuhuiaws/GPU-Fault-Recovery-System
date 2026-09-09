@@ -430,27 +430,6 @@ def test_reconcile_without_a_reviewed_expectation_accepts_the_live_window() -> N
     assert mutations == ["modify-db-cluster"]
 
 
-def test_reconcile_can_leave_the_settle_wait_to_a_dry_run_caller() -> None:
-    """A dry run holds the modify back, so waiting for it would wait forever."""
-
-    rds = FakeRds(0.5, 8.0)
-
-    result = aurora.reconcile_aurora_capacity(
-        aws_region="us-east-1",
-        cluster_id="aurora-a",
-        desired=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0),
-        timeout_seconds=5,
-        poll_seconds=0,
-        aws_json=rds,
-        wait_for_settle=False,
-    )
-
-    operations = rds.operations()
-    assert result["modified"] is True
-    assert operations.count("modify-db-cluster") == 1
-    assert operations[operations.index("modify-db-cluster") + 1 :] == []
-
-
 def test_the_module_cli_reconciles_and_prints_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -554,3 +533,51 @@ def test_the_module_cli_reports_a_rejected_window_without_a_traceback(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "0.5 ACU increments" in captured.err
+
+
+def test_request_settles_the_window_and_leaves_the_acu_ramp_to_await() -> None:
+    """The administrator command rolls the roles between the two halves.
+
+    ``request`` must hand back a cluster the release preflight accepts --
+    ``available`` on the new window -- without spending the scale-up's slow
+    part, the ``ServerlessDatabaseCapacity`` ramp; that metric is read only by
+    ``await``, after the roles have rolled.
+    """
+
+    rds = FakeRds(0.5, 8.0)
+    desired = AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
+
+    requested = aurora.request_aurora_capacity(
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        desired=desired,
+        timeout_seconds=5,
+        poll_seconds=0,
+        aws_json=rds,
+    )
+
+    operations = rds.operations()
+    assert requested["modified"] is True
+    assert requested["scale_up"] is True
+    assert (requested["after"]["min_acu"], requested["after"]["max_acu"]) == (8.0, 32.0)
+    assert operations.count("modify-db-cluster") == 1
+    assert "get-metric-statistics" not in operations, (
+        "request waited for the ACU ramp instead of leaving it to await"
+    )
+    polls_after_modify = operations[operations.index("modify-db-cluster") + 1 :]
+    assert polls_after_modify.count("describe-db-clusters") == (
+        aurora.CAPACITY_SETTLE_STABLE_POLLS
+    )
+
+    settled = aurora.await_aurora_capacity(
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        desired=desired,
+        modified=True,
+        timeout_seconds=5,
+        poll_seconds=0,
+        aws_json=rds,
+    )
+
+    assert "get-metric-statistics" in rds.operations()
+    assert {item["actual_acu"] for item in settled["instances"]} == {8.0}

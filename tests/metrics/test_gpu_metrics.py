@@ -941,6 +941,8 @@ def test_gpu_metrics_endpoint_bridges_xid94_to_policy() -> None:
 
 
 def test_non_xid_gpu_finding_creates_site_safety_workflow() -> None:
+    """The DRAIN chain now ends in ESCALATE_SUPPORT: the node stays held, so
+    the operator hand-off is an explicit step (logic item 8)."""
     context = build_context()
 
     async def scenario() -> None:
@@ -967,6 +969,7 @@ def test_non_xid_gpu_finding_creates_site_safety_workflow() -> None:
             "QUARANTINE",
             "COLLECT_DIAGNOSTIC_BUNDLE",
             "VALIDATE_GPU",
+            "ESCALATE_SUPPORT",
         ]
         assert statuses.status_code == 200
         assert statuses.json()[0]["collector"] == "GPU_METRICS"
@@ -1008,6 +1011,8 @@ def test_composite_finding_suppresses_duplicate_component_workflows() -> None:
 
 
 def test_row_remap_failure_preserves_nvidia_policy_provenance() -> None:
+    """The chain now ends in ESCALATE_SUPPORT: an RMA-class DRAIN keeps the
+    node held, so the operator hand-off must be explicit (logic item 8)."""
     context = build_context()
 
     async def scenario() -> None:
@@ -1039,6 +1044,7 @@ def test_row_remap_failure_preserves_nvidia_policy_provenance() -> None:
             "COLLECT_DIAGNOSTIC_BUNDLE",
             "RUN_FIELD_DIAGNOSTIC",
             "VALIDATE_GPU",
+            "ESCALATE_SUPPORT",
         ]
 
     asyncio.run(scenario())

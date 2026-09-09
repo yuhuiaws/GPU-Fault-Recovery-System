@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
 from gpu_fault.release_state_snapshot import (
@@ -20,6 +21,43 @@ from gpu_fault.release_state_snapshot import (
 REGIONAL_RELEASE_STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 CPU_INGRESS_APP = "gpu-fault-control-plane-ingress"
 VERIFICATION_MAX_AGE_SECONDS = 900
+
+
+class JoinVerificationExpired(BootstrapError):
+    """The ``VERIFIED`` evidence is older than the window.
+
+    The data plane the join rolled out is still healthy; the right answer is to
+    verify it again, not to roll it back. Callers clear the step and re-verify.
+    """
+
+
+def verification_is_stale(
+    evidence: dict[str, Any],
+    now: datetime | None = None,
+) -> bool:
+    try:
+        verified_at = datetime.fromisoformat(str(evidence["verified_at"]))
+    except (KeyError, ValueError):
+        return True
+    if verified_at.tzinfo is None:
+        return True
+    age = ((now or datetime.now(timezone.utc)) - verified_at).total_seconds()
+    return age < -60 or age > VERIFICATION_MAX_AGE_SECONDS
+
+
+def clear_verified_step(state_path: Path, state: dict[str, Any]) -> None:
+    """Forget a stale ``VERIFIED`` step so the next verify records fresh evidence."""
+
+    state["completed_steps"] = [
+        step for step in state.get("completed_steps") or [] if step != "VERIFIED"
+    ]
+    evidence = state.get("evidence")
+    if isinstance(evidence, dict):
+        evidence.pop("VERIFIED", None)
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json_atomic(state_path, state)
+
+
 REGISTRY_STATUS_CLIENT = r"""
 import json
 import os
@@ -299,7 +337,15 @@ def validate_verified_membership(
     candidate_site: RenderedSite,
     cluster_id: str,
     now: datetime | None = None,
-) -> dict[str, Any]:
+) -> None:
+    """Check the recorded evidence against the transaction, without a live read.
+
+    The verify itself brackets the rollout with two runtime snapshots and the
+    final step records a third after activation; between them the site lock keeps
+    every other mutation out, so this gate only has to prove that the files and
+    identities the evidence was built from are still the ones being committed.
+    """
+
     cluster_id = _require_cluster_id(cluster_id)
     if evidence.get("cluster_id") != cluster_id:
         raise BootstrapError("join verification evidence cluster identity drifted")
@@ -318,43 +364,6 @@ def validate_verified_membership(
         or site_non_membership_sha256(current_site.source) != expected_non_membership
     ):
         raise BootstrapError("join source site non-membership fields drifted")
-
-    try:
-        verified_at = datetime.fromisoformat(str(evidence["verified_at"]))
-    except (KeyError, ValueError) as exc:
-        raise BootstrapError("join verification timestamp is invalid") from exc
-    if verified_at.tzinfo is None:
-        raise BootstrapError("join verification timestamp has no timezone")
-    observed = now or datetime.now(timezone.utc)
-    age = (observed - verified_at).total_seconds()
-    if age < -60 or age > VERIFICATION_MAX_AGE_SECONDS:
-        raise BootstrapError("join verification evidence expired")
-
-    current = membership_runtime_snapshot(current_site)
-    if current["live_release_identity_sha256"] != evidence.get(
-        "live_release_identity_sha256"
-    ):
-        raise BootstrapError("live release identity drifted after join verification")
-    baseline_states = {
-        str(key): str(value)
-        for key, value in _mapping(
-            evidence.get("registry_cluster_states") or {},
-            "verified registry cluster states",
-        ).items()
-    }
-    current_states = {
-        str(key): str(value)
-        for key, value in _mapping(
-            current.get("registry_cluster_states") or {},
-            "current registry cluster states",
-        ).items()
-    }
-    if set(current_states) != set(baseline_states):
-        raise BootstrapError("regional registry membership drifted after verification")
-    if current_states.get(cluster_id) != "PENDING":
-        raise BootstrapError(
-            f"joined cluster {cluster_id} crossed the activation boundary unexpectedly"
-        )
     candidate_ids = {
         str(value) for value in evidence.get("candidate_cluster_ids") or []
     }
@@ -363,48 +372,8 @@ def validate_verified_membership(
     }
     if candidate_ids != actual_candidate_ids or cluster_id not in candidate_ids:
         raise BootstrapError("join candidate cluster set drifted after verification")
-    transitions = {
-        item
-        for item, lifecycle in current_states.items()
-        if lifecycle != baseline_states[item]
-    }
-    invalid = sorted(
-        item
-        for item in transitions
-        if not (
-            item in candidate_ids
-            and baseline_states[item] == "PENDING"
-            and current_states[item] == "ACTIVE"
-        )
-    )
-    if invalid:
-        raise BootstrapError(
-            "regional registry lifecycle drifted after verification: "
-            + ", ".join(invalid)
-        )
-    baseline_generation = int(evidence["registry_generation"])
-    current_generation = int(current["registry_generation"])
-    if current_generation < baseline_generation:
-        raise BootstrapError("regional registry generation moved backwards")
-    if current_generation == baseline_generation and current[
-        "registry_content_sha256"
-    ] != evidence.get("registry_content_sha256"):
-        raise BootstrapError("regional registry content drifted without a generation")
-    transaction_progressed = any(
-        step in set(state.get("completed_steps") or [])
-        for step in ("SITE_UPDATED", "RELEASE_STATE_UPDATED", "REGISTRY_UPDATED")
-    )
-    if (
-        not transitions
-        and not transaction_progressed
-        and (
-            current_generation != baseline_generation
-            or current["live_release_state_sha256"]
-            != evidence.get("live_release_state_sha256")
-        )
-    ):
-        raise BootstrapError("membership state drifted after join verification")
-    return current
+    if verification_is_stale(evidence, now):
+        raise JoinVerificationExpired("join verification evidence expired")
 
 
 def final_membership_identity(

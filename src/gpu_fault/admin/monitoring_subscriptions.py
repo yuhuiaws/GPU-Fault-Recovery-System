@@ -286,9 +286,18 @@ def ensure_monitoring_subscriptions(
     cpu: ClusterIdentity,
     topic_arn: str,
     topic_generation: str,
-    queue_arn: str,
     alert_email: str | None,
-) -> tuple[str, str, dict[str, Any] | None]:
+) -> dict[str, Any] | None:
+    """Converge the topic's subscriptions and return the email one, if any.
+
+    The topic used to carry an SQS subscription to a per-site alerts queue as
+    well; nothing ever consumed that queue, so bootstrap no longer creates or
+    subscribes it. Legacy queues are still removed by uninstall from the
+    registry rows they left behind.
+    """
+
+    if not alert_email:
+        return None
     subscriptions = cast(
         list[dict[str, Any]],
         runner.aws_json(
@@ -299,45 +308,12 @@ def ensure_monitoring_subscriptions(
             topic_arn,
         ).get("Subscriptions", []),
     )
-    queue_subscription = next(
-        (
-            item
-            for item in subscriptions
-            if str(item.get("Protocol") or "").lower() == "sqs"
-            and item.get("Endpoint") == queue_arn
-        ),
-        None,
+    return ensure_email_subscription(
+        runner,
+        state=state,
+        cpu=cpu,
+        topic_arn=topic_arn,
+        topic_generation=topic_generation,
+        endpoint=alert_email,
+        subscriptions=subscriptions,
     )
-    if queue_subscription is None:
-        queue_subscription_arn = runner.aws_text(
-            cpu.region,
-            "sns",
-            "subscribe",
-            "--topic-arn",
-            topic_arn,
-            "--protocol",
-            "sqs",
-            "--notification-endpoint",
-            queue_arn,
-            "--query",
-            "SubscriptionArn",
-            mutate=True,
-        )
-        queue_subscription_ownership = "CREATED"
-    else:
-        queue_subscription_arn = str(queue_subscription.get("SubscriptionArn") or "")
-        queue_subscription_ownership = "CREATED"
-    email_subscription = (
-        ensure_email_subscription(
-            runner,
-            state=state,
-            cpu=cpu,
-            topic_arn=topic_arn,
-            topic_generation=topic_generation,
-            endpoint=alert_email,
-            subscriptions=subscriptions,
-        )
-        if alert_email
-        else None
-    )
-    return queue_subscription_arn, queue_subscription_ownership, email_subscription

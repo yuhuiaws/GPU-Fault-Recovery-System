@@ -24,6 +24,7 @@ from gpu_fault.store.postgres.ddl import declared_index_names
 from tests.store._postgres_processor_claim_support import (
     REQUEST_LEASE,
     _evidence,
+    _request,
     _telemetry,
     _truncate,
 )
@@ -201,3 +202,138 @@ def test_declared_indexes_include_the_claim_window_index():
     # The F-D2 twin of ``priority_claim`` is gone: two identical indexes let
     # the planner pick either, which is what made the plan assertions flap.
     assert "gpu_fault_processor_queue_claim_order" not in declared_index_names()
+
+
+def _seed_bulk_pending_paths(store: PostgresStore, count_per_path: int) -> None:
+    """Three routine paths, ``count_per_path`` PENDING rows each, so a path
+    filter has a real backlog to walk past (B-3 / G-3)."""
+
+    with store._db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO gpu_fault_processor_queue (
+                request_id, status, cluster_id, correlation_key, ordering_key,
+                priority, created_at, updated_at, payload
+            )
+            SELECT
+                'processor-' || path.tag || '-' || n,
+                'PENDING',
+                'cluster-a',
+                'node-' || path.tag || '-' || n,
+                'cluster-a/node-' || path.tag || '-' || n,
+                100,
+                now() - (n || ' seconds')::interval,
+                now(),
+                jsonb_build_object(
+                    'request_id', 'processor-' || path.tag || '-' || n,
+                    'path', path.name,
+                    'priority', 100,
+                    'status', 'PENDING'
+                )
+            FROM generate_series(1, %s) AS n
+            CROSS JOIN (
+                VALUES
+                    ('inv', '/v1/collector-events/gpu-inventory'),
+                    ('met', '/v1/collector-events/gpu-metrics'),
+                    ('host', '/v1/collector-events/host-telemetry')
+            ) AS path(tag, name)
+            """,
+            (count_per_path,),
+        )
+        cursor.execute("ANALYZE gpu_fault_processor_queue")
+
+
+@pytest.mark.parametrize(
+    "include_paths",
+    [
+        {"/v1/collector-events/gpu-inventory"},
+        {"/v1/collector-events/gpu-inventory", "/v1/collector-events/gpu-metrics"},
+    ],
+    ids=["single-path", "two-paths"],
+)
+def test_claim_window_with_include_paths_walks_the_path_index_in_order(
+    store, include_paths
+):
+    """Every dedicated pool claims with ``include_paths`` (7 of the 8
+    sub-claims per cycle). Their window must be an ordered walk of
+    ``gpu_fault_processor_queue_path_priority_claim`` per path that stops at
+    the LIMIT - not a Bitmap scan of the whole path backlog followed by a
+    top-N sort, whose cost grows with depth (B-3 / G-3)."""
+
+    _seed_bulk_pending_paths(store, 2000)
+    sql, params = store.claim_active_processor_query(
+        "pod-plan",
+        now=datetime.now(timezone.utc),
+        lease_duration=REQUEST_LEASE,
+        limit=16,
+        include_paths=include_paths,
+    )
+
+    plan = _plan(store, sql, params)
+    # The interlock subplans under candidate_ids legitimately probe the
+    # path index with an IN list; the assertions are about the window.
+    window_plan = plan.split("CTE candidate_ids")[0]
+
+    assert "Sort Key: candidate.priority" not in window_plan, plan
+    assert "Sort Key: candidate.created_at" not in window_plan, plan
+    assert "Bitmap Index Scan" not in window_plan, plan
+    assert (
+        "Index Scan using gpu_fault_processor_queue_path_priority_claim "
+        "on gpu_fault_processor_queue candidate"
+    ) in window_plan, plan
+    assert "Seq Scan on gpu_fault_processor_queue candidate" not in window_plan, plan
+    assert "= ANY (" not in window_plan, (
+        "the path filter must be an equality per sub-window, not = ANY(array)"
+    )
+    for path in include_paths:
+        assert f"(payload ->> 'path'::text) = '{path}'::text" in window_plan, plan
+
+
+def test_claim_with_include_paths_still_returns_the_oldest_rows_first(store):
+    """The per-path sub-windows must not change what is claimed: the oldest
+    routine rows of the named path, and only that path."""
+
+    now = datetime.now(timezone.utc)
+    metrics_ids: list[str] = []
+    for index in range(6):
+        created_at = now - timedelta(seconds=60 - index)
+        item = _request(
+            "/v1/collector-events/gpu-metrics",
+            body=('{"node_id":"node-met-%d","summary":true}' % index).encode(),
+        ).model_copy(update={"created_at": created_at, "updated_at": created_at})
+        store.enqueue_processor_request(item)
+        metrics_ids.append(item.request_id)
+        store.enqueue_processor_request(_evidence(f"node-host-{index}"))
+
+    claimed = store.claim_active_processor_requests(
+        "pod-order",
+        now=now,
+        lease_duration=REQUEST_LEASE,
+        limit=4,
+        include_paths={"/v1/collector-events/gpu-metrics"},
+    )
+
+    assert [item.path for item in claimed] == ["/v1/collector-events/gpu-metrics"] * 4
+    assert [item.request_id for item in claimed] == metrics_ids[:4]
+
+
+def test_claim_with_exclude_paths_keeps_the_priority_index_walk(store):
+    _seed_bulk_pending(store, 6000)
+    sql, params = store.claim_active_processor_query(
+        "pod-plan",
+        now=datetime.now(timezone.utc),
+        lease_duration=REQUEST_LEASE,
+        limit=4,
+        exclude_paths={
+            "/v1/collector-events/gpu-inventory",
+            "/v1/collector-events/gpu-metrics",
+        },
+    )
+
+    plan = _plan(store, sql, params)
+
+    assert (
+        "Index Scan using gpu_fault_processor_queue_priority_claim "
+        "on gpu_fault_processor_queue candidate"
+    ) in plan, plan
+    assert "Sort Key: candidate.priority" not in plan, plan

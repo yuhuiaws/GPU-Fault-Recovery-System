@@ -7,12 +7,14 @@ import re
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
+
+from gpu_fault.admin.command_log import child_failure
 
 ARN_PATTERN = re.compile(
     r"^arn:(?P<partition>[^:]+):(?P<service>[^:]+):"
@@ -94,22 +96,17 @@ class BootstrapRequest:
     gpu_cluster_arns: tuple[str, ...]
     repository_root: Path
     state_dir: Path
+    # SES sends from this address to this address; there is no separate sender,
+    # recipient list or subject prefix (the site.yaml fields the release engine
+    # reads are filled from it).
     alert_email: str | None = None
-    email_sender: str | None = None
-    email_recipients: tuple[str, ...] = ()
-    email_subject_prefix: str = ""
-    cosign_signing_key: Path | None = None
-    cosign_public_key: Path | None = None
-    cosign_password_file: Path | None = None
     staging_only_release: bool = False
     impact_base: str = "origin/main"
-    dry_run: bool = False
-    # Amazon Managed Grafana dashboards (``gpu_fault.admin.grafana``): on by
-    # default, an explicit workspace id is operator input, ``grafana_create``
-    # opts into creating a workspace when the region has none.
-    grafana_enabled: bool = True
+    # Amazon Managed Grafana dashboards (``gpu_fault.admin.grafana``): an
+    # explicit workspace id is operator input; ``grafana_viewer`` is the IAM
+    # Identity Center user granted VIEWER on the workspace after the import.
     grafana_workspace_id: str | None = None
-    grafana_create: bool = False
+    grafana_viewer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,8 +117,7 @@ class BootstrapResult:
 
 
 class CommandRunner:
-    def __init__(self, *, dry_run: bool = False) -> None:
-        self.dry_run = dry_run
+    def __init__(self) -> None:
         self._print_lock = threading.Lock()
 
     def run(
@@ -138,8 +134,6 @@ class CommandRunner:
         shown = "<sensitive command>" if sensitive else " ".join(arguments)
         with self._print_lock:
             print(f"+ {shown}", file=sys.stderr, flush=True)
-        if self.dry_run and mutate:
-            return ""
         completed = subprocess.run(
             list(arguments),
             input=input_text,
@@ -150,10 +144,14 @@ class CommandRunner:
             cwd=cwd,
         )
         if completed.returncode:
-            message = completed.stderr.strip() if capture else ""
-            raise BootstrapError(
-                f"command failed ({completed.returncode}): {arguments[0]}"
-                + (f": {message}" if message else "")
+            # The whole captured stderr stays in the message: callers match
+            # ``NoSuchEntity``/``NotFound`` in it to tell "absent" from "broken".
+            raise child_failure(
+                BootstrapError,
+                arguments,
+                completed.returncode,
+                detail=completed.stderr.strip() if capture else "",
+                sensitive=sensitive,
             )
         return completed.stdout.strip() if capture else ""
 
@@ -176,8 +174,6 @@ class CommandRunner:
             mutate=mutate,
             sensitive=sensitive,
         )
-        if self.dry_run and mutate and not raw:
-            return {}
         return cast(dict[str, Any], json.loads(raw))
 
     def aws_text(
@@ -203,7 +199,7 @@ class CommandRunner:
 
 class ReadOnlyProbeRunner(CommandRunner):
     def __init__(self, delegate: CommandRunner) -> None:
-        super().__init__(dry_run=delegate.dry_run)
+        super().__init__()
         self._delegate = delegate
 
     def run(
@@ -354,6 +350,23 @@ class BootstrapState:
             self.value["phase"] = value
             self._write()
 
+    def result(self, name: str) -> Any:
+        """The recorded result of a task that has already run.
+
+        For a task in a ``run_parallel`` graph, this is how it reads the result
+        of a declared dependency: the scheduler records a task before it marks
+        it complete, and starts a dependent only after both, so the value is
+        there by the time the dependent asks for it.
+        """
+
+        with self._lock:
+            try:
+                return self.value["resources"][name]
+            except KeyError:
+                raise BootstrapError(
+                    f"bootstrap task {name!r} has not recorded a result"
+                ) from None
+
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.parent.chmod(0o700)
@@ -409,15 +422,72 @@ def assert_site_tag(
     raise BootstrapError(f"{description} belongs to site {owner!r}, not {site_id!r}")
 
 
+def _task_dependencies(
+    tasks: Mapping[str, Callable[[], Any]],
+    dependencies: Mapping[str, Sequence[str]] | None,
+    *,
+    completed: set[str],
+    resources: Mapping[str, Any],
+) -> dict[str, frozenset[str]]:
+    """Each task's dependencies that this run has to wait for.
+
+    A dependency is either a task in this graph or a task an earlier run has
+    already completed and recorded -- the graph of a later phase run on its own
+    (tests, a partial rerun) still names the foundation tasks it needs, and
+    those hold by then. Anything else is a wiring error, not a runtime one.
+    """
+
+    edges: dict[str, frozenset[str]] = {}
+    for name in tasks:
+        needs = frozenset(dependencies.get(name, ()) if dependencies else ())
+        held = {
+            need for need in needs if need in completed and need in resources
+        } - set(tasks)
+        unknown = needs - set(tasks) - held
+        if unknown:
+            raise BootstrapError(
+                f"bootstrap task {name!r} depends on {sorted(unknown)!r}, which "
+                "neither this run schedules nor an earlier run completed"
+            )
+        edges[name] = needs - held
+    return edges
+
+
 def run_parallel(
     tasks: Mapping[str, Callable[[], Any]],
     *,
     state: BootstrapState,
     revalidate: frozenset[str] = frozenset(),
     probes: Mapping[str, Callable[[], Any]] | None = None,
+    dependencies: Mapping[str, Sequence[str]] | None = None,
+    on_complete: Callable[[frozenset[str]], None] | None = None,
 ) -> dict[str, Any]:
+    """Run the tasks on up to eight threads, each as soon as its dependencies hold.
+
+    ``dependencies`` names, per task, the tasks whose results it reads (through
+    ``state.result``); a task starts the moment every one of them is complete --
+    either checkpointed from an earlier run or recorded by this one -- and never
+    before. Without it the graph is flat and every task starts at once.
+
+    The checkpoint semantics are the same for every task: a completed task that
+    is not in ``revalidate`` is trusted from ``completed_tasks`` and never runs;
+    one that is in ``revalidate`` runs its read-only probe first and enters
+    ensure only when the probe raises ``BootstrapMutationRequired``.
+
+    Failure is contained, not immediate: a failed task fails the run only after
+    every task that does not depend on it has finished (their results are
+    recorded, so a rerun resumes past them), and a task whose dependency failed
+    is skipped and reported as such rather than counted as a failure of its
+    own. ``on_complete`` sees the set of complete tasks whenever it grows,
+    starting with the checkpointed set, so a caller can mark a phase the moment
+    its subset holds.
+    """
+
     completed = set(state.value["completed_tasks"])
     resources = state.value["resources"]
+    edges = _task_dependencies(
+        tasks, dependencies, completed=completed, resources=resources
+    )
     results = {
         name: resources[name]
         for name in tasks
@@ -436,35 +506,95 @@ def run_parallel(
         return ensure()
 
     pending = {
-        name: (lambda name=name, function=function: reconcile(name, function))
-        for name, function in tasks.items()
-        if name not in results
+        name: function for name, function in tasks.items() if name not in results
     }
+    if on_complete is not None and results:
+        on_complete(frozenset(results))
     if not pending:
         return results
+    failures: list[tuple[str, Exception]] = []
+    skipped: dict[str, str] = {}
+    running: dict[Future[Any], str] = {}
+
+    def schedule(executor: ThreadPoolExecutor) -> None:
+        # To a fixpoint: skipping one task can make its dependents skippable in
+        # the same pass, and a task that was only waiting on a skipped one must
+        # not be mistaken for a cycle below.
+        moved = True
+        while moved:
+            moved = False
+            blocked = {name for name, _exc in failures} | set(skipped)
+            for name in list(pending):
+                failed_needs = edges[name] & blocked
+                if failed_needs:
+                    skipped[name] = sorted(failed_needs)[0]
+                elif edges[name].issubset(results):
+                    running[executor.submit(reconcile, name, pending[name])] = name
+                else:
+                    continue
+                del pending[name]
+                moved = True
+
     with ThreadPoolExecutor(max_workers=min(8, len(pending))) as executor:
-        futures = {
-            executor.submit(function): name for name, function in pending.items()
-        }
-        failures: list[tuple[str, Exception]] = []
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                results[name] = future.result()
-            except Exception as exc:
-                failures.append((name, exc))
-                continue
-            state.record(name, results[name])
-            state.complete(name)
+        while True:
+            schedule(executor)
+            if not running:
+                break
+            done, _still_running = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                name = running.pop(future)
+                try:
+                    results[name] = future.result()
+                except Exception as exc:
+                    failures.append((name, exc))
+                    continue
+                state.record(name, results[name])
+                state.complete(name)
+                if on_complete is not None:
+                    on_complete(frozenset(results))
+    if pending:
+        raise BootstrapError(
+            "bootstrap tasks wait on each other in a cycle: "
+            + ", ".join(sorted(pending))
+        )
     if failures:
         failed_names = ", ".join(sorted(name for name, _exc in failures))
         first_name, first_error = failures[0]
-        first_error.add_note(
+        note = (
             f"parallel bootstrap task(s) failed: {failed_names}; "
             f"first observed task: {first_name}"
         )
+        if skipped:
+            note += "; skipped because a dependency failed: " + ", ".join(
+                f"{name} (after {cause})" for name, cause in sorted(skipped.items())
+            )
+        first_error.add_note(note)
         raise first_error
     return results
+
+
+def describe_or_absent(
+    runner: CommandRunner,
+    region: str,
+    *arguments: str,
+    not_found: Sequence[str],
+) -> dict[str, Any] | None:
+    """One ``aws`` describe that answers both "is it there?" and "what is it?".
+
+    Only an error naming one of the ``not_found`` codes means absent; anything
+    else (AccessDenied, a throttled call, a broken CLI) is re-raised. Reading a
+    failed describe as "absent" -- the ``subprocess.run(...).returncode == 0``
+    pattern this replaces -- sends the run into a ``create-*`` call that then
+    fails on the resource that was there all along, or worse, succeeds twice.
+    """
+
+    try:
+        return runner.aws_json(region, *arguments)
+    except BootstrapError as exc:
+        message = str(exc)
+        if any(code in message for code in not_found):
+            return None
+        raise
 
 
 def write_secret(path: Path, value: str) -> None:

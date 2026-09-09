@@ -10,6 +10,7 @@ reading and partition logic; the gate module re-exports the names it always had.
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 from pathlib import Path
@@ -25,6 +26,7 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config/ci-unit-gate.json"
 CONFIG_SCHEMA_VERSION = 3
+POSTGRES_TEST_URL_ENV = "GPU_FAULT_TEST_POSTGRES_URL"
 RUNTIME_SHARDS = ("runtime_0", "runtime_1", "runtime_2")
 SHARDS = (*RUNTIME_SHARDS, "deployment", "fault_runner", "postgres")
 TEST_DOMAINS = ("runtime", "deployment", "fault_runner", "postgres")
@@ -175,14 +177,117 @@ def deployment_only_source_files(
     return tuple(sorted(result))
 
 
-def _test_owner(relative: str, config: Mapping[str, Any]) -> str | None:
+_POSTGRES_GATE_CACHE: dict[str, tuple[tuple[int, int], bool]] = {}
+
+
+def _reads_postgres_test_url(tree: ast.AST) -> bool:
+    """True when the module reads ``GPU_FAULT_TEST_POSTGRES_URL`` from the
+    process environment: ``os.getenv(...)``, ``os.environ.get(...)`` or
+    ``os.environ[...]``. A dict literal, ``monkeypatch.setenv`` or a docstring
+    naming the variable is a mention, not a gate.
+    """
+
+    def is_environ(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id == "environ") or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "environ"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        )
+
+    def names_url(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and node.value == POSTGRES_TEST_URL_ENV
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and node.args and names_url(node.args[0]):
+            function = node.func
+            if isinstance(function, ast.Name) and function.id == "getenv":
+                return True
+            if isinstance(function, ast.Attribute) and (
+                (
+                    function.attr == "getenv"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "os"
+                )
+                or (function.attr == "get" and is_environ(function.value))
+            ):
+                return True
+        if (
+            isinstance(node, ast.Subscript)
+            and is_environ(node.value)
+            and names_url(node.slice)
+        ):
+            return True
+    return False
+
+
+def _imported_test_modules(tree: ast.AST, relative: str) -> list[str]:
+    """Repository-relative paths of the ``tests`` modules ``relative`` imports."""
+
+    package = relative.rsplit("/", 1)[0].split("/")
+    result = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        if node.level:
+            base = package[: len(package) - (node.level - 1)]
+            parts = [*base, *node.module.split(".")]
+        else:
+            parts = node.module.split(".")
+        if parts and parts[0] == "tests":
+            result.append("/".join(parts) + ".py")
+    return result
+
+
+def postgres_gated_test(root: Path, relative: str) -> bool:
+    """Whether the test module at ``relative`` skips without a Postgres URL.
+
+    G-1: the postgres shard named four files while sixty-odd modules gate on
+    the variable and every other shard clears it. The shard now owns every
+    module that reads the variable itself, or imports a ``tests`` helper that
+    does -- the claim-support module reads it once and every Postgres fixture
+    goes through it. Results are cached per (size, mtime) because the identity
+    and target computations visit each file several times.
+    """
+
+    return _postgres_gated_test(root, relative, ())
+
+
+def _postgres_gated_test(root: Path, relative: str, chain: tuple[str, ...]) -> bool:
+    if relative in chain:
+        return False
+    path = root / relative
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    stamp = (stat.st_size, stat.st_mtime_ns)
+    cached = _POSTGRES_GATE_CACHE.get(str(path))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        gated = False
+    else:
+        gated = _reads_postgres_test_url(tree) or any(
+            _postgres_gated_test(root, imported, (*chain, relative))
+            for imported in _imported_test_modules(tree, relative)
+        )
+    _POSTGRES_GATE_CACHE[str(path)] = (stamp, gated)
+    return gated
+
+
+def _test_owner(relative: str, config: Mapping[str, Any], *, root: Path) -> str | None:
     tests = config["tests"]
     if relative in set(tests["shared_files"]):
         return "shared_tests"
     if relative in set(tests["coverage_excluded_files"]):
         return None
-    if relative in set(tests["postgres_files"]) or relative.startswith(
-        "tests/store/_postgres"
+    if (
+        relative in set(tests["postgres_files"])
+        or relative.startswith("tests/store/_postgres")
+        or postgres_gated_test(root, relative)
     ):
         return "postgres_tests"
     if relative in set(tests["fault_runner_files"]):
@@ -213,7 +318,7 @@ def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
             relative.startswith("tests/")
             and path.name.startswith("test_")
             and path.suffix == ".py"
-            and _test_owner(relative, config) == expected_group
+            and _test_owner(relative, config, root=root) == expected_group
         ):
             targets.append(relative)
     if not targets:
@@ -234,7 +339,7 @@ def validate_test_partition(root: Path = ROOT) -> dict[str, int]:
             or path.suffix != ".py"
         ):
             continue
-        owner = _test_owner(relative, config)
+        owner = _test_owner(relative, config, root=root)
         if owner is None:
             if relative not in excluded:
                 raise CoverageGateError(f"unclassified coverage test: {relative}")

@@ -1,6 +1,5 @@
-"""Store side of F-G2 (4)(6): decisions by status with an age bound, the two
-completion gauges, and -- on PostgreSQL -- the atomicity of the completion
-transaction.
+"""Store side of F-G2 (6): the two completion gauges, and -- on PostgreSQL --
+the atomicity of the completion transaction.
 
 The PostgreSQL cases need ``GPU_FAULT_TEST_POSTGRES_URL``.
 """
@@ -8,7 +7,7 @@ The PostgreSQL cases need ``GPU_FAULT_TEST_POSTGRES_URL``.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -16,7 +15,6 @@ from gpu_fault.app.context import default_simulated_profile
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     EffectiveRuntimeProfile,
     Environment,
     TerminalEvent,
@@ -24,7 +22,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.service import CompletionService
 from gpu_fault.store import InMemoryStore, NotFoundError, SqliteStore
-from gpu_fault.store.memory.store import SimulatedDiagnosticAdapter
+from gpu_fault.store.shared.record_models import record_models
 from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
@@ -64,100 +62,32 @@ def _event(attempt_id: str, *, ended_at: datetime = NOW) -> TerminalEvent:
     )
 
 
-def _decision(
-    event: TerminalEvent,
-    status: DecisionStatus,
-    *,
-    diagnostic_request_id: str | None = None,
-) -> CompletionDecision:
+def _decision(event: TerminalEvent, status: DecisionStatus) -> CompletionDecision:
     return CompletionDecision(
         cluster_id=event.cluster_id,
         attempt_id=event.attempt_id,
         event_key=event.event_key,
         status=status,
         reason="test",
-        diagnostic_request_id=diagnostic_request_id,
     )
-
-
-def _diagnostic(event: TerminalEvent, created_at: datetime) -> DiagnosticRequest:
-    return DiagnosticRequest(
-        request_id=f"diag-{event.attempt_id}",
-        cluster_id=event.cluster_id,
-        attempt_id=event.attempt_id,
-        node_ids=["node-a"],
-        checks=["gpu-enumeration"],
-        created_at=created_at,
-    )
-
-
-def test_decisions_by_status_respect_the_diagnostic_age_bound(store) -> None:
-    old = _event("attempt-old")
-    fresh = _event("attempt-fresh")
-    orphan = _event("attempt-orphan")
-    planned = _event("attempt-planned")
-    for event in (old, fresh, orphan, planned):
-        assert store.save_event_if_absent(event), f"{event.attempt_id} not inserted"
-    store.save_diagnostic(_diagnostic(old, NOW - timedelta(hours=2)))
-    store.save_diagnostic(_diagnostic(fresh, NOW - timedelta(minutes=1)))
-    store.save_decision(
-        _decision(
-            old, DecisionStatus.PENDING_TRIAGE, diagnostic_request_id="diag-attempt-old"
-        )
-    )
-    store.save_decision(
-        _decision(
-            fresh,
-            DecisionStatus.PENDING_TRIAGE,
-            diagnostic_request_id="diag-attempt-fresh",
-        )
-    )
-    store.save_decision(
-        _decision(
-            orphan,
-            DecisionStatus.PENDING_TRIAGE,
-            diagnostic_request_id="diag-never-persisted",
-        )
-    )
-    store.save_decision(_decision(planned, DecisionStatus.PLAN_CREATED))
-
-    everything = store.list_decisions_by_status(DecisionStatus.PENDING_TRIAGE)
-    assert sorted(item.attempt_id for item in everything) == [
-        "attempt-fresh",
-        "attempt-old",
-        "attempt-orphan",
-    ]
-
-    stale = store.list_decisions_by_status(
-        DecisionStatus.PENDING_TRIAGE, older_than=NOW - timedelta(hours=1)
-    )
-    # A decision whose diagnostic request cannot be found is stale by
-    # definition: nothing can ever report on it. Oldest first, unknown age first.
-    assert [item.attempt_id for item in stale] == ["attempt-orphan", "attempt-old"]
-
-    assert store.list_decisions_by_status(
-        DecisionStatus.PENDING_TRIAGE, older_than=NOW - timedelta(hours=1), limit=1
-    ) == [stale[0]]
-    assert store.list_decisions_by_status(DecisionStatus.NO_ACTION) == []
 
 
 def test_decision_status_counts_and_orphan_events(store) -> None:
     decided = _event("attempt-decided")
-    pending = _event("attempt-pending")
+    planned = _event("attempt-planned")
     undecided = _event("attempt-undecided")
-    for event in (decided, pending, undecided):
+    for event in (decided, planned, undecided):
         assert store.save_event_if_absent(event), f"{event.attempt_id} not inserted"
     store.save_decision(_decision(decided, DecisionStatus.NO_ACTION))
-    store.save_decision(_decision(pending, DecisionStatus.PENDING_TRIAGE))
+    store.save_decision(_decision(planned, DecisionStatus.PLAN_CREATED))
 
     assert store.decision_status_counts() == {
         DecisionStatus.NO_ACTION: 1,
-        DecisionStatus.PENDING_TRIAGE: 1,
-        DecisionStatus.PLAN_CREATED: 0,
+        DecisionStatus.PLAN_CREATED: 1,
     }
     assert store.count_completion_events_without_decision() == 1
 
-    store.save_decision(_decision(undecided, DecisionStatus.PLAN_CREATED))
+    store.save_decision(_decision(undecided, DecisionStatus.NO_ACTION))
     assert store.count_completion_events_without_decision() == 0
 
 
@@ -190,9 +120,7 @@ def test_postgres_terminal_event_and_decision_are_one_transaction() -> None:
         pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
     for store in postgres_store_instance():
         store.save_profile(default_simulated_profile())
-        service = CompletionService(
-            store, SimulatedDiagnosticAdapter(store), planner=_RaisingPlanner()
-        )
+        service = CompletionService(store, planner=_RaisingPlanner())
         event = _event("attempt-atomic")
 
         with pytest.raises(RuntimeError, match="planner exploded"):
@@ -202,4 +130,84 @@ def test_postgres_terminal_event_and_decision_are_one_transaction() -> None:
         with pytest.raises(NotFoundError):
             store.get_event_by_attempt(event.cluster_id, event.attempt_id)
         assert store.count_completion_events_without_decision() == 0
+    _truncate()
+
+
+# --------------------------------------------------------------------------
+# Final review F-1: rows written before the quick-triage cutover carry
+# ``"diagnostic_request_id": null`` and some carry ``status: "PENDING_TRIAGE"``.
+# ``StrictModel`` forbids extras, so without tolerant decoding every read of
+# such a row (a redelivered terminal, ``/decision``, ``submit_remediation``)
+# raised until the 30-day retention removed it.
+
+LEGACY_ROW = (
+    '{"cluster_id":"cluster-a","attempt_id":"attempt-legacy",'
+    '"event_key":"cluster-a/attempt-legacy/TrainingAttemptTerminal",'
+    '"status":"NO_ACTION","reason":"controller-initiated or user stop",'
+    '"duplicate":false,"matched_marker_ids":[],"diagnostic_request_id":null,'
+    '"recovery_plan_id":null}'
+)
+LEGACY_TRIAGE_ROW = (
+    '{"cluster_id":"cluster-a","attempt_id":"attempt-triage",'
+    '"event_key":"cluster-a/attempt-triage/TrainingAttemptTerminal",'
+    '"status":"PENDING_TRIAGE","reason":"quick diagnostics requested",'
+    '"duplicate":false,"matched_marker_ids":[],'
+    '"diagnostic_request_id":"diag-attempt-triage","recovery_plan_id":null}'
+)
+
+
+def test_a_pre_cutover_decision_row_still_decodes() -> None:
+    decision = record_models()["decision"].model_validate_json(LEGACY_ROW)
+
+    assert isinstance(decision, CompletionDecision), "decision kind decodes rows"
+    assert decision.status is DecisionStatus.NO_ACTION, "status is kept"
+    assert decision.reason == "controller-initiated or user stop", "reason is kept"
+    assert "diagnostic_request_id" not in decision.model_dump(), (
+        "the legacy key is dropped, not carried"
+    )
+
+
+def test_a_pre_cutover_pending_triage_row_reads_as_no_action_with_its_history() -> None:
+    decision = CompletionDecision.model_validate_json(LEGACY_TRIAGE_ROW)
+
+    assert decision.status is DecisionStatus.NO_ACTION, (
+        "PENDING_TRIAGE no longer exists; the row reads as a closed decision"
+    )
+    assert decision.reason.startswith("pre-cutover triage decision"), (
+        "operators must see that this was a triage-era decision"
+    )
+    assert "quick diagnostics requested" in decision.reason, (
+        "the original reason is kept behind the prefix"
+    )
+    assert decision.recovery_plan_id is None, "a triage row never had a plan"
+
+
+def test_postgres_reads_a_pre_cutover_decision_row() -> None:
+    """The row is written as the old release wrote it (raw JSON, no model) and
+    read back through the store, which is the path that actually parses it."""
+
+    url = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
+    for store in postgres_store_instance():
+        event = _event("attempt-legacy")
+        assert store.save_event_if_absent(event), "event row was not inserted"
+        with psycopg.connect(url) as connection:
+            connection.execute(
+                """
+                INSERT INTO gpu_fault_objects(kind, key, payload)
+                VALUES ('decision', %s, %s::jsonb)
+                ON CONFLICT(kind, key) DO UPDATE SET payload=excluded.payload
+                """,
+                (event.event_key, LEGACY_ROW),
+            )
+
+        by_event = store.get_decision_by_event(event.event_key)
+        by_attempt = store.get_decision_by_attempt(event.cluster_id, event.attempt_id)
+
+        assert by_event is not None, "the legacy row must be readable"
+        assert by_event.status is DecisionStatus.NO_ACTION, "status is kept"
+        assert by_attempt == by_event, "both read paths decode the same row"
     _truncate()

@@ -38,6 +38,7 @@ from gpu_fault.execution import (
     ProductionWorkflowExecutor,
     WorkflowStepContext,
 )
+from gpu_fault.execution.restart_budget_preflight import reserve_restart_budgets
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -1046,17 +1047,29 @@ class LiveProtocolAudit:
         )
 
     def run_015(self) -> None:
+        """Restart budget is decided once, at claim time; dispatch only reads it.
+
+        Three refusals, none of which mints a remote command or touches a
+        workload: an occupied budget refuses the claim preflight
+        (``reserve_restart_budgets`` -> RESTART_BUDGET_EXHAUSTED); a dispatch
+        that holds no reservation fails closed at the adapter
+        (``issue_restart_authorization`` -> RESTART_RESERVATION_MISSING) instead
+        of reserving there; and a step without ``source_gpu_count`` is refused
+        at the gate before either site reads the budget row.
+        """
+
         adapter = RegionalRemoteWorkflowAdapter(
             self.store,
             owners={KUBERNETES_OWNER},
         )
         job_id = f"{self.run_id}-budget"
+        priming_reservation = f"{self.run_id}-existing-reservation"
         try:
             state, reserved = self.store.reserve_job_restart(
                 self.cluster_id,
                 job_id,
                 1,
-                f"{self.run_id}-existing-reservation",
+                priming_reservation,
             )
             expect(
                 reserved and state.restart_count == 1,
@@ -1074,16 +1087,52 @@ class LiveProtocolAudit:
                     "restart_budget": 1,
                 },
             )
-            exhausted = adapter.execute(
-                self._adapter_context("cmd015-exhausted", step=full)
+            # (a) The claim preflight against the occupied budget: the only
+            # site that reserves, and so the only site that can say exhausted.
+            claim = self._adapter_context("cmd015-exhausted", step=full)
+            failure = reserve_restart_budgets(
+                self.store,
+                claim.workflow,
+                claim.incident,
+                claim.workflow.official_steps,
             )
             expect(
-                exhausted.status.value == "FAILED"
+                failure is not None,
+                "the claim preflight admitted an exhausted budget",
+            )
+            assert failure is not None
+            exhausted = failure.outcome
+            expect(
+                failure.step_index == 0
+                and exhausted.status.value == "FAILED"
                 and exhausted.details.get("reason") == "RESTART_BUDGET_EXHAUSTED"
-                and "restart budget exhausted" in str(exhausted.error),
+                and "restart budget exhausted" in str(exhausted.error)
+                and "1/1" in str(exhausted.error),
                 f"exhausted budget answered {exhausted.status.value}: "
                 f"{exhausted.error!r}",
             )
+            state = self.store.get_restart_budget(self.cluster_id, job_id)
+            expect(
+                state.restart_count == 1
+                and state.reservation_ids == [priming_reservation],
+                f"the refused claim changed the budget row: {state.reservation_ids!r}",
+            )
+            # (b) Dispatch without a reservation: the adapter reads the
+            # preflight's reservation back and fails closed when there is none.
+            unreserved = adapter.execute(
+                self._adapter_context("cmd015-unreserved", step=full)
+            )
+            expect(
+                unreserved.status.value == "FAILED"
+                and unreserved.details.get("reason") == "RESTART_RESERVATION_MISSING"
+                and "restart reservation missing" in str(unreserved.error)
+                and unreserved.details.get("restart_count") == 1
+                and unreserved.details.get("restart_budget") == 1,
+                f"unreserved dispatch answered {unreserved.status.value}: "
+                f"{unreserved.error!r} {unreserved.details!r}",
+            )
+            # (c) The gate refuses an incomplete safety context before any
+            # budget read, in the claim preflight's words.
             missing = full.model_copy(
                 update={
                     "parameters": {
@@ -1098,6 +1147,7 @@ class LiveProtocolAudit:
             )
             expect(
                 incomplete.status.value == "FAILED"
+                and incomplete.details.get("reason") == "RESTART_SAFETY_CONTEXT_MISSING"
                 and "restart safety context is missing: source_gpu_count"
                 in str(incomplete.error),
                 f"missing context answered {incomplete.status.value}: "
@@ -1105,6 +1155,7 @@ class LiveProtocolAudit:
             )
             command_incidents = {
                 f"{self.run_id}-cmd015-exhausted-incident",
+                f"{self.run_id}-cmd015-unreserved-incident",
                 f"{self.run_id}-cmd015-missing-incident",
             }
             leaked = [
@@ -1123,6 +1174,9 @@ class LiveProtocolAudit:
         self.record(
             "GF-REGIONAL-CMD-015",
             exhausted_error=exhausted.error,
+            exhausted_details=dict(exhausted.details),
+            unreserved_error=unreserved.error,
+            unreserved_details=dict(unreserved.details),
             missing_context_error=incomplete.error,
             commands_created=0,
             restart_budget_deleted=True,

@@ -4,11 +4,6 @@ import os
 import time
 from typing import Any, Callable
 
-from gpu_fault.execution import (
-    WorkflowStepContext,
-)
-
-
 from gpu_fault.adapters.common import (
     ANNOTATION_EXECUTION_EPOCH,
     ANNOTATION_FENCING,
@@ -16,6 +11,9 @@ from gpu_fault.adapters.common import (
     ANNOTATION_OPERATION,
     ANNOTATION_STEP_INDEX,
     ANNOTATION_WORKFLOW,
+)
+from gpu_fault.execution import (
+    WorkflowStepContext,
 )
 
 NODE_PATCH_ATTEMPTS = 3

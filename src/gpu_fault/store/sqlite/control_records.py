@@ -6,9 +6,7 @@ from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
-    CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     FaultIncident,
     NodeMarker,
     RecoveryAction,
@@ -36,6 +34,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
     _db: Any
     _delete: Callable[..., Any]
     _get: Callable[..., Any]
+    _get_link: Callable[..., Any]
     _get_optional: Callable[..., Any]
     _link: Callable[..., Any]
     _list: Callable[..., Any]
@@ -223,46 +222,6 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
             self._state_transaction(f"completion/{event_key}"),
         )
 
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        rows = self._db.execute(
-            """
-            SELECT decision.payload, diagnostic.payload
-            FROM objects AS decision
-            LEFT JOIN objects AS diagnostic
-              ON diagnostic.kind='diagnostic'
-             AND diagnostic.key=json_extract(
-                 decision.payload, '$.diagnostic_request_id'
-             )
-            WHERE decision.kind='decision'
-              AND json_extract(decision.payload, '$.status')=?
-            """,
-            (status.value,),
-        ).fetchall()
-        floor = datetime.min.replace(tzinfo=timezone.utc)
-        candidates: list[tuple[datetime | None, CompletionDecision]] = []
-        for decision_payload, diagnostic_payload in rows:
-            created_at = (
-                DiagnosticRequest.model_validate_json(diagnostic_payload).created_at
-                if diagnostic_payload is not None
-                else None
-            )
-            if older_than is not None and created_at is not None:
-                if created_at > older_than:
-                    continue
-            candidates.append(
-                (created_at, CompletionDecision.model_validate_json(decision_payload))
-            )
-        candidates.sort(key=lambda item: (item[0] or floor, item[1].event_key))
-        return [decision for _created_at, decision in candidates[:limit]]
-
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         rows = self._db.execute(
             """
@@ -308,6 +267,61 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         ).fetchall()
         return [NodeMarker.model_validate_json(row[0]) for row in rows]
 
+    def cleanup_inactive_markers(self, *, older_than: datetime, limit: int) -> int:
+        with self._state_transaction("marker/cleanup"):
+            marker_ids = [
+                marker.marker_id
+                for marker in sorted(
+                    self._list("marker"),
+                    key=lambda item: (item.observed_at, item.marker_id),
+                )
+                if not marker.active
+                and marker.observed_at <= older_than
+                and self._get_optional("incident", marker.incident_id) is None
+            ][:limit]
+            for marker_id in marker_ids:
+                self._delete("marker", marker_id)
+            return log_cleanup("marker", marker_ids)
+
+    def cleanup_completion_records(self, *, older_than: datetime, limit: int) -> int:
+        with self._state_transaction("completion/cleanup"):
+            events = {event.event_key: event for event in self._list("event")}
+            incidents = self._list("incident")
+            incident_ids = {incident.incident_id for incident in incidents}
+            live_event_ids = {incident.event_id for incident in incidents}
+            candidates = []
+            for decision in self._list("decision"):
+                event = events.get(decision.event_key)
+                if event is None or event.ended_at > older_than:
+                    continue
+                linked = self._get_link("incident_by_event", decision.event_key)
+                if linked is not None and linked in incident_ids:
+                    continue
+                if decision.event_key in live_event_ids:
+                    continue
+                plan = (
+                    self._get_optional("plan", decision.recovery_plan_id)
+                    if decision.recovery_plan_id
+                    else None
+                )
+                if plan is not None and plan.incident_id in incident_ids:
+                    continue
+                candidates.append((event.ended_at, decision, event, plan))
+            candidates.sort(key=lambda item: (item[0], item[1].event_key))
+            removed = []
+            for _ended_at, decision, event, plan in candidates[:limit]:
+                key = decision.event_key
+                self._delete("decision", key)
+                self._delete("event", key)
+                self._db.execute(
+                    "DELETE FROM links WHERE kind='attempt_event' AND key=?",
+                    (self._state_key((event.cluster_id, event.attempt_id)),),
+                )
+                if plan is not None:
+                    self._delete("plan", plan.plan_id)
+                removed.append(key)
+            return log_cleanup("completion_decision", removed)
+
     def list_recent_markers_for_nodes(
         self,
         node_ids: set[str],
@@ -323,6 +337,7 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
                 marker
                 for marker in self._list("marker")
                 if marker.active
+                and marker.trusted
                 and (
                     marker.observed_at >= observed_after
                     or (

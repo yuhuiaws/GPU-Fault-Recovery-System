@@ -5,7 +5,6 @@ from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import Any, TypeVar
 
-
 CompletionItem = TypeVar("CompletionItem")
 
 

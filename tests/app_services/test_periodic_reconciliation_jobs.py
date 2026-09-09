@@ -1,13 +1,12 @@
-"""Three reconciliation jobs whose store halves existed without a caller.
+"""Two reconciliation jobs whose store halves existed without a caller.
 
 F-D5: ``reclaim_expired_processor_leases`` hands lapsed LEASED rows back to
 PENDING, but only the claim window called it, and only inside its horizon.
-F-G2 (4): ``CompletionService.reconcile_pending_triage`` closes decisions
-stuck in PENDING_TRIAGE, but nothing scheduled it. F-D10 (P1-75F): the
-processor queue keeps a per-cluster counter table beside the rows; drift
-between the two was only visible to an admin CLI. Each now runs on the
-periodic runner, counted and exported, and the drift query -- a full-table
-count -- runs on the runner's clock, never inside a ``/metrics`` scrape.
+F-D10 (P1-75F): the processor queue keeps a per-cluster counter table beside
+the rows; drift between the two was only visible to an admin CLI. Each now
+runs on the periodic runner, counted and exported, and the drift query -- a
+full-table count -- runs on the runner's clock, never inside a ``/metrics``
+scrape.
 """
 
 from __future__ import annotations
@@ -81,17 +80,7 @@ class _Store:
         return dict(self.status)
 
 
-class _Completion:
-    def __init__(self, moved: int) -> None:
-        self.moved = moved
-        self.calls: list[dict[str, object]] = []
-
-    def reconcile_pending_triage(self, *, now: datetime, limit: int) -> list[object]:
-        self.calls.append({"now": now, "limit": limit})
-        return [object() for _ in range(self.moved)]
-
-
-def _runner(store, *, completion=None, **config) -> PeriodicServiceRunner:
+def _runner(store, **config) -> PeriodicServiceRunner:
     processor = SimpleNamespace(
         is_healthy=lambda: True,
         active_consumers=False,
@@ -99,9 +88,7 @@ def _runner(store, *, completion=None, **config) -> PeriodicServiceRunner:
         owner_id="pod-a:1",
     )
     return PeriodicServiceRunner(
-        context=SimpleNamespace(
-            store=store, regional_mode=False, completion=completion
-        ),
+        context=SimpleNamespace(store=store, regional_mode=False),
         processor=processor,
         stop=Event(),
         identity_registries=[],
@@ -117,7 +104,6 @@ def _runner(store, *, completion=None, **config) -> PeriodicServiceRunner:
 def test_reconciliation_intervals_have_their_documented_defaults(monkeypatch):
     for name in (
         "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS",
-        "GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS",
         "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -125,19 +111,16 @@ def test_reconciliation_intervals_have_their_documented_defaults(monkeypatch):
     config = PeriodicServiceConfig.from_environment()
 
     assert config.lease_reclaim_interval == 30.0
-    assert config.pending_triage_interval == 60.0
     assert config.counter_drift_interval == 60.0
 
 
 def test_reconciliation_intervals_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS", "7")
-    monkeypatch.setenv("GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS", "8")
     monkeypatch.setenv("GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS", "9")
 
     config = PeriodicServiceConfig.from_environment()
 
     assert config.lease_reclaim_interval == 7.0
-    assert config.pending_triage_interval == 8.0
     assert config.counter_drift_interval == 9.0
 
 
@@ -145,7 +128,6 @@ def test_reconciliation_intervals_are_read_from_the_environment(monkeypatch):
     "name",
     [
         "GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS",
-        "GPU_FAULT_PENDING_TRIAGE_SCAN_SECONDS",
         "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS",
     ],
 )
@@ -189,26 +171,6 @@ def test_a_quiet_reclaim_round_logs_nothing_and_adds_nothing(caplog):
 
     assert runner.metrics_snapshot()["processor_expired_leases_reclaimed_total"] == 0
     assert caplog.records == []
-
-
-# --- F-G2 (4) -----------------------------------------------------------------
-
-
-def test_pending_triage_reconciliation_uses_the_cleanup_batch_size():
-    completion = _Completion(moved=2)
-    runner = _runner(_Store(), completion=completion)
-
-    ran = runner._run_pending_triage(1000.0)
-
-    assert ran is True, "the pending-triage job did not run when due"
-    assert len(completion.calls) == 1
-    assert completion.calls[0]["limit"] == BATCH
-    observed = completion.calls[0]["now"]
-    assert isinstance(observed, datetime) and observed.tzinfo is timezone.utc, (
-        "the deadline must be judged on an aware UTC clock"
-    )
-    snapshot = runner.metrics_snapshot()
-    assert snapshot["completion_pending_triage_reconciled_total"] == 2
 
 
 # --- F-D10 P1-75F -------------------------------------------------------------
@@ -265,15 +227,13 @@ def test_the_drift_query_runs_on_the_runner_clock_not_the_scrape():
 
 def test_reconciliation_counters_reach_metrics():
     store = _Store(reclaimed=3)
-    runner = _runner(store, completion=_Completion(moved=2))
+    runner = _runner(store)
     runner._run_lease_reclaim(1000.0)
-    runner._run_pending_triage(1000.0)
     runtime = SimpleNamespace(context=SimpleNamespace(periodic_runner=runner))
 
     lines = control_loop_metric_lines(runtime)
 
     assert "gpu_fault_processor_expired_leases_reclaimed_total 3" in lines
-    assert "gpu_fault_completion_pending_triage_reconciled_total 2" in lines
     assert "# TYPE gpu_fault_processor_counter_drift_abs gauge" in lines
 
 
@@ -287,5 +247,5 @@ def test_the_new_jobs_take_their_turn_in_every_tick(monkeypatch):
 
     runner.run_all_due(1000.0)
 
-    for name in ("lease_reclaim", "pending_triage", "counter_drift"):
+    for name in ("lease_reclaim", "counter_drift"):
         assert name in ran, f"{name} is not part of the periodic tick: {ran}"

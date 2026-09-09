@@ -6,9 +6,9 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence, cast
+from typing import Any, Iterator, Mapping, Protocol, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -18,6 +18,7 @@ from gpu_fault.admin.config import (
 )
 from gpu_fault.admin.config_parser import boolean_field
 from gpu_fault.digests import SHA256_PATTERN
+from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 
 SITE_API_VERSION = "gpu-fault.aws/v1alpha1"
 SITE_KIND = "RegionalSite"
@@ -132,6 +133,273 @@ def _text_list(
     if len(normalized) < minimum:
         raise SiteConfigError(f"{path} requires at least {minimum} value(s)")
     return normalized
+
+
+def _failure_domain_labels(value: object, path: str) -> tuple[str, ...]:
+    """Ordered node label keys, finest domain first; the default priority when absent.
+
+    Order is meaning here (the first label a node carries wins), so unlike the
+    other list fields this one is not sorted.
+    """
+
+    if value is None:
+        return FAILURE_DOMAIN_LABELS
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise SiteConfigError(f"{path} must be a list")
+    labels = tuple(
+        _required_text(item, f"{path}[]") for item in cast(Sequence[object], value)
+    )
+    if not labels:
+        raise SiteConfigError(f"{path} requires at least 1 value(s)")
+    if len(set(labels)) != len(labels):
+        raise SiteConfigError(f"{path} values must be unique")
+    for label in labels:
+        if not IDENTIFIER_PATTERN.fullmatch(label):
+            raise SiteConfigError(f"{path} contains an invalid label key: {label}")
+    return labels
+
+
+RETENTION_DAYS_ENV = "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS"
+RETENTION_ARCHIVE_URI_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI"
+RETENTION_INTERVAL_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS"
+S3_URI_PATTERN = re.compile(
+    r"^s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?P<prefix>/.*)?$"
+)
+
+
+def archive_s3_prefix_arn(uri: str) -> str:
+    """The object ARN pattern one ``s3://bucket/prefix`` archive URI covers."""
+
+    match = S3_URI_PATTERN.fullmatch(uri.strip())
+    if match is None:
+        raise SiteConfigError("archiveS3Uri must be an s3://bucket[/prefix] URI")
+    prefix = (match.group("prefix") or "").strip("/")
+    return f"arn:aws:s3:::{match.group('bucket')}/{prefix + '/' if prefix else ''}*"
+
+
+def default_control_record_archive_s3_uri(
+    *, account_id: str, region: str, site_name: str
+) -> str:
+    """The archive destination a site gets when ``spec.retention`` names none.
+
+    One bucket per account and Region, one prefix per site, so turning
+    retention on is a single ``controlRecordRetentionDays`` line: bootstrap
+    creates and hardens the bucket, the control-plane role is granted the
+    prefix, and the deploy preflight checks it exists.
+    """
+
+    return (
+        f"s3://gpu-fault-control-records-{account_id}-{region}/"
+        f"{site_name}/control-record-archive"
+    )
+
+
+DEFAULT_CONTROL_RECORD_RETENTION_DAYS = 30
+
+
+class AwsAccountScope(Protocol):
+    """The account/region pair a default archive bucket name is derived from
+    (bootstrap passes its CPU ``ClusterIdentity``)."""
+
+    @property
+    def account_id(self) -> str: ...
+
+    @property
+    def region(self) -> str: ...
+
+
+def bootstrap_archive_s3_uri(
+    existing_site: Mapping[str, Any] | None,
+    *,
+    identity: AwsAccountScope,
+    site_name: str,
+) -> str | None:
+    """The archive target bootstrap must create and grant, or None when the
+    site turned retention off. A first bootstrap (no site yet) gets the
+    default: retention is on unless the operator later declares 0."""
+
+    retention = site_retention(existing_site)
+    if not retention.enabled:
+        return None
+    return retention.archive_s3_uri or default_control_record_archive_s3_uri(
+        account_id=identity.account_id, region=identity.region, site_name=site_name
+    )
+
+
+def eks_arn_account_id(arn: str) -> str:
+    parts = str(arn).split(":")
+    if len(parts) < 6 or not parts[4].isdigit():
+        raise SiteConfigError(f"not an EKS cluster ARN: {arn}")
+    return parts[4]
+
+
+@dataclass(frozen=True)
+class RetentionSiteConfig:
+    """``spec.retention``: archive-first deletion of closed control records.
+
+    Absent means **on** with the product default (30 days; control-plane
+    review 2026-09-08): closed incidents and their workflows are archived to
+    the site's bucket and deleted after 30 days, the bucket being created by
+    bootstrap. An operator turns it off by declaring
+    ``controlRecordRetentionDays: 0`` explicitly, so the decision to keep rows
+    forever is the one that has to be written down.
+    """
+
+    control_record_retention_days: int = DEFAULT_CONTROL_RECORD_RETENTION_DAYS
+    archive_s3_uri: str | None = None
+    archive_interval_seconds: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.control_record_retention_days > 0
+
+    @classmethod
+    def from_value(cls, value: object) -> RetentionSiteConfig:
+        if value is None:
+            return cls()
+        data = _mapping(
+            value,
+            "spec.retention",
+            allowed={
+                "controlRecordRetentionDays",
+                "archiveS3Uri",
+                "archiveIntervalSeconds",
+            },
+        )
+        days = _integer(
+            data.get("controlRecordRetentionDays"),
+            "spec.retention.controlRecordRetentionDays",
+            default=DEFAULT_CONTROL_RECORD_RETENTION_DAYS,
+            minimum=0,
+            maximum=3650,
+        )
+        uri = _optional_text(data.get("archiveS3Uri"), "spec.retention.archiveS3Uri")
+        if uri is not None:
+            archive_s3_prefix_arn(uri)
+        # ``days > 0`` without a URI is allowed here: the site resolves it to
+        # the account/Region/site default (``resolved``) once it knows them.
+        interval = data.get("archiveIntervalSeconds")
+        return cls(
+            control_record_retention_days=days,
+            archive_s3_uri=uri,
+            archive_interval_seconds=(
+                None
+                if interval is None
+                else _integer(
+                    interval,
+                    "spec.retention.archiveIntervalSeconds",
+                    default=3600,
+                    minimum=60,
+                    maximum=86400 * 7,
+                )
+            ),
+        )
+
+    def resolved(
+        self, *, account_id: str, region: str, site_name: str
+    ) -> RetentionSiteConfig:
+        """This block with the default archive URI filled in when retention is
+        on and the operator named none."""
+
+        if not self.enabled or self.archive_s3_uri is not None:
+            return self
+        return replace(
+            self,
+            archive_s3_uri=default_control_record_archive_s3_uri(
+                account_id=account_id, region=region, site_name=site_name
+            ),
+        )
+
+    def as_release_config(self) -> dict[str, Any]:
+        return {
+            "control_record_retention_days": self.control_record_retention_days,
+            "archive_s3_uri": self.archive_s3_uri,
+            "archive_interval_seconds": self.archive_interval_seconds,
+        }
+
+    def environment(self) -> dict[str, str]:
+        """The worker variables, empty unless retention is on."""
+
+        if not self.enabled or self.archive_s3_uri is None:
+            return {}
+        values = {
+            RETENTION_DAYS_ENV: str(self.control_record_retention_days),
+            RETENTION_ARCHIVE_URI_ENV: self.archive_s3_uri,
+        }
+        if self.archive_interval_seconds is not None:
+            values[RETENTION_INTERVAL_ENV] = str(self.archive_interval_seconds)
+        return values
+
+
+def site_retention(site: Mapping[str, Any] | None) -> RetentionSiteConfig:
+    """``spec.retention`` of a raw site document, off when absent or unreadable.
+
+    Resolves the default archive URI the same way ``RegionalSite`` does, so the
+    bootstrap rerun that widens the role and creates the bucket sees the same
+    target the release will render.
+    """
+
+    if not isinstance(site, Mapping):
+        return RetentionSiteConfig()
+    spec = site.get("spec")
+    if not isinstance(spec, Mapping):
+        return RetentionSiteConfig()
+    retention = RetentionSiteConfig.from_value(spec.get("retention"))
+    if not retention.enabled or retention.archive_s3_uri is not None:
+        return retention
+    cpu = spec.get("cpu")
+    metadata = site.get("metadata")
+    cpu_fields: Mapping[str, Any] = cpu if isinstance(cpu, Mapping) else {}
+    metadata_fields: Mapping[str, Any] = (
+        metadata if isinstance(metadata, Mapping) else {}
+    )
+    try:
+        return retention.resolved(
+            account_id=eks_arn_account_id(str(cpu_fields.get("eksArn") or "")),
+            region=str(spec.get("awsRegion") or ""),
+            site_name=str(metadata_fields.get("name") or ""),
+        )
+    except SiteConfigError:
+        return retention
+
+
+NOTIFICATION_CHANNEL_SNS = "sns"
+NOTIFICATION_CHANNEL_SES = "ses"
+NOTIFICATION_CHANNELS = (NOTIFICATION_CHANNEL_SNS, NOTIFICATION_CHANNEL_SES)
+
+
+def default_notification_channel(notifications: Mapping[str, Any] | None) -> str:
+    """The channel a ``spec.notifications`` block means when it names none.
+
+    New sites get SNS: one topic, one confirmed subscription, the same channel
+    the AMP alerts already use. A site written before the channel existed
+    carries an ``emailSender`` (bootstrap always filled it), and that sender is
+    a verified SES identity the operator went through a mail to confirm, so
+    such a site keeps SES until the operator declares ``channel: sns``. A
+    routine upgrade therefore never moves a live site's notifications.
+    """
+
+    if isinstance(notifications, Mapping) and notifications.get("emailSender"):
+        return NOTIFICATION_CHANNEL_SES
+    return NOTIFICATION_CHANNEL_SNS
+
+
+def site_notification_channel(site: Mapping[str, Any] | None) -> str:
+    """``spec.notifications.channel`` of a raw site document, defaulted as above.
+
+    Raw-document companion of ``NotificationSiteConfig.channel`` for the paths
+    (bootstrap, the deploy precheck) that must answer before the site is
+    validated whole; an unreadable document answers ``sns``.
+    """
+
+    spec = site.get("spec") if isinstance(site, Mapping) else None
+    notifications = spec.get("notifications") if isinstance(spec, Mapping) else None
+    if not isinstance(notifications, Mapping):
+        return NOTIFICATION_CHANNEL_SNS
+    declared = notifications.get("channel")
+    if isinstance(declared, str) and declared.strip() in NOTIFICATION_CHANNELS:
+        return declared.strip()
+    return default_notification_channel(notifications)
 
 
 @dataclass(frozen=True)
@@ -448,12 +716,23 @@ class HealthSiteConfig:
 
 @dataclass(frozen=True)
 class NotificationSiteConfig:
+    """``spec.notifications``: where the control plane's own alerts go.
+
+    ``channel`` is ``sns`` (the site's health topic, the default for a block
+    that never named a sender) or ``ses`` (the verified sender a bootstrap
+    before the channel existed wrote; kept until the operator declares
+    ``channel: sns``). On ``sns`` only ``adminEmail`` is required, and naming
+    one implies ``allowEmail``; a leftover ``emailSender``/``emailRecipients``
+    is carried but not required, so flipping a live site edits one key.
+    """
+
     allow_email: bool = False
     acknowledge_external_alert_channel: bool = True
     admin_email: str | None = None
     email_sender: str | None = None
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
+    channel: str = NOTIFICATION_CHANNEL_SNS
 
     @classmethod
     def from_value(cls, value: object) -> NotificationSiteConfig:
@@ -467,12 +746,25 @@ class NotificationSiteConfig:
                 "emailSender",
                 "emailRecipients",
                 "emailSubjectPrefix",
+                "channel",
             },
         )
+        channel = data.get("channel")
+        if channel is None:
+            channel = default_notification_channel(data)
+        elif not isinstance(channel, str) or channel not in NOTIFICATION_CHANNELS:
+            raise SiteConfigError(
+                "spec.notifications.channel must be one of "
+                + ", ".join(NOTIFICATION_CHANNELS)
+            )
+        # An adminEmail on the sns channel implies the channel is wanted; a
+        # block that names no address keeps the acknowledged-off default.
         allow_email = _boolean(
             data.get("allowEmail"),
             "spec.notifications.allowEmail",
-            default=False,
+            default=(
+                channel == NOTIFICATION_CHANNEL_SNS and bool(data.get("adminEmail"))
+            ),
         )
         acknowledge = _boolean(
             data.get("acknowledgeExternalAlertChannel"),
@@ -503,8 +795,12 @@ class NotificationSiteConfig:
             raise SiteConfigError(
                 "notifications must enable email or acknowledge an external alert channel"
             )
-        if allow_email and (
-            admin_email is None or email_sender is None or not email_recipients
+        if allow_email and channel == NOTIFICATION_CHANNEL_SNS and admin_email is None:
+            raise SiteConfigError("SNS notifications require notifications.adminEmail")
+        if (
+            allow_email
+            and channel == NOTIFICATION_CHANNEL_SES
+            and (admin_email is None or email_sender is None or not email_recipients)
         ):
             raise SiteConfigError(
                 "email notifications require notifications.adminEmail "
@@ -517,6 +813,7 @@ class NotificationSiteConfig:
             email_sender=email_sender,
             email_recipients=email_recipients,
             email_subject_prefix=email_subject_prefix,
+            channel=channel,
         )
 
 
@@ -630,6 +927,8 @@ class SiteSpec:
     health: HealthSiteConfig
     notifications: NotificationSiteConfig
     clusters: tuple[GpuClusterSiteConfig, ...]
+    failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
+    retention: RetentionSiteConfig = RetentionSiteConfig()
 
     @classmethod
     def from_value(cls, value: object) -> SiteSpec:
@@ -651,6 +950,8 @@ class SiteSpec:
                 "health",
                 "notifications",
                 "clusters",
+                "failureDomainLabels",
+                "retention",
             },
         )
         region = _required_text(data.get("awsRegion"), "spec.awsRegion")
@@ -715,6 +1016,10 @@ class SiteSpec:
             health=health,
             notifications=NotificationSiteConfig.from_value(data.get("notifications")),
             clusters=clusters,
+            failure_domain_labels=_failure_domain_labels(
+                data.get("failureDomainLabels"), "spec.failureDomainLabels"
+            ),
+            retention=RetentionSiteConfig.from_value(data.get("retention")),
         )
 
 
@@ -742,7 +1047,17 @@ class RegionalSite:
         name = _required_text(metadata.get("name"), "metadata.name")
         if not IDENTIFIER_PATTERN.fullmatch(name):
             raise SiteConfigError("metadata.name contains unsupported characters")
-        return cls(name=name, spec=SiteSpec.from_value(data.get("spec")))
+        spec = SiteSpec.from_value(data.get("spec"))
+        if spec.retention.enabled and spec.retention.archive_s3_uri is None:
+            spec = replace(
+                spec,
+                retention=spec.retention.resolved(
+                    account_id=eks_arn_account_id(spec.cpu.eks_arn),
+                    region=spec.aws_region,
+                    site_name=name,
+                ),
+            )
+        return cls(name=name, spec=spec)
 
 
 @dataclass(frozen=True)
@@ -911,6 +1226,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "email_sender": site.spec.notifications.email_sender,
             "email_recipients": list(site.spec.notifications.email_recipients),
             "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
+            "channel": site.spec.notifications.channel,
         },
         "admin_config": {
             "config": admin_config.as_dict(),
@@ -918,6 +1234,8 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "role_sha256": admin_config.role_sha256(),
         },
         "clusters": clusters,
+        "failure_domain_labels": list(site.spec.failure_domain_labels),
+        "retention": site.spec.retention.as_release_config(),
     }
     image_values = {
         "GPU_FAULT_RUNTIME_IMAGE": site.spec.images.runtime,

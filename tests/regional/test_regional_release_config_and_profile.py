@@ -8,6 +8,7 @@ import yaml
 
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.models import RuntimeProfile
+from gpu_fault_release import regional_admin_commands as ADMIN
 from tests.regional._release_orchestrator_support import (
     DNS_MODULE,
     GPU_EKS_ARN,
@@ -191,20 +192,21 @@ def test_status_keeps_health_report_when_release_summary_is_unavailable(
     module = MODULE
     config = module.ReleaseConfig.load(config_file(tmp_path))
     release = module.RegionalRelease(config, module.Runner(dry_run=True))
+    monkeypatch.setattr(module.RegionalRelease, "_load_state", lambda _self: {})
     monkeypatch.setattr(
-        module.RegionalRelease, "_apply_health_baseline", lambda _self: None
+        module.RegionalRelease, "_apply_health_baseline", lambda _self, _state: None
     )
     monkeypatch.setattr(
-        module,
+        ADMIN,
         "build_full_status",
-        lambda _release: {
+        lambda _release, *, state: {
             "healthy": False,
             "release_status_error": "deployment is missing",
             "health": {"mode": "status"},
         },
     )
 
-    report = release.status()
+    report = release.status(full=True)
 
     assert report["healthy"] is False
     assert report["release_status_error"] == "deployment is missing"

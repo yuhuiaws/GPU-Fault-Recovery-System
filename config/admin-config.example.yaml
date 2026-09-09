@@ -17,6 +17,8 @@ spec:
       maxActiveRegion: 20
       maxActivePerCluster: 5
       maxActivePerResourceClass: 2
+      # maxActivePerNode and maxActivePerFailureDomain are safety constants
+      # fixed at 1; they are not configurable and are omitted here on purpose.
   aurora:
     minAcu: 8
     maxAcu: 32

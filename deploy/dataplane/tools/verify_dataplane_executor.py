@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Post-deploy self-check for the data-plane cluster executor.
 
-The control plane has verify-control-plane-role-split.sh; the data plane
+The control plane has verify_control_plane_role_split.py; the data plane
 had nothing, and every gap found on real hardware so far shared one
 shape: the Pod was Running, the logs were clean, and the executor was
 still unable to do its job. This checks the properties that decide that,

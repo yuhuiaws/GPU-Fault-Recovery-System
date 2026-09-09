@@ -19,14 +19,17 @@ from typing import TYPE_CHECKING, Any
 
 from gpu_fault.adapters.common import node_action_accepted_nodes
 from gpu_fault.aws_errors import aws_configuration_error
+from gpu_fault.cluster_executor.batching import execute_batched_command
+from gpu_fault.cluster_executor.lease import adapter_facing_details
 from gpu_fault.cluster_executor.regional_client import ClusterExecutorError
-from gpu_fault.execution import WorkflowStepContext
+from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.execution.fleet_preflight import (
     command_requires_fleet_preflight,
     fleet_preflight_reason,
 )
 from gpu_fault.execution.transient_errors import retryable_adapter_error
 from gpu_fault.models import (
+    WorkflowOperation,
     WorkflowStepExecution,
     WorkflowStepStatus,
     execution_phase,
@@ -62,7 +65,9 @@ class CommandDispatch:
         check come first; then the single matching adapter runs the step, and
         whatever it raised is classified into a result by
         ``_classify_failure`` -- retryable (WAITING), rejected, misconfigured
-        or an executor defect (FAILED).
+        or an executor defect (FAILED). A compound command (``batched_steps``)
+        leaves here after the barrier check: ``execute_batched_command`` runs
+        its covered steps one at a time through these same pieces.
         """
 
         lease_token = command.lease_token
@@ -70,9 +75,14 @@ class CommandDispatch:
             raise ClusterExecutorError("claimed command has no lease token")
         try:
             self._validate(command)
-            hold = self._fleet_preflight_hold(command, lease_token)
-            if hold is not None:
-                return hold
+            if not command.batched_steps:
+                # A compound command's head is preflighted inside the batched
+                # run, against the workflow as it stands when its turn comes,
+                # like every step it covers; doing it here too would cost the
+                # control-plane round trip the compound command exists to save.
+                hold = self._fleet_preflight_hold(command, lease_token)
+                if hold is not None:
+                    return hold
             matches = [
                 adapter
                 for adapter in self.executor.adapters
@@ -86,6 +96,10 @@ class CommandDispatch:
             barrier_hold = self._barrier_hold(command, matches[0], lease_token)
             if barrier_hold is not None:
                 return barrier_hold
+            if command.batched_steps:
+                return execute_batched_command(
+                    self.executor, command, matches[0], lease_token
+                )
             workflow = command.workflow
             if command.result_details:
                 previous = WorkflowStepExecution(
@@ -94,7 +108,7 @@ class CommandDispatch:
                     status=WorkflowStepStatus.WAITING,
                     phase=execution_phase(workflow),
                     adapter_operation_id=(f"remote/{command.command_id}"),
-                    details=command.result_details,
+                    details=adapter_facing_details(command.result_details),
                 )
                 workflow = workflow.model_copy(
                     update={
@@ -114,33 +128,49 @@ class CommandDispatch:
                     idempotency_key=command.idempotency_key,
                 )
             )
-            status = {
-                WorkflowStepStatus.WAITING: (RemoteCommandStatus.WAITING),
-                WorkflowStepStatus.SUCCEEDED: (RemoteCommandStatus.SUCCEEDED),
-                WorkflowStepStatus.FAILED: (RemoteCommandStatus.FAILED),
-            }[outcome.status]
-            details = dict(outcome.details or {})
-            error = outcome.error
-            if status is RemoteCommandStatus.FAILED and not error:
-                # A FAILED outcome without a message is still the adapter's
-                # verdict, not an executor defect. Left as None it failed the
-                # result model's validation inside this try block and was
-                # caught below as an executor-internal-error -- a stack trace,
-                # an unexpected-failure count and an alert for a refusal the
-                # adapter merely forgot to describe.
-                error = (
-                    f"{command.step.operation.value} adapter reported FAILED "
-                    "without an error message"
-                )
-                details["error_message_missing"] = True
-            return RemoteCommandResult(
-                lease_token=lease_token,
-                status=status,
-                details=details,
-                error=error,
+            return self.outcome_result(
+                outcome, lease_token, operation=command.step.operation
             )
         except Exception as exc:
             return self._classify_failure(exc, command, lease_token)
+
+    @staticmethod
+    def outcome_result(
+        outcome: WorkflowStepOutcome,
+        lease_token: str,
+        *,
+        operation: WorkflowOperation,
+    ) -> RemoteCommandResult:
+        """The adapter's own verdict as a result; no merge, no classification.
+
+        ``operation`` is the step's own so a compound command's later steps
+        are described as themselves, not as the head.
+        """
+
+        status = {
+            WorkflowStepStatus.WAITING: (RemoteCommandStatus.WAITING),
+            WorkflowStepStatus.SUCCEEDED: (RemoteCommandStatus.SUCCEEDED),
+            WorkflowStepStatus.FAILED: (RemoteCommandStatus.FAILED),
+        }[outcome.status]
+        details = dict(outcome.details or {})
+        error = outcome.error
+        if status is RemoteCommandStatus.FAILED and not error:
+            # A FAILED outcome without a message is still the adapter's
+            # verdict, not an executor defect. Left as None it failed the
+            # result model's validation inside the caller's try block and was
+            # caught as an executor-internal-error -- a stack trace, an
+            # unexpected-failure count and an alert for a refusal the adapter
+            # merely forgot to describe.
+            error = (
+                f"{operation.value} adapter reported FAILED without an error message"
+            )
+            details["error_message_missing"] = True
+        return RemoteCommandResult(
+            lease_token=lease_token,
+            status=status,
+            details=details,
+            error=error,
+        )
 
     def _fleet_preflight_hold(
         self,
@@ -205,6 +235,11 @@ class CommandDispatch:
         ``ClusterExecutorError`` is first a transient control-plane failure,
         then a transport/adapter retry, then a deliberate rejection; anything
         else is a retry, an AWS configuration gap, or an executor defect.
+
+        ``command`` is the step being judged: for a step inside a compound
+        command the caller passes its per-step view (own ``step``,
+        ``step_index``, ``result_details``), so the log lines, the hold merge
+        and the accepted-node check all describe that step and not the head.
         """
 
         if isinstance(exc, ClusterExecutorError):
@@ -289,6 +324,10 @@ class CommandDispatch:
             command.step.operation.value,
             command.step.execution_owner,
             ",".join(command.step.node_ids),
+            # Explicit: the batched run classifies a step's exception after
+            # its ``except`` block has closed, where there is no "current"
+            # exception for LOGGER.exception to pick up.
+            exc_info=exc,
         )
         return RemoteCommandResult(
             lease_token=lease_token,
@@ -324,6 +363,11 @@ class CommandDispatch:
             executor_id=self.executor.executor_id,
         )
         if retryable is not None:
+            # Unlike an adapter or control-plane retryable, a transport failure
+            # names this executor's own connectivity (gaierror, refused
+            # connection, timeout reaching the target); the claim loop counts
+            # whole cycles of these and backs off (``_idle_delay``).
+            self.executor.increment("retryable_transport_errors_total")
             LOGGER.warning(
                 "regional cluster executor transport failed; "
                 "command remains retryable: command=%s cluster=%s "

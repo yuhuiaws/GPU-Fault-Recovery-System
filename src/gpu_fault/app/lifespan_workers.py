@@ -5,12 +5,61 @@ import os
 import random
 import time
 from threading import Event, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
+import gpu_fault.app.process_metrics as process_metrics
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 from gpu_fault.env_validation import training_health_monitor_enabled
+from gpu_fault.store.contracts import WakeupChannel
+
+if TYPE_CHECKING:
+    from gpu_fault.app.context import ApplicationContext
 
 LOGGER = logging.getLogger(__name__)
+
+# One listener thread per wakeup channel, named so a shutdown failure or a
+# thread dump says which channel hung.
+DISPATCHER_WAKEUP_THREAD_NAMES: dict[WakeupChannel, str] = {
+    WakeupChannel.WORKFLOW_DISPATCH: "gpu-fault-workflow-dispatch-wakeups-workflow",
+    WakeupChannel.REMOTE_COMMAND: "gpu-fault-workflow-dispatch-wakeups-remote-command",
+}
+
+
+def dispatcher_wakeup_threads(context: ApplicationContext, stop: Event) -> list[Thread]:
+    """Unstarted listener threads that turn the store's ``WakeupChannel``
+    NOTIFYs into ``dispatcher.wake()`` in this process (性能 A).
+
+    Both worker shapes get them -- the processor Pod's ``run_dispatch`` loop
+    and the bare ``run_forever`` thread -- because both consume the same wake
+    event; the routes' own ``wake()`` calls land in the ingress process and
+    never reach the scanner. Skipped when the dispatcher is off (the ingress
+    role) or the store has no listener (the processor's queue listener is
+    gated the same way, for the same test doubles).
+    """
+
+    dispatcher = context.dispatcher
+    if not dispatcher.config.enabled or not hasattr(
+        context.store, "run_wakeup_listener"
+    ):
+        return []
+    return [
+        Thread(
+            target=dispatcher.run_wakeups,
+            args=(channel, stop),
+            name=DISPATCHER_WAKEUP_THREAD_NAMES[channel],
+            daemon=True,
+        )
+        for channel in WakeupChannel
+    ]
+
+
+def start_dispatcher_wakeup_threads(
+    context: ApplicationContext, stop: Event
+) -> list[Thread]:
+    threads = dispatcher_wakeup_threads(context, stop)
+    for thread in threads:
+        thread.start()
+    return threads
 
 
 def start_regional_registry_worker(runtime: Any, stop: Event) -> Thread | None:
@@ -120,6 +169,7 @@ def start_processor_threads(
                 daemon=True,
             )
         )
+    threads.extend(dispatcher_wakeup_threads(context, stop))
     if processor.telemetry_spool_enabled:
         threads.append(
             Thread(
@@ -319,6 +369,24 @@ def start_notification_worker(
     worker = Thread(
         target=dispatch,
         name="gpu-fault-notification-dispatcher",
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
+def start_process_metrics_worker(
+    render: Callable[[], list[str]], stop: Event
+) -> Thread:
+    """Share this process's /metrics render with the Pod's other uvicorn
+    processes every few seconds, so a scrape answered by any of them merges
+    the whole Pod (see ``process_metrics``). Every process, every role; the
+    thread returns at once when sharing is off (no POD_UID)."""
+
+    worker = Thread(
+        target=process_metrics.publish_forever,
+        args=(render, stop),
+        name="gpu-fault-process-metrics",
         daemon=True,
     )
     worker.start()

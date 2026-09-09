@@ -9,17 +9,27 @@ workspace IAM role (SigV4, ``default`` auth type), a folder, and imports every
 converges instead of duplicating.
 
 Two rules shape the failure handling. The workspace is never guessed between
-candidates: an untagged region with one ACTIVE workspace is adopted and tagged
-for the next run, two untagged workspaces are an error that names them, none is
-an error that names the flag. And dashboards are not the alerting path: unless
-the operator's own input was wrong (``--grafana-workspace-id`` pointing at
-nothing, or ``--grafana create`` refused), a failed step is recorded as ``FAILED``
-with a loud warning and the deploy continues.
+candidates: ``--grafana-workspace-id`` wins, then the workspace tagged for this
+site, then a region with one ACTIVE untagged workspace is adopted and tagged for
+the next run, two untagged workspaces are an error that names them, and none
+means the deploy creates one for the site (IAM Identity Center authentication,
+``CUSTOMER_MANAGED``, our read-only AMP role, our creation tag so uninstall
+removes it). And dashboards are not the alerting path: unless the operator's own
+input was wrong (``--grafana-workspace-id`` pointing at nothing, ``--grafana-viewer``
+refused), a failed step -- a refused import or a creation the region cannot
+serve -- is recorded as ``FAILED`` with a loud warning that names the manual
+fallback, and the deploy continues.
 
 The Grafana HTTP API is reached with a service-account token minted through the
 AWS API for one run (15 minutes) and deleted in a ``finally``; the token never
 enters state, the summary or the command log (the runner treats the minting
 command as sensitive).
+
+Opening the dashboards is the one manual step left: Amazon Managed Grafana only
+authenticates IAM Identity Center or SAML users, so someone has to be granted a
+role on the workspace. ``--grafana-viewer <sso-user-id>`` does it in the deploy;
+without it the deploy prints the exact ``aws grafana update-permissions`` line
+for the resolved workspace.
 """
 
 from __future__ import annotations
@@ -69,10 +79,13 @@ TOKEN_SECONDS_TO_LIVE = 900
 # only carries the site tag was adopted, and adopted workspaces are preserved.
 CREATED_TAG_KEY = "gpu-fault:grafana-created-by"
 CREATED_TAG_VALUE = "gpu-fault-admin"
-DRY_RUN_WORKSPACE_ID = "g-dryrun"
-GRAFANA_MODES = ("enabled", "disabled", "create")
-GRAFANA_ENV = "GPU_FAULT_ADMIN_GRAFANA"
 GRAFANA_WORKSPACE_ID_ENV = "GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID"
+GRAFANA_VIEWER_ENV = "GPU_FAULT_ADMIN_GRAFANA_VIEWER"
+# (argparse destination, inherited variable) for every option this module owns.
+_OPTION_VARIABLES = (
+    ("grafana_workspace_id", GRAFANA_WORKSPACE_ID_ENV),
+    ("grafana_viewer", GRAFANA_VIEWER_ENV),
+)
 HTTP_TIMEOUT_SECONDS = 30
 WORKSPACE_ACTIVE_TIMEOUT_SECONDS = 600
 _WORKSPACE_TASK = "monitoring_install"
@@ -94,12 +107,13 @@ HttpTransport = Callable[[str, str, Mapping[str, str], bytes | None], HttpRespon
 class GrafanaSettings:
     """What one deploy run wants from Grafana, resolved from CLI, site and state."""
 
-    enabled: bool = True
     workspace_id: str | None = None
     # ``--grafana-workspace-id`` on this command is operator input: a wrong value
     # fails the deploy. The same id read back from ``site.yaml`` is not.
     workspace_id_is_operator_input: bool = False
-    create: bool = False
+    # ``--grafana-viewer``: the IAM Identity Center user granted VIEWER once the
+    # dashboards are in. Operator input too; a refused grant fails the deploy.
+    viewer_sso_user_id: str | None = None
     # The previous run's ``monitoring_install.grafana`` record, so the read-only
     # probe can ask for ensure until the dashboards have actually landed.
     previous: Mapping[str, Any] | None = None
@@ -110,21 +124,20 @@ class GrafanaSettings:
 
 def add_grafana_arguments(deploy: argparse.ArgumentParser) -> None:
     deploy.add_argument(
-        "--grafana",
-        choices=GRAFANA_MODES,
-        default=None,
-        help=(
-            "import the solution dashboards into Amazon Managed Grafana in the "
-            "CPU cluster's region (default: enabled); 'create' also creates a "
-            "workspace when the region has none"
-        ),
-    )
-    deploy.add_argument(
         "--grafana-workspace-id",
         metavar="WORKSPACE_ID",
         help=(
-            "existing Amazon Managed Grafana workspace to import into "
-            "(default: the one ACTIVE workspace in the region)"
+            "Amazon Managed Grafana workspace to import the solution dashboards "
+            "into (default: the workspace tagged for this site, else the one "
+            "ACTIVE workspace in the CPU cluster's region, else one is created)"
+        ),
+    )
+    deploy.add_argument(
+        "--grafana-viewer",
+        metavar="SSO_USER_ID",
+        help=(
+            "IAM Identity Center user id granted VIEWER on the Grafana workspace "
+            "after the import (otherwise the deploy prints the command to run)"
         ),
     )
 
@@ -138,37 +151,23 @@ def grafana_environment(arguments: argparse.Namespace) -> dict[str, str]:
     consent does.
     """
 
-    environment: dict[str, str] = {}
-    mode = getattr(arguments, "grafana", None)
-    if mode:
-        environment[GRAFANA_ENV] = str(mode)
-    workspace_id = getattr(arguments, "grafana_workspace_id", None)
-    if workspace_id:
-        environment[GRAFANA_WORKSPACE_ID_ENV] = str(workspace_id)
-    return environment
+    return {
+        variable: str(value)
+        for destination, variable in _OPTION_VARIABLES
+        if (value := getattr(arguments, destination, None))
+    }
 
 
 def grafana_request_fields(arguments: argparse.Namespace) -> dict[str, Any]:
     """``BootstrapRequest`` fields: the option wins, then the inherited variable."""
 
-    mode = str(
-        getattr(arguments, "grafana", None)
-        or os.getenv("GPU_FAULT_ADMIN_GRAFANA", "enabled")
-    ).strip()
-    if mode not in GRAFANA_MODES:
-        raise BootstrapError(
-            f"GPU_FAULT_ADMIN_GRAFANA must be one of {', '.join(GRAFANA_MODES)}, "
-            f"not {mode!r}"
-        )
-    workspace_id = str(
-        getattr(arguments, "grafana_workspace_id", None)
-        or os.getenv("GPU_FAULT_ADMIN_GRAFANA_WORKSPACE_ID", "")
-    ).strip()
-    return {
-        "grafana_enabled": mode != "disabled",
-        "grafana_workspace_id": workspace_id or None,
-        "grafana_create": mode == "create",
-    }
+    fields: dict[str, Any] = {}
+    for destination, variable in _OPTION_VARIABLES:
+        value = str(
+            getattr(arguments, destination, None) or os.getenv(variable, "")
+        ).strip()
+        fields[destination] = value or None
+    return fields
 
 
 def grafana_settings(
@@ -180,17 +179,15 @@ def grafana_settings(
     previous = _state_result(state)
     if request.grafana_workspace_id:
         return GrafanaSettings(
-            enabled=request.grafana_enabled,
             workspace_id=request.grafana_workspace_id,
             workspace_id_is_operator_input=True,
-            create=request.grafana_create,
+            viewer_sso_user_id=request.grafana_viewer,
             previous=previous,
         )
     persisted = _site_health(existing_site).get("grafanaWorkspaceId")
     return GrafanaSettings(
-        enabled=request.grafana_enabled,
         workspace_id=str(persisted) if persisted else None,
-        create=request.grafana_create,
+        viewer_sso_user_id=request.grafana_viewer,
         previous=previous,
     )
 
@@ -200,14 +197,56 @@ def grafana_site_health(
 ) -> dict[str, Any]:
     """The ``spec.health`` keys that persist this run's Grafana decision."""
 
-    if not settings.enabled:
-        return {"grafanaEnabled": False}
     result = _state_result(state) or {}
     workspace_id = result.get("workspace_id") or settings.workspace_id
-    health: dict[str, Any] = {"grafanaEnabled": True}
-    if workspace_id:
-        health["grafanaWorkspaceId"] = str(workspace_id)
-    return health
+    return {"grafanaWorkspaceId": str(workspace_id)} if workspace_id else {}
+
+
+def grafana_access_lines(state: BootstrapState) -> list[str]:
+    """What the operator reads at the end of a deploy: where the dashboards are
+    and how a person gets in.
+
+    The import needs no human login, but viewing does: Amazon Managed Grafana
+    authenticates only IAM Identity Center or SAML users. When ``--grafana-viewer``
+    granted someone, say so; otherwise print the exact ``update-permissions``
+    line for the resolved workspace so nobody has to look the id up.
+    """
+
+    result = _state_result(state) or {}
+    workspace_id = str(result.get("workspace_id") or "")
+    if str(result.get("status") or "") != "PROVISIONED" or not workspace_id:
+        return []
+    lines = [f"Grafana dashboards: {result.get('dashboards_url') or ''}"]
+    viewer = result.get("viewer_sso_user_id")
+    if viewer:
+        lines.append(f"Grafana VIEWER granted to Identity Center user {viewer}")
+    else:
+        lines.append(
+            "Grafana access: grant yourself VIEWER with "
+            f"`{viewer_permission_command(str(result.get('region') or ''), workspace_id, '<sso-user-id>')}` "
+            "or re-run deploy with --grafana-viewer <sso-user-id>"
+        )
+    return lines
+
+
+def viewer_permission_command(region: str, workspace_id: str, sso_user_id: str) -> str:
+    """The ``aws`` line that grants one Identity Center user VIEWER."""
+
+    return (
+        f"aws grafana update-permissions --region {region} "
+        f"--workspace-id {workspace_id} --update-instruction-batch "
+        f"'{json.dumps(_viewer_instructions(sso_user_id), separators=(',', ':'))}'"
+    )
+
+
+def _viewer_instructions(sso_user_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "action": "ADD",
+            "role": "VIEWER",
+            "users": [{"id": sso_user_id, "type": "SSO_USER"}],
+        }
+    ]
 
 
 def _state_result(state: BootstrapState) -> Mapping[str, Any] | None:
@@ -232,7 +271,6 @@ def ensure_grafana_workspace(
     cpu: ClusterIdentity,
     site_id: str,
     requested_id: str | None = None,
-    create_allowed: bool = False,
 ) -> dict[str, Any]:
     """Resolve the one workspace this site uses; see the module docstring."""
 
@@ -270,7 +308,7 @@ def ensure_grafana_workspace(
         raise BootstrapError(
             f"{len(candidates)} Amazon Managed Grafana workspaces in {region} carry "
             f"no {SITE_TAG_KEY} tag: {listed}; pass --grafana-workspace-id to "
-            "choose one, or --grafana disabled"
+            "choose one"
         )
     if candidates:
         workspace = candidates[0]
@@ -290,15 +328,6 @@ def ensure_grafana_workspace(
             capture=False,
         )
         return _resolved(workspace, region, "EXTERNAL")
-    if runner.dry_run:
-        return _resolved(
-            {"id": DRY_RUN_WORKSPACE_ID, "status": "ACTIVE"}, region, "EXTERNAL"
-        )
-    if not create_allowed:
-        raise BootstrapError(
-            f"no Amazon Managed Grafana workspace in {region}; "
-            "pass --grafana-workspace-id, or --grafana disabled"
-        )
     return _create_workspace(runner, cpu=cpu, site_id=site_id)
 
 
@@ -364,28 +393,43 @@ def _resolved(
 def _create_workspace(
     runner: CommandRunner, *, cpu: ClusterIdentity, site_id: str
 ) -> dict[str, Any]:
+    """Create the site's workspace: IAM Identity Center sign-in, our AMP role.
+
+    The region may refuse -- no Identity Center instance, a quota, a denied
+    ``grafana:CreateWorkspace`` -- and that is not the operator's mistake, so the
+    error carries the fallback the deploy's soft failure will print.
+    """
+
     role = _ensure_workspace_role(runner, cpu=cpu, site_id=site_id)
     tags = {SITE_TAG_KEY: site_id, CREATED_TAG_KEY: CREATED_TAG_VALUE}
-    created = runner.aws_json(
-        cpu.region,
-        "grafana",
-        "create-workspace",
-        "--workspace-name",
-        safe_name(f"gpu-fault-{site_id}", maximum=255),
-        "--account-access-type",
-        "CURRENT_ACCOUNT",
-        "--authentication-providers",
-        "AWS_SSO",
-        "--permission-type",
-        "CUSTOMER_MANAGED",
-        "--workspace-role-arn",
-        role["role_arn"],
-        "--workspace-data-sources",
-        "PROMETHEUS",
-        "--tags",
-        json.dumps(tags, separators=(",", ":")),
-        mutate=True,
-    )
+    try:
+        created = runner.aws_json(
+            cpu.region,
+            "grafana",
+            "create-workspace",
+            "--workspace-name",
+            safe_name(f"gpu-fault-{site_id}", maximum=255),
+            "--account-access-type",
+            "CURRENT_ACCOUNT",
+            "--authentication-providers",
+            "AWS_SSO",
+            "--permission-type",
+            "CUSTOMER_MANAGED",
+            "--workspace-role-arn",
+            role["role_arn"],
+            "--workspace-data-sources",
+            "PROMETHEUS",
+            "--tags",
+            json.dumps(tags, separators=(",", ":")),
+            mutate=True,
+        )
+    except BootstrapError as exc:
+        raise BootstrapError(
+            f"could not create an Amazon Managed Grafana workspace in {cpu.region}: "
+            f"{exc}. Create one in the console (IAM Identity Center "
+            "authentication, CUSTOMER_MANAGED permissions) and re-run deploy with "
+            "--grafana-workspace-id <id>"
+        ) from exc
     workspace_id = str((created.get("workspace") or {}).get("id") or "")
     if not workspace_id:
         raise BootstrapError("create-workspace returned no workspace id")
@@ -744,15 +788,6 @@ def provision_grafana(
         "workspace_url": base_url,
         "dashboards_url": f"{base_url}/dashboards/f/{DASHBOARD_FOLDER_UID}",
     }
-    if runner.dry_run:
-        return {
-            **summary,
-            "status": "DRY_RUN",
-            "dashboards": [
-                {"uid": item["uid"], "title": item["title"], "version": None}
-                for item in dashboards
-            ],
-        }
     account_id = _ensure_service_account(runner, region, workspace_id)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     minted = runner.aws_json(
@@ -840,8 +875,9 @@ def ensure_grafana_dashboards(
     ``PROVISIONED`` -- a soft failure is retried on every deploy, not cached.
     """
 
-    if settings is None or not settings.enabled:
-        return {"status": "DISABLED"}
+    if settings is None:
+        # A caller without a Grafana decision (the legacy site path): no step.
+        return {"status": "SKIPPED"}
     previous = dict(settings.previous or {})
     if probe_only:
         if str(previous.get("status") or "") != "PROVISIONED":
@@ -858,17 +894,15 @@ def ensure_grafana_dashboards(
         except BootstrapError as exc:
             raise BootstrapMutationRequired("grafana workspace") from exc
         return {"status": "PROBED"}
-    operator_input = settings.workspace_id_is_operator_input or settings.create
     try:
         workspace = ensure_grafana_workspace(
             runner,
             cpu=cpu,
             site_id=site_id,
             requested_id=settings.workspace_id,
-            create_allowed=settings.create,
         )
     except BootstrapError as exc:
-        if operator_input:
+        if settings.workspace_id_is_operator_input:
             raise
         return _failed(exc, {})
     try:
@@ -882,15 +916,53 @@ def ensure_grafana_dashboards(
         )
     except (BootstrapError, ValueError) as exc:
         return _failed(exc, workspace)
-    return {"status": "PROVISIONED", **workspace, **summary}
+    viewer: dict[str, Any] = {}
+    if settings.viewer_sso_user_id:
+        grant_viewer(
+            runner,
+            region=cpu.region,
+            workspace_id=str(workspace["workspace_id"]),
+            sso_user_id=settings.viewer_sso_user_id,
+        )
+        viewer = {"viewer_sso_user_id": settings.viewer_sso_user_id}
+    return {"status": "PROVISIONED", **workspace, **summary, **viewer}
+
+
+def grant_viewer(
+    runner: CommandRunner, *, region: str, workspace_id: str, sso_user_id: str
+) -> None:
+    """Grant one Identity Center user VIEWER; ``--grafana-viewer`` is operator
+    input, so a refused id is an error, not a soft failure.
+
+    ``update-permissions`` answers 200 and lists per-instruction failures in
+    ``errors`` instead of failing the call, so the body is what decides.
+    """
+
+    answer = runner.aws_json(
+        region,
+        "grafana",
+        "update-permissions",
+        "--workspace-id",
+        workspace_id,
+        "--update-instruction-batch",
+        json.dumps(_viewer_instructions(sso_user_id), separators=(",", ":")),
+        mutate=True,
+    )
+    errors = answer.get("errors") or []
+    if errors:
+        raise BootstrapError(
+            f"Grafana workspace {workspace_id} refused VIEWER for Identity Center "
+            f"user {sso_user_id}: {json.dumps(errors)[:300]}"
+        )
 
 
 def _failed(error: Exception, workspace: Mapping[str, Any]) -> dict[str, Any]:
     reason = str(error)
     print(
         "WARNING: Grafana dashboards were not provisioned; the alerting path is "
-        f"unaffected and the deploy continues. Reason: {reason}. Import "
-        f"{DASHBOARDS_DIRECTORY}/*.json by hand or re-run deploy once fixed.",
+        f"unaffected and the deploy continues. Reason: {reason}. Fix the cause "
+        f"and re-run deploy, or import {DASHBOARDS_DIRECTORY}/*.json by hand "
+        "(Dashboards -> New -> Import, data source 'GPU Fault AMP').",
         file=sys.stderr,
         flush=True,
     )

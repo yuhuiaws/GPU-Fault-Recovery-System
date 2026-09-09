@@ -78,8 +78,21 @@ def _deployment(
                             "envFrom": [
                                 {"configMapRef": {"name": f"{name}-config-core"}}
                             ],
+                            "volumeMounts": [
+                                {
+                                    "name": "aurora-credentials",
+                                    "mountPath": "/etc/gpu-fault/aurora",
+                                    "readOnly": True,
+                                }
+                            ],
                         }
-                    ]
+                    ],
+                    "volumes": [
+                        {
+                            "name": "aurora-credentials",
+                            "secret": {"secretName": "gpu-fault-aurora"},
+                        }
+                    ],
                 }
             },
         },
@@ -115,7 +128,7 @@ def _live_control_plane() -> dict[str, dict[str, Any]]:
                 "GPU_FAULT_TELEMETRY_SPOOL": "false",
                 "GPU_FAULT_PROCESSOR_WORKERS": "8",
             },
-            UVICORN + "--port 8081 --workers 1",
+            UVICORN + "--port 8081 --workers 4",
             replicas=1,
         ),
         "gpu-fault-telemetry-spool-worker": _deployment(
@@ -382,7 +395,7 @@ def test_apply_script_passes_the_snapshot_to_both_verifications() -> None:
     assert guard < flag < end_of_guard < lint, "flag must be added inside the guard"
     assert script.count("--container-env-snapshot") == 1
 
-    verify = script.index('"${SCRIPT_DIR}/verify-control-plane-role-split.sh"')
+    verify = script.index('python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"')
     handoff = script.rindex(
         'GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE="${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}"',
         0,

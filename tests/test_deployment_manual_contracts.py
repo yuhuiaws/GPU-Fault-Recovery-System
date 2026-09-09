@@ -101,8 +101,10 @@ def test_manual_forbids_multiple_global_load_balancer_controllers() -> None:
 def test_manual_uses_current_regional_rollout_contracts() -> None:
     text = manual()
 
+    # REG-9 no longer restarts the control plane by hand (rotate-token does
+    # it), so the manual names the script in three break-glass places only.
     assert (
-        text.count("deploy/control-plane/tools/restart-regional-control-plane.sh") >= 4
+        text.count("deploy/control-plane/tools/restart-regional-control-plane.sh") >= 3
     )
     assert "while [ $i -lt 300 ]" in text
     assert "--timeout=420s" in text
@@ -138,7 +140,8 @@ def test_manual_documents_both_training_submission_paths() -> None:
     assert "gpu-training-submit" in text
     assert "gpu-fault-workload-annotate" in text
     assert "apply --dry-run=server" in text
-    assert "gpu-fault-admin verify" in text
+    assert "gpu-fault-admin status --full" in text
+    assert "gpu-fault-admin verify" not in text, "verify is no longer a public verb"
     assert "--site" in text
     assert "warnings为空" in text
     assert "注册锚点" in text
@@ -158,7 +161,6 @@ def test_manual_support_files_exist() -> None:
         "deploy/control-plane/tools/restart-regional-control-plane.sh",
         "deploy/control-plane/tools/apply-control-plane-role-split.sh",
         "deploy/control-plane/tools/verify_control_plane_role_split.py",
-        "deploy/control-plane/tools/verify-control-plane-role-split.sh",
         "deploy/README.md",
         "scripts/verify-regional-alerting.py",
         "scripts/generate-cleanup-inventory.py",
@@ -391,8 +393,11 @@ def test_developer_release_has_one_build_and_deploy_entrypoint() -> None:
     assert "cosign verify-blob" in workflow
     assert "make PYTHON=.venv/bin/python release-build" in developer
     assert "make PYTHON=.venv/bin/python release-deploy" in developer
-    assert "gpu-fault-admin approve-profile" in developer
-    assert "--plan-sha256" in developer
+    assert "gpu-fault-admin approve-profile" not in developer, (
+        "profile approval is a deploy flag, not a separate verb"
+    )
+    assert "--approve-profile-plan" in developer
+    assert "--plan-sha256" not in developer
     assert "site_identity" in developer
     assert "cpu_eks_arn" in developer
     assert "profile-plan.json" in developer

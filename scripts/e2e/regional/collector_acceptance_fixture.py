@@ -171,6 +171,25 @@ for workflow in store.list_workflows(limit=500, newest_first=True):
         continue
     incidents.append(incident.model_dump(mode="json"))
     workflows.append(workflow.model_dump(mode="json"))
+# A MONITOR_ONLY / NO_ACTION decision (RESTART_APP on an IDLE node) opens no
+# workflow at all, so the workflow walk above never surfaces its incident. The
+# marked decision still names it, so its incident is read directly here -- the
+# only way a case can assert the RECOVERED incident that closed without a
+# workflow. Deduped against the workflow-discovered incidents and filtered by
+# cluster/node exactly as they are.
+seen_incident_ids = {item["incident_id"] for item in incidents}
+for item in decisions:
+    incident_id = item.get("incident_id")
+    if not incident_id or incident_id in seen_incident_ids:
+        continue
+    try:
+        incident = store.get_incident(incident_id)
+    except Exception:
+        continue
+    if incident.cluster_id != cluster_id or node_id not in incident.node_ids:
+        continue
+    seen_incident_ids.add(incident_id)
+    incidents.append(incident.model_dump(mode="json"))
 # Every backend filters remote commands by workflow in the store; paging the
 # whole table through the API Pod to filter it here was the slowest read of
 # the poll.

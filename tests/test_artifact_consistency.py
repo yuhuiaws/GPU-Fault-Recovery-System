@@ -52,6 +52,14 @@ def release_manifest() -> dict:
 def test_module_digest_reacts_to_a_behaviour_change(tmp_path) -> None:
     copy = tmp_path / "gpu_fault"
     shutil.copytree(SOURCE_PACKAGE, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    # The digest covers the sibling local package installed next to
+    # ``gpu_fault`` when there is one (the deploy-host wheel's release engine),
+    # so a faithful copy of the checkout carries ``src/gpu_fault_release`` too.
+    shutil.copytree(
+        SOURCE_PACKAGE.parent / "gpu_fault_release",
+        tmp_path / "gpu_fault_release",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     baseline = module_digest(copy)
     assert baseline == module_digest(SOURCE_PACKAGE)
 

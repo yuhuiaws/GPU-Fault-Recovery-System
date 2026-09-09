@@ -1,12 +1,14 @@
 """Run the Aurora credential refresh synchronously before a release mutates.
 
 RDS rotates the managed master password every 7 days. The only thing that
-copies AWSCURRENT into the ``gpu-fault-aurora`` Secret and reconciles the
-control-plane Deployments is the ``gpu-fault-aurora-credential-refresh``
-CronJob (``deploy/control-plane/regional/aurora-credential-refresh.yaml``,
-``src/gpu_fault/aurora_credential_refresh.py``). Running replicas are not
-disturbed by a rotation -- the pool authenticated before it -- but every NEW
-Pod scheduled between the rotation and the CronJob's next tick dies on
+copies AWSCURRENT into the ``gpu-fault-aurora`` Secret is the
+``gpu-fault-aurora-credential-refresh`` CronJob
+(``deploy/control-plane/regional/aurora-credential-refresh.yaml``,
+``src/gpu_fault/aurora_credential_refresh.py``). Running Pods mount that
+Secret as files and their pool re-reads the DSN on every connect (CP-3), so
+once the Secret is current they recover without a restart -- but until it is,
+every reconnect the pool makes after ``max_idle`` fails, and every NEW Pod
+scheduled between the rotation and the CronJob's next tick dies on
 ``FATAL: password authentication failed``.
 
 A release transaction is exactly a burst of new Pods. On 2026-09-07 12:13Z a
@@ -36,9 +38,9 @@ from gpu_fault_release.regional_release_config import ReleaseError
 CRONJOB_NAME = "gpu-fault-aurora-credential-refresh"
 REFRESH_WAIT_SECONDS_ENV = "GPU_FAULT_RELEASE_AURORA_REFRESH_WAIT_SECONDS"
 # The CronJob's own activeDeadlineSeconds is 900 and a converged run finishes in
-# seconds; a rotation that has to verify the new password against the database
-# and roll three Deployments is the slow path this has to accommodate. The
-# operator-visible manual cure used the same 300s.
+# seconds; a rotation that has to fetch AWSCURRENT and verify the new password
+# against the database is the slow path this has to accommodate (it no longer
+# rolls any Deployment). The operator-visible manual cure used the same 300s.
 DEFAULT_REFRESH_WAIT_SECONDS = 300
 # How much longer the client may block than the server-side wait, so a hung
 # kubectl cannot hold the release forever while the Job decides the verdict.

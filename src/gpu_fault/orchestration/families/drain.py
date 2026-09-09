@@ -2,35 +2,90 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    bounded_reasons,
     FaultIncident,
     IncidentState,
     RecoveryAction,
     WorkflowRequest,
     WorkflowStatus,
+    bounded_reasons,
 )
+from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
+from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 
 
 @dataclass(frozen=True)
 class DrainOperationCallbacks:
-    active_node_exclusive_workflow: Callable
-    attempt_group_key: Callable
-    merge_disposition: Callable
-    node_group_key: Callable
-    ingest_node_health: Callable
-    incident_state_for_workflow: Callable
-    prepare_preempting_successor: Callable
+    active_node_exclusive_workflow: Callable[..., Any]
+    aggregation_deadlines: Callable[..., Any]
+    attempt_group_key: Callable[..., Any]
+    merge_disposition: Callable[..., Any]
+    node_group_key: Callable[..., Any]
+    ingest_node_health: Callable[..., Any]
+    incident_state_for_workflow: Callable[..., Any]
+    preempt_parallel_job_branch: Callable[..., Any]
+    prepare_preempting_successor: Callable[..., Any]
 
 
 class DrainOperationService:
-    def __init__(self, store, brancher, callbacks: DrainOperationCallbacks) -> None:
+    """The two node-health routes that join a node's incumbent workflow.
+
+    Both routes ask ``disposition()`` and apply the verdict through the
+    :class:`DispositionApplier` the three fault families share (F-B5). They
+    used to fold the nine verdicts into two of their own -- route one queued
+    everything but ABSORB behind the node's branch, route two treated
+    WIDEN_IN_PLACE as ABSORB -- so a PENDING, unstarted RESET_GPU incumbent
+    met by a critical QUARANTINE (verdict REPLACE_IN_PLACE) ran the reset
+    first and the isolation second (control-plane review 2026-09-08, C-07).
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        arbiter: Any,
+        brancher: Any,
+        callbacks: DrainOperationCallbacks,
+        *,
+        workflow_preemption_enabled: bool,
+    ) -> None:
         self.store = store
+        self.arbiter = arbiter
         self.brancher = brancher
         self.callbacks = callbacks
+        self.dispositions = DispositionApplier(
+            arbiter=arbiter,
+            brancher=brancher,
+            aggregation_deadlines=callbacks.aggregation_deadlines,
+            prepare_preempting_successor=callbacks.prepare_preempting_successor,
+            preempt_parallel_job_branch=callbacks.preempt_parallel_job_branch,
+            workflow_preemption_enabled=workflow_preemption_enabled,
+        )
+
+    def _apply(
+        self,
+        disposition: Disposition | str,
+        *,
+        finding: NodeHealthFinding,
+        candidate_incident: FaultIncident,
+        candidate_workflow: WorkflowRequest,
+        target_incident: FaultIncident,
+        target_workflow: WorkflowRequest,
+        now: datetime,
+    ) -> tuple[WorkflowRequest, FaultIncident]:
+        return self.dispositions.apply(
+            disposition,
+            node_id=finding.node_id,
+            candidate=candidate_incident,
+            candidate_workflow=candidate_workflow,
+            existing_incident=target_incident,
+            existing_workflow=target_workflow,
+            gpu_uuids=set(finding.gpu_uuids),
+            mutable=workflow_is_mutable(target_workflow),
+            now=now,
+        )
 
     def ingest_terminal_node_quarantine(
         self,
@@ -109,19 +164,35 @@ class DrainOperationService:
                         }
                     ),
                 )
-            disposition = self.callbacks.merge_disposition(
-                target_workflow,
-                candidate_workflow,
-                finding.node_id,
-                set(finding.gpu_uuids),
+            disposition = Disposition(
+                self.callbacks.merge_disposition(
+                    target_workflow,
+                    candidate_workflow,
+                    finding.node_id,
+                    set(finding.gpu_uuids),
+                )
             )
-            if disposition in {"ABSORB", "ABSORB_RECORD_ONLY"}:
-                merged = target_workflow.model_copy(update={"updated_at": now})
-            else:
+            if disposition is Disposition.QUEUE_SUCCESSOR:
+                # The one verdict this route does not hand to the applier. A
+                # separate successor record would run *after* the incumbent
+                # readmits the node and restarts the job; a critical quarantine
+                # joins the incumbent's DAG as a terminal branch so those
+                # steps are superseded in the same write (the reason the
+                # route reuses the incumbent's merge key at all).
                 merged = self.brancher.append_parallel_job_branch_successor(
                     target_workflow,
                     candidate_workflow,
                     finding.node_id,
+                )
+            else:
+                merged, _ = self._apply(
+                    disposition,
+                    finding=finding,
+                    candidate_incident=candidate_incident,
+                    candidate_workflow=candidate_workflow,
+                    target_incident=target_incident,
+                    target_workflow=target_workflow,
+                    now=now,
                 )
             finding_name = finding.metric_name or finding.diagnostic_parameters.get(
                 "diagnostic_reason", finding.category.value
@@ -212,37 +283,16 @@ class DrainOperationService:
                 set(finding.gpu_uuids),
                 allow_job_branch_merge=False,
             )
-            winner_is_candidate = False
-            if disposition in {"ABSORB", "ABSORB_RECORD_ONLY", "WIDEN_IN_PLACE"}:
-                merged = target_workflow.model_copy(update={"updated_at": now})
-            elif disposition == "REPLACE_IN_PLACE":
-                winner_is_candidate = True
-                merged = candidate_workflow.model_copy(
-                    update={
-                        "request_id": target_workflow.request_id,
-                        "incident_id": target_incident.incident_id,
-                        "fencing_token": (target_workflow.fencing_token + 1),
-                        "predecessor_workflow_id": (
-                            target_workflow.predecessor_workflow_id
-                        ),
-                        "created_at": target_workflow.created_at,
-                        "updated_at": now,
-                    }
-                )
-            else:
-                winner_is_candidate = True
-                successor = candidate_workflow.model_copy(
-                    update={
-                        "incident_id": target_incident.incident_id,
-                        "fencing_token": target_workflow.fencing_token,
-                        "predecessor_workflow_id": (target_workflow.request_id),
-                        "not_before": None,
-                        "updated_at": now,
-                    }
-                )
-                merged = self.callbacks.prepare_preempting_successor(
-                    target_workflow, successor
-                )
+            merged, winner = self._apply(
+                disposition,
+                finding=finding,
+                candidate_incident=candidate_incident,
+                candidate_workflow=candidate_workflow,
+                target_incident=target_incident,
+                target_workflow=target_workflow,
+                now=now,
+            )
+            winner_is_candidate = winner is not target_incident
             finding_name = finding.metric_name or finding.category.value
             incident = target_incident.model_copy(
                 update={

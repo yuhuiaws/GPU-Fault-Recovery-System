@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from gpu_fault.models import FaultIncident, RecoveryPlan
 from gpu_fault.store.shared.errors import StaleWriteError
@@ -41,6 +41,7 @@ class PostgresRecordCasMixin:
         incident: FaultIncident,
         *,
         expected: FaultIncident | None = None,
+        extra_event_ids: Sequence[str] = (),
     ) -> None:
         """See ``WorkflowStore.save_incident``.
 
@@ -63,6 +64,9 @@ class PostgresRecordCasMixin:
                 incident.event_id,
                 incident.incident_id,
             )
+            for event_id in extra_event_ids:
+                if event_id != incident.event_id:
+                    self._link("incident_by_event", event_id, incident.incident_id)
 
     def _save_incident_guarded(self, incident: FaultIncident) -> None:
         payload = incident.model_dump_json()

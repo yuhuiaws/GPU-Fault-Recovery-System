@@ -93,6 +93,10 @@ _EXPORTS = {
         "gpu_fault.notifications.dcgm_diagnostic",
         "DcgmDiagnosticEmailBuilder",
     ),
+    "DiagnosticInconclusiveEmailBuilder": (
+        "gpu_fault.notifications.diagnostic_inconclusive",
+        "DiagnosticInconclusiveEmailBuilder",
+    ),
     "RestartGuardEmailBuilder": (
         "gpu_fault.notifications.restart_guard",
         "RestartGuardEmailBuilder",
@@ -132,8 +136,16 @@ _EXPORTS = {
         "gpu_fault.notifications.ses",
         "DisabledNotificationNotifier",
     ),
+    "SnsClient": ("gpu_fault.notifications.sns", "SnsClient"),
+    "SnsNotificationConfig": ("gpu_fault.notifications.sns", "SnsNotificationConfig"),
+    "SnsNotifier": ("gpu_fault.notifications.sns", "SnsNotifier"),
+    "sns_subject": ("gpu_fault.notifications.sns", "sns_subject"),
+    "notification_channel_from_environment": (
+        "gpu_fault.notifications.channel",
+        "notification_channel_from_environment",
+    ),
     "notification_notifier_from_environment": (
-        "gpu_fault.notifications.ses",
+        "gpu_fault.notifications.channel",
         "notification_notifier_from_environment",
     ),
 }

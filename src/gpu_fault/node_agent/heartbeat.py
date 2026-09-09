@@ -18,11 +18,10 @@ from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     CollectorServiceState,
 )
-
 from gpu_fault.fleet import (
-    AgentHeartbeat,
     CURRENT_AGENT_PROTOCOL_VERSION,
     NODE_ACTION_KEY_VERSION_SHARED,
+    AgentHeartbeat,
     SignedAgentHeartbeat,
     sign_agent_heartbeat,
 )

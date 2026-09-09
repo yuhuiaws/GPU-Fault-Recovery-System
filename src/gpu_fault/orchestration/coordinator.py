@@ -6,12 +6,11 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from functools import cached_property
-from threading import RLock
 from typing import Any, Sequence
 
 from gpu_fault.env import env_bool
+from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
-    bounded_reasons,
     BlockedKind,
     Environment,
     FaultIncident,
@@ -23,6 +22,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
     WorkloadState,
+    bounded_reasons,
     resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
@@ -30,24 +30,15 @@ from gpu_fault.operation_registry import (
     NODE_ACTION_SCOPE_OPERATIONS,
     NODE_EXCLUSIVE_OPERATIONS,
     NODE_WIDE_RECOVERY_OPERATIONS,
-    OPERATION_CAPABILITY as REGISTERED_OPERATION_CAPABILITY,
     RECOVERY_OPERATION_DOMINANCE,
     RECOVERY_OPERATION_RANK,
     TRANSIENT_GPU_INVENTORY_OPERATIONS,
     WORKLOAD_SCOPED_OPERATIONS,
     ZERO_RANK_ACTION_OPERATIONS,
 )
-from gpu_fault.policy import (
-    ActionDisposition,
-    DistributedXidBatch,
-    FaultPolicyDecision,
-    SxidEvent,
-    XidEvent,
+from gpu_fault.operation_registry import (
+    OPERATION_CAPABILITY as REGISTERED_OPERATION_CAPABILITY,
 )
-from gpu_fault.store import NotFoundError
-from gpu_fault.store.contracts import ControlPlaneStore
-from gpu_fault.host_health import NodeHealthFinding
-from gpu_fault.watcher import AttemptObservation
 from gpu_fault.orchestration import (
     DagBrancher,
     HardwareEscalationService,
@@ -75,10 +66,22 @@ from gpu_fault.orchestration.families import (
     ResetOperationService,
     ValidationOperationService,
 )
+from gpu_fault.orchestration.families.identity import note_stale_event_link
+from gpu_fault.orchestration.node_locks import NodeLocks
 from gpu_fault.orchestration.placement_hold import PlacementHoldService
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
+from gpu_fault.policy import (
+    ActionDisposition,
+    DistributedXidBatch,
+    FaultPolicyDecision,
+    SxidEvent,
+    XidEvent,
+)
+from gpu_fault.store import NotFoundError
+from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.watcher import AttemptObservation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -145,7 +148,7 @@ class IncidentOrchestrator:
         self.store = store
         self._arbiter = self._ARBITER
         self._brancher = self._BRANCHER
-        self._lock = RLock()
+        self._node_locks = NodeLocks()
         self._conflicts = NodeConflictService(self.store, self._arbiter)
         self._evidence_operations = EvidenceOperationService(
             self.store,
@@ -254,7 +257,7 @@ class IncidentOrchestrator:
             pre_action_operation=PRE_ACTION_OPERATION,
         )
         self._reset_operations = ResetOperationService(
-            self.store, self._builder, self._lock
+            self.store, self._builder, self._node_locks.as_rlock()
         )
         self._placement_holds = PlacementHoldService(self.store, self._builder)
         # Rule A, case 2: holds opened here, and holds the observation ingest
@@ -316,17 +319,21 @@ class IncidentOrchestrator:
     def _drain_operations(self) -> DrainOperationService:
         callbacks = DrainOperationCallbacks(
             active_node_exclusive_workflow=(self._active_node_exclusive_workflow),
+            aggregation_deadlines=self._aggregation_deadlines,
             attempt_group_key=self._attempt_group_key,
             merge_disposition=self._merge_disposition,
             node_group_key=self._node_group_key,
             ingest_node_health=self.ingest_node_health,
             incident_state_for_workflow=(self._incident_state_for_workflow),
+            preempt_parallel_job_branch=(self._preempt_parallel_job_branch),
             prepare_preempting_successor=(self._prepare_preempting_successor),
         )
         return DrainOperationService(
             self.store,
+            self._arbiter,
             self._brancher,
             callbacks,
+            workflow_preemption_enabled=(self.workflow_preemption_enabled),
         )
 
     @cached_property
@@ -442,7 +449,7 @@ class IncidentOrchestrator:
         )
         return NodeHealthIngestionService(
             self.store,
-            self._lock,
+            self._node_locks.as_rlock(),
             plan_builder,
             callbacks,
         )
@@ -561,13 +568,23 @@ class IncidentOrchestrator:
         ):
             # Node names can repeat across regional clusters, so marker
             # correlation must stop at the incident's cluster boundary
-            # before comparing shared node and GPU identities.
-            try:
-                candidate_incident = self.store.get_incident(candidate.incident_id)
-            except NotFoundError:
-                continue
-            if candidate_incident.cluster_id != cluster_id:
-                continue
+            # before comparing shared node and GPU identities. The marker
+            # carries its tenant since H-14 (the policy stamps
+            # ``cluster_id=event.cluster_id``), so the boundary is read off
+            # the marker; reading the incident for every candidate only to
+            # compare its cluster made this loop N+1 store round trips per
+            # event (性能 3). Legacy rows without a cluster_id still take
+            # the incident read: a missing tenant must not be guessed.
+            if candidate.cluster_id:
+                if candidate.cluster_id != cluster_id:
+                    continue
+            else:
+                try:
+                    candidate_incident = self.store.get_incident(candidate.incident_id)
+                except NotFoundError:
+                    continue
+                if candidate_incident.cluster_id != cluster_id:
+                    continue
             if candidate.marker_id == marker.marker_id:
                 continue
             if not set(candidate.scope.node_ids).intersection(marker.scope.node_ids):
@@ -673,25 +690,30 @@ class IncidentOrchestrator:
         event: XidEvent | SxidEvent,
         decision: FaultPolicyDecision,
     ) -> tuple[FaultIncident, WorkflowRequest | None]:
-        with self._lock:
+        with self._node_locks.held([(event.cluster_id, event.node_id)]):
             existing = self.store.get_incident_by_event(event.event_id)
             if existing is not None:
-                workflow = (
-                    self.store.get_workflow(existing.workflow_request_id)
-                    if existing.workflow_request_id
-                    else None
-                )
-                return existing, workflow
+                linked = self._linked_workflow(existing, event.event_id)
+                if linked is not None:
+                    return existing, linked[0]
+                # C-04: the link says handled but its workflow is gone; the
+                # build path below rebuilds and re-links (the store's own
+                # duplicate check treats the link as dirty the same way).
             try:
                 correlated = self.store.get_incident(decision.marker.incident_id)
             except NotFoundError:
                 correlated = None
+            linked = None
             if correlated is not None:
-                workflow = (
-                    self.store.get_workflow(correlated.workflow_request_id)
-                    if correlated.workflow_request_id
-                    else None
-                )
+                linked = self._linked_workflow(correlated, event.event_id)
+                if linked is None:
+                    # C-04: the correlation target's own workflow is gone.
+                    # Returning it would hand back a pair with no workflow
+                    # for an event that needs one; the build path below
+                    # rebuilds under the same incident id instead.
+                    correlated = None
+            if correlated is not None and linked is not None:
+                workflow = linked[0]
                 observation = self._attempt_observation(event)
                 previous_generation = (
                     workflow is not None
@@ -730,10 +752,10 @@ class IncidentOrchestrator:
                         # ``WorkflowFencingError`` this handler already
                         # raises, and ingest retries the whole event with a
                         # fresh read of the correlated incident.
-                        self.store.save_incident(correlated, expected=read_correlated)
-                        self.store.link_event_to_incident(
-                            event.event_id,
-                            correlated.incident_id,
+                        self.store.save_incident(
+                            correlated,
+                            expected=read_correlated,
+                            extra_event_ids=[event.event_id],
                         )
                         return correlated, workflow
                 else:
@@ -898,9 +920,32 @@ class IncidentOrchestrator:
         incident = self._independent_incident(
             event, decision, extra_reasons=[reason]
         ).model_copy(update={"state": IncidentState.RECOVERED})
+        # ``incident.event_id`` is this event's id and ``save_incident`` links
+        # it inside the same transaction on all three backends; the separate
+        # ``link_event_to_incident`` was a second autocommit for nothing, and a
+        # crash between the two left the fenced incident unlinked (C-09).
         self.store.save_incident(incident)
-        self.store.link_event_to_incident(event.event_id, incident.incident_id)
         return incident
+
+    def _linked_workflow(
+        self, incident: FaultIncident, event_id: str
+    ) -> tuple[WorkflowRequest | None] | None:
+        """The workflow an event's incident points at, wrapped, or None when
+        the pointer dangles (C-04). ``(None,)`` is an incident that has no
+        workflow on purpose (fenced, NO_ACTION)."""
+
+        if not incident.workflow_request_id:
+            return (None,)
+        try:
+            return (self.store.get_workflow(incident.workflow_request_id),)
+        except NotFoundError:
+            note_stale_event_link(
+                self.store,
+                event_id=event_id,
+                incident_id=incident.incident_id,
+                pointer=incident.workflow_request_id,
+            )
+            return None
 
     @staticmethod
     def _sample_hung_triage_nodes(
@@ -1088,7 +1133,13 @@ class IncidentOrchestrator:
         incident is repairing (rule A, case 2); ``None`` when nothing was
         opened. See ``orchestration.placement_hold``."""
 
-        with self._lock:
+        # The hold is keyed by the attempt's nodes: every container that
+        # names one (terminated ones too -- a superset only widens the lock).
+        with self._node_locks.held(
+            (observation.cluster_id, container.node_id)
+            for container in observation.containers
+            if container.node_id
+        ):
             held = self._placement_holds.hold(observation)
         if held is not None:
             self.placement_holds_opened_total += 1
@@ -1507,14 +1558,18 @@ class IncidentOrchestrator:
         _skip_terminal_quarantine_merge: bool = False,
         _persist: bool = True,
     ) -> tuple[FaultIncident, WorkflowRequest | None]:
-        return self._node_health.ingest(
-            finding,
-            workflow_request_id=workflow_request_id,
-            skip_attempt_grouping=_skip_attempt_grouping,
-            skip_node_resource_merge=_skip_node_resource_merge,
-            skip_terminal_quarantine_merge=(_skip_terminal_quarantine_merge),
-            persist=_persist,
-        )
+        # The health family's own ``with self.lock`` re-enters this scope;
+        # see ``NodeLocks``. Re-entrant from the drain and grouped-health
+        # callbacks, which ingest the finding they already hold.
+        with self._node_locks.held([(finding.cluster_id, finding.node_id)]):
+            return self._node_health.ingest(
+                finding,
+                workflow_request_id=workflow_request_id,
+                skip_attempt_grouping=_skip_attempt_grouping,
+                skip_node_resource_merge=_skip_node_resource_merge,
+                skip_terminal_quarantine_merge=(_skip_terminal_quarantine_merge),
+                persist=_persist,
+            )
 
     @staticmethod
     def _is_dcgm_gpu_finding(
@@ -1595,12 +1650,29 @@ class IncidentOrchestrator:
         batch: DistributedXidBatch,
         decisions: list[FaultPolicyDecision],
     ) -> tuple[FaultIncident, WorkflowRequest]:
-        return self._reset_operations.ingest_distributed_xids(batch, decisions)
+        # One batch spans several nodes; ``held`` sorts the keys so two
+        # overlapping batches take them in the same order.
+        with self._node_locks.held(
+            (item.cluster_id, item.node_id) for item in batch.events
+        ):
+            return self._reset_operations.ingest_distributed_xids(batch, decisions)
 
     def simulate(
         self, request_id: str, expected_fencing_token: int
     ) -> WorkflowExecutionResult:
-        with self._lock:
+        # Only a workflow id arrives, so the nodes to lock on are read first,
+        # outside the lock. That read is not the one acted on: the workflow
+        # and incident are re-read under the lock below, and the fencing
+        # token check plus the compare-and-set save reject anything that
+        # moved in between. A workflow whose incident names no node takes
+        # the process-wide fallback.
+        scoped_incident = self.store.get_incident(
+            self.store.get_workflow(request_id).incident_id
+        )
+        with self._node_locks.held(
+            (scoped_incident.cluster_id, node_id)
+            for node_id in scoped_incident.node_ids
+        ):
             workflow = self.store.get_workflow(request_id)
             incident = self.store.get_incident(workflow.incident_id)
             if expected_fencing_token != workflow.fencing_token:
@@ -1681,6 +1753,23 @@ class IncidentOrchestrator:
         records. Recovery that acts on the node is only safe when the
         event belongs to the current boot generation; containment and
         support escalation stay outside the fence on purpose.
+
+        Two proofs of "same generation" exist and they are ranked. The
+        boot id is the stronger one: an event stamped with the boot id the
+        ACTIVE, freshly-leased Agent reports now *is* from this incarnation
+        of the node, however long it sat in a queue. The
+        ``fault_action_max_age_seconds`` limit (900 s by default) is the
+        fallback for events that carry no boot id, or that meet an Agent
+        which reports none: without an identity to compare, age is the
+        only bound on how far the node may have drifted from the evidence.
+        Applying the age limit on top of a matching boot id made a
+        processor backlog longer than the limit quarantine every fault it
+        eventually drained instead of remediating it (逻辑 7): the node
+        was provably the same, the queue was merely slow. The age is still
+        appended to the decision's reasons in that case so the audit trail
+        shows how late the action ran; only the disposition is left alone.
+        Rejected alternative -- raising the limit -- keeps the coupling and
+        just moves the backlog length at which remediation silently stops.
         """
 
         if decision.disposition is not ActionDisposition.EXECUTABLE:
@@ -1699,19 +1788,7 @@ class IncidentOrchestrator:
             return decision
 
         blocked_reasons: list[str] = []
-        if event.source_event_time is not None:
-            event_time = self._utc(event.source_event_time)
-            age_seconds = max(
-                0.0,
-                (observed_now - event_time).total_seconds(),
-            )
-            if age_seconds > self.fault_action_max_age_seconds:
-                blocked_reasons.append(
-                    "STALE_FAULT_GENERATION: source event age "
-                    f"{age_seconds:.3f}s exceeds automatic action limit "
-                    f"{self.fault_action_max_age_seconds}s"
-                )
-
+        boot_generation_confirmed = False
         if event.source_boot_id:
             lease_is_fresh = (
                 agent.lease_expires_at is not None
@@ -1737,9 +1814,37 @@ class IncidentOrchestrator:
                     f"{event.source_boot_id} does not match current "
                     f"Agent boot ID {agent.boot_id}"
                 )
+            else:
+                boot_generation_confirmed = True
+
+        age_annotation: str | None = None
+        if event.source_event_time is not None:
+            event_time = self._utc(event.source_event_time)
+            age_seconds = max(
+                0.0,
+                (observed_now - event_time).total_seconds(),
+            )
+            if age_seconds > self.fault_action_max_age_seconds:
+                age_text = (
+                    f"source event age {age_seconds:.3f}s exceeds automatic "
+                    f"action limit {self.fault_action_max_age_seconds}s"
+                )
+                if boot_generation_confirmed:
+                    age_annotation = (
+                        f"FAULT_AGE_OVER_LIMIT: {age_text}; matching boot ID "
+                        f"{agent.boot_id} confirms the current generation"
+                    )
+                else:
+                    blocked_reasons.append(f"STALE_FAULT_GENERATION: {age_text}")
 
         if not blocked_reasons:
-            return decision
+            if age_annotation is None:
+                return decision
+            return decision.model_copy(
+                update={
+                    "reasons": list(dict.fromkeys([*decision.reasons, age_annotation])),
+                }
+            )
         reason_values = list(dict.fromkeys([*decision.reasons, *blocked_reasons]))
         marker = decision.marker.model_copy(
             update={

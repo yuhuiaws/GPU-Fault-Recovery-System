@@ -518,6 +518,7 @@ def _monitoring_resources(
             monitoring.get("sns_topic_ownership"),
             monitoring.get("sns_topic_arn") is not None,
         ),
+        # Legacy row: only older states carry a queue; uninstall still deletes it.
         (
             "aws/sqs/queue",
             "sqs_queue",
@@ -934,7 +935,9 @@ def _aurora_resources(
                 dependencies=["aws/aurora/cluster"],
             )
         )
-    master_arn = aurora.get("master_secret_arn")
+    # New states record the master Secret ARN under ``aurora_ready``; old ones under ``aurora``.
+    readiness = state.get("aurora_ready") or {}
+    master_arn = aurora.get("master_secret_arn") or readiness.get("master_secret_arn")
     if master_arn:
         resources.append(
             _record(

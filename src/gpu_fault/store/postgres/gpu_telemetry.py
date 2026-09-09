@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timezone
+from typing import Any, Callable
 
 from gpu_fault.gpu_metric_models import GpuFindingState
 from gpu_fault.store.shared.time import (

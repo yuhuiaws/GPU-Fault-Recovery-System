@@ -1299,13 +1299,19 @@ def test_the_flag_travels_to_the_source_preparer_as_environment(
     assert GATE.inflight_installs_allowed({}) is False
 
 
-def test_an_explicit_variable_wins_over_the_flag(
+def test_the_flag_wins_over_a_stale_inflight_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(ENV, "1")
-    arguments = admin_cli.parser().parse_args(["deploy", FLAG, "--state-dir", "/tmp/x"])
+    """Same rule as the schema-change and supersede consents: a leftover
+    ``export`` never overrides what the operator typed, and without the flag
+    nothing is added (the inherited environment travels unchanged)."""
 
-    assert admin_cli.inflight_installs_environment(arguments) == {}
+    monkeypatch.setenv(ENV, "1")
+    with_flag = admin_cli.parser().parse_args(["deploy", FLAG, "--state-dir", "/tmp/x"])
+    without = admin_cli.parser().parse_args(["deploy", "--state-dir", "/tmp/x"])
+
+    assert admin_cli.inflight_installs_environment(with_flag) == {ENV: "1"}
+    assert admin_cli.inflight_installs_environment(without) == {}
 
 
 def test_the_flag_is_a_deploy_option_not_a_verb() -> None:

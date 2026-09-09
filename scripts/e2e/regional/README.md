@@ -108,6 +108,7 @@ them would turn every `--plan` into an execute against a real node.
 - `run_collector_acceptance.py`
 - `run_collector_destructive.py`
 - `run_collect016_training_recovery.py`
+- `run_collect021_late_xid_after_pod_death.py`
 - `run_collect017_efa_plugin.py`
 - `run_iso006_cluster_offline.py`
 - `run_e2e002_multicluster_fault.py`
@@ -318,23 +319,24 @@ Current classification:
   real fail-safe quiesce/restore cycle with the deployed executor state
   machine and live PostgreSQL.
 - PREEMPT-036 uses `run_preempt036_stuck_workflow_reconcile.py`. It is fully
-  isolated and never contacts a cluster: per reconcile mode it creates its own
-  store (a throwaway `postgres:16` container on a random loopback port, removed
-  with `docker rm -f` in `finally`; a temporary SqliteStore when docker cannot
-  start one, recorded as `store_backend` in the evidence), seeds the stuck
-  workflow shape through Store APIs only, and then executes the text the admin
-  layer actually ships -- the reconcile module's own source plus its
-  stdin/stdout driver, the same string `workflow-reconcile` sends into the CPU
-  ingress Pod -- in a local subprocess. The release verdict is measured with the
-  shipped `workflow_safety` and `remote_command_stats` probe sources before and
-  after each apply. `--run-dir` is required and evidence lands in
+  isolated and never contacts a cluster: per stuck-workflow shape it creates its
+  own store (a throwaway `postgres:16` container on a random loopback port,
+  removed with `docker rm -f` in `finally`; a temporary SqliteStore when docker
+  cannot start one, recorded as `store_backend` in the evidence), seeds the
+  shape through Store APIs only, and then drives the product's own dispatcher --
+  built from its public constructors with no adapters -- through
+  `WorkflowDispatcher.sweep_stuck_records`, the sweep the production dispatch
+  loop runs before every scan, for the passes the shape needs plus one to show
+  it is idempotent. The release verdict is measured with the shipped
+  `workflow_safety` and `remote_command_stats` probe sources before and after
+  the sweep. `--run-dir` is required and evidence lands in
   `<run-dir>/cases/GF-REGIONAL-PREEMPT-036/`; unlike HA-008 there is no
   temporary-directory default, because the evidence is the point of the case.
-  Its verdicts and seeding live in `preempt036_verdicts.py` and are unit tested
-  in `tests/regional/test_preempt036_stuck_workflow_reconcile.py`. The runner
-  uses only store URLs it created itself and refuses any other, including an
-  ambient `GPU_FAULT_STORE_URL`: a fixture whose job is to manufacture wedged
-  workflows must not be able to aim at a real database.
+  Its seeding, sweep helper and verdicts live in `preempt036_verdicts.py` and
+  are unit tested in `tests/regional/test_preempt036_stuck_workflow_reconcile.py`.
+  The runner uses only store URLs it created itself and refuses any other,
+  including an ambient `GPU_FAULT_STORE_URL`: a fixture whose job is to
+  manufacture wedged workflows must not be able to aim at a real database.
 - NOTIFY-001..005 share `run_notification_acceptance.py`. Reset/restart email
   cases use labeled drills rather than repeating physical actions.
 - CAP-001..004 share `run_capacity_acceptance.py`, promoted from the isolated
@@ -590,7 +592,9 @@ Current classification:
 - COLLECT manual cases use two shared entry points:
   `run_collector_acceptance.py` for 001/002/003/005/009/010/011/012 and
   `run_collector_destructive.py` for 004/008/013/014/015. COLLECT-016 and
-  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers.
+  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers;
+  COLLECT-021 (`run_collect021_late_xid_after_pod_death.py`) reuses the
+  COLLECT-016 managed-training fixtures to drive the Pod-dies-before-XID race.
   Every driver is plan-only by default and requires the previous formal case
   evidence before mutation.
 - ISO-006 and E2E-002 have dedicated two-physical-cluster drivers.
@@ -658,7 +662,10 @@ restore a quarantined node. Direct taint or ownership-annotation deletion is
 not an equivalent cleanup.
 
 `declare_warm_spare.py` declares or releases the one warm spare node
-`DESTR-003`/`DESTR-008` require. It is read-only unless `--declare` or
+`DESTR-003`/`DESTR-008` require. It is a thin wrapper over the supported operator
+command, `gpu-fault-admin config spare` (`src/gpu_fault/admin/warm_spare.py`):
+the wrapper binds a site profile and a `--baseline` file to the same checks and
+the same mutation, and holds no logic of its own. It is read-only unless `--declare` or
 `--release` is given, each with its own confirmation string, and it records the
 node's pre-declaration labels and cordon state in a `--baseline` file so the
 release restores exactly that — a node that was already cordoned stays cordoned.

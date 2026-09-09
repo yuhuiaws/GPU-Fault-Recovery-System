@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from gpu_fault.processor import ProcessorRequestStatus
 from gpu_fault.processor.models import ROUTINE_PRIORITY
-from gpu_fault.store.shared.processor_helpers import PartialEnqueueError
+from gpu_fault.store.shared.processor_helpers import (
+    PartialEnqueueError,
+    coalesce_routine_sample,
+)
 
 
 @dataclass
@@ -17,6 +19,10 @@ class _ProcessorAdmissionPlan:
     reason_by_index: dict[int, str | None]
     new_base_ids: set[str]
     new_requests: list[object]
+    # Coalesced base id -> the newest raw sample merged into it. If the
+    # conditional merge write finds the row no longer PENDING, this sample
+    # is admitted as a row of its own instead of being dropped.
+    fallback_by_base: dict[str, object]
 
 
 class PostgresProcessorAdmissionMixin:
@@ -87,15 +93,9 @@ class PostgresProcessorAdmissionMixin:
                     row = cursor.fetchone()
                 if row is not None:
                     pending = self._decode("processor_request", row[0])
-                    coalesced = request.model_copy(
-                        update={
-                            "request_id": pending.request_id,
-                            "created_at": pending.created_at,
-                            "status": ProcessorRequestStatus.PENDING,
-                        }
-                    )
-                    self._persist_processor_request(coalesced)
-                    return coalesced, "coalesced"
+                    coalesced = coalesce_routine_sample(pending, request)
+                    if self._update_pending_processor_row(coalesced):
+                        return coalesced, "coalesced"
             counter_scope = request.cluster_id or "__unscoped__"
             with self._db.cursor() as cursor:
                 depths, global_depth = self._processor_counter_depths(
@@ -299,8 +299,55 @@ class PostgresProcessorAdmissionMixin:
             )
             for ordering_key, payload in cursor.fetchall():
                 pending = self._decode("processor_request", payload)
+                if pending.status is not ProcessorRequestStatus.PENDING:
+                    continue
                 pending_by_ordering.setdefault((ordering_key, pending.path), pending)
         return existing_by_id, pending_by_ordering
+
+    def _update_pending_processor_row(self, coalesced: Any) -> bool:
+        """Write a merged sample over its PENDING row, and only over that.
+
+        A conditional UPDATE keyed on ``status='PENDING'`` rather than the
+        blind ``ON CONFLICT`` upsert: the upsert overwrote ``lease_owner``,
+        ``leader_epoch``, ``lease_token`` and ``lease_expires_at`` with the
+        fresh sample's ``None`` whenever its ``updated_at`` was newer, which
+        is how a claimed row went back to PENDING under its owner (B-1).
+        The lease columns are not written at all here. Returns ``False``
+        when the row is no longer PENDING, so the caller admits the sample
+        as a row of its own instead of silently dropping it.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE gpu_fault_processor_queue
+                SET
+                    cluster_id=%s,
+                    correlation_key=%s,
+                    ordering_key=%s,
+                    priority=%s,
+                    not_before=%s,
+                    retry_count=%s,
+                    lane_policy=%s,
+                    updated_at=%s,
+                    payload=%s::jsonb
+                WHERE request_id=%s
+                  AND status='PENDING'
+                """,
+                (
+                    coalesced.cluster_id,
+                    coalesced.correlation_key,
+                    coalesced.ordering_key(),
+                    coalesced.queue_priority(),
+                    coalesced.not_before,
+                    coalesced.retry_count,
+                    coalesced.lane_policy.value,
+                    coalesced.updated_at,
+                    coalesced.model_dump_json(),
+                    coalesced.request_id,
+                ),
+            )
+            return bool(cursor.rowcount == 1)
 
     @staticmethod
     def _plan_processor_admission(
@@ -313,6 +360,7 @@ class PostgresProcessorAdmissionMixin:
         base_by_index: dict[int, str] = {}
         reason_by_index: dict[int, str | None] = {}
         new_base_ids: set[str] = set()
+        fallback_by_base: dict[str, object] = {}
         for index, request in enumerate(requests):
             existing = existing_by_id.get(request.request_id)
             if existing is not None:
@@ -322,17 +370,13 @@ class PostgresProcessorAdmissionMixin:
             coalescable = request.coalescable()
             pending = pending_by_ordering.get(ordering_key) if coalescable else None
             if pending is not None:
-                coalesced = request.model_copy(
-                    update={
-                        "request_id": pending.request_id,
-                        "created_at": pending.created_at,
-                        "status": ProcessorRequestStatus.PENDING,
-                    }
-                )
+                coalesced = coalesce_routine_sample(pending, request)
                 pending_by_ordering[ordering_key] = coalesced
                 final_by_base[pending.request_id] = coalesced
                 base_by_index[index] = pending.request_id
                 reason_by_index[index] = "coalesced"
+                if pending.request_id not in new_base_ids:
+                    fallback_by_base[pending.request_id] = request
                 continue
             final_by_base[request.request_id] = request
             base_by_index[index] = request.request_id
@@ -355,6 +399,7 @@ class PostgresProcessorAdmissionMixin:
             reason_by_index=reason_by_index,
             new_base_ids=new_base_ids,
             new_requests=new_requests,
+            fallback_by_base=fallback_by_base,
         )
 
     def _lock_processor_admission_capacity(
@@ -488,15 +533,29 @@ class PostgresProcessorAdmissionMixin:
         rejected_by_base: dict[str, str],
         accepted_new_ids: set[str],
     ):
-        self._put_processor_queue_many(
-            [
-                request
-                for base_id, request in plan.final_by_base.items()
-                if not (
-                    base_id in plan.new_base_ids and base_id not in accepted_new_ids
-                )
-            ]
-        )
+        new_rows = [
+            request
+            for base_id, request in plan.final_by_base.items()
+            if base_id in plan.new_base_ids and base_id in accepted_new_ids
+        ]
+        # Merges into rows that were already queued go through the
+        # conditional UPDATE, never the upsert (B-1). The rows are locked
+        # FOR UPDATE by ``_load_processor_admission_rows`` in this same
+        # transaction, so a miss here means the lock and the status check
+        # disagreed - the sample is then admitted as a row of its own
+        # rather than answered "coalesced" and lost.
+        for base_id, request in plan.final_by_base.items():
+            if base_id in plan.new_base_ids:
+                continue
+            if self._update_pending_processor_row(request):
+                continue
+            fallback = plan.fallback_by_base[base_id]
+            plan.final_by_base[base_id] = fallback
+            for index, mapped in plan.base_by_index.items():
+                if mapped == base_id:
+                    plan.reason_by_index[index] = None
+            new_rows.append(fallback)
+        self._put_processor_queue_many(new_rows)
         for index in range(len(plan.results)):
             if plan.results[index] is not None:
                 continue

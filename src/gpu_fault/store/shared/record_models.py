@@ -7,7 +7,6 @@ from pydantic import BaseModel
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
-    DiagnosticRequest,
     EfaTrafficAdminDecision,
     EfaTrafficState,
     EffectiveRuntimeProfile,
@@ -20,7 +19,6 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
     WorkflowRequest,
     XidMetricBaseline,
 )
@@ -82,8 +80,6 @@ def record_models() -> dict[str, type[BaseModel]]:
         "event": TerminalEvent,
         "decision": CompletionDecision,
         "marker": NodeMarker,
-        "diagnostic": DiagnosticRequest,
-        "triage": TriageReport,
         "plan": RecoveryPlan,
         "profile": EffectiveRuntimeProfile,
         "incident": FaultIncident,

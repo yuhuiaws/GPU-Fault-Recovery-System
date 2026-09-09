@@ -39,6 +39,7 @@ UNINSTALL_CONFIRMATION = "UNINSTALL_GPU_FAULT"
 # and the GPU cluster records; fewer preserved entries means it deleted
 # something the request told it to keep.
 MIN_PRESERVED_REGISTRY_ENTRIES = 2
+AURORA_CLUSTER_RESOURCE_KEY = "aws/aurora/cluster"
 
 
 class InjectedAcceptanceFailure(RuntimeError):
@@ -123,6 +124,13 @@ def assert_uninstall_result(result: dict[str, Any]) -> None:
         if status == "DELETE_PENDING"
     )
     _require(not pending, "final registry still has DELETE_PENDING entries", pending)
+    # The reinstall contract: the Aurora cluster (and so the site's records)
+    # survives a keep-CPU uninstall that did not ask for ``--reset-database``.
+    _require(
+        dict(statuses or {}).get(AURORA_CLUSTER_RESOURCE_KEY) == "PRESERVED",
+        "keep-CPU uninstall did not preserve the Aurora cluster",
+        statuses,
+    )
 
 
 def run_admin_lifecycle(
@@ -230,7 +238,6 @@ class LiveAdminLifecycleBackend:
         allowed_namespaces: tuple[str, ...],
         join_state_dir: Path,
         run_dir: Path,
-        final_snapshot_policy: str,
     ) -> None:
         self.site_path = site_path
         self.gpu_cluster_arn = gpu_cluster_arn
@@ -238,7 +245,6 @@ class LiveAdminLifecycleBackend:
         self.allowed_namespaces = allowed_namespaces
         self.join_state_dir = join_state_dir
         self.run_dir = run_dir
-        self.final_snapshot_policy = final_snapshot_policy
         # Captured tokens stay in memory: a copy under run_dir would be a valid
         # cluster credential on disk until the cluster is removed, and the old
         # code only deleted it on success.
@@ -438,12 +444,15 @@ class LiveAdminLifecycleBackend:
             return {"status": exc.code, "detail": payload.get("detail")}
 
     def uninstall(self) -> dict[str, Any]:
+        # A keep-CPU uninstall is a reinstall: the Aurora cluster and its records
+        # stay for the next deploy, so the database is never reset here and the
+        # final-snapshot policy (a delete-mode choice) is left at its default.
         result = uninstall(
             UninstallRequest(
                 site=self._site(),
                 cpu_disposition="keep",
                 confirmation=UNINSTALL_CONFIRMATION,
-                final_snapshot_policy=self.final_snapshot_policy,
+                reset_database=False,
             )
         )
         return {**result, "final_registry_statuses": final_registry_statuses(result)}
@@ -484,11 +493,6 @@ def parser() -> argparse.ArgumentParser:
         default=["gpu-fault-system", "training"],
     )
     value.add_argument("--run-dir", required=True, type=Path)
-    value.add_argument(
-        "--aurora-final-snapshot",
-        choices=("retain", "skip"),
-        default="retain",
-    )
     value.add_argument("--execute", action="store_true")
     value.add_argument("--confirm")
     return value
@@ -520,7 +524,6 @@ def main() -> int:
         "gpu_cluster_arn": arguments.gpu_cluster_arn,
         "cluster_id": arguments.cluster_id,
         "allowed_namespaces": sorted(set(arguments.allowed_namespace)),
-        "aurora_final_snapshot": arguments.aurora_final_snapshot,
     }
     recorder = EvidenceRecorder(
         arguments.run_dir / f"{CASE_ID}.json",
@@ -534,7 +537,6 @@ def main() -> int:
         allowed_namespaces=tuple(sorted(set(arguments.allowed_namespace))),
         join_state_dir=arguments.run_dir / "join-state",
         run_dir=arguments.run_dir,
-        final_snapshot_policy=arguments.aurora_final_snapshot,
     )
     result = run_admin_lifecycle(backend, recorder)
     print(json.dumps(result, indent=2, sort_keys=True))

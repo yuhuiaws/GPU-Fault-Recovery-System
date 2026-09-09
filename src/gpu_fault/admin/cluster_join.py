@@ -36,14 +36,14 @@ from gpu_fault.admin.bootstrap_services import (
     provision_node_action_keys,
 )
 from gpu_fault.admin.cluster_join_evidence import (
+    JoinVerificationExpired,
     build_verified_membership_evidence,
+    clear_verified_step,
     join_activation_is_irreversible,
     membership_runtime_snapshot,
+    verification_is_stale,
 )
-from gpu_fault.admin.cluster_join_readonly import (
-    cached_network_baseline,
-    parallel_verify_and_discover,
-)
+from gpu_fault.admin.cluster_join_readonly import cached_network_baseline
 from gpu_fault.admin.cluster_join_state import (
     complete_step as _complete,
 )
@@ -67,6 +67,7 @@ from gpu_fault.admin.cluster_removal import (
     _sync_release_state,
     _wait_vpc_association_absent,
 )
+from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
@@ -937,29 +938,16 @@ def _prepare_execution(
     state_dir: Path,
     state_path: Path,
     state: dict[str, Any],
-    baseline_verified: bool = False,
     candidate_preflight: bool = True,
     network_baseline: list[dict[str, Any]] | None = None,
 ) -> JoinExecution | dict[str, Any]:
-    discovered = None
-    if (
-        not baseline_verified
-        and not _done(state, "PRECHECKED")
-        and not _done(state, "DISCOVERED")
-    ):
-        discovered = parallel_verify_and_discover(
-            lambda: _run_rollout(request.site, "verify"),
-            lambda: _discover_join_target(request, runner),
-        )
-        _complete(state_path, state, "PRECHECKED")
     if not _done(state, "PRECHECKED"):
-        if not baseline_verified:
-            _run_rollout(request.site, "verify")
+        # The candidate verify after the rollout covers every cluster in the
+        # site, the existing ones included; a baseline verify of the site first
+        # was a second full verify that could only repeat that answer.
         _complete(state_path, state, "PRECHECKED")
     if not _done(state, "DISCOVERED"):
-        target, cluster_id, existing = discovered or _discover_join_target(
-            request, runner
-        )
+        target, cluster_id, existing = _discover_join_target(request, runner)
         if existing is not None:
             _complete(
                 state_path,
@@ -1038,9 +1026,15 @@ def _prepare_execution(
             context=target.context,
             namespace=str(request.site.release_config["namespace"]),
         )
+        # The cluster token is site state and lives beside the tokens bootstrap
+        # wrote, in the site's ``secure/``; the join directory is disposable
+        # transaction state. The fleet-master copy stays in the join directory:
+        # rollback deletes it, and the site's own copy has to survive that.
         secure = state_dir / "secure"
         secure.mkdir(mode=0o700, parents=True, exist_ok=True)
-        token_file = secure / f"{cluster_id}.token"
+        site_secure = request.site.source.parent / "secure"
+        site_secure.mkdir(mode=0o700, parents=True, exist_ok=True)
+        token_file = site_secure / f"{cluster_id}.token"
         write_secret(token_file, secrets.token_hex(32))
         fleet_master_file = _ensure_base_secrets(
             runner,
@@ -1215,6 +1209,13 @@ def _verify_join_candidate(
     state_path: Path,
     state: dict[str, Any],
 ) -> None:
+    verified = (state.get("evidence") or {}).get("VERIFIED")
+    if _done(state, "VERIFIED") and verification_is_stale(
+        verified if isinstance(verified, dict) else {}
+    ):
+        # Evidence from an earlier run that is past its window: the data plane
+        # is still joined and healthy, so verify it again rather than undo it.
+        clear_verified_step(state_path, state)
     if not _done(state, "VERIFIED"):
         before = membership_runtime_snapshot(execution.candidate)
         _run_rollout(execution.candidate, "verify")
@@ -1248,6 +1249,25 @@ def _activate_and_commit(
     state_path: Path,
     state: dict[str, Any],
 ) -> None:
+    commit_membership(
+        request,
+        execution=execution,
+        state_dir=state_dir,
+        state_path=state_path,
+        state=state,
+    )
+
+
+def commit_membership(
+    request: JoinClusterRequest,
+    *,
+    execution: JoinExecution,
+    state_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> None:
+    """Activate the cluster, commit the site, then refresh what depends on membership."""
+
     from gpu_fault.admin.cluster_join_commit import activate_and_commit
 
     activate_and_commit(
@@ -1256,6 +1276,18 @@ def _activate_and_commit(
         state_dir=state_dir,
         state_path=state_path,
         state=state,
+    )
+    # Membership is final: the failure-domain map must now cover the new
+    # cluster's nodes, rendered from the committed site rather than the
+    # candidate so a concurrent batch join is not narrowed to one member.
+    refresh_failure_domain_map(request.site)
+
+
+def refresh_failure_domain_map(site: RenderedSite) -> None:
+    """Re-render the control-worker's failure-domain map from the committed site."""
+
+    apply_failure_domain_map(
+        load_site(site.source, repository_root=site.repository_root)
     )
 
 
@@ -1272,18 +1304,29 @@ def _deploy_and_commit(
         state_path=state_path,
         state=state,
     )
-    _verify_join_candidate(
-        execution=execution,
-        state_path=state_path,
-        state=state,
-    )
-    _activate_and_commit(
-        request,
-        execution=execution,
-        state_dir=state_dir,
-        state_path=state_path,
-        state=state,
-    )
+    for _round in range(2):
+        _verify_join_candidate(
+            execution=execution,
+            state_path=state_path,
+            state=state,
+        )
+        try:
+            _activate_and_commit(
+                request,
+                execution=execution,
+                state_dir=state_dir,
+                state_path=state_path,
+                state=state,
+            )
+        except JoinVerificationExpired:
+            # The window closed between verify and commit. Nothing about the
+            # rolled-out data plane is wrong, so re-verify instead of rolling it
+            # back; one retry, so a clock that keeps producing stale evidence
+            # cannot loop.
+            clear_verified_step(state_path, state)
+            continue
+        return
+    raise BootstrapError("join verification evidence expired again after a re-verify")
 
 
 def _site_contains_cluster(path: Path, cluster_id: str) -> bool:

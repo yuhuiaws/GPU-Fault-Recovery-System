@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 import tempfile
-from datetime import UTC, datetime
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.admin.config import AdminConfig
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_dataplane_observability import (
     phase_failure_details,
     restore_control_plane_observability,
@@ -70,12 +72,6 @@ from gpu_fault_release.regional_release_rollback_context import (
 from gpu_fault_release.regional_release_rollback_context import (
     rollback_target_arguments as _rollback_target_arguments,
 )
-from gpu_fault_release.regional_schema_change import (
-    SCHEMA_CHANGE_ACCEPTANCE_KEY,
-    ensure_schema_change_snapshot,
-    recorded_acceptance,
-    resolve_acceptance,
-)
 from gpu_fault_release.regional_release_rollout_cleanup import (
     # Re-exported for the same reason, and bound as module globals rather than
     # called through the source module so a test that patches
@@ -97,10 +93,14 @@ from gpu_fault_release.regional_release_timing import (
 from gpu_fault_release.regional_release_transaction import complete_rollback
 from gpu_fault_release.regional_release_validation import validate_gpu_rollback_target
 from gpu_fault_release.regional_runtime_profile import ensure_runtime_profile
+from gpu_fault_release.regional_schema_change import (
+    SCHEMA_CHANGE_ACCEPTANCE_KEY,
+    ensure_schema_change_snapshot,
+    recorded_acceptance,
+    resolve_acceptance,
+)
 
-from gpu_fault.admin.config import AdminConfig
-
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 # Changes whose previous state nothing captures, so a rollback that claimed to
 # restore them would be reporting a state it never put back. The ADOT manifest
 # and image used to be here; the observability snapshot now carries the live

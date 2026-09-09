@@ -12,19 +12,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
+from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
     build_preflight_report,
     report_exit_code,
 )
 from gpu_fault_release.regional_admin_commands import (
-    bootstrap_cpu_is_current,
-    build_full_status,
-    build_release_diff,
     apply_rds_ca_bundle,
+    bootstrap_cpu_is_current,
+    build_release_diff,
     build_release_summary,
+    build_status,
+    compact_report,
     ensure_schema,
+    full_report_requested,
     run_deploy,
     run_resume,
     stage_noop_release,
@@ -61,7 +66,6 @@ from gpu_fault_release.regional_notifications import (
 from gpu_fault_release.regional_observability_rollback import (
     restore_observability_snapshot,
 )
-from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault_release.regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
@@ -77,6 +81,10 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseDiff,
     classify_release,
     control_plane_role_targets,
+)
+from gpu_fault_release.regional_release_failure_domains import (
+    FAILURE_DOMAIN_MAP_SHA256_ENV,
+    apply_failure_domain_map,
 )
 from gpu_fault_release.regional_release_fleet_rollout import (
     agent_heartbeats_converged,
@@ -115,6 +123,10 @@ from gpu_fault_release.regional_release_iam import (
 from gpu_fault_release.regional_release_iam import (
     validate_executor_iam_role,
 )
+from gpu_fault_release.regional_release_narration import (
+    narrate_release_end,
+    narrate_release_start,
+)
 from gpu_fault_release.regional_release_node_runtime_rollout import (
     preflight_node_runtime,
     roll_node_runtime,
@@ -139,11 +151,7 @@ from gpu_fault_release.regional_release_orchestration import (
     build_rollback_environment as build_rollback_environment,
 )
 from gpu_fault_release.regional_release_preflight import ensure_region_contexts
-from gpu_fault_release.regional_release_narration import (
-    narrate_release_end,
-    narrate_release_start,
-)
-from gpu_fault_release.regional_release_probes import probe_label
+from gpu_fault_release.regional_release_probes import command_label
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,
     desired_registry,
@@ -210,7 +218,7 @@ from gpu_fault_release.regional_runtime_profile import (
     runtime_profile_policy_digest,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 FAST_ROLLOUT_TIMEOUT = "5m"
 SLOW_COMMAND_SECONDS = 15.0
 SLOW_COMMAND_LABEL_LIMIT = 160
@@ -221,43 +229,6 @@ SENSITIVE_CONFIG_MARKERS = (
     "CREDENTIAL",
     "PRIVATE_KEY",
 )
-
-
-def _echoed_arguments(arguments: list[str]) -> list[str]:
-    """Replace a probe body in the command echo with the probe's name.
-
-    Only the echo changes. ``args`` itself is untouched, so the bytes on the
-    wire and the ``-c`` calling convention are exactly what they were -- which
-    is the whole point of shipping the probe as source (``probes/README.md``).
-
-    Without this, every probe put its full body on one ``+ python3 -c ...``
-    line. The probe programs are commented, so that was 24% of the lines of an
-    upgrade, and it pushed the kubectl trace an operator actually reads off the
-    screen.
-    """
-
-    echoed = list(arguments)
-    for index, argument in enumerate(echoed):
-        if index == 0 or echoed[index - 1] != "-c":
-            continue
-        label = probe_label(argument)
-        if label is not None:
-            echoed[index] = label
-    return echoed
-
-
-def _command_label(args: list[str], *, sensitive: bool = False) -> str:
-    """The command exactly as the ``+`` echo has always shown it.
-
-    Not shortened: an argument that is not a probe body is the release's real
-    input -- a manifest, a selector, a node name -- and the trace an operator
-    reads to reconstruct what ran has to keep it whole. Shortening belongs to the
-    elapsed line, which is a pointer rather than a record.
-    """
-
-    if sensitive:
-        return "<sensitive command>"
-    return " ".join([Path(args[0]).name, *_echoed_arguments(args[1:])])
 
 
 class Runner:
@@ -301,7 +272,7 @@ class Runner:
         sensitive: bool = False,
         timeout_seconds: float | None = None,
     ) -> str:
-        label = _command_label(args, sensitive=sensitive)
+        label = command_label(args, sensitive=sensitive)
         print("+ " + label, file=sys.stderr, flush=True)
         if self.dry_run and not capture:
             return ""
@@ -333,11 +304,21 @@ class Runner:
             # silent: their output is what they were marked sensitive for.
             # Both go to stderr: stdout carries the machine-readable release
             # report, and a failed command's chatter must not land in it.
-            if capture and not sensitive:
+            quoted = capture and not sensitive
+            if quoted:
                 for text in (completed.stdout, completed.stderr):
                     if text:
                         print(text, file=sys.stderr)
-            raise ReleaseError(f"command failed ({completed.returncode}): {args[0]}")
+            # Our own scripts have just reported themselves (above, or on the
+            # inherited descriptors); a foreign command gets one line naming
+            # the step and its last words.
+            raise child_failure(
+                ReleaseError,
+                args,
+                completed.returncode,
+                detail=last_output_line(completed.stderr) if quoted else "",
+                sensitive=sensitive,
+            )
         return completed.stdout.strip() if capture else ""
 
     def probe(self, args: list[str], *, timeout_seconds: float | None = None) -> bool:
@@ -373,7 +354,7 @@ class Runner:
                 f"probe timed out after {timeout_seconds}s: {args[0]}"
             ) from exc
         finally:
-            self._narrate_elapsed(_command_label(args), started)
+            self._narrate_elapsed(command_label(args), started)
         return completed.returncode == 0
 
     def probe_output(
@@ -400,7 +381,7 @@ class Runner:
                 f"probe timed out after {timeout_seconds}s: {args[0]}"
             ) from exc
         finally:
-            self._narrate_elapsed(_command_label(args), started)
+            self._narrate_elapsed(command_label(args), started)
         return completed.returncode, completed.stdout, completed.stderr
 
 
@@ -449,6 +430,9 @@ def render_and_apply_cpu_roles(
             },
         )
         environment["GPU_FAULT_ROLE_SPLIT_GENERATED_DIR"] = str(generated)
+        # The failure-domain ConfigMap ships in the same apply; its digest rides
+        # the pod-template annotation so the worker rolls only when it changed.
+        environment[FAILURE_DOMAIN_MAP_SHA256_ENV] = apply_failure_domain_map(release)
         release.runner.run(
             [
                 "bash",
@@ -797,12 +781,10 @@ class RegionalRelease:
             *execution,
         ]
 
-    def status(self) -> dict[str, Any]:
-        self._apply_health_baseline()
-        return build_full_status(self)
+    def status(self, *, full: bool = False) -> dict[str, Any]:
+        return build_status(self, full=full)
 
-    def _apply_health_baseline(self) -> None:
-        state = self._load_state()
+    def _apply_health_baseline(self, state: dict[str, Any]) -> None:
         previous = state.get("previous")
         rollback_result = state.get("rollback_result")
         if (
@@ -1356,6 +1338,10 @@ def parser() -> argparse.ArgumentParser:
     # It lets the in-flight install check proceed (logging) when no
     # control-plane Pod can answer the store read.
     value.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
+    # `status`: every health check instead of the cheap two. `preflight`: the
+    # passing checks' details instead of their names. GPU_FAULT_FULL_REPORT=1
+    # does the same for a wrapper that cannot add the flag.
+    value.add_argument("--full", action="store_true")
     return value
 
 
@@ -1381,10 +1367,19 @@ def _run_mode(arguments: argparse.Namespace) -> int:
         )
     elif arguments.mode == "preflight":
         report = build_preflight_report(release)
-        print(json.dumps(report, indent=2, sort_keys=True))
+        full = bool(getattr(arguments, "full", False)) or full_report_requested()
+        print(
+            json.dumps(
+                report if full else compact_report(report),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         exit_code = report_exit_code(report)
     elif arguments.mode == "status":
-        report = release.status()
+        report = release.status(
+            full=bool(getattr(arguments, "full", False)) or full_report_requested()
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
         exit_code = 0 if report.get("healthy") else 1
     elif arguments.mode == "release-summary":
@@ -1434,7 +1429,7 @@ def _run_mode(arguments: argparse.Namespace) -> int:
     elif arguments.mode == "sync-state":
         sync_release_state(release)
     elif arguments.mode == "verify":
-        release._apply_health_baseline()
+        release._apply_health_baseline(release._load_state())
         report = build_health_report(release, mode="verify")
         print(json.dumps(report, indent=2, sort_keys=True))
         exit_code = report_exit_code(report)
@@ -1460,7 +1455,9 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        # A child that was our own script has already said why; only a foreign
+        # command's failure needs this line, and the child's status passes up.
+        exit_code = report_failure("ERROR", exc)
     finally:
         # `finally` rather than the success path, so an invocation that died --
         # the case where an operator most needs to know it is over and how long

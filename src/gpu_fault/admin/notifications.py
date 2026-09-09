@@ -5,13 +5,18 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
     ClusterIdentity,
     CommandRunner,
+)
+from gpu_fault.admin.site import (
+    NOTIFICATION_CHANNEL_SES,
+    NOTIFICATION_CHANNEL_SNS,
+    NOTIFICATION_CHANNELS,
 )
 
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
@@ -20,9 +25,44 @@ EMAIL_SECRET_NAME = "gpu-fault-email"
 
 @dataclass(frozen=True)
 class NotificationRouting:
+    """Where the control plane's own notifications go, and over which channel.
+
+    ``sns`` (the default for every site the CLI writes): the administrator
+    address is the one confirmed subscription on the site topic; ``sender`` and
+    ``recipients`` are carried for the record but no SES identity exists.
+    ``ses``: mail goes from the administrator address to the administrator
+    address through a verified SES identity, as before.
+    """
+
     sender: str
     recipients: tuple[str, ...]
     subject_prefix: str
+    channel: str = NOTIFICATION_CHANNEL_SNS
+
+    @property
+    def uses_ses(self) -> bool:
+        return self.channel == NOTIFICATION_CHANNEL_SES
+
+    def site_notifications(self, admin_email: str) -> dict[str, Any]:
+        """The ``spec.notifications`` block the generated site.yaml declares.
+
+        Only the SES channel has a sender identity and a recipient list; the
+        SNS channel is the administrator's subscription on the site topic.
+        """
+
+        addresses: dict[str, Any] = (
+            {"emailSender": self.sender, "emailRecipients": list(self.recipients)}
+            if self.uses_ses
+            else {}
+        )
+        return {
+            "channel": self.channel,
+            "allowEmail": True,
+            "acknowledgeExternalAlertChannel": False,
+            "adminEmail": admin_email,
+            **addresses,
+            "emailSubjectPrefix": self.subject_prefix,
+        }
 
 
 def validate_admin_email(value: str) -> str:
@@ -35,29 +75,26 @@ def validate_admin_email(value: str) -> str:
 def resolve_notification_routing(
     *,
     admin_email: str,
-    sender_email: str | None = None,
-    recipients: Sequence[str] = (),
-    subject_prefix: str = "",
+    channel: str = NOTIFICATION_CHANNEL_SNS,
 ) -> NotificationRouting:
-    sender = validate_admin_email(sender_email or admin_email)
-    normalized_recipients = tuple(
-        dict.fromkeys(
-            validate_admin_email(item) for item in (recipients or (admin_email,))
-        )
-    )
-    normalized_prefix = subject_prefix.strip()
-    if (
-        len(normalized_prefix) > 64
-        or "\n" in normalized_prefix
-        or "\r" in normalized_prefix
-    ):
+    """One administrator address is the whole routing, on either channel.
+
+    There is no separate sender, recipient list or subject prefix on the
+    command; the ``site.yaml`` fields the release engine reads are filled from
+    this routing. The channel comes from the existing site (``sns`` for a new
+    one) so a routine upgrade never moves a live site's notifications.
+    """
+
+    if channel not in NOTIFICATION_CHANNELS:
         raise BootstrapError(
-            "email subject prefix must be a single line of at most 64 characters"
+            "notification channel must be one of " + ", ".join(NOTIFICATION_CHANNELS)
         )
+    sender = validate_admin_email(admin_email)
     return NotificationRouting(
         sender=sender,
-        recipients=normalized_recipients,
-        subject_prefix=normalized_prefix,
+        recipients=(sender,),
+        subject_prefix="",
+        channel=channel,
     )
 
 
@@ -138,15 +175,18 @@ def _apply_email_secret(
     *,
     cpu_kubeconfig: Path,
     namespace: str,
-    sender: str,
-    recipients: Sequence[str],
+    sender: str | None,
+    recipients: Sequence[str] | None,
     subject_prefix: str,
     site_id: str,
     account_id: str,
 ) -> None:
+    # The SNS channel carries no addresses: the runtime reads the topic from
+    # its environment and only the subject prefix and the site context from
+    # this Secret, so those two keys are left out rather than written empty.
     expected = {
-        "email-sender": sender,
-        "email-recipients": ",".join(recipients),
+        **({"email-sender": sender} if sender else {}),
+        **({"email-recipients": ",".join(recipients)} if recipients else {}),
         "email-subject-prefix": subject_prefix,
         "site-id": site_id,
         "aws-account-id": account_id,
@@ -196,11 +236,7 @@ def _apply_email_secret(
             "secret",
             "generic",
             EMAIL_SECRET_NAME,
-            f"--from-literal=email-sender={expected['email-sender']}",
-            f"--from-literal=email-recipients={expected['email-recipients']}",
-            f"--from-literal=email-subject-prefix={expected['email-subject-prefix']}",
-            f"--from-literal=site-id={expected['site-id']}",
-            f"--from-literal=aws-account-id={expected['aws-account-id']}",
+            *(f"--from-literal={key}={value}" for key, value in expected.items()),
             "--dry-run=client",
             "-o",
             "yaml",
@@ -223,29 +259,26 @@ def _apply_email_secret(
     )
 
 
-def ensure_email_notifications(
+def ses_identity_verified(identity: Mapping[str, Any]) -> bool:
+    return bool(identity.get("VerifiedForSendingStatus")) or (
+        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
+    )
+
+
+def ensure_ses_identity(
     runner: CommandRunner,
     *,
-    cpu: ClusterIdentity,
-    cpu_kubeconfig: Path,
-    namespace: str,
+    region: str,
+    sender: str,
     site_id: str,
-    admin_email: str,
-    sender_email: str | None = None,
-    recipients: Sequence[str] = (),
-    subject_prefix: str = "",
-) -> dict[str, Any]:
-    routing = resolve_notification_routing(
-        admin_email=admin_email,
-        sender_email=sender_email,
-        recipients=recipients,
-        subject_prefix=subject_prefix,
-    )
-    identity = _ses_identity(
-        runner,
-        region=cpu.region,
-        email=routing.sender,
-    )
+) -> tuple[dict[str, Any], bool]:
+    """The SES identity for ``sender``, created (verification mail sent) if absent.
+
+    Returns ``(identity, created)``. Idempotent: an identity that exists is only
+    read, so a rerun neither re-sends the verification nor re-tags it.
+    """
+
+    identity = _ses_identity(runner, region=region, email=sender)
     created = identity is None
     if created:
         runner.run(
@@ -254,9 +287,9 @@ def ensure_email_notifications(
                 "sesv2",
                 "create-email-identity",
                 "--region",
-                cpu.region,
+                region,
                 "--email-identity",
-                routing.sender,
+                sender,
                 "--tags",
                 f"Key={SITE_TAG_KEY},Value={site_id}",
             ],
@@ -264,21 +297,63 @@ def ensure_email_notifications(
             sensitive=True,
             capture=False,
         )
-        identity = _ses_identity(
-            runner,
-            region=cpu.region,
-            email=routing.sender,
-        )
+        identity = _ses_identity(runner, region=region, email=sender)
     if identity is None:
         raise BootstrapError("SES email identity could not be inspected")
-    verified = bool(identity.get("VerifiedForSendingStatus")) or (
-        str(identity.get("VerificationStatus") or "").upper() == "SUCCESS"
-    )
-    if not verified:
-        raise BootstrapError(
-            "SES sent a verification request to the configured sender email; "
-            "complete verification and rerun the same deploy command"
+    return identity, created
+
+
+def ensure_email_notifications(
+    runner: CommandRunner,
+    *,
+    cpu: ClusterIdentity,
+    cpu_kubeconfig: Path,
+    namespace: str,
+    site_id: str,
+    admin_email: str,
+    routing: NotificationRouting,
+) -> dict[str, Any]:
+    """The bootstrap task: the notification Secret, plus SES identity for ``ses``.
+
+    ``sns`` (the default) touches no SES API at all: the site topic and its
+    confirmed subscription -- created and checked by the monitoring task and
+    the deploy's first-minute precheck -- are the channel, and this task only
+    writes the Secret the runtime reads the subject prefix and site context
+    from.
+
+    For ``ses`` verification is no longer gated here. ``gpu-fault-admin deploy``
+    checks the sender identity and the SNS subscription in its first minute
+    (``notification_precheck``) and stops with both addresses named; by the time
+    this task runs the identity is verified, and if it is not (the check was
+    bypassed by an internal hop) the status is recorded for ``status`` and the
+    verifier rather than failing a bootstrap that is minutes in.
+    """
+
+    if not routing.uses_ses:
+        _apply_email_secret(
+            runner,
+            cpu_kubeconfig=cpu_kubeconfig,
+            namespace=namespace,
+            sender=None,
+            recipients=None,
+            subject_prefix=routing.subject_prefix,
+            site_id=site_id,
+            account_id=cpu.account_id,
         )
+        return {
+            "channel": routing.channel,
+            "admin_email": admin_email,
+            "email_subject_prefix": routing.subject_prefix,
+            "identity_ownership": "NONE",
+            "verified": True,
+            "verification_status": "NOT_REQUIRED",
+            "secret_name": EMAIL_SECRET_NAME,
+        }
+
+    identity, created = ensure_ses_identity(
+        runner, region=cpu.region, sender=routing.sender, site_id=site_id
+    )
+    verified = ses_identity_verified(identity)
     account = runner.aws_json(cpu.region, "sesv2", "get-account")
     if not bool(account.get("SendingEnabled")):
         raise BootstrapError("SES sending is disabled for the AWS account")
@@ -294,6 +369,7 @@ def ensure_email_notifications(
         account_id=cpu.account_id,
     )
     return {
+        "channel": routing.channel,
         "admin_email": admin_email,
         "sender_email": routing.sender,
         "email_recipients": list(routing.recipients),
@@ -303,7 +379,8 @@ def ensure_email_notifications(
             f"arn:aws:ses:{cpu.region}:{cpu.account_id}:identity/{routing.sender}"
         ),
         "identity_ownership": "CREATED" if created else "EXTERNAL",
-        "verified": True,
+        "verified": verified,
+        "verification_status": "VERIFIED" if verified else "PENDING",
         "production_access_enabled": bool(account.get("ProductionAccessEnabled")),
         "secret_name": EMAIL_SECRET_NAME,
     }

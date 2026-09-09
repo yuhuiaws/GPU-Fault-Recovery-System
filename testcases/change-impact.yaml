@@ -159,21 +159,27 @@ rules:
       - scripts/capture_release_evidence.py
       - scripts/release_deploy.py
       - scripts/release_deploy_evidence.py
+      - scripts/release_deploy_profile.py
       - scripts/deploy_source_identity.py
       - scripts/restore_ci_candidate.py
       - scripts/staging_deploy.py
       - scripts/staging_state_hygiene.py
+      - scripts/staging_source_snapshot.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
+      - tests/regional/test_boot020_runner.py
       - tests/regional/test_*release*.py
       - tests/test_artifact_consistency.py
     pytest:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
+      - tests/regional/test_boot020_runner.py
       - tests/regional/test_regional_release_orchestrator.py
       - tests/regional/test_regional_release_config_and_profile.py
       - tests/regional/test_regional_release_resume.py
@@ -184,6 +190,7 @@ rules:
       - tests/regional/test_allowed_namespace_preflight.py
       - tests/regional/test_release_supersede_failed_transaction.py
       - tests/deploy/test_rds_ca_bundle_wiring.py
+      - tests/admin/test_admin_rollback_command.py
       - tests/deploy/test_verify_control_plane_role_split_optional.py
       - tests/deploy/test_verify_control_plane_role_split_snapshot.py
       - tests/regional/test_release_aurora_refresh_preflight.py
@@ -223,6 +230,7 @@ rules:
       - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
       - scripts/staging_state_hygiene.py
+      - scripts/staging_source_snapshot.py
       - config/admin-config.example.yaml
       - src/gpu_fault/admin/bootstrap_dependencies.py
       - src/gpu_fault/data/deploy-host-tools.json
@@ -230,6 +238,7 @@ rules:
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_admin_cluster_*.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
       - tests/test_restore_ci_candidate.py
       - tests/regional/test_installed_resource_registry.py
@@ -240,6 +249,7 @@ rules:
       - tests/admin/test_admin_cluster_join.py
       - tests/admin/test_admin_cluster_removal.py
       - tests/test_staging_deploy.py
+      - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
       - tests/test_restore_ci_candidate.py
       - tests/regional/test_installed_resource_registry.py
@@ -308,7 +318,6 @@ rules:
       - src/gpu_fault/app/routes/regional.py
       - src/gpu_fault/app/routes/completion.py
       - deploy/dataplane/cluster-action-executor.yaml
-      - deploy/dataplane/tools/verify-dataplane-executor.sh
       - deploy/dataplane/tools/verify_dataplane_executor.py
       - tests/hyperpod/test_cluster_executor.py
       - tests/regional/test_regional_control_plane.py
@@ -508,10 +517,12 @@ rules:
       - tests/notifications/**
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
+      - tests/admin/test_admin_site_notification_channel.py
     pytest:
       - tests/notifications
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
+      - tests/admin/test_admin_site_notification_channel.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001
       - GF-REGIONAL-NOTIFY-003..007
@@ -667,7 +678,8 @@ rules:
       - tests/regional/test_plugins.py
       - tests/app/test_route_tenancy_security.py
     regional_cases:
-      - GF-REGIONAL-BOOT-001..015
+      - GF-REGIONAL-BOOT-001..005
+      - GF-REGIONAL-BOOT-007..015
       - GF-REGIONAL-AUTH-001..009
       - GF-REGIONAL-AUTH-011
       - GF-REGIONAL-AUTH-013..016
@@ -677,22 +689,23 @@ rules:
     fallback: true
 
   - id: workflow-reconcile
-    description: Operator reconcile of stuck, BLOCKED and retired-generation workflows (offline admin tooling; PREEMPT-036 drives it against an isolated store).
+    description: Stuck-workflow reconciliation -- the dispatcher's automatic sweeps (retired generations, compile-time BLOCKED no-ops, orphaned remote commands) and the administrator's restore reconcile (offline admin tooling; PREEMPT-036 drives the sweeps against an isolated store).
     paths:
       - src/gpu_fault/workflow_reconcile.py
       - src/gpu_fault/workflow_resolution.py
       - src/gpu_fault/retired_generation.py
+      - src/gpu_fault/compile_blocked.py
+      - src/gpu_fault/orphaned_commands.py
       - src/gpu_fault/admin/workflow_reconcile.py
       - tests/test_workflow_reconcile.py
       - tests/test_workflow_reconcile_operator_exit.py
       - tests/test_retired_generation_apply.py
       - tests/admin/test_admin_workflow_reconcile.py
-      - tests/admin/test_compile_blocked_reconcile.py
-      - tests/admin/test_orphaned_commands_reconcile.py
-      - tests/admin/test_retired_generation_reconcile.py
-      - tests/admin/test_retired_generation_waiting_ttl.py
+      - tests/admin/test_admin_workflow_reconcile_cli.py
       - tests/admin/test_workflow_reconcile_epoch_cas.py
       - tests/execution/test_retired_generation.py
+      - tests/execution/test_compile_blocked_sweep.py
+      - tests/execution/test_orphaned_commands_sweep.py
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py
@@ -701,12 +714,11 @@ rules:
       - tests/test_workflow_reconcile_operator_exit.py
       - tests/test_retired_generation_apply.py
       - tests/admin/test_admin_workflow_reconcile.py
-      - tests/admin/test_compile_blocked_reconcile.py
-      - tests/admin/test_orphaned_commands_reconcile.py
-      - tests/admin/test_retired_generation_reconcile.py
-      - tests/admin/test_retired_generation_waiting_ttl.py
+      - tests/admin/test_admin_workflow_reconcile_cli.py
       - tests/admin/test_workflow_reconcile_epoch_cas.py
       - tests/execution/test_retired_generation.py
+      - tests/execution/test_compile_blocked_sweep.py
+      - tests/execution/test_orphaned_commands_sweep.py
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py
@@ -724,6 +736,8 @@ rules:
       - tests/regional/test_regional_admin_*.py
     pytest:
       - tests/admin
+      - tests/admin/test_admin_rotate_token.py
+      - tests/admin/test_admin_submit_remediation.py
       - tests/regional/test_regional_admin_checks.py
       - tests/regional/test_regional_admin_commands.py
     regional_cases:

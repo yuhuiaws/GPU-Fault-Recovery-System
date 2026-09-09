@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 import hashlib
 import inspect
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -85,6 +85,35 @@ def _apply_store_review_indexes_v12(cursor: MigrationCursor) -> None:
     # partial ``gpu_fault_remote_command_workflow`` served, so that one goes
     # here the way v11 dropped the twin claim-window index.
     cursor.execute("DROP INDEX IF EXISTS gpu_fault_remote_command_workflow")
+
+
+def _apply_control_plane_review_indexes_v13(cursor: MigrationCursor) -> None:
+    # Control-plane review 2026-09-08, items G-2 / G-9 / F-9 / F-I1 / G-6:
+    # seven new partial indexes on gpu_fault_objects (the all-status workflow
+    # updated_at order the /metrics detail scan reads, the incident -> workflow
+    # pointer and workflow -> predecessor join keys the orphan inspections
+    # probe, the incident and fleet-deployment updated_at orders the archiver
+    # and the retention sweep use, and the two missing marker scope GINs) plus
+    # per-table autovacuum factors for the whole-row-upsert hot table. Same
+    # three-step method as v9-v12: declared IF NOT EXISTS by the idempotent
+    # DDL, built CONCURRENTLY by the operator/deploy Job first, validated at
+    # startup -- and from this version the startup check also refuses an
+    # INVALID index and a definition that drifted from the DDL.
+    cursor.execute("SELECT 1")
+
+
+def _apply_objects_wakeup_trigger_v14(cursor: MigrationCursor) -> None:
+    # One row trigger on gpu_fault_objects publishes the two wakeup channels
+    # (gpu_fault_workflow_dispatch, gpu_fault_remote_command) that let the
+    # workflow dispatcher and the data-plane executor stop paying their 5 s /
+    # 2 s poll on every remediation step. Same precedent as the spool trigger
+    # change folded into v13 (E-8): the idempotent DDL creates the function
+    # with CREATE OR REPLACE and the trigger through _ensure_trigger, so
+    # --ensure-schema installs it and a current database re-runs lock-free.
+    # No table or column changes; the version exists because the migration
+    # registry checksums every ddl*.py file, and a wheel without the trigger
+    # would poll silently against a database that has it (or the reverse).
+    cursor.execute("SELECT 1")
 
 
 def _apply_dispatcher_indexes_v9(cursor: MigrationCursor) -> None:
@@ -222,6 +251,18 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="store-review-hot-query-indexes",
         ddl_checksum="37e84d0dbacd405f6eb05223c65f997e44b0be2524d7b7ed577f3ced0a222c99",
         apply=_apply_store_review_indexes_v12,
+    ),
+    SchemaMigration(
+        version=13,
+        name="control-plane-review-indexes-and-autovacuum",
+        ddl_checksum="b8d1ac08876ac315c9b170691dfa87867803bf4300730018fba596277fcc2986",
+        apply=_apply_control_plane_review_indexes_v13,
+    ),
+    SchemaMigration(
+        version=14,
+        name="objects-wakeup-notify-trigger",
+        ddl_checksum="b87cc5f1a92677cd3e09e38d3e57659cdad0e0a2db628236778f870485382944",
+        apply=_apply_objects_wakeup_trigger_v14,
     ),
 )
 

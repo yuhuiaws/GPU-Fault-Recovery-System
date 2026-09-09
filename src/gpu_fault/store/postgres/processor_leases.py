@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 
@@ -135,6 +134,19 @@ class PostgresProcessorLeaseMixin:
         not_before: datetime | None = None,
         retry_count: int | None = None,
     ) -> None:
+        """Hand a claimed request back: lane and queue row each on their own CAS.
+
+        The two writes are independent (B-2). The lane row is released
+        whenever ``(ordering_key, owner_id, epoch, lease_token)`` still
+        match, whatever the queue row says - a queue row that lost its
+        lease fields (or was completed by a fenced batch) must not leave
+        the owner's lane leased for the remaining lease. The queue row goes
+        back to PENDING whenever its fencing fields match and it is LEASED,
+        whatever the lane says - a lane another owner has since taken over
+        must not leave this row LEASED until its lease expires. Neither
+        step is a precondition of the other.
+        """
+
         from gpu_fault.processor import (
             ProcessorRequestStatus,
         )
@@ -142,21 +154,6 @@ class PostgresProcessorLeaseMixin:
         with self._state_transaction(f"processor_request/{request_id}"):
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
-            if (
-                current.lease_owner != owner_id
-                or current.leader_epoch != lane_epoch
-                or current.lease_token != lease_token
-            ):
-                return
-            # Completing does not clear the fencing fields, so without
-            # this a COMPLETED request passes the check above and goes
-            # back to PENDING - it is claimed again and its side effects
-            # run twice. The callers do exactly that: a batch whose
-            # result is missing one request raises, and the handler then
-            # releases every request in the batch, including the ones the
-            # same statement had just committed.
-            if current.status != ProcessorRequestStatus.LEASED:
-                return
             now = datetime.now(timezone.utc)
             with self._db.cursor() as cursor:
                 cursor.execute(
@@ -167,6 +164,7 @@ class PostgresProcessorLeaseMixin:
                       AND owner_id=%s
                       AND epoch=%s
                       AND lease_token=%s
+                      AND lease_expires_at > %s
                     """,
                     (
                         now,
@@ -175,10 +173,20 @@ class PostgresProcessorLeaseMixin:
                         owner_id,
                         lane_epoch,
                         lease_token,
+                        now,
                     ),
                 )
-                released = cursor.rowcount == 1
-            if not released:
+            if (
+                current.lease_owner != owner_id
+                or current.leader_epoch != lane_epoch
+                or current.lease_token != lease_token
+            ):
+                return
+            # Completing does not clear the fencing fields, so without
+            # this a COMPLETED request passes the check above and goes
+            # back to PENDING - it is claimed again and its side effects
+            # run twice (F-D9).
+            if current.status != ProcessorRequestStatus.LEASED:
                 return
             self._persist_processor_state(
                 current.model_copy(

@@ -13,9 +13,10 @@ in ``sys.argv[1]`` with nothing else to arrange.
 Response: ``{"series_count": N, "all_labeled": bool, "all_zero": bool}``.
 
 ``all_labeled`` is the real subject. The four uvicorn workers behind one port
-each keep their own copy of this counter, so the family is only summable if every
-series carries ``process_id``; an unlabeled series means one worker's rejections
-are silently overwriting another's. ``all_zero`` is the health part. Both are
+each keep their own copy of this counter and the Pod's /metrics merges every
+live process's samples, so the family is only summable if every series carries
+``process_id``; an unlabeled series means one worker's rejections are silently
+overwriting another's in the merge. ``all_zero`` is the health part. Both are
 ``bool(series) and ...`` so that "no series at all" is false rather than
 vacuously true -- a Pod not publishing the family must not read as ready.
 """

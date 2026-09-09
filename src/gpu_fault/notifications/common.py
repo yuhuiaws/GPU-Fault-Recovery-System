@@ -22,7 +22,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.models import StrictModel as StrictModel
 
-
 RESTART_GUARD_TEMPLATE_VERSION = "restart-guard-zh-v2"
 RESTART_WORKLOAD_TEMPLATE_VERSION = "restart-workload-zh-v1"
 RESTART_NODE_TEMPLATE_VERSION = "restart-node-zh-v1"
@@ -41,6 +40,38 @@ DCGM_DIAGNOSTIC_TEMPLATE_VERSION = "dcgm-diagnostic-zh-v2"
 EFA_RDMA_EVENT_TEMPLATE_VERSION = "efa-rdma-event-zh-v1"
 HARDWARE_INVENTORY_TEMPLATE_VERSION = "hardware-inventory-mismatch-zh-v1"
 HOST_RESOURCE_EVENT_TEMPLATE_VERSION = "host-resource-event-zh-v1"
+DIAGNOSTIC_INCONCLUSIVE_TEMPLATE_VERSION = "diagnostic-inconclusive-zh-v1"
+
+DIAGNOSTIC_INCONCLUSIVE_EMAIL_TEMPLATE = """\
+GPU 节点诊断未定论通知
+
+一、事件信息
+- 集群：{cluster_id}
+- 节点：{nodes}
+- Incident：{incident_id}
+- Workflow：{workflow_id}
+- Event ID：{event_id}
+- Policy source：{policy_source}
+- Official action：{official_action}
+
+二、诊断结果
+- Workflow steps：{operations}
+- 失败 step：{failed_operation}
+- 失败原因：{error}
+- 结论：诊断未定论（diagnostic inconclusive）。该 workflow 只包含取证/诊断/验证类
+  步骤，没有改动或隔离节点。
+
+三、系统处理
+- Incident 已收尾为 RECOVERED，reason 记为 diagnostic inconclusive。
+- 该 incident 的 marker 已退役，节点不再被视为「修复中」；后续训练失败按正常
+  路径（快速分诊或重启）处理。
+- 未创建任何恢复动作或 AWS Support case。若节点持续报警，请人工复核。
+
+四、触发原因
+{reasons}
+
+邮件模板：{template_version}
+"""
 
 HARDWARE_INVENTORY_EMAIL_TEMPLATE = """\
 GPU 节点硬件 Inventory 不匹配通知

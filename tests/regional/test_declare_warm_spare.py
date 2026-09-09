@@ -1,271 +1,39 @@
+"""The acceptance wrapper over ``gpu-fault-admin config spare``.
+
+The refusal matrix, the baseline-before-patch ordering and the exact-baseline
+release are tested where the logic lives, in
+``tests/admin/test_admin_warm_spare.py``. What is tested here is the wrapper's
+own surface: it binds the same functions rather than copies of them, it maps a
+site profile onto the admin request, and it still refuses the shared ``--node``
+flag that would cordon the wrong machine.
+"""
+
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from gpu_fault.admin import warm_spare
 from scripts.e2e.regional import declare_warm_spare as helper
-from scripts.e2e.regional.warm_spare_fixture import (
-    HYPERPOD_HEALTH_LABEL,
-    INSTANCE_GROUP_LABEL,
-    SPARE_LABEL,
-    SPARE_POOL_STATE_ANNOTATION,
-    SPARE_RESERVATION_ANNOTATION,
-)
+from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
 
-def _node(name: str, **overrides: Any) -> dict[str, Any]:
-    snapshot: dict[str, Any] = {
-        "name": name,
-        "uid": f"uid-{name}",
-        "ready": "True",
-        "unschedulable": False,
-        "gpu_allocatable": 8,
-        "taints": [],
-        "labels": {
-            SPARE_LABEL: None,
-            HYPERPOD_HEALTH_LABEL: "Schedulable",
-            INSTANCE_GROUP_LABEL: "group-a",
-            "node.kubernetes.io/instance-type": "ml.p5en.48xlarge",
-        },
-        "annotations": {
-            SPARE_RESERVATION_ANNOTATION: None,
-            SPARE_POOL_STATE_ANNOTATION: None,
-        },
-    }
-    for key, value in overrides.items():
-        if key in {"labels", "annotations"}:
-            snapshot[key] = {**snapshot[key], **value}
-        else:
-            snapshot[key] = value
-    return snapshot
-
-
-def _settings(tmp_path: Path, *, fault_node: str = "") -> helper.Settings:
-    return helper.Settings(
-        node="node-spare",
-        fault_node=fault_node,
-        hyperpod_cluster="cluster-a",
-        baseline=tmp_path / "spare-baseline.json",
+def test_the_wrapper_binds_the_admin_module_not_a_copy() -> None:
+    assert helper.declare_refusals is warm_spare.declare_refusals, (
+        "the wrapper must not re-implement the declare refusals"
     )
-
-
-def _refusals(settings: helper.Settings, **overrides: Any) -> list[str]:
-    arguments: dict[str, Any] = {
-        "spare": _node("node-spare"),
-        "fault": None,
-        "declared": [],
-        "workloads": [],
-        "state": {"agents": [{"node_id": "node-spare", "lifecycle_state": "ACTIVE"}]},
-    }
-    arguments.update(overrides)
-    return helper.declare_refusals(settings, **arguments)
-
-
-def test_a_healthy_monitored_node_can_be_declared(tmp_path: Path) -> None:
-    assert _refusals(_settings(tmp_path)) == []
-
-
-def test_declaration_is_refused_without_exactly_one_active_agent(
-    tmp_path: Path,
-) -> None:
-    # "纳入监控" is a hard precondition of the warm-spare path: an unmonitored
-    # node has no Agent to fence and no health signal to trust.
-    settings = _settings(tmp_path)
-
-    assert "node does not have exactly one ACTIVE Agent" in _refusals(
-        settings, state={"agents": []}
+    assert helper.release_refusals is warm_spare.release_refusals, (
+        "the wrapper must not re-implement the release refusals"
     )
-    assert "node does not have exactly one ACTIVE Agent" in _refusals(
-        settings,
-        state={"agents": [{"node_id": "node-spare", "lifecycle_state": "REVOKED"}]},
-    )
-    # Two Agents claiming one node is ambiguous, not "the first one wins".
-    assert "node does not have exactly one ACTIVE Agent" in _refusals(
-        settings,
-        state={
-            "agents": [
-                {"node_id": "node-spare", "lifecycle_state": "ACTIVE"},
-                {"node_id": "node-spare", "lifecycle_state": "ACTIVE"},
-            ]
-        },
-    )
-
-
-def test_declaration_is_refused_while_a_gpu_workload_is_running(tmp_path: Path) -> None:
-    # Cordoning does not evict. A spare declared under a live job is busy, and
-    # the case would allocate a node that is already working.
-    refusals = _refusals(
-        _settings(tmp_path),
-        workloads=[{"node": "node-spare", "namespace": "team", "gpus": 8}],
-    )
-
-    assert "node still has an active GPU workload" in refusals
-
-
-def test_declaration_is_refused_on_a_topology_mismatch(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, fault_node="node-fault")
-    fault = _node("node-fault", labels={"node.kubernetes.io/instance-type": "ml.p4d"})
-
-    refusals = _refusals(settings, fault=fault)
-
-    assert any("topology does not match" in item for item in refusals), refusals
-
-
-def test_declaration_is_refused_on_pre_existing_quarantine_ownership(
-    tmp_path: Path,
-) -> None:
-    refusals = _refusals(
-        _settings(tmp_path),
-        spare=_node("node-spare", annotations={"gpu-fault.io/incident-id": "INC-1"}),
-    )
-
-    assert "node carries quarantine ownership from an earlier incident" in refusals, (
-        refusals
-    )
-
-
-def test_declaration_is_refused_when_the_pool_state_is_not_available(
-    tmp_path: Path,
-) -> None:
-    # Absent is fine -- the control plane owns this annotation and DESTR-003
-    # accepts it unset -- but ALLOCATED means the pool already spent this node.
-    assert (
-        _refusals(
-            _settings(tmp_path),
-            spare=_node(
-                "node-spare", annotations={SPARE_POOL_STATE_ANNOTATION: "ALLOCATED"}
-            ),
-        )
-    ) == ["spare pool state is not AVAILABLE"]
-
-
-def test_release_is_refused_for_a_reserved_or_quarantined_node() -> None:
-    reserved = _node("node-spare", annotations={SPARE_RESERVATION_ANNOTATION: "INC-1"})
-    quarantined = _node(
-        "node-spare",
-        taints=[{"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}],
-    )
-
-    assert helper.release_refusals(reserved) == [
-        "node is reserved by an incident; release it through the case"
-    ]
-    assert helper.release_refusals(quarantined) == [
-        "node is quarantined; use restore_validated_quarantine.py instead"
-    ]
-    assert helper.release_refusals(_node("node-spare")) == []
-
-
-def test_release_is_refused_while_the_pool_still_records_an_allocation() -> None:
-    # The pool state outlives the reservation annotation on some paths, and an
-    # ALLOCATED node is carrying the failed-over job: dropping its spare label
-    # takes it out of the pool while the control plane still holds it.
-    allocated = _node(
-        "node-spare", annotations={SPARE_POOL_STATE_ANNOTATION: "ALLOCATED"}
-    )
-
-    assert helper.release_refusals(allocated) == [
-        "node is ALLOCATED by the spare pool; release it through the case"
-    ]
-    for state in (None, "AVAILABLE"):
-        assert (
-            helper.release_refusals(
-                _node("node-spare", annotations={SPARE_POOL_STATE_ANNOTATION: state})
-            )
-            == []
-        )
-
-
-def test_release_restores_the_recorded_baseline_not_the_current_state(
-    tmp_path: Path,
-) -> None:
-    # A node that was already cordoned before the declaration must stay cordoned
-    # after the release. Restoring "uncordon" unconditionally would hand an
-    # operator-cordoned node back to the scheduler.
-    settings = _settings(tmp_path)
-    baseline = _node("node-spare", unschedulable=True)
-    settings.baseline.write_text(
-        json.dumps({"node": "node-spare", "baseline": baseline}), encoding="utf-8"
-    )
-    applied: list[helper.NodePatch] = []
-
-    class FakeWarm:
-        def node_snapshot(self, node: str) -> dict[str, Any]:
-            del node
-            return _node("node-spare", labels={SPARE_LABEL: "true"})
-
-        def spare_nodes(self) -> list[str]:
-            return []
-
-        regional = None
-
-    class FakeMutation:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            del args, kwargs
-            self.baseline: dict[str, Any] = {}
-
-        def apply(self, patch: helper.NodePatch) -> None:
-            applied.append(patch)
-
-        def restore(self) -> dict[str, Any]:
-            self.apply(
-                helper.NodePatch(
-                    labels={SPARE_LABEL: self.baseline["labels"].get(SPARE_LABEL)},
-                    annotations={},
-                    unschedulable=bool(self.baseline["unschedulable"]),
-                )
-            )
-            return _node("node-spare", unschedulable=True)
-
-    original = helper.NodeMutationFixture
-    helper.NodeMutationFixture = FakeMutation  # type: ignore[assignment,misc]
-    try:
-        record = helper.release(settings, FakeWarm(), {"node": baseline})
-    finally:
-        helper.NodeMutationFixture = original  # type: ignore[misc]
-
-    assert applied == [
-        helper.NodePatch(labels={SPARE_LABEL: None}, annotations={}, unschedulable=True)
-    ], applied
-    assert record["released_at"]
-    assert json.loads(settings.baseline.read_text(encoding="utf-8"))["released_at"]
-
-
-def test_release_refuses_an_already_released_or_mismatched_record(
-    tmp_path: Path,
-) -> None:
-    settings = _settings(tmp_path)
-    settings.baseline.write_text(
-        json.dumps(
-            {"node": "node-spare", "baseline": _node("node-spare"), "released_at": "x"}
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(helper.RegionalFixtureError, match="already released"):
-        helper.release(settings, object(), {})
-
-    settings.baseline.write_text(
-        json.dumps({"node": "node-other", "baseline": _node("node-other")}),
-        encoding="utf-8",
-    )
-    with pytest.raises(helper.RegionalFixtureError, match="records node node-other"):
-        helper.release(settings, object(), {})
-
-
-def test_declare_refuses_to_overwrite_an_unreleased_record(tmp_path: Path) -> None:
-    # Overwriting would destroy the only record of what the node looked like
-    # before it became a spare.
-    settings = _settings(tmp_path)
-    settings.baseline.write_text(
-        json.dumps({"node": "node-spare", "baseline": _node("node-spare")}),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(helper.RegionalFixtureError, match="unreleased declaration"):
-        helper.declare(settings, object(), {})
+    assert helper.declare is warm_spare.declare, "declare must be the admin one"
+    assert helper.release is warm_spare.release, "release must be the admin one"
+    assert helper.DECLARE_CONFIRMATION == "DECLARE_WARM_SPARE_CORDON"
+    assert helper.RELEASE_CONFIRMATION == "RELEASE_WARM_SPARE_UNCORDON"
+    assert helper.DECLARE_CONFIRMATION == warm_spare.DECLARE_CONFIRMATION
+    assert helper.RELEASE_CONFIRMATION == warm_spare.RELEASE_CONFIRMATION
 
 
 def test_helper_is_read_only_by_default() -> None:
@@ -274,20 +42,7 @@ def test_helper_is_read_only_by_default() -> None:
     assert arguments.declare is False
     assert arguments.release is False
     assert arguments.confirm == ""
-    assert helper.DECLARE_CONFIRMATION == "DECLARE_WARM_SPARE_CORDON"
-    assert helper.RELEASE_CONFIRMATION == "RELEASE_WARM_SPARE_UNCORDON"
-
-
-def test_the_report_is_serialisable_after_a_declaration() -> None:
-    # The baseline record embeds the survey and the survey is the report, so
-    # attaching the record back unfiltered makes the report contain itself. That
-    # only fails at the closing `json.dumps` -- after the node was cordoned --
-    # so the operator would see a traceback for a declaration that succeeded.
-    report: dict[str, Any] = {"observed_at": "2026-09-05T00:00:00Z"}
-    record = {"node": "node-spare", "pre_declaration_survey": report}
-    report["declaration"] = helper.without_survey(record)
-
-    assert json.loads(json.dumps(report))["declaration"] == {"node": "node-spare"}
+    assert helper.mode(arguments) == "check"
 
 
 def test_the_spare_is_never_named_by_the_shared_node_flag() -> None:
@@ -304,3 +59,149 @@ def test_helper_carries_no_site_topology() -> None:
     assert "/secure/gpu-fault-bootstrap" not in source
     assert "514385905925" not in source
     assert "hyperpod-i-" not in source
+
+
+def test_configure_reads_the_profile_flags_and_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GPU_FAULT_SPARE_NODE", raising=False)
+    monkeypatch.setenv("GPU_FAULT_FAULT_NODE", "node-fault")
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER_NAME", "hp-a")
+    arguments = helper.parser().parse_args(
+        ["--spare-node", "node-spare", "--baseline", str(tmp_path / "b.json")]
+    )
+
+    settings = helper.configure(arguments)
+
+    assert settings == helper.Settings(
+        node="node-spare",
+        fault_node="node-fault",
+        hyperpod_cluster="hp-a",
+        baseline=tmp_path / "b.json",
+    )
+    with pytest.raises(RegionalFixtureError, match="baseline record path"):
+        helper.configure(helper.parser().parse_args(["--spare-node", "node-spare"]))
+
+
+def test_the_request_maps_the_mode_and_records_the_baseline_directory(
+    tmp_path: Path,
+) -> None:
+    settings = helper.Settings(
+        node="node-spare",
+        fault_node="node-fault",
+        hyperpod_cluster="hp-a",
+        baseline=tmp_path / "records" / "spare.json",
+    )
+    arguments = helper.parser().parse_args(
+        [
+            "--spare-node",
+            "node-spare",
+            "--declare",
+            "--confirm",
+            helper.DECLARE_CONFIRMATION,
+        ]
+    )
+
+    request = helper.request(settings, arguments)
+
+    assert request.mode == "declare"
+    assert request.node == "node-spare"
+    assert request.fault_node == "node-fault"
+    assert request.confirmation == helper.DECLARE_CONFIRMATION
+    assert request.reference == "acceptance-warm-spare"
+    assert request.state_dir == tmp_path / "records"
+    released = helper.request(
+        settings,
+        helper.parser().parse_args(
+            ["--spare-node", "node-spare", "--release", "--reference", "DESTR-003"]
+        ),
+    )
+    assert released.mode == "release"
+    assert released.reference == "DESTR-003"
+
+
+def test_the_agent_check_needs_exactly_one_active_row() -> None:
+    # "纳入监控" is a hard precondition of the warm-spare path: an unmonitored
+    # node has no Agent to fence and no health signal to trust.
+    node = "node-spare"
+
+    assert helper.agent_state({"agents": []}, node).lifecycle_state is None
+    assert (
+        helper.agent_state(
+            {"agents": [{"node_id": node, "lifecycle_state": "REVOKED"}]}, node
+        ).lifecycle_state
+        == "REVOKED"
+    )
+    # Two Agents claiming one node is ambiguous, not "the first one wins".
+    assert (
+        helper.agent_state(
+            {
+                "agents": [
+                    {"node_id": node, "lifecycle_state": "ACTIVE"},
+                    {"node_id": node, "lifecycle_state": "ACTIVE"},
+                ]
+            },
+            node,
+        ).lifecycle_state
+        is None
+    )
+    active = helper.agent_state(
+        {"agents": [{"node_id": node, "lifecycle_state": "ACTIVE"}]}, node
+    )
+    assert active == warm_spare.AgentState(lifecycle_state="ACTIVE")
+    assert warm_spare.declare_refusals(
+        node,
+        spare=_ready_snapshot(node),
+        fault=None,
+        fault_node="",
+        declared=[],
+        workloads=[],
+        agent=helper.agent_state({"agents": []}, node),
+    ) == ["node does not have exactly one ACTIVE Agent"]
+
+
+def test_an_unreadable_store_is_a_refusal_not_a_pass() -> None:
+    class Warm:
+        def store_snapshot(self) -> dict[str, Any]:
+            raise RegionalFixtureError("cpu python probe failed")
+
+    state = helper.store_agent_lookup(Warm())("cluster-a", "node-spare")  # type: ignore[arg-type]
+
+    assert state.lifecycle_state is None
+    assert state.error == "cpu python probe failed"
+
+
+def test_the_node_api_is_kubectl_bound_to_the_profile_gpu_cluster() -> None:
+    regional = SimpleNamespace(
+        settings=SimpleNamespace(
+            gpu_kubeconfig=Path("/p/gpu.kubeconfig"), gpu_context="ctx"
+        )
+    )
+
+    api = helper.node_api(regional)  # type: ignore[arg-type]
+
+    assert isinstance(api, warm_spare.KubectlNodeApi), type(api)
+    assert api.kubectl == [
+        "kubectl",
+        "--kubeconfig",
+        "/p/gpu.kubeconfig",
+        "--context",
+        "ctx",
+    ]
+
+
+def _ready_snapshot(node: str) -> dict[str, Any]:
+    return warm_spare.node_snapshot(
+        {
+            "metadata": {
+                "name": node,
+                "labels": {
+                    warm_spare.HYPERPOD_HEALTH_LABEL: "Schedulable",
+                    warm_spare.INSTANCE_GROUP_LABEL: "group-a",
+                    "node.kubernetes.io/instance-type": "ml.p5en.48xlarge",
+                },
+            },
+            "spec": {},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+    )

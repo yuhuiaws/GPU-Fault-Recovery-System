@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from importlib.resources import files
 from typing import Any, Callable, Mapping, Sequence
 
@@ -55,7 +56,7 @@ def deploy_host_dependency_report(
     python = dict(source["python"])
     expected_python = (int(python["major"]), int(python["minor"]))
     actual_python = (sys.version_info.major, sys.version_info.minor)
-    tool_reports = []
+    tools = []
     for raw in source["tools"]:
         if not isinstance(raw, dict):
             raise BootstrapError("deploy-host tool manifest contains a non-object")
@@ -70,19 +71,21 @@ def deploy_host_dependency_report(
             or not all(isinstance(item, str) and item for item in command)
         ):
             raise BootstrapError("deploy-host tool manifest contains an invalid tool")
+        tools.append(raw)
+
+    def probe(raw: Mapping[str, Any]) -> dict[str, Any]:
+        name = str(raw["name"])
+        executable = str(raw["executable"])
         path = active_which(executable)
         if path is None:
-            tool_reports.append(
-                {
-                    "name": name,
-                    "executable": executable,
-                    "status": "MISSING",
-                    "version": "",
-                }
-            )
-            continue
+            return {
+                "name": name,
+                "executable": executable,
+                "status": "MISSING",
+                "version": "",
+            }
         completed = active_runner(
-            list(command),
+            [str(item) for item in raw["command"]],
             text=True,
             capture_output=True,
             check=False,
@@ -94,18 +97,22 @@ def deploy_host_dependency_report(
             if version_field
             else ""
         )
-        tool_reports.append(
-            {
-                "name": name,
-                "executable": path,
-                "status": "PASS" if completed.returncode == 0 else "FAILED",
-                "version": version
-                or _version_output(
-                    completed.stdout or "",
-                    completed.stderr or "",
-                ),
-            }
-        )
+        return {
+            "name": name,
+            "executable": path,
+            "status": "PASS" if completed.returncode == 0 else "FAILED",
+            "version": version
+            or _version_output(
+                completed.stdout or "",
+                completed.stderr or "",
+            ),
+        }
+
+    # Eleven `--version` processes at ~0.3-1 s each were the first serial second
+    # of every deploy; they share nothing, so they run together. The report keeps
+    # the manifest order so its output is stable.
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(tools)))) as pool:
+        tool_reports = list(pool.map(probe, tools))
     return {
         "schema_version": 1,
         "healthy": actual_python == expected_python

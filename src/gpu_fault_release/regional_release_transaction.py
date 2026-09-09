@@ -6,6 +6,9 @@ from gpu_fault_release.regional_release_config import (
     PartialClusterRolloutError,
     ReleaseError,
 )
+from gpu_fault_release.regional_release_fleet_rollout import (
+    delete_stale_release_secret_backups,
+)
 from gpu_fault_release.regional_release_timing import mark_rollback_complete
 
 
@@ -37,7 +40,15 @@ def commit_release(release: Any) -> None:
     if loaded.get("commit_cleanup_completed") is True:
         return
     if isinstance(previous, dict):
-        release._delete_release_secret_backups(previous)
+        # The committed release's own Secret backups stay: they are what
+        # `deploy --rollback` restores from after the commit. Older ones go.
+        # A release object may carry its own sweep (test doubles do); the
+        # engine's release uses the fleet function directly.
+        sweep = getattr(release, "_delete_stale_release_secret_backups", None)
+        if sweep is not None:
+            sweep(previous)
+        else:
+            delete_stale_release_secret_backups(release, previous)
     cleanup_snapshots = getattr(release, "_cleanup_previous_snapshots", None)
     if cleanup_snapshots is not None:
         cleanup_snapshots()

@@ -22,8 +22,8 @@ from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
 )
+from gpu_fault.orchestration.families.identity import note_stale_event_link
 from gpu_fault.store.shared.errors import NotFoundError
-
 
 RESTART_SAFETY_PARAMETERS = (
     "cluster_id",
@@ -247,6 +247,12 @@ def _escalation_operations(
                 WorkflowOperation.QUARANTINE,
                 WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
                 WorkflowOperation.VALIDATE_GPU,
+                # Same exit as the node-health DRAIN chain: the node stays
+                # quarantined (RMA class, no RESTORE_SCHEDULING), and the
+                # explicit hand-off is what moves the incident to ESCALATED
+                # and tells an operator. Without it the drain parked in
+                # QUARANTINED with nobody notified.
+                WorkflowOperation.ESCALATE_SUPPORT,
             ]
         )
     else:
@@ -579,6 +585,43 @@ class HardwareEscalationService:
             next_operation,
             failed_executions,
         )
+
+    @staticmethod
+    def _exhausted_branch_executions(
+        workflow: WorkflowRequest,
+        failed_executions: list[WorkflowStepExecution],
+    ) -> list[WorkflowStepExecution]:
+        """Keep only the failures on the branches that actually exhausted.
+
+        A job DAG's other branch may have failed a step, escalated in place and
+        recovered (RESET_GPU failed, the reboot rung succeeded, RESTORE_SCHEDULING
+        ran): that FAILED record is history, not hardware to hand to support.
+        Read by node -- the exhausted rung's steps name the node, the branch's
+        earlier steps may still carry ``branch:initial`` -- so every failure on
+        the exhausted node stays in scope and nothing else does. Live 2026-09-09
+        (DESTR-014): the support-after incident covered both nodes and
+        re-quarantined the one that had just been restored.
+        """
+
+        exhausted = set(workflow.exhausted_branch_ids)
+        if not exhausted:
+            return failed_executions
+        steps = workflow.official_steps
+        exhausted_nodes = {
+            node_id
+            for step in steps
+            if step.branch_id in exhausted
+            for node_id in (step.branch_node_ids or step.node_ids)
+        }
+        if not exhausted_nodes:
+            return failed_executions
+        scoped = [
+            execution
+            for execution in failed_executions
+            if 0 <= execution.step_index < len(steps)
+            and set(steps[execution.step_index].node_ids) & exhausted_nodes
+        ]
+        return scoped or failed_executions
 
     @staticmethod
     def collect_scope(
@@ -1057,11 +1100,27 @@ class HardwareEscalationService:
         if existing is not None:
             if not existing.workflow_request_id:
                 return None
-            return (
-                existing,
-                self.store.get_workflow(existing.workflow_request_id),
-            )
-        scope = self.collect_scope(workflow, source, failed_executions)
+            try:
+                return (
+                    existing,
+                    self.store.get_workflow(existing.workflow_request_id),
+                )
+            except NotFoundError:
+                # C-04: the escalation was recorded but its workflow row is
+                # gone; ``emit`` rebuilds through
+                # ``create_incident_workflow_if_absent``, which treats the
+                # dirty link the same way and re-links this event id.
+                note_stale_event_link(
+                    self.store,
+                    event_id=event_id,
+                    incident_id=existing.incident_id,
+                    pointer=existing.workflow_request_id,
+                )
+        scope = self.collect_scope(
+            workflow,
+            source,
+            self._exhausted_branch_executions(workflow, failed_executions),
+        )
         return self.emit(
             workflow,
             source,

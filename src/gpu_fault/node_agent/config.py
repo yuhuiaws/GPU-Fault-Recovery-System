@@ -16,7 +16,6 @@ from gpu_fault.node_agent.common import (
     DEFAULT_QUIESCE_PROCESSES,
     DEFAULT_QUIESCE_SERVICES,
 )
-
 from gpu_fault.node_agent.executor import NodeActionExecutor
 from gpu_fault.node_agent.ledger import NodeActionLedger
 from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager

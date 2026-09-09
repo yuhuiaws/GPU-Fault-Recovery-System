@@ -28,7 +28,6 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import NotFoundError
 
-
 LOGGER = logging.getLogger(__name__)
 HEALTH_ANNOTATION = "gpu-fault.io/spare-health"
 FAILURES_ANNOTATION = "gpu-fault.io/spare-health-failures"

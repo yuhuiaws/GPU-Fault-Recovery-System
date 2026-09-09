@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple
-
 import json
 import logging
 import os
@@ -11,12 +9,11 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-
+from typing import Any, Callable, NamedTuple
 
 from gpu_fault.host_health import (
     HostMetricSample,
 )
-
 
 LOGGER = logging.getLogger(__name__)
 

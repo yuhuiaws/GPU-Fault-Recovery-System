@@ -9,7 +9,6 @@ from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
-    DiagnosticRequest,
     EffectiveRuntimeProfile,
     FaultIncident,
     NodeMarker,
@@ -17,7 +16,6 @@ from gpu_fault.models import (
     RecoveryPlan,
     RestartBudgetState,
     TerminalEvent,
-    TriageReport,
     WorkflowRequest,
     WorkflowStatus,
 )
@@ -38,7 +36,7 @@ from gpu_fault.store.shared.record_guards import record_matches_expected
 class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     # Attributes supplied by the composed concrete implementation.
     _decisions: Any
-    _diagnostics: Any
+    _incident_by_event: Any
     _hyperpod_node_identities: Any
     _hyperpod_submissions: Any
     _installation_resources: dict[str, InstallationResource]
@@ -46,7 +44,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     _profiles: Any
     _raw_evidence: Any
     _restart_budgets: Any
-    _triage_reports: Any
 
     _attempt_event_keys: Any
     _events: Any
@@ -181,6 +178,57 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             "attempt_observation_terminalized": terminalized,
         }
 
+    def cleanup_inactive_markers(self, *, older_than: datetime, limit: int) -> int:
+        with self._lock:
+            marker_ids = [
+                marker.marker_id
+                for marker in sorted(
+                    self._markers.values(),
+                    key=lambda item: (item.observed_at, item.marker_id),
+                )
+                if not marker.active
+                and marker.observed_at <= older_than
+                and marker.incident_id not in self._incidents
+            ][:limit]
+            for marker_id in marker_ids:
+                del self._markers[marker_id]
+        return log_cleanup("marker", marker_ids)
+
+    def cleanup_completion_records(self, *, older_than: datetime, limit: int) -> int:
+        with self._lock:
+            live_event_ids = {
+                incident.event_id for incident in self._incidents.values()
+            }
+            candidates = []
+            for decision in self._decisions.values():
+                event = self._events.get(decision.event_key)
+                if event is None or event.ended_at > older_than:
+                    continue
+                linked = self._incident_by_event.get(decision.event_key)
+                if linked is not None and linked in self._incidents:
+                    continue
+                if decision.event_key in live_event_ids:
+                    continue
+                plan = (
+                    self._plans.get(decision.recovery_plan_id)
+                    if decision.recovery_plan_id
+                    else None
+                )
+                if plan is not None and plan.incident_id in self._incidents:
+                    continue
+                candidates.append((event.ended_at, decision, event, plan))
+            candidates.sort(key=lambda item: (item[0], item[1].event_key))
+            removed = []
+            for _ended_at, decision, event, plan in candidates[:limit]:
+                key = decision.event_key
+                self._decisions.pop(key, None)
+                self._events.pop(key, None)
+                self._attempt_event_keys.pop((event.cluster_id, event.attempt_id), None)
+                if plan is not None:
+                    self._plans.pop(plan.plan_id, None)
+                removed.append(key)
+        return log_cleanup("completion_decision", removed)
+
     def save_event_if_absent(self, event: TerminalEvent) -> bool:
         with self._lock:
             existing = self._events.get(event.event_key)
@@ -291,39 +339,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
         with self._lock:
             return self._decisions.get(event_key)
 
-    def _decision_age_key(self, decision: CompletionDecision) -> datetime | None:
-        if not decision.diagnostic_request_id:
-            return None
-        request = self._diagnostics.get(decision.diagnostic_request_id)
-        return request.created_at if request is not None else None
-
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        with self._lock:
-            candidates = [
-                (self._decision_age_key(decision), decision)
-                for decision in self._decisions.values()
-                if decision.status is status
-            ]
-        if older_than is not None:
-            candidates = [
-                (created_at, decision)
-                for created_at, decision in candidates
-                if created_at is None or created_at <= older_than
-            ]
-        floor = datetime.min.replace(tzinfo=timezone.utc)
-        candidates.sort(
-            key=lambda item: (item[0] or floor, item[1].event_key),
-        )
-        return [decision for _created_at, decision in candidates[:limit]]
-
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         with self._lock:
             counts = {status: 0 for status in DecisionStatus}
@@ -373,6 +388,7 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                     marker
                     for marker in self._markers.values()
                     if marker.active
+                    and marker.trusted
                     and (
                         marker.observed_at >= observed_after
                         or (
@@ -456,21 +472,6 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
                 key=lambda marker: marker.observed_at,
                 reverse=True,
             )
-
-    def save_diagnostic(self, request: DiagnosticRequest) -> None:
-        with self._lock:
-            self._diagnostics[request.request_id] = request
-
-    def get_diagnostic(self, request_id: str) -> DiagnosticRequest:
-        with self._lock:
-            request = self._diagnostics.get(request_id)
-            if request is None:
-                raise NotFoundError(request_id)
-            return request
-
-    def save_triage_report(self, report: TriageReport) -> None:
-        with self._lock:
-            self._triage_reports[report.request_id] = report
 
     def save_plan(
         self,

@@ -1,4 +1,12 @@
-"""HA-009: phase-budget TTL, refresh watchdog, rollout predicate reuse, skipped roles."""
+"""HA-009: phase-budget TTL, refresh watchdog, steady-state predicate, idle-window variant.
+
+CP-3 (路 A): a rotation is a Secret write; running Pods reload the mounted file
+and nothing restarts. The case therefore asserts the opposite of what it used
+to: generation, Pod UIDs and restartCount stay put, the projected file catches
+up with the Secret, and after the pool's ``max_idle`` has recycled its
+connections every Pod still answers ``/healthz`` with no authentication failure
+in its log (H1-5).
+"""
 
 from __future__ import annotations
 
@@ -20,6 +28,12 @@ def test_registration_ttl_and_probe_deadline_cover_the_worst_path() -> None:
     assert total > 60 * 60, (
         "the old 45-minute TTL was shorter than the ~60-minute worst path"
     )
+    # Path A phases: the Secret propagates to the mounts, then the case waits
+    # out the pool's max_idle and observes; no consumer rollout any more.
+    assert "consumer_rollout" not in ha009.PHASE_BUDGETS
+    assert ha009.PHASE_BUDGETS["secret_propagation"] >= 120, "kubelet sync period"
+    assert ha009.PHASE_BUDGETS["idle_window"] > ha009.DEFAULT_POOL_MAX_IDLE_SECONDS
+    assert ha009.PHASE_BUDGETS["post_idle_observation"] >= 60
     assert ha009.REFRESH_WATCHDOG_SECONDS == (
         ha009.PHASE_BUDGETS["managed_rotation"]
         + ha009.PHASE_BUDGETS["first_refresh_job"]
@@ -100,10 +114,91 @@ def test_deployments_rolled_requires_updated_replicas_and_new_uids() -> None:
     assert ha009.deployments_rolled(before, not_updated) is False, (
         "ready == replicas with updatedReplicas short is mid-rollout"
     )
+    # deployments_rolled stays for the refresher's --restart-deployments
+    # compatibility mode; the catalog status for path A is STEADY.
     assert ha009.role_status(before) == {
-        "gpu-fault-api-ha": "ROLLED",
-        "gpu-fault-control-worker": "ROLLED",
+        "gpu-fault-api-ha": "STEADY",
+        "gpu-fault-control-worker": "STEADY",
         "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
+    }
+
+
+def test_deployments_steady_requires_same_generation_uids_and_restarts() -> None:
+    before = {
+        "gpu-fault-api-ha": _deployment(1, ["a1", "a2", "a3"]),
+        "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w3"]),
+        "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
+    }
+    assert ha009.deployments_steady(before, before) == []
+
+    rolled = {**before, "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"])}
+    assert any(
+        "generation" in item for item in ha009.deployments_steady(before, rolled)
+    ), "a generation bump must be reported as a rollout"
+
+    replaced = {
+        **before,
+        "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w9"]),
+    }
+    assert any("Pod" in item for item in ha009.deployments_steady(before, replaced)), (
+        "a replaced Pod uid must be reported"
+    )
+
+    restarted = {**before, "gpu-fault-api-ha": _deployment(1, ["a1", "a2", "a3"])}
+    restarted["gpu-fault-api-ha"]["pods"][0][1]["restarts"] = 1
+    assert any(
+        "restart" in item for item in ha009.deployments_steady(before, restarted)
+    ), "a container restart must be reported"
+    assert ha009.role_status(before) == {
+        "gpu-fault-api-ha": "STEADY",
+        "gpu-fault-control-worker": "STEADY",
+        "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
+    }
+
+
+METRICS_TEXT = """# HELP gpu_fault_postgres_pool_size x
+# TYPE gpu_fault_postgres_pool_size gauge
+gpu_fault_postgres_pool_size 2
+gpu_fault_postgres_pool_connections_errors_total 3
+gpu_fault_postgres_pool_checkout_wait_seconds_count 44
+gpu_fault_aurora_credential_refresh_last_success_age_seconds 71.5
+"""
+
+
+def test_pool_metric_samples_are_parsed_from_the_exposition_text() -> None:
+    values = ha009.parse_pool_metrics(METRICS_TEXT)
+    assert values == {
+        "gpu_fault_postgres_pool_size": 2.0,
+        "gpu_fault_postgres_pool_connections_errors_total": 3.0,
+        "gpu_fault_aurora_credential_refresh_last_success_age_seconds": 71.5,
+    }
+
+
+def test_idle_wait_is_max_idle_plus_margin_and_never_past_the_budget() -> None:
+    assert ha009.idle_wait_seconds(300, budget=480) == 360
+    assert ha009.idle_wait_seconds(900, budget=480) == 480
+
+
+def _observation(
+    pods: list[str], *, healthz: int = 200, errors: float = 3.0, auth_failures: int = 0
+) -> dict:
+    return {
+        "started_at": "2026-09-08T10:00:00+00:00",
+        "finished_at": "2026-09-08T10:02:00+00:00",
+        "samples": {
+            pod: [
+                {
+                    "healthz_status": healthz,
+                    "metrics": {
+                        "gpu_fault_postgres_pool_size": 2.0,
+                        "gpu_fault_postgres_pool_connections_errors_total": errors,
+                    },
+                }
+                for _ in range(3)
+            ]
+            for pod in pods
+        },
+        "auth_failures_in_logs": {pod: auth_failures for pod in pods},
     }
 
 
@@ -113,11 +208,9 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w3"]),
         "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
     }
-    after = {
-        "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"]),
-        "gpu-fault-control-worker": _deployment(2, ["x1", "x2", "x3"]),
-        "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
-    }
+    # Path A: nothing rolls. The snapshot after the case equals the baseline.
+    after = before
+    pods = ["p-a1", "p-a2", "p-a3", "p-w1", "p-w2", "p-w3"]
     probe = {
         "counters": {
             "event_attempts": 10,
@@ -148,10 +241,12 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         current_before="v1",
         digest_before="d1",
         digest_after="d2",
-        first_job={"logs": ["rotated=True restarted=True"]},
+        first_job={"logs": ["rotated=True restarted=False"]},
         second_job={"logs": ["rotated=False restarted=False"]},
         deployments_before=before,
         deployments_after=after,
+        propagation={"digest": "d2", "pods": {pod: "d2" for pod in pods}},
+        idle_observation=_observation(pods),
         receipts=receipts,
         runtime=runtime,
         digest_before_noop="d2",
@@ -166,6 +261,54 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
     assert errors == ha005.continuity_errors(
         broken_probe, receipts, accepted_ids=["r1"]
     ), "HA-009 must report exactly what HA-005's shared evaluation reports"
+
+    # The refresher must not have rolled anything (the old PASS shape).
+    rolled = {
+        **common,
+        "deployments_after": {
+            **before,
+            "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"]),
+        },
+        "first_job": {"logs": ["rotated=True restarted=True"]},
+    }
+    errors = ha009.rotation_errors(final_probe=probe, **rolled)
+    assert any("generation" in item for item in errors), (
+        "the api-ha rollout must surface as a generation error"
+    )
+    assert any("restarted=False" in item for item in errors), (
+        "the first Job log must show the restart happened"
+    )
+
+    # The projected file must have caught up in every Pod.
+    stale = {
+        **common,
+        "propagation": {
+            "digest": "d2",
+            "pods": {**{p: "d2" for p in pods}, "p-w3": "d1"},
+        },
+    }
+    assert any(
+        "p-w3" in item for item in ha009.rotation_errors(final_probe=probe, **stale)
+    ), "the lagging Pod must be named in the propagation error"
+
+    # H1-5: after max_idle every Pod still serves and no reconnect was refused.
+    sick = {**common, "idle_observation": _observation(pods, healthz=503)}
+    assert any(
+        "healthz" in item for item in ha009.rotation_errors(final_probe=probe, **sick)
+    ), "a 503 healthz after max_idle must fail the case"
+    refused = {**common, "idle_observation": _observation(pods, auth_failures=2)}
+    assert any(
+        "authentication" in item
+        for item in ha009.rotation_errors(final_probe=probe, **refused)
+    ), "refused reconnects must fail the case"
+    unrendered = {**common, "idle_observation": _observation(pods)}
+    for samples in unrendered["idle_observation"]["samples"].values():
+        for sample in samples:
+            sample["metrics"].pop("gpu_fault_postgres_pool_connections_errors_total")
+    assert any(
+        "connections_errors_total" in item
+        for item in ha009.rotation_errors(final_probe=probe, **unrendered)
+    ), "a missing pool error counter must fail the case"
 
 
 def test_stop_refresh_watchdog_reports_a_fired_watchdog(tmp_path: Path) -> None:

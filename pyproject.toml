@@ -88,6 +88,7 @@ support = "gpu_fault.adapters.support_escalation:SupportEscalationAdapter"
 
 [project.entry-points."gpu_fault.notification_builders"]
 dcgm-diagnostic = "gpu_fault.notifications.dcgm_diagnostic:DcgmDiagnosticEmailBuilder"
+diagnostic-inconclusive = "gpu_fault.notifications.diagnostic_inconclusive:DiagnosticInconclusiveEmailBuilder"
 efa-rdma = "gpu_fault.notifications.efa_rdma:EfaRdmaEventEmailBuilder"
 hardware-escalation = "gpu_fault.notifications.hardware_escalation:HardwareEscalationEmailBuilder"
 hardware-inventory = "gpu_fault.notifications.hardware_inventory:HardwareInventoryEmailBuilder"

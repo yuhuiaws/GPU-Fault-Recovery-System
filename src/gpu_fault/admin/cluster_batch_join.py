@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -20,12 +22,11 @@ from gpu_fault.admin.cluster_join import (
     JoinExecution,
 )
 from gpu_fault.admin.cluster_join_evidence import (
+    JoinVerificationExpired,
     build_verified_membership_evidence,
+    clear_verified_step,
     membership_runtime_snapshot,
-)
-from gpu_fault.admin.cluster_join_readonly import (
-    load_network_baseline_cache,
-    write_network_baseline_cache,
+    verification_is_stale,
 )
 from gpu_fault.admin.cluster_join_state import (
     complete_step,
@@ -40,21 +41,31 @@ from gpu_fault.admin.membership_lock import (
 )
 from gpu_fault.admin.site import RenderedSite
 
-DEFAULT_BATCH_JOIN_CONCURRENCY = 4
-GLOBAL_BATCH_JOIN_NODE_BUDGET = 64
+# Read-only discovery and the per-cluster prerequisite work (IAM role, network
+# allow-list, node keys) fan out this wide. How many clusters *roll* at once is
+# not decided here: the release engine owns cluster parallelism through
+# ``spec.release.upgradeMaxParallelClusters`` and its own node wave caps, and
+# the batch reads that value (see ``deploy_concurrency``).
+PREPARE_PHASE_WORKERS = 4
+REGISTRY_SNAPSHOT_BEFORE = "installation-resources-before.json"
 
 
 @dataclass
 class BatchJoinContext:
     site: RenderedSite
     batch_id: str
-    state_dir: Path
-    concurrency: int
+    candidate_dir: Path
     runner_factory: Callable[[], CommandRunner]
     results: list[dict[str, Any]]
     failures: dict[str, str]
     network_baseline: list[dict[str, Any]] | None = None
-    effective_deploy_concurrency: int = 1
+
+
+def deploy_concurrency(site: RenderedSite) -> int:
+    """Clusters rolled at once: the site's ``upgradeMaxParallelClusters``."""
+
+    configured = site.release_config["release"].get("upgrade_max_parallel_clusters")
+    return max(1, int(configured if configured is not None else 1))
 
 
 def _execution(attempt: JoinAttempt) -> JoinExecution:
@@ -66,7 +77,6 @@ def _execution(attempt: JoinAttempt) -> JoinExecution:
 def _initialize_context(
     requests: tuple[JoinClusterRequest, ...],
     *,
-    max_workers: int,
     runner_factory: Callable[[], CommandRunner],
 ) -> tuple[BatchJoinContext, list[JoinAttempt]]:
     site = requests[0].site
@@ -77,14 +87,12 @@ def _initialize_context(
     arns = [request.gpu_cluster_arn for request in requests]
     if len(arns) != len(set(arns)):
         raise BootstrapError("batch join contains duplicate GPU cluster ARNs")
-    batch_id = hashlib.sha256("\n".join(sorted(arns)).encode()).hexdigest()[:16]
-    state_dir = site.source.parent / "join-cluster" / "batches" / batch_id
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     context = BatchJoinContext(
         site=site,
-        batch_id=batch_id,
-        state_dir=state_dir,
-        concurrency=max(1, min(DEFAULT_BATCH_JOIN_CONCURRENCY, max_workers)),
+        # Correlates the per-cluster VERIFIED evidence of one batch; the
+        # per-cluster ``join-cluster/<arn-hash>/state.json`` is the record.
+        batch_id=hashlib.sha256("\n".join(sorted(arns)).encode()).hexdigest()[:16],
+        candidate_dir=site.source.parent / "join-cluster",
         runner_factory=runner_factory,
         results=[],
         failures={},
@@ -119,35 +127,24 @@ def _run_readonly_tasks(
     attempts: list[JoinAttempt],
 ) -> tuple[
     dict[str, tuple[ClusterIdentity, str, dict[str, Any] | None]],
-    Path,
+    Path | None,
 ]:
-    cache = context.state_dir / "network-baseline.json"
-    context.network_baseline = cast(
-        list[dict[str, Any]] | None,
-        load_network_baseline_cache(cache, context.site),
-    )
     undiscovered = [
         attempt for attempt in attempts if not step_done(attempt.state, "DISCOVERED")
     ]
-    registry_path = context.state_dir / "installation-resources-before.json"
+    # One registry export serves the whole batch; it is exported into the first
+    # undiscovered cluster's record and copied into the others afterwards.
+    registry_path = (
+        undiscovered[0].state_dir / REGISTRY_SNAPSHOT_BEFORE if undiscovered else None
+    )
     tasks: dict[Any, tuple[str, JoinAttempt | None]] = {}
     discoveries: dict[str, tuple[ClusterIdentity, str, dict[str, Any] | None]] = {}
     failures = []
-    count = (
-        int(any(not step_done(item.state, "PRECHECKED") for item in attempts))
-        + int(bool(undiscovered))
-        + int(context.network_baseline is None)
-        + len(undiscovered)
-    )
+    count = int(bool(undiscovered)) + len(undiscovered) + 1
     with ThreadPoolExecutor(
-        max_workers=min(context.concurrency, max(1, count))
+        max_workers=min(PREPARE_PHASE_WORKERS, max(1, count))
     ) as executor:
-        if any(not step_done(item.state, "PRECHECKED") for item in attempts):
-            tasks[executor.submit(join._run_rollout, context.site, "verify")] = (
-                "baseline",
-                None,
-            )
-        if undiscovered:
+        if undiscovered and registry_path is not None:
             tasks[
                 executor.submit(join._export_registry, context.site, registry_path)
             ] = ("registry", None)
@@ -159,14 +156,13 @@ def _run_readonly_tasks(
                         context.runner_factory(),
                     )
                 ] = ("discovery", attempt)
-        if context.network_baseline is None:
-            tasks[
-                executor.submit(
-                    join._existing_cluster_networks,
-                    context.runner_factory(),
-                    context.site,
-                )
-            ] = ("networks", None)
+        tasks[
+            executor.submit(
+                join._existing_cluster_networks,
+                context.runner_factory(),
+                context.site,
+            )
+        ] = ("networks", None)
         for future in as_completed(tasks):
             kind, task_attempt = tasks[future]
             try:
@@ -193,18 +189,23 @@ def _run_readonly_tasks(
         raise BootstrapError(
             "batch join read-only preparation failed: " + "; ".join(sorted(failures))
         )
-    assert context.network_baseline is not None
-    write_network_baseline_cache(cache, context.site, context.network_baseline)
     return discoveries, registry_path
+
+
+def _registry_snapshot_for(attempt: JoinAttempt, exported: Path | None) -> Path:
+    target = attempt.state_dir / REGISTRY_SNAPSHOT_BEFORE
+    if exported is not None and exported != target and exported.is_file():
+        shutil.copyfile(exported, target)
+        target.chmod(0o600)
+    return target
 
 
 def _checkpoint_readonly_results(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
     discoveries: dict[str, tuple[ClusterIdentity, str, dict[str, Any] | None]],
-    registry_path: Path,
+    registry_path: Path | None,
 ) -> list[JoinAttempt]:
-    verified_at = datetime.now(timezone.utc).isoformat()
     active = []
     identities: list[tuple[str, str, str, str, str]] = []
     for attempt in attempts:
@@ -218,7 +219,6 @@ def _checkpoint_readonly_results(
                 "PRECHECKED",
                 {
                     "site_sha256": context.site.source_sha256,
-                    "verified_at": verified_at,
                     "batch_id": context.batch_id,
                 },
             )
@@ -255,7 +255,9 @@ def _checkpoint_readonly_results(
                 {
                     "target": asdict(target),
                     "cluster_id": cluster_id,
-                    "registry_snapshot": str(registry_path),
+                    "registry_snapshot": str(
+                        _registry_snapshot_for(attempt, registry_path)
+                    ),
                 },
             )
         discovery = attempt.state["evidence"]["DISCOVERED"]
@@ -290,14 +292,13 @@ def _prepare_executions(
             state_dir=attempt.state_dir,
             state_path=attempt.state_path,
             state=attempt.state,
-            baseline_verified=True,
             candidate_preflight=False,
             network_baseline=context.network_baseline,
         )
 
     prepared_attempts = []
     with ThreadPoolExecutor(
-        max_workers=min(context.concurrency, len(attempts))
+        max_workers=min(PREPARE_PHASE_WORKERS, len(attempts))
     ) as executor:
         futures = {executor.submit(prepare, attempt): attempt for attempt in attempts}
         for future in as_completed(futures):
@@ -340,7 +341,7 @@ def _preflight_candidate(
     candidate = join._write_batch_candidate_site(
         context.site,
         [_execution(item) for item in attempts],
-        state_dir=context.state_dir,
+        state_dir=context.candidate_dir,
     )
     try:
         join._run_rollout(candidate, "preflight")
@@ -363,12 +364,8 @@ def _deploy_clusters(
     deployed: list[JoinAttempt] = []
     if not attempts:
         return deployed
-    context.effective_deploy_concurrency = effective_deploy_concurrency(
-        context,
-        attempts,
-    )
     with ThreadPoolExecutor(
-        max_workers=context.effective_deploy_concurrency
+        max_workers=min(deploy_concurrency(context.site), len(attempts))
     ) as executor:
         futures = {
             executor.submit(
@@ -390,57 +387,22 @@ def _deploy_clusters(
     return deployed
 
 
-def effective_deploy_concurrency(
-    context: BatchJoinContext,
-    attempts: list[JoinAttempt],
-) -> int:
-    if not attempts:
-        return 1
-    configured = int(
-        context.site.release_config["release"].get(
-            "upgrade_max_unavailable",
-            1,
-        )
-    )
-    per_cluster_limits = []
-    for attempt in attempts:
-        node_count = len(_execution(attempt).local.get("nodes") or [])
-        size_cap = (
-            min(max(1, node_count), 4)
-            if node_count < 64
-            else 8
-            if node_count < 256
-            else 16
-            if node_count < 512
-            else 32
-        )
-        # 0 is "auto" in the release config: the wave engine takes the size cap
-        # it derives from the node count, so the budget divisor has to count
-        # those nodes too. Reading auto as 1 here divided a 64-node budget by 1
-        # and admitted clusters that each take `size_cap` nodes down at once.
-        per_cluster_limits.append(
-            size_cap if configured <= 0 else max(1, min(configured, size_cap))
-        )
-    return min(
-        context.concurrency,
-        len(attempts),
-        max(
-            1,
-            GLOBAL_BATCH_JOIN_NODE_BUDGET // max(per_cluster_limits),
-        ),
-    )
-
-
 def _verify_deployed(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
 ) -> list[JoinAttempt]:
     if not attempts:
         return []
+    for attempt in attempts:
+        verified = (attempt.state.get("evidence") or {}).get("VERIFIED")
+        if step_done(attempt.state, "VERIFIED") and verification_is_stale(
+            verified if isinstance(verified, dict) else {}
+        ):
+            clear_verified_step(attempt.state_path, attempt.state)
     candidate = join._write_batch_candidate_site(
         context.site,
         [_execution(item) for item in attempts],
-        state_dir=context.state_dir,
+        state_dir=context.candidate_dir,
     )
     before = membership_runtime_snapshot(candidate)
     try:
@@ -450,7 +412,7 @@ def _verify_deployed(
             _record_failure(context, attempt, attempt.execution, exc)
         return []
     after = membership_runtime_snapshot(candidate)
-    verified_at = datetime.now(timezone.utc).isoformat()
+    verified_at = datetime.now(timezone.utc)
     candidate_cluster_ids = [
         str(item["cluster_id"]) for item in candidate.release_config["clusters"]
     ]
@@ -475,7 +437,7 @@ def _verify_deployed(
                     candidate_cluster_ids=candidate_cluster_ids,
                     cluster_id=_execution(attempt).cluster_id,
                     batch_id=context.batch_id,
-                    verified_at=datetime.fromisoformat(verified_at),
+                    verified_at=verified_at,
                 ),
             )
     return attempts
@@ -485,10 +447,13 @@ def _commit_clusters(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
 ) -> None:
-    for attempt in sorted(
-        attempts,
-        key=lambda item: _execution(item).cluster_id,
-    ):
+    def ordered(items: list[JoinAttempt]) -> list[JoinAttempt]:
+        return sorted(items, key=lambda item: _execution(item).cluster_id)
+
+    pending = ordered(attempts)
+    reverified: set[str] = set()
+    while pending:
+        attempt = pending.pop(0)
         execution = _execution(attempt)
         try:
             join._activate_and_commit(
@@ -498,6 +463,23 @@ def _commit_clusters(
                 state_path=attempt.state_path,
                 state=attempt.state,
             )
+        except JoinVerificationExpired as exc:
+            # Earlier commits of this batch used up the window. The clusters
+            # still waiting share one candidate file, so all of them are
+            # re-verified together; one re-verify per cluster, then it is a
+            # failure like any other.
+            remaining = [attempt, *pending]
+            stale = [
+                item for item in remaining if item.request.gpu_cluster_arn in reverified
+            ]
+            for item in stale:
+                _record_failure(context, item, item.execution, exc)
+            remaining = [item for item in remaining if item not in stale]
+            for item in remaining:
+                reverified.add(item.request.gpu_cluster_arn)
+                clear_verified_step(item.state_path, item.state)
+            pending = ordered(_verify_deployed(context, remaining))
+            continue
         except Exception as exc:
             _record_failure(context, attempt, execution, exc)
             continue
@@ -506,7 +488,7 @@ def _commit_clusters(
 
 def _finish(context: BatchJoinContext) -> dict[str, Any]:
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": "PARTIAL" if context.failures else "COMPLETED",
         "batch_id": context.batch_id,
         "joined": sorted(
@@ -520,35 +502,30 @@ def _finish(context: BatchJoinContext) -> dict[str, Any]:
             if item.get("phase") == "ALREADY_MANAGED"
         ),
         "failed": dict(sorted(context.failures.items())),
-        "configured_concurrency": context.concurrency,
-        "effective_deploy_concurrency": context.effective_deploy_concurrency,
-        "global_node_budget": GLOBAL_BATCH_JOIN_NODE_BUDGET,
+        "deploy_concurrency": deploy_concurrency(context.site),
+        "clusters": sorted(
+            context.results, key=lambda item: str(item.get("cluster_id") or "")
+        ),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    state_path = context.state_dir / "state.json"
-    write_json_atomic(state_path, summary)
     if context.failures:
         raise BootstrapError(
             "batch join completed with failed clusters: "
             + ", ".join(sorted(context.failures))
-            + f"; evidence: {state_path}"
+            + "; summary: "
+            + json.dumps(summary, sort_keys=True)
         )
-    return {**summary, "batch_state_dir": str(context.state_dir)}
+    return summary
 
 
 def _join_clusters_locked(
     requests: tuple[JoinClusterRequest, ...],
     *,
-    max_workers: int = DEFAULT_BATCH_JOIN_CONCURRENCY,
     runner_factory: Callable[[], CommandRunner] = CommandRunner,
 ) -> dict[str, Any]:
     if not requests:
         return {"phase": "COMPLETED", "joined": [], "already_managed": []}
-    context, attempts = _initialize_context(
-        requests,
-        max_workers=max_workers,
-        runner_factory=runner_factory,
-    )
+    context, attempts = _initialize_context(requests, runner_factory=runner_factory)
     if not attempts:
         return _finish(context)
     discoveries, registry_path = _run_readonly_tasks(context, attempts)
@@ -571,7 +548,6 @@ def _join_clusters_locked(
 def join_clusters(
     requests: tuple[JoinClusterRequest, ...],
     *,
-    max_workers: int = DEFAULT_BATCH_JOIN_CONCURRENCY,
     runner_factory: Callable[[], CommandRunner] = CommandRunner,
 ) -> dict[str, Any]:
     if not requests:
@@ -580,6 +556,5 @@ def join_clusters(
         current = reload_site_for_mutation(requests[0].site)
         return _join_clusters_locked(
             tuple(replace(request, site=current) for request in requests),
-            max_workers=max_workers,
             runner_factory=runner_factory,
         )

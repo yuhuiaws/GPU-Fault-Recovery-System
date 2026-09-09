@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Callable
-
 import os
 import re
 from pathlib import Path
+from typing import Any, Callable
 
 from gpu_fault.schema_migrations import (
     LATEST_POSTGRES_SCHEMA_VERSION,
     POSTGRES_SCHEMA_MIGRATIONS,
 )
 from gpu_fault.store.postgres.ddl import (
-    declared_index_names,
     create_postgres_schema,
 )
-
+from gpu_fault.store.postgres.index_builder import (
+    index_definition_defects,
+    index_health,
+)
 
 POSTGRES_SCHEMA_VERSION = LATEST_POSTGRES_SCHEMA_VERSION
 
@@ -202,6 +203,9 @@ class PostgresSchemaMixin:
                         'gpu_fault_telemetry_spool_notify_available()'
                     ),
                     to_regprocedure(
+                        'gpu_fault_objects_notify_wakeup()'
+                    ),
+                    to_regprocedure(
                         'gpu_fault_processor_priority_count_sync()'
                     )
                 """
@@ -217,6 +221,7 @@ class PostgresSchemaMixin:
         trigger_names = (
             "gpu_fault_processor_queue_notify_pending_trigger",
             "gpu_fault_telemetry_spool_notify_available_trigger",
+            "gpu_fault_objects_notify_wakeup_trigger",
         )
         with self._db.cursor() as cursor:
             cursor.execute(
@@ -243,11 +248,17 @@ class PostgresSchemaMixin:
             fault_counter_triggers_exist = cursor.fetchone()[0]
         missing = set(trigger_names) - present_triggers
         if missing:
-            label = (
-                "processor queue" if trigger_names[0] in missing else "telemetry spool"
-            )
+            if trigger_names[0] in missing:
+                label = "processor queue notification"
+            elif trigger_names[1] in missing:
+                label = "telemetry spool notification"
+            else:
+                # Schema v14: without it the dispatcher and the executor fall
+                # back to their polls silently, the exact latency this trigger
+                # exists to remove.
+                label = "objects wakeup"
             raise RuntimeError(
-                f"PostgreSQL {label} notification trigger is missing; "
+                f"PostgreSQL {label} trigger is missing; "
                 "run gpu-fault-store-migrate --ensure-schema"
             )
         if not fault_counter_triggers_exist:
@@ -284,20 +295,39 @@ class PostgresSchemaMixin:
         build degraded silently into a sequential scan per dispatcher tick.
         """
 
-        expected = declared_index_names()
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                "SELECT indexname FROM pg_indexes WHERE indexname = ANY(%s)",
-                (sorted(expected),),
-            )
-            present = {row[0] for row in cursor.fetchall()}
-        missing = sorted(expected - present)
+        # Present, valid and the declared definition (G-6). A CREATE INDEX
+        # CONCURRENTLY that failed leaves an INVALID index the planner never
+        # uses, and an index recreated by hand under the same name keeps the
+        # name; both passed a name-only check and degraded the hot queries
+        # silently until the next FULL release rebuilt them.
+        with self._db.transaction():
+            with self._db.cursor() as cursor:
+                health = index_health(cursor.connection)
+                drifted = index_definition_defects(cursor)
+        missing = sorted(row["name"] for row in health if not row["present"])
+        invalid = sorted(
+            row["name"] for row in health if row["present"] and not row["valid"]
+        )
         if missing:
             raise RuntimeError(
                 "PostgreSQL indexes are missing: "
                 + ", ".join(missing)
                 + "; build them (CREATE INDEX CONCURRENTLY on a live database) "
                 "and run gpu-fault-store-migrate --ensure-schema"
+            )
+        if invalid:
+            raise RuntimeError(
+                "PostgreSQL indexes are invalid (a CONCURRENTLY build failed): "
+                + ", ".join(invalid)
+                + "; rebuild them with gpu-fault-store-migrate "
+                "--build-indexes-concurrently"
+            )
+        if drifted:
+            raise RuntimeError(
+                "PostgreSQL indexes have a definition that differs from the DDL: "
+                + ", ".join(drifted)
+                + "; drop them and rebuild with gpu-fault-store-migrate "
+                "--build-indexes-concurrently"
             )
 
     def _validate_triggers_enabled(self) -> None:

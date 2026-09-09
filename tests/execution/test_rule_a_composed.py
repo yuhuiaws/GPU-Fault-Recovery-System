@@ -6,7 +6,7 @@ workflow ends FAILED with a reason naming the node, its incident ESCALATED.
 
 The workflow under test is shaped like ``PassiveWorkflowCompiler.compile``'s
 ``after_incident`` restart: a derived incident id, a single RESTART_WORKLOAD
-step carrying ``requires_incident_state`` and ``reuse_allocation``, nodes
+step carrying ``requires_incident_state``, nodes
 that include the one under repair. Its incident id differs from the node
 remediation's, so the dispatcher's hold treats it as another incident and it
 waits like any job workflow; the step's premise is the backstop once it runs.
@@ -80,7 +80,6 @@ def _after_incident_restart(store, *, created_at: datetime) -> None:
                     **RESTART_PARAMETERS,
                     "requires_incident_state": IncidentState.RECOVERED.value,
                     "incident_id": "inc-node",
-                    "reuse_allocation": True,
                 },
             )
         ],
@@ -98,6 +97,23 @@ def _dispatcher(store, adapter: FakeAdapter) -> WorkflowDispatcher:
         WorkflowDispatcherConfig(
             enabled=True, batch_size=10, max_workers=1, node_busy_wait_seconds=WINDOW
         ),
+    )
+
+
+def _rewind(store, request_id: str, by: timedelta) -> None:
+    """Move the row's clock ``by`` into the past: its ``created_at`` and every
+    HOLD the dispatcher stamped on it (the rule A window opens at the first)."""
+
+    current = store.get_workflow(request_id)
+    store.amend_workflow(
+        request_id,
+        {
+            "created_at": current.created_at - by,
+            "events": [
+                event.model_copy(update={"at": event.at - by})
+                for event in current.events
+            ],
+        },
     )
 
 
@@ -134,10 +150,10 @@ def test_a_restart_waits_on_the_busy_node_then_fails_without_restarting():
     assert adapter.calls == [], "nothing restarts while the node is under repair"
     assert store.get_workflow("wf-restart").status is WorkflowStatus.PENDING
 
-    # The window passes with the node still under the other remediation.
-    store.amend_workflow(
-        "wf-restart", {"created_at": now - timedelta(seconds=WINDOW + 60)}
-    )
+    # The window passes with the node still under the other remediation. The
+    # wait is measured from the first HOLD the dispatcher recorded (D-11), so
+    # that is what moves into the past, along with ``created_at``.
+    _rewind(store, "wf-restart", timedelta(seconds=WINDOW + 60))
     gave_up = dispatcher.run_once()
     dispatcher.run_once()
 
@@ -194,6 +210,13 @@ def test_the_running_premise_gives_up_at_the_window_not_the_generic_step_cap():
     # than the window but far less than the 600s generic step cap. The step's
     # clock is floored at the execution window's start (deadline minus the
     # workflow budget), so the deadline is placed to open that window 600s ago.
+    # Its first claim's preflight reserved the restart; dispatch signs that.
+    store.reserve_job_restart(
+        str(RESTART_PARAMETERS["cluster_id"]),
+        str(RESTART_PARAMETERS["job_id"]),
+        int(RESTART_PARAMETERS["restart_budget"]),
+        "wf-restart/0/RESTART_WORKLOAD",
+    )
     budget = ProductionExecutorConfig.workflow_execution_timeout_seconds
     store.save_workflow(
         copy_model(

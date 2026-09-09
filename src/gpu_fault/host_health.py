@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-import logging
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import Field
 
 from gpu_fault.env import env_bool
+from gpu_fault.log_rules import NODE_LOG_RULES
 from gpu_fault.models import (
     EfaTrafficSignal,
     MarkerScope,
@@ -23,7 +24,6 @@ from gpu_fault.models import (
     WorkloadState,
     recovery_action_sort_key,
 )
-from gpu_fault.log_rules import NODE_LOG_RULES
 
 LOGGER = logging.getLogger(__name__)
 
@@ -354,10 +354,19 @@ class NodeHealthPolicy:
     # control plane never gets a sample for.
     DISK_IO_SUSTAIN_SECONDS = 120.0
     NETWORK_DROPS_SUSTAIN_SECONDS = 60.0
+    # CPU saturation, run-queue load and memory pressure are the noisiest of
+    # all: a data-loader burst or a checkpoint flush crosses 98 % CPU or 95 %
+    # memory for a few samples on a perfectly healthy trainer. One sample used
+    # to mint a WARNING RUN_DIAGNOSTICS finding -- and with it an incident, a
+    # marker and a VALIDATE_HOST workflow -- for every such burst.
+    HOST_RESOURCE_SUSTAIN_SECONDS = 120.0
     METRIC_RULE_SUSTAIN_SECONDS: dict[str, float] = {
         "disk_io_util_percent": DISK_IO_SUSTAIN_SECONDS,
         "disk_io_await_ms": DISK_IO_SUSTAIN_SECONDS,
         "network_drops_delta": NETWORK_DROPS_SUSTAIN_SECONDS,
+        "cpu_usage_percent": HOST_RESOURCE_SUSTAIN_SECONDS,
+        "load1_per_cpu": HOST_RESOURCE_SUSTAIN_SECONDS,
+        "memory_used_percent": HOST_RESOURCE_SUSTAIN_SECONDS,
     }
 
     METRIC_RULES = {

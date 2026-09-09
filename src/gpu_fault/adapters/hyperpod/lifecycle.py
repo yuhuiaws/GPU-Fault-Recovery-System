@@ -12,6 +12,10 @@ from gpu_fault.adapters.common import (
 from gpu_fault.adapters.hyperpod.confirmation import HyperPodConfirmationMixin
 from gpu_fault.adapters.hyperpod.notifications import HyperPodNotificationMixin
 from gpu_fault.adapters.kubernetes.adapter import KubernetesWorkflowAdapter
+from gpu_fault.adapters.kubernetes.primitives import (
+    NodePatchConflict,
+    patch_node_with_retry,
+)
 from gpu_fault.adapters.node_action.adapter import NodeActionWorkflowAdapter
 from gpu_fault.aws_errors import aws_configuration_error
 from gpu_fault.execution import (
@@ -159,6 +163,62 @@ class HyperPodLifecycleStepAdapter(
                 f"{annotations.get(ANNOTATION_INCIDENT)!r}, not this incident"
             )
         return problems
+
+    def _reassert_isolation(
+        self, context: WorkflowStepContext, details: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Re-cordon a rebooting node the provider's bootstrap uncordoned.
+
+        HyperPod's node bootstrap patches the Node after a managed reboot and
+        clears ``spec.unschedulable`` (audit: ``hyperpod-service-linked-role``,
+        ``bootstrap/v0.0.0``, DESTR-014 2026-09-09); the ownership annotations
+        survive. Until RESTORE_SCHEDULING runs the node must stay cordoned, and
+        the REPLACE_NODE rung an unconfirmed reboot escalates into observes
+        isolation and refuses an uncordoned node. Runs on every poll of an
+        unconfirmed RESTART_NODE, touches only a node this incident still owns,
+        and records what it re-cordoned; a node absent mid-reboot or a patch
+        conflict waits for the next poll.
+        """
+
+        observed = details.get("observed_isolation")
+        if (
+            self.kubernetes_adapter is None
+            or context.step.operation is not WorkflowOperation.RESTART_NODE
+            or not isinstance(observed, dict)
+        ):
+            return {}
+        core = self.kubernetes_adapter.core
+        incident_id = context.incident.incident_id
+        reasserted = [str(item) for item in details.get("isolation_reasserted") or []]
+        for node_id, record in observed.items():
+            if not isinstance(record, dict) or not record.get("unschedulable"):
+                continue
+            kubernetes_node = str(record.get("kubernetes_node") or node_id)
+            patched: list[bool] = []
+
+            def body(node: Any) -> dict[str, Any] | None:
+                annotations = KubernetesWorkflowAdapter._annotations(node)
+                if annotations.get(ANNOTATION_INCIDENT) != incident_id:
+                    return None
+                if KubernetesWorkflowAdapter._unschedulable(node):
+                    return None
+                patched.append(True)
+                return {
+                    "metadata": {"annotations": {}},
+                    "spec": {"unschedulable": True},
+                }
+
+            try:
+                patch_node_with_retry(core, kubernetes_node, body)
+            except NodePatchConflict:
+                continue
+            except Exception as exc:
+                if isinstance(exc, KeyError) or getattr(exc, "status", None) == 404:
+                    continue
+                raise
+            if patched and node_id not in reasserted:
+                reasserted.append(node_id)
+        return {"isolation_reasserted": reasserted} if reasserted else {}
 
     def _observe_isolation(
         self, context: WorkflowStepContext
@@ -355,12 +415,16 @@ class HyperPodLifecycleStepAdapter(
                 state=previous.details,
             )
         if previous and previous.adapter_operation_id:
+            base_details = {
+                **previous.details,
+                **self._reassert_isolation(context, previous.details),
+            }
             if (
                 previous.adapter_operation_id
                 in context.request.confirmed_adapter_operation_ids
             ):
                 details = {
-                    **previous.details,
+                    **base_details,
                     "externally_confirmed": True,
                     "confirmation_source": "explicit-operation-id",
                 }
@@ -375,12 +439,10 @@ class HyperPodLifecycleStepAdapter(
                     operation_id=previous.adapter_operation_id,
                     details=details,
                 )
-            automatic_confirmation = self._automatic_confirmation(
-                context, previous.details
-            )
+            automatic_confirmation = self._automatic_confirmation(context, base_details)
             if automatic_confirmation is not None:
                 details = {
-                    **previous.details,
+                    **base_details,
                     **automatic_confirmation,
                 }
                 notification_id = self._notify_node_restarted(
@@ -396,7 +458,7 @@ class HyperPodLifecycleStepAdapter(
                 )
             return WorkflowStepOutcome.waiting(
                 operation_id=previous.adapter_operation_id,
-                details=previous.details,
+                details=base_details,
             )
         if not context.request.confirm_cluster_name:
             return WorkflowStepOutcome.failed(

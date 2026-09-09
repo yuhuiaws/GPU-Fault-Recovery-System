@@ -1,6 +1,4 @@
 from gpu_fault.notifications.common import (
-    AdvisoryNotification,
-    Any,
     FABRIC_RESET_EMAIL_TEMPLATE,
     FABRIC_RESET_TEMPLATE_VERSION,
     GPU_COUNT_CHANGE_EMAIL_TEMPLATE,
@@ -14,6 +12,8 @@ from gpu_fault.notifications.common import (
     RESTART_NODE_TEMPLATE_VERSION,
     RESTART_WORKLOAD_EMAIL_TEMPLATE,
     RESTART_WORKLOAD_TEMPLATE_VERSION,
+    AdvisoryNotification,
+    Any,
 )
 
 

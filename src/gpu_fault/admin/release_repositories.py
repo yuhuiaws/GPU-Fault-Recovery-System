@@ -85,8 +85,6 @@ def _ensure_build_cache_lifecycle_policy(
     desired = _build_cache_lifecycle_policy()
     desired_text = _canonical_policy_text(desired)
     desired_sha256 = hashlib.sha256(desired_text.encode()).hexdigest()
-    if runner.dry_run:
-        return desired_sha256
     described = subprocess.run(
         [
             "aws",
@@ -159,32 +157,6 @@ def _ensure_ecr_repository(
     name = _release_repository_name(site_id, cache=cache)
     expected_mutability = "MUTABLE" if cache else "IMMUTABLE"
     expected_scan = not cache
-    if runner.dry_run:
-        result = {
-            "repository_name": name,
-            "repository_arn": (
-                f"arn:aws:ecr:{cpu.region}:{cpu.account_id}:repository/{name}"
-            ),
-            "repository_uri": (
-                f"{cpu.account_id}.dkr.ecr.{cpu.region}.amazonaws.com/{name}"
-            ),
-            "ownership": "CREATED",
-            "purpose": "build-cache" if cache else "runtime",
-        }
-        if cache:
-            result.update(
-                {
-                    "lifecycle_policy_sha256": (
-                        _ensure_build_cache_lifecycle_policy(
-                            runner,
-                            region=cpu.region,
-                            repository_name=name,
-                        )
-                    ),
-                    "untagged_retention_days": str(BUILD_CACHE_UNTAGGED_RETENTION_DAYS),
-                }
-            )
-        return result
     described = subprocess.run(
         [
             "aws",
@@ -327,9 +299,6 @@ def prepare_signed_release(
         runtime_repository=repositories["runtime"]["repository_uri"],
         cache_repository=repositories["cache"]["repository_uri"],
         runtime_profile="hyperpod-v1",
-        cosign_signing_key=request.cosign_signing_key,
-        cosign_public_key=request.cosign_public_key,
-        cosign_password_file=request.cosign_password_file,
         staging_only=request.staging_only_release,
         impact_base=request.impact_base,
     )

@@ -7,7 +7,6 @@ from pydantic import Field
 
 from gpu_fault.models import StrictModel, WorkloadState
 
-
 SITE_METRIC_POLICY_VERSION = "site-dcgm-metric-policy/v3"
 
 

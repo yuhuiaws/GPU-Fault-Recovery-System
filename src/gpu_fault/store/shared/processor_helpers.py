@@ -71,3 +71,33 @@ class PartialEnqueueError(RuntimeError):
         )
         self.committed = committed
         self.cause = cause
+
+
+def coalesce_routine_sample(pending: Any, request: Any) -> Any:
+    """The row a latest-wins sample leaves behind when it merges into ``pending``.
+
+    The payload follows the newest sample; the identity (``request_id``,
+    ``created_at``) stays with the row that is already queued so the caller
+    who was given that id still finds its receipt. The retry schedule stays
+    too (B-5): a fresh sample carries ``retry_count=0`` / ``not_before=None``
+    and used to reset a lane that ``_release(failure=...)`` had just backed
+    off, so a deterministic 500 re-ran every collection interval. Every
+    backend's admission path merges through here so the three agree.
+    """
+
+    from gpu_fault.processor import ProcessorRequestStatus
+
+    later_not_before = pending.not_before
+    if request.not_before is not None and (
+        later_not_before is None or request.not_before > later_not_before
+    ):
+        later_not_before = request.not_before
+    return request.model_copy(
+        update={
+            "request_id": pending.request_id,
+            "created_at": pending.created_at,
+            "status": ProcessorRequestStatus.PENDING,
+            "retry_count": max(pending.retry_count, request.retry_count),
+            "not_before": later_not_before,
+        }
+    )

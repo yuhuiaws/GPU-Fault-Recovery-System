@@ -388,30 +388,62 @@ def _ready(
     return True
 
 
-def reconcile_aurora_capacity(
+def _await_ready(
+    caller: AwsJsonCaller,
     *,
     aws_region: str,
     cluster_id: str,
     desired: AuroraCapacityConfig,
-    expected: AuroraCapacityConfig | None = None,
-    timeout_seconds: int = 1800,
-    poll_seconds: float = 10.0,
-    aws_json: AwsJsonCaller | None = None,
-    wait_for_settle: bool = True,
+    require_observed_capacity: bool,
+    required_stable: int,
+    timeout_seconds: int,
+    poll_seconds: float,
 ) -> dict[str, Any]:
-    """Move the cluster to ``desired`` and wait until RDS has really done it.
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    stable = 0
+    while time.monotonic() < deadline:
+        last = observe_aurora_capacity(
+            aws_region=aws_region,
+            cluster_id=cluster_id,
+            include_observed_capacity=require_observed_capacity,
+            aws_json=caller,
+        )
+        stable = (
+            stable + 1
+            if _ready(
+                last,
+                desired,
+                require_observed_capacity=require_observed_capacity,
+            )
+            else 0
+        )
+        if stable >= required_stable:
+            return last
+        time.sleep(poll_seconds)
+    raise AdminConfigError(
+        "Aurora capacity did not converge before the administrator timeout: "
+        + json.dumps(last, sort_keys=True)
+    )
 
-    ``expected`` is the reviewed current window of a plan/apply transaction: the
-    live cluster must match it or ``desired`` (a resumed apply), anything else is
-    somebody else's change and is refused. Callers without such a record --
-    bootstrap, the legacy deploy, the perf harness -- leave it ``None`` and
-    reconcile whatever is live.
 
-    ``wait_for_settle=False`` is for a dry-run runner that held the modify back;
-    waiting for a change nobody made would wait forever.
+def _modify_window(
+    caller: AwsJsonCaller,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    desired: AuroraCapacityConfig,
+    expected: AuroraCapacityConfig | None,
+) -> tuple[dict[str, Any], bool, bool]:
+    """Observe, refuse drift, issue the modify; ``(before, modified, scale_up)``.
+
+    ``expected`` is the reviewed current window of an apply: the live cluster
+    must match it or ``desired`` (a resumed apply), anything else is somebody
+    else's change and is refused. Callers without such a record -- bootstrap,
+    the legacy deploy, the perf harness -- leave it ``None`` and reconcile
+    whatever is live.
     """
 
-    caller = _caller(aws_json)
     desired.validate()
     if expected is not None:
         expected.validate()
@@ -434,7 +466,6 @@ def reconcile_aurora_capacity(
     # the reviewed record is the baseline when there is one (a resumed apply
     # still proves the ACU it asked for), the live window otherwise.
     baseline = expected.min_acu if expected is not None else live_capacity[0]
-    require_observed_capacity = desired.min_acu > baseline
     modified = live_capacity != (desired.min_acu, desired.max_acu)
     if modified:
         caller(
@@ -448,48 +479,131 @@ def reconcile_aurora_capacity(
             "--apply-immediately",
             mutate=True,
         )
-        if not wait_for_settle:
-            return {"before": initial, "after": None, "modified": True}
+    return initial, modified, desired.min_acu > baseline
+
+
+def request_aurora_capacity(
+    *,
+    aws_region: str,
+    cluster_id: str,
+    desired: AuroraCapacityConfig,
+    expected: AuroraCapacityConfig | None = None,
+    timeout_seconds: int = 1800,
+    poll_seconds: float = 10.0,
+    aws_json: AwsJsonCaller | None = None,
+) -> dict[str, Any]:
+    """Move the window to ``desired`` and wait until RDS reads ``available`` on it.
+
+    The first half of a capacity change for a caller with work to do in
+    between: the ``modify-db-cluster`` and the wait for the cluster and both
+    instances to be ``available`` with the new window
+    (``CAPACITY_SETTLE_STABLE_POLLS`` times after a modify). It does not wait
+    for a scale-up's instances to actually run at the new floor; that is
+    ``await_aurora_capacity``, which the administrator command runs after the
+    control-plane roles have rolled, because the two are independent and the
+    ACU ramp is the slow part. The structural wait has to happen here, though:
+    the release's own preflight refuses an Aurora cluster that is not
+    ``available``. The result's ``scale_up`` says whether
+    ``await_aurora_capacity`` still has work to do.
+    """
+
+    caller = _caller(aws_json)
+    initial, modified, scale_up = _modify_window(
+        caller,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        desired=desired,
+        expected=expected,
+    )
     # A cluster nobody touched is already settled, so one confirming observation
     # answers the question; after a modify it cannot.
-    required_stable = CAPACITY_SETTLE_STABLE_POLLS if modified else 1
-    deadline = time.monotonic() + timeout_seconds
-    last = initial
-    stable = 0
-    while time.monotonic() < deadline:
-        last = observe_aurora_capacity(
-            aws_region=aws_region,
-            cluster_id=cluster_id,
-            include_observed_capacity=require_observed_capacity,
-            aws_json=caller,
-        )
-        stable = (
-            stable + 1
-            if _ready(
-                last,
-                desired,
-                require_observed_capacity=require_observed_capacity,
-            )
-            else 0
-        )
-        if stable >= required_stable:
-            return {
-                "before": initial,
-                "after": last,
-                "modified": modified,
-            }
-        time.sleep(poll_seconds)
-    raise AdminConfigError(
-        "Aurora capacity did not converge before the administrator timeout: "
-        + json.dumps(last, sort_keys=True)
+    after = _await_ready(
+        caller,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        desired=desired,
+        require_observed_capacity=False,
+        required_stable=CAPACITY_SETTLE_STABLE_POLLS if modified else 1,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    return {
+        "before": initial,
+        "after": after,
+        "modified": modified,
+        "scale_up": scale_up,
+    }
+
+
+def await_aurora_capacity(
+    *,
+    aws_region: str,
+    cluster_id: str,
+    desired: AuroraCapacityConfig,
+    modified: bool,
+    timeout_seconds: int = 1800,
+    poll_seconds: float = 10.0,
+    aws_json: AwsJsonCaller | None = None,
+) -> dict[str, Any]:
+    """Wait until both instances actually run at ``desired.min_acu``.
+
+    The second half of a scale-up, after ``request_aurora_capacity``: the
+    cluster already reads ``available`` on the new window, this proves the
+    ``ServerlessDatabaseCapacity`` metric reached the floor on the writer and
+    the reader. ``modified`` says whether this apply issued the change, in
+    which case the same consecutive-poll rule applies.
+    """
+
+    desired.validate()
+    return _await_ready(
+        _caller(aws_json),
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        desired=desired,
+        require_observed_capacity=True,
+        required_stable=CAPACITY_SETTLE_STABLE_POLLS if modified else 1,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
     )
 
 
-def aurora_capacity_changed(
-    current: AuroraCapacityConfig,
+def reconcile_aurora_capacity(
+    *,
+    aws_region: str,
+    cluster_id: str,
     desired: AuroraCapacityConfig,
-) -> bool:
-    return current != desired
+    expected: AuroraCapacityConfig | None = None,
+    timeout_seconds: int = 1800,
+    poll_seconds: float = 10.0,
+    aws_json: AwsJsonCaller | None = None,
+) -> dict[str, Any]:
+    """Move the cluster to ``desired`` and wait until RDS has really done it.
+
+    The whole change in one settle loop (structure and, for a scale-up, the
+    observed ACU together), for callers with nothing to do in between:
+    bootstrap, the legacy deploy, the perf harness and the administrator
+    command's Aurora rollback. See ``_modify_window`` for ``expected``.
+    """
+
+    caller = _caller(aws_json)
+    initial, modified, scale_up = _modify_window(
+        caller,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        desired=desired,
+        expected=expected,
+    )
+    after = _await_ready(
+        caller,
+        aws_region=aws_region,
+        cluster_id=cluster_id,
+        desired=desired,
+        require_observed_capacity=scale_up,
+        required_stable=CAPACITY_SETTLE_STABLE_POLLS if modified else 1,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    return {"before": initial, "after": after, "modified": modified}
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -63,7 +63,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 - 多副本 processor、lane lease、fencing token 和幂等 workflow。
 - GPU 服务 quiesce、GPU reset、节点 reboot 和 warm-spare 故障转移。
 - Completion Watcher、训练重启预算和 GPU 数量一致性门禁。
-- SES 通知、AMP/Alertmanager/SNS 观测和长期证据归档。
+- 经站点 SNS topic 发出的管理员通知（可选 SES）、AMP/Alertmanager/SNS 观测和长期证据归档。
 
 ## 文档入口
 
@@ -149,17 +149,18 @@ dirty工作区由内部准备器转成隔离的`staging_only`快照并执行影�
 完整生产门禁。用户不提供release-ref、artifact、site、bundle或venv路径。完整流程见
 [EC2源码统一部署流程](docs/EC2源码Staging复现流程.md)。
 
-若Runtime Profile策略变化，首次deploy会生成私有计划并停止。审核后执行：
+若Runtime Profile策略变化，首次deploy会生成私有计划并停止。审核后在同一条deploy上带
+审批参数重跑，审批并继续部署：
 
 ```bash
-gpu-fault-admin approve-profile \
+gpu-fault-admin deploy \
   --state-dir /secure/gpu-fault-staging \
-  --plan-sha256 "$(jq -er '.plan_sha256' \
+  --approve-profile-plan "$(jq -er '.plan_sha256' \
     /secure/gpu-fault-staging/release-deploy/profile-plan.json)" \
   --reference CHG-12345
 ```
 
-再重跑原四参数deploy。审批绑定计划和live baseline，成功后一次性消费；计划漂移必须
+没有单独的审批动词。审批绑定计划和live baseline，成功后一次性消费；计划漂移必须
 重新审批。
 
 ### 管理员：首次部署和日常管理
@@ -193,7 +194,7 @@ gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
 
 # 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群
 gpu-fault-admin remove-cluster --state-dir /secure/gpu-fault \
-  --cluster-id <cluster-id> --confirm REMOVE_GPU_CLUSTER
+  --gpu-cluster-arn <gpu-arn> --confirm REMOVE_GPU_CLUSTER
 
 # 卸载整个方案控制面和数据面，但保留底层CPU/GPU集群
 gpu-fault-admin uninstall --state-dir /secure/gpu-fault \

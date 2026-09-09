@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any
-
 
 PINNED_XID_CATALOG_VERSION = "610"
 PINNED_XID_SOURCE_SHA256 = (

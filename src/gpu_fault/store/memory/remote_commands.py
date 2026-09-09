@@ -13,6 +13,13 @@ from gpu_fault.store.shared.errors import (
     NotFoundError,
     WorkflowLeaseError,
 )
+from gpu_fault.store.shared.remote_commands import (
+    covering_compound_command,
+    merged_batched_results,
+    stale_fence,
+    stale_fence_reason,
+    stale_fence_update,
+)
 from gpu_fault.store.shared.remote_helpers import (
     OPEN_REMOTE_COMMAND_STATUSES,
 )
@@ -98,6 +105,56 @@ class MemoryRemoteCommandMixin:
             )
         return matches[0] if matches else None
 
+    def find_remote_command_covering_step(
+        self,
+        workflow_request_id: str,
+        step_index: int,
+        command_step_space: str,
+        *,
+        fencing_token: int,
+    ) -> RemoteActionCommand | None:
+        with self._lock:
+            candidates = [
+                item
+                for item in self._remote_commands.values()
+                if item.workflow_request_id == workflow_request_id
+                and item.fencing_token == fencing_token
+            ]
+        return covering_compound_command(candidates, step_index, command_step_space)
+
+    def record_remote_command_progress(
+        self,
+        cluster_id: str,
+        command_id: str,
+        executor_id: str,
+        lease_token: str,
+        *,
+        batched_results: dict[str, Any],
+    ) -> RemoteActionCommand:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            command: RemoteActionCommand | None = self._remote_commands.get(command_id)
+            if command is None or command.cluster_id != cluster_id:
+                raise NotFoundError(f"{cluster_id}/{command_id}")
+            if (
+                command.status is not RemoteCommandStatus.LEASED
+                or command.lease_owner != executor_id
+                or command.lease_token != lease_token
+                or command.lease_expires_at is None
+                or command.lease_expires_at <= now
+            ):
+                raise WorkflowLeaseError("remote command lease is stale")
+            command = command.model_copy(
+                update={
+                    "result_details": merged_batched_results(
+                        command.result_details, batched_results
+                    ),
+                    "updated_at": now,
+                }
+            )
+            self._remote_commands[command_id] = command
+            return command
+
     def _open_remote_command_candidates(
         self,
         cluster_id: str,
@@ -135,6 +192,7 @@ class MemoryRemoteCommandMixin:
         limit: int,
         lease_seconds: int,
         execution_owners: set[str] | None = None,
+        accept_batched_steps: bool = True,
     ):
         now = datetime.now(timezone.utc)
         claimed = []
@@ -164,6 +222,9 @@ class MemoryRemoteCommandMixin:
                         execution_owners is not None
                         and command.step.execution_owner not in execution_owners
                     )
+                    # A compound command is never handed to an executor whose
+                    # protocol predates ``batched_steps`` (性能 C).
+                    or (not accept_batched_steps and command.batched_steps)
                     or (
                         command.status
                         not in {
@@ -230,6 +291,44 @@ class MemoryRemoteCommandMixin:
                 expired += 1
         return expired
 
+    def expire_stale_fenced_remote_commands(
+        self,
+        *,
+        lease_expired_before: datetime,
+        limit: int,
+    ) -> int:
+        """Fail LEASED commands whose lease lapsed under a stale generation.
+
+        The claim never re-leases such a row and its executor was told to stop
+        on renewal; one that never reported (executor gone, lease lapsed for
+        longer than ``lease_expired_before`` allows) is closed here so it does
+        not stay LEASED for ever (control-plane review 2026-09-08, D-9).
+        """
+
+        now = datetime.now(timezone.utc)
+        expired = 0
+        with self._lock:
+            stale = [
+                item
+                for item in sorted(
+                    self._remote_commands.values(),
+                    key=lambda item: (item.created_at, item.command_id),
+                )
+                if item.status is RemoteCommandStatus.LEASED
+                and item.lease_expires_at is not None
+                and item.lease_expires_at <= lease_expired_before
+                and stale_fence(item, self._workflows.get(item.workflow_request_id))
+            ][:limit]
+            for command in stale:
+                self._remote_commands[command.command_id] = stale_fence_update(
+                    command,
+                    self._workflows.get(command.workflow_request_id),
+                    now,
+                    swept=True,
+                )
+                expired += 1
+        return expired
+
     def renew_remote_command_lease(
         self,
         cluster_id: str,
@@ -252,12 +351,19 @@ class MemoryRemoteCommandMixin:
                 or command.lease_expires_at <= now
             ):
                 raise WorkflowLeaseError("remote command lease is stale")
-            command = command.model_copy(
-                update={
-                    "lease_expires_at": lease_deadline(lease_seconds),
-                    "updated_at": now,
-                }
-            )
+            update: dict[str, Any] = {
+                "lease_expires_at": lease_deadline(lease_seconds),
+                "updated_at": now,
+            }
+            workflow = self._workflows.get(command.workflow_request_id)
+            if (
+                stale_fence(command, workflow)
+                and command.cancellation_requested_at is None
+            ):
+                # See ``SharedRemoteCommandMixin.renew_remote_command_lease``.
+                update["cancellation_requested_at"] = now
+                update["cancellation_reason"] = stale_fence_reason(command, workflow)
+            command = command.model_copy(update=update)
             self._remote_commands[command_id] = command
             return command
 
@@ -307,13 +413,16 @@ class MemoryRemoteCommandMixin:
             command = self._remote_commands.get(command_id)
             if command is None or command.cluster_id != cluster_id:
                 raise NotFoundError(f"{cluster_id}/{command_id}")
-            workflow = self._workflows.get(command.workflow_request_id)
-            if workflow is not None and workflow.fencing_token != command.fencing_token:
-                raise WorkflowLeaseError("remote command fencing token is stale")
             if command.status in {
                 RemoteCommandStatus.SUCCEEDED,
                 RemoteCommandStatus.FAILED,
             }:
+                return command
+            workflow = self._workflows.get(command.workflow_request_id)
+            if stale_fence(command, workflow):
+                # See ``SharedRemoteCommandMixin.complete_remote_command``.
+                command = stale_fence_update(command, workflow, now, result=result)
+                self._remote_commands[command_id] = command
                 return command
             if (
                 command.status is not RemoteCommandStatus.LEASED

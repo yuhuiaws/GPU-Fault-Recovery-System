@@ -8,13 +8,16 @@ import random
 import secrets
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from gpu_fault.app.admission_runtime import max_compressed_request_bytes
+from gpu_fault.app.admission_runtime import (
+    NulInRequestBody,
+    declared_body_oversize,
+)
 from gpu_fault.app.runtime import ProcessorDispatchState
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
@@ -25,12 +28,12 @@ from gpu_fault.processor import (
     ProcessorRequest,
     ProcessorRequestStatus,
 )
+from gpu_fault.processor.models import is_reserved_tier
 from gpu_fault.processor_diagnostics import (
     bind_processor_replay,
     report_processor_replay_phase,
     reset_processor_replay,
 )
-from gpu_fault.processor.models import is_reserved_tier
 
 # A synchronous caller waits for the processor to complete its request by
 # polling the store. A fixed 100ms interval cost every waiter ~1150 store reads
@@ -118,6 +121,9 @@ class ProcessorDispatchDependencies:
     telemetry_spool_rejections: dict[str, int]
     telemetry_spool_admitted_by_path: dict[str, int]
     telemetry_request_budget_seconds: float
+    # Optional so an assembly that predates it keeps working; the factory
+    # passes the runtime's dict so /metrics sees the count (E-3).
+    decode_rejections: dict[str, int] = field(default_factory=lambda: {"nul": 0})
 
 
 @dataclass(frozen=True)
@@ -233,15 +239,13 @@ async def _prepare_request(
                     else request.headers.get("Content-Encoding", "")
                 ),
             )
-        except StoreIoCapacityExceeded:
-            return JSONResponse(
-                status_code=503,
-                headers={"Retry-After": "2"},
-                content={"detail": "request decode capacity exceeded"},
-            )
+        except StoreIoCapacityExceeded as exc:
+            return _decode_capacity_response(exc, dependencies)
         except OverflowError:
             dependencies.state.oversize_rejections += 1
             return _oversize_response(dependencies)
+        except NulInRequestBody as exc:
+            return _nul_response(exc, dependencies.decode_rejections)
         except (
             OSError,
             EOFError,
@@ -278,12 +282,8 @@ async def _prepare_request(
             ),
             parsed_payload=payload,
         )
-    except StoreIoCapacityExceeded:
-        return JSONResponse(
-            status_code=503,
-            headers={"Retry-After": "2"},
-            content={"detail": "request decode capacity exceeded"},
-        )
+    except StoreIoCapacityExceeded as exc:
+        return _decode_capacity_response(exc, dependencies)
     idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "").strip()
     if idempotency_key:
         item = item.model_copy(
@@ -305,6 +305,34 @@ async def _prepare_request(
     )
 
 
+def _nul_response(exc: NulInRequestBody, rejections: dict[str, int]) -> JSONResponse:
+    """A 422: the sink treats it as terminal and dead-letters the sample."""
+
+    rejections["nul"] = rejections.get("nul", 0) + 1
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+def _retry_after_headers(dependencies: ProcessorDispatchDependencies) -> dict[str, str]:
+    return {"Retry-After": str(dependencies.processor_retry_after_seconds)}
+
+
+def _decode_capacity_response(
+    exc: StoreIoCapacityExceeded,
+    dependencies: ProcessorDispatchDependencies,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        headers=_retry_after_headers(dependencies),
+        content={
+            "detail": (
+                "request deadline exceeded"
+                if isinstance(exc, RequestDeadlineExceeded)
+                else "request decode capacity exceeded"
+            )
+        },
+    )
+
+
 def _declared_oversize(
     request: Request,
     dependencies: ProcessorDispatchDependencies,
@@ -322,20 +350,16 @@ def _declared_oversize(
     length that could still decode within budget
     (:func:`max_compressed_request_bytes`), and the decoder remains authoritative
     for the decompressed size.
+
+    In regional mode the cluster authentication middleware reads the body
+    first, so it runs the same check (:func:`declared_body_oversize`) before
+    its own ``await request.body()`` (A-3); this one then covers the
+    single-cluster assembly, where dispatch is the first reader.
     """
 
-    try:
-        length = int(request.headers.get("Content-Length", ""))
-    except ValueError:
-        # No usable declaration: the HTTP parser rejects a malformed one, and a
-        # chunked body has none, so the post-decode check stays authoritative.
-        return None
-    limit = (
-        max_compressed_request_bytes(dependencies.processor_max_request_bytes)
-        if request.headers.get("Content-Encoding", "").strip()
-        else dependencies.processor_max_request_bytes
-    )
-    if length <= limit:
+    if not declared_body_oversize(
+        request.headers, dependencies.processor_max_request_bytes
+    ):
         return None
     return _oversize_response(dependencies)
 
@@ -446,12 +470,22 @@ async def _enqueue(
                 global_admission_guard=(dependencies.processor_global_admission_guard),
             )
         prepared.server_timing["admission"] = (time.monotonic() - started) * 1000
-    except StoreIoCapacityExceeded:
+    except StoreIoCapacityExceeded as exc:
         prepared.server_timing["admission"] = (time.monotonic() - started) * 1000
+        # Same answer shape as ``_poll_for_response`` and ``_try_spool``: a
+        # budget the request spent waiting is a deadline, not store capacity,
+        # and the receipt id lets a caller without one find its row (A-1).
         return JSONResponse(
             status_code=503,
-            headers={"Retry-After": "2"},
-            content={"detail": "store I/O capacity exceeded"},
+            headers=_retry_after_headers(dependencies),
+            content={
+                "detail": (
+                    "request deadline exceeded"
+                    if isinstance(exc, RequestDeadlineExceeded)
+                    else "store I/O capacity exceeded"
+                ),
+                "processor_request_id": item.request_id,
+            },
         )
     if result in {
         "global",

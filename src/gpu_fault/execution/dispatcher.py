@@ -3,22 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    Future,
-    ThreadPoolExecutor,
-    wait,
-)
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from threading import Event
-from typing import Callable, Literal
+from typing import Callable, Literal, TypeVar
 
 from pydantic import ValidationError
 
-from gpu_fault.execution import restart_budget_preflight
-from gpu_fault.execution.config import (
-    WorkflowDispatcherConfig,
-)
+from gpu_fault.compile_blocked import close_compile_blocked_workflows
+from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
+from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
     DISPATCHER_INTERNAL_ERROR_ACTOR,
@@ -30,6 +24,8 @@ from gpu_fault.execution.executor import (
 )
 from gpu_fault.execution.models import (
     WorkflowExecutionError,
+    WorkflowRecordInvalidError,
+    WorkflowStructureError,
 )
 from gpu_fault.execution.transient_errors import (
     transient_store_error,
@@ -57,12 +53,14 @@ from gpu_fault.models import (
     workflow_is_open,
 )
 from gpu_fault.orchestration import WorkflowFencingError
+from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
+from gpu_fault.orphaned_commands import cancel_orphaned_commands
 from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,
 )
-from gpu_fault.store.contracts import ControlPlaneStore
-from gpu_fault.store.shared.errors import StaleWriteError
+from gpu_fault.store.contracts import ControlPlaneStore, WakeupChannel
+from gpu_fault.store.shared.errors import StaleWriteError, WorkflowMergedError
 from gpu_fault.store.shared.workflow_scan import dispatch_eligible_at
 from gpu_fault.workflow_resolution import (
     RETIRED_GENERATION_STATUSES,
@@ -73,8 +71,15 @@ from gpu_fault.workflow_resolution import (
 )
 
 LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 DISPATCHER_PLACEMENT_HOLD_ACTOR = "dispatcher-placement-hold"
+
+# D-7: the lease a WAITING row keeps between two dispatches. Three polls so
+# one missed tick does not lose it, floored because the remediation budget
+# counts only RUNNING rows with a live lease -- a lease that lapsed before the
+# next dispatch would let another workflow take the same scope.
+WAITING_LEASE_FLOOR_SECONDS = 30.0
 HOLD_REASON_PLACEMENT_HOLD_DISSOLVED_TEXT = "placement hold dissolved: nodes freed"
 
 
@@ -87,8 +92,16 @@ class WorkflowDispatcher:
 
     EXECUTABLE_STATUSES = set(EXECUTABLE_WORKFLOW_STATUSES)
     # Only an error that proves the record itself cannot be executed may
-    # write it BLOCKED; everything else stays executable and is counted.
-    BLOCKING_INTERNAL_ERRORS: tuple[type[BaseException], ...] = (ValidationError,)
+    # write it BLOCKED; everything else stays executable and is counted. A bare
+    # ``ValidationError`` is not proof: under ``execute()`` it is raised for a
+    # plan row, a remote command's embedded snapshot or an adapter's own model
+    # as readily as for the workflow row -- a rolling release makes exactly
+    # that happen -- so the executor wraps the one decode that is about this
+    # record (D-5), and a deterministic DAG shape error joins it (D-6).
+    BLOCKING_INTERNAL_ERRORS: tuple[type[BaseException], ...] = (
+        WorkflowRecordInvalidError,
+        WorkflowStructureError,
+    )
 
     def __init__(
         self,
@@ -111,6 +124,12 @@ class WorkflowDispatcher:
         self.executor = executor
         self.config = config
         self.failure_handler = failure_handler
+        # D-7: a WAITING row used to keep the executor's full lease (180 s), so
+        # after a dispatch-lease handover every in-flight row was pinned to
+        # the old holder until it lapsed. The executor stamps this instead.
+        executor.waiting_lease_duration = timedelta(
+            seconds=max(3 * config.poll_interval_seconds, WAITING_LEASE_FLOOR_SECONDS)
+        )
         self.failure_handling_abandoned_total = 0
         self.plan_sync_misses_total = 0
         self.node_busy_timeouts_total = 0
@@ -118,6 +137,11 @@ class WorkflowDispatcher:
         # inside the window (rule A, case 2); nothing reached the data plane.
         self.placement_holds_dissolved_total = 0
         self.internal_errors_total = 0
+        # D-4: a write path of one row that failed without aborting the tick,
+        # by path (``abandoned_generation``, ``placement_hold``,
+        # ``node_busy_hold``, ``node_busy_timeout``, ``internal_error_block``,
+        # ``internal_error_release``). Counted here, logged with the traceback.
+        self.sweep_errors_total: dict[str, int] = {}
         self.deferred_total = 0
         self.preemption_pending_seen_total = 0
         # F-L1: rows every cycle scanned and set aside, by reason, summed over
@@ -142,21 +166,21 @@ class WorkflowDispatcher:
         # the newest event whichever process reported it (ARCH-E E4).
         self.internal_error_last_seen_timestamp_seconds = 0.0
         self.failure_handling_abandoned_last_seen_timestamp_seconds = 0.0
+        # Store-wakeup counters and listener state (``dispatcher_wakeups``).
+        self.wakeups_total = dispatcher_wakeups.per_channel(0)
+        self.wakeups_ignored_total = 0
+        self.wakeup_last_seen_timestamp_seconds = 0.0
+        self.wakeup_listener_connected = dispatcher_wakeups.per_channel(False)
         self._stop = Event()
         self._wake = Event()
         self._worker_pool = ThreadPoolExecutor(
-            max_workers=config.max_workers,
-            thread_name_prefix="workflow-dispatch",
+            max_workers=config.max_workers, thread_name_prefix="workflow-dispatch"
         )
 
     def wake(self) -> None:
-        """Request an early durable workflow scan.
-
-        Process-local: in the split deployment the ingress process that calls
-        this is not the worker process that scans, so the call only shortens
-        the poll interval when both roles share a process. The scan cadence
-        itself is ``poll_interval_seconds`` (F-A8).
-        """
+        """Request an early durable workflow scan. Process-local: the listener
+        threads in ``dispatcher_wakeups`` carry store wakeups into the worker
+        process and coalesce bursts into one extra scan (F-A8)."""
         if self.config.enabled:
             self._wake.set()
 
@@ -165,6 +189,13 @@ class WorkflowDispatcher:
         if requested:
             self._wake.clear()
         return requested
+
+    def run_wakeups(self, channel: WakeupChannel, stop: Event | None = None) -> None:
+        """Listener thread body for ``channel``; see ``dispatcher_wakeups``."""
+        dispatcher_wakeups.run_wakeups(self, channel, stop)
+
+    def _set_wakeup_listener_state(self, channel: WakeupChannel, state: bool) -> None:
+        dispatcher_wakeups.set_listener_state(self, channel, state)
 
     DISPATCH_LEASE_KEY = "workflow-dispatch"
     MAX_SCAN_ROWS = 20_000
@@ -184,8 +215,7 @@ class WorkflowDispatcher:
             )
         self._reconcile_failed_workflows()
         now = datetime.now(timezone.utc)
-        self._supersede_abandoned_generations(now)
-        retired = self._revoke_retired_generations(now)
+        retired = self.sweep_stuck_records(now)
         timed_out = self._expire_stuck_workflows(now)
         workflows, filtered, horizon_exhausted = self._scan_dispatchable(now, retired)
         executed = 0
@@ -266,9 +296,12 @@ class WorkflowDispatcher:
                     )
                 )
                 if isinstance(exc, self.BLOCKING_INTERNAL_ERRORS):
-                    blocked = self._block_after_internal_error(workflow, exc)
-                    self._sync_plan(blocked, blocked.status)
                     failed += 1
+                    try:
+                        blocked = self._block_after_internal_error(workflow, exc)
+                        self._sync_plan(blocked, blocked.status)
+                    except Exception:  # noqa: BLE001 - one row, not the tick (D-4)
+                        self._count_sweep_error("internal_error_block", workflow)
                     continue
                 # Anything else says nothing about the record: an adapter
                 # wiring bug on this replica, a missing capability, a
@@ -280,7 +313,10 @@ class WorkflowDispatcher:
                 internal_errors += 1
                 self.internal_errors_total += 1
                 self.internal_error_last_seen_timestamp_seconds = time.time()
-                self._release_after_internal_error(workflow)
+                try:
+                    self._release_after_internal_error(workflow)
+                except Exception:  # noqa: BLE001 - one row, not the tick (D-4)
+                    self._count_sweep_error("internal_error_release", workflow)
                 LOGGER.exception(
                     "workflow dispatch hit an internal error; workflow %s "
                     "stays %s: %s: %s",
@@ -302,6 +338,17 @@ class WorkflowDispatcher:
             horizon_exhausted=horizon_exhausted,
             deferred=deferred,
             internal_errors=internal_errors,
+        )
+
+    def _count_sweep_error(self, path: str, workflow: WorkflowRequest) -> None:
+        """Log and count one row's failed write path; the tick goes on (D-4)."""
+
+        self.sweep_errors_total[path] = self.sweep_errors_total.get(path, 0) + 1
+        LOGGER.exception(
+            "dispatcher %s write failed for workflow %s; the row is left for a "
+            "later tick and the cycle continues",
+            path,
+            workflow.request_id,
         )
 
     def _holds_dispatch_lease(self) -> bool:
@@ -491,23 +538,88 @@ class WorkflowDispatcher:
             if not busy and self._is_unstarted_placement_hold(workflow):
                 # The repair the hold waited on ended inside the window: the
                 # job keeps running and the hold has nothing left to do.
-                if self._dissolve_placement_hold(workflow):
+                if self._guarded_write(
+                    "placement_hold",
+                    workflow,
+                    lambda: self._dissolve_placement_hold(workflow),
+                    default=False,
+                ):
                     held("placement_hold_dissolved")
                     continue
             if busy:
                 wait = timedelta(seconds=self.config.node_busy_wait_seconds)
-                if now < workflow.created_at + wait:
-                    self._record_node_busy_hold(workflow, busy)
+                if now < self._node_busy_wait_start(workflow, now) + wait:
+                    self._guarded_write(
+                        "node_busy_hold",
+                        workflow,
+                        lambda: self._record_node_busy_hold(workflow, busy, now=now),
+                        default=None,
+                    )
                     held("node_busy")
                     continue
                 # F-N1 §8: waited long enough. The job workflow gives up by
                 # stopping the job -- the signal its owner can see -- and
                 # ends FAILED; the node remediation keeps its budget.
-                self._fail_node_busy(workflow, busy)
+                self._guarded_write(
+                    "node_busy_timeout",
+                    workflow,
+                    lambda: self._fail_node_busy(workflow, busy),
+                    default=None,
+                )
                 held("node_busy_timeout")
                 continue
             candidates.append(workflow)
         return candidates, filtered
+
+    def _guarded_write(
+        self,
+        path: str,
+        workflow: WorkflowRequest,
+        write: Callable[[], _T],
+        *,
+        default: _T,
+    ) -> _T:
+        """Run one row's write inside the scan; a failure is this row's alone.
+
+        A transient store error still propagates: the whole tick is what
+        retries it, and swallowing it would hide an outage behind per-row
+        counters (D-4).
+        """
+
+        try:
+            return write()
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            if transient_store_error(exc):
+                raise
+            self._count_sweep_error(path, workflow)
+            return default
+
+    @staticmethod
+    def _node_busy_wait_start(workflow: WorkflowRequest, now: datetime) -> datetime:
+        """When the rule A window opened for this row.
+
+        Not ``created_at``: a job workflow held behind ``not_before`` (the
+        aggregation window) or an open predecessor is filtered before the busy
+        check runs, so none of that time was a wait on the busy node, and a
+        row released after more than the window failed its job on the first
+        look (control-plane review 2026-09-08, D-11). Nor
+        ``dispatch_eligible_at``: a predecessor gate leaves that equal to
+        ``created_at``. The window opens at the first HOLD the dispatcher
+        recorded for the row -- the first tick that saw the busy node -- and
+        a row without one has not waited yet, so its first look always holds.
+        """
+
+        first_hold = next(
+            (
+                event.at
+                for event in workflow.events
+                if event.kind is WorkflowEventKind.HOLD
+                and event.actor == DISPATCHER_ACTOR
+                and event.details.get("reason") == HOLD_REASON_NODE_UNDER_REMEDIATION
+            ),
+            None,
+        )
+        return first_hold if first_hold is not None else now
 
     def _successor_is_open(self, request_id: str) -> bool:
         try:
@@ -545,6 +657,9 @@ class WorkflowDispatcher:
             if (
                 other.request_id == workflow.request_id
                 or other.incident_id == workflow.incident_id
+                # A NEEDS_OPERATOR row that never ran a step is not repairing
+                # anything (control-plane review 2026-09-08, C-03).
+                or never_executed_operator_block(other)
             ):
                 continue
             for node in sorted(nodes & set(other_incident.node_ids)):
@@ -645,7 +760,7 @@ class WorkflowDispatcher:
         return ids[0], ids
 
     def _record_node_busy_hold(
-        self, workflow: WorkflowRequest, busy: dict[str, str]
+        self, workflow: WorkflowRequest, busy: dict[str, str], *, now: datetime
     ) -> None:
         """Write one HOLD event for a PENDING row the dispatcher does not own.
 
@@ -666,7 +781,7 @@ class WorkflowDispatcher:
                 "remediation_workflow_ids": ids,
                 "node_ids": sorted(busy),
                 "node_busy_wait_seconds": int(self.config.node_busy_wait_seconds),
-                "held_since": workflow.created_at.isoformat(),
+                "held_since": self._node_busy_wait_start(workflow, now).isoformat(),
             },
         )
         if held is None:
@@ -751,10 +866,7 @@ class WorkflowDispatcher:
 
     def _dispatch_workflow(
         self, workflow: WorkflowRequest
-    ) -> tuple[
-        tuple[int, int, int, int],
-        WorkflowDispatchFailure | None,
-    ]:
+    ) -> tuple[tuple[int, int, int, int], WorkflowDispatchFailure | None]:
         result = self.executor.execute(
             workflow.request_id,
             WorkflowExecutionRequest(
@@ -762,14 +874,18 @@ class WorkflowDispatcher:
                 confirm_cluster_name=self.config.confirm_cluster_name,
             ),
         )
-        self._sync_plan(workflow, result.status)
+        # The plan mirror runs after the outcome is judged, never before: it
+        # reads another row, and a decode failure there used to be taken as
+        # proof that *this* record cannot execute (D-5).
         if result.status in {
             WorkflowStatus.SUCCEEDED,
             WorkflowStatus.BLOCKED,
             WorkflowStatus.SUPERSEDED,
         }:
+            self._sync_plan(workflow, result.status)
             return (1, 0, 1, 0), None
         if result.status is WorkflowStatus.FAILED:
+            self._sync_plan(workflow, result.status)
             if self.store.get_preempting_successor(workflow.request_id) is None:
                 self._handle_failed_workflow(
                     self.store.get_workflow(workflow.request_id)
@@ -781,6 +897,7 @@ class WorkflowDispatcher:
                     error=result.error or "workflow execution failed",
                 ),
             )
+        self._sync_plan(workflow, result.status)
         return (1, 1, 0, 0), None
 
     @property
@@ -1147,6 +1264,20 @@ class WorkflowDispatcher:
             incident.cluster_id, scope_keys
         )
 
+    def sweep_stuck_records(self, now: datetime) -> set[str]:
+        """Close the records nothing else will -- by Store predicate, never age.
+
+        Abandoned and retired generations, compile-time BLOCKED no-ops and remote
+        commands a terminal workflow left open; not counted into the dispatch
+        report. Returns the still-settling retired generations the scan withholds.
+        """
+
+        self._supersede_abandoned_generations(now)
+        retired = self._revoke_retired_generations(now)
+        close_compile_blocked_workflows(self.store, now=now)
+        cancel_orphaned_commands(self.store, now=now)
+        return retired
+
     def _supersede_abandoned_generations(self, now: datetime) -> list[WorkflowRequest]:
         """Terminalize workflows their incident re-planned away from.
 
@@ -1186,61 +1317,23 @@ class WorkflowDispatcher:
                 f"{workflow.fencing_token} ran"
             )
             try:
-                claimed = self.store.claim_workflow(
-                    workflow.request_id,
-                    self.executor.config.executor_id,
-                    workflow.fencing_token,
-                    lease_duration=timedelta(seconds=30),
-                    now=now,
+                replacement = self._supersede_abandoned_generation(
+                    workflow, successor, reason, now
                 )
-            except WorkflowLeaseError:
+            except WorkflowMergedError:
+                # A merge bumped the row between the claim and the save: it is
+                # looked at again next tick, counted so a row that does this
+                # every tick is visible, and the tick goes on (D-4).
+                self._count_sweep_error("abandoned_generation", workflow)
                 continue
-            replacement = claimed.model_copy(
-                update={
-                    "status": WorkflowStatus.SUPERSEDED,
-                    "preempted_by_workflow_id": successor.request_id,
-                    "preemption_reason": reason,
-                    "superseded_at": now,
-                    "execution_owner_id": None,
-                    "execution_lease_expires_at": None,
-                    "updated_at": now,
-                }
-            )
-            # Planning may already hold a restart reservation for a
-            # RESTART_WORKLOAD step no adapter ever attempted. Terminalizing
-            # without releasing it would spend that job's restart budget on a
-            # workflow that never restarted anything.
-            restart_budget_preflight.release_unattempted_restart_reservations(
-                self.store,
-                replacement,
-                waiting_ttl=self._restart_waiting_ttl,
-            )
-            # The incident is what an operator reads first; without a line on
-            # it the record closed under it is invisible there. Loaded only for
-            # a workflow actually superseded, so the sweep costs the rest
-            # nothing more. Bounded and deduplicated, so a rerun writes it once.
-            audit = (
-                f"abandoned generation {workflow.fencing_token} workflow "
-                f"{workflow.request_id} superseded by {successor.request_id} "
-                f"at generation {successor.fencing_token}"
-            )
-            incident = self.store.get_incident(workflow.incident_id)
-            self.store.save_workflow_and_incident_if_leased(
-                replacement,
-                incident.model_copy(
-                    update={
-                        "reasons": bounded_reasons([*incident.reasons, audit]),
-                        "updated_at": now,
-                    }
-                ),
-                # The id the claim above succeeded with. Reading it back off the
-                # record would be ``str | None``, and a claim that returns
-                # without raising is a claim this executor holds.
-                self.executor.config.executor_id,
-                claimed.execution_epoch,
-                now=now,
-            )
-            self._sync_plan(replacement, WorkflowStatus.SUPERSEDED)
+            except WorkflowLeaseError:
+                # Another executor holds it; nothing to count.
+                continue
+            except Exception as exc:  # noqa: BLE001 - one row, not the tick
+                if transient_store_error(exc):
+                    raise
+                self._count_sweep_error("abandoned_generation", workflow)
+                continue
             superseded.append(replacement)
             LOGGER.warning(
                 "workflow superseded as an abandoned generation: "
@@ -1254,44 +1347,95 @@ class WorkflowDispatcher:
             )
         return superseded
 
+    def _supersede_abandoned_generation(
+        self,
+        workflow: WorkflowRequest,
+        successor: WorkflowRequest,
+        reason: str,
+        now: datetime,
+    ) -> WorkflowRequest:
+        """Claim, release, save and mirror one abandoned generation."""
+
+        claimed = self.store.claim_workflow(
+            workflow.request_id,
+            self.executor.config.executor_id,
+            workflow.fencing_token,
+            lease_duration=timedelta(seconds=30),
+            now=now,
+        )
+        replacement = claimed.model_copy(
+            update={
+                "status": WorkflowStatus.SUPERSEDED,
+                "preempted_by_workflow_id": successor.request_id,
+                "preemption_reason": reason,
+                "superseded_at": now,
+                "execution_owner_id": None,
+                "execution_lease_expires_at": None,
+                "updated_at": now,
+            }
+        )
+        # Planning may already hold a restart reservation for a
+        # RESTART_WORKLOAD step no adapter ever attempted. Terminalizing
+        # without releasing it would spend that job's restart budget on a
+        # workflow that never restarted anything.
+        restart_budget_preflight.release_unattempted_restart_reservations(
+            self.store,
+            replacement,
+            waiting_ttl=self._restart_waiting_ttl,
+        )
+        # The incident is what an operator reads first; without a line on
+        # it the record closed under it is invisible there. Loaded only for
+        # a workflow actually superseded, so the sweep costs the rest
+        # nothing more. Bounded and deduplicated, so a rerun writes it once.
+        audit = (
+            f"abandoned generation {workflow.fencing_token} workflow "
+            f"{workflow.request_id} superseded by {successor.request_id} "
+            f"at generation {successor.fencing_token}"
+        )
+        incident = self.store.get_incident(workflow.incident_id)
+        self.store.save_workflow_and_incident_if_leased(
+            replacement,
+            incident.model_copy(
+                update={
+                    "reasons": bounded_reasons([*incident.reasons, audit]),
+                    "updated_at": now,
+                }
+            ),
+            # The id the claim above succeeded with. Reading it back off the
+            # record would be ``str | None``, and a claim that returns
+            # without raising is a claim this executor holds.
+            self.executor.config.executor_id,
+            claimed.execution_epoch,
+            now=now,
+        )
+        self._sync_plan(replacement, WorkflowStatus.SUPERSEDED)
+        return replacement
+
     def _revoke_retired_generations(self, now: datetime) -> set[str]:
         """Revoke a retired generation that had already started.
 
         ``_supersede_abandoned_generations`` above only clears the record that
-        never ran. That is the cheap case. The one that actually cost a fleet was
-        the opposite: on 2026-09-04 the retired generation was ``RUNNING``, held
-        an execution owner, a renewing lease, six remediation budget claims and
-        an unsettled ``STOP_WORKLOADS`` remote command against three nodes, and
-        the fleet rollout fence was the only thing still standing between that
-        command and a running 24-GPU job. Its incident had recovered at a higher
-        generation four hours earlier.
+        never ran. The one that actually cost a fleet was the opposite: on
+        2026-09-04 the retired generation was ``RUNNING``, held an owner, a
+        renewing lease, six budget claims and an unsettled ``STOP_WORKLOADS``
+        remote command against three nodes of a running 24-GPU job, four hours
+        after its incident had recovered at a higher generation.
 
-        The order below is the whole point, and it is why this can take two
-        ticks. A remote command outlives the workflow row, so revoking the
-        workflow first would leave a destructive command behind whose next fence
-        evaluation releases it. So: cancel the commands first -- ``PENDING`` and
-        ``WAITING`` go terminal in the store immediately, and a ``LEASED`` one
-        gets a cancellation request that both bars it from ever being claimed
-        again and turns whatever the executor reports into a ``FAILED`` -- and
-        revoke the workflow only once the store shows every one of them settled.
+        The order below is the whole point, and why this can take two ticks. A
+        remote command outlives the workflow row, so revoking the workflow first
+        would leave a destructive command behind whose next fence evaluation
+        releases it. So: cancel the commands first -- ``PENDING`` and ``WAITING``
+        go terminal at once, a ``LEASED`` one gets a cancellation request that
+        bars it from being claimed again and turns whatever the executor reports
+        into a ``FAILED`` -- and revoke only once the store shows them settled.
 
-        No lease is taken. ``claim_workflow`` cannot help here: the lease holder
-        is this very dispatch loop, which renews on every tick, so a
-        lease-respecting revocation would wait forever on a record it is itself
-        keeping alive. Safety comes from
+        No lease is taken: the lease holder is this very dispatch loop, which
+        renews on every tick, so a lease-respecting revocation would wait
+        forever on a record it is itself keeping alive. Safety comes from
         ``retired_generation_records`` re-deriving every condition inside the
-        store transaction. In particular a record that has already *completed* a
-        destructive operation is never revoked -- there is something real to
-        compensate for, and the release gate goes on reporting it until an
-        operator resolves it.
-
-        Not counted into the dispatch report, for the same reason a supersession
-        is not: cleanup is neither an execution nor a failure.
-
-        Returns the ids of the retired generations that are still open, which
-        ``run_once`` withholds from dispatch: a record waiting for its commands
-        to settle is one ``_validate_fencing`` would reject, and blocking it on a
-        fencing error would bury the revocation under a dispatch failure.
+        store transaction; a record that has already *completed* a destructive
+        operation is never revoked -- there is something real to compensate
+        for, and the release gate goes on reporting it until an operator acts.
         """
 
         held: set[str] = set()
@@ -1464,11 +1608,7 @@ class WorkflowDispatcher:
                 expected=current,
             )
 
-    def _sync_plan(
-        self,
-        workflow: WorkflowRequest,
-        status: WorkflowStatus,
-    ) -> None:
+    def _sync_plan(self, workflow: WorkflowRequest, status: WorkflowStatus) -> None:
         if not workflow.source_plan_id:
             return
         try:
@@ -1484,6 +1624,20 @@ class WorkflowDispatcher:
                 workflow.request_id,
                 workflow.source_plan_id,
                 status.value,
+            )
+            return
+        except ValidationError as exc:
+            # A plan row this release cannot decode (written by a newer one,
+            # or by an older one after a rollback) says nothing about the
+            # workflow, whose outcome is already saved (D-5).
+            self.plan_sync_misses_total += 1
+            LOGGER.warning(
+                "workflow %s names plan %s which cannot be decoded; status %s "
+                "not mirrored: %s",
+                workflow.request_id,
+                workflow.source_plan_id,
+                status.value,
+                exc,
             )
             return
         plan_status = {

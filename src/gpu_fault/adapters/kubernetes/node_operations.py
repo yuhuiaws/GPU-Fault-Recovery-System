@@ -5,6 +5,26 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from gpu_fault.adapters.common import (
+    ANNOTATION_EFA_PLUGIN_RESTART_OPERATION,
+    ANNOTATION_EFA_PLUGIN_RESTART_POD_UID,
+    ANNOTATION_EFA_PLUGIN_RESTART_STARTED_AT,
+    ANNOTATION_FENCING,
+    ANNOTATION_GPU_PLUGIN_RESTART_OPERATION,
+    ANNOTATION_GPU_PLUGIN_RESTART_POD_UID,
+    ANNOTATION_GPU_PLUGIN_RESTART_STARTED_AT,
+    ANNOTATION_INCIDENT,
+    ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
+    ANNOTATION_PREVIOUS_UNSCHEDULABLE,
+    QUARANTINE_TAINT,
+    NodeIsolationRejected,
+    quarantine_taint_value,
+)
+from gpu_fault.adapters.kubernetes.primitives import (
+    NodePatchConflict,
+    node_scheduling_snapshot,
+    patch_node_with_retry,
+)
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -17,27 +37,12 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import NotFoundError
 
-
-from gpu_fault.adapters.common import (
-    ANNOTATION_EFA_PLUGIN_RESTART_OPERATION,
-    ANNOTATION_EFA_PLUGIN_RESTART_POD_UID,
-    ANNOTATION_EFA_PLUGIN_RESTART_STARTED_AT,
-    ANNOTATION_FENCING,
-    ANNOTATION_GPU_PLUGIN_RESTART_OPERATION,
-    ANNOTATION_GPU_PLUGIN_RESTART_POD_UID,
-    ANNOTATION_GPU_PLUGIN_RESTART_STARTED_AT,
-    ANNOTATION_INCIDENT,
-    ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
-    ANNOTATION_PREVIOUS_UNSCHEDULABLE,
-    NodeIsolationRejected,
-    QUARANTINE_TAINT,
-    quarantine_taint_value,
-)
-from gpu_fault.adapters.kubernetes.primitives import (
-    NodePatchConflict,
-    node_scheduling_snapshot,
-    patch_node_with_retry,
-)
+# The warm-spare pool's declaration (``hyperpod_spares``): a labeled node whose
+# pool state is not ALLOCATED is an unreserved spare and must stay cordoned.
+SPARE_LABEL = "gpu-fault.io/spare"
+SPARE_LABEL_VALUE = "true"
+SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
+SPARE_POOL_STATE_ALLOCATED = "ALLOCATED"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +79,7 @@ class KubernetesNodeOperationsMixin:
     store: Any
 
     _annotations: Callable[..., Any]
+    _labels: Callable[..., dict[str, str]]
     _efa_plugin_pods: Callable[..., Any]
     _node_allocatable: Callable[..., Any]
     _pod_name: Callable[..., Any]
@@ -496,6 +502,17 @@ class KubernetesNodeOperationsMixin:
             },
         )
 
+    def _unreserved_spare(self, node: Any) -> bool:
+        """A node declared as a warm spare that no incident currently holds
+        (pool state anything but ALLOCATED)."""
+
+        labels: dict[str, str] = self._labels(node)
+        if labels.get(SPARE_LABEL) != SPARE_LABEL_VALUE:
+            return False
+        annotations: dict[str, Any] = dict(self._annotations(node))
+        pool_state = annotations.get(SPARE_POOL_STATE_ANNOTATION)
+        return bool(pool_state != SPARE_POOL_STATE_ALLOCATED)
+
     def _gpu_fault_isolated(self, node: Any) -> bool:
         annotations = self._annotations(node)
         return (
@@ -536,6 +553,16 @@ class KubernetesNodeOperationsMixin:
             ).lower()
             == "true"
         )
+        if self._unreserved_spare(node):
+            # A declared warm spare that no incident holds must stay cordoned:
+            # "unreserved spare is schedulable" fails the pool's health check
+            # and nothing else re-cordons it. Live 2026-09-08 (DESTR-003): the
+            # spare was uncordoned by its failover, then quarantined by the
+            # escalation, then released to the pool while still quarantined;
+            # the validated restore that cleared the quarantine read
+            # previous-unschedulable=false and uncordoned it, leaving a
+            # labeled, schedulable spare no supported path would cordon again.
+            was_unschedulable = True
         return {
             "metadata": {
                 "resourceVersion": self._resource_version(node),

@@ -7,7 +7,6 @@ from typing import Any, Callable, cast
 
 from gpu_fault.installation_resources import InstallationResource
 from gpu_fault.models import (
-    CompletionDecision,
     DecisionStatus,
     NodeMarker,
     RecoveryAction,
@@ -224,6 +223,18 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         source_boot_id: str | None = None,
         limit: int = 1000,
     ) -> list[NodeMarker]:
+        """Trusted, active markers on ``node_ids`` since ``observed_after`` (or
+        from the same boot), newest first.
+
+        The correlator behind every provider event never acts on an
+        untrusted marker, so ``trusted='true'`` is a no-op for its result and
+        what lets the partial GIN ``gpu_fault_active_marker_nodes`` (WHERE
+        active AND trusted) serve the read instead of a whole-kind scan;
+        the time comparison and ordering are on the stored text, the form
+        the models serialise, because a ``::timestamptz`` cast can match no
+        index (control-plane review 2026-09-08, G-9 (1)).
+        """
+
         if not node_ids or limit < 1:
             return []
         with self._db.cursor() as cursor:
@@ -233,18 +244,19 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 FROM gpu_fault_objects
                 WHERE kind='marker'
                   AND payload->>'active'='true'
+                  AND payload->>'trusted'='true'
                   AND payload->'scope'->'node_ids' ?| %s
                   AND (
-                      (payload->>'observed_at')::timestamptz >= %s
+                      payload->>'observed_at' >= %s
                       OR payload->>'source_boot_id'=%s
                   )
-                ORDER BY (payload->>'observed_at')::timestamptz DESC,
+                ORDER BY payload->>'observed_at' DESC,
                          key DESC
                 LIMIT %s
                 """,
                 (
                     sorted(node_ids),
-                    observed_after,
+                    _utc_text(observed_after),
                     source_boot_id,
                     limit,
                 ),
@@ -896,6 +908,132 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                     "attempt_observation_legacy", [row[0] for row in cursor.fetchall()]
                 )
 
+    def cleanup_inactive_markers(self, *, older_than: datetime, limit: int) -> int:
+        """Drop retired markers past retention that no live incident owns.
+
+        Markers had no retention at all and every provider event scanned the
+        whole kind (G-9). An incident that still exists keeps its markers --
+        the archiver bundles them with it (F-I1) -- so only orphans go.
+        Predicate shape for the index Agent 5 declares:
+        ``((payload->>'observed_at')) WHERE kind='marker' AND
+        payload->>'active'='false'``.
+        """
+
+        with self._state_transaction("marker/cleanup"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH victims AS (
+                        SELECT marker.key
+                        FROM gpu_fault_objects AS marker
+                        WHERE marker.kind='marker'
+                          AND marker.payload->>'active'='false'
+                          AND marker.payload->>'observed_at' <= %s
+                          AND NOT EXISTS (
+                              SELECT 1 FROM gpu_fault_objects AS incident
+                              WHERE incident.kind='incident'
+                                AND incident.key=marker.payload->>'incident_id'
+                          )
+                        ORDER BY marker.payload->>'observed_at', marker.key
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    ),
+                    deleted AS (
+                        DELETE FROM gpu_fault_objects AS target
+                        USING victims
+                        WHERE target.kind='marker'
+                          AND target.key=victims.key
+                        RETURNING target.key
+                    )
+                    SELECT key FROM deleted ORDER BY key
+                    """,
+                    (_utc_text(older_than), limit),
+                )
+                keys = [row[0] for row in cursor.fetchall()]
+            return log_cleanup("marker", keys)
+
+    def cleanup_completion_records(self, *, older_than: datetime, limit: int) -> int:
+        """Drop settled completion decisions with their event row once the
+        terminal event is past retention (F-8).
+
+        Kept: any decision whose event or plan is referenced by an incident
+        that still exists -- the archiver takes those with the incident. The
+        plan goes with the decision only when no incident references it.
+        """
+
+        with self._state_transaction("completion/cleanup"):
+            with self._db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT decision.key,
+                           decision.payload->>'recovery_plan_id',
+                           event.payload->>'cluster_id',
+                           event.payload->>'attempt_id'
+                    FROM gpu_fault_objects AS decision
+                    JOIN gpu_fault_objects AS event
+                      ON event.kind='event'
+                     AND event.key=decision.key
+                    WHERE decision.kind='decision'
+                      AND event.payload->>'ended_at' <= %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_links AS link
+                          JOIN gpu_fault_objects AS incident
+                            ON incident.kind='incident'
+                           AND incident.key=link.value
+                          WHERE link.kind='incident_by_event'
+                            AND link.key=decision.key
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_objects AS incident
+                          WHERE incident.kind='incident'
+                            AND incident.payload->>'event_id'=decision.key
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_objects AS plan
+                          JOIN gpu_fault_objects AS incident
+                            ON incident.kind='incident'
+                           AND incident.key=plan.payload->>'incident_id'
+                          WHERE plan.kind='plan'
+                            AND plan.key=decision.payload->>'recovery_plan_id'
+                      )
+                    ORDER BY event.payload->>'ended_at', decision.key
+                    LIMIT %s
+                    FOR UPDATE OF decision SKIP LOCKED
+                    """,
+                    (_utc_text(older_than), limit),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    return 0
+                pairs: list[tuple[str, str]] = []
+                link_keys: list[str] = []
+                for key, plan_id, cluster_id, attempt_id in rows:
+                    pairs.append(("decision", key))
+                    pairs.append(("event", key))
+                    if plan_id:
+                        pairs.append(("plan", plan_id))
+                    link_keys.append(self._state_key((cluster_id, attempt_id)))
+                cursor.execute(
+                    """
+                    DELETE FROM gpu_fault_links
+                    WHERE kind='attempt_event' AND key=ANY(%s)
+                    """,
+                    (link_keys,),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM gpu_fault_objects
+                    WHERE (kind,key) IN (
+                      SELECT * FROM unnest(%s::text[],%s::text[])
+                    )
+                    """,
+                    ([item[0] for item in pairs], [item[1] for item in pairs]),
+                )
+            return log_cleanup("completion_decision", [row[0] for row in rows])
+
     def completion_transaction(self, event_key: str) -> AbstractContextManager[None]:
         # One transaction, one advisory lock per event: the writes the
         # completion service nests inside (event row, incident + workflow,
@@ -905,45 +1043,6 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
             AbstractContextManager[None],
             self._state_transaction(f"completion/{event_key}"),
         )
-
-    def list_decisions_by_status(
-        self,
-        status: DecisionStatus,
-        *,
-        older_than: datetime | None = None,
-        limit: int = 100,
-    ) -> list[CompletionDecision]:
-        if limit < 1:
-            return []
-        clauses = ["decision.kind='decision'", "decision.payload->>'status'=%s"]
-        parameters: list[object] = [status.value]
-        if older_than is not None:
-            clauses.append(
-                "(diagnostic.key IS NULL OR diagnostic.payload->>'created_at' <= %s)"
-            )
-            parameters.append(_utc_text(older_than))
-        parameters.append(limit)
-        with self._db.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT decision.payload
-                FROM gpu_fault_objects AS decision
-                LEFT JOIN gpu_fault_objects AS diagnostic
-                  ON diagnostic.kind='diagnostic'
-                 AND diagnostic.key=decision.payload->>'diagnostic_request_id'
-                WHERE """
-                + " AND ".join(clauses)
-                + """
-                ORDER BY diagnostic.payload->>'created_at' NULLS FIRST,
-                         decision.key
-                LIMIT %s
-                """,
-                parameters,
-            )
-            rows = cursor.fetchall()
-        return [
-            cast(CompletionDecision, self._decode("decision", row[0])) for row in rows
-        ]
 
     def decision_status_counts(self) -> dict[DecisionStatus, int]:
         # Per-value counts on ``gpu_fault_decision_status_count`` rather than a
