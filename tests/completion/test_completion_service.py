@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
@@ -18,7 +17,7 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.passive import PassiveWorkflowCompiler
-from gpu_fault.service import CompletionPendingError, CompletionService
+from gpu_fault.service import CompletionService
 from gpu_fault.telemetry import EvidenceKind
 from gpu_fault.watcher import (
     AllocationCompleteness,
@@ -47,6 +46,15 @@ def marker(
         recommended_action=action,
         action_owner="simulated-runtime",
         mapping_version="test-v1",
+    )
+
+
+def compiled_completion(context: ApplicationContext) -> CompletionService:
+    """The production wiring: plans are compiled into workflows (see
+    ``ApplicationContext.from_settings``); the bare fixture has no compiler."""
+
+    return CompletionService(
+        context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
     )
 
 
@@ -209,36 +217,16 @@ def test_emergency_stopped_terminal_continues_to_recovery(
     assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
-def test_passive_terminal_waits_for_incident_creation(
-    context: ApplicationContext, failed_event: TerminalEvent
-) -> None:
-    attempt_id = "train-123-passive-race"
-    incident_id, _ = failure_containment_ids(
-        (f"{failed_event.cluster_id}/{attempt_id}/TrainingAttemptFailureDetected")
-    )
-    terminal = copy_model(
-        failed_event,
-        attempt_id=attempt_id,
-        terminal_status=TerminalStatus.STOPPED,
-        termination_initiator_incident_id=incident_id,
-    )
-
-    with pytest.raises(CompletionPendingError, match="incident is not persisted yet"):
-        context.completion.handle_terminal(terminal)
-
-    assert context.store.get_decision_by_event(terminal.event_key) is None
-
-
-def test_terminal_waits_for_passive_containment(
+def test_terminal_during_open_containment_chains_recovery_behind_it(
     context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
 ) -> None:
-    context.completion.handle_failure_detected(
+    containment = context.completion.handle_failure_detected(
         FailureDetectedEvent(
             cluster_id=failed_event.cluster_id,
             job_id=failed_event.job_id,
             attempt_id=failed_event.attempt_id,
             detected_at=ended_at,
-            runtime_profile_version=(failed_event.runtime_profile_version),
+            runtime_profile_version=failed_event.runtime_profile_version,
             workload_ids=["training/pytorchjob/distributed-training"],
             node_ids=["node-a", "node-b"],
             gpu_uuids=["GPU-a", "GPU-b"],
@@ -246,16 +234,100 @@ def test_terminal_waits_for_passive_containment(
             node_id="node-a",
             exit_code=1,
             reason="critical container exited non-zero",
-            allocation_completeness=(AllocationCompleteness.COMPLETE),
+            allocation_completeness=AllocationCompleteness.COMPLETE,
         )
     )
+    assert (
+        context.store.get_workflow(containment.workflow_request_id).status
+        is WorkflowStatus.PENDING
+    )
 
-    with pytest.raises(
-        CompletionPendingError, match="containment workflow is not complete"
-    ):
-        context.completion.handle_terminal(failed_event)
+    decision = compiled_completion(context).handle_terminal(failed_event)
 
-    assert context.store.get_decision_by_event(failed_event.event_key) is None
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    recovery = context.store.get_workflow(plan.workflow_request_id)
+    assert recovery.predecessor_workflow_id == containment.workflow_request_id
+
+
+def test_failed_terminal_before_failure_detection_creates_the_containment(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    incident_id, workflow_id = failure_containment_ids(
+        f"{failed_event.cluster_id}/{failed_event.attempt_id}/TrainingAttemptFailureDetected"
+    )
+    event = copy_model(
+        failed_event, workload_ids=["training/pytorchjob/distributed-training"]
+    )
+
+    decision = compiled_completion(context).handle_terminal(event)
+
+    containment = context.store.get_workflow(workflow_id)
+    assert [step.operation for step in containment.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.STOP_WORKLOADS,
+    ]
+    assert context.store.get_incident(incident_id).event_type == (
+        "TRAINING_ATTEMPT_FAILURE_DETECTED"
+    )
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert (
+        context.store.get_workflow(plan.workflow_request_id).predecessor_workflow_id
+        == workflow_id
+    )
+    late = context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            detected_at=event.ended_at,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=event.workload_ids,
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    assert late.duplicate is True
+
+
+def test_untagged_stop_after_passive_containment_is_our_own_stop(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """DESTR-015: the tombstone can lose the initiator annotation; the store knows."""
+    context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=failed_event.cluster_id,
+            job_id=failed_event.job_id,
+            attempt_id=failed_event.attempt_id,
+            detected_at=ended_at,
+            runtime_profile_version=failed_event.runtime_profile_version,
+            workload_ids=["training/pytorchjob/distributed-training"],
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    stopped = copy_model(
+        failed_event,
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = compiled_completion(context).handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
 
 
 def test_matching_marker_reuses_incident_and_is_idempotent(

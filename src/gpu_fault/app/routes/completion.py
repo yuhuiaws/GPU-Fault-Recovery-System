@@ -25,7 +25,6 @@ from gpu_fault.models import (
     RestartBudgetState,
     TerminalEvent,
 )
-from gpu_fault.service import CompletionPendingError
 from gpu_fault.watcher import (
     AttemptObservation,
     FailureContainmentDecision,
@@ -128,14 +127,11 @@ async def terminal(
     event: TerminalEvent,
     dependencies: CompletionRouterDependencies = Depends(get_completion_dependencies),
 ) -> CompletionDecision:
-    try:
-        return await _store_call(
-            dependencies,
-            dependencies.context.completion.handle_terminal,
-            event,
-        )
-    except CompletionPendingError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return await _store_call(
+        dependencies,
+        dependencies.context.completion.handle_terminal,
+        event,
+    )
 
 
 @router.get(

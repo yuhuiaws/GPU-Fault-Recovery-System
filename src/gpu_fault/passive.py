@@ -62,7 +62,21 @@ class PassiveWorkflowCompiler:
         self.store = store
         self.evidence_owner = evidence_owner
 
-    def compile(self, plan: RecoveryPlan, event: TerminalEvent) -> RecoveryPlan:
+    def compile(
+        self,
+        plan: RecoveryPlan,
+        event: TerminalEvent,
+        *,
+        predecessor_workflow_id: str | None = None,
+    ) -> RecoveryPlan:
+        """Compile ``plan`` into an incident and a PENDING workflow.
+
+        ``predecessor_workflow_id`` names the attempt's passive containment
+        workflow when the completion service knows one: the dispatcher holds
+        the recovery while that predecessor is open, which replaced the HTTP
+        conflict the terminal used to be answered with.
+        """
+
         if plan.workflow_request_id:
             return plan
         now = datetime.now(timezone.utc)
@@ -127,6 +141,7 @@ class PassiveWorkflowCompiler:
         workflow = WorkflowRequest(
             incident_id=incident.incident_id,
             source_plan_id=plan.plan_id,
+            predecessor_workflow_id=predecessor_workflow_id,
             runtime_profile_version=plan.runtime_profile_version,
             status=WorkflowStatus.PENDING,
             official_action=incident.official_action,

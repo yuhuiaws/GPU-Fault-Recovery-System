@@ -35,10 +35,6 @@ from gpu_fault.watcher import (
 LOGGER = logging.getLogger(__name__)
 
 
-class CompletionPendingError(RuntimeError):
-    pass
-
-
 class CompletionService:
     def __init__(
         self,
@@ -240,11 +236,24 @@ class CompletionService:
         )
 
     def handle_terminal(self, event: TerminalEvent) -> CompletionDecision:
-        explicit_initiator, passive_containment = self._containment_gate(event)
+        """Decide a terminal event immediately, whatever its containment is doing.
+
+        The terminal used to be held (an HTTP conflict the data plane retried)
+        while the attempt's passive containment workflow was open or not yet
+        persisted.
+        That queued the cluster's terminal events behind one stuck STOP
+        (P0-62C) and left the decision to a retry loop. Now the containment
+        is created here when it is missing, and the recovery workflow names it
+        as ``predecessor_workflow_id``, so the dispatcher sequences
+        stop-then-restart without anyone waiting.
+        """
+
         existing = self.store.get_decision_by_event(event.event_key)
         if existing is not None:
             return existing.model_copy(update={"duplicate": True})
         self.store.get_profile(event.runtime_profile_version)
+        containment_workflow_id = self._ensure_terminal_containment(event)
+        explicit_initiator, passive_containment = self._containment_context(event)
 
         # Everything persisted about this event -- the event row, the plan
         # with its incident and workflow, the decision -- is written inside
@@ -267,25 +276,75 @@ class CompletionService:
                     "redelivery: event_key=%s",
                     event.event_key,
                 )
-            decision = self._decide(event, explicit_initiator, passive_containment)
+            decision = self._decide(
+                event,
+                explicit_initiator,
+                passive_containment,
+                predecessor_workflow_id=containment_workflow_id,
+            )
             self.store.save_decision(decision)
         return decision
 
-    def _containment_gate(
-        self, event: TerminalEvent
-    ) -> tuple[FaultIncident | None, FaultIncident | None]:
-        """Hold the terminal event while its passive containment is open.
+    def _passive_event_key(self, event: TerminalEvent) -> str:
+        """The failure-detected event key the passive containment is keyed by."""
 
-        Returns the explicitly named initiator incident (if any) and the
-        passive containment incident (if any). Raises
-        ``CompletionPendingError`` -- a 409 to the data plane, which retries
-        -- while the containment workflow is still open.
+        return f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
+
+    def _ensure_terminal_containment(self, event: TerminalEvent) -> str | None:
+        """The containment workflow id for this attempt, created here when a
+        failure terminal arrives before (or without) its failure-detected event.
+
+        Runs before the completion transaction: it is its own idempotent
+        store transaction keyed by the passive event id, and a second replica
+        racing on it gets ``created=False``. Nothing is created for a clean
+        STOPPED/SUCCEEDED terminal (nothing failed), for a terminal with no
+        workload ids (nothing to stop), or for a terminal another incident's
+        workflow stopped (``_decide`` answers NO_ACTION for it).
         """
 
-        expected_passive_incident, _ = failure_containment_ids(
-            f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
+        existing = self.store.get_incident_by_event(self._passive_event_key(event))
+        if existing is not None:
+            return existing.workflow_request_id
+        if not event.is_failure or not event.workload_ids:
+            return None
+        passive_incident_id, _ = failure_containment_ids(self._passive_event_key(event))
+        if event.termination_initiator_incident_id not in (None, passive_incident_id):
+            return None
+        _incident, workflow, _created = self._ensure_containment(
+            cluster_id=event.cluster_id,
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
+            runtime_profile_version=event.runtime_profile_version,
+            workload_ids=list(event.workload_ids),
+            node_ids=sorted({item.node_id for item in event.allocation}),
+            gpu_uuids=sorted(
+                {gpu for item in event.allocation for gpu in item.gpu_uuids}
+            ),
+            reasons=[
+                f"terminal {event.terminal_status.value} reported before "
+                "failure detection",
+                *[
+                    f"rank {item.rank} exit_code={item.exit_code}"
+                    for item in event.rank_exit_status
+                    if item.exit_code
+                ],
+            ],
         )
-        explicit_initiator = None
+        return workflow.request_id
+
+    def _containment_context(
+        self, event: TerminalEvent
+    ) -> tuple[FaultIncident | None, FaultIncident | None]:
+        """The explicitly named initiator incident (if any) and the passive
+        containment incident (if any) for this attempt.
+
+        The passive incident is looked up by the attempt, not only through
+        the terminal's initiator annotation: the DESTR-015 tombstone race can
+        lose that annotation on a job our own containment stopped, and the
+        store knows better than the tombstone.
+        """
+
+        explicit_initiator: FaultIncident | None = None
         if event.termination_initiator_incident_id:
             try:
                 explicit_initiator = self.store.get_incident(
@@ -293,46 +352,14 @@ class CompletionService:
                 )
             except NotFoundError:
                 explicit_initiator = None
-        if (
-            event.termination_initiator_incident_id == expected_passive_incident
-            and explicit_initiator is None
-        ):
-            raise CompletionPendingError(
-                "passive containment incident is not persisted yet: "
-                f"{expected_passive_incident}"
-            )
         passive_containment = (
             explicit_initiator
             if (
                 explicit_initiator is not None
                 and explicit_initiator.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
             )
-            else self.store.get_incident_by_event(
-                f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
-            )
+            else self.store.get_incident_by_event(self._passive_event_key(event))
         )
-        if (
-            passive_containment is not None
-            and passive_containment.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
-            and passive_containment.workflow_request_id
-        ):
-            containment = self.store.get_workflow(
-                passive_containment.workflow_request_id
-            )
-            if containment.status not in {
-                WorkflowStatus.SUCCEEDED,
-                WorkflowStatus.FAILED,
-                WorkflowStatus.SUPERSEDED,
-            }:
-                # Open (or BLOCKED awaiting an operator): the terminal
-                # event is retried later. A containment that FAILED or
-                # was SUPERSEDED will never succeed; answering 409 forever
-                # queued the whole cluster's terminal events behind it
-                # (P0-62C).
-                raise CompletionPendingError(
-                    "passive containment workflow is not complete: "
-                    f"{containment.request_id}/{containment.status.value}"
-                )
         return explicit_initiator, passive_containment
 
     def _decide(
@@ -340,12 +367,18 @@ class CompletionService:
         event: TerminalEvent,
         explicit_initiator: FaultIncident | None,
         passive_containment: FaultIncident | None,
+        *,
+        predecessor_workflow_id: str | None = None,
     ) -> CompletionDecision:
         """Decide a terminal event. Runs inside the completion transaction.
 
         Returns the decision. Explicit foreign initiator → NO_ACTION; user stop
         or success → NO_ACTION and withdraw; trusted marker → marker plan; no
-        allocation → evidence + escalate; otherwise one budgeted restart.
+        allocation → evidence + escalate; otherwise one budgeted restart. A
+        STOPPED terminal is a user stop only when no passive containment
+        exists for the attempt: with one, the stop was ours, tagged or not.
+        Every compiled plan chains behind ``predecessor_workflow_id`` (the
+        containment workflow) so the dispatcher orders stop-then-restart.
         """
 
         if event.termination_initiator_incident_id and (
@@ -420,7 +453,9 @@ class CompletionService:
                 if incident is not None
                 else self.planner.from_marker(event, selected, profile)
             )
-            plan = self._save_plan(plan, event)
+            plan = self._save_plan(
+                plan, event, predecessor_workflow_id=predecessor_workflow_id
+            )
             return CompletionDecision(
                 cluster_id=event.cluster_id,
                 attempt_id=event.attempt_id,
@@ -442,7 +477,9 @@ class CompletionService:
         if not event.allocation:
             profile = self.store.get_profile(event.runtime_profile_version)
             plan = self.planner.from_missing_allocation(event, profile)
-            plan = self._save_plan(plan, event)
+            plan = self._save_plan(
+                plan, event, predecessor_workflow_id=predecessor_workflow_id
+            )
             return CompletionDecision(
                 cluster_id=event.cluster_id,
                 attempt_id=event.attempt_id,
@@ -454,7 +491,9 @@ class CompletionService:
 
         profile = self.store.get_profile(event.runtime_profile_version)
         plan = self._save_plan(
-            self.planner.without_hardware_evidence(event, profile), event
+            self.planner.without_hardware_evidence(event, profile),
+            event,
+            predecessor_workflow_id=predecessor_workflow_id,
         )
         return CompletionDecision(
             cluster_id=event.cluster_id,
@@ -471,9 +510,17 @@ class CompletionService:
             recovery_plan_id=plan.plan_id,
         )
 
-    def _save_plan(self, plan: RecoveryPlan, event: TerminalEvent) -> RecoveryPlan:
+    def _save_plan(
+        self,
+        plan: RecoveryPlan,
+        event: TerminalEvent,
+        *,
+        predecessor_workflow_id: str | None = None,
+    ) -> RecoveryPlan:
         if self.workflow_compiler is not None:
-            plan = self.workflow_compiler.compile(plan, event)
+            plan = self.workflow_compiler.compile(
+                plan, event, predecessor_workflow_id=predecessor_workflow_id
+            )
         self.store.save_plan(plan)
         return plan
 
