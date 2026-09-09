@@ -21,6 +21,7 @@ import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -47,6 +48,9 @@ OUTBOX_LOCK_FORCE_ADVICE = (
     " which can lose one side's update"
 )
 OUTBOX_LOCK_RETRY_SECONDS = 0.5
+#: The most of ``<outbox>.lock`` a refusal reads to name the holder: the file is
+#: one short JSON line, and a foreign or corrupt file must not cost a full read.
+OUTBOX_LOCK_HOLDER_MAX_BYTES = 4096
 
 
 def _bump(counters: dict[str, int], key: str) -> int:
@@ -67,6 +71,49 @@ class OutboxLockUnavailable(OSError):
     """Raised for ``required=True`` only: a command with no lock to degrade to."""
 
 
+def describe_lock_holder(handle: int) -> str:
+    """Who holds ``<outbox>.lock``, from the identity line its taker wrote.
+
+    ``flock`` carries no owner, so a refusal or a forced rewrite could only say
+    "another process": an operator could not tell a live collector's replay
+    from a colleague's ``requeue-dead``. Every taker records itself in the
+    file (see :meth:`OutboxFile._record_lock_holder`); this reads that record
+    best-effort, bounded to one small ``pread`` on the descriptor the caller
+    already has open, and never raises: anything short of a well-formed line is
+    "holder unknown".
+
+    A recorded pid that no longer exists is reported as *stale*, not trusted:
+    the flock dies with its process, so a lock still held while the recorded
+    holder is gone means the actual holder did not overwrite the record -- a
+    collector from before this line existed, or a child that inherited the
+    descriptor (and so the lock) from the recorded parent. The file is a hint
+    about the holder, never the lock itself.
+    """
+
+    try:
+        text = os.pread(handle, OUTBOX_LOCK_HOLDER_MAX_BYTES, 0).decode(
+            "utf-8", errors="replace"
+        )
+        # The first JSON value only: a taker whose trailing ``ftruncate`` failed
+        # leaves the tail of a longer predecessor's line behind it.
+        holder, _end = json.JSONDecoder().raw_decode(text)
+    except (OSError, ValueError):
+        return "holder unknown"
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "holder unknown"
+    role = holder.get("role") if isinstance(holder.get("role"), str) else "unknown role"
+    since = holder.get("since") if isinstance(holder.get("since"), str) else "unknown"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return f"stale holder pid {pid} ({role}, gone)"
+    except OSError:
+        # EPERM: the process exists but belongs to another user -- alive.
+        pass
+    return f"held by pid {pid} ({role}) since {since}"
+
+
 @dataclass(frozen=True)
 class OutboxFile:
     """The durable NDJSON outbox one collector writes (ARCH-G2).
@@ -80,6 +127,9 @@ class OutboxFile:
     """
 
     path: Path
+    #: Written into ``<outbox>.lock`` by every lock take so a refusal can name
+    #: the holder: ``collector`` for the sink, ``cli:<subcommand>`` for the CLI.
+    role: str = "collector"
 
     @property
     def lock_path(self) -> Path:
@@ -145,6 +195,7 @@ class OutboxFile:
             while True:
                 try:
                     fcntl.flock(handle, mode)
+                    self._record_lock_holder(handle)
                     return handle
                 except OSError as exc:
                     attempts -= 1
@@ -154,8 +205,8 @@ class OutboxFile:
                         raise OutboxLockUnavailable(
                             exc.errno or 0,
                             f"another process still holds the collector"
-                            f" outbox lock {self.lock_path} after {waited:.1f}s"
-                            " (a live collector's outbox replay)"
+                            f" outbox lock {self.lock_path} after {waited:.1f}s,"
+                            f" {describe_lock_holder(handle)}"
                             f"{OUTBOX_LOCK_FORCE_ADVICE}",
                         ) from exc
                 time.sleep(OUTBOX_LOCK_RETRY_SECONDS)
@@ -163,6 +214,40 @@ class OutboxFile:
             with contextlib.suppress(OSError):
                 os.close(handle)
             raise
+
+    def _record_lock_holder(self, handle: int) -> None:
+        """Leave this taker's identity in the lock file it now holds.
+
+        The flock is on the open file description, not the bytes, so
+        rewriting the contents while holding it is safe, and a later taker
+        simply overwrites the line. One ~80-byte ``pwrite`` and one
+        ``ftruncate`` on a descriptor already open, no fsync (about 5 us
+        measured): it runs once per lock take -- a buffered append or a
+        replay/compaction rewrite, each of which already fsyncs the outbox --
+        never per collected event. The write goes *first* and the truncate
+        trims to its length: truncating to zero and rewriting is the pattern
+        ext4's ``auto_da_alloc`` treats as a file replace, and it charged every
+        ``close()`` of the lock a forced block flush (about 900 us). No hostname
+        (the file never leaves the node) and no monotonic clock (meaningless to
+        another process). A failure here must not fail the lock, let alone the
+        post the lock protects; the previous holder's line is emptied so the
+        reader says "holder unknown" rather than naming them.
+        """
+
+        line = json.dumps(
+            {
+                "pid": os.getpid(),
+                "role": self.role,
+                "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            os.pwrite(handle, line, 0)
+            os.ftruncate(handle, len(line))
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.ftruncate(handle, 0)
 
     def _warn_unlocked_write(self, exc: OSError, *, forced: bool = False) -> None:
         total = _bump(_UNLOCKED_WRITES, str(self.lock_path))

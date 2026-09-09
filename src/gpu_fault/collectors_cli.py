@@ -46,10 +46,15 @@ def _add_outbox_parser(
     times ``OUTBOX_LOCK_RETRY_SECONDS`` apart (10 x 0.5 s, so at most 4.5 s of
     waiting), and a lock still held after that exits non-zero and changes
     nothing -- unlike the collector, this process has no in-process lock to
-    fall back on. ``--force`` runs the same bounded poll and then rewrites
-    *without* the lock, for a collector that is stopped and left its lock
-    behind. It leaves records whose payload was truncated to a digest dead:
-    only a 4 KB excerpt of those bodies exists, so they cannot be replayed.
+    fall back on. The refusal names the holder from the identity line every
+    taker leaves in ``.lock`` (``held by pid <n> (collector|cli:<subcommand>)
+    since <ts>``, ``stale holder pid <n> (..., gone)`` or ``holder unknown``),
+    so a live collector's replay can be told from a colleague's command.
+    ``--force`` runs the same bounded poll and then rewrites *without* the
+    lock, for a collector that is stopped and left its lock behind; its
+    WARNING carries the same holder line. It leaves records whose payload was
+    truncated to a digest dead: only a 4 KB excerpt of those bodies exists, so
+    they cannot be replayed.
     """
 
     outbox = subcommands.add_parser(
@@ -103,7 +108,9 @@ def _outbox_path(args: argparse.Namespace) -> Path:
 
 
 def run_outbox_command(args: argparse.Namespace) -> None:
-    outbox = OutboxFile(_outbox_path(args))
+    # The role is what a refused collector or colleague reads out of ``.lock``
+    # while this command holds it, so it names the subcommand, not the binary.
+    outbox = OutboxFile(_outbox_path(args), role=f"cli:{args.outbox_action}")
     if args.outbox_action == "list":
         for index, record in enumerate(outbox.read()):
             print(OutboxFile.describe(index, record))

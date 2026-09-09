@@ -10,9 +10,11 @@ outbox evicted its oldest records silently.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import os
+import subprocess
 import sys
 from email.message import Message
 from threading import Event, Thread
@@ -738,4 +740,259 @@ def test_the_refusal_names_the_wait_it_took_and_offers_force_once(
     )
     assert message.count("--force") == 1, (
         f"the refusal repeats the advice it already carries: {message!r}"
+    )
+
+
+def _requeue_against_held_lock(
+    outbox_path, *, hold, force: bool, monkeypatch, caplog
+) -> tuple[BaseException | None, str]:
+    """Run ``requeue-dead`` in a thread while ``hold()`` keeps the lock.
+
+    Returns what stopped the command (``None`` when it ran) and the WARNING
+    text it logged. The bounded poll is shortened so the test answers fast.
+    """
+
+    monkeypatch.setattr(collector_outbox, "OUTBOX_LOCK_RETRY_SECONDS", 0.02)
+    outcome: list[BaseException | None] = []
+
+    def requeue() -> None:
+        try:
+            collectors_cli.run_outbox_command(
+                _requeue_arguments(outbox_path, force=force)
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    worker = Thread(target=requeue, daemon=True, name="requeue-dead-named-holder")
+    with hold, caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.sinks"):
+        worker.start()
+        worker.join(10)
+        assert not worker.is_alive(), "requeue-dead did not answer in 10s"
+        warnings = caplog.text
+    worker.join(10)
+    return outcome[0], warnings
+
+
+def test_the_strict_refusal_names_the_collector_holding_the_lock(
+    monkeypatch, tmp_path, capsys, caplog
+) -> None:
+    """R3: ``flock`` carries no owner, so the refusal could not say who held it.
+
+    "Another process" left the operator guessing between a live collector's
+    replay and a colleague's ``requeue-dead``; the answer decides whether
+    ``--force`` is safe. The taker now writes ``pid``/``role``/``since`` into
+    ``.lock`` and the refusal reads it back.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    # A second open file description in this process: what the live sink looks
+    # like to the CLI's flock, with the sink's own role in the file.
+    stopped, _warnings = _requeue_against_held_lock(
+        outbox_path,
+        hold=OutboxFile(outbox_path).locked(),
+        force=False,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+    capsys.readouterr()
+
+    assert isinstance(stopped, SystemExit), f"the held lock did not refuse: {stopped!r}"
+    message = str(stopped)
+    assert f"held by pid {os.getpid()} (collector) since 20" in message, (
+        f"the refusal does not name the holder's pid and role: {message!r}"
+    )
+    assert "holder unknown" not in message, message
+    assert json.loads(outbox_path.read_text())["replayable"] is False, (
+        "requeue-dead rewrote the outbox although the collector held the lock"
+    )
+
+
+def test_the_forced_warning_names_the_collector_holding_the_lock(
+    monkeypatch, tmp_path, capsys, caplog
+) -> None:
+    """``--force`` past a live holder is the F7 race; the log must say whose."""
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    stopped, warnings = _requeue_against_held_lock(
+        outbox_path,
+        hold=OutboxFile(outbox_path).locked(),
+        force=True,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+    capsys.readouterr()
+
+    assert stopped is None, f"--force did not get through: {stopped!r}"
+    assert json.loads(outbox_path.read_text())["replayable"] is True, (
+        "--force answered but did not requeue the dead record"
+    )
+    assert f"held by pid {os.getpid()} (collector) since 20" in warnings, (
+        f"the forced WARNING does not name who held the lock: {warnings!r}"
+    )
+    assert "because --force was passed" in warnings, warnings
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"", id="empty"),
+        pytest.param(b"\x00garbage{not json", id="garbage"),
+        pytest.param(b'{"role":"collector"}', id="no-pid"),
+        pytest.param(b'{"pid":"12","role":"collector"}', id="pid-not-int"),
+        pytest.param(b'["pid", 12]', id="not-an-object"),
+        pytest.param(b"{" + b"x" * 8192 + b"}", id="oversize"),
+    ],
+)
+def test_an_unreadable_lock_file_reads_as_holder_unknown(
+    monkeypatch, tmp_path, capsys, caplog, contents
+) -> None:
+    """A foreign or torn ``.lock`` is a missing hint, never a failure or a guess.
+
+    A pre-R3 collector leaves the file empty; a truncate-then-write torn by a
+    concurrent reader leaves it partial; the bounded 4 KB read cuts an oversize
+    file mid-JSON. All of them must land on the same three words.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+    lock_path.write_bytes(contents)
+
+    @contextlib.contextmanager
+    def hold_without_recording():
+        # A raw flock: the holder that does not write its identity.
+        handle = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+
+    stopped, _warnings = _requeue_against_held_lock(
+        outbox_path,
+        hold=hold_without_recording(),
+        force=False,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+    capsys.readouterr()
+
+    assert isinstance(stopped, SystemExit), f"the held lock did not refuse: {stopped!r}"
+    message = str(stopped)
+    assert "holder unknown" in message, (
+        f"an unreadable lock file did not read as unknown: {message!r}"
+    )
+    assert "held by pid" not in message and "stale holder" not in message, message
+    assert lock_path.read_bytes() == contents, (
+        "a refused taker rewrote the lock file it does not hold"
+    )
+
+
+def test_a_recorded_holder_that_is_gone_reads_as_stale(
+    monkeypatch, tmp_path, capsys, caplog
+) -> None:
+    """The flock dies with its process, so a dead recorded pid is not the holder.
+
+    Somebody else holds the lock without having overwritten the line -- an
+    older collector, or a child that inherited the parent's descriptor. Saying
+    "held by pid N" would send the operator to ``kill`` a pid that is gone.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+    # A process that has exited and been reaped: its pid is certainly gone.
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    assert finished.wait(30) == 0
+    dead_pid = finished.pid
+    lock_path.write_text(
+        json.dumps(
+            {"pid": dead_pid, "role": "collector", "since": "2026-09-09T00:00:00+00:00"}
+        )
+    )
+
+    @contextlib.contextmanager
+    def hold_without_recording():
+        handle = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+
+    stopped, _warnings = _requeue_against_held_lock(
+        outbox_path,
+        hold=hold_without_recording(),
+        force=False,
+        monkeypatch=monkeypatch,
+        caplog=caplog,
+    )
+    capsys.readouterr()
+
+    assert isinstance(stopped, SystemExit), f"the held lock did not refuse: {stopped!r}"
+    message = str(stopped)
+    assert f"stale holder pid {dead_pid} (collector, gone)" in message, (
+        f"a dead recorded pid was not reported as gone: {message!r}"
+    )
+    assert "held by pid" not in message, message
+
+
+def test_every_lock_take_records_its_role_and_a_write_failure_is_harmless(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The sink writes ``collector``, the CLI ``cli:<subcommand>``; neither may fail.
+
+    The identity line is a hint for the *next* taker, so a lock file that
+    cannot be written (a read-only ``.lock`` left by root, a full volume) must
+    not fail the lock and, behind it, the post the lock protects.
+    """
+
+    outbox_path = tmp_path / "outbox.ndjson"
+    _seed(outbox_path, [_record(0, replayable=False, error="HTTP 422: nope")])
+    lock_path = OutboxFile(outbox_path).lock_path
+    # A longer identity left by an earlier taker. The take must never truncate
+    # to zero first (ext4 auto_da_alloc turns truncate-to-zero + rewrite +
+    # close into a ~1 ms flush), so it writes over the old line and trims to
+    # its own length; the reader takes the first JSON value either way.
+    lock_path.write_text(json.dumps({"pid": 1, "role": "x" * 300}) + "\n")
+
+    with OutboxFile(outbox_path).locked():
+        recorded = json.loads(lock_path.read_text().splitlines()[0])
+    assert recorded["pid"] == os.getpid() and recorded["role"] == "collector", recorded
+    assert recorded["since"].startswith("20") and "+00:00" in recorded["since"], (
+        f"the timestamp is not an ISO UTC instant: {recorded!r}"
+    )
+    assert set(recorded) == {"pid", "role", "since"}, (
+        f"the lock file carries more than the holder's identity: {recorded!r}"
+    )
+    handle = os.open(lock_path, os.O_RDONLY)
+    try:
+        assert collector_outbox.describe_lock_holder(handle).startswith(
+            f"held by pid {os.getpid()} (collector) since 20"
+        ), "the reader did not take the first line over the old tail"
+    finally:
+        os.close(handle)
+
+    collectors_cli.run_outbox_command(_requeue_arguments(outbox_path))
+    capsys.readouterr()
+    recorded = json.loads(lock_path.read_text().splitlines()[0])
+    assert recorded["role"] == "cli:requeue-dead", (
+        f"the CLI did not record its subcommand as the role: {recorded!r}"
+    )
+
+    def refuse_writes(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "pwrite", refuse_writes)
+    with OutboxFile(outbox_path).locked(required=True):
+        pass  # the lock was taken: the body ran and nothing was raised
+    assert lock_path.read_bytes() == b"", (
+        "the failed identity write left stale contents behind instead of an "
+        "empty file, so the next refusal would name a holder that is gone"
     )
