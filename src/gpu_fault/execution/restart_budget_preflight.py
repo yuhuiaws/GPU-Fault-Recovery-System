@@ -19,7 +19,10 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.execution.config import OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
+from gpu_fault.execution.config import (
+    NODE_INSTALL_OPERATIONS,
+    OPERATOR_ACKNOWLEDGEMENT_OPERATIONS,
+)
 from gpu_fault.execution.remediation_budget import remediation_budget_claims
 import gpu_fault.execution.step_bounds as step_bounds
 
@@ -94,6 +97,7 @@ def claim_deadlines(
     job_lifetime_seconds: float,
     node_lifetime_seconds: float,
     operator_acknowledgement_seconds: float | None = None,
+    install_floor_seconds: float | None = None,
 ) -> tuple[datetime, datetime]:
     """``(execution_deadline, lifetime_deadline_at)`` for a claim (F-N1).
 
@@ -103,7 +107,14 @@ def claim_deadlines(
     an operator-acknowledgement step (CHECK_MECHANICALS) waits on a human, so
     both deadlines are floored at ``now + operator_acknowledgement_seconds``:
     a one-hour lifetime would otherwise fail the very step whose meaning is
-    "wait for the inspection".
+    "wait for the inspection". A workflow that contains a node install
+    (``NODE_INSTALL_OPERATIONS``) gets its execution deadline -- only that one
+    -- floored at ``now + install_floor_seconds``, the install ceiling plus the
+    containment allowance (``ProductionExecutorConfig.
+    install_execution_floor_seconds``): the plain 1800 s budget cut a
+    full-length install at ``1800 - delta`` and the raised per-step ceiling
+    never fired (F2). The lifetime still caps it; the boot-time validator
+    refuses a lifetime that would.
     """
 
     lifetime = workflow.lifetime_deadline_at
@@ -132,6 +143,15 @@ def claim_deadlines(
         # live as step_waiting_seconds = -84599, then 0).
         if fresh_execution:
             execution = max(execution, floor)
+    if (
+        fresh_execution
+        and install_floor_seconds is not None
+        and any(
+            step.operation in NODE_INSTALL_OPERATIONS
+            for step in workflow.official_steps
+        )
+    ):
+        execution = max(execution, now + timedelta(seconds=install_floor_seconds))
     return min(execution, lifetime), lifetime
 
 
@@ -260,6 +280,7 @@ def prepare_claimed_workflow(
         operator_acknowledgement_seconds=(
             executor.config.operator_acknowledgement_timeout_seconds
         ),
+        install_floor_seconds=executor.config.install_execution_floor_seconds(),
     )
     workflow = workflow.model_copy(
         update={

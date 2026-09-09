@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Iterable, Mapping
 from uuid import uuid4
 
 from gpu_fault.env import env_bool
@@ -81,10 +81,11 @@ def node_install_step_timeout_seconds(values: Mapping[str, str]) -> int:
     the agent's verdict can land. 1900 s matches the unit's ``TimeoutStopSec``.
     Written out for ``scripts/generate-env-reference.py``.
 
-    Note the workflow execution budget (``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_
-    SECONDS``, 1800 s from the first claim) still bounds the whole workflow:
-    this ceiling stops the step cap from firing first, it does not buy an
-    install more time than the workflow has.
+    The workflow execution budget (``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_
+    SECONDS``, 1800 s from the first claim) would still cut a full-length
+    install at ``1800 - delta``, so ``claim_deadlines`` floors an install
+    workflow's execution deadline at this ceiling plus
+    ``node_install_containment_seconds`` (F2); the lifetime still caps it.
     """
 
     value = int(
@@ -105,6 +106,31 @@ def node_install_step_overrides(
 
     ceiling = node_install_step_timeout_seconds(values)
     return {operation: ceiling for operation in NODE_INSTALL_OPERATIONS}
+
+
+DEFAULT_NODE_INSTALL_CONTAINMENT_SECONDS = 600
+
+
+def node_install_containment_seconds(values: Mapping[str, str]) -> int:
+    """The allowance a workflow holding an install gets for the steps around it.
+
+    ``claim_deadlines`` floors such a workflow's execution deadline at the claim
+    plus the install ceiling plus this (F2). Before the install run a quiesce
+    and VERIFY_NO_GPU_CLIENTS, whose total wait at the shipped defaults is
+    60 attempts x 5 s = 300 s, so one default per-step cap (600 s) holds both
+    with room. Without the floor the 1800 s workflow budget cut a full-length
+    install at ``1800 - delta`` and the raised step ceiling never fired. ``0``
+    is legal -- a compression drill wants the floor to equal the ceiling -- so
+    only a negative value is refused. Written out for
+    ``scripts/generate-env-reference.py``.
+    """
+
+    value = int(values.get("GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS", "600"))
+    if value < 0:
+        raise WorkflowExecutionError(
+            "workflow install containment allowance must not be negative"
+        )
+    return value
 
 
 def _adapter_owned_step_overrides() -> dict[WorkflowOperation, int]:
@@ -235,6 +261,11 @@ class ProductionExecutorConfig:
     step_waiting_timeout_overrides: Mapping[WorkflowOperation, int] = field(
         default_factory=_adapter_owned_step_overrides
     )
+    # F2: the execution deadline of a workflow that contains one of
+    # NODE_INSTALL_OPERATIONS is floored at the claim plus the install ceiling
+    # plus this allowance for the containment steps around the install (see
+    # ``install_execution_floor_seconds``).
+    node_install_containment_seconds: int = DEFAULT_NODE_INSTALL_CONTAINMENT_SECONDS
     # Rule A: the window a job waits on a node under another remediation. The
     # same variable as ``WorkflowDispatcherConfig.node_busy_wait_seconds``;
     # here it caps the ``after_incident`` restart premise (a WAITING outcome
@@ -268,6 +299,42 @@ class ProductionExecutorConfig:
 
         lead = self.step_waiting_timeout_seconds - self.step_waiting_warning_seconds
         return max(1, self.step_waiting_limit(operation) - lead)
+
+    def install_execution_floor_seconds(self) -> int:
+        """The least execution budget a workflow holding a node install gets (F2).
+
+        The install ceiling (one knob for the three installs, so the largest is
+        the value) plus the containment allowance. ``claim_deadlines`` floors
+        the execution deadline here on the claim that stamps it, still capped
+        by the lifetime; ``validate_timing_relationships`` refuses a node
+        lifetime that holds the ceiling but not this floor.
+        """
+
+        ceiling = max(
+            self.step_waiting_limit(operation) for operation in NODE_INSTALL_OPERATIONS
+        )
+        return ceiling + self.node_install_containment_seconds
+
+    def execution_budget_seconds(
+        self, operations: Iterable[WorkflowOperation]
+    ) -> float:
+        """The budget ``claim_deadlines`` stamps for a workflow of ``operations``.
+
+        The plain execution timeout, lifted to the operator-acknowledgement
+        window when the workflow waits on an inspection and to the install
+        floor when it holds a node install. ``step_bounds.step_elapsed_since``
+        subtracts this from the stamped deadline to recover the window start;
+        subtracting the plain timeout from a floored deadline put that start in
+        the future and a step's measured wait at 0 (before the clamp, -84599).
+        """
+
+        present = set(operations)
+        budget = float(self.workflow_execution_timeout_seconds)
+        if not present.isdisjoint(OPERATOR_ACKNOWLEDGEMENT_OPERATIONS):
+            budget = max(budget, float(self.operator_acknowledgement_timeout_seconds))
+        if not present.isdisjoint(NODE_INSTALL_OPERATIONS):
+            budget = max(budget, float(self.install_execution_floor_seconds()))
+        return budget
 
     @classmethod
     def from_environment(cls) -> ProductionExecutorConfig:
@@ -366,6 +433,7 @@ class ProductionExecutorConfig:
             step_waiting_timeout_seconds=step_timeout,
             step_waiting_warning_seconds=step_warning,
             step_waiting_timeout_overrides=overrides,
+            node_install_containment_seconds=node_install_containment_seconds(values),
             node_busy_wait_seconds=node_busy_wait_seconds(values),
             workflow_preemption_enabled=env_bool(
                 "GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION", True, environ=values
@@ -489,6 +557,13 @@ def validate_timing_relationships(
     * the workflow execution timeout <= both lifetimes. ``claim_deadlines``
       returns ``min(execution, lifetime)`` (restart_budget_preflight.py:131),
       so a longer timeout is silently truncated and the configured value lies.
+    * the install workflow execution floor <= the node workflow lifetime, once
+      the lifetime holds the install ceiling. ``claim_deadlines`` floors an
+      install workflow's execution deadline at the ceiling plus the containment
+      allowance (``install_execution_floor_seconds``) and then caps it by the
+      lifetime, so a lifetime between the two truncates every driver, firmware
+      or EFA-driver install workflow silently. A lifetime below the ceiling is
+      already the first rule's sentence and is not reported twice.
     * the lease duration < the execution timeout. The lease is renewed once
       per step (executor.py:207-212, ``_lease_duration`` executor.py:1661);
       a lease at or above the timeout means an executor that died mid-step
@@ -567,6 +642,23 @@ def validate_timing_relationships(
             f"the workflow execution timeout ({_seconds(execution)}) exceeds "
             + " and ".join(exceeded)
             + ", so claim_deadlines silently truncates it"
+        )
+
+    install_ceiling = max(
+        executor.step_waiting_limit(operation) for operation in NODE_INSTALL_OPERATIONS
+    )
+    install_floor = executor.install_execution_floor_seconds()
+    if install_ceiling <= node_lifetime < install_floor:
+        violations.append(
+            f"the node workflow lifetime ({_seconds(node_lifetime)}, "
+            "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS) holds the install step "
+            f"ceiling ({_seconds(install_ceiling)}, "
+            "GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS) but not the install "
+            f"workflow execution floor ({_seconds(install_floor)}: the ceiling plus "
+            f"{_seconds(executor.node_install_containment_seconds)} "
+            "GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS), so claim_deadlines "
+            "truncates every driver, firmware or EFA-driver install workflow to "
+            "the lifetime and the floor never applies"
         )
 
     if executor.lease_duration_seconds >= execution:
