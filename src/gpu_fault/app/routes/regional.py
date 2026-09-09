@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -9,7 +10,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from gpu_fault.app.authorization import authorization_bucket
 from gpu_fault.async_store import (
+    REQUEST_DEADLINE,
     AsyncStoreExecutor,
+    RequestDeadlineExceeded,
     StoreIoCapacityExceeded,
 )
 from gpu_fault.execution.fleet_preflight import (
@@ -86,11 +89,56 @@ async def _store_call(
     try:
         return await dependencies.store_io.run(function, *args, **kwargs)
     except StoreIoCapacityExceeded as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="store I/O capacity exceeded",
-            headers={"Retry-After": retry_after},
-        ) from exc
+        raise store_io_rejection(exc, retry_after=retry_after) from exc
+
+
+def store_io_rejection(
+    exc: StoreIoCapacityExceeded, *, retry_after: str = "2"
+) -> HTTPException:
+    """The 503 a store I/O refusal becomes, named for its real cause: a request
+    that ran out of budget is a deadline, not store capacity (the two need
+    different remedies -- a shorter wait versus a larger pool)."""
+
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "request deadline exceeded"
+            if isinstance(exc, RequestDeadlineExceeded)
+            else "store I/O capacity exceeded"
+        ),
+        headers={"Retry-After": retry_after},
+    )
+
+
+# What a long-poll must leave of the request budget for the claim that follows
+# the wait: the store I/O admission timeout (2 s by default) plus a margin.
+CLAIM_WAIT_RESERVE_SECONDS = 3.0
+
+
+def bounded_claim_wait_seconds(
+    requested: float,
+    *,
+    deadline: float | None,
+    now: float,
+    reserve_seconds: float = CLAIM_WAIT_RESERVE_SECONDS,
+) -> float:
+    """How long a claim may be held before its request budget runs out.
+
+    The request carries one deadline (``REQUEST_DEADLINE``, the backpressure
+    middleware's budget, 15 s by default) and the claim that ends the wait is a
+    store call bound by it. An executor asking for a 20 s wait therefore had
+    every idle claim answered 503 "deadline" -- live 2026-09-09: both executor
+    replicas failed readiness for as long as the queue was empty. The wait is
+    the smaller of what was asked, the server cap (applied by the hub) and what
+    the budget still allows after the reserve; nothing left means no wait.
+    """
+
+    if requested <= 0:
+        return 0.0
+    if deadline is None:
+        return requested
+    remaining = deadline - now - reserve_seconds
+    return max(0.0, min(requested, remaining))
 
 
 def _require_cluster(cluster_id: str | None) -> str:
@@ -266,7 +314,10 @@ async def claim_remote_commands(
         return commands
 
     hub = dependencies.remote_command_wakeups
-    if claim.wait_seconds <= 0 or hub is None:
+    wait_seconds = bounded_claim_wait_seconds(
+        claim.wait_seconds, deadline=REQUEST_DEADLINE.get(), now=time.monotonic()
+    )
+    if wait_seconds <= 0 or hub is None:
         return RemoteCommandClaim(commands=await claim_once())
     # Long-poll. Subscribe before the first claim so a command written between
     # that claim and the wait still wakes this request. The wait holds no
@@ -279,7 +330,7 @@ async def claim_remote_commands(
         commands = await claim_once()
         if commands or not waiter.admitted:
             return RemoteCommandClaim(commands=commands)
-        await waiter.wait(claim.wait_seconds)
+        await waiter.wait(wait_seconds)
         return RemoteCommandClaim(commands=await claim_once())
 
 
