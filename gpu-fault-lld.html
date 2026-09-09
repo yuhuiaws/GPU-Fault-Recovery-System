@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
-  <title>GPU 故障处理系统详细设计</title>
+  <title>详细设计</title>
   <style>
     html {
       color: #1a1a1a;
@@ -229,9 +229,6 @@
   </style>
 </head>
 <body>
-<header id="title-block-header">
-<h1 class="title">GPU 故障处理系统详细设计</h1>
-</header>
 <h1 id="gpu-故障处理系统详细设计">GPU 故障处理系统详细设计</h1>
 <h2 id="设计基线">1. 设计基线</h2>
 <h3 id="本文档的定位与阅读路径">1.1 本文档的定位与阅读路径</h3>
@@ -1397,6 +1394,13 @@ COLLECT_EVIDENCE
 RESET_GPU | REBOOT_NODE | REPLACE_NODE
 VALIDATE_NODE
 RESTART_WORKLOAD</code></pre>
+<p>Planner 只表达动作与目标节点；<code>RESTART_WORKLOAD</code>
+的执行参数（cluster/job/attempt/GPU
+数/预算、avoid_node_ids、<code>requires_incident_state</code>）全部由
+Passive Compiler 依据 <code>RecoveryPlan.avoid_node_ids</code> 与
+<code>RecoveryPlan.restart_after_incident_id</code>
+推导。<code>SimulatedRecoveryExecutor</code> 在模拟前同样从 plan
+字段读取这些前提。</p>
 <p><code>PassiveWorkflowCompiler</code> 将 RecoveryAction 映射为
 WorkflowOperation。GPU reset 固定编译为
 <code>QUIESCE_GPU_SERVICES -&gt; VERIFY_NO_GPU_CLIENTS -&gt; RESET_GPU -&gt; RESTORE_GPU_SERVICES</code>。Node
