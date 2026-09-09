@@ -518,7 +518,9 @@ def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -
     assert "adotIrsaRoleArn" not in clusters["gpu-b"], (
         "a cluster without a writer role was given a placeholder ARN"
     )
-    assert clusters["gpu-a"]["executorIrsaRoleArn"].endswith("gpu-a-executor")
+    assert clusters["gpu-a"]["executorIrsaRoleArn"].endswith("gpu-a-executor"), (
+        "the executor role ARN must still be written next to the writer ARN"
+    )
 
 
 def test_existing_site_keeps_the_operator_owned_adot_role() -> None:

@@ -811,11 +811,15 @@ def test_a_drifted_adot_writer_policy_is_repaired_to_the_site_workspace(
 
     account.adot_writer()
 
-    assert not account.mutations("create-role")
+    assert not account.mutations("create-role"), (
+        "a second run must not create the writer role again"
+    )
     put = account.mutations("put-role-policy")
     assert len(put) == 1, "the drifted writer policy was not rewritten exactly once"
     policy = json.loads(put[0][put[0].index("--policy-document") + 1])
-    assert policy["Statement"][0]["Resource"].endswith("workspace/ws-test")
+    assert policy["Statement"][0]["Resource"].endswith("workspace/ws-test"), (
+        "the writer policy must be scoped to the site's AMP workspace"
+    )
 
 
 def test_the_adot_writer_role_is_refused_without_a_workspace(

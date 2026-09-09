@@ -1,5 +1,7 @@
 {
   "tests/admin/test_admin_bootstrap_site.py:admin_bootstrap._ensure_public_subnets": 1,
+  "tests/admin/test_admin_bootstrap_site.py:admin_bootstrap._site_document": 1,
+  "tests/admin/test_admin_cluster_join.py:admin_cluster_join._parallel_prerequisites": 1,
   "tests/app_services/test_admission_regional_auth.py:AdmissionRuntimeFactory._decode_json_body": 2,
   "tests/app_services/test_cleanup_budget.py:runner._cleanup_round": 2,
   "tests/app_services/test_cleanup_budget.py:runner._owns_task_lease": 2,
@@ -81,6 +83,7 @@
   "tests/execution/_node_action_cases_2.py:adapter._secret_for_node": 6,
   "tests/execution/test_branch_settlement.py:ProductionWorkflowExecutor._has_unrestored_quiesce": 3,
   "tests/execution/test_branch_settlement.py:executor._save_leased": 2,
+  "tests/execution/test_cluster_executor_batching.py:CommandDispatch._fleet_preflight_hold": 1,
   "tests/execution/test_dag_batch_failure.py:ProductionWorkflowExecutor._has_unrestored_quiesce": 2,
   "tests/execution/test_dag_job_failure_waits_for_siblings.py:branches._escalator": 1,
   "tests/execution/test_dag_job_failure_waits_for_siblings.py:branches._job_dag": 3,

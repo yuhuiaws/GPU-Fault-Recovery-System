@@ -59,9 +59,9 @@ from gpu_fault.cluster_executor.metrics import (
 )
 from gpu_fault.dataplane_metrics import MetricsServer
 from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
-from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import RemoteCommandStatus
+from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 from tests.execution.test_cluster_executor_batching import (
     FakeClient,
     FakeNodeAdapter,
