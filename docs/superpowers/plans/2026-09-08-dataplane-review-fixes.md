@@ -97,11 +97,11 @@ Target:
 
 ---
 
-## WP-X: Cluster executor (`src/gpu_fault/cluster_executor.py`, `src/gpu_fault/adapters/node_action/**`, `tests/execution/test_cluster_executor*.py`, `tests/execution/test_node_action*.py`, `tests/execution/_node_action_cases_*.py`, `tests/hyperpod/test_cluster_executor*.py`)
+## WP-X: Cluster executor (`src/gpu_fault/cluster_executor/` — split into a package by F6a after this plan was written, `src/gpu_fault/adapters/node_action/**`, `tests/execution/test_cluster_executor*.py`, `tests/execution/test_node_action*.py`, `tests/execution/_node_action_cases_*.py`, `tests/hyperpod/test_cluster_executor*.py`)
 
 ### Task 3: result reporting survives transport errors; a poison command does not sink its batch
 
-**Files:** Modify `src/gpu_fault/cluster_executor.py`; Test `tests/execution/test_cluster_executor_lease_and_report.py` (+ new file if it grows past ~400 lines).
+**Files:** Modify `src/gpu_fault/cluster_executor/` (then a single module); Test `tests/execution/test_cluster_executor_lease_and_report.py` (+ new file if it grows past ~400 lines).
 **Evidence:** `cluster-executor §F1 (P1), §F3, §F9, §F10, §F11`.
 
 Behaviour today: `_post`/`_get` (`cluster_executor.py:183,206`) wrap only `HTTPError`; `_execute_and_report` (`:987`) catches only `ClusterExecutorError`. A `URLError`/timeout on `complete` escapes the worker, `run_once` raises, the command stays LEASED until expiry and is re-claimed and **re-executed**. `RemoteCommandClaim.model_validate(response)` (`:234`) fails the whole claim batch when one command is unparseable, after the control plane committed the leases. Counters are mutated from several threads without a lock; 404 is detected by `"(404)" in str(exc)` (`:353`); `run()` logs every `run_once` exception as "claim failed" (`:1084`).
@@ -118,7 +118,7 @@ Target:
 
 ### Task 4: WAITING results keep the adapter's continuation state; early exits keep per-node results
 
-**Files:** Modify `src/gpu_fault/cluster_executor.py` (`_execute` around `:1160`), `src/gpu_fault/adapters/node_action/step_execution.py` (`:230,254,270,311`); Test `tests/execution/test_node_action.py` (or `_node_action_cases_*.py`), `tests/execution/test_cluster_executor_lease_and_report.py`.
+**Files:** Modify `src/gpu_fault/cluster_executor/` (`_execute`, now `dispatch.py::CommandDispatch.execute`), `src/gpu_fault/adapters/node_action/step_execution.py` (`:230,254,270,311`); Test `tests/execution/test_node_action.py` (or `_node_action_cases_*.py`), `tests/execution/test_cluster_executor_lease_and_report.py`.
 **Evidence:** `cluster-executor §F2, §F4`.
 
 Behaviour today: executor-manufactured WAITING results (fleet preflight hold, `_retryable_result`, `_retryable_control_plane_result`) carry only their own keys and `complete_remote_command` replaces `result_details`, wiping `agent_baselines`, `spare_failover_pending`, `gpu_client_quiesce_attempt`. In `_fold_result`, early returns for FAILED/INTERRUPTED/retryable nodes assemble `details` without `node_results`, so a terminal FAILED never reports the nodes that succeeded.
@@ -130,7 +130,7 @@ Target: in `_execute`, every executor-manufactured WAITING result's details = `{
 
 ### Task 21: executor execution deadline, liveness, and round-trip reduction
 
-**Files:** Modify `src/gpu_fault/cluster_executor.py`, `src/gpu_fault/adapters/node_action/transport.py`, `barriers.py`, `deploy/dataplane/cluster-action-executor.yaml`; Test WP-X test files + `tests/deploy/**` or `tests/test_deploy_layout.py` if they assert this manifest.
+**Files:** Modify `src/gpu_fault/cluster_executor/` (then a single module), `src/gpu_fault/adapters/node_action/transport.py`, `barriers.py`, `deploy/dataplane/cluster-action-executor.yaml`; Test WP-X test files + `tests/deploy/**` or `tests/test_deploy_layout.py` if they assert this manifest.
 **Evidence:** `cluster-executor §F5, §F6, §F7, §F8`.
 
 Target:
@@ -251,7 +251,7 @@ Target:
 
 ### Task 11: host collector cannot wedge; progress-file errors are not hangs
 
-**Files:** Modify `src/gpu_fault/collectors/host/collector.py`, `host/system_metrics.py`, `host/network.py`, `host/inventory.py`, `training_progress.py`, `deploy/systemd/gpu-fault-host-collector.service`; Test `tests/collectors/test_host.py` (+ new `test_host_bounds.py` if it grows), the systemd unit test in `tests/deploy/**` or `tests/node_agent/test_node_deployment.py` (`grep -rl WatchdogSec tests` first).
+**Files:** Modify `src/gpu_fault/collectors/host/collector.py`, `host/system_metrics.py`, `host/network.py`, `host/inventory.py`, `training_progress.py`, `deploy/systemd/gpu-fault-host-collector.service`; Test `tests/collectors/test_host.py` (+ new `test_host_bounds.py` if it grows), the systemd unit test in `tests/deploy/**` or `tests/node_agent/test_node_deployment_*.py (split into six modules by F6c)` (`grep -rl WatchdogSec tests` first).
 **Evidence:** `host-collector §F1 (P1), §F2 (P1), §F3 (P1), §F4, §F6`.
 
 Target:
@@ -358,7 +358,7 @@ Target: each of the 8 call sites calls `deliver_or_raise(...)` and drops its loc
 
 ---
 
-## WP-D: Deploy, installer, reconciler, HMA ingest (`deploy/dataplane/**` except `completion-watcher.yaml` and `cluster-action-executor.yaml`, `deploy/systemd/**` except `gpu-fault-host-collector.service`, `deploy/node/**`, `src/gpu_fault/node_installer_reconciler.py`, `src/gpu_fault_release/regional_gpu_bootstrap.py`, `src/gpu_fault/hma.py`, `src/gpu_fault/app/routes/gpu_events.py`, `tests/node_agent/test_node_installer_reconciler.py`, `tests/node_agent/test_node_deployment.py`, `tests/deploy/**`, `tests/test_deploy_layout.py`, `tests/test_installation_resources.py`, `tests/hma/**`)
+## WP-D: Deploy, installer, reconciler, HMA ingest (`deploy/dataplane/**` except `completion-watcher.yaml` and `cluster-action-executor.yaml`, `deploy/systemd/**` except `gpu-fault-host-collector.service`, `deploy/node/**`, `src/gpu_fault/node_installer_reconciler.py`, `src/gpu_fault_release/regional_gpu_bootstrap.py`, `src/gpu_fault/hma.py`, `src/gpu_fault/app/routes/gpu_events.py`, `tests/node_agent/test_node_installer_reconciler.py`, `tests/node_agent/test_node_deployment_*.py (split into six modules by F6c)`, `tests/deploy/**`, `tests/test_deploy_layout.py`, `tests/test_installation_resources.py`, `tests/hma/**`)
 
 ### Task 15: installer reconciler — budget, isolation, backoff
 
@@ -388,7 +388,7 @@ Target:
 
 ### Task 17: installer GPU-health gates become WARN; agent restart is safe
 
-**Files:** Modify `deploy/node/install-gpu-fault-collector.sh`, `deploy/node/verify-gpu-fault-collector.sh`; Test `tests/node_agent/test_node_deployment.py`, `tests/deploy/**` (find the shell-script contract tests: `grep -rl verify-gpu-fault-collector tests`).
+**Files:** Modify `deploy/node/install-gpu-fault-collector.sh`, `deploy/node/verify-gpu-fault-collector.sh`; Test `tests/node_agent/test_node_deployment_*.py (split into six modules by F6c)`, `tests/deploy/**` (find the shell-script contract tests: `grep -rl verify-gpu-fault-collector tests`).
 **Evidence:** `hma-installer-deploy §F9`; `node-agent-core §F7`; owner decision 6.
 
 Target:
