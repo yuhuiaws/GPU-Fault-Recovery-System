@@ -75,9 +75,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 )
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     INSTANCE_GROUP_LABEL,
+    instance_type,
+    QUARANTINE_TAINT,
     SPARE_LABEL,
     WarmSpareLiveFixture,
-    instance_type,
 )
 
 yaml = importlib.import_module("yaml")
@@ -741,6 +742,7 @@ class _LiveRun:
     inject_fault: Any
     inject_sibling: Any
     incident_id: str = ""
+    follow_up_incident_id: str = ""
     env_opened: bool = False
     control_env_opened: bool = False
     holder_armed: bool = False
@@ -984,6 +986,9 @@ def _control_plane_errors(
     follow_up = run.regional.cpu_python(
         destr018.ESCALATION_CHAIN, str(workflow.get("request_id") or "")
     )
+    run.follow_up_incident_id = str(
+        (follow_up.get("incident") or {}).get("incident_id") or ""
+    )
     errors.extend(
         follow_up_errors(
             {
@@ -1051,7 +1056,9 @@ def _data_plane_errors(
             },
             fault_node=settings.fault_node,
             sibling_node=settings.sibling_node,
-            incident_id=run.incident_id,
+            # The escalation's QUARANTINE runs under the support-after incident,
+            # so that incident's digest is the taint value a correct run leaves.
+            incident_id=run.follow_up_incident_id or run.incident_id,
         )
     )
     provider = run.regional.provider_events(run.started_at, datetime.now(timezone.utc))
@@ -1217,8 +1224,10 @@ def _cleanup(
             lambda: warm.reactivate_agent(settings.sibling_node),
         )
         guard(
-            "sibling_restore",
-            lambda: _restore_sibling(warm, settings, incident_id, profile_version),
+            "isolation_restore",
+            lambda: _restore_isolated_nodes(
+                regional, warm, settings, incident_id, profile_version
+            ),
         )
     if env_opened:
         guard(
@@ -1253,23 +1262,88 @@ def _cleanup(
     return result
 
 
-def _restore_sibling(
+def _restore_isolated_nodes(
+    regional: RegionalLiveFixture,
     warm: WarmSpareLiveFixture,
     settings: Settings,
     incident_id: str,
     profile_version: str,
 ) -> dict[str, Any]:
-    warm.wait_incident_idle(incident_id)
-    created = warm.create_restore_workflow(
-        incident_id=incident_id,
-        node=settings.sibling_node,
-        profile_version=profile_version,
-        reason="DESTR-014 validated cleanup",
-    )
-    restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
-    if restored.get("status") != "SUCCEEDED":
-        raise RegionalFixtureError("sibling restore workflow did not succeed")
-    return restored
+    """Release every node the case -- or the product's own escalation -- left
+    isolated, through the incident that owns the isolation.
+
+    The exhaustion escalation opens a support-after incident that re-quarantines
+    the node and owns its taint, so a restore through the case's own incident
+    is refused (attempt 8, 2026-09-09: "sibling restore workflow did not
+    succeed" and both nodes stayed quarantined). Same rule as the DESTR-003/008
+    cleanups: read each node's owner annotation, validated-restore through it,
+    record the owner, then close the case incident if it is still open. Never
+    delete a taint or an annotation by hand.
+    """
+
+    report: dict[str, Any] = {"nodes": {}}
+    for node in (settings.sibling_node, settings.fault_node):
+        snapshot = regional.node_snapshot(node)
+        owner = str(
+            (snapshot.get("ownership_annotations") or {}).get(
+                "gpu-fault.io/incident-id"
+            )
+            or ""
+        )
+        isolated = (
+            bool(snapshot.get("unschedulable"))
+            or any(
+                item.get("key") == QUARANTINE_TAINT
+                for item in snapshot.get("taints") or []
+            )
+            or bool(owner)
+        )
+        entry: dict[str, Any] = {
+            "quarantine_owner": owner or None,
+            "isolated": isolated,
+        }
+        if isolated:
+            target = owner or incident_id
+            if owner and owner != incident_id:
+                entry["successor_incident"] = owner
+            warm.wait_incident_idle(target)
+            created = warm.create_restore_workflow(
+                incident_id=target,
+                node=node,
+                profile_version=profile_version,
+                reason="DESTR-014 validated cleanup",
+            )
+            restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+            entry["restore"] = {
+                "workflow_request_id": created["workflow_request_id"],
+                "status": restored.get("status"),
+                "error": restored.get("error"),
+            }
+            if restored.get("status") != "SUCCEEDED":
+                raise RegionalFixtureError(
+                    f"{node} restore workflow did not succeed: "
+                    f"{restored.get('status')} {restored.get('error')}"
+                )
+        report["nodes"][node] = entry
+    state = warm.incident_by_id(incident_id).get("state")
+    report["incident_state_before_close"] = state
+    if state != "RECOVERED":
+        warm.wait_incident_idle(incident_id)
+        created = warm.create_restore_workflow(
+            incident_id=incident_id,
+            node=settings.sibling_node,
+            profile_version=profile_version,
+            reason="DESTR-014 validated cleanup: close the case incident",
+        )
+        restored = warm.wait_workflow_id(str(created["workflow_request_id"]))
+        report["close"] = {
+            "status": restored.get("status"),
+            "error": restored.get("error"),
+        }
+        if restored.get("status") != "SUCCEEDED":
+            raise RegionalFixtureError("case incident close workflow did not succeed")
+    report["incident_state_after"] = warm.incident_by_id(incident_id).get("state")
+    return report
 
 
 CASE = CaseRunner(

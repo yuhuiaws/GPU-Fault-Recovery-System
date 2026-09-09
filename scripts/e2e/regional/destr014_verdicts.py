@@ -317,6 +317,10 @@ def schedulability_errors(
     sibling_node: str,
     incident_id: str,
 ) -> list[str]:
+    """``incident_id`` is the incident that owns the sibling's quarantine: the
+    support-after escalation when the exhaustion opened one (its QUARANTINE
+    writes the taint), else the case incident."""
+
     errors: list[str] = []
     fault = snapshots.get(fault_node) or {}
     sibling = snapshots.get(sibling_node) or {}
