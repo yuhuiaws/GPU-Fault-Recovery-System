@@ -307,8 +307,13 @@ def test_each_attempt_row_records_the_generation_of_the_agent_that_took_it(
     assert [row["agent_generation"] for row in history] == [7, 8, None], history
 
 
-def schema_v2_ledger(path: Path) -> str:
-    """Write a ledger exactly as the per-attempt (v2) agent left it on disk."""
+def schema_v2_ledger(path: Path, *, column_already_added: bool = False) -> str:
+    """Write a ledger exactly as the per-attempt (v2) agent left it on disk.
+
+    ``column_already_added`` is the file a crash leaves between the ``ALTER
+    TABLE`` and the version stamp: the column exists, ``user_version`` is
+    still 2.
+    """
 
     db = sqlite3.connect(str(path), isolation_level=None)
     db.execute(
@@ -366,6 +371,8 @@ def schema_v2_ledger(path: Path) -> str:
             canonical_digest({"target_driver_branch": 575}),
         ),
     )
+    if column_already_added:
+        db.execute("ALTER TABLE results ADD COLUMN agent_generation INTEGER")
     db.execute("PRAGMA user_version=2")
     db.close()
     return row.command_id
@@ -397,6 +404,29 @@ def test_a_v2_ledger_gains_the_generation_column_and_keeps_its_rows(
     db = sqlite3.connect(str(path))
     assert db.execute("PRAGMA user_version").fetchone()[0] == LEDGER_SCHEMA_VERSION
     assert LEDGER_SCHEMA_VERSION > 2, "the column is a schema change"
+
+
+def test_a_v2_ledger_that_already_has_the_column_is_stamped_without_error(
+    tmp_path: Path,
+) -> None:
+    """Crash between the ALTER TABLE and the version stamp, then reopen."""
+
+    path = tmp_path / "v2-half.db"
+    legacy_id = schema_v2_ledger(path, column_already_added=True)
+
+    ledger = NodeActionLedger(str(path))
+
+    assert ledger.get(legacy_id) is not None, "the row must survive the retry"
+    (legacy_row,) = ledger.attempt_history(legacy_id)
+    assert legacy_row["agent_generation"] is None, legacy_row
+    fresh = command(VERIFY, command_id="wf-new/1/VERIFY_NO_GPU_CLIENTS/node-a")
+    ledger.mark_in_progress(fresh, 1, agent_generation=4)
+    (new_row,) = ledger.attempt_history(fresh.command_id)
+    assert new_row["agent_generation"] == 4, new_row
+    db = sqlite3.connect(str(path))
+    assert db.execute("PRAGMA user_version").fetchone()[0] == LEDGER_SCHEMA_VERSION
+    columns = [row[1] for row in db.execute("PRAGMA table_info(results)")]
+    assert columns.count("agent_generation") == 1, columns
 
 
 def test_reopening_a_v2_migrated_ledger_does_not_migrate_again(tmp_path: Path) -> None:

@@ -23,9 +23,10 @@ INSTALL_TIMEOUT_SECONDS = 1800
 class InstallOutcomeUnknownError(RuntimeError):
     """An install was spawned and nobody can say what it left behind.
 
-    A package manager or firmware tool killed at its deadline may still be
-    mid-flight or half-applied, and a verification probe that cannot run after
-    the install finished says nothing about whether it applied. Both used to
+    A package manager or firmware tool killed at its deadline has left the
+    node half-applied (and a wrapper script's children can outlive the kill),
+    and a verification probe that cannot run after the install finished says
+    nothing about whether it applied. Both used to
     surface as ``TimeoutExpired`` / ``OSError``, which the executor classes as
     retryable -- and a resubmit runs a second 1800 s install on top of the
     first. A ``RuntimeError`` is never retried; ``action_details`` carries the
@@ -95,8 +96,8 @@ class RemediationOperationsMixin:
 
         Up to the spawn a failure ran nothing (the executable cannot be
         started) and keeps its own class, so the control plane may resubmit.
-        From the spawn on, a killed installer or a probe that could not run
-        both leave the node in a state only an operator can read, and are
+        From the spawn on, an installer killed part-way or a probe that could
+        not run both leave the node in a state only an operator can read, and are
         reported as ``InstallOutcomeUnknownError`` -- a clean non-zero exit
         (``RuntimeError`` from ``_run_checked``) and a verification mismatch
         are definite outcomes and pass through as they are.

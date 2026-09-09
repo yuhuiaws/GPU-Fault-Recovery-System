@@ -36,6 +36,8 @@ from ._support import (
 
 INSTALL_TIMEOUT_SECONDS = 1800
 UNKNOWN_OUTCOME_FLAGS = ("outcome_unknown", "manual_confirmation_required")
+# The nvidia-smi query ``_verify_no_clients`` runs before the install spawns.
+CLIENT_PROBE = "--query-compute-apps=gpu_uuid,pid,process_name"
 
 Failure = Callable[[list[str], int | None], BaseException]
 
@@ -54,7 +56,9 @@ class InstallRunner:
     ``install`` names the executable whose spawn is the point of no return;
     ``failure`` is raised for it (a timeout after the spawn, or an OSError in
     place of the spawn), ``verify_failure`` for any command that matches a key
-    of ``answers`` -- the post-install verification probes.
+    of ``answers`` -- the post-install verification probes -- and
+    ``probe_failure`` for the compute-client probe that runs *before* the
+    install.
     """
 
     def __init__(
@@ -64,16 +68,20 @@ class InstallRunner:
         answers: dict[str, str],
         failure: Failure | None = None,
         verify_failure: Failure | None = None,
+        probe_failure: Failure | None = None,
     ) -> None:
         self.install = install
         self.answers = answers
         self.failure = failure
         self.verify_failure = verify_failure
+        self.probe_failure = probe_failure
         self.commands: list[list[str]] = []
 
     def __call__(self, argv, *, timeout=None, **_):
         argv = list(argv)
         self.commands.append(argv)
+        if CLIENT_PROBE in argv and self.probe_failure is not None:
+            raise self.probe_failure(argv, timeout)
         if argv[0] == self.install:
             if self.failure is not None:
                 raise self.failure(argv, timeout)
@@ -302,6 +310,46 @@ def test_a_verification_probe_that_fails_to_run_after_the_install_is_not_retryab
     assert runner.installs() == 1, (
         f"the install must not run a second time for a failed probe: {runner.commands}"
     )
+
+
+@pytest.mark.parametrize(
+    "install",
+    [
+        pytest.param(driver_install, id="driver"),
+        pytest.param(firmware_install, id="firmware"),
+    ],
+)
+def test_a_timed_out_client_probe_before_the_install_stays_retryable(
+    tmp_path, install
+) -> None:
+    """The retryable side of the boundary: nothing was spawned yet.
+
+    ``_verify_no_clients`` runs ``nvidia-smi --query-compute-apps`` before the
+    installer; a slow nvidia-smi there is exactly the ``TimeoutExpired`` the
+    executor is right to call retryable, and the resubmit must be allowed to
+    run the install.
+    """
+
+    agent, runner, signed = install(tmp_path, probe_failure=timeout)
+
+    first = agent.execute(signed)
+
+    assert first.status is NodeActionStatus.FAILED, first
+    assert first.retryable is True, (
+        f"a probe timeout before the spawn must stay retryable: {first.error}"
+    )
+    assert (first.error or "").startswith("TimeoutExpired:"), first.error
+    assert not any(first.details.get(flag) for flag in UNKNOWN_OUTCOME_FLAGS), (
+        f"nothing was installed, so the outcome is not unknown: {first.details}"
+    )
+    assert runner.installs() == 0, (
+        f"the install must not have been spawned: {runner.commands}"
+    )
+    runner.probe_failure = None
+    second = agent.execute(signed)
+    assert second.status is NodeActionStatus.SUCCEEDED, second.error
+    assert second.attempt == 2, second
+    assert runner.installs() == 1, runner.commands
 
 
 def test_a_gpu_reset_timeout_keeps_its_own_classification(tmp_path) -> None:

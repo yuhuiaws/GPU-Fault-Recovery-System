@@ -697,7 +697,9 @@ class NodeActionExecutor(
         # is retryable only while it can mean "the probe was slow": the reset
         # and install handlers convert their own deadline into a RuntimeError
         # (``ResetOutcomeUnknown``, ``InstallOutcomeUnknownError``) before it
-        # gets here, because a killed reset or installer may still be running.
+        # gets here: the reset the driver was asked for keeps going after
+        # nvidia-smi is killed, and an installer killed part-way has left the
+        # node half-applied.
         return isinstance(error, (OSError, TimeoutError, subprocess.TimeoutExpired))
 
 
