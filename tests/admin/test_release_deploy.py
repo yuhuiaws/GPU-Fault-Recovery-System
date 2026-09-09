@@ -1431,10 +1431,12 @@ def test_the_rollback_record_carries_the_engines_inflight_install_verdict(
 def test_a_rollback_record_says_when_the_engine_left_no_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An engine that predates the verdict (or a rollback re-entered after
-    ``rollback-cpu-restored``, which skips the gate) leaves no
-    ``inflight_installs`` in its state; the record must say so rather than
-    imply the check passed."""
+    """An engine that predates the verdict leaves no ``inflight_installs`` in
+    its state; the record must say so rather than imply the check passed. It
+    must not blame a rollback re-entered after ``rollback-cpu-restored``: that
+    re-entry skips the gate but the FIRST attempt's verdict stays in the state
+    (with its ``checked_at``), so the state is not empty there (fix round 4,
+    LOW-4)."""
 
     site = _site(tmp_path, monkeypatch)
 
@@ -1445,4 +1447,8 @@ def test_a_rollback_record_says_when_the_engine_left_no_verdict(
     assert verdict["verdict"] == "unrecorded"
     assert "inflight_installs" in verdict["reason"], (
         "the reason names the missing engine-state key"
+    )
+    assert "predates" in verdict["reason"], "the one cause that leaves no verdict"
+    assert "re-enter" not in verdict["reason"], (
+        "a re-entry keeps the first attempt's verdict; it is not unrecorded"
     )

@@ -20,27 +20,44 @@ control-plane Pod:
 
   What the check could not establish is classified by WHERE it failed. The
   probe is exec'd through a shell wrapper that prints an exit marker after it,
-  whatever it did, so its output proves whether the probe process ran at all.
-  Only a probe that provably never ran -- no Running control-plane Pod in any
-  role, or ``kubectl`` failing before the wrapper answered -- is
-  ``StoreUnreachable``; that is the one failure the AUTOMATIC rollback proceeds
-  over, logging ``inflight-installs-unchecked`` loudly, because its primary
-  scenario is a control plane that is down (CrashLoop, broken wheel), a dead
-  control plane dispatches nothing, and wedging production in ``failed`` is the
-  worse failure. Everything after the probe started -- it exited non-zero, it
-  printed no JSON, it reported its own ``probe_error`` (a fresh connection
-  failing in the Aurora window while the Pod's warm pool still dispatches), it
-  hung past the timeout, its scan was unbounded -- is an evidence defect and
-  refuses in every mode, consent included: the store did not say "clear".
+  whatever it did, so its output proves whether the probe process ran at all;
+  the Pod list carries each container's ``ready`` flag, so the engine knows
+  whether the Pod it could not enter was a live dispatcher. Three classes:
+
+  * ``StoreUnreachable`` -- the probe provably never ran AND nothing could have
+    been dispatching: no Running control-plane Pod in any role, or ``kubectl
+    exec`` failing before the wrapper answered on Pods with NO ready container
+    (CrashLoopBackOff, ContainerCreating, terminating). The one failure the
+    AUTOMATIC rollback proceeds over, logging ``inflight-installs-unchecked``
+    loudly: its primary scenario is a control plane that is down (broken
+    wheel), a dead control plane dispatches nothing, and wedging production in
+    ``failed`` is the worse failure.
+  * ``KubectlFailure`` -- a live control plane the engine could not ask:
+    ``kubectl exec`` failed before the wrapper answered on a Pod with a READY
+    container (kubelet down or the node partitioned while the API server still
+    reports Running, a deploy-host identity without ``pods/exec``, an image
+    without ``sh``), or ``get pod`` itself failed (API server unreachable,
+    expired ``aws eks get-token``, no list RBAC). The ready Pod's warm pool may
+    still be dispatching, so this refuses in every mode, automatic rollback
+    included. The consent variable MAY override it -- a transport / RBAC fault
+    is something the operator can verify by hand -- and the log then says
+    exactly what was skipped and why.
+  * Evidence defects -- everything after the probe started: it exited non-zero
+    (its output is then not trusted even when it parses), it printed no JSON,
+    it reported its own ``probe_error`` (a fresh connection failing in the
+    Aurora window while the Pod's warm pool still dispatches), it hung past the
+    timeout, its scan was unbounded. Refuse in every mode, consent included:
+    the store did not say "clear", and the cause has to be fixed.
 
   ``--allow-inflight-installs`` on ``gpu-fault-admin deploy`` is the operator's
-  consent to proceed over a LISTED in-flight set, or over a store no Pod could
-  answer for; it travels down the deploy's process chain as
-  ``GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS`` like the other release-engine
-  consents. The engine's own ``rollback`` mode has no flag, so a refusal there
-  names the variable instead. The gate returns a verdict (``checked`` /
-  ``verdict`` / ``reason`` / ``steps``) the rollback persists with its first
-  checkpoint and the release driver copies into its own record.
+  consent to proceed over a LISTED in-flight set, over a store no Pod could
+  answer for, or over a kubectl-level failure; it travels down the deploy's
+  process chain as ``GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS`` like the other
+  release-engine consents. The engine's own ``rollback`` mode has no flag, so a
+  refusal there names the variable instead. The gate returns a verdict
+  (``checked`` / ``verdict`` / ``reason`` / ``steps`` / ``checked_at``) that
+  both the upgrade and the rollback persist with their first checkpoint and
+  the release driver copies into its own record.
 """
 
 from __future__ import annotations
@@ -49,6 +66,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from gpu_fault_release import regional_deployment_inventory as inventory
@@ -92,9 +110,14 @@ PROBE_EXIT_MARKER = "__GPU_FAULT_PROBE_EXIT"
 # on import reaches the log; the marker echo makes the wrapper itself exit 0,
 # which is what lets ``Runner.run`` hand the output back instead of raising.
 PROBE_WRAPPER = f'{CONTROL_PLANE_PYTHON} - 2>&1; echo "{PROBE_EXIT_MARKER}=$?"'
-# Every Running Pod of a role, one name per line (tests key on this selector to
-# answer the gate's ``get pod`` as a healthy control plane would).
-RUNNING_PODS_JSONPATH = 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}'
+# Every Running Pod of a role, one per line: its name, a tab, then the
+# ``ready`` flag of each of its containers (space-separated; empty for a Pod
+# whose containers have no status yet). Tests key on this selector to answer
+# the gate's ``get pod`` as a healthy control plane would.
+RUNNING_PODS_JSONPATH = (
+    'jsonpath={range .items[*]}{.metadata.name}{"\\t"}'
+    '{.status.containerStatuses[*].ready}{"\\n"}{end}'
+)
 # How much of the probe's non-JSON output a refusal quotes.
 _OUTPUT_TAIL = 600
 _CHECK = "the in-flight install check"
@@ -147,15 +170,38 @@ class InflightInstallsRefused(ReleaseError):
 
 
 class StoreUnreachable(ReleaseError):
-    """The probe provably never ran: no Running control-plane Pod in any role,
-    or ``kubectl`` failed before the wrapper could print its exit marker.
+    """The probe provably never ran and nothing could have been dispatching: no
+    Running control-plane Pod in any role, or ``kubectl exec`` failed before the
+    wrapper could print its exit marker on Pods with NO ready container
+    (CrashLoopBackOff, ContainerCreating, terminating).
 
     The one failure an automatic rollback (or the consent) may proceed over.
-    Everything that happens after the probe started -- a non-zero exit, no
+    A Pod with a ready container that kubectl could not enter is not this -- it
+    is ``KubectlFailure``, a live dispatcher the engine could not ask. And
+    everything that happens after the probe started -- a non-zero exit, no
     JSON, a ``probe_error``, a hang, an unbounded scan -- is evidence, raised as
     a plain ``ReleaseError``, and refuses in every mode: the store answered, and
     the answer was not "clear".
     """
+
+
+class KubectlFailure(ReleaseError):
+    """A live control plane the engine could not ask, because ``kubectl`` --
+    not the store -- failed: ``exec`` into a Pod with a READY container failed
+    before the wrapper answered (kubelet down or the node partitioned while the
+    API server still reports Running, a deploy-host identity without
+    ``pods/exec``, an image without ``sh``), or ``get pod`` itself failed (API
+    server unreachable, expired ``aws eks get-token``, no list RBAC).
+
+    Refuses in every mode, the automatic rollback included: the ready Pod's warm
+    pool may be dispatching right now. The consent variable may override it (a
+    transport / RBAC fault is checkable by hand, unlike a probe defect); the
+    narration then carries ``short`` so the log says what was skipped.
+    """
+
+    def __init__(self, message: str, *, short: str) -> None:
+        super().__init__(message)
+        self.short = short
 
 
 def inflight_installs_allowed(environment: dict[str, str] | None = None) -> bool:
@@ -168,36 +214,54 @@ def inflight_installs_allowed(environment: dict[str, str] | None = None) -> bool
     )
 
 
-def _running_pods(release: Any, deployment: str) -> list[str]:
-    """Every Running Pod of ``deployment`` -- not only ``items[0]``: a stuck
-    rollout leaves the old ReplicaSet's Pod Running beside the new CrashLooping
-    one, and the old Pod is the one still dispatching."""
+def _running_pods(release: Any, deployment: str) -> list[tuple[str, bool]]:
+    """Every Running Pod of ``deployment`` with whether any container of it is
+    ready -- not only ``items[0]``: a stuck rollout leaves the old ReplicaSet's
+    Pod Running beside the new CrashLooping one, and the old Pod is the one
+    still dispatching. ``ready`` decides what a ``kubectl exec`` failure on the
+    Pod means (``_exec_store_probe``). Raises ``KubectlFailure`` when the list
+    itself fails: that is the API server or the kubeconfig, not the store.
+    """
 
-    listed = release.runner.run(
-        release._cpu(
-            "-n",
-            release.config.namespace,
-            "get",
-            "pod",
-            "-l",
-            f"app={deployment}",
-            "--field-selector=status.phase=Running",
-            "-o",
-            RUNNING_PODS_JSONPATH,
-        ),
-        capture=True,
-    )
-    return [name for name in str(listed or "").split() if name]
+    try:
+        listed = release.runner.run(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "pod",
+                "-l",
+                f"app={deployment}",
+                "--field-selector=status.phase=Running",
+                "-o",
+                RUNNING_PODS_JSONPATH,
+            ),
+            capture=True,
+        )
+    except ReleaseError as exc:
+        raise KubectlFailure(
+            f"kubectl could not list control-plane Pods for role {deployment}: "
+            f"{exc} -- the API server or kubeconfig, not the store",
+            short="kubectl could not list the control-plane Pods",
+        ) from exc
+    pods: list[tuple[str, bool]] = []
+    for line in str(listed or "").splitlines():
+        name, _tab, readiness = line.strip().partition("\t")
+        if name:
+            pods.append((name, "true" in readiness.split()))
+    return pods
 
 
 def _exec_probe_in_pod(release: Any, pod: str, script: str) -> str:
     """One run of the wrapped probe in ``pod``; returns the wrapper's stdout.
 
-    Raises ``StoreUnreachable`` when ``kubectl`` failed before the wrapper
+    Raises ``KubectlFailure`` when ``kubectl`` failed before the wrapper
     answered (the wrapper itself always exits 0, so a non-zero exit is
-    kubectl's: API server unreachable, container not running) and a plain
-    ``ReleaseError`` when the exec started and hung past the timeout -- the
-    store did not answer in time, which is an answer of sorts.
+    kubectl's: API server unreachable, container not running, no exec RBAC);
+    the caller decides from the Pod's readiness whether that is an unreachable
+    store or a live dispatcher it could not ask. Raises a plain ``ReleaseError``
+    when the exec started and hung past the timeout -- the store did not answer
+    in time, which is an answer of sorts.
     """
 
     try:
@@ -226,21 +290,25 @@ def _exec_probe_in_pod(release: Any, pod: str, script: str) -> str:
                 f"{_CHECK} did not answer within {PROBE_TIMEOUT_SECONDS:.0f} s in "
                 f"{pod}: the control-plane store is not answering"
             ) from exc
-        raise StoreUnreachable(f"{pod}: {exc}") from exc
+        raise KubectlFailure(str(exc), short="exec failed on a ready Pod") from exc
 
 
 def _exec_store_probe(release: Any, *, script: str, failure: str) -> str:
     """Run the wrapped probe in the first Running control-plane Pod that lets it
     start: the ingress role first (the one an upgrade rolls), then every other
     role, every Running Pod of each. The consumer roles run the same wheel
-    against the same store and answer the same probe.
+    against the same store and answer the same probe. First evidence wins.
 
-    Raises ``StoreUnreachable`` naming every Pod and role tried when the probe
-    could not be started anywhere; a timeout propagates at once (the roles read
-    the same store, and each would cost the whole window again).
+    When no Pod produced the marker: ``KubectlFailure`` if any role's list
+    failed or any Pod with a ready container refused the exec (a live control
+    plane the engine could not ask), else ``StoreUnreachable`` naming every Pod
+    and role tried (nothing was dispatching). A timeout propagates at once (the
+    roles read the same store, and each would cost the whole window again).
     """
 
-    errors: list[str] = []
+    unreachable: list[str] = []
+    kubectl: list[str] = []
+    exec_failed_on_ready = False
     roles = [
         inventory.CPU_INGRESS_DEPLOYMENT,
         *(
@@ -250,17 +318,41 @@ def _exec_store_probe(release: Any, *, script: str, failure: str) -> str:
         ),
     ]
     for deployment in roles:
-        pods = _running_pods(release, deployment)
-        if not pods:
-            errors.append(f"{deployment}: no Running Pod")
+        try:
+            pods = _running_pods(release, deployment)
+        except KubectlFailure as exc:
+            kubectl.append(str(exc))
             continue
-        for pod in pods:
+        if not pods:
+            unreachable.append(f"{deployment}: no Running Pod")
+            continue
+        for pod, ready in pods:
             try:
                 return _exec_probe_in_pod(release, pod, script)
-            except StoreUnreachable as exc:
-                errors.append(f"{deployment}: {exc}")
+            except KubectlFailure as exc:
+                if ready:
+                    exec_failed_on_ready = True
+                    kubectl.append(
+                        f"{deployment}/{pod} is Running with a ready container, "
+                        f"but kubectl exec failed before the probe started: {exc}"
+                    )
+                else:
+                    unreachable.append(
+                        f"{deployment}/{pod} has no ready container: {exc}"
+                    )
+    if kubectl:
+        raise KubectlFailure(
+            f"{failure} could not ask a live control plane -- kubectl failed, not "
+            "the store: " + "; ".join([*kubectl, *unreachable]),
+            short=(
+                "exec failed on a ready Pod"
+                if exec_failed_on_ready
+                else "kubectl could not list the control-plane Pods"
+            ),
+        )
     raise StoreUnreachable(
-        f"{failure} could not reach any Running control-plane Pod: " + "; ".join(errors)
+        f"{failure} could not reach any Running control-plane Pod: "
+        + "; ".join(unreachable)
     )
 
 
@@ -305,12 +397,17 @@ def _parse_probe_output(raw: str) -> dict[str, Any]:
                     f"{_CHECK} probe reported an error instead of evidence: "
                     f"{document['probe_error']}"
                 )
+            if exit_code:
+                # It printed a snapshot and then died (an exception after the
+                # print, a killed interpreter): not the run it meant to finish.
+                break
             if isinstance(document.get("inflight"), list):
                 return document
             break
     if exit_code:
         raise ReleaseError(
-            f"{_CHECK} probe exited {exit_code} without evidence: {_tail(body)}"
+            f"{_CHECK} probe exited {exit_code}; its evidence is not trusted: "
+            f"{_tail(body)}"
         )
     raise ReleaseError(
         f"{_CHECK} returned invalid evidence (no JSON object with an 'inflight' "
@@ -328,11 +425,13 @@ def _tail(lines: list[str]) -> str:
 def inflight_install_snapshot(release: Any) -> dict[str, Any]:
     """One store read: the in-flight install steps, as the probe reports them.
 
-    Raises ``StoreUnreachable`` when the probe provably never ran -- the store
-    did not answer -- and a plain ``ReleaseError`` for a defect in evidence the
-    probe did return (non-zero exit, no JSON, ``probe_error``, unbounded scan)
-    or a hang. The caller treats only the first as "unreadable"; the second is
-    an answer and is binding.
+    Raises ``StoreUnreachable`` when the probe provably never ran and nothing
+    was dispatching, ``KubectlFailure`` when a live control plane could not be
+    asked (kubectl, not the store, failed), and a plain ``ReleaseError`` for a
+    defect in evidence the probe did return (non-zero exit, no JSON,
+    ``probe_error``, unbounded scan) or a hang. The caller treats only the first
+    as "unreadable", the second as refusable-but-consentable, the third as an
+    answer that is binding.
     """
 
     raw = _exec_store_probe(
@@ -391,6 +490,10 @@ def _verdict(
         "verdict": verdict,
         "reason": reason,
         "steps": steps,
+        # A rollback re-entered after ``rollback-cpu-restored`` skips the gate
+        # and leaves the FIRST attempt's verdict in the state; the reader needs
+        # to know how old it is. UTC, ISO-8601, like the driver's record.
+        "checked_at": datetime.now(timezone.utc).isoformat(),
     }
     if snapshot is not None:
         record["inflight_count"] = int(snapshot.get("inflight_count") or 0)
@@ -412,16 +515,21 @@ def require_no_inflight_installs(
     ``rollback``). ``unreadable`` is what a store that could not be reached
     means: ``refuse`` (manual upgrade and rollback: fail closed, the env lever
     opens it) or ``proceed`` (the automatic rollback: log and go on). Only a
-    probe that provably never ran is "unreadable" (``StoreUnreachable``);
-    evidence the probe did return -- an in-flight install, an unbounded scan,
-    a non-zero exit, no JSON, its own ``probe_error``, a hang -- is binding in
-    every mode. The operator's explicit consent covers the listed in-flight set
-    and the unreachable store, never an evidence defect: a check that ran and
-    could not vouch for anything has a cause to fix, not a flag to pass.
+    probe that provably never ran on a control plane with no ready Pod is
+    "unreadable" (``StoreUnreachable``). A live control plane kubectl could not
+    ask (``KubectlFailure``: exec refused on a ready Pod, or the Pod list
+    failed) refuses in every mode, automatic included, and the consent may
+    override it. Evidence the probe did return -- an in-flight install, an
+    unbounded scan, a non-zero exit, no JSON, its own ``probe_error``, a hang --
+    is binding in every mode. The operator's explicit consent thus covers the
+    listed in-flight set, the unreachable store and the kubectl-level failure,
+    never an evidence defect: a check that ran and could not vouch for anything
+    has a cause to fix, not a flag to pass.
 
     The verdict is ``{"checked", "verdict": clear|unchecked|overridden,
-    "reason", "steps", ...}``; the caller persists it (the rollback with its
-    first checkpoint, the release driver in its rollback record).
+    "reason", "steps", "checked_at", ...}``; the caller persists it (the upgrade
+    and the rollback with their first checkpoint, the release driver in its
+    rollback record).
     """
 
     allowed = inflight_installs_allowed()
@@ -450,6 +558,30 @@ def require_no_inflight_installs(
             "handed to a node agent would be submitted a second time by the "
             "control plane this transaction puts in place; retry when the "
             f"control plane answers, or {_lever(action)} without the check"
+        ) from exc
+    except KubectlFailure as exc:
+        # A live control plane the engine could not ask. Not the store's fault
+        # and not the probe's; the consent may open it because the operator can
+        # verify a transport / RBAC fault by hand -- and the log then says what
+        # was skipped in those words, not as "unreachable".
+        if allowed:
+            reason = f"{exc.short}, consent given"
+            narrate_step(
+                "inflight-installs-unchecked",
+                action=action,
+                reason=reason,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return _verdict(
+                "unchecked", checked=False, reason=reason, steps=[], error=str(exc)
+            )
+        raise InflightInstallsRefused(
+            f"{action} refused: {exc}. The control plane is live and could not be "
+            f"asked, so a {_operations()} step already handed to a node agent "
+            "cannot be ruled out; fix kubectl's access to the control-plane Pods "
+            "(the API server, the kubeconfig / aws eks get-token, the deploy "
+            "host's pods/exec RBAC, an image with sh) and retry, or "
+            f"{_lever(action)} without the check"
         ) from exc
     except ReleaseError as exc:
         # The probe ran and the answer cannot be read as "clear": refused in

@@ -44,8 +44,11 @@ module the deployed ``gpu_fault`` lacks -- these are answers of the form "I
 could not read", not "nobody could run me", and the release engine must refuse
 on them. So ``main`` runs under a catch-all that prints
 ``{"probe_error": "<type>: <message>"}`` on stdout and exits 1; the engine's
-shell wrapper marks the exit code either way. Only a failure before this file
-runs at all (no Running Pod, kubectl never reaching one) is silence.
+shell wrapper marks the exit code either way. The ``gpu_fault`` imports live
+inside ``main`` for the same reason: a deployed module without a name this
+file needs is an ImportError the catch-all must see, not a traceback before
+it. Only a failure before this file runs at all (no Running Pod, kubectl never
+reaching one) is silence.
 
 A step is in flight when its index is neither completed nor superseded and its
 latest execution record is absent (PENDING: not yet handed to an adapter) or
@@ -67,25 +70,13 @@ import json
 import sys
 from typing import Any
 
-from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
-
-INSTALL_OPERATIONS = {
-    WorkflowOperation.REMEDIATE_DRIVER,
-    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
-    WorkflowOperation.REMEDIATE_EFA_DRIVER,
-}
-STATUSES = {
-    WorkflowStatus.PENDING,
-    WorkflowStatus.SAFETY_PENDING,
-    WorkflowStatus.RUNNING,
-}
 WINDOW = 1000
 REPORT_LIMIT = 100
 
 
-def step_state(workflow: Any, index: int) -> str | None:
-    """``PENDING`` / ``WAITING`` when the step is in flight, else ``None``."""
+def step_state(workflow: Any, index: int, waiting: Any) -> str | None:
+    """``PENDING`` / ``WAITING`` when the step is in flight, else ``None``.
+    ``waiting`` is ``WorkflowStepStatus.WAITING`` of the deployed module."""
 
     if index in set(workflow.completed_step_indexes) or index in set(
         workflow.superseded_step_indexes
@@ -97,21 +88,34 @@ def step_state(workflow: Any, index: int) -> str | None:
             latest = execution
     if latest is None:
         return "PENDING"
-    if latest.status is WorkflowStepStatus.WAITING:
+    if latest.status is waiting:
         return "WAITING"
     return None
 
 
 def main() -> None:
+    from gpu_fault.app import ApplicationContext
+    from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
+
+    install_operations = {
+        WorkflowOperation.REMEDIATE_DRIVER,
+        WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+        WorkflowOperation.REMEDIATE_EFA_DRIVER,
+    }
+    statuses = {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.SAFETY_PENDING,
+        WorkflowStatus.RUNNING,
+    }
     store = ApplicationContext.from_environment().store
-    rows = list(store.list_workflows(statuses=STATUSES, limit=WINDOW + 1))
+    rows = list(store.list_workflows(statuses=statuses, limit=WINDOW + 1))
     inflight: list[dict[str, Any]] = []
     for workflow in rows:
         for index, step in enumerate(workflow.official_steps):
-            if step.operation not in INSTALL_OPERATIONS:
+            if step.operation not in install_operations:
                 continue
             try:
-                state = step_state(workflow, index)
+                state = step_state(workflow, index, WorkflowStepStatus.WAITING)
             except Exception:
                 state = "UNKNOWN"
             if state is None:

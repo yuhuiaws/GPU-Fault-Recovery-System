@@ -76,7 +76,7 @@ class RecordingRunner:
     def run(self, args, **kwargs):
         self.calls.append((args, kwargs))
         if GATE.RUNNING_PODS_JSONPATH in args:
-            return "cpu-pod-a"
+            return "cpu-pod-a\ttrue"
         if GATE.PROBE_WRAPPER in args:
             clear = {"inflight": [], "inflight_count": 0, "bounded": True, "scanned": 0}
             return f"{json.dumps(clear)}\n{GATE.PROBE_EXIT_MARKER}=0"
@@ -296,6 +296,10 @@ def test_rollback_uses_previous_executor_and_node_pins(
 
     release.rollback(state=previous)
 
+    assert release.state["inflight_installs"]["verdict"] == "clear", (
+        "the gate ran for real against the runner's clear snapshot and its "
+        "verdict rode into the rollback's state"
+    )
     assert restore_calls == [
         "registry",
         "publish-registry",

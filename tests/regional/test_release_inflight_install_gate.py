@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,15 +34,6 @@ from typing import Any
 import pytest
 
 from gpu_fault.admin import cli as admin_cli
-from gpu_fault.models import (
-    BlockedKind,
-    WorkflowOperation,
-    WorkflowRequest,
-    WorkflowStatus,
-    WorkflowStepExecution,
-    WorkflowStepSpec,
-    WorkflowStepStatus,
-)
 from gpu_fault.execution.config import NODE_INSTALL_OPERATIONS
 from gpu_fault.operation_registry import GENERATION_STABLE_COMMAND_OPERATIONS
 from gpu_fault_release import regional_deployment_inventory as INVENTORY
@@ -109,329 +101,50 @@ def test_the_release_object_binds_the_gate_like_the_other_preflights() -> None:
     )
 
 
-# --- the probe --------------------------------------------------------------------
-
-
-def _workflow(
-    request_id: str,
-    status: WorkflowStatus,
-    steps: list[tuple[WorkflowOperation, list[str]]],
-    *,
-    executions: list[tuple[int, WorkflowStepStatus]] = (),
-    completed: list[int] = (),
-    superseded: list[int] = (),
-) -> WorkflowRequest:
-    return WorkflowRequest(
-        request_id=request_id,
-        incident_id=f"incident-{request_id}",
-        status=status,
-        fencing_token=1,
-        official_steps=[
-            WorkflowStepSpec(
-                operation=operation, execution_owner="regional", node_ids=node_ids
-            )
-            for operation, node_ids in steps
-        ],
-        step_executions=[
-            WorkflowStepExecution(
-                step_index=index, operation=steps[index][0], status=step_status
-            )
-            for index, step_status in executions
-        ],
-        completed_step_indexes=list(completed),
-        superseded_step_indexes=list(superseded),
-    )
-
-
-def _run_probe(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    workflows: list[WorkflowRequest],
-) -> dict[str, Any]:
-    from gpu_fault.app import ApplicationContext
-
-    asked: list[tuple[set[WorkflowStatus], int]] = []
-
-    def list_workflows(statuses=None, *, limit=100, **_kwargs):
-        asked.append((set(statuses or ()), limit))
-        rows = [workflow for workflow in workflows if workflow.status in statuses]
-        return rows[:limit]
-
-    context = SimpleNamespace(store=SimpleNamespace(list_workflows=list_workflows))
-    monkeypatch.setattr(
-        ApplicationContext, "from_environment", classmethod(lambda cls: context)
-    )
-    exec(  # noqa: S102 - the probe is a program, this is how the Pod runs it
-        compile(PROBES.probe_source("inflight_installs"), "inflight_installs", "exec"),
-        {"__name__": "__probe__"},
-    )
-    result = json.loads(capsys.readouterr().out)
-    assert len(asked) == 1, "one store read, not one per workflow"
-    # Executable statuses only: BLOCKED is never archived and grows without
-    # bound, and (pinned below) never holds an official install step mid-flight.
-    assert asked[0][0] == {
-        WorkflowStatus.PENDING,
-        WorkflowStatus.SAFETY_PENDING,
-        WorkflowStatus.RUNNING,
-    }
-    assert asked[0][1] == 1001, "one row past the 1000-row window proves overflow"
-    return result
-
-
-def test_the_probe_reports_pending_and_waiting_install_steps_with_their_nodes(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    pending = _workflow(
-        "wf-pending",
-        WorkflowStatus.PENDING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-a"])],
-    )
-    waiting = _workflow(
-        "wf-waiting",
-        WorkflowStatus.RUNNING,
-        [
-            (WorkflowOperation.QUIESCE_GPU_SERVICES, ["node-b"]),
-            (WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE, ["node-b"]),
-        ],
-        executions=[(0, WorkflowStepStatus.SUCCEEDED), (1, WorkflowStepStatus.WAITING)],
-        completed=[0],
-    )
-
-    result = _run_probe(monkeypatch, capsys, [pending, waiting])
-
-    assert result["inflight_count"] == 2
-    by_id = {item["workflow_id"]: item for item in result["inflight"]}
-    assert by_id["wf-pending"]["operation"] == "REMEDIATE_DRIVER"
-    assert by_id["wf-pending"]["node_ids"] == ["node-a"]
-    assert by_id["wf-pending"]["step_status"] == "PENDING"
-    assert by_id["wf-waiting"]["operation"] == "UPDATE_SOFTWARE_FIRMWARE"
-    assert by_id["wf-waiting"]["node_ids"] == ["node-b"]
-    assert by_id["wf-waiting"]["step_index"] == 1
-    assert by_id["wf-waiting"]["step_status"] == "WAITING"
-
-
-def test_the_probe_ignores_finished_failed_superseded_and_unrelated_steps(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    done = _workflow(
-        "wf-done",
-        WorkflowStatus.RUNNING,
-        [
-            (WorkflowOperation.REMEDIATE_EFA_DRIVER, ["node-c"]),
-            (WorkflowOperation.RESTORE_GPU_SERVICES, ["node-c"]),
-        ],
-        executions=[(0, WorkflowStepStatus.SUCCEEDED)],
-        completed=[0],
-    )
-    failed = _workflow(
-        "wf-failed",
-        WorkflowStatus.RUNNING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-d"])],
-        executions=[(0, WorkflowStepStatus.FAILED)],
-    )
-    superseded = _workflow(
-        "wf-superseded",
-        WorkflowStatus.RUNNING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-e"])],
-        superseded=[0],
-    )
-    unrelated = _workflow(
-        "wf-reset", WorkflowStatus.RUNNING, [(WorkflowOperation.RESET_GPU, ["node-f"])]
-    )
-    terminal = _workflow(
-        "wf-succeeded",
-        WorkflowStatus.SUCCEEDED,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-g"])],
-    )
-
-    result = _run_probe(
-        monkeypatch, capsys, [done, failed, superseded, unrelated, terminal]
-    )
-
-    assert result == {
-        "inflight": [],
-        "inflight_count": 0,
-        "bounded": True,
-        "scanned": 4,
-    }
-
-
-def test_the_probe_reports_its_own_failure_as_evidence(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The HIGH-1 scenario of fix round 3: the Pod is Running and its warm
-    connection pool keeps dispatching, but the probe's FRESH store connection
-    fails (Aurora rotation window). That is not "the store did not answer"; it
-    is the probe answering "I could not read". It must reach stdout as JSON so
-    the gate can refuse on it instead of reading a bare exit 1 as transport."""
-
-    from gpu_fault.app import ApplicationContext
-
-    def from_environment(cls):
-        raise ConnectionError("password authentication failed for user gpu_fault")
-
-    monkeypatch.setattr(
-        ApplicationContext, "from_environment", classmethod(from_environment)
-    )
-
-    with pytest.raises(SystemExit) as exit_status:
-        exec(  # noqa: S102 - the probe is a program, this is how the Pod runs it
-            compile(
-                PROBES.probe_source("inflight_installs"), "inflight_installs", "exec"
-            ),
-            {"__name__": "__probe__"},
-        )
-
-    assert exit_status.value.code == 1, "the probe ran and failed: non-zero"
-    reported = json.loads(capsys.readouterr().out)
-    assert reported["probe_error"].startswith("ConnectionError: "), reported
-    assert "password authentication failed" in reported["probe_error"]
-    assert "inflight" not in reported, "a failed read must not look like evidence"
-
-
-def test_blocked_workflows_are_not_scanned(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """BLOCKED is excluded because no DISPATCHED BLOCKED row is ever reopened,
-    not because it cannot hold an install execution (it can, see the next
-    test). ``executor.py`` returns the recorded result for SUCCEEDED / BLOCKED /
-    SUPERSEDED without executing; the operator levers close a BLOCKED row to
-    SUPERSEDED and refuse rows that were already dispatched. The one writer
-    that does rewrite BLOCKED to PENDING -- ``node_lifecycle._state`` merging a
-    second node fault into an aggregation window -- only reaches a row whose
-    ``not_before`` is still in the future and that has no execution owner, i.e.
-    a row the dispatcher has never claimed, so it can carry no install execution
-    (pinned in ``tests/orchestration/test_replacement_merge_reopens_only_undis-
-    patched.py``). So no control plane -- old or new -- will ever derive a
-    command id for a dispatched step in a BLOCKED row again, and the
-    double-submit this gate exists for cannot start there. The table is also
-    never archived, which is what let the newest RUNNING row fall past the
-    window when BLOCKED was scanned (F1)."""
-
-    blocked = _workflow(
-        "wf-blocked-waiting",
-        WorkflowStatus.BLOCKED,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-i"])],
-        executions=[(0, WorkflowStepStatus.WAITING)],
-    )
-
-    result = _run_probe(monkeypatch, capsys, [blocked])
-
-    assert result["inflight"] == []
-    assert result["bounded"] is True
-
-
-def test_a_blocked_internal_error_row_with_a_waiting_install_is_not_counted(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A RUNNING workflow CAN end up BLOCKED with a WAITING install execution:
-    ``dispatcher._block_after_internal_error`` blocks a mid-dispatch
-    ValidationError as ``BlockedKind.INTERNAL_ERROR`` and ``terminalize_claimed``
-    leaves ``step_executions`` intact (``workflow_resolution`` and the postgres
-    open-predecessor SQL both know this shape). The node agent may still be
-    installing -- but no control plane will ever re-derive that step's command
-    id (a BLOCKED row is never re-executed), so the old/new command-id shape
-    cannot produce a second submit for it. Not in flight for this gate."""
-
-    blocked = _workflow(
-        "wf-internal-error",
-        WorkflowStatus.BLOCKED,
-        [
-            (WorkflowOperation.QUIESCE_GPU_SERVICES, ["node-m"]),
-            (WorkflowOperation.REMEDIATE_DRIVER, ["node-m"]),
-        ],
-        executions=[(0, WorkflowStepStatus.SUCCEEDED), (1, WorkflowStepStatus.WAITING)],
-        completed=[0],
-    ).model_copy(
-        update={
-            "blocked_kind": BlockedKind.INTERNAL_ERROR,
-            "blocked_reasons": ["dispatcher internal error: ValidationError"],
-        }
-    )
-    running_sibling = _workflow(
-        "wf-running",
-        WorkflowStatus.RUNNING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-n"])],
-        executions=[(0, WorkflowStepStatus.WAITING)],
-    )
-
-    result = _run_probe(monkeypatch, capsys, [blocked, running_sibling])
-
-    assert [item["workflow_id"] for item in result["inflight"]] == ["wf-running"]
-
-
-def test_a_transiently_succeeded_execution_is_not_in_flight(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Between the agent's success and ``completed_step_indexes`` there is a
-    window where the latest execution says SUCCEEDED; the node is done, so the
-    step is not in flight (F5)."""
-
-    finished = _workflow(
-        "wf-finished",
-        WorkflowStatus.RUNNING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-j"])],
-        executions=[(0, WorkflowStepStatus.SUCCEEDED)],
-    )
-
-    result = _run_probe(monkeypatch, capsys, [finished])
-
-    assert result == {
-        "inflight": [],
-        "inflight_count": 0,
-        "bounded": True,
-        "scanned": 1,
-    }
-
-
-def test_more_rows_than_the_window_is_reported_as_unbounded_not_as_zero(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """``list_workflows`` is oldest-first; with more executable rows than the
-    window the newest RUNNING install would fall off the end and the probe used
-    to print 0 -- failing open. Now it says it could not bound the scan."""
-
-    old = [
-        _workflow(
-            f"wf-old-{index}",
-            WorkflowStatus.PENDING,
-            [(WorkflowOperation.RESET_GPU, ["node-k"])],
-        )
-        for index in range(1001)
-    ]
-    newest = _workflow(
-        "wf-newest-install",
-        WorkflowStatus.RUNNING,
-        [(WorkflowOperation.REMEDIATE_DRIVER, ["node-z"])],
-        executions=[(0, WorkflowStepStatus.WAITING)],
-    )
-
-    result = _run_probe(monkeypatch, capsys, [*old, newest])
-
-    assert result["bounded"] is False
-    assert result["scanned"] == 1001
-    assert result["inflight_count"] == 0, "the install fell past the window"
-
-
 # --- the gate ---------------------------------------------------------------------
 
 
+def _pods(*pods: tuple[str, bool]) -> str:
+    """What the gate's ``get pod`` prints: one Running Pod per line, its name,
+    a tab, then the ``ready`` flag of each container (``true false`` for a Pod
+    with one ready and one crashing container; nothing at all for a Pod whose
+    containers have no status yet)."""
+
+    return "\n".join(
+        f"{name}\t{'true' if ready else 'false'}" if ready is not None else name
+        for name, ready in pods
+    )
+
+
 class Runner:
-    """Every control-plane role has one Running Pod (``cpu-pod``); every exec
-    answers the same way: a string is what ``kubectl exec`` printed, an
-    exception is what ``Runner.run`` raised (kubectl exited non-zero, or timed
-    out)."""
+    """Every control-plane role has one Running Pod (``cpu-pod``, ``ready``
+    unless said otherwise); every exec answers the same way: a string is what
+    ``kubectl exec`` printed, an exception is what ``Runner.run`` raised
+    (kubectl exited non-zero, or timed out). ``list_error`` is what ``get pod``
+    itself raises (API server unreachable, expired token, no list RBAC)."""
 
     dry_run = False
 
-    def __init__(self, result: str | Exception) -> None:
+    def __init__(
+        self,
+        result: str | Exception,
+        *,
+        ready: bool = True,
+        list_error: Exception | None = None,
+    ) -> None:
         self.result = result
+        self.ready = ready
+        self.list_error = list_error
         self.execs: list[list[str]] = []
         self.exec_kwargs: list[dict[str, Any]] = []
+        self.lists = 0
 
     def run(self, args, **kwargs):
         if "get" in args and "pod" in args:
-            return "cpu-pod"
+            self.lists += 1
+            if self.list_error is not None:
+                raise self.list_error
+            return _pods(("cpu-pod", self.ready))
         self.execs.append(list(args))
         self.exec_kwargs.append(kwargs)
         if isinstance(self.result, Exception):
@@ -442,9 +155,11 @@ class Runner:
         return True
 
 
-def _release(result: str | Exception) -> SimpleNamespace:
+def _release(
+    result: str | Exception, *, ready: bool = True, list_error: Exception | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
-        runner=Runner(result),
+        runner=Runner(result, ready=ready, list_error=list_error),
         config=SimpleNamespace(namespace=NAMESPACE),
         _cpu=lambda *args: ["kubectl", *args],
     )
@@ -479,8 +194,9 @@ def _timed_out() -> MODULE.ReleaseError:
 
 
 class RoleRunner:
-    """Resolves one Running Pod per control-plane Deployment and answers an exec
-    per Pod: a string is stdout, an exception is what ``kubectl exec`` raised."""
+    """Resolves the Running Pods of each control-plane Deployment (``pods`` maps
+    the role to what ``get pod`` prints, see ``_pods``) and answers an exec per
+    Pod: a string is stdout, an exception is what ``kubectl exec`` raised."""
 
     dry_run = False
 
@@ -582,6 +298,8 @@ def test_no_in_flight_install_lets_the_transaction_proceed_quietly(
 
     result = GATE.require_no_inflight_installs(_release(_snapshot()), action="upgrade")
 
+    checked_at = result.pop("checked_at")
+    assert datetime.fromisoformat(checked_at).utcoffset() == timedelta(0), checked_at
     assert result == {
         "checked": True,
         "verdict": "clear",
@@ -591,6 +309,40 @@ def test_no_in_flight_install_lets_the_transaction_proceed_quietly(
         "scanned": 0,
     }
     assert capsys.readouterr().err == ""
+
+
+def test_every_verdict_says_when_it_was_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback re-entered after ``rollback-cpu-restored`` skips the gate and
+    leaves the FIRST attempt's verdict in the state; a reader has to be able to
+    tell how old it is (fix round 4, LOW-4). UTC, ISO-8601, with the offset."""
+
+    before = datetime.now(timezone.utc)
+    monkeypatch.delenv(ENV, raising=False)
+    verdicts = [
+        GATE.require_no_inflight_installs(_release(_snapshot()), action="upgrade"),
+        GATE.require_no_inflight_installs(
+            _no_pod_release(), action="rollback", unreadable="proceed"
+        ),
+    ]
+    monkeypatch.setenv(ENV, "1")
+    verdicts.append(
+        GATE.require_no_inflight_installs(
+            _release(_snapshot(DRIVER_STEP)), action="upgrade"
+        )
+    )
+
+    assert [verdict["verdict"] for verdict in verdicts] == [
+        "clear",
+        "unchecked",
+        "overridden",
+    ]
+    for verdict in verdicts:
+        checked_at = datetime.fromisoformat(verdict["checked_at"])
+        assert checked_at.tzinfo is not None, "the timestamp carries its offset"
+        assert checked_at.utcoffset() == timedelta(0), "UTC, like the driver's record"
+        assert before <= checked_at <= datetime.now(timezone.utc), verdict
 
 
 def test_the_probe_runs_through_a_shell_wrapper_that_marks_its_exit(
@@ -628,7 +380,9 @@ def test_an_unreachable_store_refuses_and_names_the_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(ENV, raising=False)
-    release = _release(MODULE.ReleaseError("command failed (1): kubectl exec"))
+    release = _release(
+        MODULE.ReleaseError("command failed (1): kubectl exec"), ready=False
+    )
 
     with pytest.raises(GATE.InflightInstallsRefused) as failure:
         GATE.require_no_inflight_installs(release, action="upgrade")
@@ -882,19 +636,20 @@ def test_a_hung_probe_refuses_instead_of_hanging_the_engine(
     assert len(release.runner.execs) == 2, "one exec per call, no role fallback"
 
 
-def test_a_kubectl_failure_before_the_wrapper_answered_is_unreachable(
+def test_a_kubectl_failure_on_a_pod_with_no_ready_container_is_unreachable(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The wrapper always exits 0, so a non-zero ``kubectl exec`` with no marker
-    on stdout means kubectl never got the wrapper to run: the API server was
-    unreachable, or the Pod is phase Running with its container in
-    CrashLoopBackOff (which is what a broken control-plane wheel looks like).
-    With no marker there is no evidence the probe started, so this stays
-    ``StoreUnreachable`` (the automatic rollback proceeds, logging), and it is
-    tried on every Running Pod of every role first."""
+    on stdout means kubectl never got the wrapper to run. When the Pod is phase
+    Running but NO container of it is ready -- CrashLoopBackOff (a broken
+    control-plane wheel), ContainerCreating, terminating with its containers
+    stopped -- nothing in it dispatches, so there is no evidence the probe
+    started and no dispatcher to have asked: ``StoreUnreachable`` (the
+    automatic rollback proceeds, logging), tried on every Running Pod of every
+    role first."""
 
     monkeypatch.delenv(ENV, raising=False)
-    release = _release(MODULE.ReleaseError("command failed (1): kubectl"))
+    release = _release(MODULE.ReleaseError("command failed (1): kubectl"), ready=False)
 
     result = GATE.require_no_inflight_installs(
         release, action="rollback", unreadable="proceed"
@@ -904,10 +659,179 @@ def test_a_kubectl_failure_before_the_wrapper_answered_is_unreachable(
     assert len(release.runner.execs) == len(INVENTORY.CPU_RUNTIME_DEPLOYMENTS), (
         "every role's Running Pod was tried before giving up"
     )
-    assert "command failed (1): kubectl" in capsys.readouterr().err
+    logged = capsys.readouterr().err
+    assert "command failed (1): kubectl" in logged
+    assert "no ready container" in logged, "the log says why the Pod did not count"
 
     with pytest.raises(GATE.InflightInstallsRefused, match="could not read"):
         GATE.require_no_inflight_installs(release, action="rollback")
+
+
+def test_a_kubectl_failure_on_a_ready_pod_refuses_in_every_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Pod with a READY container is a live dispatcher: its warm pool keeps
+    handing installs to node agents while kubectl cannot get into it -- kubelet
+    down or the node partitioned (the API server reports Running for up to the
+    eviction timeout, ``error dialing backend``), a deploy-host identity without
+    ``pods/exec``, an image without ``sh``. Reading that as "unreachable" let
+    every automatic rollback proceed unchecked over a dispatching control plane
+    (fix round 4, HIGH-1). It is a refusal in every mode, and the message names
+    kubectl / exec / RBAC -- not the store, which was never asked."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    release = _release(MODULE.ReleaseError("command failed (1): kubectl"), ready=True)
+
+    for unreadable in ("refuse", "proceed"):
+        with pytest.raises(GATE.InflightInstallsRefused) as failure:
+            GATE.require_no_inflight_installs(
+                release, action="rollback", unreadable=unreadable
+            )
+        message = str(failure.value)
+        assert "command failed (1): kubectl" in message
+        assert "kubectl" in message and "exec" in message and "RBAC" in message, message
+        assert "ready" in message, "the message says why the Pod counted"
+        assert "could not read the control-plane store" not in message, (
+            "the store was never asked; do not blame it"
+        )
+        assert f"{ENV}=1" in message, (
+            "consent is offered: a transport fault is checkable"
+        )
+        assert isinstance(failure.value.__cause__, GATE.KubectlFailure), failure.value
+        assert not isinstance(failure.value.__cause__, GATE.StoreUnreachable), (
+            "a ready Pod kubectl cannot enter is not an unreachable store"
+        )
+    assert len(release.runner.execs) == 2 * len(INVENTORY.CPU_RUNTIME_DEPLOYMENTS), (
+        "every role's ready Pod was tried before refusing, in both modes"
+    )
+    assert capsys.readouterr().err == "", "a refusal is not logged as unchecked"
+
+
+def test_consent_overrides_a_kubectl_failure_on_a_ready_pod_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unlike a probe defect, a kubectl / RBAC fault is something the operator
+    can check by hand before consenting, so the consent env may open this one.
+    The narration is honest about what was skipped and why."""
+
+    monkeypatch.setenv(ENV, "1")
+    release = _release(MODULE.ReleaseError("command failed (1): kubectl"), ready=True)
+
+    result = GATE.require_no_inflight_installs(release, action="rollback")
+
+    assert result["verdict"] == "unchecked"
+    assert result["checked"] is False
+    assert "exec failed on a ready Pod" in result["reason"], result
+    assert "consent given" in result["reason"], result
+    assert "command failed (1): kubectl" in result["error"]
+    logged = capsys.readouterr().err
+    assert "inflight-installs-unchecked" in logged
+    assert "exec failed on a ready Pod, consent given" in logged, logged
+
+
+def test_one_ready_pod_that_kubectl_cannot_enter_outweighs_the_unready_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck rollout: the new Pod CrashLoops (not ready), the old one is
+    ready and dispatching, and kubectl fails against both. The old Pod is the
+    one that matters, so the gate refuses rather than proceeding unchecked --
+    but evidence from any Pod that did answer still wins over both."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    ingress = INVENTORY.CPU_INGRESS_DEPLOYMENT
+    other = next(name for name in INVENTORY.CPU_RUNTIME_DEPLOYMENTS if name != ingress)
+    failure = MODULE.ReleaseError("command failed (1): kubectl")
+    runner = RoleRunner(
+        pods={ingress: _pods(("ingress-new", False), ("ingress-old", True))},
+        answers={"ingress-new": failure, "ingress-old": failure},
+    )
+
+    with pytest.raises(GATE.InflightInstallsRefused) as refused:
+        GATE.require_no_inflight_installs(
+            _role_release(runner), action="rollback", unreadable="proceed"
+        )
+    assert isinstance(refused.value.__cause__, GATE.KubectlFailure), (
+        "the ready Pod's failure decides the class"
+    )
+    assert "ingress-old" in str(refused.value), "the ready Pod is named"
+    assert runner.execs == ["ingress-new", "ingress-old"]
+
+    answering = RoleRunner(
+        pods={
+            ingress: _pods(("ingress-new", False), ("ingress-old", True)),
+            other: _pods(("worker-pod", True)),
+        },
+        answers={
+            "ingress-new": failure,
+            "ingress-old": failure,
+            "worker-pod": _snapshot(),
+        },
+    )
+    result = GATE.require_no_inflight_installs(
+        _role_release(answering), action="rollback", unreadable="proceed"
+    )
+    assert result["verdict"] == "clear", "evidence from a Pod that answered wins"
+
+
+def test_a_failed_pod_list_refuses_and_names_kubectl_not_the_store(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``get pod`` itself failing -- API server unreachable, an expired ``aws
+    eks get-token``, no list RBAC -- used to escape as a generic evidence
+    defect with the "drain the backlog / fix the probe" text and no consent
+    (fix round 4, MEDIUM-2). It is a kubectl-level failure: refused in every
+    mode, honestly worded, and the consent env may override it."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    release = _release(
+        _snapshot(), list_error=MODULE.ReleaseError("command failed (1): kubectl")
+    )
+
+    for unreadable in ("refuse", "proceed"):
+        with pytest.raises(GATE.InflightInstallsRefused) as failure:
+            GATE.require_no_inflight_installs(
+                release, action="rollback", unreadable=unreadable
+            )
+        message = str(failure.value)
+        assert "kubectl could not list control-plane Pods" in message, message
+        assert "API server" in message, message
+        assert "command failed (1): kubectl" in message
+        assert "could not read the control-plane store" not in message
+        assert "drain the backlog" not in message, "not an evidence defect"
+        assert isinstance(failure.value.__cause__, GATE.KubectlFailure), failure.value
+    assert release.runner.execs == [], "no Pod was ever exec'd"
+    assert release.runner.lists == 2 * len(INVENTORY.CPU_RUNTIME_DEPLOYMENTS), (
+        "every role's list was attempted before refusing, in both modes"
+    )
+    assert capsys.readouterr().err == ""
+
+    monkeypatch.setenv(ENV, "1")
+    result = GATE.require_no_inflight_installs(release, action="rollback")
+    assert result["verdict"] == "unchecked"
+    assert "kubectl could not list" in result["reason"], result
+    assert "consent given" in result["reason"], result
+    assert "inflight-installs-unchecked" in capsys.readouterr().err
+
+
+def test_a_non_zero_exit_distrusts_even_well_formed_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe that printed a valid snapshot and then exited non-zero did not
+    finish the way it meant to (an exception after the print, a killed
+    interpreter); its evidence is not trusted (fix round 4, LOW-6)."""
+
+    monkeypatch.delenv(ENV, raising=False)
+    clear = {"inflight": [], "inflight_count": 0, "bounded": True, "scanned": 3}
+    release = _release(_probe_output(json.dumps(clear), code=1))
+
+    for unreadable in ("refuse", "proceed"):
+        with pytest.raises(GATE.InflightInstallsRefused) as failure:
+            GATE.require_no_inflight_installs(
+                release, action="rollback", unreadable=unreadable
+            )
+        message = str(failure.value)
+        assert "exited 1" in message, message
+        assert "not trusted" in message, message
 
 
 def test_every_running_pod_of_a_role_is_tried_not_only_the_first(
@@ -920,7 +844,7 @@ def test_every_running_pod_of_a_role_is_tried_not_only_the_first(
     monkeypatch.delenv(ENV, raising=False)
     ingress = INVENTORY.CPU_INGRESS_DEPLOYMENT
     runner = RoleRunner(
-        pods={ingress: "ingress-new\ningress-old"},
+        pods={ingress: _pods(("ingress-new", False), ("ingress-old", True))},
         answers={
             "ingress-new": MODULE.ReleaseError("command failed (1): kubectl"),
             "ingress-old": _snapshot(DRIVER_STEP),
@@ -933,12 +857,19 @@ def test_every_running_pod_of_a_role_is_tried_not_only_the_first(
     assert runner.execs == ["ingress-new", "ingress-old"]
 
 
-def test_the_two_failure_kinds_are_distinct_exception_types() -> None:
-    assert issubclass(GATE.StoreUnreachable, GATE.ReleaseError), (
-        "main() reports every refusal as a ReleaseError"
+def test_the_three_failure_kinds_are_distinct_exception_types() -> None:
+    for kind in (GATE.StoreUnreachable, GATE.KubectlFailure):
+        assert issubclass(kind, GATE.ReleaseError), (
+            "main() reports every refusal as a ReleaseError"
+        )
+        assert not issubclass(kind, GATE.InflightInstallsRefused), (
+            "a cause the gate decides on, not a refusal by itself"
+        )
+    assert not issubclass(GATE.KubectlFailure, GATE.StoreUnreachable), (
+        "a live control plane kubectl could not ask is not an unreachable store"
     )
-    assert not issubclass(GATE.StoreUnreachable, GATE.InflightInstallsRefused), (
-        "unreachable is a cause the gate decides on, not a refusal by itself"
+    assert not issubclass(GATE.StoreUnreachable, GATE.KubectlFailure), (
+        "nor the other way round: the automatic rollback keys on the exact type"
     )
     with pytest.raises(GATE.StoreUnreachable):
         GATE.inflight_install_snapshot(_no_pod_release())
@@ -959,7 +890,10 @@ def test_the_read_falls_back_to_another_running_control_plane_role(
     ingress = INVENTORY.CPU_INGRESS_DEPLOYMENT
     other = next(name for name in INVENTORY.CPU_RUNTIME_DEPLOYMENTS if name != ingress)
     runner = RoleRunner(
-        pods={ingress: "ingress-pod", other: "worker-pod"},
+        pods={
+            ingress: _pods(("ingress-pod", True)),
+            other: _pods(("worker-pod", True)),
+        },
         answers={
             "ingress-pod": MODULE.ReleaseError("command failed (137): kubectl"),
             "worker-pod": _snapshot(DRIVER_STEP),
@@ -1048,6 +982,58 @@ def test_a_refused_upgrade_writes_no_state(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(GATE.InflightInstallsRefused, match="workflow-7f3a"):
         ORCHESTRATION.upgrade_release(release, diff=diff)
     assert release.state == {}
+
+
+def test_the_upgrade_keeps_the_gates_verdict_for_its_first_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollback has persisted its verdict since fix round 3; the upgrade
+    discarded it (``_upgrade_context`` rebinds ``release.state`` right after
+    the gate). An upgrade that proceeded under consent now writes the
+    ``overridden`` verdict -- the listed set it was consented over -- into the
+    state before the ``preflight`` checkpoint (fix round 4, MEDIUM-3)."""
+
+    calls: list[str] = []
+    verdict = {
+        "checked": True,
+        "verdict": "overridden",
+        "reason": FLAG,
+        "steps": ["workflow-7f3a REMEDIATE_DRIVER step 3 on ip-10-0-1-17 (WAITING)"],
+        "inflight_count": 1,
+        "scanned": 4,
+    }
+    checkpoints: list[tuple[str, dict[str, Any]]] = []
+
+    def save_state(phase: str, **_updates: Any) -> None:
+        checkpoints.append((phase, dict(release.state)))
+        raise _Reached()
+
+    release = _upgrade_double(
+        calls,
+        _require_no_inflight_installs=lambda **_kwargs: dict(verdict),
+        _save_state=save_state,
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION, "_validate_upgrade_transaction", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        ORCHESTRATION,
+        "_upgrade_context",
+        lambda *_a, **_k: ({"metadata": {}}, set(), set(), False),
+    )
+    diff = DIFF.ReleaseDiff(
+        kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
+        changed=frozenset({"control_plane_wheel"}),
+    )
+
+    with pytest.raises(_Reached):
+        ORCHESTRATION.upgrade_release(release, diff=diff)
+
+    assert [phase for phase, _state in checkpoints] == ["preflight"]
+    assert checkpoints[0][1].get("inflight_installs") == verdict, (
+        "the verdict is in the state the first checkpoint persists"
+    )
+    assert release.state["inflight_installs"] == verdict
 
 
 def _rollback_double(calls: list[str], **stubs: Any) -> SimpleNamespace:

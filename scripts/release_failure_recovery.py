@@ -51,9 +51,8 @@ def _recorded_inflight_verdict(live_state: Mapping[str, Any] | None) -> dict[str
         "checked": False,
         "verdict": "unrecorded",
         "reason": (
-            f"the engine state carries no {INFLIGHT_INSTALLS_STATE_KEY} verdict "
-            "(an engine that predates it, or a rollback re-entered after "
-            "rollback-cpu-restored, which skips the check)"
+            f"the engine state carries no {INFLIGHT_INSTALLS_STATE_KEY} verdict: "
+            "the engine predates the field"
         ),
         "steps": [],
     }

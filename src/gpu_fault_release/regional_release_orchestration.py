@@ -1132,7 +1132,7 @@ def upgrade_release(
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     # One store read; refuses by name while a driver/firmware/EFA install is
     # PENDING or WAITING (``regional_release_store_preflight``).
-    self._require_no_inflight_installs(action="upgrade")
+    verdict = self._require_no_inflight_installs(action="upgrade")
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
     acceptance = _validate_upgrade_transaction(
@@ -1154,6 +1154,10 @@ def upgrade_release(
         # A new transaction must not inherit rollback checkpoints or failure
         # fields from the currently deployed release.
         self.state = {}
+    if isinstance(verdict, dict):
+        # The gate's verdict, persisted by the first checkpoint like the rollback's.
+        self.state["inflight_installs"] = verdict
+    if not resume:
         self._save_state(
             "preflight",
             previous=previous,
