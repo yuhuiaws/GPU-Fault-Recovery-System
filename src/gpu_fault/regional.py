@@ -753,31 +753,43 @@ class RegionalRemoteWorkflowAdapter:
                     "mutation_submitted_by_control_plane": False,
                 },
             )
+        current: RemoteActionCommand | None = None
         restart_authorization: RestartAuthorization | None = None
         if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
-            # The preflight is the only site that reserves restart budget;
-            # dispatch reads that reservation back and signs it for the data
-            # plane. A step without one fails closed instead of reserving here.
-            issued = restart_budget_preflight.issue_restart_authorization(
-                self.store, context.incident, context.step, context.idempotency_key
+            # A command under this id that already SUCCEEDED or FAILED has its
+            # verdict, whatever happened to the restart reservation since (a
+            # terminal write, an operator restore). The reservation gate is
+            # for minting a command, not for reading one back.
+            current = self._settled_remote_command(command_id)
+            if current is None:
+                # The preflight is the only site that reserves restart budget;
+                # dispatch reads that reservation back and signs it for the
+                # data plane. A step without one fails closed instead of
+                # reserving here.
+                issued = restart_budget_preflight.issue_restart_authorization(
+                    self.store,
+                    context.incident,
+                    context.step,
+                    context.idempotency_key,
+                )
+                if not isinstance(issued, RestartAuthorization):
+                    return issued
+                restart_authorization = issued
+        if current is None:
+            command = RemoteActionCommand(
+                command_id=command_id,
+                cluster_id=context.incident.cluster_id,
+                workflow_request_id=context.workflow.request_id,
+                incident_id=context.incident.incident_id,
+                step_index=context.step_index,
+                fencing_token=context.workflow.fencing_token,
+                idempotency_key=context.idempotency_key,
+                step=context.step,
+                workflow=context.workflow,
+                incident=context.incident,
+                restart_authorization=restart_authorization,
             )
-            if not isinstance(issued, RestartAuthorization):
-                return issued
-            restart_authorization = issued
-        command = RemoteActionCommand(
-            command_id=command_id,
-            cluster_id=context.incident.cluster_id,
-            workflow_request_id=context.workflow.request_id,
-            incident_id=context.incident.incident_id,
-            step_index=context.step_index,
-            fencing_token=context.workflow.fencing_token,
-            idempotency_key=context.idempotency_key,
-            step=context.step,
-            workflow=context.workflow,
-            incident=context.incident,
-            restart_authorization=restart_authorization,
-        )
-        current = self.store.ensure_remote_command(command)
+            current = self.store.ensure_remote_command(command)
         operation_id = f"remote/{current.command_id}"
         if current.status is RemoteCommandStatus.SUCCEEDED:
             return WorkflowStepOutcome.succeeded(
@@ -808,3 +820,21 @@ class RegionalRemoteWorkflowAdapter:
                 "mutation_submitted_by_control_plane": False,
             },
         )
+
+    def _settled_remote_command(self, command_id: str) -> RemoteActionCommand | None:
+        """The SUCCEEDED or FAILED command already stored under ``command_id``.
+
+        ``None`` when there is no command yet or it is still open; an open
+        command goes through ``ensure_remote_command`` like a new one.
+        """
+
+        try:
+            existing: RemoteActionCommand = self.store.get_remote_command(command_id)
+        except NotFoundError:
+            return None
+        if existing.status in (
+            RemoteCommandStatus.SUCCEEDED,
+            RemoteCommandStatus.FAILED,
+        ):
+            return existing
+        return None

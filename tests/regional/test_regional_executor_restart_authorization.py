@@ -20,7 +20,11 @@ from gpu_fault.execution.restart_budget_preflight import (
     reserve_restart_budgets,
 )
 from gpu_fault.models import RestartAuthorization, WorkflowOperation, WorkflowStepStatus
-from gpu_fault.regional import RegionalRemoteWorkflowAdapter
+from gpu_fault.regional import (
+    RegionalRemoteWorkflowAdapter,
+    RemoteCommandResult,
+    RemoteCommandStatus,
+)
 from gpu_fault.store import InMemoryStore, NotFoundError
 from tests._builders import build_store, copy_model
 from tests.regional._regional_support import TOKEN_A, registration, workflow_state
@@ -101,3 +105,34 @@ def test_remote_restart_without_a_reservation_fails_closed_and_mints_nothing() -
     # Failing closed reserved nothing either: there is still no budget row.
     with pytest.raises(NotFoundError):
         store.get_restart_budget("cluster-a", "training-a")
+
+
+def test_settled_remote_command_verdict_wins_over_a_missing_reservation() -> None:
+    store = build_store()
+    adapter = _adapter(store)
+    context = _restart_context()
+    store.reserve_job_restart("cluster-a", "training-a", 1, context.idempotency_key)
+    assert adapter.execute(context).status is WorkflowStepStatus.WAITING
+    command = store.claim_remote_commands(
+        "cluster-a", "executor-a", limit=1, lease_seconds=60, execution_owners={OWNER}
+    )[0]
+    store.complete_remote_command(
+        "cluster-a",
+        command.command_id,
+        RemoteCommandResult(
+            lease_token=command.lease_token,
+            status=RemoteCommandStatus.SUCCEEDED,
+            details={"restart_attempt_id": "training-a-a002"},
+        ),
+    )
+    # The reservation goes away after the restart already ran (a terminal
+    # write, an operator restore): the gate is for minting a command, not for
+    # reading back the verdict of one that exists.
+    store.release_job_restart("cluster-a", "training-a", context.idempotency_key)
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert outcome.adapter_operation_id == f"remote/{command.command_id}"
+    assert outcome.details == {"restart_attempt_id": "training-a-a002"}
+    assert len(store.list_remote_commands()) == 1

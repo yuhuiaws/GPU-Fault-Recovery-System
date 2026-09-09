@@ -284,6 +284,78 @@ def test_issue_authorization_requires_an_existing_reservation() -> None:
     assert granted.source_attempt_id == "train-1-a1"
 
 
+def test_issue_authorization_rejects_a_step_from_another_cluster() -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-b",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+        },
+    )
+    # Even a reservation on the step's own cluster does not make it the
+    # incident's restart: the gate trusts the incident over the plan.
+    store.reserve_job_restart("cluster-b", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    assert isinstance(outcome, WorkflowStepOutcome)
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error == (
+        "restart safety context cluster does not match incident: cluster-b != cluster-a"
+    )
+    assert outcome.details == {
+        "reason": "RESTART_CLUSTER_MISMATCH",
+        "restart_cluster_id": "cluster-b",
+        "incident_cluster_id": "cluster-a",
+    }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reserved"),
+    [
+        ({"source_gpu_count": "eight"}, True),
+        ({"restart_budget": "one"}, False),
+        ({"restart_budget": None}, True),
+    ],
+)
+def test_issue_authorization_fails_closed_on_a_malformed_numeric_parameter(
+    overrides: dict[str, object], reserved: bool
+) -> None:
+    store = build_store()
+    incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")
+    step = workflow_step(
+        WorkflowOperation.RESTART_WORKLOAD,
+        parameters={
+            "cluster_id": "cluster-a",
+            "job_id": "train-1",
+            "source_attempt_id": "train-1-a1",
+            "source_gpu_count": 8,
+            "restart_budget": 1,
+            **overrides,
+        },
+    )
+    if reserved:
+        store.reserve_job_restart("cluster-a", "train-1", 1, "wf/0/RESTART_WORKLOAD")
+
+    outcome = issue_restart_authorization(
+        store, incident, step, "wf/0/RESTART_WORKLOAD"
+    )
+
+    # A malformed plan is a FAILED step with a reason, not an adapter traceback.
+    assert isinstance(outcome, WorkflowStepOutcome)
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.error is not None
+    assert outcome.error.startswith("restart safety context is invalid: ")
+    assert outcome.details["reason"] == "RESTART_SAFETY_CONTEXT_INVALID"
+
+
 def test_issue_authorization_rejects_a_reservation_held_by_another_step() -> None:
     store = build_store()
     incident = fault_incident("inc-1", "event-1", cluster_id="cluster-a")

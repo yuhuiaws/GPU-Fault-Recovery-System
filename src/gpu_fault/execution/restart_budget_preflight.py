@@ -109,6 +109,27 @@ def issue_restart_authorization(
         )
     cluster_id = str(parameters["cluster_id"])
     job_id = str(parameters["job_id"])
+    # The same gates the claim preflight applied, in the same words: the gate
+    # trusts the incident over the plan, and a malformed plan is a FAILED step
+    # with a reason rather than an adapter traceback.
+    if cluster_id != incident.cluster_id:
+        return WorkflowStepOutcome.failed(
+            "restart safety context cluster does not match "
+            f"incident: {cluster_id} != {incident.cluster_id}",
+            details={
+                "reason": "RESTART_CLUSTER_MISMATCH",
+                "restart_cluster_id": cluster_id,
+                "incident_cluster_id": incident.cluster_id,
+            },
+        )
+    try:
+        source_gpu_count = int(parameters["source_gpu_count"])
+        restart_budget = int(parameters["restart_budget"])
+    except (TypeError, ValueError) as exc:
+        return WorkflowStepOutcome.failed(
+            f"restart safety context is invalid: {exc}",
+            details={"reason": "RESTART_SAFETY_CONTEXT_INVALID"},
+        )
     try:
         state = store.get_restart_budget(cluster_id, job_id)
     except NotFoundError:
@@ -120,18 +141,14 @@ def issue_restart_authorization(
                 "reason": "RESTART_RESERVATION_MISSING",
                 "reservation_id": reservation_id,
                 "restart_count": state.restart_count if state is not None else 0,
-                "restart_budget": (
-                    state.budget
-                    if state is not None
-                    else int(parameters["restart_budget"])
-                ),
+                "restart_budget": state.budget if state is not None else restart_budget,
             },
         )
     return RestartAuthorization(
         cluster_id=cluster_id,
         job_id=job_id,
         source_attempt_id=str(parameters["source_attempt_id"]),
-        source_gpu_count=int(parameters["source_gpu_count"]),
+        source_gpu_count=source_gpu_count,
         restart_budget=state.budget,
         restart_count=state.restart_count,
         reservation_id=reservation_id,
