@@ -342,6 +342,77 @@ def test_an_already_buffered_quarantined_key_evicts_nothing() -> None:
     assert outbox.quarantine_evictions_total == 0
 
 
+def test_a_retried_append_that_finds_its_key_counts_no_phantom_eviction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R5 fix 1, M1: the eviction list is per closure run, not per call.
+
+    The first run of the append closure evicts the oldest quarantined record;
+    the replace hits a 409 because another writer (the previous watcher
+    generation, the one-shot) got there first and, as it happens, appended the
+    same key after evicting that same record itself. The retry re-reads, finds
+    the key, adds nothing and writes nothing -- but the victim from the first
+    run was still in ``evicted``, so it was counted and logged as evicted by
+    this process, which evicted nothing.
+    """
+
+    core = ConfigMapCore()
+    now = [1_000.0]
+    _quarantine(core, now, "attempt-a", "attempt-b")
+    outbox = KubernetesCompletionOutbox(
+        core, RecordingSink(fail=True), max_records=2, now=lambda: now[0]
+    )
+    fresh = [
+        *[
+            item
+            for item in json.loads(core.data["events.json"])
+            if "attempt-b" in item["key"]
+        ],
+        {
+            "key": "cluster-a/attempt-c/terminal",
+            "path": "/v1/attempts/terminal",
+            "payload": payload("attempt-c"),
+            "buffered_at": now[0],
+            "attempts": 0,
+            "quarantined": False,
+        },
+    ]
+    original_replace = core.replace_namespaced_config_map
+    conflicts: list[str] = []
+
+    def replace_once_conflicted(name, namespace, body):
+        if not conflicts:
+            conflicts.append(name)
+            core.objects[OUTBOX_NAME] = {
+                "events.json": json.dumps(fresh, sort_keys=True, separators=(",", ":"))
+            }
+            core.versions[OUTBOX_NAME] += 1
+            raise FakeApiException(409)
+        return original_replace(name, namespace, body)
+
+    core.replace_namespaced_config_map = replace_once_conflicted
+    version_after_conflict = core.versions[OUTBOX_NAME] + 1
+
+    with caplog.at_level(logging.ERROR, logger="gpu_fault.completion_outbox"):
+        result = outbox.post("/v1/attempts/terminal", payload("attempt-c"))
+
+    assert result == {"deferred_to_replay": True}, result
+    assert _keys(core) == [
+        "cluster-a/attempt-b/terminal",
+        "cluster-a/attempt-c/terminal",
+    ], _keys(core)
+    assert conflicts == [OUTBOX_NAME], "the first replace must have conflicted"
+    assert core.versions[OUTBOX_NAME] == version_after_conflict, (
+        "the retry must find the key and write nothing"
+    )
+    assert outbox.quarantine_evictions_total == 0, (
+        "this process evicted nothing; the victim of the conflicted run is not "
+        f"its eviction: {outbox.quarantine_evictions_total}"
+    )
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [], f"no phantom eviction may be logged: {errors}"
+
+
 class FakeApiException(Exception):
     """Stands in for ``kubernetes.client.rest.ApiException``."""
 

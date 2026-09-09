@@ -300,7 +300,10 @@ def _quarantined_record(core: FakeCoreApi, clock: Clock) -> dict:
     rejecting = OutageSink(
         CollectorError("collector event rejected (422): unknown", status_code=422)
     )
-    outbox = KubernetesCompletionOutbox(core, rejecting)
+    # Stamped on the test clock so a later test can age the record past 24 h.
+    outbox = KubernetesCompletionOutbox(
+        core, rejecting, now=lambda: clock.value.timestamp()
+    )
     payload = {"cluster_id": "hp-cluster", "attempt_id": FAILED}
     with pytest.raises(CollectorError):
         outbox.post(TERMINAL, payload)
@@ -376,6 +379,52 @@ def test_the_replay_quarantined_mode_exits_nonzero_when_records_remain(
     assert exit_info.value.code == 1, (
         "a record the control plane still rejects stays quarantined and the "
         f"one-shot must say so in its exit status, got {exit_info.value.code}"
+    )
+
+
+def test_the_one_shot_keeps_a_rejected_record_through_a_transient_failure(
+    monkeypatch,
+) -> None:
+    """A day-old ``rejected`` record must not expire under the one-shot.
+
+    Expiry is the bound on a *retry* disposition. A rejected record is the
+    control plane's verdict and the operator's evidence, and it is usually
+    older than a day by the time the one-shot runs; a 5xx or a socket error
+    during that run is a transient failure of the run, not a reason to
+    delete the record, count it as expired and exit 0 as if nothing were
+    left.
+    """
+
+    clock = Clock()
+    core = FakeCoreApi([])
+    _quarantined_record(core, clock)
+    clock.value += timedelta(hours=25)
+    down = OutageSink(OSError("control plane unavailable"))
+    outbox = KubernetesCompletionOutbox(core, down, now=lambda: clock.value.timestamp())
+    controller = KubernetesCompletionController(
+        core, outbox, cluster_id="hp-cluster", now=clock
+    )
+    monkeypatch.setattr(
+        completion_controller, "controller_from_environment", lambda: controller
+    )
+    monkeypatch.setattr(
+        completion_controller, "validate_gpu_fault_environment", lambda **_kwargs: None
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        completion_controller.main(["--replay-quarantined"])
+
+    record = _records(core).get(f"hp-cluster/{FAILED}/terminal")
+    assert record is not None and record["quarantined"] is True, (
+        f"a transient failure must leave the rejected record in place: {_records(core)}"
+    )
+    assert record["quarantine_reason"] == "rejected", record
+    assert outbox.expired_total == 0, (
+        f"a rejected record never expires: expired_total={outbox.expired_total}"
+    )
+    assert exit_info.value.code == 1, (
+        "the record is still quarantined, so the one-shot must exit 1, got "
+        f"{exit_info.value.code}"
     )
 
 

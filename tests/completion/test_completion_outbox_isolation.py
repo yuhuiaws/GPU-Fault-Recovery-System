@@ -21,6 +21,7 @@ from gpu_fault.collectors.sinks import CollectorError, is_retryable_delivery_sta
 from gpu_fault.completion_outbox import (
     KubernetesCompletionOutbox,
     completion_delivery_disposition,
+    replay_quarantined_once,
 )
 from tests.completion.test_completion_outbox import ConfigMapCore, payload
 
@@ -214,7 +215,7 @@ def test_a_retry_disposition_older_than_a_day_expires_out_of_the_wal(
 def test_an_expired_record_whose_removal_fails_is_not_counted_yet() -> None:
     """Count the loss only once it happened; the next pass tries again."""
 
-    from tests.completion.test_completion_outbox import UnwritableCore
+    from tests.completion.test_completion_outbox import FakeApiException, UnwritableCore
 
     now = [1_000_000.0]
     core = UnwritableCore()
@@ -226,7 +227,7 @@ def test_an_expired_record_whose_removal_fails_is_not_counted_yet() -> None:
     now[0] += 24 * 3600
     core.writable = False
 
-    with pytest.raises(Exception):
+    with pytest.raises(FakeApiException):
         outbox.replay()
 
     assert outbox.expired_total == 0, "nothing was removed, so nothing expired"
@@ -235,6 +236,113 @@ def test_an_expired_record_whose_removal_fails_is_not_counted_yet() -> None:
     outbox.replay()
     assert _records(core) == {}
     assert outbox.expired_total == 1
+
+
+def test_a_transient_failure_in_the_one_shot_keeps_a_day_old_rejected_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R5 fix 1, C1: the age bound is for live retry dispositions only.
+
+    A rejected record is almost always older than a day by the time an
+    operator runs ``--replay-quarantined``. R5 let a transient failure in that
+    pass (a 503, a connection reset) read as "retryable and older than a day":
+    the record was expired, removed, counted, and the one-shot exited 0 over an
+    empty log -- the operator's evidence gone in the very command meant to
+    recover it. A quarantined record keeps its quarantine, its reason and the
+    422 evidence of the verdict; the transient failure is recorded beside it.
+    """
+
+    now = [1_000_000.0]
+    core = ConfigMapCore()
+    outbox = KubernetesCompletionOutbox(
+        core,
+        ScriptedSink({"attempt-a": _rejected(422, "workload_ids is required")}),
+        now=lambda: now[0],
+    )
+    with pytest.raises(CollectorError):
+        outbox.post(TERMINAL, payload("attempt-a"))
+    outbox.replay()
+    assert _records(core)["cluster-a/attempt-a/terminal"]["quarantined"] is True
+
+    now[0] += 25 * 3600
+    one_shot = KubernetesCompletionOutbox(
+        core,
+        ScriptedSink({"attempt-a": OSError("connection reset")}),
+        now=lambda: now[0],
+    )
+    with caplog.at_level(logging.INFO, logger="test.one_shot"):
+        rc = replay_quarantined_once(one_shot, logging.getLogger("test.one_shot"))
+
+    record = _records(core).get("cluster-a/attempt-a/terminal")
+    assert record is not None, (
+        "a transient failure in the one-shot must not remove a rejected record: "
+        f"{_records(core)}"
+    )
+    assert (
+        record["quarantined"] is True and record["quarantine_reason"] == "rejected"
+    ), f"the quarantine and its reason must survive a transient failure: {record}"
+    assert record["last_status"] == 422 and "workload_ids" in record["last_error"], (
+        f"the evidence of the verdict must not be overwritten by the outage: {record}"
+    )
+    assert record["attempts"] == 2, record
+    assert record["last_transient_error"] == "connection reset", (
+        f"the transient failure is recorded beside the verdict, not over it: {record}"
+    )
+    assert record["last_transient_status"] is None, record
+    assert record["last_transient_at"] == now[0], record
+    assert one_shot.expired_total == 0, (
+        f"a rejected record never expires: expired_total={one_shot.expired_total}"
+    )
+    assert one_shot.last_replay == {
+        "replayed": 0,
+        "deferred": 1,
+        "quarantined": 0,
+        "expired": 0,
+    }, one_shot.last_replay
+    assert rc == 1, (
+        f"the record is still quarantined, so the one-shot must say so: {rc}"
+    )
+
+
+def test_the_one_shot_exits_nonzero_when_it_expired_a_live_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R5 fix 1, M2: a removal during the one-shot is a loss, not a success.
+
+    The operator ran the command to recover records. A live retry disposition
+    older than a day that fails transiently in that pass is expired and
+    removed exactly as the loop would have done it; the one-shot must not then
+    log ``expired=1`` at INFO and exit 0 over the empty log.
+    """
+
+    now = [1_000_000.0]
+    core = ConfigMapCore()
+    outbox = KubernetesCompletionOutbox(
+        core, ScriptedSink({"attempt-a": OSError("down")}), now=lambda: now[0]
+    )
+    with pytest.raises(OSError):
+        outbox.post(TERMINAL, payload("attempt-a"))
+    now[0] += 25 * 3600
+    one_shot = KubernetesCompletionOutbox(
+        core,
+        ScriptedSink({"attempt-a": OSError("connection reset")}),
+        now=lambda: now[0],
+    )
+
+    with caplog.at_level(logging.INFO, logger="test.one_shot"):
+        rc = replay_quarantined_once(one_shot, logging.getLogger("test.one_shot"))
+
+    assert _records(core) == {}, f"a day-old live retry still expires: {_records(core)}"
+    assert one_shot.expired_total == 1
+    assert rc == 1, f"an expiry in the one-shot is a loss and must exit 1, got {rc}"
+    errors = [
+        message.getMessage()
+        for message in caplog.records
+        if message.levelno == logging.ERROR
+    ]
+    assert any("expired" in text and "1" in text for text in errors), (
+        f"the loss must be summarised at ERROR, not INFO: {caplog.text}"
+    )
 
 
 def test_a_non_retryable_status_quarantines_on_first_sight() -> None:

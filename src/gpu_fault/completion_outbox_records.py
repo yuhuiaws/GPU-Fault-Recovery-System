@@ -302,8 +302,10 @@ def _record_age_key(record: dict[str, Any]) -> float:
 def _oldest_quarantined(records: list[dict[str, Any]]) -> int | None:
     """Index of the quarantined record that has been buffered longest.
 
-    Ties, and records without a readable ``buffered_at``, fall back to list
-    order, which is insertion order.
+    A record without a readable ``buffered_at`` sorts *first* (its age key is
+    0, older than any real instant): a hand-edited record with no timestamp is
+    the one with the least claim on a slot. Ties fall back to list order,
+    which is insertion order.
     """
 
     candidates = [

@@ -830,7 +830,8 @@ class KubernetesCompletionController:
 
     @property
     def outbox_expired_total(self) -> int:
-        """Retryable records quarantined for age, not verdict (final review C1)."""
+        """Retry records removed after the ERROR that names them, 24 h after
+        they were buffered (final review C1, R5) -- never a rejected one."""
 
         return int(getattr(self.sink, "expired_total", 0))
 

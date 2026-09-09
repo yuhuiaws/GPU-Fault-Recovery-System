@@ -215,18 +215,38 @@ def _replay_failure(
     is removed by the caller (R5), so its ``fields`` are for the log only. A
     record without a readable ``buffered_at`` cannot expire: it keeps being
     retried, which is the failure mode that loses nothing.
+
+    The age bound is for *live* retry dispositions only. A quarantined record
+    that fails retryably -- the one-shot ``--replay-quarantined`` hit a 503 or
+    a connection reset -- is almost always older than a day by then, and
+    reading that as an expiry removed the operator's evidence in the very
+    command meant to recover it (R5 fix 1, C1). It stays quarantined with its
+    original reason, and ``last_status`` / ``last_error`` keep the verdict;
+    the transient failure is recorded beside them in ``last_transient_*``.
     """
 
-    fields: dict[str, Any] = {
-        "attempts": int(record.get("attempts", 0)) + 1,
-        "last_status": (
-            getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        ),
-        "last_error": str(exc)[:500],
-    }
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    attempts = int(record.get("attempts", 0)) + 1
     if completion_delivery_disposition(exc) == "quarantine":
         outcome = "rejected"
+        fields: dict[str, Any] = {
+            "attempts": attempts,
+            "last_status": status,
+            "last_error": str(exc)[:500],
+        }
+    elif record.get("quarantined", False):
+        return "retry", {
+            "attempts": attempts,
+            "last_transient_status": status,
+            "last_transient_error": str(exc)[:500],
+            "last_transient_at": now,
+        }
     else:
+        fields = {
+            "attempts": attempts,
+            "last_status": status,
+            "last_error": str(exc)[:500],
+        }
         buffered_at = record.get("buffered_at")
         age = now - float(buffered_at) if isinstance(buffered_at, (int, float)) else 0.0
         if age < max_retry_age_seconds:
@@ -736,7 +756,11 @@ class KubernetesCompletionOutbox:
 
         def append(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             nonlocal deliver_live, added
+            # Per closure run: a 409 retry that finds the key already written
+            # by another writer adds nothing and must not report the victim of
+            # the conflicted run as an eviction of this one (R5 fix 1, M1).
             added = False
+            evicted.clear()
             existing = next((item for item in records if item.get("key") == key), None)
             if existing is not None:
                 deliver_live = bool(existing.get("quarantined", False))
@@ -1307,9 +1331,9 @@ def replay_quarantined_requested(argv: Sequence[str] | None) -> bool:
         action="store_true",
         help=(
             "replay every buffered completion record once, quarantined ones "
-            "included, then exit (0 when nothing is left quarantined, 1 "
-            "otherwise); run after fixing the cause the records were "
-            "quarantined for. Does not start the watch loop."
+            "included, then exit (0 when nothing is left quarantined and "
+            "nothing expired, 1 otherwise); run after fixing the cause the "
+            "records were quarantined for. Does not start the watch loop."
         ),
     )
     return bool(parser.parse_args(argv).replay_quarantined)
@@ -1325,21 +1349,33 @@ def replay_quarantined_once(outbox: Any, logger: logging.Logger) -> int:
     The pass is bounded like any other (``replay_batch_size`` records,
     ``replay_budget_seconds``), so a backlog larger than one batch needs the
     command run again; the exit code says whether anything is still
-    quarantined.
+    quarantined -- or was lost. A live retry disposition older than a day that
+    fails again in this pass expires and is removed, exactly as the loop would
+    have done it; the operator ran the command to recover records, so that
+    removal is summarised at ERROR and the exit code is 1 (R5 fix 1, M2).
     """
 
     replayed = outbox.replay(include_quarantined=True)
     remaining = int(getattr(outbox, "last_quarantined_depth", 0))
+    expired = int(outbox.last_replay.get("expired", 0))
     logger.info(
         "one-shot replay of the completion outbox: replayed=%d deferred=%d "
         "quarantined=%d expired=%d still_quarantined=%d depth=%d",
         replayed,
         outbox.last_replay["deferred"],
         outbox.last_replay["quarantined"],
-        outbox.last_replay.get("expired", 0),
+        expired,
         remaining,
         int(getattr(outbox, "last_depth", 0)),
     )
+    if expired:
+        logger.error(
+            "%d completion record(s) expired during the one-shot replay and "
+            "were removed from the write-ahead log; each is named with its key "
+            "and payload digest in the ERROR lines above, and the control "
+            "plane never accepted it",
+            expired,
+        )
     if remaining:
         logger.error(
             "%d completion record(s) are still quarantined after the one-shot "
@@ -1347,8 +1383,7 @@ def replay_quarantined_once(outbox: Any, logger: logging.Logger) -> int:
             "command again if the batch bound cut the pass short",
             remaining,
         )
-        return 1
-    return 0
+    return 1 if remaining or expired else 0
 
 
 def replay_completion_outbox(sink: Any, logger: logging.Logger) -> None:
