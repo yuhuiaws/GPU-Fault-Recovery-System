@@ -423,11 +423,14 @@ class ClusterActionExecutor:
     def metrics_snapshot(self) -> dict[str, Any]:
         """Every executor counter, for the claim breadcrumb and operators.
 
-        The executor Pod has no /metrics listener of its own; the readiness
-        probe already reads the claim-state breadcrumb out of process, so the
-        counters ride along in that file (``kubectl exec ... cat``) until a
-        scrape endpoint exists. Read under the counter lock so the breadcrumb
-        cannot catch a half-applied increment.
+        The readiness probe reads the claim-state breadcrumb out of process,
+        so the counters ride along in that file (``kubectl exec ... cat``)
+        next to their ``/metrics`` export: every key here that ``increment``
+        writes is also a ``gpu_fault_cluster_executor_*`` series (the metrics
+        test pins the two sets against each other), and the two views read
+        the same numbers because ``increment`` mirrors each change under this
+        lock. Read under the counter lock so the breadcrumb cannot catch a
+        half-applied increment.
         """
 
         with self._counter_lock:

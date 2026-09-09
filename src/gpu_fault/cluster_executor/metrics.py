@@ -8,9 +8,12 @@ collector; this module is the family behind that port.
 
 The series are the executor's own counters, not a second set: ``increment``
 is the only writer of an executor counter and mirrors every change here, so
-the scrape and the breadcrumb always read the same numbers. Results, the loop
-breadcrumb and the batch in flight are the three things the counters never
-said, and they are recorded at the one place each is decided.
+the scrape and the breadcrumb always read the same numbers. Every counter the
+breadcrumb carries through ``increment`` is exported (a merge once ported five
+that rode in the breadcrumb alone; the metrics test now pins the two sets
+against each other). Results, the loop breadcrumb and the batch in flight are
+the three things the counters never said, and they are recorded at the one
+place each is decided.
 """
 
 from __future__ import annotations
@@ -29,9 +32,11 @@ LOGGER = logging.getLogger("gpu_fault.cluster_executor")
 
 CLUSTER_EXECUTOR_METRICS_PREFIX = "gpu_fault_cluster_executor_"
 
-# Executor counter attribute -> exported series. A counter that is not listed
-# stays breadcrumb-only; a series listed here that the executor does not have
-# is a construction-time AttributeError in the first test that increments it.
+# Executor counter attribute -> exported series. Every attribute ``increment``
+# writes is listed (the metrics test pins this against the breadcrumb); a
+# series listed here that the executor does not have is a construction-time
+# AttributeError in the first test that increments it. The three attributes
+# without a ``_total`` suffix get one here, as Prometheus counters do.
 COUNTER_SERIES: dict[str, str] = {
     "claimed_total": "claims_total",
     "execution_timeouts_total": "execution_timeouts_total",
@@ -39,6 +44,17 @@ COUNTER_SERIES: dict[str, str] = {
     "fleet_fence_holds_total": "fleet_fence_holds_total",
     "lease_lost_total": "lease_lost_total",
     "transport_retries_total": "transport_retries_total",
+    "reported_failures": "report_failures_total",
+    "unexpected_failures": "unexpected_failures_total",
+    "lease_renewal_failures": "lease_renewal_failures_total",
+    "results_withheld_total": "results_withheld_total",
+    "cancellations_observed_total": "cancellations_observed_total",
+    "barrier_unavailable_holds_total": "barrier_unavailable_holds_total",
+    "retryable_adapter_errors_total": "retryable_adapter_errors_total",
+    "retryable_transport_errors_total": "retryable_transport_errors_total",
+    "batched_commands_total": "batched_commands_total",
+    "batched_steps_total": "batched_steps_total",
+    "batched_progress_failures_total": "batched_progress_failures_total",
 }
 GAUGE_SERIES: dict[str, str] = {"stuck_executions": "stuck_executions"}
 # One counter per verdict: the renderer has no labels, and a labelled
@@ -97,6 +113,64 @@ def cluster_executor_metrics() -> MetricFamily:
                 "transport_retries_total",
                 "Result posts retried after a transport failure with no verdict "
                 "in it (connection dropped, timeout); one per backoff sleep.",
+            ),
+            (
+                "report_failures_total",
+                "Results the control plane refused or that exhausted their "
+                "report retries; the command stays LEASED until its lease lapses.",
+            ),
+            (
+                "unexpected_failures_total",
+                "Commands that raised out of the executor itself (bad adapter "
+                "wiring, a defect in the dispatch or report path), not out of "
+                "the action; each one has a stack trace in the log.",
+            ),
+            (
+                "lease_renewal_failures_total",
+                "Lease heartbeats the control plane did not answer; enough in a "
+                "row and the lease is treated as lost (see lease_lost_total).",
+            ),
+            (
+                "results_withheld_total",
+                "Verdicts not posted because the lease was lost first (expired "
+                "locally, renewals exhausted, or lapsed during the report "
+                "backoff); the next lease holder redoes the step.",
+            ),
+            (
+                "cancellations_observed_total",
+                "Commands whose lease renewal came back with a cancellation "
+                "request; no further node action starts under them.",
+            ),
+            (
+                "barrier_unavailable_holds_total",
+                "Multi-node barrier steps held WAITING because this regional "
+                "executor has no barrier coordinator wired.",
+            ),
+            (
+                "retryable_adapter_errors_total",
+                "Adapter exceptions that said nothing about the step (Kubernetes "
+                "409/429/5xx, client timeouts) reported WAITING instead of FAILED.",
+            ),
+            (
+                "retryable_transport_errors_total",
+                "Actions that failed on this executor's own connectivity (DNS, "
+                "refused connection, timeout reaching the target) reported "
+                "WAITING; whole cycles of these back the claim loop off.",
+            ),
+            (
+                "batched_commands_total",
+                "Compound remote commands run; each carries several node-side "
+                "steps behind one claim (see batched_steps_total).",
+            ),
+            (
+                "batched_steps_total",
+                "Steps executed inside compound commands; a step skipped because "
+                "a previous claim already completed it adds 0.",
+            ),
+            (
+                "batched_progress_failures_total",
+                "Per-step progress posts the control plane did not accept; the "
+                "terminal result carries every verdict, so no step is lost.",
             ),
         ),
         gauges=(

@@ -11,8 +11,12 @@ What is pinned here:
 * every series matches the family contract and survives F7's keep rule, so a
   renamed metric fails a test instead of vanishing before AMP;
 * the counters are the executor's own counters -- ``increment`` is their only
-  writer, so a claim/result cycle, a timeout, a fence hold and a report retry
-  move the same numbers the breadcrumb carries;
+  writer, so a claim/result cycle, a timeout, a fence hold, a report retry, a
+  compound command and a transport error move the same numbers the breadcrumb
+  carries;
+* every counter the breadcrumb carries through ``increment`` is a series: a
+  counter added to the breadcrumb alone (the merge ported five that way) fails
+  the contract test instead of staying ``kubectl exec``-only;
 * ``/healthz`` asks the exec probe's question of the exec probe's file: the
   loop breadcrumb fresher than 300 s, nothing about the control plane;
 * port 0 disables the server and a port that cannot be bound is one ERROR line;
@@ -46,9 +50,16 @@ from gpu_fault.cluster_executor import (
     start_executor_metrics,
 )
 from gpu_fault.cluster_executor import bootstrap as BOOTSTRAP
+from gpu_fault.cluster_executor.metrics import COUNTER_SERIES, GAUGE_SERIES
 from gpu_fault.dataplane_metrics import MetricsServer
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import RemoteCommandStatus
+from tests.execution.test_cluster_executor_batching import (
+    FakeClient,
+    FakeNodeAdapter,
+    all_succeed,
+    compound_command,
+)
 from tests.execution.test_cluster_executor_deadline import StuckAdapter
 from tests.execution.test_cluster_executor_lease_and_report import (
     EXECUTOR,
@@ -73,6 +84,17 @@ EXPECTED_METRICS = {
     "gpu_fault_cluster_executor_fleet_fence_holds_total": "counter",
     "gpu_fault_cluster_executor_lease_lost_total": "counter",
     "gpu_fault_cluster_executor_transport_retries_total": "counter",
+    "gpu_fault_cluster_executor_report_failures_total": "counter",
+    "gpu_fault_cluster_executor_unexpected_failures_total": "counter",
+    "gpu_fault_cluster_executor_lease_renewal_failures_total": "counter",
+    "gpu_fault_cluster_executor_results_withheld_total": "counter",
+    "gpu_fault_cluster_executor_cancellations_observed_total": "counter",
+    "gpu_fault_cluster_executor_barrier_unavailable_holds_total": "counter",
+    "gpu_fault_cluster_executor_retryable_adapter_errors_total": "counter",
+    "gpu_fault_cluster_executor_retryable_transport_errors_total": "counter",
+    "gpu_fault_cluster_executor_batched_commands_total": "counter",
+    "gpu_fault_cluster_executor_batched_steps_total": "counter",
+    "gpu_fault_cluster_executor_batched_progress_failures_total": "counter",
     "gpu_fault_cluster_executor_in_flight_commands": "gauge",
     "gpu_fault_cluster_executor_claim_loop_alive": "gauge",
     "gpu_fault_cluster_executor_stuck_executions": "gauge",
@@ -200,6 +222,39 @@ def test_a_fresh_executor_exports_every_series_at_zero(tmp_path) -> None:
     )
 
 
+def test_every_increment_driven_breadcrumb_counter_is_an_exported_series(
+    tmp_path,
+) -> None:
+    """The breadcrumb and the scrape are two views of one set of counters.
+
+    A counter that reaches the breadcrumb through ``increment`` but has no
+    series is ``kubectl exec``-only (the merge shipped five that way). The
+    three breadcrumb keys that are not ``increment`` counters are the claim
+    loop's degraded-cycle streak, the spare sweep's own total and the ISO
+    claim time; they are the only ones allowed to stay out of the family.
+    """
+
+    executor = build_executor(FakeExecutorClient(), [], tmp_path)
+    breadcrumb_only = {
+        "consecutive_transport_degraded_cycles",
+        "spare_reservations_reclaimed_total",
+        "last_successful_claim_at",
+    }
+    exported = set(COUNTER_SERIES) | set(GAUGE_SERIES)
+
+    unexported = set(executor.metrics_snapshot()) - breadcrumb_only - exported
+    assert unexported == set(), (
+        f"breadcrumb counters with no /metrics series: {sorted(unexported)}"
+    )
+    series = set(COUNTER_SERIES.values()) | set(GAUGE_SERIES.values())
+    assert series <= set(executor_samples(executor)), (
+        "every mapped series must be a member of the rendered family"
+    )
+    assert all(hasattr(executor, attribute) for attribute in exported), (
+        "a mapped attribute the executor lacks is an AttributeError at increment"
+    )
+
+
 # ----------------------------------------------------------------- the counters
 
 
@@ -323,6 +378,71 @@ def test_a_transport_failure_on_the_report_counts_one_retry_per_backoff(
     assert values["transport_retries_total"] == 1 == len(delays), values
     assert values["results_succeeded_total"] == 1, "the second post landed"
     assert executor.metrics_snapshot()["transport_retries_total"] == 1
+
+
+def test_a_compound_command_moves_the_batched_command_and_step_series(tmp_path) -> None:
+    """One claimed compound command with four covered steps: the scrape must
+    count the command once and every step it ran, like the breadcrumb does."""
+
+    client = FakeClient(compound_command())
+    executor = build_executor(client, [FakeNodeAdapter(all_succeed())], tmp_path)
+
+    assert executor.run_once() == 1
+    values = executor_samples(executor)
+    snapshot = executor.metrics_snapshot()
+
+    assert client.reported().status is RemoteCommandStatus.SUCCEEDED
+    assert values["batched_commands_total"] == 1 == snapshot["batched_commands_total"]
+    assert values["batched_steps_total"] == 4 == snapshot["batched_steps_total"], (
+        "the four node-side steps behind the head must each count once"
+    )
+    assert values["batched_progress_failures_total"] == 0, (
+        "every progress post landed on the fake client"
+    )
+    assert values["claims_total"] == 1 and values["results_succeeded_total"] == 1
+
+
+def test_a_progress_post_failure_moves_the_batched_progress_failure_series(
+    tmp_path,
+) -> None:
+    client = FakeClient(compound_command(), progress_error=RuntimeError("503"))
+    executor = build_executor(client, [FakeNodeAdapter(all_succeed())], tmp_path)
+
+    assert executor.run_once() == 1
+    values = executor_samples(executor)
+
+    assert client.reported().status is RemoteCommandStatus.SUCCEEDED, (
+        "a failed progress post costs latency, never a step"
+    )
+    assert values["batched_progress_failures_total"] == 4 == len(client.progress_posts)
+    assert values["batched_steps_total"] == 4, values
+
+
+def test_a_transport_error_from_the_adapter_moves_the_retryable_transport_series(
+    tmp_path,
+) -> None:
+    """A gaierror out of the adapter is the executor's own connectivity: the
+    command is held WAITING and the transport counter, not the adapter one,
+    moves."""
+
+    client = FakeExecutorClient([remote_command("command-a")])
+    adapter = RecordingAdapter(
+        raises=socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    )
+    executor = build_executor(client, [adapter], tmp_path)
+
+    assert executor.run_once() == 1
+    values = executor_samples(executor)
+
+    assert client.reported("command-a").status is RemoteCommandStatus.WAITING
+    assert (
+        values["retryable_transport_errors_total"]
+        == 1
+        == executor.retryable_transport_errors_total
+    )
+    assert values["retryable_adapter_errors_total"] == 0, values
+    assert values["results_waiting_total"] == 1, values
+    assert executor.metrics_snapshot()["retryable_transport_errors_total"] == 1
 
 
 def test_a_lost_lease_and_an_abandoned_hold_are_exported(tmp_path) -> None:
