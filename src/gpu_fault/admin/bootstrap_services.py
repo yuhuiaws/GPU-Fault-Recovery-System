@@ -1189,6 +1189,8 @@ def install_monitoring(
     # Dashboards ride on this task so they are checkpointed with the AMP install
     # they visualise and re-imported when the dashboard assets change; the step
     # itself decides between a soft FAILED record and an operator-input error.
+    # The alert email is the site administrator's: the step derives the Identity
+    # Center user to grant Grafana ADMIN from it.
     dashboards = ensure_grafana_dashboards(
         runner,
         settings=grafana,
@@ -1197,6 +1199,7 @@ def install_monitoring(
         amp_workspace_id=str(monitoring["workspace_id"]),
         repository_root=repository_root,
         probe_only=probe_only,
+        admin_email=alert_email,
     )
     return {
         **role,

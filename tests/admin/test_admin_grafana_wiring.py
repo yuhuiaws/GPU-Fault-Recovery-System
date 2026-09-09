@@ -234,6 +234,9 @@ def test_install_monitoring_records_the_grafana_step_with_the_amp_workspace(
     assert call["site_id"] == SITE
     assert call["repository_root"] == tmp_path
     assert call["cpu"] == cpu
+    assert call["admin_email"] == "ops@example.com", (
+        "the step did not receive the administrator email the ADMIN grant derives from"
+    )
 
 
 def test_bootstrap_resolves_grafana_from_the_existing_site_and_persists_it(

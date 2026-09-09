@@ -25,11 +25,22 @@ AWS API for one run (15 minutes) and deleted in a ``finally``; the token never
 enters state, the summary or the command log (the runner treats the minting
 command as sensitive).
 
-Opening the dashboards is the one manual step left: Amazon Managed Grafana only
-authenticates IAM Identity Center or SAML users, so someone has to be granted a
-role on the workspace. ``--grafana-viewer <sso-user-id>`` does it in the deploy;
-without it the deploy prints the exact ``aws grafana update-permissions`` line
-for the resolved workspace.
+Opening the dashboards needs a person with a role on the workspace: Amazon
+Managed Grafana only authenticates IAM Identity Center or SAML users. After the
+import the deploy derives that person from the site's administrator email --
+``sso-admin list-instances`` names the one identity store, ``identitystore
+get-user-id`` finds the user by ``emails.value`` (then ``userName``),
+``grafana list-permissions`` makes the grant idempotent -- and grants ADMIN, so
+the administrator can add viewers in the Grafana UI. ``--grafana-viewer
+<sso-user-id>`` still grants VIEWER to an explicitly named user (operator input:
+a refused id fails the deploy). The derived grant never fails the deploy: no or
+two Identity Center instances, no user with that email, a denied lookup are
+recorded as ``not-derivable`` with the reason, and the deploy prints the exact
+``aws grafana update-permissions`` line for the resolved workspace next to it.
+The read-only probe repeats the derivation on later deploys while it stays
+``not-derivable``, so creating the user is enough for the next deploy to grant.
+The deploy host therefore needs ``sso:ListInstances``, ``identitystore:GetUserId``
+and ``grafana:ListPermissions`` next to ``grafana:UpdatePermissions``.
 """
 
 from __future__ import annotations
@@ -89,6 +100,10 @@ _OPTION_VARIABLES = (
 HTTP_TIMEOUT_SECONDS = 30
 WORKSPACE_ACTIVE_TIMEOUT_SECONDS = 600
 _WORKSPACE_TASK = "monitoring_install"
+# Grafana workspace roles, weakest first: a user holding a role at or above the
+# one to grant is not granted again.
+_ROLE_RANK = {"VIEWER": 1, "EDITOR": 2, "ADMIN": 3}
+_ADMIN_GRANTED = frozenset({"granted", "already"})
 
 
 @dataclass(frozen=True)
@@ -137,7 +152,9 @@ def add_grafana_arguments(deploy: argparse.ArgumentParser) -> None:
         metavar="SSO_USER_ID",
         help=(
             "IAM Identity Center user id granted VIEWER on the Grafana workspace "
-            "after the import (otherwise the deploy prints the command to run)"
+            "after the import, next to the ADMIN the deploy grants the user behind "
+            "the administrator email (when that user cannot be derived the deploy "
+            "prints the command to run)"
         ),
     )
 
@@ -207,9 +224,11 @@ def grafana_access_lines(state: BootstrapState) -> list[str]:
     and how a person gets in.
 
     The import needs no human login, but viewing does: Amazon Managed Grafana
-    authenticates only IAM Identity Center or SAML users. When ``--grafana-viewer``
-    granted someone, say so; otherwise print the exact ``update-permissions``
-    line for the resolved workspace so nobody has to look the id up.
+    authenticates only IAM Identity Center or SAML users. Say who was granted --
+    the administrator derived from the site email (ADMIN) and/or the
+    ``--grafana-viewer`` user (VIEWER); when nobody was, print the exact
+    ``update-permissions`` line for the resolved workspace so nobody has to look
+    the id up, followed by the reason the automatic grant did not happen.
     """
 
     result = _state_result(state) or {}
@@ -217,14 +236,28 @@ def grafana_access_lines(state: BootstrapState) -> list[str]:
     if str(result.get("status") or "") != "PROVISIONED" or not workspace_id:
         return []
     lines = [f"Grafana dashboards: {result.get('dashboards_url') or ''}"]
+    admin_grant = result.get("admin_grant")
+    admin_grant = dict(admin_grant) if isinstance(admin_grant, Mapping) else {}
+    admin_status = str(admin_grant.get("status") or "")
+    if admin_status in _ADMIN_GRANTED:
+        verb = "granted to" if admin_status == "granted" else "already held by"
+        lines.append(
+            f"Grafana ADMIN {verb} {admin_grant.get('email')} "
+            f"(Identity Center user {admin_grant.get('sso_user_id')})"
+        )
     viewer = result.get("viewer_sso_user_id")
     if viewer:
         lines.append(f"Grafana VIEWER granted to Identity Center user {viewer}")
-    else:
+    if admin_status not in _ADMIN_GRANTED and not viewer:
         lines.append(
             "Grafana access: grant yourself VIEWER with "
             f"`{viewer_permission_command(str(result.get('region') or ''), workspace_id, '<sso-user-id>')}` "
             "or re-run deploy with --grafana-viewer <sso-user-id>"
+        )
+    if admin_status and admin_status not in _ADMIN_GRANTED:
+        lines.append(
+            "Grafana ADMIN was not granted automatically: "
+            f"{admin_grant.get('reason') or 'no reason recorded'}"
         )
     return lines
 
@@ -235,15 +268,15 @@ def viewer_permission_command(region: str, workspace_id: str, sso_user_id: str) 
     return (
         f"aws grafana update-permissions --region {region} "
         f"--workspace-id {workspace_id} --update-instruction-batch "
-        f"'{json.dumps(_viewer_instructions(sso_user_id), separators=(',', ':'))}'"
+        f"'{json.dumps(_role_instructions('VIEWER', sso_user_id), separators=(',', ':'))}'"
     )
 
 
-def _viewer_instructions(sso_user_id: str) -> list[dict[str, Any]]:
+def _role_instructions(role: str, sso_user_id: str) -> list[dict[str, Any]]:
     return [
         {
             "action": "ADD",
-            "role": "VIEWER",
+            "role": role,
             "users": [{"id": sso_user_id, "type": "SSO_USER"}],
         }
     ]
@@ -866,6 +899,7 @@ def ensure_grafana_dashboards(
     repository_root: Path,
     probe_only: bool = False,
     http: HttpTransport | None = None,
+    admin_email: str | None = None,
 ) -> dict[str, Any]:
     """Resolve the workspace and import the dashboards; see the module docstring.
 
@@ -873,6 +907,10 @@ def ensure_grafana_dashboards(
     re-proves that a provisioned workspace still resolves, and asks for ensure
     (``BootstrapMutationRequired``) whenever the last run did not end in
     ``PROVISIONED`` -- a soft failure is retried on every deploy, not cached.
+    While the administrator's ADMIN grant is still ``not-derivable`` the probe
+    repeats the derivation (reads only): the moment the user exists without
+    ADMIN, the write the grant needs raises ``BootstrapMutationRequired`` and
+    the task re-runs to grant; a grant already made is not derived again.
     """
 
     if settings is None:
@@ -883,7 +921,7 @@ def ensure_grafana_dashboards(
         if str(previous.get("status") or "") != "PROVISIONED":
             raise BootstrapMutationRequired("grafana dashboards")
         try:
-            ensure_grafana_workspace(
+            workspace = ensure_grafana_workspace(
                 runner,
                 cpu=cpu,
                 site_id=site_id,
@@ -893,6 +931,15 @@ def ensure_grafana_dashboards(
             )
         except BootstrapError as exc:
             raise BootstrapMutationRequired("grafana workspace") from exc
+        recorded = previous.get("admin_grant")
+        recorded = dict(recorded) if isinstance(recorded, Mapping) else {}
+        if admin_email and str(recorded.get("status") or "") not in _ADMIN_GRANTED:
+            grant_admin(
+                runner,
+                region=cpu.region,
+                workspace_id=str(workspace["workspace_id"]),
+                email=admin_email,
+            )
         return {"status": "PROBED"}
     try:
         workspace = ensure_grafana_workspace(
@@ -916,27 +963,182 @@ def ensure_grafana_dashboards(
         )
     except (BootstrapError, ValueError) as exc:
         return _failed(exc, workspace)
+    workspace_id = str(workspace["workspace_id"])
     viewer: dict[str, Any] = {}
     if settings.viewer_sso_user_id:
+        # Operator input first: a refused id fails the deploy before anything
+        # derived is attempted.
         grant_viewer(
             runner,
             region=cpu.region,
-            workspace_id=str(workspace["workspace_id"]),
+            workspace_id=workspace_id,
             sso_user_id=settings.viewer_sso_user_id,
         )
         viewer = {"viewer_sso_user_id": settings.viewer_sso_user_id}
-    return {"status": "PROVISIONED", **workspace, **summary, **viewer}
+    admin_grant = grant_admin(
+        runner, region=cpu.region, workspace_id=workspace_id, email=admin_email
+    )
+    return {
+        "status": "PROVISIONED",
+        **workspace,
+        **summary,
+        **viewer,
+        "admin_grant": admin_grant,
+    }
 
 
 def grant_viewer(
     runner: CommandRunner, *, region: str, workspace_id: str, sso_user_id: str
 ) -> None:
     """Grant one Identity Center user VIEWER; ``--grafana-viewer`` is operator
-    input, so a refused id is an error, not a soft failure.
+    input, so a refused id is an error, not a soft failure."""
 
-    ``update-permissions`` answers 200 and lists per-instruction failures in
-    ``errors`` instead of failing the call, so the body is what decides.
+    _grant_role(
+        runner,
+        region=region,
+        workspace_id=workspace_id,
+        role="VIEWER",
+        sso_user_id=sso_user_id,
+    )
+
+
+def grant_admin(
+    runner: CommandRunner, *, region: str, workspace_id: str, email: str | None
+) -> dict[str, Any]:
+    """Grant ADMIN to the Identity Center user behind the administrator email.
+
+    Returns the ``admin_grant`` record: ``granted``, ``already`` (the user holds
+    ADMIN, nothing written) or ``not-derivable`` with the reason. The email is
+    the site's, not this command's input, so nothing here raises ``BootstrapError``
+    -- the dashboards are imported and access is additive. With the read-only
+    runner the write itself raises ``BootstrapMutationRequired``, which is how
+    the probe asks for the task to re-run.
     """
+
+    outcome: dict[str, Any] = {"email": email, "role": "ADMIN"}
+    if not email:
+        return {
+            **outcome,
+            "status": "not-derivable",
+            "reason": "the deploy has no administrator email to derive the user from",
+        }
+    try:
+        store_id = _identity_store_id(runner, region)
+        sso_user_id = _identity_center_user_id(runner, region, store_id, email)
+        outcome["sso_user_id"] = sso_user_id
+        held = _sso_user_role(runner, region, workspace_id, sso_user_id)
+        if held is not None and _ROLE_RANK[held] >= _ROLE_RANK["ADMIN"]:
+            return {**outcome, "status": "already"}
+        _grant_role(
+            runner,
+            region=region,
+            workspace_id=workspace_id,
+            role="ADMIN",
+            sso_user_id=sso_user_id,
+        )
+    except BootstrapError as exc:
+        return {**outcome, "status": "not-derivable", "reason": str(exc)}
+    return {**outcome, "status": "granted"}
+
+
+def _identity_store_id(runner: CommandRunner, region: str) -> str:
+    """The identity store of the one IAM Identity Center instance; never a guess."""
+
+    instances = cast(
+        list[dict[str, Any]],
+        runner.aws_json(region, "sso-admin", "list-instances").get("Instances", []),
+    )
+    if not instances:
+        raise BootstrapError(
+            f"no IAM Identity Center instance is visible from {region} "
+            "(aws sso-admin list-instances returned none)"
+        )
+    if len(instances) > 1:
+        listed = ", ".join(str(item.get("InstanceArn") or "?") for item in instances)
+        raise BootstrapError(
+            f"{len(instances)} IAM Identity Center instances are visible from "
+            f"{region} ({listed}); the deploy cannot choose the user's identity store"
+        )
+    store_id = str(instances[0].get("IdentityStoreId") or "")
+    if not store_id:
+        raise BootstrapError(
+            f"IAM Identity Center instance {instances[0].get('InstanceArn')} "
+            "carries no IdentityStoreId"
+        )
+    return store_id
+
+
+def _identity_center_user_id(
+    runner: CommandRunner, region: str, store_id: str, email: str
+) -> str:
+    """The user whose ``emails.value`` is the email, else whose ``userName`` is."""
+
+    for attribute in ("emails.value", "userName"):
+        identifier = {
+            "UniqueAttribute": {"AttributePath": attribute, "AttributeValue": email}
+        }
+        try:
+            answer = runner.aws_json(
+                region,
+                "identitystore",
+                "get-user-id",
+                "--identity-store-id",
+                store_id,
+                "--alternate-identifier",
+                json.dumps(identifier, separators=(",", ":")),
+            )
+        except BootstrapError as exc:
+            if "ResourceNotFoundException" in str(exc):
+                continue
+            raise
+        user_id = str(answer.get("UserId") or "")
+        if user_id:
+            return user_id
+    raise BootstrapError(
+        f"no Identity Center user has email {email} (emails.value or userName, "
+        f"identity store {store_id}); create/assign one in IAM Identity Center, "
+        "then re-run deploy or run the command above"
+    )
+
+
+def _sso_user_role(
+    runner: CommandRunner, region: str, workspace_id: str, sso_user_id: str
+) -> str | None:
+    """The strongest role the Identity Center user holds on the workspace."""
+
+    permissions = cast(
+        list[dict[str, Any]],
+        runner.aws_json(
+            region,
+            "grafana",
+            "list-permissions",
+            "--workspace-id",
+            workspace_id,
+            "--user-type",
+            "SSO_USER",
+        ).get("permissions", []),
+    )
+    held = [
+        str(item.get("role") or "")
+        for item in permissions
+        if isinstance(item.get("user"), Mapping)
+        and str(item["user"].get("id") or "") == sso_user_id
+        and str(item["user"].get("type") or "SSO_USER") == "SSO_USER"
+        and str(item.get("role") or "") in _ROLE_RANK
+    ]
+    return max(held, key=lambda role: _ROLE_RANK[role]) if held else None
+
+
+def _grant_role(
+    runner: CommandRunner,
+    *,
+    region: str,
+    workspace_id: str,
+    role: str,
+    sso_user_id: str,
+) -> None:
+    """``update-permissions`` answers 200 and lists per-instruction failures in
+    ``errors`` instead of failing the call, so the body is what decides."""
 
     answer = runner.aws_json(
         region,
@@ -945,13 +1147,13 @@ def grant_viewer(
         "--workspace-id",
         workspace_id,
         "--update-instruction-batch",
-        json.dumps(_viewer_instructions(sso_user_id), separators=(",", ":")),
+        json.dumps(_role_instructions(role, sso_user_id), separators=(",", ":")),
         mutate=True,
     )
     errors = answer.get("errors") or []
     if errors:
         raise BootstrapError(
-            f"Grafana workspace {workspace_id} refused VIEWER for Identity Center "
+            f"Grafana workspace {workspace_id} refused {role} for Identity Center "
             f"user {sso_user_id}: {json.dumps(errors)[:300]}"
         )
 
