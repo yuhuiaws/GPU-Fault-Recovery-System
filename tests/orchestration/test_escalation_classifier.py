@@ -322,6 +322,56 @@ def test_an_unknown_outcome_workload_stop_still_reaches_an_operator():
     assert classification[1] is RecoveryAction.ESCALATE_OPERATOR, classification[:3]
 
 
+def test_an_unknown_outcome_job_stop_escalates_every_node_of_the_step():
+    """A timed-out STOP_WORKLOADS hands the operator the whole job, by design.
+
+    The step acts on every node of the job, so when the executor abandons it
+    with the outcome unknown nobody knows which ranks stopped. The ruling is
+    to quarantine all of them and open one ticket rather than guess: the
+    incident scope is the step's full node list, each with its cause.
+    """
+
+    store = build_store()
+    nodes = ["node-a", "node-b", "node-c"]
+    steps = [workflow_step(WorkflowOperation.STOP_WORKLOADS, node_ids=nodes)]
+    _, workflow = _failed(
+        store,
+        steps,
+        [
+            workflow_step_execution(
+                0,
+                WorkflowOperation.STOP_WORKLOADS,
+                WorkflowStepStatus.FAILED,
+                error="executor abandoned STOP_WORKLOADS after 1800s; outcome unknown",
+                details={
+                    "execution_timeout": True,
+                    "operation": WorkflowOperation.STOP_WORKLOADS.value,
+                    "outcome_unknown": True,
+                    "manual_confirmation_required": True,
+                    "node_failures": {
+                        node: ["execution timed out; outcome unknown"] for node in nodes
+                    },
+                },
+            )
+        ],
+        completed=[],
+        gpu_uuids=("GPU-a",),
+    )
+
+    escalation = HardwareEscalationService(store, _StubBuilder()).escalate(workflow)
+
+    assert escalation is not None, "an unknown-outcome job stop must reach an operator"
+    incident, successor = escalation
+    assert sorted(incident.node_ids) == nodes, (
+        "every node of the timed-out job step is quarantined, not only the first"
+    )
+    assert all(node in incident.reasons[0] for node in nodes), incident.reasons[0]
+    successor_nodes = sorted(
+        {node for step in successor.official_steps for node in step.node_ids}
+    )
+    assert successor_nodes == nodes, successor_nodes
+
+
 def _support_reason(details, error):
     """The first reason ``emit`` writes for a FAILED RESET_GPU with ``details``."""
 
