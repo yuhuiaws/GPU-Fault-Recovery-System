@@ -583,6 +583,11 @@ class ClusterActionExecutor:
             # An empty claim round trip proves the control-plane route works
             # and leaves nothing blocked, so it is not a degraded cycle.
             self.consecutive_transport_degraded_cycles = 0
+        # Assigned, not incremented, so ``increment`` cannot mirror it: the
+        # gauge is set here, the one place the streak changes.
+        self.metrics.transport_degraded_cycles(
+            self.consecutive_transport_degraded_cycles
+        )
         return len(commands)
 
     def _execute_and_report(self, command: RemoteActionCommand) -> CommandOutcome:
@@ -616,10 +621,16 @@ class ClusterActionExecutor:
         sweep = self.spare_reservation_sweep
         if sweep is None or not sweep.due():
             return
+        # The sweep owns its total and may raise after releasing some of the
+        # reservations it set out to, so the series follows the total's delta,
+        # not ``run``'s return value.
+        before = sweep.reclaimed_total
         try:
             sweep.run()
         except Exception:  # noqa: BLE001 - housekeeping must not stop claims
             LOGGER.warning("spare reservation sweep failed", exc_info=True)
+        finally:
+            self.metrics.spare_reservations_reclaimed(sweep.reclaimed_total - before)
 
     def run(self) -> None:
         consecutive_failures = 0

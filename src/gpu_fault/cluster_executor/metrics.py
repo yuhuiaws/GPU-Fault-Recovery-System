@@ -8,11 +8,12 @@ collector; this module is the family behind that port.
 
 The series are the executor's own counters, not a second set: ``increment``
 is the only writer of an executor counter and mirrors every change here, so
-the scrape and the breadcrumb always read the same numbers. Every counter the
-breadcrumb carries through ``increment`` is exported (a merge once ported five
-that rode in the breadcrumb alone; the metrics test now pins the two sets
-against each other). Results, the loop breadcrumb and the batch in flight are
-the three things the counters never said, and they are recorded at the one
+the scrape and the breadcrumb always read the same numbers. Every number the
+breadcrumb carries is exported -- the ``increment`` counters, the claim loop's
+degraded-cycle streak and the spare sweep's total (a merge once ported five
+counters that rode in the breadcrumb alone; the metrics test now pins the two
+sets against each other). Results, the loop breadcrumb and the batch in flight
+are the three things the counters never said, and they are recorded at the one
 place each is decided.
 """
 
@@ -57,6 +58,15 @@ COUNTER_SERIES: dict[str, str] = {
     "batched_progress_failures_total": "batched_progress_failures_total",
 }
 GAUGE_SERIES: dict[str, str] = {"stuck_executions": "stuck_executions"}
+# Breadcrumb numbers the executor sets outside ``increment``: the claim loop
+# assigns its degraded-cycle streak (a gauge) and the spare sweep owns its own
+# reclaimed total (a counter). Each has one dedicated move below, called where
+# the value changes, so the guard test can pin the breadcrumb against the
+# family without a third path through ``increment``.
+DIRECT_SERIES: dict[str, str] = {
+    "consecutive_transport_degraded_cycles": "consecutive_transport_degraded_cycles",
+    "spare_reservations_reclaimed_total": "spare_reservations_reclaimed_total",
+}
 # One counter per verdict: the renderer has no labels, and a labelled
 # ``results_posted_total{status=...}`` is what an alert would have to split
 # anyway. PENDING and LEASED are queue states a result may never carry.
@@ -172,6 +182,11 @@ def cluster_executor_metrics() -> MetricFamily:
                 "Per-step progress posts the control plane did not accept; the "
                 "terminal result carries every verdict, so no step is lost.",
             ),
+            (
+                "spare_reservations_reclaimed_total",
+                "Warm-spare reservations released by the periodic sweep because "
+                "they outlived their TTL with no incident closing them.",
+            ),
         ),
         gauges=(
             (
@@ -187,6 +202,12 @@ def cluster_executor_metrics() -> MetricFamily:
                 "stuck_executions",
                 "Threads still inside a command this executor abandoned at the "
                 "execution cap; Python cannot kill them, so they accumulate.",
+            ),
+            (
+                "consecutive_transport_degraded_cycles",
+                "Current streak of claim cycles that advanced nothing and ended "
+                "in a retryable transport error on this executor's own network; "
+                "resets to 0 on the first clean cycle (see _idle_delay).",
             ),
         ),
         timestamps=(
@@ -205,7 +226,7 @@ def cluster_executor_metrics() -> MetricFamily:
 
 
 class ClusterExecutorMetrics:
-    """The family plus the four moves the executor makes on it."""
+    """The family plus the moves the executor makes on it."""
 
     def __init__(self) -> None:
         self.family = cluster_executor_metrics()
@@ -237,6 +258,17 @@ class ClusterExecutorMetrics:
 
     def in_flight(self, count: int) -> None:
         self.family.set("in_flight_commands", count)
+
+    def transport_degraded_cycles(self, streak: int) -> None:
+        """The claim loop assigned its degraded-cycle streak (not via increment)."""
+
+        self.family.set(DIRECT_SERIES["consecutive_transport_degraded_cycles"], streak)
+
+    def spare_reservations_reclaimed(self, amount: int) -> None:
+        """The spare sweep released ``amount`` reservations in one run."""
+
+        if amount > 0:
+            self.family.inc(DIRECT_SERIES["spare_reservations_reclaimed_total"], amount)
 
 
 def loop_breadcrumb_is_fresh(path: str, max_age_seconds: float) -> bool:

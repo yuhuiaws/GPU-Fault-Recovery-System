@@ -14,9 +14,10 @@ What is pinned here:
   writer, so a claim/result cycle, a timeout, a fence hold, a report retry, a
   compound command and a transport error move the same numbers the breadcrumb
   carries;
-* every counter the breadcrumb carries through ``increment`` is a series: a
-  counter added to the breadcrumb alone (the merge ported five that way) fails
-  the contract test instead of staying ``kubectl exec``-only;
+* every number the breadcrumb carries is a series -- the ``increment``
+  counters, the claim loop's degraded-cycle streak and the spare sweep's
+  total -- so a counter added to the breadcrumb alone (the merge ported five
+  that way) fails the contract test instead of staying ``kubectl exec``-only;
 * ``/healthz`` asks the exec probe's question of the exec probe's file: the
   loop breadcrumb fresher than 300 s, nothing about the control plane;
 * port 0 disables the server and a port that cannot be bound is one ERROR line;
@@ -30,6 +31,7 @@ import os
 import re
 import socket
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -50,8 +52,14 @@ from gpu_fault.cluster_executor import (
     start_executor_metrics,
 )
 from gpu_fault.cluster_executor import bootstrap as BOOTSTRAP
-from gpu_fault.cluster_executor.metrics import COUNTER_SERIES, GAUGE_SERIES
+from gpu_fault.cluster_executor.metrics import (
+    COUNTER_SERIES,
+    DIRECT_SERIES,
+    GAUGE_SERIES,
+)
 from gpu_fault.dataplane_metrics import MetricsServer
+from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
+from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import RemoteCommandStatus
 from tests.execution.test_cluster_executor_batching import (
@@ -69,6 +77,13 @@ from tests.execution.test_cluster_executor_lease_and_report import (
     remote_command,
 )
 from tests.execution.test_cluster_executor_report_retry import FlakyReportClient
+from tests.hyperpod.test_spare_reservations import (
+    NOW,
+    FakeCore,
+    FakeLifecycle,
+    reserved_node,
+    spare,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 ADOT_DATAPLANE_MANIFEST = ROOT / "deploy" / "dataplane" / "adot-dataplane.yaml"
@@ -95,7 +110,9 @@ EXPECTED_METRICS = {
     "gpu_fault_cluster_executor_batched_commands_total": "counter",
     "gpu_fault_cluster_executor_batched_steps_total": "counter",
     "gpu_fault_cluster_executor_batched_progress_failures_total": "counter",
+    "gpu_fault_cluster_executor_spare_reservations_reclaimed_total": "counter",
     "gpu_fault_cluster_executor_in_flight_commands": "gauge",
+    "gpu_fault_cluster_executor_consecutive_transport_degraded_cycles": "gauge",
     "gpu_fault_cluster_executor_claim_loop_alive": "gauge",
     "gpu_fault_cluster_executor_stuck_executions": "gauge",
     "gpu_fault_cluster_executor_last_claim_timestamp": "gauge",
@@ -225,32 +242,35 @@ def test_a_fresh_executor_exports_every_series_at_zero(tmp_path) -> None:
 def test_every_increment_driven_breadcrumb_counter_is_an_exported_series(
     tmp_path,
 ) -> None:
-    """The breadcrumb and the scrape are two views of one set of counters.
+    """The breadcrumb and the scrape are two views of one set of numbers.
 
-    A counter that reaches the breadcrumb through ``increment`` but has no
-    series is ``kubectl exec``-only (the merge shipped five that way). The
-    three breadcrumb keys that are not ``increment`` counters are the claim
-    loop's degraded-cycle streak, the spare sweep's own total and the ISO
-    claim time; they are the only ones allowed to stay out of the family.
+    A number that reaches the breadcrumb but has no series is ``kubectl
+    exec``-only (the merge shipped five counters that way). ``increment``
+    counters are mapped by ``COUNTER_SERIES``/``GAUGE_SERIES``; the two values
+    the executor sets outside ``increment`` (the claim loop's degraded-cycle
+    streak, the spare sweep's total) by ``DIRECT_SERIES``. The ISO claim time
+    is a timestamp string with a numeric twin (``last_claim_timestamp``) and
+    is the only key allowed to stay out.
     """
 
     executor = build_executor(FakeExecutorClient(), [], tmp_path)
-    breadcrumb_only = {
-        "consecutive_transport_degraded_cycles",
-        "spare_reservations_reclaimed_total",
-        "last_successful_claim_at",
-    }
-    exported = set(COUNTER_SERIES) | set(GAUGE_SERIES)
+    incremented = set(COUNTER_SERIES) | set(GAUGE_SERIES)
+    exported = incremented | set(DIRECT_SERIES)
 
-    unexported = set(executor.metrics_snapshot()) - breadcrumb_only - exported
+    unexported = set(executor.metrics_snapshot()) - {"last_successful_claim_at"}
+    unexported -= exported
     assert unexported == set(), (
-        f"breadcrumb counters with no /metrics series: {sorted(unexported)}"
+        f"breadcrumb numbers with no /metrics series: {sorted(unexported)}"
     )
-    series = set(COUNTER_SERIES.values()) | set(GAUGE_SERIES.values())
+    series = (
+        set(COUNTER_SERIES.values())
+        | set(GAUGE_SERIES.values())
+        | set(DIRECT_SERIES.values())
+    )
     assert series <= set(executor_samples(executor)), (
         "every mapped series must be a member of the rendered family"
     )
-    assert all(hasattr(executor, attribute) for attribute in exported), (
+    assert all(hasattr(executor, attribute) for attribute in incremented), (
         "a mapped attribute the executor lacks is an AttributeError at increment"
     )
 
@@ -443,6 +463,56 @@ def test_a_transport_error_from_the_adapter_moves_the_retryable_transport_series
     assert values["retryable_adapter_errors_total"] == 0, values
     assert values["results_waiting_total"] == 1, values
     assert executor.metrics_snapshot()["retryable_transport_errors_total"] == 1
+
+
+def test_the_transport_degraded_streak_is_a_gauge_that_rises_and_resets(
+    tmp_path,
+) -> None:
+    """A cycle that advanced nothing and failed on the executor's own network
+    reads 1; the next clean cycle reads 0 again, like the breadcrumb."""
+
+    client = FakeExecutorClient([remote_command("command-a")], [remote_command("b")])
+    adapter = RecordingAdapter(
+        raises=socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    )
+    executor = build_executor(client, [adapter], tmp_path)
+
+    assert executor.run_once() == 1
+    degraded = executor_samples(executor)
+    adapter.raises = None
+    assert executor.run_once() == 1
+    clean = executor_samples(executor)
+
+    assert degraded["consecutive_transport_degraded_cycles"] == 1, degraded
+    assert clean["consecutive_transport_degraded_cycles"] == 0, clean
+    assert clean["retryable_transport_errors_total"] == 1, (
+        "the counter keeps the history the gauge does not"
+    )
+    assert executor.metrics_snapshot()["consecutive_transport_degraded_cycles"] == 0
+
+
+def test_a_sweep_that_reclaims_a_spare_moves_the_reclaimed_series(tmp_path) -> None:
+    core_nodes = {
+        "hyperpod-i-1": reserved_node(
+            "incident-old", reserved_at=NOW - timedelta(hours=2)
+        )
+    }
+    coordinator = HyperPodSpareCoordinator(
+        FakeLifecycle([spare("i-1")]), None, FakeCore(core_nodes), now=lambda: NOW
+    )
+    sweep = SpareReservationSweep(
+        coordinator, ttl_seconds=3600.0, interval_seconds=300.0, now=lambda: NOW
+    )
+    executor = build_executor(
+        FakeExecutorClient(), [], tmp_path, spare_reservation_sweep=sweep
+    )
+
+    executor.sweep_spare_reservations()
+    values = executor_samples(executor)
+
+    assert sweep.reclaimed_total == 1, "the fixture must reclaim exactly one spare"
+    assert values["spare_reservations_reclaimed_total"] == 1, values
+    assert executor.metrics_snapshot()["spare_reservations_reclaimed_total"] == 1
 
 
 def test_a_lost_lease_and_an_abandoned_hold_are_exported(tmp_path) -> None:
