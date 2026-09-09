@@ -20,7 +20,7 @@
     "why": "release orchestrator and rollback path: only typed since the mypy target was widened"
   },
   "src/gpu_fault_release": {
-    "ceiling": 40,
+    "ceiling": 38,
     "priority": 4,
     "why": "release orchestrator and rollback path (moved from deploy/control-plane/regional in S16): only typed since the mypy target was widened"
   }

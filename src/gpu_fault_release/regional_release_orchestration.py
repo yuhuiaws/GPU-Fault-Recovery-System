@@ -1869,8 +1869,9 @@ def rollback_release(
     # Before any restore is planned: the previous release's control plane would
     # re-submit an install that is PENDING or WAITING right now. Skipped once
     # the control plane is already restored (a cleanup re-entry). An automatic
-    # rollback proceeds only when no Running control-plane Pod could run the
-    # probe (StoreUnreachable); a manual one refuses. The verdict rides in the
+    # rollback proceeds only when no Running control-plane Pod with a ready
+    # container could run the probe (StoreUnreachable); a kubectl-level failure
+    # on a ready Pod and a manual rollback refuse. The verdict rides in the
     # state so ``rollback-started`` persists whether and on what this was
     # checked (``render_persisted_state`` writes the state whole).
     if "rollback-cpu-restored" not in set(

@@ -186,7 +186,9 @@ def test_port_zero_disables_the_server(caplog: pytest.LogCaptureFixture) -> None
         assert start_metrics_server(_family(), port=0) is None, (
             "port 0 must not start a server"
         )
-    assert any("disabled" in record.getMessage() for record in caplog.records)
+    assert any("disabled" in record.getMessage() for record in caplog.records), (
+        "port 0 must log that the metrics endpoint is disabled"
+    )
 
 
 def test_bind_failure_is_logged_and_does_not_raise(
@@ -208,7 +210,7 @@ def test_bind_failure_is_logged_and_does_not_raise(
 def test_started_server_runs_on_a_daemon_thread() -> None:
     live = _ephemeral(_family())
     try:
-        assert live.is_running
+        assert live.is_running, "the ephemeral metrics server must be running"
         thread = next(
             t for t in threading.enumerate() if t.name == "gpu-fault-dataplane-metrics"
         )
