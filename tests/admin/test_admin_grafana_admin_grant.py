@@ -307,7 +307,7 @@ def test_no_matching_user_keeps_the_printed_command_and_names_the_missing_user(
     state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
     state.record("monitoring_install", {"grafana": result})
     lines = grafana_access_lines(state)
-    assert lines[0].startswith("Grafana dashboards: ")
+    assert lines[0].startswith("Grafana dashboards: "), lines[0]
     command_line = next(line for line in lines if "update-permissions" in line)
     assert "--workspace-id g-5b81a13d97" in command_line
     assert "<sso-user-id>" in command_line, "the ready command lost its placeholder"
@@ -583,7 +583,7 @@ def test_the_access_lines_say_who_was_granted_admin(tmp_path: Path) -> None:
     )
     assert ADMIN_EMAIL in already[1] and USER_ID in already[1]
     assert "already" in already[1]
-    assert not any("update-permissions" in line for line in already)
+    assert not any("update-permissions" in line for line in already), already
 
 
 def test_the_access_lines_keep_the_command_when_the_grant_was_not_derivable(
@@ -605,7 +605,7 @@ def test_the_access_lines_keep_the_command_when_the_grant_was_not_derivable(
         "aws grafana update-permissions --region us-east-1 --workspace-id g-5b81a13d97"
         in line
         for line in lines
-    )
+    ), lines
     assert any("no IAM Identity Center instance" in line for line in lines), (
         "the reason the grant was skipped is not printed"
     )
