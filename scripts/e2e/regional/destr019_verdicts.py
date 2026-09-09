@@ -75,6 +75,10 @@ AUDIT_COLUMNS = (
     "parameters_digest",
     "signature_digest",
     "exit_code",
+    # v3: the agent incarnation that took the attempt. Nullable -- NULL on rows
+    # written before the column existed and on attempts accepted before the
+    # agent's first heartbeat -- so the row check only types it.
+    "agent_generation",
 )
 # ``LEDGER_SCHEMA_VERSION`` is the node agent's own: the verdict refuses any
 # other ``user_version``, so a literal here lagged every schema bump (2 -> 3
@@ -451,6 +455,11 @@ def ledger_row_errors(
         errors.append("ledger row carries no gpu_uuids column value")
     if row.get("exit_code") is not None:
         errors.append(f"a SUCCEEDED row carries exit_code {row.get('exit_code')!r}")
+    generation = row.get("agent_generation")
+    if generation is not None and (
+        isinstance(generation, bool) or not isinstance(generation, int)
+    ):
+        errors.append(f"ledger agent_generation is not an integer: {generation!r}")
     if int(audit.get("interrupted_count") or 0) != baseline_interrupted:
         errors.append(
             "the ledger gained INTERRUPTED rows during the case: "

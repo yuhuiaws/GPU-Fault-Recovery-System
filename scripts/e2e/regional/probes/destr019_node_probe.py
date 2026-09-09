@@ -96,6 +96,8 @@ AUDIT_COLUMNS = (
     "parameters_digest",
     "signature_digest",
     "exit_code",
+    # v3 (nullable); ``selectable`` below drops it on a ledger that predates it.
+    "agent_generation",
 )
 # The pre-ARCH-C4 schema, statement for statement
 # (git show 84ce59f:src/gpu_fault/node_agent/ledger.py). The migration drill

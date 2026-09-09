@@ -450,6 +450,19 @@ def test_the_ledger_contract_passes_on_one_audited_attempt_row() -> None:
     assert _ledger_errors(_audit()) == [], "one complete attempt-1 row passes"
 
 
+def test_the_ledger_contract_tolerates_a_null_agent_generation_but_types_it() -> None:
+    """Pre-v3 rows and pre-heartbeat attempts carry NULL; a value must be an int."""
+
+    assert _ledger_errors(_audit(agent_generation=None)) == [], (
+        "NULL is a valid v3 value"
+    )
+    assert _ledger_errors(_audit(agent_generation=7)) == [], (
+        "an incarnation number passes"
+    )
+    typed = _ledger_errors(_audit(agent_generation="seven"))
+    assert "agent_generation is not an integer" in _text(typed), typed
+
+
 def test_the_ledger_contract_rejects_missing_columns_bad_digests_and_interruptions() -> (
     None
 ):
@@ -660,4 +673,36 @@ def test_the_verdict_pins_the_ledger_schema_version_the_node_agent_writes() -> N
     assert verdicts.LEDGER_SCHEMA_VERSION == ledger.LEDGER_SCHEMA_VERSION, (
         verdicts.LEDGER_SCHEMA_VERSION,
         ledger.LEDGER_SCHEMA_VERSION,
+    )
+
+
+def test_the_audit_column_list_is_the_ledger_table_minus_key_and_payload(
+    tmp_path: Path,
+) -> None:
+    """The verdict audits every column the shipped ledger declares.
+
+    v3 added ``agent_generation``; a list that stopped at v2 passed a node whose
+    migration had not added the column, and the probe (which selects only its
+    own list) never read the value off the live row.
+    """
+
+    import sqlite3
+
+    from gpu_fault.node_agent.ledger import NodeActionLedger
+    from scripts.e2e.regional.probes import destr019_node_probe as probe
+
+    NodeActionLedger(str(tmp_path / "node-actions.db"))
+    connection = sqlite3.connect(tmp_path / "node-actions.db")
+    try:
+        table_columns = set(probe.ledger_columns(connection))
+    finally:
+        connection.close()
+
+    assert set(verdicts.AUDIT_COLUMNS) == table_columns - {"command_id", "payload"}, (
+        sorted(verdicts.AUDIT_COLUMNS),
+        sorted(table_columns),
+    )
+    assert "agent_generation" in verdicts.AUDIT_COLUMNS, verdicts.AUDIT_COLUMNS
+    assert set(verdicts.AUDIT_COLUMNS) <= set(probe.AUDIT_COLUMNS), sorted(
+        set(verdicts.AUDIT_COLUMNS) - set(probe.AUDIT_COLUMNS)
     )
