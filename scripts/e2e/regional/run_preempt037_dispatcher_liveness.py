@@ -215,6 +215,10 @@ def execute(
         "baseline": baseline,
         "opened_at": utc_now(),
     }
+    # What the processes read before the window: the restore must bring every
+    # replica back to this, which is not "absent" when an envFrom ConfigMap
+    # supplies the variable.
+    record["effective_before"] = verdicts.effective_variable_value(replicas(regional))
     baseline_path = case_dir / "env-window-baseline.json"
     write_json_atomic(baseline_path, record)
     before = worker_metrics(regional)
@@ -271,7 +275,7 @@ def execute(
             key: value for key, value in baseline.items() if key != "generation"
         }
         record["replicas_after_close"] = wait_replicas(
-            regional, baseline["value"] if baseline["present"] else None
+            regional, record["effective_before"]
         )
         write_json_atomic(baseline_path, record)
         stages["restore"] = verdicts.restore_errors(record)

@@ -162,3 +162,19 @@ def test_the_runner_is_plan_by_default_and_names_the_service_action(
     assert verdicts.PREDECESSOR_CASE_ID == "GF-REGIONAL-PREEMPT-036"
     assert verdicts.VARIABLE == "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER"
     assert "PENDING, RUNNING or WAITING" in "\n".join(preempt037.stop_conditions())
+
+
+def test_the_restore_waits_for_the_value_the_processes_read_before_the_window() -> None:
+    """The Deployment carried no literal entry, yet every process read ``true``
+    from an envFrom ConfigMap; a restore that waited for ``None`` never
+    completed (attempt 1, 2026-09-09)."""
+    replicas = [
+        {"pod": "w-1", "values": {verdicts.VARIABLE: "true"}},
+        {"pod": "w-2", "values": {verdicts.VARIABLE: "true"}},
+    ]
+    assert verdicts.effective_variable_value(replicas) == "true"
+    assert verdicts.effective_variable_value([{"pod": "w-1", "values": {}}]) is None
+    with pytest.raises(ValueError, match="disagree"):
+        verdicts.effective_variable_value(
+            [*replicas, {"pod": "w-3", "values": {verdicts.VARIABLE: "false"}}]
+        )

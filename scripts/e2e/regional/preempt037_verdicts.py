@@ -124,6 +124,23 @@ def quiescence_errors(workflows: list[dict[str, Any]]) -> list[str]:
     return []
 
 
+def effective_variable_value(replicas: list[dict[str, Any]]) -> str | None:
+    """The one value every replica's process reads for the variable.
+
+    The Deployment may carry no literal ``env`` entry for it while the process
+    still reads it from an ``envFrom`` ConfigMap (live: ``true`` from
+    ``gpu-fault-control-worker-config-core``); restoring the Deployment to
+    "absent" therefore brings the replicas back to *that* value, not to none.
+    Attempt 1 (2026-09-09) waited 600 s for ``None`` and failed its own restore.
+    Replicas disagreeing is a rollout still in flight, reported as an error.
+    """
+
+    values = {(item.get("values") or {}).get(VARIABLE) for item in replicas}
+    if len(values) != 1:
+        raise ValueError(f"replicas disagree on {VARIABLE}: {sorted(map(str, values))}")
+    return values.pop()
+
+
 def window_errors(record: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if record.get("variable") != VARIABLE or record.get("value") != WINDOW_VALUE:
