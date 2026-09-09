@@ -944,14 +944,20 @@ def test_the_engine_exits_with_the_refusal_code_the_driver_classifies_on(
         MODULE,
         "parser",
         lambda: SimpleNamespace(
-            parse_args=lambda: SimpleNamespace(mode="rollback", dry_run=False)
+            parse_args=lambda: SimpleNamespace(
+                mode="rollback", dry_run=False, config="/tmp/site.json"
+            )
         ),
     )
+    # The engine's first act is loading the config; raising there stands in for
+    # the gate refusing a few calls later.
     monkeypatch.setattr(
-        MODULE,
-        "_run_mode",
-        lambda _arguments: (_ for _ in ()).throw(
-            GATE.InflightInstallsRefused("rollback refused: workflow-7f3a")
+        MODULE.ReleaseConfig,
+        "load",
+        classmethod(
+            lambda cls, _path: (_ for _ in ()).throw(
+                GATE.InflightInstallsRefused("rollback refused: workflow-7f3a")
+            )
         ),
     )
 
@@ -960,9 +966,11 @@ def test_the_engine_exits_with_the_refusal_code_the_driver_classifies_on(
     assert "workflow-7f3a" in capsys.readouterr().err
 
     monkeypatch.setattr(
-        MODULE,
-        "_run_mode",
-        lambda _arguments: (_ for _ in ()).throw(MODULE.ReleaseError("broke")),
+        MODULE.ReleaseConfig,
+        "load",
+        classmethod(
+            lambda cls, _path: (_ for _ in ()).throw(MODULE.ReleaseError("broke"))
+        ),
     )
     assert MODULE.main() == 2, "every other engine error keeps the generic code"
 
@@ -970,10 +978,10 @@ def test_the_engine_exits_with_the_refusal_code_the_driver_classifies_on(
 def test_the_rollback_mode_takes_an_automatic_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    arguments = MODULE.parser().parse_args(
+    parsed = MODULE.parser().parse_args(
         ["rollback", "--config", "/tmp/site.json", "--automatic"]
     )
-    assert arguments.automatic is True, "the driver marks its rollback automatic"
+    assert parsed.automatic is True, "the driver marks its rollback automatic"
     assert (
         MODULE.parser().parse_args(["rollback", "--config", "/tmp/x"]).automatic
         is False
@@ -981,9 +989,11 @@ def test_the_rollback_mode_takes_an_automatic_marker(
 
     seen: list[dict[str, Any]] = []
     release = SimpleNamespace(rollback=lambda **kwargs: seen.append(kwargs))
+    monkeypatch.setattr(
+        MODULE, "parser", lambda: SimpleNamespace(parse_args=lambda: parsed)
+    )
     monkeypatch.setattr(MODULE.ReleaseConfig, "load", classmethod(lambda cls, _p: None))
     monkeypatch.setattr(MODULE, "RegionalRelease", lambda _config, _runner: release)
 
-    MODULE._run_mode(arguments)
-
+    assert MODULE.main() == 0
     assert seen == [{"automatic": True}]
