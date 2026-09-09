@@ -2,9 +2,10 @@
 
 FINAL-建议汇总 F-G1 (P0-47C / P0-64A / P0-64B / P1-64C / P1-64F / P1-64G).
 ``replay()`` walked the ConfigMap in order and raised on the first failure, so
-a terminal event the control plane permanently rejects (unknown runtime
-profile, 409 from a stuck containment workflow) stopped every later record of
-the whole GPU cluster from ever being delivered. The collector outbox in
+a terminal event the control plane permanently rejects (an unknown runtime
+profile, or -- before terminals were decided immediately and chained behind
+their containment workflow -- a 409 from a containment still open) stopped
+every later record of the whole GPU cluster from ever being delivered. The collector outbox in
 ``gpu_fault.collectors.sinks`` already isolates per record, keeps a budget and
 marks records non-replayable; this file pins the same behaviour here and pins
 that the two layers classify a status code the same way.

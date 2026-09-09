@@ -13,6 +13,7 @@ from gpu_fault.models import (
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
+    TerminalStatus,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -252,8 +253,9 @@ class CompletionService:
         if existing is not None:
             return existing.model_copy(update={"duplicate": True})
         self.store.get_profile(event.runtime_profile_version)
-        containment_workflow_id = self._ensure_terminal_containment(event)
-        explicit_initiator, passive_containment = self._containment_context(event)
+        explicit_initiator, passive_containment = self._containment_context(
+            event, self._ensure_terminal_containment(event)
+        )
 
         # Everything persisted about this event -- the event row, the plan
         # with its incident and workflow, the decision -- is written inside
@@ -280,7 +282,11 @@ class CompletionService:
                 event,
                 explicit_initiator,
                 passive_containment,
-                predecessor_workflow_id=containment_workflow_id,
+                predecessor_workflow_id=(
+                    passive_containment.workflow_request_id
+                    if passive_containment is not None
+                    else None
+                ),
             )
             self.store.save_decision(decision)
         return decision
@@ -290,27 +296,46 @@ class CompletionService:
 
         return f"{event.cluster_id}/{event.attempt_id}/TrainingAttemptFailureDetected"
 
-    def _ensure_terminal_containment(self, event: TerminalEvent) -> str | None:
-        """The containment workflow id for this attempt, created here when a
-        failure terminal arrives before (or without) its failure-detected event.
+    def _ensure_terminal_containment(
+        self, event: TerminalEvent
+    ) -> FaultIncident | None:
+        """The passive containment incident for this attempt (its
+        ``workflow_request_id`` is the recovery's predecessor), created here
+        when a failure terminal arrives before (or without) its
+        failure-detected event.
 
         Runs before the completion transaction: it is its own idempotent
         store transaction keyed by the passive event id, and a second replica
-        racing on it gets ``created=False``. Nothing is created for a clean
-        STOPPED/SUCCEEDED terminal (nothing failed), for a terminal with no
-        workload ids (nothing to stop), or for a terminal another incident's
-        workflow stopped (``_decide`` answers NO_ACTION for it).
+        racing on it gets ``created=False``. Only a FAILED or TIMED_OUT
+        terminal creates one: a STOPPED terminal is a user stop unless a
+        containment already exists (rule A / PREEMPT-033), however its ranks
+        exited, and SUCCEEDED has nothing to stop. Nor is one created for a
+        terminal with no workload ids (nothing to stop) or for a terminal
+        another incident's workflow stopped (``_decide`` answers NO_ACTION for
+        it). An existing incident whose workflow pointer is missing (the
+        dirty link ``_duplicate_event_records`` repairs) falls through so the
+        store rebuilds the workflow instead of leaving the recovery unchained.
         """
 
         existing = self.store.get_incident_by_event(self._passive_event_key(event))
-        if existing is not None:
-            return existing.workflow_request_id
-        if not event.is_failure or not event.workload_ids:
-            return None
-        passive_incident_id, _ = failure_containment_ids(self._passive_event_key(event))
-        if event.termination_initiator_incident_id not in (None, passive_incident_id):
-            return None
-        _incident, workflow, _created = self._ensure_containment(
+        if existing is not None and existing.workflow_request_id:
+            return existing
+        if existing is None:
+            if (
+                event.terminal_status
+                not in {TerminalStatus.FAILED, TerminalStatus.TIMED_OUT}
+                or not event.workload_ids
+            ):
+                return None
+            passive_incident_id, _ = failure_containment_ids(
+                self._passive_event_key(event)
+            )
+            if event.termination_initiator_incident_id not in (
+                None,
+                passive_incident_id,
+            ):
+                return None
+        incident, _workflow, _created = self._ensure_containment(
             cluster_id=event.cluster_id,
             job_id=event.job_id,
             attempt_id=event.attempt_id,
@@ -330,18 +355,20 @@ class CompletionService:
                 ],
             ],
         )
-        return workflow.request_id
+        return incident
 
     def _containment_context(
-        self, event: TerminalEvent
+        self, event: TerminalEvent, passive: FaultIncident | None
     ) -> tuple[FaultIncident | None, FaultIncident | None]:
         """The explicitly named initiator incident (if any) and the passive
         containment incident (if any) for this attempt.
 
-        The passive incident is looked up by the attempt, not only through
-        the terminal's initiator annotation: the DESTR-015 tombstone race can
-        lose that annotation on a job our own containment stopped, and the
-        store knows better than the tombstone.
+        ``passive`` is the attempt's containment as ``_ensure_terminal_containment``
+        found or created it -- one store read that also yields the recovery's
+        predecessor. It is resolved by the attempt, not only through the
+        terminal's initiator annotation: the DESTR-015 tombstone race can lose
+        that annotation on a job our own containment stopped, and the store
+        knows better than the tombstone.
         """
 
         explicit_initiator: FaultIncident | None = None
@@ -358,7 +385,7 @@ class CompletionService:
                 explicit_initiator is not None
                 and explicit_initiator.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED"
             )
-            else self.store.get_incident_by_event(self._passive_event_key(event))
+            else passive
         )
         return explicit_initiator, passive_containment
 

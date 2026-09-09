@@ -9,6 +9,7 @@ from gpu_fault.models import (
     IncidentState,
     MarkerScope,
     NodeMarker,
+    RankExitStatus,
     RecoveryAction,
     Severity,
     TerminalEvent,
@@ -328,6 +329,37 @@ def test_untagged_stop_after_passive_containment_is_our_own_stop(
     assert decision.status is DecisionStatus.PLAN_CREATED
     plan = context.store.get_plan(decision.recovery_plan_id)
     assert [step.action for step in plan.steps] == [RecoveryAction.RESTART_WORKLOAD]
+
+
+def test_untagged_stop_with_failing_ranks_and_no_containment_is_a_user_stop(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """Rule (2) / PREEMPT-033: a user STOPPED whose containers went out non-zero
+    is still a user stop. Only a FAILED/TIMED_OUT terminal mints a containment;
+    a STOPPED one never does, however its ranks exited."""
+
+    stopped = copy_model(
+        failed_event,
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[
+            RankExitStatus(
+                rank=0, exit_code=143, node_id="node-a", finished_at=ended_at
+            )
+        ],
+        workload_ids=["training/pytorchjob/distributed-training"],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = compiled_completion(context).handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.NO_ACTION
+    assert decision.recovery_plan_id is None
+    assert (
+        context.store.get_incident_by_event(
+            f"{stopped.cluster_id}/{stopped.attempt_id}/TrainingAttemptFailureDetected"
+        )
+        is None
+    )
 
 
 def test_matching_marker_reuses_incident_and_is_idempotent(
