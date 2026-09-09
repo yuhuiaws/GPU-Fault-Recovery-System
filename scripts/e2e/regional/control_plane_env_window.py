@@ -2,7 +2,7 @@
 """Open or close a temporary env window on the control-worker Deployment.
 
 `GF-REGIONAL-DESTR-018` needs the workflow lifetime compressed for one
-maintenance window and then restored exactly:
+maintenance window and then restored exactly. The operator chooses two values:
 
 * ``GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS`` -- lowered so a node
   workflow held WAITING reaches its hard lifetime inside the window instead of
@@ -14,7 +14,34 @@ maintenance window and then restored exactly:
   ``details.workflow_lifetime_exceeded=false``, which is the opposite of what
   the case exists to prove.
 
-Both live on the CPU-plane ``gpu-fault-control-worker`` Deployment, which is
+The rest of the timing set moves in lockstep, derived from those two
+(``lockstep_assignments``), because ``execution.config.
+validate_timing_relationships`` fails the control plane closed at boot when the
+set is inconsistent -- a window that lowered the lifetime alone CrashLooped
+every worker replica:
+
+* every per-step waiting ceiling must be at or below the node lifetime
+  (``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS``,
+  ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS``,
+  ``GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS``), and every override at
+  or above the default step cap -- so each is set to the lifetime. Not below
+  it: the drill needs the *lifetime* to be the bound that fires, and
+  ``executor._execute_step`` checks the workflow deadline before the per-step
+  cap, so a cap equal to the lifetime never fires first.
+* ``GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS`` keeps the shipped lead (half the
+  step cap) and stays at or below the cap.
+* ``GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS`` takes whatever the
+  lifetime leaves above the install ceiling, up to its shipped value, so the
+  install execution floor (ceiling + allowance, F2) fits the lifetime.
+* ``GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS`` must stay below the execution
+  timeout; it is lowered to half of it, never above its shipped value.
+
+The rendered set is checked with the control plane's own validator before the
+window opens (``assignment_errors``), judged against the shipped defaults for
+everything the window does not set. No variable is ever raised above its shipped
+default; the two operator-chosen values keep their historical 60..3600 s range.
+
+All of them live on the CPU-plane ``gpu-fault-control-worker`` Deployment, which is
 where the workflow executor and the single-instance dispatch lease run
 (``execution/dispatcher.py``: ``DISPATCH_LEASE_KEY = "workflow-dispatch"``).
 Changing the Deployment template rolls every worker replica, so the lease moves
@@ -30,7 +57,7 @@ before mutating, waits until *every ready replica* reports the new values, and
 absent goes back to absent (delete), never to ``0``. It refuses to open a
 window already open under a baseline it did not write, and refuses to close one
 it has no record of. The variable allow-list is compiled in; it can change
-nothing else, and it can only *lower* a lifetime, never raise one above the
+nothing else, and it can only *lower* a bound, never raise one above the
 shipped default.
 """
 
@@ -50,6 +77,12 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.execution.config import (  # noqa: E402
+    ProductionExecutorConfig,
+    WorkflowExecutionError,
+    validate_timing_from_environment,
+)
+from gpu_fault.models import WorkflowOperation  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -71,18 +104,45 @@ DEPLOYMENT = "gpu-fault-control-worker"
 CONTAINER = "control-worker"
 LIFETIME_VARIABLE = "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS"
 EXECUTION_TIMEOUT_VARIABLE = "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS"
-ALLOWED_VARIABLES = (LIFETIME_VARIABLE, EXECUTION_TIMEOUT_VARIABLE)
+STEP_TIMEOUT_VARIABLE = "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS"
+STEP_WARNING_VARIABLE = "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS"
+MANAGED_RECOVERY_VARIABLE = "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS"
+INSTALL_STEP_VARIABLE = "GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS"
+INSTALL_CONTAINMENT_VARIABLE = "GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS"
+LEASE_DURATION_VARIABLE = "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS"
+_SHIPPED = ProductionExecutorConfig.from_mapping({})
+# What the control plane reads when a variable is absent, taken from the config
+# that reads it so the two cannot drift. Also the most a window may set: above
+# it a window stops compressing and starts extending production bounds.
+SHIPPED_DEFAULTS: dict[str, str] = {
+    LIFETIME_VARIABLE: str(_SHIPPED.node_workflow_lifetime_seconds),
+    EXECUTION_TIMEOUT_VARIABLE: str(_SHIPPED.workflow_execution_timeout_seconds),
+    STEP_TIMEOUT_VARIABLE: str(_SHIPPED.step_waiting_timeout_seconds),
+    STEP_WARNING_VARIABLE: str(_SHIPPED.step_waiting_warning_seconds),
+    MANAGED_RECOVERY_VARIABLE: str(
+        _SHIPPED.step_waiting_limit(WorkflowOperation.REPLACE_NODE)
+    ),
+    INSTALL_STEP_VARIABLE: str(
+        _SHIPPED.step_waiting_limit(WorkflowOperation.REMEDIATE_DRIVER)
+    ),
+    INSTALL_CONTAINMENT_VARIABLE: str(_SHIPPED.node_install_containment_seconds),
+    LEASE_DURATION_VARIABLE: str(_SHIPPED.lease_duration_seconds),
+}
+ALLOWED_VARIABLES = tuple(SHIPPED_DEFAULTS)
+# The two the operator chooses; the rest are derived from them.
+CHOSEN_VARIABLES = (LIFETIME_VARIABLE, EXECUTION_TIMEOUT_VARIABLE)
 # Reported alongside the window so a case can do its timing arithmetic against
 # what the deployed control plane actually reads. Never written by this helper.
 OBSERVED_VARIABLES = (
     "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
-    "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS",
     "GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS",
 )
 SURVEYED_VARIABLES = ALLOWED_VARIABLES + OBSERVED_VARIABLES
 # A lifetime under a minute cannot contain the containment steps that must run
 # before the deadline; above the shipped default this stops being a compression
 # window and becomes a way to make production workflows outlive their bound.
+# The historical range of the two chosen values; a derived one may go to 0 (the
+# containment allowance) and never above its shipped default.
 MINIMUM_SECONDS = 60
 MAXIMUM_SECONDS = 3600
 OPEN_CONFIRMATION = "OPEN_CONTROL_PLANE_ENV_WINDOW"
@@ -118,10 +178,11 @@ def parse_assignments(pairs: list[str]) -> dict[str, str]:
             raise RegionalFixtureError(
                 f"{name} is not in the control-plane env window allow-list"
             )
-        if not value.isdigit() or not MINIMUM_SECONDS <= int(value) <= MAXIMUM_SECONDS:
+        minimum, maximum = value_bounds(name)
+        if not value.isdigit() or not minimum <= int(value) <= maximum:
             raise RegionalFixtureError(
-                f"{name} must be an integer of "
-                f"{MINIMUM_SECONDS}..{MAXIMUM_SECONDS} seconds, got {value!r}"
+                f"{name} must be an integer of {minimum}..{maximum} seconds, "
+                f"got {value!r}"
             )
         if name in result:
             raise RegionalFixtureError(f"{name} was set twice")
@@ -132,8 +193,80 @@ def parse_assignments(pairs: list[str]) -> dict[str, str]:
     return result
 
 
+def value_bounds(name: str) -> tuple[int, int]:
+    """The inclusive range one variable may be set to.
+
+    The two chosen values keep their historical range; a derived one may go as
+    low as the control plane's own validation allows (it is checked next, on the
+    completed set) and never above what the release ships.
+    """
+
+    if name in CHOSEN_VARIABLES:
+        return MINIMUM_SECONDS, MAXIMUM_SECONDS
+    return 0, int(SHIPPED_DEFAULTS[name])
+
+
+def lockstep_assignments(
+    lifetime_seconds: int, execution_timeout_seconds: int | None = None
+) -> dict[str, str]:
+    """The whole timing set for one compressed lifetime (see the module doc).
+
+    Every per-step ceiling becomes the lifetime (a ceiling above it is refused
+    at boot; one below it would end the wait before the lifetime the drill
+    measures), the warning keeps the shipped half-cap lead, the install
+    containment allowance is whatever the lifetime leaves above the install
+    ceiling, and the lease is halved under the execution timeout. Nothing is
+    raised above its shipped default, so an uncompressed lifetime renders the
+    defaults themselves.
+    """
+
+    shipped = {name: int(value) for name, value in SHIPPED_DEFAULTS.items()}
+    # Unless chosen, the execution timeout is the lifetime (the drill needs it at
+    # or above the lifetime) but never more than the release ships.
+    execution = (
+        min(shipped[EXECUTION_TIMEOUT_VARIABLE], lifetime_seconds)
+        if execution_timeout_seconds is None
+        else execution_timeout_seconds
+    )
+    step = min(shipped[STEP_TIMEOUT_VARIABLE], lifetime_seconds)
+    install = min(shipped[INSTALL_STEP_VARIABLE], lifetime_seconds)
+    return {
+        LIFETIME_VARIABLE: str(lifetime_seconds),
+        EXECUTION_TIMEOUT_VARIABLE: str(execution),
+        STEP_TIMEOUT_VARIABLE: str(step),
+        STEP_WARNING_VARIABLE: str(min(shipped[STEP_WARNING_VARIABLE], step // 2)),
+        MANAGED_RECOVERY_VARIABLE: str(
+            min(shipped[MANAGED_RECOVERY_VARIABLE], lifetime_seconds)
+        ),
+        INSTALL_STEP_VARIABLE: str(install),
+        INSTALL_CONTAINMENT_VARIABLE: str(
+            min(shipped[INSTALL_CONTAINMENT_VARIABLE], lifetime_seconds - install)
+        ),
+        LEASE_DURATION_VARIABLE: str(
+            min(shipped[LEASE_DURATION_VARIABLE], execution // 2)
+        ),
+    }
+
+
+def complete_assignments(assignments: dict[str, str]) -> dict[str, str]:
+    """``assignments`` with every derived variable filled in from the lifetime.
+
+    An explicit value wins over the derived one; without a lifetime there is
+    nothing to derive from and the request is returned as given.
+    """
+
+    lifetime = assignments.get(LIFETIME_VARIABLE)
+    if lifetime is None:
+        return dict(assignments)
+    execution = assignments.get(EXECUTION_TIMEOUT_VARIABLE)
+    derived = lockstep_assignments(
+        int(lifetime), None if execution is None else int(execution)
+    )
+    return {**derived, **assignments}
+
+
 def assignment_errors(assignments: dict[str, str]) -> list[str]:
-    """Cross-variable rules the two names cannot be checked apart from.
+    """What the run would prove wrongly, or the control plane would refuse.
 
     ``claim_deadlines`` returns ``min(now + execution_timeout, lifetime)`` as
     the execution deadline and the lifetime separately, and
@@ -143,19 +276,27 @@ def assignment_errors(assignments: dict[str, str]) -> list[str]:
     execution-deadline miss, so a window that compresses the lifetime without
     keeping the execution timeout at or above it silently changes which
     contract the run proves.
+
+    The completed set is then given to the control plane's own boot-time
+    validator (``validate_timing_from_environment``), judged against the
+    shipped defaults for everything the window does not set: a set it refuses
+    would CrashLoop every worker replica instead of opening a window.
     """
 
+    errors: list[str] = []
     lifetime = assignments.get(LIFETIME_VARIABLE)
     timeout = assignments.get(EXECUTION_TIMEOUT_VARIABLE)
-    if lifetime is None or timeout is None:
-        return []
-    if int(timeout) < int(lifetime):
-        return [
+    if lifetime is not None and timeout is not None and int(timeout) < int(lifetime):
+        errors.append(
             f"{EXECUTION_TIMEOUT_VARIABLE}={timeout} is below "
             f"{LIFETIME_VARIABLE}={lifetime}; the execution deadline would fire "
             "first and the failure would not carry workflow_lifetime_exceeded"
-        ]
-    return []
+        )
+    try:
+        validate_timing_from_environment(complete_assignments(assignments))
+    except (WorkflowExecutionError, RuntimeError) as exc:
+        errors.append(f"the control plane would refuse this window at boot: {exc}")
+    return errors
 
 
 def open_arguments(assignments: dict[str, str]) -> list[str]:
@@ -165,9 +306,10 @@ def open_arguments(assignments: dict[str, str]) -> list[str]:
 def restore_arguments(baseline: dict[str, Any]) -> list[str]:
     """`kubectl set env` arguments that put the Deployment back to baseline.
 
-    A variable the shipped manifest did not carry is deleted (``NAME-``), not
-    set back to a literal: the regional release ships neither of these two, and
-    a leftover literal is config the release does not know it has.
+    A variable the shipped manifest did not carry as a literal is deleted
+    (``NAME-``), not set back to a value: the regional release carries the
+    timing set through ``envFrom`` ConfigMaps or not at all, and a leftover
+    literal is config the release does not know it has.
     """
 
     variables = baseline.get("variables") or {}
@@ -386,6 +528,9 @@ def open_window(
     *,
     sleep: Any = time.sleep,
 ) -> dict[str, Any]:
+    # The whole timing set is written, recorded and converged on, whatever
+    # subset the caller chose; the record must name what the Deployment got.
+    assignments = complete_assignments(assignments)
     record = read_baseline(settings.baseline) if settings.baseline.is_file() else None
     decision = open_decision(record, report["deployment"], assignments)
     if decision == "refuse":
@@ -506,7 +651,11 @@ def parser() -> argparse.ArgumentParser:
         "--set",
         action="append",
         default=[],
-        help=("NAME=VALUE for --open; allowed names: " + ", ".join(ALLOWED_VARIABLES)),
+        help=(
+            "NAME=VALUE for --open; the rest of the timing set is derived from "
+            f"{LIFETIME_VARIABLE} unless set explicitly. Allowed names: "
+            + ", ".join(ALLOWED_VARIABLES)
+        ),
     )
     mode = value.add_mutually_exclusive_group()
     mode.add_argument("--open", action="store_true")

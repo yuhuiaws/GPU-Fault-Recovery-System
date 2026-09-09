@@ -63,10 +63,19 @@ def test_the_confirmation_token_names_this_case_and_its_predecessor() -> None:
     assert metadata.risk == "live-service-action"
 
 
-def test_the_case_declares_the_two_variables_the_env_window_may_manage() -> None:
-    assert env_window.ALLOWED_VARIABLES == (
+def test_the_case_chooses_two_variables_and_the_env_window_derives_the_rest() -> None:
+    """The case hands over the lifetime and the execution timeout; the window
+    completes the timing set (step caps, managed recovery, the install ceiling
+    and its containment allowance, the lease) so the control plane's boot
+    validator accepts the compressed lifetime instead of CrashLooping."""
+
+    assert env_window.CHOSEN_VARIABLES == (
         "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS",
         "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS",
+    )
+    assert env_window.ALLOWED_VARIABLES[:2] == env_window.CHOSEN_VARIABLES
+    assert "GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS" in (
+        env_window.ALLOWED_VARIABLES
     )
     assert env_window.DEPLOYMENT == "gpu-fault-control-worker"
 
