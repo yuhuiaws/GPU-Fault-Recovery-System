@@ -163,8 +163,13 @@ def _drop_env(deployment: dict[str, Any], name: str) -> None:
 class _Kubectl:
     """Answers ``kubectl -n <ns> get deployment|configmap <name> -o json``."""
 
-    def __init__(self, deployments: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        deployments: dict[str, dict[str, Any]],
+        config_maps: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         self.deployments = deployments
+        self.config_maps = dict(config_maps or {})
         self.calls: list[list[str]] = []
 
     def __call__(
@@ -175,7 +180,10 @@ class _Kubectl:
         self.calls.append(command)
         if kind == "configmap":
             return subprocess.CompletedProcess(
-                command, 0, stdout=json.dumps({"data": {}}), stderr=""
+                command,
+                0,
+                stdout=json.dumps({"data": self.config_maps.get(name, {})}),
+                stderr="",
             )
         assert kind == "deployment", command
         if name not in self.deployments:
@@ -198,8 +206,13 @@ def verifier(monkeypatch):
     return module
 
 
-def _install(monkeypatch, verifier, live: dict[str, dict[str, Any]]) -> _Kubectl:
-    kubectl = _Kubectl(live)
+def _install(
+    monkeypatch,
+    verifier,
+    live: dict[str, dict[str, Any]],
+    config_maps: dict[str, dict[str, str]] | None = None,
+) -> _Kubectl:
+    kubectl = _Kubectl(live, config_maps)
     monkeypatch.setattr(verifier.subprocess, "run", kubectl)
     return kubectl
 
@@ -448,6 +461,51 @@ def test_snapshot_mode_allows_a_drained_spool_tier_only_when_the_snapshot_disabl
     admitting["gpu-fault-telemetry-spool-worker"]["status"]["readyReplicas"] = 0
     _install(monkeypatch, verifier, admitting)
     monkeypatch.setenv(VARIABLE, _snapshot_file(tmp_path, _snapshot_of(admitting)))
+
+    assert verifier.main() == 1
+    assert (
+        "role-split check failed: gpu-fault-telemetry-spool-worker is scaled to zero"
+        in capsys.readouterr().out
+    )
+
+
+def test_snapshot_mode_reads_the_spool_switch_from_the_snapshots_env_from(
+    monkeypatch, verifier, capsys, tmp_path
+):
+    """The rendered role split carries GPU_FAULT_TELEMETRY_SPOOL in the
+    ``gpu-fault-api-ha-config-telemetry`` ConfigMap, not as a literal env entry.
+    Reading only the literal list failed the rollback of deploy #32
+    (2026-09-09) with "spool-worker is scaled to zero" on a site whose spool
+    had always been off; the exemption resolves envFrom the way kubelet does."""
+
+    live = _live_control_plane()
+    live["gpu-fault-telemetry-spool-worker"]["spec"]["replicas"] = 0
+    live["gpu-fault-telemetry-spool-worker"]["status"]["readyReplicas"] = 0
+    (api,) = live["gpu-fault-api-ha"]["spec"]["template"]["spec"]["containers"]
+    api["env"] = [
+        item for item in api["env"] if item["name"] != "GPU_FAULT_TELEMETRY_SPOOL"
+    ]
+    api["envFrom"] = [{"configMapRef": {"name": "gpu-fault-api-ha-config-telemetry"}}]
+    _install(
+        monkeypatch,
+        verifier,
+        live,
+        {"gpu-fault-api-ha-config-telemetry": {"GPU_FAULT_TELEMETRY_SPOOL": "false"}},
+    )
+    monkeypatch.setenv(VARIABLE, _snapshot_file(tmp_path, _snapshot_of(live)))
+
+    assert verifier.main() == 0, capsys.readouterr().out
+
+    # The verifier caches ConfigMap reads for the run, so the admitting site
+    # references a differently named ConfigMap.
+    api["envFrom"] = [{"configMapRef": {"name": "gpu-fault-api-ha-config-admitting"}}]
+    _install(
+        monkeypatch,
+        verifier,
+        live,
+        {"gpu-fault-api-ha-config-admitting": {"GPU_FAULT_TELEMETRY_SPOOL": "true"}},
+    )
+    monkeypatch.setenv(VARIABLE, _snapshot_file(tmp_path, _snapshot_of(live)))
 
     assert verifier.main() == 1
     assert (

@@ -348,18 +348,20 @@ def spool_tier_disabled_in_snapshot(snapshot: dict[str, Any]) -> bool:
     """Whether the previous release itself ran with telemetry-spool admission off.
 
     Read from the snapshot's own ingress environment, not from the current
-    contract: when the previous ingress carried the literal
-    ``GPU_FAULT_TELEMETRY_SPOOL=false`` the spool tier was legitimately scaled
-    to zero (the apply script drains it on that transition), so a rollback that
-    restores that shape must not be failed for the zero.
+    contract: when the previous ingress resolved ``GPU_FAULT_TELEMETRY_SPOOL``
+    to ``false`` the spool tier was legitimately scaled to zero (the apply
+    script drains it on that transition), so a rollback that restores that
+    shape must not be failed for the zero. The variable is resolved the way
+    kubelet would -- literal ``env`` and ``envFrom`` ConfigMaps alike -- because
+    the rendered role split carries it in ``gpu-fault-api-ha-config-telemetry``,
+    not as a literal: reading the literal list alone failed the rollback of
+    deploy #32 (2026-09-09) with "spool-worker is scaled to zero" on a site
+    whose spool had always been off.
     """
 
     api = (snapshot.get("gpu-fault-api-ha") or {}).get("api") or {}
-    return any(
-        item.get("name") == "GPU_FAULT_TELEMETRY_SPOOL"
-        and str(item.get("value", "")).strip().lower() == "false"
-        for item in api.get("env") or []
-    )
+    value = env_value(api, "GPU_FAULT_TELEMETRY_SPOOL")
+    return str(value or "").strip().lower() == "false"
 
 
 def verify_against_snapshot(
