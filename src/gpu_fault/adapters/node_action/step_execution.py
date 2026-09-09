@@ -15,6 +15,7 @@ from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
+from gpu_fault.orchestration.escalation import unknown_outcome_failure
 
 
 @dataclass
@@ -281,6 +282,25 @@ class NodeActionExecutionService:
             # re-submit bound; the attempt count and last error it recorded
             # are the operator's only view of what the agent tried.
             failure_details.update(result.details)
+        if unknown_outcome_failure(result.details):
+            # The agent itself says it does not know what happened: an
+            # installer killed at its deadline may still be running, a
+            # verification that could not run may hide a half-written driver.
+            # Both ladders (``orchestration/escalation.py``,
+            # ``execution/branch_escalation.py``) read these flags from the
+            # step details and hand the node to an operator instead of
+            # climbing; ``node_failures`` is what the support reason quotes,
+            # so the cause is named per node exactly as for INTERRUPTED.
+            failure_details.update(result.details)
+            failure_details.update(
+                {
+                    "operation": context.step.operation.value,
+                    "failed_nodes": [node_id],
+                    "node_failures": {
+                        node_id: [f"node action outcome unknown: {result.error}"]
+                    },
+                }
+            )
         # Last, so this step's own accounting of what it finished cannot be
         # overwritten by a same-named key the agent happened to report.
         failure_details.update(self._partial_progress(state))
