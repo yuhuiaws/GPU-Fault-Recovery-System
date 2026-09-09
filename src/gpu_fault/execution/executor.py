@@ -720,15 +720,20 @@ class ProductionWorkflowExecutor:
         incident: FaultIncident,
         execution_epoch: int,
     ) -> WorkflowExecutionResult:
+        reason = "node branch escalation exhausted: " + ", ".join(
+            workflow.exhausted_branch_ids
+        )
+        # The reason is the record's, not only the audit event's: the field is
+        # what the API, the acceptance verdicts and the failure handler read
+        # (live 2026-09-09 the exhausted DESTR-014 workflow ended FAILED with
+        # ``terminal_failure_reason`` None and the reason only in TERMINAL).
         return self._terminalize(
             workflow,
             incident,
             WorkflowStatus.FAILED,
             execution_epoch,
-            reason=(
-                "node branch escalation exhausted: "
-                + ", ".join(workflow.exhausted_branch_ids)
-            ),
+            reason=reason,
+            updates={"terminal_failure_reason": reason},
         )
 
     # Steps that undo what an earlier step did to a node; they still run for a

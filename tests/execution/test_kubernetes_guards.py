@@ -15,7 +15,7 @@ from gpu_fault.adapters.kubernetes.primitives import (
     build_kubernetes_clients,
     kubernetes_request_timeout_seconds,
 )
-from tests._builders import build_store, copy_model
+from tests._builders import build_store, copy_model, workflow_step_execution
 
 from ._support import (
     FakeCoreApi,
@@ -523,6 +523,80 @@ def test_hyperpod_preflight_refuses_when_no_kubernetes_adapter_can_observe() -> 
     assert outcome.status is WorkflowStepStatus.FAILED
     assert outcome.details["safety_rejection"] is True
     assert lifecycle.calls == 0
+
+
+def _unconfirmed_reboot_context(
+    store, core, incident_id: str, *, owner: str | None = None
+):
+    """A RESTART_NODE already submitted (WAITING with an operation id) whose
+    node the provider's bootstrap has uncordoned after the reboot."""
+    request = WorkflowExecutionRequest(
+        expected_fencing_token=3, confirm_cluster_name="hp-cluster"
+    )
+    context = _hyperpod_context(store, request)
+    core.node["spec"]["unschedulable"] = False
+    if owner is not None:
+        core.node["metadata"]["annotations"]["gpu-fault.io/incident-id"] = owner
+    previous = workflow_step_execution(
+        0,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowStepStatus.WAITING,
+        adapter_operation_id="reboot-op-1",
+        details={
+            "observed_isolation": {
+                "node-a": {"kubernetes_node": "node-a", "unschedulable": True}
+            }
+        },
+    )
+    return WorkflowStepContext(
+        workflow=copy_model(context.workflow, step_executions=[previous]),
+        incident=context.incident,
+        step=context.step,
+        step_index=0,
+        request=request,
+        idempotency_key=context.idempotency_key,
+    )
+
+
+def test_a_rebooting_node_the_provider_uncordoned_is_re_isolated_while_waiting() -> (
+    None
+):
+    """HyperPod's node bootstrap clears ``spec.unschedulable`` after a managed
+    reboot (audit 2026-09-09: hyperpod-service-linked-role, bootstrap/v0.0.0);
+    the ownership annotations survive. Left alone the node is schedulable until
+    RESTORE_SCHEDULING, and the REPLACE_NODE rung an unconfirmed reboot escalates
+    into refuses it as "not isolated" (DESTR-014 attempt 8). Each poll of the
+    unconfirmed reboot re-cordons a node this incident still owns."""
+    store = build_store()
+    core = _isolated_node("incident-active")
+    context = _unconfirmed_reboot_context(store, core, "incident-active")
+    lifecycle = FakeHyperPodLifecycle()
+    adapter = HyperPodLifecycleStepAdapter(lifecycle, kubernetes_adapter=_adapter(core))
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert core.node["spec"]["unschedulable"] is True, core.node["spec"]
+    assert outcome.details["isolation_reasserted"] == ["node-a"], outcome.details
+    assert outcome.details["observed_isolation"], "the submit-time record is kept"
+    assert lifecycle.calls == 0, "no second reboot is submitted"
+
+
+def test_a_node_another_incident_owns_is_left_alone_while_waiting() -> None:
+    store = build_store()
+    core = _isolated_node("incident-active")
+    context = _unconfirmed_reboot_context(
+        store, core, "incident-active", owner="incident-other"
+    )
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert core.node["spec"]["unschedulable"] is False, core.node["spec"]
+    assert "isolation_reasserted" not in outcome.details, outcome.details
 
 
 def test_hyperpod_preflight_passes_observed_isolation_to_the_provider() -> None:
