@@ -83,7 +83,14 @@ def test_an_undispatched_blocked_row_is_rewritten_to_pending_by_the_merge(
     context: ApplicationContext,
 ) -> None:
     """The rewrite exists -- pinned so the gate's ground is stated exactly: it
-    reaches a BLOCKED row whose window is still open and that nothing owns."""
+    reaches a BLOCKED row whose window is still open and that nothing owns.
+
+    Since main's C-03 (``workflow_merge.never_executed_operator_block``) the
+    never-executed BLOCKED(NEEDS_OPERATOR) row is replaced in place under the
+    candidate's id rather than rewritten under its own, so the test pins the
+    outcome -- one PENDING record with no execution history and no second live
+    row -- not the request id.
+    """
 
     _incident, workflow = _open_replacement(context)
     assert workflow.status is WorkflowStatus.PENDING
@@ -102,9 +109,13 @@ def test_an_undispatched_blocked_row_is_rewritten_to_pending_by_the_merge(
         _finding("second", "node-b")
     )
 
-    assert merged.request_id == workflow.request_id, "merged into the same row"
     assert merged.status is WorkflowStatus.PENDING, "BLOCKED went back to PENDING"
     assert merged.step_executions == [], "a fresh request: no execution history"
+    if merged.request_id != workflow.request_id:
+        replaced = context.store.get_workflow(workflow.request_id)
+        assert replaced is None or replaced.status is not WorkflowStatus.PENDING, (
+            "the replaced BLOCKED row must not survive as a second live record"
+        )
 
 
 def test_a_dispatched_blocked_row_is_never_reopened(

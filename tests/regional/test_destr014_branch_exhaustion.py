@@ -1035,9 +1035,7 @@ def test_the_managed_recovery_window_is_a_control_plane_setting() -> None:
     assert destr014.managed_recovery_errors(600) == [], "600 is the default step cap"
     assert destr014.managed_recovery_errors(900) == [], "900 fits twice in the lifetime"
     below = destr014.managed_recovery_errors(300)
-    assert any("GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS" in item for item in below), (
-        below
-    )
+    assert any("below the default step timeout" in item for item in below), below
     assert destr014.managed_recovery_errors(3000), "2x window must fit the job lifetime"
 
 
