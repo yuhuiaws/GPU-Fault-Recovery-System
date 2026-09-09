@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Sequence
 
@@ -386,20 +386,45 @@ def fail_restart_preflight(
     execution_epoch: int,
     failure: RestartBudgetPreflightFailure,
 ) -> Any:
-    """Persist a restart preflight failure without invoking an adapter."""
+    """Persist a restart preflight failure without invoking an adapter.
 
+    An exhausted budget is also the operator's business: the preflight is the
+    only site that refuses a restart for it, so the preflight sends the mail
+    (the restart adapter no longer reserves, and so never learns the budget
+    is gone).
+    """
+
+    outcome = failure.outcome
+    details = outcome.details or {}
+    if details.get("reason") == "RESTART_BUDGET_EXHAUSTED":
+        parameters = failure.step.parameters
+        notification = executor.restart_email_builder.build_budget_exhausted(
+            cluster_id=incident.cluster_id,
+            incident_id=incident.incident_id,
+            job_id=str(parameters["job_id"]),
+            attempt_id=str(parameters["source_attempt_id"]),
+            restart_count=int(details["restart_count"]),
+            restart_budget=int(details["restart_budget"]),
+        )
+        notification = executor.store.save_notification_if_absent(notification)
+        if executor.notification_sender is not None:
+            executor.notification_sender(notification.notification_id)
+        outcome = replace(
+            outcome,
+            details={**details, "notification_id": notification.notification_id},
+        )
     workflow = step_bounds.record_attempt(
         workflow,
         failure.step,
         failure.step_index,
-        failure.outcome,
+        outcome,
     )
     result = executor._terminalize(
         workflow,
         incident,
         WorkflowStatus.FAILED,
         execution_epoch,
-        reason=failure.outcome.error,
+        reason=outcome.error,
         incident_state=IncidentState.ESCALATED,
     )
     LOGGER.warning(
@@ -415,6 +440,17 @@ def fail_restart_preflight(
 # The bounds in ``step_bounds`` stamp these when they, not the adapter, end a
 # step; a RESTART_WORKLOAD record carrying one never reached a submission.
 _WAITING_CAP_DETAIL = "step_waiting_timeout_seconds"
+# The restart adapter stamps this on every refusal it makes before submitting
+# anything; the regional path carries it verbatim from the data plane's
+# ``RemoteCommandResult.details`` into the step record.
+_NOT_SUBMITTED_DETAIL = "restart_submitted"
+# ``remote_status_source`` values of a FAILED remote command that never reached
+# the data-plane adapter: the cluster executor refused it before dispatch, or
+# the workflow cancelled it while it was still PENDING or WAITING (a restart
+# that has answered WAITING has not submitted anything yet).
+_NEVER_DISPATCHED_STATUS_SOURCES = frozenset(
+    {"executor-rejected", "workflow-timeout", "workflow-preempted"}
+)
 
 
 def _restart_never_left_the_gate(
@@ -431,14 +467,30 @@ def _restart_never_left_the_gate(
     failure, holds budget for a restart nobody made (F-C9). A remote command
     that a cluster executor is running is the one shape that says nothing
     about submission, and keeps its reservation.
+
+    A FAILED record releases only when it proves nothing was submitted: the
+    adapter's own ``restart_submitted: False`` refusal, the waiting cap, a
+    remote command the cluster executor rejected or the workflow cancelled
+    before it left PENDING/WAITING, or a cancellation the node answered with
+    WAITING. An executor-internal or configuration error, a stale-fence
+    settle, an unclaimed command and a plain node failure say nothing about
+    submission and keep the budget spent -- conservatively, by decision.
     """
 
-    if str(record.details.get("remote_status") or "") == "RUNNING":
+    details = record.details
+    if str(details.get("remote_status") or "") == "RUNNING":
         return False
     if record.status is WorkflowStepStatus.WAITING:
         return waiting_ttl is not None and now - record.started_at >= waiting_ttl
-    if record.status is WorkflowStepStatus.FAILED:
-        return _WAITING_CAP_DETAIL in record.details
+    if record.status is not WorkflowStepStatus.FAILED:
+        return False
+    if details.get(_NOT_SUBMITTED_DETAIL) is False or _WAITING_CAP_DETAIL in details:
+        return True
+    source = details.get("remote_status_source")
+    if source in _NEVER_DISPATCHED_STATUS_SOURCES:
+        return True
+    if source == "completed-after-cancellation":
+        return details.get("post_cancellation_status") == "WAITING"
     return False
 
 

@@ -60,6 +60,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.notifications import (
     DiagnosticInconclusiveEmailBuilder,
+    RestartGuardEmailBuilder,
     WarmSpareReplacementEmailBuilder,
 )
 from gpu_fault.operation_registry import (
@@ -233,6 +234,9 @@ class ProductionWorkflowExecutor:
         self.diagnostic_inconclusive_email_builder = (
             DiagnosticInconclusiveEmailBuilder()
         )
+        # The budget-exhausted mail: sent by the restart preflight, which is
+        # the only site that refuses a restart for a spent budget.
+        self.restart_email_builder = RestartGuardEmailBuilder()
         # D-7: set by the dispatcher; the lease a WAITING row keeps until the
         # next tick. ``None`` keeps the full ``lease_duration_seconds``.
         self.waiting_lease_duration: timedelta | None = None
@@ -2556,9 +2560,9 @@ class ProductionWorkflowExecutor:
             )
         idempotency_key = f"{workflow.request_id}/{index}/{step.operation.value}"
         if step.operation is WorkflowOperation.RESTART_WORKLOAD:
-            # The restart adapter reserves under its key; it has to be the id
-            # the preflight reserved under, phase included, or a safety-phase
-            # restart would take a second reservation (F-C9).
+            # The adapter compares its authorization's reservation_id with this
+            # key, so it has to be the id the preflight reserved under, phase
+            # included, or a safety-phase restart would be refused (F-C9).
             idempotency_key = restart_preflight.reservation_id(
                 workflow,
                 index,

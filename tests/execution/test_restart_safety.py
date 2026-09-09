@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Final
 
 import pytest
 
 from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
+from gpu_fault.execution.restart_budget_preflight import reserve_restart_budgets
 from gpu_fault.models import (
     IncidentState,
+    RestartAuthorization,
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
@@ -24,6 +28,9 @@ from tests._builders import (
 )
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+#: ``restart_context`` signs the authorization the preflight would have issued
+#: for its parameters; pass ``authorization=None`` for a request without one.
+MATCHING_AUTHORIZATION: Final = object()
 
 
 class BatchApi:
@@ -91,7 +98,11 @@ def restart_context(
     source_gpu_count: int,
     restart_budget: int,
     workload_id: str = "training/job/training-job",
+    source_attempt_id: str | None = None,
+    authorization: RestartAuthorization | None | object = MATCHING_AUTHORIZATION,
 ) -> WorkflowStepContext:
+    if source_attempt_id is None:
+        source_attempt_id = f"attempt-{operation_id}"
     incident = fault_incident(
         f"incident-{operation_id}",
         f"event-{operation_id}",
@@ -110,7 +121,7 @@ def restart_context(
         parameters={
             "cluster_id": "cluster-a",
             "job_id": "train-1",
-            "source_attempt_id": f"attempt-{operation_id}",
+            "source_attempt_id": source_attempt_id,
             "source_gpu_count": source_gpu_count,
             "restart_budget": restart_budget,
         },
@@ -124,13 +135,27 @@ def restart_context(
         created_at=NOW,
         updated_at=NOW,
     )
+    idempotency_key = f"workflow-{operation_id}/0/RESTART_WORKLOAD"
+    if authorization is MATCHING_AUTHORIZATION:
+        authorization = RestartAuthorization(
+            cluster_id="cluster-a",
+            job_id="train-1",
+            source_attempt_id=source_attempt_id,
+            source_gpu_count=source_gpu_count,
+            restart_budget=restart_budget,
+            restart_count=1,
+            reservation_id=idempotency_key,
+        )
+    assert authorization is None or isinstance(authorization, RestartAuthorization)
     return WorkflowStepContext(
         workflow=workflow,
         incident=incident,
         step=step,
         step_index=0,
-        request=WorkflowExecutionRequest(expected_fencing_token=1),
-        idempotency_key=(f"workflow-{operation_id}/0/RESTART_WORKLOAD"),
+        request=WorkflowExecutionRequest(
+            expected_fencing_token=1, restart_authorization=authorization
+        ),
+        idempotency_key=idempotency_key,
     )
 
 
@@ -146,6 +171,8 @@ def test_gpu_count_change_waits_for_explicit_admin_approval() -> None:
         alert_sender=sent.append,
     )
     context = restart_context("gpu-change", source_gpu_count=2, restart_budget=2)
+    # The preflight's reservation; the adapter only compares the authorization.
+    store.reserve_job_restart("cluster-a", "train-1", 2, context.idempotency_key)
 
     waiting = adapter.execute(context)
 
@@ -208,26 +235,118 @@ def test_storeless_gpu_count_change_uses_notification_sink() -> None:
 
 
 def test_restart_budget_blocks_second_restart_for_same_job() -> None:
+    """The preflight owns the budget; the adapter neither reserves nor refuses."""
+
+    store = build_store()
+    batch = BatchApi(gpu_count=1)
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
+    )
+    first = restart_context("first", source_gpu_count=1, restart_budget=1)
+    second = restart_context("second", source_gpu_count=1, restart_budget=1)
+
+    reserved = reserve_restart_budgets(
+        store, first.workflow, first.incident, first.workflow.official_steps
+    )
+    exhausted = reserve_restart_budgets(
+        store, second.workflow, second.incident, second.workflow.official_steps
+    )
+    outcome = adapter.execute(first)
+
+    assert reserved is None
+    assert exhausted is not None
+    assert exhausted.outcome.status is WorkflowStepStatus.FAILED
+    assert exhausted.outcome.details["reason"] == "RESTART_BUDGET_EXHAUSTED"
+    assert "restart budget exhausted" in (exhausted.outcome.error or "")
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED
+    assert len(batch.created) == 1
+    state = store.get_restart_budget("cluster-a", "train-1")
+    assert state.restart_count == 1
+    assert state.reservation_ids == [first.idempotency_key]
+    # Only the restarted-workload mail: budget exhaustion is the preflight's.
+    assert len(store.list_notifications()) == 1
+
+
+def test_restart_without_authorization_fails_closed() -> None:
     store = build_store()
     batch = BatchApi(gpu_count=1)
     adapter = KubernetesWorkflowAdapter(
         core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
     )
 
-    first = adapter.execute(
-        restart_context("first", source_gpu_count=1, restart_budget=1)
-    )
-    second = adapter.execute(
-        restart_context("second", source_gpu_count=1, restart_budget=1)
+    outcome = adapter.execute(
+        restart_context(
+            "noauth", source_gpu_count=1, restart_budget=1, authorization=None
+        )
     )
 
-    assert first.status is WorkflowStepStatus.SUCCEEDED
-    assert second.status is WorkflowStepStatus.FAILED
-    assert "restart budget exhausted" in second.error
-    assert len(batch.created) == 1
-    state = store.get_restart_budget("cluster-a", "train-1")
-    assert state.restart_count == 1
-    assert len(store.list_notifications()) == 2
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "restart authorization" in (outcome.error or "")
+    assert outcome.details["restart_submitted"] is False
+    assert batch.created == {}
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("cluster-a", "train-1")
+
+
+def test_restart_rejects_an_authorization_for_another_job() -> None:
+    store = build_store()
+    batch = BatchApi(gpu_count=1)
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
+    )
+    context = restart_context("wrong-job", source_gpu_count=1, restart_budget=1)
+    assert context.request.restart_authorization is not None
+    forged = context.request.restart_authorization.model_copy(
+        update={"job_id": "other-job"}
+    )
+    context = replace(
+        context,
+        request=context.request.model_copy(update={"restart_authorization": forged}),
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "does not match" in (outcome.error or "")
+    assert outcome.details["restart_submitted"] is False
+    assert batch.created == {}
+
+
+def test_restart_rejections_before_submission_say_so() -> None:
+    """Every guard refusal carries ``restart_submitted: False``.
+
+    The control plane's terminal write reads it to hand the preflight's
+    reservation back (``release_unattempted_restart_reservations``); here the
+    refusal comes from the incident premise rather than the authorization.
+    """
+
+    store = build_store()
+    store.save_incident(
+        fault_incident("inc-source", "event-source", state=IncidentState.ESCALATED)
+    )
+    batch = BatchApi(gpu_count=1)
+    adapter = KubernetesWorkflowAdapter(
+        core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
+    )
+    base = restart_context("premise", source_gpu_count=1, restart_budget=1)
+    step = copy_model(
+        base.step,
+        parameters={
+            **base.step.parameters,
+            "requires_incident_state": "RECOVERED",
+            "incident_id": "inc-source",
+        },
+    )
+    context = replace(
+        base, step=step, workflow=copy_model(base.workflow, official_steps=[step])
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert outcome.details["reason"] == "INCIDENT_NOT_RECOVERABLE"
+    assert outcome.details["restart_submitted"] is False
+    assert batch.created == {}
 
 
 class PyTorchCustomApi:
@@ -303,11 +422,14 @@ def _execute_pytorch_restart(custom: PyTorchCustomApi, operation_id: str):
     adapter = KubernetesWorkflowAdapter(
         core_api=UnusedApi(), batch_api=UnusedApi(), custom_api=custom, store=store
     )
+    # The PyTorchJob fixture is labelled attempt-a; the authorization the
+    # preflight signs names the same attempt, as the planner's parameter does.
     context = restart_context(
         operation_id,
         source_gpu_count=24,
         restart_budget=1,
         workload_id="training/pytorchjob/training-job",
+        source_attempt_id="attempt-a",
     )
     return adapter.execute(context), store
 
@@ -585,6 +707,7 @@ def test_pytorch_restart_creates_new_attempt_metadata() -> None:
         source_gpu_count=24,
         restart_budget=2,
         workload_id="training/pytorchjob/training-job",
+        source_attempt_id="attempt-a",
     )
 
     completed = adapter.execute(context)
@@ -621,6 +744,7 @@ def test_terminal_pytorch_restart_creates_retry_object() -> None:
         source_gpu_count=24,
         restart_budget=1,
         workload_id="training/pytorchjob/training-job",
+        source_attempt_id="attempt-a",
     )
 
     completed = adapter.execute(context)
@@ -656,9 +780,10 @@ def test_zero_gpu_workload_can_restart_when_counts_match() -> None:
         core_api=UnusedApi(), batch_api=batch, custom_api=UnusedApi(), store=store
     )
 
-    completed = adapter.execute(
-        restart_context("zero-gpu", source_gpu_count=0, restart_budget=1)
-    )
+    context = restart_context("zero-gpu", source_gpu_count=0, restart_budget=1)
+    store.reserve_job_restart("cluster-a", "train-1", 1, context.idempotency_key)
+
+    completed = adapter.execute(context)
 
     assert completed.status is WorkflowStepStatus.SUCCEEDED
     assert len(batch.created) == 1

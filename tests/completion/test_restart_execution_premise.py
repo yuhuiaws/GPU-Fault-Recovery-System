@@ -18,6 +18,7 @@ from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.models import (
     IncidentState,
     PlanStatus,
+    RestartAuthorization,
     TerminalEvent,
     WorkflowOperation,
     WorkflowStatus,
@@ -118,13 +119,28 @@ def restart_context(extra_parameters: dict[str, Any]) -> WorkflowStepContext:
         created_at=NOW,
         updated_at=NOW,
     )
+    parameters = step.parameters
+    idempotency_key = "workflow-derived/0/RESTART_WORKLOAD"
+    # The authorization the preflight signs from its reservation; the guard
+    # compares it against the step before reading either premise.
+    authorization = RestartAuthorization(
+        cluster_id=str(parameters["cluster_id"]),
+        job_id=str(parameters["job_id"]),
+        source_attempt_id=str(parameters["source_attempt_id"]),
+        source_gpu_count=int(parameters["source_gpu_count"]),
+        restart_budget=int(parameters["restart_budget"]),
+        restart_count=1,
+        reservation_id=idempotency_key,
+    )
     return WorkflowStepContext(
         workflow=workflow,
         incident=incident,
         step=step,
         step_index=0,
-        request=WorkflowExecutionRequest(expected_fencing_token=1),
-        idempotency_key="workflow-derived/0/RESTART_WORKLOAD",
+        request=WorkflowExecutionRequest(
+            expected_fencing_token=1, restart_authorization=authorization
+        ),
+        idempotency_key=idempotency_key,
     )
 
 
