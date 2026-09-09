@@ -201,19 +201,73 @@ NODE_RUNTIME_LOCK = ROOT / "requirements" / "node-runtime.lock"
 
 def test_node_runtime_lock_covers_only_the_node_closure() -> None:
     lock = _text(NODE_RUNTIME_LOCK)
-    # The node collector/agent's true top-level runtime imports.
-    for name in ("boto3", "fastapi", "kubernetes", "pydantic", "pyyaml", "uvicorn"):
+    # The node collector/agent's true runtime imports. prometheus-client is
+    # imported inside ``DcgmCollector.collect_text`` (a function-local import,
+    # invisible to a top-level scan): the lock exported with
+    # ``--no-emit-package prometheus-client`` shipped to the first canary node
+    # on 2026-09-09 and every DCGM scrape died with ModuleNotFoundError, so
+    # the node never delivered a metric and the installer verify failed.
+    for name in (
+        "boto3",
+        "fastapi",
+        "kubernetes",
+        "prometheus-client",
+        "pydantic",
+        "pyyaml",
+        "uvicorn",
+    ):
         assert re.search(rf"^{name}==", lock, re.MULTILINE), name
     # Broad control-plane-only dependencies the node never imports must not be
     # dragged onto the host by the lock.
-    for name in (
-        "prometheus-client",
-        "psycopg",
-        "psycopg-binary",
-        "uvloop",
-        "httptools",
-    ):
+    for name in ("psycopg", "psycopg-binary", "uvloop", "httptools"):
         assert not re.search(rf"^{name}==", lock, re.MULTILINE), name
+
+
+def _normalized_distribution(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def test_node_runtime_lock_pins_every_third_party_import_of_the_node_closure() -> None:
+    """Every third-party module any shipped node-runtime module imports, at
+    any nesting depth, must resolve to a distribution the lock pins. The lock
+    is the only place the hash-pinned install can take a dependency from, so a
+    module the lock omits is a ModuleNotFoundError on the node."""
+    import ast
+    import sys
+    from importlib.metadata import packages_distributions
+
+    if str(ROOT / "scripts") not in sys.path:
+        sys.path.insert(0, str(ROOT / "scripts"))
+    import component_wheels
+
+    pinned = {
+        _normalized_distribution(match.group(1))
+        for match in re.finditer(r"(?m)^([A-Za-z0-9_.-]+)==", _text(NODE_RUNTIME_LOCK))
+    }
+    distributions = packages_distributions()
+    stdlib = set(sys.stdlib_module_names) | {"__future__"}
+    missing: set[str] = set()
+    for module in sorted(component_wheels.component_modules("node_runtime")):
+        tree = ast.parse(component_wheels.MODULES[module].read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported = [node.module]
+            else:
+                continue
+            for name in imported:
+                top = name.split(".", 1)[0]
+                if top in stdlib or component_wheels.is_local_module(top):
+                    continue
+                candidates = {
+                    _normalized_distribution(dist)
+                    for dist in distributions.get(top, ())
+                }
+                assert candidates, f"{module} imports {top}, not installed in this venv"
+                if not candidates & pinned:
+                    missing.add(f"{module} -> {top} ({', '.join(sorted(candidates))})")
+    assert missing == set(), sorted(missing)
 
 
 def test_node_runtime_lock_is_hash_complete() -> None:
