@@ -474,7 +474,38 @@ _NEVER_DISPATCHED_STATUS_SOURCES = frozenset(
 _CANCELLED_STATUS_SOURCES = frozenset({"workflow-timeout", "workflow-preempted"})
 
 
-def _wait_was_before_submission(details: dict[str, Any]) -> bool:
+def _remote_command_is_before_submission(store: Any, command_id: str) -> bool:
+    """Judge a remote restart by the command as it is *now*.
+
+    The step record is last tick's snapshot: a hold it recorded may have been
+    lifted since, the command re-leased and the Job created, all before this
+    terminal write runs. So the live command decides. PENDING was never
+    leased; a WAITING or FAILED command whose current report carries the
+    adapter's marker (or a cancelled command that never reported) never
+    submitted; LEASED, SUCCEEDED and anything unreadable keep the budget.
+    """
+
+    try:
+        command = store.get_remote_command(command_id)
+    except Exception:  # noqa: BLE001 - an unreadable command is unknown; unknown keeps
+        return False
+    if command.status is RemoteCommandStatus.PENDING:
+        return True
+    if command.status is RemoteCommandStatus.WAITING:
+        return command.result_details.get(_NOT_SUBMITTED_DETAIL) is False
+    if command.status is RemoteCommandStatus.FAILED:
+        return (
+            command.result_details.get(_NOT_SUBMITTED_DETAIL) is False
+            or command.status_source in _NEVER_DISPATCHED_STATUS_SOURCES
+            or (
+                command.status_source in _CANCELLED_STATUS_SOURCES
+                and not command.result_details
+            )
+        )
+    return False
+
+
+def _wait_was_before_submission(details: dict[str, Any], store: Any) -> bool:
     """Does a WAITING report (or the cap failure copied from one) prove that
     the restart adapter had not submitted anything?
 
@@ -483,14 +514,17 @@ def _wait_was_before_submission(details: dict[str, Any]) -> bool:
     *executor* answered for an exception that may have been raised after
     ``create_namespaced_job`` (a 5xx on the second workload, a client
     timeout after the API server persisted the Job), and a remote command
-    that is LEASED is on a data-plane executor right now -- its last report
-    may be a hold the executor has since moved past. A PENDING remote command
-    was never leased, so no adapter ran. Anything else says nothing, and
-    nothing means keep.
+    is judged live through the store (``_remote_command_is_before_submission``)
+    rather than by the status the record snapshotted. Without a command
+    pointer, a snapshotted LEASED keeps and a snapshotted PENDING releases.
+    Anything else says nothing, and nothing means keep.
     """
 
     if details.get("retryable_adapter_error"):
         return False
+    command_id = details.get("remote_command_id")
+    if command_id:
+        return _remote_command_is_before_submission(store, str(command_id))
     remote_status = details.get("remote_status")
     if remote_status == RemoteCommandStatus.LEASED.value:
         return False
@@ -502,6 +536,7 @@ def _wait_was_before_submission(details: dict[str, Any]) -> bool:
 def _restart_never_left_the_gate(
     record: WorkflowStepExecution,
     *,
+    store: Any,
     now: datetime,
     waiting_ttl: timedelta | None,
 ) -> bool:
@@ -513,9 +548,11 @@ def _restart_never_left_the_gate(
     A WAITING record older than ``waiting_ttl``, and a FAILED record the
     waiting cap produced from one, release only when the wait was one of the
     adapter's own pre-submission holds (``restart_submitted: False``) or the
-    remote command was never leased (``remote_status`` PENDING); a wait the
-    executor answered for a retryable adapter error, or whose remote command
-    is LEASED, may hide a Job that exists (``_wait_was_before_submission``).
+    remote command was never leased; a wait the executor answered for a
+    retryable adapter error, or whose remote command is LEASED, may hide a
+    Job that exists (``_wait_was_before_submission``). A remote command is
+    read live from the store, not from the record's snapshot: the hold may
+    have been lifted and the Job created since the record was written.
 
     A FAILED record otherwise releases on the adapter's own marker (its
     refusals carry it; the regional path copies it verbatim from the data
@@ -531,13 +568,13 @@ def _restart_never_left_the_gate(
     if record.status is WorkflowStepStatus.WAITING:
         if waiting_ttl is None or now - record.started_at < waiting_ttl:
             return False
-        return _wait_was_before_submission(details)
+        return _wait_was_before_submission(details, store)
     if record.status is not WorkflowStepStatus.FAILED:
         return False
     if _WAITING_CAP_DETAIL in details:
         # ``bounded_waiting_outcome`` copies the last WAITING's details into
         # this failure, so the same evidence rule applies.
-        return _wait_was_before_submission(details)
+        return _wait_was_before_submission(details, store)
     if details.get(_NOT_SUBMITTED_DETAIL) is False:
         return True
     source = details.get("remote_status_source")
@@ -598,7 +635,7 @@ def release_unattempted_restart_reservations(
             record is not None
             and step_index not in forced
             and not _restart_never_left_the_gate(
-                record, now=moment, waiting_ttl=waiting_ttl
+                record, store=store, now=moment, waiting_ttl=waiting_ttl
             )
         ):
             continue

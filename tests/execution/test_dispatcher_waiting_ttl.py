@@ -25,6 +25,11 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.regional import (
+    RemoteActionCommand,
+    RemoteCommandResult,
+    RemoteCommandStatus,
+)
 from tests._builders import (
     active_workflow_executor,
     build_store,
@@ -163,16 +168,15 @@ def test_revoking_a_retired_generation_applies_the_waiting_ttl(
     store = build_store()
     now = datetime.now(timezone.utc)
     retired_id, current_id, incident_id = "workflow-retired", "workflow-current", "inc"
-    store.save_incident(
-        fault_incident(
-            incident_id,
-            "event-a",
-            cluster_id=CLUSTER,
-            state=IncidentState.ACTION_PENDING,
-            fencing_token=4,
-            workflow_request_id=current_id,
-        )
+    incident = fault_incident(
+        incident_id,
+        "event-a",
+        cluster_id=CLUSTER,
+        state=IncidentState.ACTION_PENDING,
+        fencing_token=4,
+        workflow_request_id=current_id,
     )
+    store.save_incident(incident)
     retired = workflow_request(
         retired_id,
         incident_id,
@@ -210,6 +214,34 @@ def test_revoking_a_retired_generation_applies_the_waiting_ttl(
         )
     )
     store.reserve_job_restart(CLUSTER, JOB, 1, _reservation(retired, 1))
+    # The command the record points at, as the data plane left it: reported
+    # WAITING on the approval hold. The release reads this, not the record.
+    store.ensure_remote_command(
+        RemoteActionCommand(
+            command_id="cmd-restart",
+            cluster_id=CLUSTER,
+            workflow_request_id=retired_id,
+            incident_id=incident_id,
+            step_index=1,
+            fencing_token=1,
+            idempotency_key=_reservation(retired, 1),
+            step=retired.official_steps[1],
+            workflow=retired,
+            incident=incident,
+        )
+    )
+    claimed = store.claim_remote_commands(
+        CLUSTER, "cluster-executor-a", limit=1, lease_seconds=60
+    )[0]
+    store.complete_remote_command(
+        CLUSTER,
+        "cmd-restart",
+        RemoteCommandResult(
+            lease_token=claimed.lease_token,
+            status=RemoteCommandStatus.WAITING,
+            details={"reason": "GPU_COUNT_CHANGED", "restart_submitted": False},
+        ),
+    )
 
     sweep = _dispatcher(store)
     sweep.run_once()

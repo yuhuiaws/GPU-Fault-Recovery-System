@@ -249,7 +249,8 @@ def test_a_remote_restart_nobody_claimed_is_released_after_the_ttl() -> None:
         _restart_only_workflow(store),
         WorkflowStepStatus.WAITING,
         age=timedelta(days=1),
-        details={"remote_status": "PENDING", "remote_command_id": "cmd-1"},
+        # No command pointer to read live; the snapshot says never leased.
+        details={"remote_status": "PENDING"},
     )
     _reserve(store, workflow)
 

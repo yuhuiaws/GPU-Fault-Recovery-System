@@ -26,6 +26,7 @@ from gpu_fault.models import (
 from gpu_fault.regional import (
     RegionalClusterRegistration,
     RegionalRemoteWorkflowAdapter,
+    RemoteActionCommand,
     RemoteCommandResult,
     RemoteCommandStatus,
     cluster_token_sha256,
@@ -831,24 +832,19 @@ def test_terminal_release_reads_what_a_failed_restart_record_proves(
         # Remote pointers: PENDING was never leased; LEASED is on an executor
         # now (its last report may be a hold it has moved past); WAITING is
         # judged by the data plane's marker.
-        ({"remote_status": "PENDING", "remote_command_id": "cmd-1"}, True),
+        ({"remote_status": "PENDING"}, True),
+        ({"remote_status": "LEASED", "restart_submitted": False}, False),
+        ({"remote_status": "WAITING", "restart_submitted": False}, True),
+        ({"remote_status": "WAITING"}, False),
+        # A pointer at a command the store cannot find: unknown keeps.
         (
             {
-                "remote_status": "LEASED",
-                "remote_command_id": "cmd-1",
+                "remote_status": "PENDING",
+                "remote_command_id": "cmd-gone",
                 "restart_submitted": False,
             },
             False,
         ),
-        (
-            {
-                "remote_status": "WAITING",
-                "remote_command_id": "cmd-1",
-                "restart_submitted": False,
-            },
-            True,
-        ),
-        ({"remote_status": "WAITING", "remote_command_id": "cmd-1"}, False),
         ({}, False),
     ],
 )
@@ -871,6 +867,101 @@ def test_the_waiting_ttl_releases_only_a_wait_that_proves_no_submission(
                 started_at=started,
                 updated_at=started,
                 details=details,
+            )
+        ],
+    )
+
+    release_unattempted_restart_reservations(
+        store, workflow, waiting_ttl=timedelta(minutes=10)
+    )
+
+    state = store.get_restart_budget("cluster-a", "training-a")
+    assert state.restart_count == (0 if released else 1)
+
+
+def _remote_restart_command(
+    store: InMemoryStore,
+    workflow: WorkflowRequest,
+    *,
+    leased: bool,
+    report: dict[str, object] | None = None,
+) -> str:
+    """A remote command for the workflow's RESTART step, in the given state:
+    PENDING, LEASED, or LEASED then reported WAITING with ``report``."""
+
+    incident = store.get_incident(workflow.incident_id)
+    command = RemoteActionCommand(
+        command_id="remote-restart",
+        cluster_id="cluster-a",
+        workflow_request_id=workflow.request_id,
+        incident_id=incident.incident_id,
+        step_index=2,
+        fencing_token=workflow.fencing_token,
+        idempotency_key="workflow-a/2/RESTART_WORKLOAD",
+        step=workflow.official_steps[2],
+        workflow=workflow,
+        incident=incident,
+    )
+    store.ensure_remote_command(command)
+    if leased or report is not None:
+        claimed = store.claim_remote_commands(
+            "cluster-a", "executor-a", limit=1, lease_seconds=60
+        )[0]
+        if report is not None:
+            store.complete_remote_command(
+                "cluster-a",
+                command.command_id,
+                RemoteCommandResult(
+                    lease_token=claimed.lease_token,
+                    status=RemoteCommandStatus.WAITING,
+                    details=report,
+                ),
+            )
+    return command.command_id
+
+
+@pytest.mark.parametrize(
+    ("leased", "report", "released"),
+    [
+        # Never leased: no adapter ran.
+        (False, None, True),
+        # On a data-plane executor right now: whatever the record snapshotted,
+        # the hold may have been lifted and the Job created since.
+        (True, None, False),
+        # Reported WAITING on a hold: still before submission.
+        (True, {"reason": "GPU_COUNT_CHANGED", "restart_submitted": False}, True),
+        # Reported WAITING without the marker: may be past a submission.
+        (True, {"reason": "RETRYABLE_ADAPTER_ERROR"}, False),
+    ],
+    ids=["pending", "leased", "waiting-on-hold", "waiting-unmarked"],
+)
+def test_the_waiting_ttl_reads_the_live_remote_command_not_the_snapshot(
+    leased: bool, report: dict[str, object] | None, released: bool
+) -> None:
+    store = build_store()
+    workflow = _state(store)
+    store.reserve_job_restart(
+        "cluster-a", "training-a", 1, "workflow-a/2/RESTART_WORKLOAD"
+    )
+    command_id = _remote_restart_command(store, workflow, leased=leased, report=report)
+    started = datetime.now(timezone.utc) - timedelta(hours=1)
+    # The record is last tick's snapshot: a hold, marker included, with the
+    # command still WAITING. What the command is *now* decides.
+    workflow = copy_model(
+        workflow,
+        step_executions=[
+            workflow_step_execution(
+                2,
+                WorkflowOperation.RESTART_WORKLOAD,
+                WorkflowStepStatus.WAITING,
+                started_at=started,
+                updated_at=started,
+                adapter_operation_id=f"remote/{command_id}",
+                details={
+                    "remote_command_id": command_id,
+                    "remote_status": "WAITING",
+                    "restart_submitted": False,
+                },
             )
         ],
     )
