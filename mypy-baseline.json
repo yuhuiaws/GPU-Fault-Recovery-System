@@ -187,7 +187,7 @@
   "src/gpu_fault/gpu_metrics.py:call-overload": 1,
   "src/gpu_fault/gpu_metrics.py:no-any-return": 2,
   "src/gpu_fault/gpu_metrics.py:no-untyped-call": 1,
-  "src/gpu_fault/gpu_metrics.py:no-untyped-def": 13,
+  "src/gpu_fault/gpu_metrics.py:no-untyped-def": 12,
   "src/gpu_fault/gpu_metrics.py:var-annotated": 1,
   "src/gpu_fault/gpu_power_policy.py:type-arg": 1,
   "src/gpu_fault/hma.py:no-untyped-call": 5,

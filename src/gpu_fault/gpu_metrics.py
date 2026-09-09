@@ -10,6 +10,10 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
+from gpu_fault.gpu_collection_errors import (
+    collection_error_finding,
+    collection_error_key,
+)
 from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
     GpuHealthSeverity,
@@ -387,25 +391,43 @@ class GpuMetricsService:
                 )
                 if previous_latest is not False
             ]
-            previous_finding_states = self.store.get_gpu_finding_states(
-                [
-                    key
-                    for (
-                        _sample,
-                        _gpu_key,
-                        key,
-                        _latest,
-                    ), _previous_latest in accepted_candidates
-                ]
+            completeness_key = collection_error_key(batch)
+            *previous_finding_states, previous_completeness = (
+                self.store.get_gpu_finding_states(
+                    [
+                        key
+                        for (
+                            _sample,
+                            _gpu_key,
+                            key,
+                            _latest,
+                        ), _previous_latest in accepted_candidates
+                    ]
+                    + [completeness_key]
+                )
             )
-            finding_updates = []
-            findings_by_update = []
-            collection_error = self._collection_error_finding(batch)
+            finding_updates: list[
+                tuple[tuple[str, str, str, str], GpuHealthFinding | None, datetime]
+            ] = []
+            findings_by_update: list[GpuHealthFinding | None] = []
+            collection_error = collection_error_finding(batch)
             if collection_error is not None:
-                key, finding = collection_error
-                findings.append(finding)
-                finding_updates.append((key, finding, batch.observed_at))
-                findings_by_update.append(finding)
+                error_key, error_finding = collection_error
+                findings.append(error_finding)
+                finding_updates.append((error_key, error_finding, batch.observed_at))
+                findings_by_update.append(error_finding)
+            elif (
+                previous_completeness is not None
+                and previous_completeness.finding is not None
+            ):
+                # A clean scrape clears the collection-error finding. Without
+                # this the WARNING a collector raised while dcgm-exporter was
+                # still starting after a reboot stayed active for good, and
+                # VALIDATE_GPU refused every validated restore of that node
+                # with active_gpu_health_findings (DESTR-014 attempt 10,
+                # 2026-09-09).
+                finding_updates.append((completeness_key, None, batch.observed_at))
+                findings_by_update.append(None)
             state_by_key = {}
             for (
                 (
@@ -529,35 +551,6 @@ class GpuMetricsService:
             gpu_key = item.gpu_uuid or item.pci_bdf or item.gpu_index or "node"
             result.setdefault(gpu_key, {})[item.canonical_name] = item.value
         return result
-
-    @staticmethod
-    def _collection_error_finding(batch: GpuMetricBatch):
-        if not batch.collection_errors:
-            return None
-        key = (
-            batch.cluster_id,
-            batch.node_id,
-            "node",
-            "dcgm_field_completeness",
-        )
-        finding = GpuHealthFinding(
-            finding_id=f"{batch.batch_id}-dcgm-fields",
-            cluster_id=batch.cluster_id,
-            node_id=batch.node_id,
-            observed_at=batch.observed_at,
-            severity=GpuHealthSeverity.WARNING,
-            reason="; ".join(batch.collection_errors),
-            canonical_name="dcgm_field_completeness",
-            value=float(len(batch.collection_errors)),
-            evidence_ref=batch.evidence_ref,
-            automatic_action=RecoveryAction.RUN_DIAGNOSTICS.value,
-            policy_source="SITE_DCGM_FIELD_COMPLETENESS",
-            policy_version=SITE_METRIC_POLICY_VERSION,
-            runtime_profile_version=batch.runtime_profile_version,
-            workload_state=batch.workload_state,
-            affected_workload_ids=batch.affected_workload_ids,
-        )
-        return key, finding
 
     @staticmethod
     def _finding_gpu_key(finding: GpuHealthFinding) -> str:
