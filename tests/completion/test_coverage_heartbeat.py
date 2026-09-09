@@ -27,14 +27,7 @@ from gpu_fault.completion_controller import KubernetesCompletionController
 from gpu_fault.completion_metrics_server import render_completion_metrics
 from gpu_fault.models import datetime_json_text
 from gpu_fault.telemetry import ATTEMPT_COVERAGE_PATH
-from tests.completion.test_completion_controller import (
-    NOW,
-    Clock,
-    FakeCoreApi,
-    FakeSink,
-    FakeWatch,
-    pod,
-)
+from tests.completion._support import NOW, Clock, FakeCoreApi, FakeSink, FakeWatch, pod
 
 INSTANCE = "completion-watcher-0"
 

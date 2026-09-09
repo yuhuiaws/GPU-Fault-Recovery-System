@@ -18,13 +18,7 @@ import gpu_fault
 from gpu_fault.completion_controller import KubernetesCompletionController
 from gpu_fault.completion_observation import completion_list_arguments
 from gpu_fault.telemetry import ATTEMPT_COVERAGE_PATH
-from tests.completion.test_completion_controller import (
-    NOW,
-    FakeCoreApi,
-    FakeSink,
-    controller,
-    pod,
-)
+from tests.completion._support import NOW, FakeCoreApi, FakeSink, controller, pod
 
 MANAGED_SELECTOR = "gpu-fault.io/managed=true"
 

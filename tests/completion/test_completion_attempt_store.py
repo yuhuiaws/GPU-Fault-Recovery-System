@@ -30,13 +30,7 @@ from gpu_fault.completion_outbox import KubernetesCompletionOutbox
 from gpu_fault.models import Environment
 from gpu_fault.telemetry import WorkloadContext, WorkloadTopologyService
 from gpu_fault.watcher import AttemptObservation
-from tests.completion.test_completion_controller import (
-    NOW,
-    Clock,
-    FakeCoreApi,
-    FakeSink,
-    pod,
-)
+from tests.completion._support import NOW, Clock, FakeCoreApi, FakeSink, pod
 
 ACTIVE_KEY = "active-attempts.json"
 #: Eight full-length GPU UUIDs, the way a p5 rank reports them: the single

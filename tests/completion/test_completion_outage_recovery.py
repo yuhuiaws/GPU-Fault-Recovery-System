@@ -28,12 +28,7 @@ from gpu_fault import completion_controller
 from gpu_fault.collectors import CollectorError
 from gpu_fault.completion_controller import KubernetesCompletionController
 from gpu_fault.completion_outbox import KubernetesCompletionOutbox
-from tests.completion.test_completion_controller import (
-    Clock,
-    FakeCoreApi,
-    FakeSink,
-    pod,
-)
+from tests.completion._support import Clock, FakeCoreApi, FakeSink, pod
 
 TERMINAL = "/v1/attempts/terminal"
 FAILURE = "/v1/attempts/failure-detected"

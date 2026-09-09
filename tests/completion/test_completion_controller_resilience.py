@@ -22,7 +22,7 @@ from gpu_fault.completion_controller import (
 from gpu_fault.completion_metrics_server import evaluate_completion_health
 from gpu_fault.models import Environment
 from tests._builders import attempt_observation
-from tests.completion.test_completion_controller import (
+from tests.completion._support import (
     NOW,
     Clock,
     FakeCoreApi,
