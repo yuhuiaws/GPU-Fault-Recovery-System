@@ -100,7 +100,9 @@ def describe_lock_holder(handle: int) -> str:
     except (OSError, ValueError):
         return "holder unknown"
     pid = holder.get("pid") if isinstance(holder, dict) else None
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    # ``os.kill`` takes a C pid_t and raises OverflowError, not OSError, past
+    # 2**31 - 1; a corrupt line must read as unknown, never as a traceback.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid > 2**31 - 1:
         return "holder unknown"
     role = holder.get("role") if isinstance(holder.get("role"), str) else "unknown role"
     since = holder.get("since") if isinstance(holder.get("since"), str) else "unknown"
@@ -108,7 +110,7 @@ def describe_lock_holder(handle: int) -> str:
         os.kill(pid, 0)
     except ProcessLookupError:
         return f"stale holder pid {pid} ({role}, gone)"
-    except OSError:
+    except (OSError, OverflowError):
         # EPERM: the process exists but belongs to another user -- alive.
         pass
     return f"held by pid {pid} ({role}) since {since}"
@@ -244,7 +246,8 @@ class OutboxFile:
             separators=(",", ":"),
         ).encode("utf-8")
         try:
-            os.pwrite(handle, line, 0)
+            if os.pwrite(handle, line, 0) != len(line):
+                raise OSError("short write of the outbox lock holder line")
             os.ftruncate(handle, len(line))
         except OSError:
             with contextlib.suppress(OSError):

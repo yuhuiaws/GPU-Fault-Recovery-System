@@ -844,6 +844,8 @@ def test_the_forced_warning_names_the_collector_holding_the_lock(
         pytest.param(b'{"role":"collector"}', id="no-pid"),
         pytest.param(b'{"pid":"12","role":"collector"}', id="pid-not-int"),
         pytest.param(b'["pid", 12]', id="not-an-object"),
+        pytest.param(b'{"pid":2147483648,"role":"collector"}', id="pid-overflow"),
+        pytest.param(b'{"pid":1' + b"0" * 30 + b',"role":"collector"}', id="pid-huge"),
         pytest.param(b"{" + b"x" * 8192 + b"}", id="oversize"),
     ],
 )
