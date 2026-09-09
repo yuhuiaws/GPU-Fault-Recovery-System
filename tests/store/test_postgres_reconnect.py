@@ -205,6 +205,21 @@ def rotating_role():
             admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'first'")
         except psycopg.errors.InsufficientPrivilege:
             pytest.skip("test user cannot CREATE ROLE")
+        # These tests observe the server *refusing* a stale password. A server
+        # that never checks passwords (``POSTGRES_HOST_AUTH_METHOD=trust``, the
+        # release gate's container until 2026-09-09) cannot show that, so the
+        # rotation tests are not evidence there.
+        try:
+            probe = psycopg.connect(
+                _dsn_for(role, "not-the-password"), connect_timeout=5
+            )
+        except psycopg.OperationalError:
+            pass
+        else:
+            probe.close()
+            pytest.skip(
+                "server accepts any password (trust auth); a rotation is unobservable"
+            )
 
         def rotate(password: str) -> None:
             admin.execute(f"ALTER ROLE {role} PASSWORD '{password}'")

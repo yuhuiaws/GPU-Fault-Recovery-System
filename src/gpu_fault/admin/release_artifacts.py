@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -157,6 +158,12 @@ def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
         yield configured
         return
     name = f"gpu-fault-release-postgres-{os.getpid()}"
+    # Password authentication, like Aurora: the release gate's CP-3 tests
+    # rotate a role's password and expect the server to refuse the stale one.
+    # Under ``POSTGRES_HOST_AUTH_METHOD=trust`` no password is ever checked, so
+    # ``test_postgres_reconnect`` could not observe a rotation (deploy #15,
+    # 2026-09-09). The password is ephemeral; the container dies with the gate.
+    password = secrets.token_urlsafe(18)
     runner.run(
         [
             "docker",
@@ -168,7 +175,7 @@ def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
             "-p",
             "127.0.0.1::5432",
             "-e",
-            "POSTGRES_HOST_AUTH_METHOD=trust",
+            f"POSTGRES_PASSWORD={password}",
             "postgres:16",
         ],
         mutate=True,
@@ -194,7 +201,7 @@ def isolated_postgres_url(runner: CommandRunner) -> Iterator[str]:
                 name,
             ]
         )
-        yield f"postgresql://postgres@127.0.0.1:{port}/postgres"
+        yield f"postgresql://postgres:{password}@127.0.0.1:{port}/postgres"
     finally:
         subprocess.run(
             ["docker", "rm", "-f", name],
