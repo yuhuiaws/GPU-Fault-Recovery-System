@@ -241,11 +241,19 @@ def test_the_rendered_rules_are_an_input_of_the_observability_digest(
 
 
 def _amp_release(*, present: bool) -> tuple[Any, list[list[str]], list[bytes]]:
+    """A fake AMP whose namespace starts ``present`` and follows the writes: a
+    delete makes it gone and a create makes it exist, so the restore's wait after
+    each write reads what AMP would report (ACTIVE at once, or absent)."""
     calls: list[list[str]] = []
     written: list[bytes] = []
+    state = {"present": present}
 
     def run(arguments: list[str], **_kwargs: Any) -> str:
         calls.append(list(arguments))
+        if arguments[2] == "delete-rule-groups-namespace":
+            state["present"] = False
+        elif arguments[2] == "create-rule-groups-namespace":
+            state["present"] = True
         if "--data" in arguments:
             path = arguments[arguments.index("--data") + 1].removeprefix("fileb://")
             written.append(Path(path).read_bytes())
@@ -257,7 +265,7 @@ def _amp_release(*, present: bool) -> tuple[Any, list[list[str]], list[bytes]]:
         assert arguments[:3] == ["aws", "amp", "describe-rule-groups-namespace"], (
             arguments
         )
-        if present:
+        if state["present"]:
             payload = {"ruleGroupsNamespace": {"status": {"statusCode": "ACTIVE"}}}
             return 0, json.dumps(payload), ""
         return 254, "", "An error occurred (ResourceNotFoundException) when calling"

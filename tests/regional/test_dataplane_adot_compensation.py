@@ -245,16 +245,16 @@ PHASE_DONE = "rollback-dataplane-observability-restored"
 NOT_FOUND = "An error occurred (ResourceNotFoundException) when calling ..."
 
 
-def _describe_answer(status: str = "ACTIVE") -> tuple[int, str, str]:
+def _describe_answer(
+    status: str = "ACTIVE", *, reason: str | None = None
+) -> tuple[int, str, str]:
+    document: dict[str, Any] = {"statusCode": status}
+    if reason is not None:
+        document["statusReason"] = reason
     return (
         0,
         json.dumps(
-            {
-                "ruleGroupsNamespace": {
-                    "status": {"statusCode": status},
-                    "data": "Z3JvdXBzOiBbXQo=",
-                }
-            }
+            {"ruleGroupsNamespace": {"status": document, "data": "Z3JvdXBzOiBbXQo="}}
         ),
         "",
     )
@@ -304,6 +304,13 @@ class _Rollback:
 
         def run(arguments: list[str], **_kwargs: Any) -> str:
             self.calls.append(list(arguments))
+            # The fake AMP: a delete makes the namespace gone and a create makes
+            # it exist, so the restore's post-write waits see what AMP would say.
+            if arguments[:2] == ["aws", "amp"]:
+                if arguments[2] == "delete-rule-groups-namespace":
+                    self.expected_rules_present = False
+                elif arguments[2] == "create-rule-groups-namespace":
+                    self.expected_rules_present = True
             if arguments[0] == "kubectl" and "apply" in arguments:
                 path = Path(arguments[arguments.index("-f") + 1])
                 self.applied.append(
@@ -913,6 +920,7 @@ def test_a_namespace_still_deleting_is_waited_for_before_the_put(
             _describe_answer("DELETING"),
             _describe_answer("DELETING"),
             (254, "", NOT_FOUND),
+            _describe_answer("ACTIVE"),
         ]
     )
     monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
@@ -927,6 +935,7 @@ def test_a_namespace_still_deleting_is_waited_for_before_the_put(
         "describe-rule-groups-namespace",
         "describe-rule-groups-namespace",
         "create-rule-groups-namespace",
+        "describe-rule-groups-namespace",
     ], calls
     assert len(slept) == 2, slept
 
@@ -935,7 +944,11 @@ def test_a_namespace_still_updating_is_waited_for_then_put(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     release, calls, slept = _rules_release(
-        [_describe_answer("UPDATING"), _describe_answer("ACTIVE")]
+        [
+            _describe_answer("UPDATING"),
+            _describe_answer("ACTIVE"),
+            _describe_answer("ACTIVE"),
+        ]
     )
     monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
 
@@ -944,8 +957,147 @@ def test_a_namespace_still_updating_is_waited_for_then_put(
     )
 
     assert outcome == "restored"
-    assert [c[2] for c in calls][-1] == "put-rule-groups-namespace", calls
+    assert [c[2] for c in calls][-2] == "put-rule-groups-namespace", calls
     assert len(slept) == 1, slept
+
+
+# --- the restore waits out its OWN write, as the installer does ----------------------
+
+
+def test_the_put_is_recorded_as_restored_only_once_amp_reports_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AMP validates a put asynchronously: the namespace goes UPDATING and the
+    previous rules keep serving until it settles. Returning ``restored`` at the
+    put meant the record was written while AMP was still validating, the next
+    writer (a resume, the next deploy's installer) could hit a ConflictException,
+    and a rejected definition was never noticed. The restore now polls describe
+    until ACTIVE, exactly as the installer's ``wait_for_amp_definition`` does."""
+    release, calls, slept = _rules_release(
+        [
+            _describe_answer("ACTIVE"),  # the pre-write settle check
+            _describe_answer("UPDATING"),
+            _describe_answer("UPDATING"),
+            _describe_answer("ACTIVE"),
+        ]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
+
+    outcome = DATAPLANE.restore_dataplane_expected_rules(
+        release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+    )
+
+    assert outcome == "restored"
+    assert [c[2] for c in calls] == [
+        "describe-rule-groups-namespace",
+        "put-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+    ], f"the put was not followed by a describe loop until ACTIVE: {calls}"
+    assert slept == [DATAPLANE.EXPECTED_RULES_SETTLE_SECONDS] * 2, slept
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    ("exists", "verb", "status"),
+    [
+        (True, "put-rule-groups-namespace", "UPDATE_FAILED"),
+        (False, "create-rule-groups-namespace", "CREATION_FAILED"),
+    ],
+)
+def test_a_definition_amp_rejects_fails_the_restore_naming_the_reason(
+    monkeypatch: pytest.MonkeyPatch, exists: bool, verb: str, status: str
+) -> None:
+    """A rejected definition leaves the OLD rules serving; the restore must say
+    so, with AMP's ``statusReason``, instead of recording ``restored``."""
+    reason = "rule group gpu-fault-dataplane-expected: parse error at line 3"
+    release, calls, _slept = _rules_release(
+        [
+            _describe_answer("ACTIVE") if exists else (254, "", NOT_FOUND),
+            _describe_answer(status, reason=reason),
+        ]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", lambda _s: None)
+
+    with pytest.raises(ReleaseError, match=status) as caught:
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+        )
+
+    assert reason in str(caught.value), caught.value
+    assert [c[2] for c in calls][1] == verb, calls
+
+
+def test_a_put_that_never_reaches_active_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, calls, slept = _rules_release(
+        [_describe_answer("ACTIVE")] + [_describe_answer("UPDATING")] * 5
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
+    monkeypatch.setattr(DATAPLANE, "EXPECTED_RULES_SETTLE_ATTEMPTS", 3)
+
+    with pytest.raises(ReleaseError, match="still UPDATING after 15s"):
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+        )
+
+    assert [c[2] for c in calls][1] == "put-rule-groups-namespace", calls
+    assert len(slept) == 3, slept
+
+
+def test_a_namespace_that_vanishes_after_the_put_is_not_recorded_as_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, _calls, _slept = _rules_release(
+        [_describe_answer("ACTIVE"), (254, "", NOT_FOUND)]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", lambda _s: None)
+
+    with pytest.raises(ReleaseError, match="disappeared"):
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": True, "data_base64": "Z3JvdXBzOiBbXQo="}
+        )
+
+
+def test_the_delete_is_recorded_as_deleted_only_once_the_namespace_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delete is asynchronous too (``wait_for_amp_definition_gone`` in the
+    installer): a namespace still DELETING is a ConflictException for the next
+    create, so ``deleted`` means describe answered ResourceNotFoundException."""
+    release, calls, slept = _rules_release(
+        [_describe_answer("ACTIVE"), _describe_answer("DELETING"), (254, "", NOT_FOUND)]
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", slept.append)
+
+    outcome = DATAPLANE.restore_dataplane_expected_rules(
+        release, {"present": False, "data_base64": None}
+    )
+
+    assert outcome == "deleted"
+    assert [c[2] for c in calls] == [
+        "describe-rule-groups-namespace",
+        "delete-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+        "describe-rule-groups-namespace",
+    ], f"the delete was not followed by a describe loop until gone: {calls}"
+    assert len(slept) == 1, slept
+
+
+def test_a_delete_that_never_settles_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release, _calls, _slept = _rules_release(
+        [_describe_answer("ACTIVE")] + [_describe_answer("DELETING")] * 5
+    )
+    monkeypatch.setattr(DATAPLANE, "_sleep", lambda _s: None)
+    monkeypatch.setattr(DATAPLANE, "EXPECTED_RULES_SETTLE_ATTEMPTS", 3)
+
+    with pytest.raises(ReleaseError, match="still DELETING after 15s"):
+        DATAPLANE.restore_dataplane_expected_rules(
+            release, {"present": False, "data_base64": None}
+        )
 
 
 def test_a_namespace_that_never_settles_fails_closed(
