@@ -25,8 +25,10 @@ from gpu_fault_release.regional_release_diff import (
     classify_release,
     diff_from_changed,
 )
+from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_orchestration import SUPERSEDABLE_PHASES
 from gpu_fault_release.regional_release_reporting import build_release_status
+from gpu_fault_release.regional_release_transaction import commit_live_release
 
 STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
 ROOT = repository_root()
@@ -282,6 +284,14 @@ def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
             "resume": True,
             "action": "commit",
         }
+    if _commit_pending(state) and _foreign_candidate(release, state):
+        committed = {**state, "transaction_committed": True}
+        return {
+            **classify_release(release, committed).as_dict(),
+            "resume": False,
+            "action": "upgrade",
+            "commits_live_release_id": state.get("release_id"),
+        }
     phase = str(state.get("phase") or "")
     if _upgrade_resume_required(state) or phase == "rolled-back":
         return {
@@ -491,6 +501,21 @@ def run_deploy(release: Any) -> None:
     if _commit_cleanup_pending(state):
         release.commit_release()
         return
+    if _commit_pending(state) and _foreign_candidate(release, state):
+        # The live release rolled out completely but its deploy stopped before
+        # the commit (verify or stability failed, no rollback). Only that same
+        # candidate could resume into the commit, and when the verify was the
+        # defect it never could -- so a different candidate commits it as the
+        # baseline and moves on (`commit_live_release`).
+        narrate_step(
+            "commit-live-release",
+            release_id=str(state.get("release_id") or ""),
+            reason="complete but uncommitted; committed as the baseline for "
+            f"candidate {release.release_id}",
+        )
+        commit_live_release(release, state)
+        state = release._load_state()
+        phase = str(state.get("phase") or "")
     if supersede:
         # A new transaction for a different candidate over a stopped fail-forward
         # one: not a resume, so no plan pin (M-23 originates a fresh digest), a

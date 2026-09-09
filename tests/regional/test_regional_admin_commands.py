@@ -577,3 +577,108 @@ def test_full_report_is_requested_by_environment() -> None:
     assert module.full_report_requested({module.FULL_REPORT_ENV: "0"}) is False
     assert module.full_report_requested({module.FULL_REPORT_ENV: "1"}) is True
     assert module.full_report_requested({module.FULL_REPORT_ENV: " true "}) is True
+
+
+# --- a complete, uncommitted live release and a different candidate ----------------------
+
+
+def _pending_commit_state(release_id: str = "live-release") -> dict[str, object]:
+    return {
+        "phase": "complete",
+        "release_id": release_id,
+        "transaction_committed": False,
+        "release_lifecycle": "COMMITTED",
+    }
+
+
+def test_a_different_candidate_commits_the_live_release_then_upgrades(
+    monkeypatch,
+) -> None:
+    """Deploy #29 (2026-09-09) was refused with the engine's raw
+    ``resume release_id does not match the candidate``: the live release had
+    completed, its verify had failed, and no candidate but itself could ever
+    commit it. A different candidate now commits it as the baseline first."""
+
+    module = _admin_module()
+    expected_diff = module.diff_from_changed({"control_plane_wheel"})
+    events: list[object] = []
+    states = [
+        _pending_commit_state(),
+        {**_pending_commit_state(), "transaction_committed": True},
+    ]
+    release = SimpleNamespace(
+        release_id="candidate-release",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: dict(states.pop(0)),
+        pin_approved_manifest_plan=lambda _digest: events.append(("pin", _digest)),
+        upgrade=lambda **kwargs: events.append(("upgrade", kwargs)),
+    )
+    monkeypatch.setattr(
+        module,
+        "commit_live_release",
+        lambda _release, state: events.append(("commit", state["release_id"])),
+    )
+    monkeypatch.setattr(module, "narrate_step", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        module, "classify_release", lambda _release, _state: expected_diff
+    )
+
+    module.run_deploy(release)
+
+    assert events == [
+        ("commit", "live-release"),
+        ("upgrade", {"diff": expected_diff}),
+    ], events
+
+
+def test_the_same_candidate_still_resumes_into_its_own_commit(monkeypatch) -> None:
+    module = _admin_module()
+    expected_diff = module.diff_from_changed({"control_plane_wheel"})
+    events: list[object] = []
+    release = SimpleNamespace(
+        release_id="live-release",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: _pending_commit_state(),
+        pin_approved_manifest_plan=lambda _digest: None,
+        upgrade=lambda **kwargs: events.append(("upgrade", kwargs)),
+    )
+    monkeypatch.setattr(
+        module,
+        "commit_live_release",
+        lambda _release, _state: events.append(("commit", None)),
+    )
+    monkeypatch.setattr(
+        module, "retry_release_diff", lambda _release, _state: expected_diff
+    )
+
+    module.run_deploy(release)
+
+    assert events == [("upgrade", {"resume": True, "diff": expected_diff})], events
+
+
+def test_next_deploy_names_the_live_release_a_different_candidate_will_commit(
+    monkeypatch,
+) -> None:
+    module = _admin_module()
+    expected_diff = module.diff_from_changed({"control_plane_wheel"})
+    seen: list[dict[str, object]] = []
+
+    def classify(_release, state):
+        seen.append(state)
+        return expected_diff
+
+    monkeypatch.setattr(module, "classify_release", classify)
+    release = SimpleNamespace(release_id="candidate-release")
+
+    report = module.next_deploy(release, _pending_commit_state())
+
+    assert report["action"] == "upgrade"
+    assert report["resume"] is False
+    assert report["commits_live_release_id"] == "live-release"
+    assert seen[0]["transaction_committed"] is True, (
+        "the diff is classified against the release as it will be once committed"
+    )

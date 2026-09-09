@@ -379,3 +379,94 @@ def test_rollback_after_commit_restores_from_the_retained_backups() -> None:
             source="gpu-fault-email",
             backup="gpu-fault-email-rollback-release-1",
         )
+
+
+# --- a different candidate commits the complete, uncommitted live release ----------------
+
+
+class LiveRelease(Release):
+    """The candidate's release object, whose identity is *not* the live one."""
+
+    release_id = "candidate-release"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loaded.update(
+            {"release_id": "live-release", "transaction_committed": False}
+        )
+        self.state: dict[str, Any] = {}
+
+
+def _recording_save(release: LiveRelease):
+    def save_recorded_state(target, phase, **updates):
+        assert target is release
+        release.events.append(("save", updates.get("commit_cleanup_completed")))
+        release.state.update({"phase": phase, **updates})
+
+    return save_recorded_state
+
+
+def test_commit_live_release_keeps_the_live_identity_and_orders_like_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deploy #29 (2026-09-09): release 7194b5261380 sat complete/uncommitted
+    after its verify failed, and every other candidate was refused. The
+    candidate commits it under the live identity -- never with save_state,
+    which would stamp the candidate's digests over what is actually live."""
+
+    module = transaction_module()
+    release = LiveRelease()
+    monkeypatch.setattr(module, "save_recorded_state", _recording_save(release))
+
+    module.commit_live_release(release, dict(release.loaded))
+
+    assert [event[0] for event in release.events] == ["save", "cleanup", "save"]
+    assert release.state["release_id"] == "live-release", "identity must not change"
+    assert release.state["transaction_committed"] is True
+    assert release.state["release_lifecycle"] == "COMMITTED"
+    assert release.state["commit_cleanup_completed"] is True
+    assert release.state["phase"] == "complete"
+
+
+def test_commit_live_release_refuses_anything_but_a_pending_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = transaction_module()
+    release = LiveRelease()
+    monkeypatch.setattr(module, "save_recorded_state", _recording_save(release))
+
+    with pytest.raises(ReleaseError, match="only a complete release"):
+        module.commit_live_release(release, {**dict(release.loaded), "phase": "failed"})
+    with pytest.raises(ReleaseError, match="not awaiting its commit"):
+        module.commit_live_release(
+            release, {**dict(release.loaded), "transaction_committed": True}
+        )
+    assert release.events == [], "a refused commit writes nothing"
+
+
+def test_save_recorded_state_writes_the_recorded_identity_not_the_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    STATE = transaction_module()
+
+    written: list[str] = []
+    release = SimpleNamespace(
+        release_id="candidate-release",
+        state={"release_id": "live-release", "phase": "complete", "previous": None},
+        runner=SimpleNamespace(dry_run=True),
+        config=SimpleNamespace(namespace="gpu-fault-system"),
+        _cpu=lambda *args: ["kubectl", *args],
+    )
+    monkeypatch.setattr(STATE, "narrate_phase", lambda _release, phase: None)
+    monkeypatch.setattr(
+        STATE,
+        "record_release_history",
+        lambda _release, *, phase, state_text: written.append(state_text),
+    )
+
+    STATE.save_recorded_state(release, "complete", transaction_committed=True)
+
+    assert release.state["release_id"] == "live-release"
+    assert release.state["transaction_committed"] is True
+    assert "wheel_sha256" not in release.state, "no candidate identity was stamped"
+    assert len(written) == 1 and json.loads(written[0])["release_id"] == "live-release"

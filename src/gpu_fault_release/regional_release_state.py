@@ -1571,13 +1571,13 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
             **updates,
         }
     )
+    return persist_state(release)
+
+
+def persist_state(release: Any) -> str:
     _persisted, text = render_persisted_state(release)
     if release.runner.dry_run:
         return text
-    # Every component STARTED/FAILED transition checkpoints this ConfigMap, so
-    # the write is one `apply` of a manifest built in-process instead of a
-    # temp file plus a `create --dry-run=client` render round-trip. The manifest
-    # carries its own namespace, exactly like the rendered form it replaces.
     release.runner.run(
         release._cpu("apply", "-f", "-"),
         input_text=json.dumps(
