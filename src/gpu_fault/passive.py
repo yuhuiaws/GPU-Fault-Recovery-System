@@ -217,6 +217,18 @@ class PassiveWorkflowCompiler:
                     # The plan's only isolation lever for a node it does not
                     # trust; the Kubernetes restart adapter reads it (F-G5).
                     parameters["avoid_node_ids"] = sorted(set(plan.avoid_node_ids))
+                if plan.restart_after_incident_id:
+                    # The planner only names the incident the restart waits on;
+                    # deriving the premise here keeps the adapter reading the
+                    # incident's state at execution time, not plan time (F-G5).
+                    premise = self.store.get_incident(plan.restart_after_incident_id)
+                    parameters.update(
+                        {
+                            "requires_incident_state": IncidentState.RECOVERED.value,
+                            "incident_id": premise.incident_id,
+                            "incident_node_ids": sorted(premise.node_ids),
+                        }
+                    )
             steps.append(
                 WorkflowStepSpec(
                     operation=operation,

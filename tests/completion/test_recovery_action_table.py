@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from gpu_fault.app import default_simulated_profile
+from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.markers import SPARE_BLOCKING_ACTIONS
 from gpu_fault.models import (
     CapabilityMode,
@@ -201,10 +201,40 @@ def test_after_incident_defers_avoidance_and_reuse_to_execution(
     assert plan.avoid_node_ids == []
     step = plan.steps[0]
     assert step.action is RecoveryAction.RESTART_WORKLOAD
-    assert step.parameters["reuse_allocation"] is True
-    assert step.parameters["requires_incident_state"] == "RECOVERED"
-    assert step.parameters["incident_id"] == "inc-pending"
-    assert step.parameters["incident_node_ids"] == ["node-a"]
+    assert step.parameters == {}
+    assert plan.restart_after_incident_id == "inc-pending"
+
+
+def test_compiler_derives_the_incident_premise_from_the_plan(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """The premise belongs to execution, so the compiler writes it.
+
+    The planner only names the incident the restart waits on; turning that
+    into the step's ``requires_incident_state`` parameters here keeps the
+    adapter reading the incident at execution time (F-G5).
+    """
+    incident = fault_incident(
+        "inc-pending",
+        "event-pending",
+        node_ids=["node-a"],
+        state=IncidentState.ACTION_PENDING,
+    )
+    context.store.save_incident(incident)
+    plan = PlanBuilder().after_incident(
+        failed_event, incident, default_simulated_profile()
+    )
+
+    compiled = PassiveWorkflowCompiler(context.store).compile(plan, failed_event)
+    workflow = context.store.get_workflow(compiled.workflow_request_id)
+    restart = workflow.official_steps[-1]
+
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD
+    assert restart.parameters["requires_incident_state"] == "RECOVERED"
+    assert restart.parameters["incident_id"] == "inc-pending"
+    assert restart.parameters["incident_node_ids"] == ["node-a"]
+    assert restart.parameters["restart_budget"] == failed_event.restart_budget
+    assert "reuse_allocation" not in restart.parameters
 
 
 def test_avoid_node_ids_reach_the_compiled_restart_step(

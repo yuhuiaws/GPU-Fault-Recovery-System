@@ -6,7 +6,7 @@ workflow ends FAILED with a reason naming the node, its incident ESCALATED.
 
 The workflow under test is shaped like ``PassiveWorkflowCompiler.compile``'s
 ``after_incident`` restart: a derived incident id, a single RESTART_WORKLOAD
-step carrying ``requires_incident_state`` and ``reuse_allocation``, nodes
+step carrying ``requires_incident_state``, nodes
 that include the one under repair. Its incident id differs from the node
 remediation's, so the dispatcher's hold treats it as another incident and it
 waits like any job workflow; the step's premise is the backstop once it runs.
@@ -80,7 +80,6 @@ def _after_incident_restart(store, *, created_at: datetime) -> None:
                     **RESTART_PARAMETERS,
                     "requires_incident_state": IncidentState.RECOVERED.value,
                     "incident_id": "inc-node",
-                    "reuse_allocation": True,
                 },
             )
         ],

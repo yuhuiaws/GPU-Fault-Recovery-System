@@ -150,8 +150,7 @@ def test_a_repair_marker_still_pins_the_restart_to_its_incident(
     assert decision.matched_marker_ids == ["marker-diagnostic"]
     plan = context.store.get_plan(decision.recovery_plan_id)
     assert plan.steps[0].action is RecoveryAction.RESTART_WORKLOAD
-    assert plan.steps[0].parameters["requires_incident_state"] == "RECOVERED"
-    assert plan.steps[0].parameters["incident_id"] == "inc-diagnostic"
+    assert plan.restart_after_incident_id == "inc-diagnostic"
 
 
 def test_the_repair_marker_wins_when_both_kinds_match(

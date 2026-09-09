@@ -325,10 +325,7 @@ def test_http_xid_marker_is_reused_by_failed_attempt(
             assert [step["action"] for step in plan.json()["steps"]] == [
                 "RESTART_WORKLOAD"
             ]
-            assert (
-                plan.json()["steps"][0]["parameters"]["requires_incident_state"]
-                == "RECOVERED"
-            )
+            assert plan.json()["restart_after_incident_id"] == xid.json()["incident_id"]
 
     asyncio.run(run_scenario())
 

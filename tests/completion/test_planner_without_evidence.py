@@ -24,7 +24,7 @@ def test_no_evidence_plans_one_restart_on_the_same_allocation(
     assert plan.steps[0].node_ids == ["node-a", "node-b"]
     assert plan.steps[0].parameters == {}
     assert plan.avoid_node_ids == []
-    assert getattr(plan, "restart_after_incident_id", None) is None
+    assert plan.restart_after_incident_id is None
     assert plan.checkpoint_manifest_ref == failed_event.checkpoint_manifest_ref
 
 

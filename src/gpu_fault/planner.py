@@ -183,14 +183,7 @@ class PlanBuilder:
             RecoveryAction.NO_ACTION,
             RecoveryAction.RESTART_WORKLOAD,
         }:
-            steps.append(
-                self._step(
-                    profile,
-                    RecoveryAction.RESTART_WORKLOAD,
-                    node_ids,
-                    parameters={"reuse_allocation": True},
-                )
-            )
+            steps.append(self._step(profile, RecoveryAction.RESTART_WORKLOAD, node_ids))
         elif action in {
             RecoveryAction.RESET_GPU,
             RecoveryAction.REBOOT_NODE,
@@ -405,10 +398,7 @@ class PlanBuilder:
             )
         if event.workload_ids:
             restart = self._optional_step(
-                profile,
-                RecoveryAction.RESTART_WORKLOAD,
-                node_ids,
-                parameters={"reuse_allocation": False},
+                profile, RecoveryAction.RESTART_WORKLOAD, node_ids
             )
             if restart is not None:
                 steps.append(restart)
@@ -424,10 +414,9 @@ class PlanBuilder:
 
         The restart is gated on the incident being ``RECOVERED`` *at execution
         time* (the adapter waits until it is, and gives up if it can never be).
-        Freezing ``incident.state`` here froze two execution-time decisions at
-        plan time: an ``ACTION_PENDING`` incident produced a plan that, once the
-        repair succeeded, restarted the job everywhere except on the node that
-        had just been repaired, and without its allocation (F-G5).
+        The premise is carried on the plan (``restart_after_incident_id``); the
+        compiler turns it into the step's ``requires_incident_state`` parameters
+        so the adapter reads the incident at execution time (F-G5).
         """
         allocation_nodes = sorted({item.node_id for item in event.allocation})
         return RecoveryPlan(
@@ -436,19 +425,10 @@ class PlanBuilder:
             trigger=f"incident:{incident.incident_id}",
             runtime_profile_version=profile.profile_version,
             steps=[
-                self._step(
-                    profile,
-                    RecoveryAction.RESTART_WORKLOAD,
-                    allocation_nodes,
-                    parameters={
-                        "reuse_allocation": True,
-                        "requires_incident_state": "RECOVERED",
-                        "incident_id": incident.incident_id,
-                        "incident_node_ids": sorted(incident.node_ids),
-                    },
-                )
+                self._step(profile, RecoveryAction.RESTART_WORKLOAD, allocation_nodes)
             ],
             avoid_node_ids=[],
+            restart_after_incident_id=incident.incident_id,
             checkpoint_manifest_ref=event.checkpoint_manifest_ref,
         )
 

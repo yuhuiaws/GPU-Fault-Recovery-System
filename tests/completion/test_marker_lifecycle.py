@@ -218,7 +218,7 @@ def test_terminal_still_matches_a_repaired_incident_about_this_attempt(
     assert decision.status is DecisionStatus.PLAN_CREATED
     assert decision.matched_marker_ids == ["marker-1"]
     plan = context.store.get_plan(decision.recovery_plan_id)
-    assert plan.steps[0].parameters["requires_incident_state"] == "RECOVERED"
+    assert plan.restart_after_incident_id == "inc-existing"
 
 
 def test_marker_window_must_not_exceed_the_marker_ttl() -> None:

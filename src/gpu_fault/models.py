@@ -590,6 +590,7 @@ class RecoveryPlan(StrictModel):
     runtime_profile_version: str
     steps: list[PlanStep]
     avoid_node_ids: list[str] = Field(default_factory=list)
+    restart_after_incident_id: str | None = None
     checkpoint_manifest_ref: str | None = None
     drill_id: str | None = Field(
         default=None,
