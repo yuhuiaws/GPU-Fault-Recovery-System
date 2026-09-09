@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.release_consent import ALLOW_INFLIGHT_INSTALLS_ENV
 from gpu_fault.admin.release_state import live_release_state
 from gpu_fault.admin.rollback_alignment import reconcile_rollback_management
 from gpu_fault.admin.site import (
@@ -47,6 +48,16 @@ ROLLOUT_SCRIPT = "deploy/control-plane/regional/rollout-regional-release.sh"
 RELEASE_DEPLOY_DIR = "release-deploy"
 RESULT_KEY = "gpu_fault_admin_rollback"
 DEPLOY_HINT = "rerun `gpu-fault-admin deploy --state-dir <state-dir>`"
+# The one operator consent that means something on a rollback. The engine's
+# in-flight install gate runs before its ``rollback`` mode opens the transaction
+# exactly as before an upgrade, so ``--allow-inflight-installs`` must reach it.
+# The schema-change acceptance is a consent to release a schema change
+# fail-forward -- the engine's rollback never reads it and refuses a cross-schema
+# rollback regardless (``rollback_refusal`` says so first, in its words) -- and
+# a supersede names a failed transaction to replace, which a rollback of a
+# committed release has none of. Both are refused loudly rather than forwarded,
+# so no caller can believe it consented to something the rollback cannot do.
+ROLLBACK_CONSENTS = frozenset({ALLOW_INFLIGHT_INSTALLS_ENV})
 
 
 class RollbackCommandError(RuntimeError):
@@ -252,8 +263,36 @@ def _emit(result: dict[str, Any]) -> None:
     print(json.dumps({RESULT_KEY: result}, sort_keys=True))
 
 
-def run_rollback(site: RenderedSite, *, state_dir: Path) -> int:
+def refuse_foreign_consents(environment: Mapping[str, str]) -> None:
+    """Refuse a consent mapping carrying anything but ``ROLLBACK_CONSENTS``.
+
+    Only the caller's explicit mapping is judged; a stale ``export`` in the
+    inherited process environment travels unchanged, as on the deploy path,
+    and the engine's rollback ignores the two variables anyway.
+    """
+
+    foreign = sorted(set(environment) - ROLLBACK_CONSENTS)
+    if foreign:
+        raise SiteConfigError(
+            "deploy --rollback accepts no consent but --allow-inflight-installs; "
+            "a rollback neither releases a schema change nor supersedes a "
+            "failed transaction, so it cannot carry " + ", ".join(foreign)
+        )
+
+
+def run_rollback(
+    site: RenderedSite,
+    *,
+    state_dir: Path,
+    environment: Mapping[str, str] | None = None,
+) -> int:
     """Roll the site back to its previous committed release; returns the exit code.
+
+    ``environment`` is the operator's consents as the engine's variables
+    (``release_consent.release_consent_environment``), layered over the site's
+    environment for both engine steps the way the deploy path layers them, so
+    the flag on the command wins over a stale ``export``. Only the in-flight
+    install consent is admitted (``ROLLBACK_CONSENTS``).
 
     Refusals (nothing to roll back to, a transaction in flight, a schema the
     engine will not cross) print the reason and return 2 without touching the
@@ -262,6 +301,8 @@ def run_rollback(site: RenderedSite, *, state_dir: Path) -> int:
     the failure driver's record would.
     """
 
+    consents = dict(environment or {})
+    refuse_foreign_consents(consents)
     state_dir = state_dir.expanduser().resolve()
     state = live_release_state(site)
     refusal = rollback_refusal(state)
@@ -276,7 +317,7 @@ def run_rollback(site: RenderedSite, *, state_dir: Path) -> int:
         print(f"gpu-fault-admin: rollback refused: {refusal}", file=sys.stderr)
         _emit({**result, "status": "REFUSED", "reason": refusal})
         return 2
-    environment = effective_environment(site)
+    environment = {**effective_environment(site), **consents}
     with materialized_release_config(site) as config:
         completed = subprocess.run(
             [

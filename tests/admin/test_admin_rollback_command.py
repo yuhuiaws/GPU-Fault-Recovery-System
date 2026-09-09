@@ -14,9 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from gpu_fault.admin import release_consent as CONSENT
 from gpu_fault.admin import rollback_command as COMMAND
 from gpu_fault.admin.site import SiteConfigError, load_site
 from gpu_fault_release import regional_admin_commands as ADMIN
+from gpu_fault_release import regional_release_store_preflight as PREFLIGHT
+from gpu_fault_release import regional_schema_change as SCHEMA_CHANGE
 from scripts import release_failure_recovery as RECOVERY
 from tests.admin.test_admin_site import site_file
 
@@ -381,6 +384,114 @@ def test_a_failed_sync_state_is_an_alignment_failure(
     result = _result(capsys)
     assert result["status"] == "ALIGNMENT_FAILED"
     assert "sync-state failed (4)" in result["error"]
+
+
+# --- the operator's consents ---------------------------------------------------
+
+INFLIGHT = {CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV: "1"}
+
+
+def test_the_inflight_consent_reaches_the_engine_as_its_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``deploy --rollback --allow-inflight-installs``: the in-flight install
+    gate runs on the engine's rollback too, so the consent must reach it as
+    ``GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS=1`` -- not only when the
+    operator happened to ``export`` it by hand."""
+
+    monkeypatch.delenv(CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV, raising=False)
+    _site_path, site, runs, _reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state(), _rolled_back_state()]
+    )
+
+    status = COMMAND.run_rollback(site, state_dir=tmp_path, environment=INFLIGHT)
+
+    assert status == 0, capsys.readouterr()
+    assert runs.modes == ["rollback", "sync-state"], "both engine steps ran"
+    _arguments, _cwd, env = runs.calls[0]
+    assert env[CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV] == "1", (
+        "the consent travels to the engine's rollback as its variable"
+    )
+    assert env["PYTHONPATH"] == str(site.repository_root / "src"), (
+        "the consent is added to the site's environment, not substituted for it"
+    )
+
+
+def test_without_the_consent_the_engine_sees_no_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV, raising=False)
+    _site_path, site, runs, _reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state(), _rolled_back_state()]
+    )
+
+    status = COMMAND.run_rollback(site, state_dir=tmp_path, environment={})
+
+    assert status == 0, capsys.readouterr()
+    assert CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV not in runs.calls[0][2], (
+        "no flag, no variable: the engine's gate refuses an in-flight install"
+    )
+
+
+def test_the_schema_consent_cannot_turn_a_refused_rollback_into_an_accepted_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rollback across a schema change is refused with the engine's words
+    whatever the caller's environment carries: the acceptance is a consent to
+    release a schema change fail-forward, never to roll one back, and a stale
+    ``export`` of it must change nothing here."""
+
+    monkeypatch.setenv(CONSENT.ACCEPT_SCHEMA_CHANGE_ENV, "snapshot")
+    state = _committed_state(
+        release_diff={"kind": "FULL", "changed": ["cpu_wheel", "database_schema"]},
+        schema_change_acceptance={"mode": "snapshot", "snapshot_id": "snap-1"},
+    )
+    _site_path, site, runs, reconciled = _prepare(tmp_path, monkeypatch, states=[state])
+
+    status = COMMAND.run_rollback(site, state_dir=tmp_path, environment={})
+
+    assert status == 2, "still a refusal"
+    assert runs.calls == [] and reconciled == [], "nothing runs after a refusal"
+    result = _result(capsys)
+    assert result["status"] == "REFUSED"
+    assert "not declared backward-compatible" in result["reason"], result
+    assert "snap-1" in result["reason"], "the refusal names the recorded snapshot"
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {CONSENT.ACCEPT_SCHEMA_CHANGE_ENV: "snapshot"},
+        {CONSENT.ACCEPT_SCHEMA_CHANGE_ENV: "no-snapshot"},
+        {CONSENT.SUPERSEDE_FAILED_TRANSACTION_ENV: "1"},
+    ),
+    ids=("accept-snapshot", "accept-no-snapshot", "supersede"),
+)
+def test_a_consent_with_no_meaning_on_a_rollback_is_refused_not_forwarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]
+) -> None:
+    """The rollback command has no schema-change or supersede notion: the
+    engine's rollback mode never reads either variable, and forwarding them
+    silently would let a caller believe it consented to something. Refuse the
+    mapping loudly, naming the variable, before the live state is even read."""
+
+    _site_path, site, runs, reconciled = _prepare(
+        tmp_path, monkeypatch, states=[_committed_state()]
+    )
+
+    with pytest.raises(SiteConfigError, match=next(iter(environment))):
+        COMMAND.run_rollback(site, state_dir=tmp_path, environment=environment)
+
+    assert runs.calls == [] and reconciled == [], "nothing runs after a refusal"
+
+
+def test_the_consent_spellings_are_the_engine_constants() -> None:
+    assert CONSENT.ALLOW_INFLIGHT_INSTALLS_ENV == PREFLIGHT.ALLOW_INFLIGHT_INSTALLS_ENV
+    assert CONSENT.ACCEPT_SCHEMA_CHANGE_ENV == SCHEMA_CHANGE.ACCEPT_SCHEMA_CHANGE_ENV
+    assert (
+        CONSENT.SUPERSEDE_FAILED_TRANSACTION_ENV
+        == ADMIN.SUPERSEDE_FAILED_TRANSACTION_ENV
+    )
 
 
 # --- the failure driver shares the alignment ---------------------------------

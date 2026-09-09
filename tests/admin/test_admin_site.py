@@ -1008,12 +1008,14 @@ def test_deploy_rollback_dispatches_to_the_rollback_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_dir = _managed_state(tmp_path)
-    seen: list[tuple[object, Path]] = []
+    seen: list[tuple[object, Path, dict[str, str]]] = []
     monkeypatch.setattr(admin_cli, "load_site", lambda *_a, **_k: "site")
     monkeypatch.setattr(
         admin_cli,
         "run_rollback",
-        lambda site, *, state_dir: seen.append((site, state_dir)) or 2,
+        lambda site, *, state_dir, environment: (
+            seen.append((site, state_dir, dict(environment))) or 2
+        ),
     )
     monkeypatch.setattr(
         admin_cli,
@@ -1025,7 +1027,61 @@ def test_deploy_rollback_dispatches_to_the_rollback_command(
     )
 
     assert admin_cli.run(arguments) == 2, "the rollback command's exit code is returned"
-    assert seen == [("site", state_dir.resolve())]
+    assert seen == [("site", state_dir.resolve(), {})], (
+        "without a consent flag the rollback command gets an empty consent mapping"
+    )
+
+
+def test_deploy_rollback_carries_the_inflight_consent_to_the_rollback_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``deploy --rollback --allow-inflight-installs`` reaches the engine as
+    ``GPU_FAULT_RELEASE_ALLOW_INFLIGHT_INSTALLS=1`` through the same consent
+    builder the upgrade path uses; the gate runs on the rollback too."""
+
+    state_dir = _managed_state(tmp_path)
+    seen: list[dict[str, str]] = []
+    monkeypatch.setattr(admin_cli, "load_site", lambda *_a, **_k: "site")
+    monkeypatch.setattr(
+        admin_cli,
+        "run_rollback",
+        lambda site, *, state_dir, environment: seen.append(dict(environment)) or 0,
+    )
+    arguments = admin_cli.parser().parse_args(
+        [
+            "deploy",
+            "--state-dir",
+            str(state_dir),
+            "--rollback",
+            "--allow-inflight-installs",
+        ]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert seen == [{admin_cli.ALLOW_INFLIGHT_INSTALLS_ENV: "1"}], (
+        "the flag is the only consent a rollback carries, as the engine's variable"
+    )
+
+
+def test_the_inflight_consent_without_rollback_still_reaches_the_source_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _managed_state(tmp_path)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
+    )
+    monkeypatch.setattr(
+        admin_cli, "run_rollback", lambda *_a, **_k: pytest.fail("rollback ran")
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["deploy", "--state-dir", str(state_dir), "--allow-inflight-installs"]
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert calls[-1]["extra_environment"] == {
+        admin_cli.ALLOW_INFLIGHT_INSTALLS_ENV: "1"
+    }, "the upgrade path is unchanged: the consent travels as before"
 
 
 @pytest.mark.parametrize(
@@ -1034,6 +1090,7 @@ def test_deploy_rollback_dispatches_to_the_rollback_command(
         ["--gpu-cluster-arn", "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"],
         ["--approve-profile-plan", "a" * 64, "--reference", "CHG-1"],
         ["--accept-schema-change"],
+        ["--accept-schema-change-without-snapshot"],
         ["--supersede-failed-transaction"],
     ),
 )

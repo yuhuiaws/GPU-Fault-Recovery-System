@@ -197,10 +197,14 @@ def run_deploy_rollback(
         raise SiteConfigError(
             "deploy --rollback requires a managed site under --state-dir"
         )
+    # ``refuse_rollback_options`` has already turned away the schema-change and
+    # supersede flags, so the mapping carries at most the in-flight install
+    # consent -- the one the engine's gate reads on a rollback too.
     return int(
         hooks.run_rollback(
             hooks.load_site(site_file, repository_root=arguments.repo_root),
             state_dir=state_dir,
+            environment=hooks.release_consent_environment(arguments),
         )
     )
 
