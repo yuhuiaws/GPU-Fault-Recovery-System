@@ -242,6 +242,20 @@ def test_large_registry_sets_are_not_relisted_as_literals() -> None:
             {"adapters": frozenset({OperationAdapter.KUBERNETES})},
             "generation-stable command_id but is not a node action",
         ),
+        # A stable id exists to keep a mutation from running twice; a
+        # non-mutating action wants the suffix (re-run on the fresh agent).
+        (
+            WorkflowOperation.REMEDIATE_DRIVER,
+            {"destructive": False},
+            "generation-stable command_id but is not node-mutating",
+        ),
+        # Containment is destructive in the audit sense but never a node
+        # mutation, so a scheduler-only claim set is refused the same way.
+        (
+            WorkflowOperation.REMEDIATE_DRIVER,
+            {"resource_claims": frozenset({OperationResourceClaim.SCHEDULER_MUTATION})},
+            "generation-stable command_id but is not node-mutating",
+        ),
     ],
 )
 def test_generation_stable_command_invariants_fail_closed(

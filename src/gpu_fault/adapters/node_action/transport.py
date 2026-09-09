@@ -46,6 +46,24 @@ from gpu_fault.transport.http_client import urlopen
 # is the case that must not become a FAILED step.
 TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
 
+# COMPATIBILITY SHIM -- REMOVE ONE RELEASE AFTER R4 SHIPS (added 2026-09-09).
+#
+# R4 (d5808ed) renamed the command_id of the GENERATION_STABLE_COMMAND_OPERATIONS
+# from ``<key>/<node>/agent-N`` to ``<key>/<node>``. A step of one of those
+# operations that was WAITING when the release landed holds an agent-ledger row
+# under the OLD shape; polling only the new id reads 404 and submits, and the
+# agent -- with no history for the new id -- runs the install a second time
+# next to the first. Until every such row has aged out of the agents' ledgers
+# (one release, or the ledger retention window, whichever is longer) a 404 on
+# the new id is followed by one read of the legacy id before any submit.
+#
+# The shim is one-directional: it lets the NEW control plane read rows the
+# OLD one wrote. An autoRollback to the old release reinstates code that
+# derives the suffixed id and has no read-back, so "do not roll back while a
+# REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE / REMEDIATE_EFA_DRIVER step is
+# PENDING" remains the operator rule for the rollback direction only.
+LEGACY_COMMAND_ID_SUFFIX = "/agent-"
+
 
 def _control_plane_did_not_answer(exc: BaseException) -> bool:
     """Whether a registry read failed without saying anything about the record.
@@ -196,16 +214,20 @@ class NodeActionTransportMixin:
             return WorkflowStepOutcome.failed(str(exc))
         now = datetime.now(timezone.utc)
         command_id = f"{context.idempotency_key}/{command_suffix}"
-        if (
-            agent_generation is not None
-            and operation not in GENERATION_STABLE_COMMAND_OPERATIONS
-        ):
-            # The suffix is right for an action a fresh agent should simply run
-            # again (a snapshot, a bundle). A driver install is not one: keyed
-            # by the live generation, a restart under the action formed a new
-            # command and ran the install twice, so the long-running mutations
-            # are named by step and node alone and replay from the ledger.
-            command_id += f"/agent-{agent_generation}"
+        legacy_command_ids: tuple[str, ...] = ()
+        if agent_generation is not None:
+            if operation in GENERATION_STABLE_COMMAND_OPERATIONS:
+                legacy_command_ids = self._legacy_command_ids(
+                    context, command_id, agent_generation
+                )
+            else:
+                # The suffix is right for an action a fresh agent should simply
+                # run again (a snapshot, a bundle). A driver install is not one:
+                # keyed by the live generation, a restart under the action
+                # formed a new command and ran the install twice, so the
+                # long-running mutations are named by step and node alone and
+                # replay from the ledger.
+                command_id += f"{LEGACY_COMMAND_ID_SUFFIX}{agent_generation}"
         command = NodeActionCommand(
             command_id=command_id,
             workflow_request_id=context.workflow.request_id,
@@ -231,6 +253,7 @@ class NodeActionTransportMixin:
                 envelope,
                 secret=action_secret,
                 ssl_context=ssl_context,
+                legacy_command_ids=legacy_command_ids,
             )
         except NodeActionPending as exc:
             # The only path that parsed an acceptance out of the agent: the
@@ -274,6 +297,42 @@ class NodeActionTransportMixin:
             return WorkflowStepOutcome.failed(
                 f"node agent {node_id} request failed: {type(exc).__name__}: {exc}"
             )
+
+    @staticmethod
+    def _legacy_command_ids(
+        context: WorkflowStepContext,
+        command_id: str,
+        agent_generation: int,
+    ) -> tuple[str, ...]:
+        """The pre-R4 ids this step's node action may be filed under (shim).
+
+        Exact first: the ``node_action_command_id`` pointer the step's last
+        WAITING record carries is the id the previous control plane actually
+        submitted, whatever generation the agent was at then. The live
+        generation is only a guess -- right when the agent has not restarted
+        since -- and is the fallback when the pointer is absent or already in
+        the new shape. Deduplicated so the common case (pointer == guess) is
+        one extra read, and never more than two.
+
+        REMOVE WITH THE SHIM: see ``LEGACY_COMMAND_ID_SUFFIX``.
+        """
+
+        prefix = f"{command_id}{LEGACY_COMMAND_ID_SUFFIX}"
+        candidates: list[str] = []
+        for item in reversed(context.workflow.step_executions):
+            if (
+                item.step_index != context.step_index
+                or item.operation is not context.step.operation
+            ):
+                continue
+            pointer = item.details.get("node_action_command_id")
+            if isinstance(pointer, str) and pointer.startswith(prefix):
+                candidates.append(pointer)
+            break
+        guess = f"{prefix}{agent_generation}"
+        if guess not in candidates:
+            candidates.append(guess)
+        return tuple(candidates)
 
     @staticmethod
     def _classify_http_error(
@@ -408,15 +467,16 @@ class NodeActionTransportMixin:
             key_version,
         )
 
-    def _send(
+    def _poll_result(
         self,
         endpoint: str,
-        envelope: SignedNodeAction,
+        command_id: str,
         *,
         secret: str,
-        ssl_context: ssl.SSLContext | None = None,
-    ) -> NodeActionResult:
-        command_id = envelope.command.command_id
+        ssl_context: ssl.SSLContext | None,
+    ) -> NodeActionSubmission | None:
+        """The agent's ledger row for one command_id; None when it has none."""
+
         # The result carries the same operational detail as the command,
         # so the read is authenticated with the same shared secret. An
         # agent that has not been rolled yet ignores the two extra query
@@ -443,12 +503,40 @@ class NodeActionTransportMixin:
                 timeout=self.poll_timeout_seconds,
                 ssl_context=ssl_context,
             ) as response:
-                state = NodeActionSubmission.model_validate_json(response.read())
+                return NodeActionSubmission.model_validate_json(response.read())
         except urllib_error.HTTPError as exc:
             if exc.code != 404:
                 raise
-            state = None
+            return None
+
+    def _send(
+        self,
+        endpoint: str,
+        envelope: SignedNodeAction,
+        *,
+        secret: str,
+        ssl_context: ssl.SSLContext | None = None,
+        legacy_command_ids: tuple[str, ...] = (),
+    ) -> NodeActionResult:
+        command_id = envelope.command.command_id
+        state = self._poll_result(
+            endpoint, command_id, secret=secret, ssl_context=ssl_context
+        )
         pending_details: dict[str, Any] = {"node_action_endpoint": endpoint}
+        for legacy_command_id in legacy_command_ids:
+            # COMPATIBILITY SHIM (see LEGACY_COMMAND_ID_SUFFIX): the agent may
+            # hold this step's action under the id the previous release used.
+            # Only after the new id is unknown, and only until one is found;
+            # an IN_PROGRESS legacy row is waited on, a finished one folded,
+            # and the pointer recorded for the step is the id that answered so
+            # the next poll's read-back is exact.
+            if state is not None:
+                break
+            state = self._poll_result(
+                endpoint, legacy_command_id, secret=secret, ssl_context=ssl_context
+            )
+            if state is not None:
+                pending_details["node_action_legacy_command_id"] = legacy_command_id
         if state is not None and self._should_resubmit(state):
             # The agent's ledger holds a retryable failure and will run the
             # command again as attempt + 1 when the same envelope is
@@ -481,7 +569,9 @@ class NodeActionTransportMixin:
             ) as response:
                 state = NodeActionSubmission.model_validate_json(response.read())
         if state.state is NodeActionExecutionState.PENDING:
-            raise NodeActionPending(command_id, pending_details)
+            # ``state.command_id`` rather than the envelope's: under the shim
+            # they differ, and the pointer must name the row that is running.
+            raise NodeActionPending(state.command_id, pending_details)
         if state.result is None:
             raise RuntimeError("node action completed without a result")
         return self._retry_exhausted(state.result) or state.result

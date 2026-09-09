@@ -487,6 +487,15 @@ def validate_operation_registry() -> None:
                     f"{operation.value} is maintenance-generation scoped, which "
                     "already pins its command_id; drop generation_stable_command_id"
                 )
+            if not _node_mutating(semantics):
+                # The stable id trades "re-run on the fresh agent" for "answer
+                # from the ledger". That is only right for an action whose
+                # second run damages the node; a diagnostic or a containment
+                # step wants the generation suffix and the re-run.
+                raise RuntimeError(
+                    f"{operation.value} names a generation-stable command_id "
+                    "but is not node-mutating"
+                )
         unknown = semantics.dominates - operations
         if unknown:
             raise RuntimeError(
@@ -494,6 +503,18 @@ def validate_operation_registry() -> None:
                 f"{sorted(item.value for item in unknown)}"
             )
     _validate_dominance(operations)
+
+
+def _node_mutating(semantics: OperationSemantics) -> bool:
+    """Whether the operation acts on the node beyond scheduler containment.
+
+    The per-semantics form of ``NODE_MUTATING_OPERATIONS``, which is derived
+    from the registry after validation and so cannot be consulted by it.
+    """
+
+    return semantics.destructive and semantics.resource_claims != frozenset(
+        {OperationResourceClaim.SCHEDULER_MUTATION}
+    )
 
 
 def _validate_dominance(operations: set[WorkflowOperation]) -> None:
@@ -569,9 +590,7 @@ DESTRUCTIVE_OPERATIONS = operations_with("destructive")
 CONTAINMENT_ONLY_OPERATIONS = frozenset(
     operation
     for operation, semantics in OPERATION_REGISTRY.items()
-    if semantics.destructive
-    and semantics.resource_claims
-    == frozenset({OperationResourceClaim.SCHEDULER_MUTATION})
+    if semantics.destructive and not _node_mutating(semantics)
 )
 NODE_MUTATING_OPERATIONS = DESTRUCTIVE_OPERATIONS - CONTAINMENT_ONLY_OPERATIONS
 RECOVERY_OPERATION_RANK = {
