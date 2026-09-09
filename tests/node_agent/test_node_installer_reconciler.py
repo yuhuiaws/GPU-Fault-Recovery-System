@@ -312,7 +312,7 @@ def template():
     }
 
 
-def reconciler(core, batch, *, now=lambda: NOW, max_unavailable=1):
+def reconciler(core, batch, *, now=lambda: NOW, max_unavailable=1, job_template=None):
     return NodeInstallerReconciler(
         core,
         batch,
@@ -323,7 +323,7 @@ def reconciler(core, batch, *, now=lambda: NOW, max_unavailable=1):
         artifact_sha256=ARTIFACT,
         bundle_sha256=BUNDLE,
         template_sha256=TEMPLATE,
-        job_template=template(),
+        job_template=template() if job_template is None else job_template,
         dcgm_metrics_url_template="http://{node_ip}:9400/metrics",
         retry_seconds=300,
         max_unavailable=max_unavailable,
@@ -407,6 +407,47 @@ def test_missing_installation_creates_node_bound_job():
     assert (
         core.patches[-1][1]["metadata"]["annotations"][INSTALLER_STATE_ANNOTATION]
         == "Installing"
+    )
+
+
+def test_a_template_lacking_an_env_the_reconciler_fills_fails_at_build_time(caplog):
+    """A stale Job template must not produce a Job that silently lacks a value.
+
+    The reconciler fills the template's env entries by name. A template from
+    an older release that has no ``DCGM_EXPORTER_INTERVAL_MS`` entry used to be
+    accepted as-is: the Job ran, the installer was never told the exporter's
+    period, and the collector's duty-cycle check stayed off on that node with
+    nothing in the logs. The template is pinned by digest, so the mismatch is a
+    deploy defect; it has to surface as an error naming the missing entry --
+    counted as the pass's ``error`` and logged with the name, since the pass
+    isolates one node's failure from the rest -- not as a Job that installs
+    the wrong thing.
+    """
+
+    core = CoreApi([node()])
+    batch = BatchApi()
+    stale = template()
+    container = stale["spec"]["template"]["spec"]["containers"][0]
+    container["env"] = [
+        item for item in container["env"] if item["name"] != "DCGM_EXPORTER_INTERVAL_MS"
+    ]
+
+    result = reconciler(core, batch, job_template=stale).reconcile_once()
+
+    assert result["error"] == 1 and result["created"] == 0, (
+        f"a stale template must fail the node's build, not install through it: {result}"
+    )
+    assert batch.created == [], (
+        "a Job was created from a template that cannot carry the exporter "
+        f"period: {batch.created}"
+    )
+    errors = [record for record in caplog.records if record.exc_info is not None]
+    assert len(errors) == 1 and isinstance(errors[0].exc_info[1], RuntimeError), (
+        f"the build failure must surface as a RuntimeError, not a per-node "
+        f"'unsupported' verdict: {[record.getMessage() for record in caplog.records]}"
+    )
+    assert "DCGM_EXPORTER_INTERVAL_MS" in str(errors[0].exc_info[1]), (
+        f"the error must name the env entry the template lacks: {errors[0].exc_info[1]}"
     )
 
 

@@ -839,11 +839,24 @@ class NodeInstallerReconciler:
             # and its duty-cycle check never runs in production.
             "DCGM_EXPORTER_INTERVAL_MS": str(DCGM_EXPORTER_COLLECT_INTERVAL_MS),
         }
+        unfilled = dict(updates)
         for env in container.get("env", []):
             name = env.get("name")
-            if name in updates:
+            if name in unfilled:
                 env.clear()
-                env.update(name=name, value=updates[name])
+                env.update(name=name, value=unfilled.pop(name))
+        if unfilled:
+            # The template is pinned by digest, so an entry it lacks is a deploy
+            # defect, not a per-node condition: a Job created anyway would run
+            # the installer without that value and install the wrong thing
+            # silently (the exporter period, say, leaves the collector's
+            # duty-cycle check off). Not a ValueError -- the caller reads that
+            # as "this node is unsupported" and moves on to the next one.
+            raise RuntimeError(
+                "installer job template has no env entry for "
+                + ", ".join(sorted(unfilled))
+                + "; the pinned template predates the reconciler filling it"
+            )
         return body
 
 

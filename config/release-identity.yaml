@@ -80,12 +80,14 @@ component_inputs:
     - deploy/dataplane/hyperpod-dcgm-exporter.yaml
     # The exporter's node affinity is rendered from the instance-type
     # inventory, its collect period from the exporter cadence constant, and
-    # the renderer that substitutes both lives in regional_release_rendering.py:
-    # without them, adding a supported GPU type or changing the period leaves
-    # the DaemonSet digest unchanged, the release skips the re-apply and the new
-    # nodes never get an exporter. Only these two small modules, not the whole
-    # node installer reconciler: while the inventory lived there, every
-    # reconciler fix rolled every exporter Pod on every GPU cluster.
+    # the renderer that substitutes both lives in
+    # regional_release_rendering.py: without them, adding a supported GPU
+    # type or changing the period leaves the DaemonSet digest unchanged, the
+    # release skips the re-apply and the new nodes never get an exporter.
+    # Only these two small modules, not the whole node installer reconciler:
+    # while the inventory lived there, every reconciler fix showed a dcgm
+    # change in every plan and re-applied the DaemonSet (an unchanged
+    # template does not restart its Pods) on every GPU cluster.
     - src/gpu_fault/dcgm_exporter_cadence.py
     - src/gpu_fault/gpu_instance_inventory.py
     - src/gpu_fault_release/regional_gpu_bootstrap.py

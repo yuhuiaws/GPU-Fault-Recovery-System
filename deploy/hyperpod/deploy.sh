@@ -2658,17 +2658,17 @@ configure_dcgm_exporter() {
             "${HYPERPOD_CLUSTER_NAME}" >&2
         return 1
     }
-    # The checked-in DaemonSet carries a required nodeAffinity placeholder that
-    # the regional release renders from the node installer's instance-type
-    # inventory. This legacy single-cluster path has no renderer and pins the
-    # Pods to the one instance type it discovers above anyway (see the patch
-    # below), so it substitutes that type. Applying the placeholder verbatim
-    # would install an affinity that matches no node at all: zero Pods
-    # scheduled, `rollout status` passing trivially and the metrics probe below
-    # failing with nothing to explain it.
+    # Two placeholders the regional release renders from gpu_instance_inventory
+    # and dcgm_exporter_cadence; this legacy path has no renderer, so it pins
+    # the one instance type found above (see the patch below) and the reviewed
+    # period. Applied verbatim, the affinity matches no node: zero Pods and a
+    # trivially passing `rollout status`. Legacy caveat: the period reaches only
+    # this DaemonSet; run_node_installer_job's Jobs pass an empty
+    # DCGM_EXPORTER_INTERVAL_MS, so `existing`-mode nodes never learn it.
     sed \
         -e "s#${DEFAULT_DCGM_EXPORTER_IMAGE}#${DCGM_EXPORTER_IMAGE}#g" \
-        -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" -e "s#REPLACE_WITH_DCGM_EXPORTER_COLLECT_INTERVAL_MS#15000#g" \
+        -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" \
+        -e "s#REPLACE_WITH_DCGM_EXPORTER_COLLECT_INTERVAL_MS#15000#g" \
         "${REPO_DIR}/deploy/dataplane/hyperpod-dcgm-exporter.yaml" |
         kubectl apply -f -
     kubectl -n "${NAMESPACE}" patch daemonset \

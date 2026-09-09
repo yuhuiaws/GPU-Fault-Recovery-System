@@ -7,8 +7,10 @@ deploy pins the same list. It lives on its own because it is a *release
 input*: ``config/release-identity.yaml`` lists this module under
 ``component_inputs.dcgm`` so that a new supported type re-applies the exporter
 DaemonSet. While the table sat inside ``node_installer_reconciler.py`` the
-whole reconciler was that input, and every unrelated reconciler fix rolled
-every exporter Pod on every GPU cluster.
+whole reconciler was that input, and every unrelated reconciler fix showed a
+``dcgm`` change in every plan and re-applied the exporter DaemonSet on every
+GPU cluster (a no-op apply plus a rollout-status wait; an unchanged template
+does not restart its Pods).
 """
 
 from __future__ import annotations

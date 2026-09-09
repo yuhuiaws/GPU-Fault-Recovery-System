@@ -11,17 +11,29 @@ existing`` can write the collector's seconds, and the installer's docker-mode
 default is held equal to it by contract test. A second literal anywhere would
 let a node's grading depend on how its exporter happened to start.
 
+The period is not free-standing: it is the dcgm collector's own scrape period
+(the collector CLI's metrics-interval default, the installer's
+``METRICS_INTERVAL``), because the collector's stale carry-over covers
+``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`` (8) of its own intervals and the
+exporter must refresh at or below that bound (``collectors/gpu/dcgm.py``); on
+DCGM's 30 s default every second sample repeats the previous one and a
+throttling episode cannot be graded. A contract test pins the seconds below to
+both defaults and the milliseconds to the reviewed value.
+
 This module is a release input (``config/release-identity.yaml``,
 ``component_inputs.dcgm``): changing the period changes the rendered DaemonSet
-and must re-apply it.
+and must re-apply it. Any edit here -- even to this docstring -- changes the
+``dcgm`` component digest and re-applies the DaemonSet once, so the module
+holds constants only.
 """
 
 from __future__ import annotations
 
-#: DCGM's ``-c`` argument, in milliseconds. Kept at the collector's 15 s scrape
-#: period: on DCGM's 30 s default every second sample repeats the previous one,
-#: so a throttling episode cannot be graded.
-DCGM_EXPORTER_COLLECT_INTERVAL_MS = 15000
+#: The dcgm collector's scrape period in seconds, which the exporter matches.
+DCGM_COLLECTOR_INTERVAL_SECONDS = 15
+
+#: DCGM's ``-c`` argument, in milliseconds: one collector interval.
+DCGM_EXPORTER_COLLECT_INTERVAL_MS = DCGM_COLLECTOR_INTERVAL_SECONDS * 1000
 
 #: What the checked-in DaemonSet carries in place of the period. The renderer
 #: substitutes it, and a render that leaves it behind fails the release.

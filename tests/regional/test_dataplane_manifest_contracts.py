@@ -35,6 +35,7 @@ proves nothing looks exactly like a fixed manifest:
 
 from __future__ import annotations
 
+import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -42,7 +43,9 @@ from typing import Any, Iterator
 
 import yaml
 
+from gpu_fault import collectors_cli
 from gpu_fault import dcgm_exporter_cadence as CADENCE
+from gpu_fault.collectors.gpu.dcgm import DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
@@ -298,6 +301,70 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
     assert "DCGM_EXPORTER_COLLECT_INTERVAL_MS >= 1000" in installer, (
         "below 1000 ms the derived GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS "
         "truncates to 0 and the collector refuses to start"
+    )
+
+
+def test_the_exporter_period_is_pinned_to_the_collector_scrape_period() -> None:
+    """The cadence constant is tied to the period the collector actually uses.
+
+    Every other check in this file derives its expectation from
+    ``CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS``, so a constant set to 30000
+    would pass them all and quietly re-open owner decision 3: the collector
+    scrapes every 15 s, the exporter refreshes every 30 s, and half of every
+    throttling episode is invisible again. The constant exists for the
+    duty-cycle carry-over -- the exporter's refresh must stay at or below
+    ``DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS`` x the collector's scrape period --
+    so it is pinned here to the two places that period comes from: the
+    installer's ``METRICS_INTERVAL`` default and the dcgm collector's
+    ``GPU_FAULT_METRICS_INTERVAL_SECONDS`` default. Both are read from their
+    sources, not typed a third time.
+    """
+
+    installer = INSTALLER.read_text(encoding="utf-8")
+    installer_default = re.search(r'(?m)^METRICS_INTERVAL="(\d+)"$', installer)
+    assert installer_default is not None, (
+        "the installer no longer defaults METRICS_INTERVAL as a plain literal, "
+        "so the collector's scrape period cannot be read from it"
+    )
+    cli_default = re.search(
+        r'GPU_FAULT_DCGM_METRICS_URL.*?GPU_FAULT_METRICS_INTERVAL_SECONDS", "(\d+)"',
+        inspect.getsource(collectors_cli),
+        re.S,
+    )
+    assert cli_default is not None, (
+        "the dcgm collector CLI no longer defaults GPU_FAULT_METRICS_INTERVAL_SECONDS "
+        "next to its metrics URL, so its scrape period cannot be read from it"
+    )
+    collector_seconds = int(installer_default.group(1))
+    assert int(cli_default.group(1)) == collector_seconds, (
+        "the installer and the collector CLI default the dcgm scrape period "
+        f"differently ({collector_seconds} s vs {cli_default.group(1)} s), so "
+        "the exporter cadence has two periods to match"
+    )
+    assert CADENCE.DCGM_COLLECTOR_INTERVAL_SECONDS == collector_seconds, (
+        "the cadence module's collector period drifted from the collector's "
+        f"own default ({collector_seconds} s): the exporter constant is now "
+        "derived from a period nothing scrapes at"
+    )
+    assert CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS == collector_seconds * 1000, (
+        "the exporter collects on a period other than the collector's scrape "
+        "period, so a throttling episode shorter than the exporter's refresh "
+        "repeats stale samples and cannot be graded (owner decision 3)"
+    )
+    assert CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS <= (
+        DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS * collector_seconds * 1000
+    ), (
+        "the exporter refreshes more slowly than the duty-cycle carry-over "
+        f"window ({DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS} x {collector_seconds} s)"
+        " covers, so a sustained throttle stops confirming between refreshes"
+    )
+    # The literal is the reviewed production value (2026-09-08 data-plane
+    # review, owner decision 3). Changing it means re-reviewing the duty-cycle
+    # carry-over window in collectors/gpu/dcgm.py, not just editing a constant.
+    assert CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS == 15000, (
+        "the exporter collect period left its reviewed 15000 ms; re-review the "
+        "duty-cycle carry-over window before shipping "
+        f"{CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS} ms"
     )
 
 
@@ -729,15 +796,16 @@ def _copy_source(tmp_path: Path, relative: str) -> Path:
 def test_an_unrelated_reconciler_edit_leaves_the_dcgm_component_digest_alone(
     tmp_path: Path,
 ) -> None:
-    """Only the instance inventory may roll the exporter DaemonSet.
+    """Only the exporter's own inputs may re-apply the exporter DaemonSet.
 
     ``component_inputs.dcgm`` used to list the whole node installer reconciler
     module because the affinity list is rendered from a table inside it. Every
     reconciler fix that never touched the table therefore changed
-    ``dcgm_digest``, and the release re-applied the exporter DaemonSet on every
-    GPU cluster: a rolling restart (``maxUnavailable: 1``) of every exporter
-    Pod, each node losing its samples in turn, for a change the exporter could
-    not observe.
+    ``dcgm_digest``: a ``dcgm`` entry in every plan and a re-apply plus
+    ``rollout status`` wait on every GPU cluster, for a change the exporter
+    could not observe. (An unchanged template does not bump the DaemonSet
+    generation, so no Pod restarted -- the cost was a spurious plan entry and
+    a wait, not lost samples.)
     """
 
     patterns = _dcgm_component_patterns()
@@ -752,8 +820,8 @@ def test_an_unrelated_reconciler_edit_leaves_the_dcgm_component_digest_alone(
 
     assert after == before, (
         "the dcgm component digest changed on a reconciler edit outside the "
-        "instance inventory, so every reconciler fix rolls every exporter Pod "
-        "on every GPU cluster"
+        "instance inventory, so every reconciler fix shows a dcgm change in "
+        "every plan and re-applies the exporter DaemonSet on every GPU cluster"
     )
 
 
