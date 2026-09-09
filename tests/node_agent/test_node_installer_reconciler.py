@@ -279,6 +279,7 @@ def template():
         "EXPECTED_GPU_COUNT",
         "EXPECTED_EFA_DEVICE_COUNT",
         "DCGM_METRICS_URL_B64",
+        "DCGM_EXPORTER_INTERVAL_MS",
     ]
     return {
         "apiVersion": "batch/v1",
@@ -389,6 +390,11 @@ def test_missing_installation_creates_node_bound_job():
     assert env["EXPECTED_GPU_COUNT"] == "8"
     assert env["EXPECTED_EFA_DEVICE_COUNT"] == "16"
     assert env["TARGET_NODE_IP"] == "10.0.1.25"
+    assert env.get("DCGM_EXPORTER_INTERVAL_MS") == "15000", (
+        "the Job must carry the exporter DaemonSet's collect period, or the "
+        "installer's `existing` mode leaves the collector's duty-cycle check "
+        f"off on every production node: {env.get('DCGM_EXPORTER_INTERVAL_MS')!r}"
+    )
     node_secret = next(
         item
         for item in body["spec"]["template"]["spec"]["volumes"]

@@ -16,7 +16,11 @@ from gpu_fault_release.regional_release_config import (
 )
 
 from gpu_fault.admin.config import AdminConfig
-from gpu_fault.node_installer_reconciler import _INVENTORY as INSTANCE_TYPES
+from gpu_fault.dcgm_exporter_cadence import (
+    DCGM_EXPORTER_COLLECT_INTERVAL_MS,
+    DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
+)
+from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY as INSTANCE_TYPES
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
@@ -28,14 +32,14 @@ SUPPORTED_INSTANCE_TYPES_PLACEHOLDER = "REPLACE_WITH_SUPPORTED_INSTANCE_TYPES"
 def _supported_instance_types() -> str:
     """The exporter's node-affinity list, as a YAML flow sequence.
 
-    Read from the node installer's own inventory rather than copied: the two
-    must never disagree, because a GPU type the installer supports but the
-    exporter does not schedule on can never finish an install (its
-    ``dcgm_ready`` check has nothing to scrape), and the reconciler retries the
-    Job every 300 s forever. Each type is emitted twice, with and without the
-    ``ml.`` prefix, because HyperPod labels its nodes ``ml.<type>`` while a
-    self-managed node pool carries the bare EC2 type; ``_inventory()`` accepts
-    both for the same reason.
+    Read from the same inventory the node installer sizes GPU/EFA counts
+    from rather than copied: the two must never disagree, because a GPU type
+    the installer supports but the exporter does not schedule on can never
+    finish an install (its ``dcgm_ready`` check has nothing to scrape), and the
+    reconciler retries the Job every 300 s forever. Each type is emitted twice,
+    with and without the ``ml.`` prefix, because HyperPod labels its nodes
+    ``ml.<type>`` while a self-managed node pool carries the bare EC2 type;
+    ``gpu_instance_inventory()`` accepts both for the same reason.
     """
 
     names = sorted(INSTANCE_TYPES)
@@ -50,6 +54,11 @@ def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
     ``REPLACE_WITH_SUPPORTED_INSTANCE_TYPES`` where the applied DaemonSet
     carried the real instance types -- the applied artifact was not the planned
     one, which is the whole promise of the plan/apply gate.
+
+    The collect period (``-c``) is rendered from
+    :data:`gpu_fault.dcgm_exporter_cadence.DCGM_EXPORTER_COLLECT_INTERVAL_MS`,
+    the same constant the node installer reconciler hands every install Job so
+    the host collector learns the period of an ``existing`` exporter.
     """
 
     text = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
@@ -65,12 +74,17 @@ def render_dcgm_exporter_manifest(*, namespace: str, image: str) -> str:
             SUPPORTED_INSTANCE_TYPES_PLACEHOLDER,
             _supported_instance_types(),
         )
-    )
-    if SUPPORTED_INSTANCE_TYPES_PLACEHOLDER in text:
-        raise ReleaseError(
-            "DCGM exporter manifest still carries "
-            f"{SUPPORTED_INSTANCE_TYPES_PLACEHOLDER}"
+        .replace(
+            DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
+            str(DCGM_EXPORTER_COLLECT_INTERVAL_MS),
         )
+    )
+    for placeholder in (
+        SUPPORTED_INSTANCE_TYPES_PLACEHOLDER,
+        DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
+    ):
+        if placeholder in text:
+            raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")
     return text
 
 

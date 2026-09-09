@@ -9,8 +9,8 @@ proves nothing looks exactly like a fixed manifest:
   passed trivially, ``dcgm_ready`` failed inside the node installer, the
   install Job failed and the reconciler recreated it every 300 s forever
   (``gpu-metrics-collectors §F4``, ``hma-installer-deploy §F1``). The allowed
-  list is rendered from ``node_installer_reconciler._INVENTORY`` -- the one
-  table the installer already sizes GPU/EFA counts from -- so a new supported
+  list is rendered from ``gpu_instance_inventory.GPU_INSTANCE_INVENTORY`` -- the
+  one table the installer already sizes GPU/EFA counts from -- so a new supported
   type cannot be added to the fleet without the exporter following, and an
   unsupported type still gets no Pod at all.
 * The exporter bound ``0.0.0.0:9400`` under ``hostNetwork`` while every
@@ -36,12 +36,14 @@ proves nothing looks exactly like a fixed manifest:
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Iterator
 
 import yaml
 
-from gpu_fault.node_installer_reconciler import _INVENTORY as RECONCILER_INVENTORY
+from gpu_fault import dcgm_exporter_cadence as CADENCE
+from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
 from scripts.release_identity import file_set_identity
@@ -52,6 +54,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DATAPLANE = ROOT / "deploy" / "dataplane"
 SYSTEMD = ROOT / "deploy" / "systemd"
 INSTALLER = ROOT / "deploy" / "node" / "install-gpu-fault-collector.sh"
+INSTALLER_JOB = ROOT / "deploy" / "node" / "run-hyperpod-installer-job.sh"
 #: Liveness must never fire on a component that is merely idle: the heartbeat
 #: threshold is the review's floor, and the probe period the review's cadence.
 MINIMUM_HEARTBEAT_SECONDS = 300
@@ -161,8 +164,8 @@ def test_dcgm_exporter_daemonset_matches_every_reconciler_instance_type(
     )
     values = set(_instance_type_values(spec))
     assert values, "the rendered DaemonSet has no instance-type node affinity"
-    expected = {f"ml.{name}" for name in RECONCILER_INVENTORY} | set(
-        RECONCILER_INVENTORY
+    expected = {f"ml.{name}" for name in GPU_INSTANCE_INVENTORY} | set(
+        GPU_INSTANCE_INVENTORY
     )
     assert values == expected, (
         "the exporter must schedule on exactly the instance types the node "
@@ -222,8 +225,22 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
         "without -c the exporter keeps DCGM's 30 s default while the collector "
         "scrapes every 15 s, so half of every throttling episode is invisible"
     )
-    assert arguments[arguments.index("-c") + 1] == "15000", (
-        f"the DaemonSet must collect every 15 000 ms, got {arguments}"
+    period = str(CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_MS)
+    assert arguments[arguments.index("-c") + 1] == period, (
+        f"the DaemonSet must collect every {period} ms, got {arguments}"
+    )
+    checked_in = (DATAPLANE / "hyperpod-dcgm-exporter.yaml").read_text(encoding="utf-8")
+    assert CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER in checked_in, (
+        "the checked-in DaemonSet spells the collect interval as a literal, so "
+        "the renderer's constant and the manifest can drift apart"
+    )
+    legacy = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
+    assert (
+        f"s#{CADENCE.DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER}#{period}#" in legacy
+    ), (
+        "the legacy single-cluster deploy applies the DaemonSet through sed and "
+        "must substitute the same period the renderer does, or it ships the "
+        "placeholder as -c and the exporter refuses to start"
     )
     assert "-c ${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS}" in unit, (
         "the systemd launch path must take its collect interval from the "
@@ -281,6 +298,121 @@ def test_dcgm_exporter_collects_every_15_seconds_on_both_launch_paths(
     assert "DCGM_EXPORTER_COLLECT_INTERVAL_MS >= 1000" in installer, (
         "below 1000 ms the derived GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS "
         "truncates to 0 and the collector refuses to start"
+    )
+
+
+def _installer_shell_excerpt(pattern: str, *, flags: int = re.M) -> str:
+    installer = INSTALLER.read_text(encoding="utf-8")
+    match = re.search(pattern, installer, flags)
+    assert match is not None, f"the installer no longer carries {pattern!r}"
+    return match.group(0)
+
+
+def _run_installer_exporter_env_block(tmp_path: Path, *arguments: str) -> Any:
+    """Run the installer's own flag parse, validation and env lines for the period.
+
+    Stitched from the script text rather than re-typed, so a renamed variable
+    or a rewritten condition fails here instead of quietly testing a copy.
+    """
+
+    installer = INSTALLER.read_text(encoding="utf-8")
+    parse_arm = _installer_shell_excerpt(r"^\s*--dcgm-exporter-interval-ms\).*$")
+    validation = _installer_shell_excerpt(
+        r'^\{ \[\[ "\$\{DCGM_EXPORTER_COLLECT_INTERVAL_MS\}".*?\n\s*die "[^"]*"\n',
+        flags=re.M | re.S,
+    )
+    env_block = _installer_shell_excerpt(
+        r'^    if \[\[ "\$\{DCGM_EXPORTER_MODE\}" == "docker".*?^    fi\n',
+        flags=re.M | re.S,
+    )
+    defaults = "".join(
+        line + "\n"
+        for line in re.findall(r"^DCGM_EXPORTER_[A-Z_]*=.*$", installer, re.M)
+        if "DCGM_EXPORTER_IMAGE" not in line
+    )
+    script = tmp_path / "exporter-period.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        'die() { printf "die: %s\\n" "$1" >&2; exit 1; }\n'
+        'require_value() { [[ $# -ge 2 ]] || die "$1 needs a value"; }\n'
+        'write_env() { printf \'%s=%s\\n\' "$1" "$2"; }\n'
+        + defaults
+        + 'DCGM_EXPORTER_MODE="$1"; shift\n'
+        + 'while [[ $# -gt 0 ]]; do\n    case "$1" in\n'
+        + parse_arm
+        + '\n        *) die "unexpected $1" ;;\n    esac\ndone\n'
+        + validation
+        + env_block,
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        ["bash", str(script), *arguments], capture_output=True, text=True, check=False
+    )
+
+
+def test_an_existing_exporter_reports_its_period_only_when_told(tmp_path: Path) -> None:
+    """``--dcgm-exporter existing`` writes the collector's seconds iff the Job says so.
+
+    Production installs with ``--dcgm-exporter existing`` against our own
+    DaemonSet, and that mode wrote nothing: the collector's 8x duty-cycle
+    invariant check never ran on a single production node. The period is not
+    the installer's to guess -- a customer exporter really is unknown -- so it
+    is written only when the reconciler passes the DaemonSet's value, and
+    validated like the docker-mode environment variable.
+    """
+
+    told = _run_installer_exporter_env_block(
+        tmp_path, "existing", "--dcgm-exporter-interval-ms", "15000"
+    )
+    assert told.returncode == 0, told.stderr
+    assert "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS=15\n" in told.stdout, (
+        "an existing exporter whose period the Job passed must hand the "
+        f"collector its seconds: {told.stdout!r}"
+    )
+    untold = _run_installer_exporter_env_block(tmp_path, "existing")
+    assert untold.returncode == 0, untold.stderr
+    assert "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS" not in untold.stdout, (
+        "an existing exporter of unknown period must leave the seconds unset, "
+        f"or the collector checks against a guess: {untold.stdout!r}"
+    )
+    disabled = _run_installer_exporter_env_block(
+        tmp_path, "disabled", "--dcgm-exporter-interval-ms", "15000"
+    )
+    assert "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS" not in disabled.stdout, (
+        f"there is no exporter to have a period in disabled mode: {disabled.stdout!r}"
+    )
+    for bad in ("015000", "500", "15s"):
+        rejected = _run_installer_exporter_env_block(
+            tmp_path, "existing", "--dcgm-exporter-interval-ms", bad
+        )
+        assert rejected.returncode != 0 and "die:" in rejected.stderr, (
+            f"--dcgm-exporter-interval-ms {bad} must be refused like the "
+            f"docker-mode variable: {rejected.stdout!r} {rejected.stderr!r}"
+        )
+
+
+def test_the_installer_job_forwards_the_exporter_period_to_the_node() -> None:
+    """The reconciler's value has to survive the Job template and the chroot."""
+
+    job = INSTALLER_JOB.read_text(encoding="utf-8")
+    assert "- name: DCGM_EXPORTER_INTERVAL_MS" in job, (
+        "the installer Job template carries no DCGM_EXPORTER_INTERVAL_MS env "
+        "entry, so the reconciler has nothing to fill and the node never learns "
+        "the exporter's period"
+    )
+    assert 'DCGM_EXPORTER_INTERVAL_MS="\\${DCGM_EXPORTER_INTERVAL_MS}"' in job, (
+        "the Job env is not forwarded through `chroot /host /usr/bin/env` into "
+        "the installer shell"
+    )
+    assert "--dcgm-exporter-interval-ms" in job, (
+        "the installer shell never passes --dcgm-exporter-interval-ms"
+    )
+    assert 'if [[ -n "\\${DCGM_EXPORTER_INTERVAL_MS}" ]]' in job, (
+        "an empty period must not reach the installer as an empty argument"
+    )
+    installer = INSTALLER.read_text(encoding="utf-8")
+    assert "--dcgm-exporter-interval-ms MS" in installer, (
+        "the installer's usage text does not document --dcgm-exporter-interval-ms"
     )
 
 
@@ -579,25 +711,68 @@ def _dcgm_component_patterns() -> tuple[str, ...]:
     return tuple(identity["component_inputs"]["dcgm"])
 
 
+def _copy_component_inputs(tmp_path: Path, patterns: tuple[str, ...]) -> None:
+    for pattern in patterns:
+        for source in sorted(ROOT.glob(pattern)):
+            destination = tmp_path / source.relative_to(ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+
+
+def _copy_source(tmp_path: Path, relative: str) -> Path:
+    destination = tmp_path / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes((ROOT / relative).read_bytes())
+    return destination
+
+
+def test_an_unrelated_reconciler_edit_leaves_the_dcgm_component_digest_alone(
+    tmp_path: Path,
+) -> None:
+    """Only the instance inventory may roll the exporter DaemonSet.
+
+    ``component_inputs.dcgm`` used to list the whole node installer reconciler
+    module because the affinity list is rendered from a table inside it. Every
+    reconciler fix that never touched the table therefore changed
+    ``dcgm_digest``, and the release re-applied the exporter DaemonSet on every
+    GPU cluster: a rolling restart (``maxUnavailable: 1``) of every exporter
+    Pod, each node losing its samples in turn, for a change the exporter could
+    not observe.
+    """
+
+    patterns = _dcgm_component_patterns()
+    _copy_component_inputs(tmp_path, patterns)
+    reconciler = _copy_source(tmp_path, "src/gpu_fault/node_installer_reconciler.py")
+    before = file_set_identity(tmp_path, patterns)["sha256"]
+    source = reconciler.read_text(encoding="utf-8")
+    reconciler.write_text(
+        source + "\n# a reconciler fix the exporter cannot observe\n", encoding="utf-8"
+    )
+    after = file_set_identity(tmp_path, patterns)["sha256"]
+
+    assert after == before, (
+        "the dcgm component digest changed on a reconciler edit outside the "
+        "instance inventory, so every reconciler fix rolls every exporter Pod "
+        "on every GPU cluster"
+    )
+
+
 def test_a_new_instance_type_changes_the_dcgm_component_digest(tmp_path: Path) -> None:
     """Adding a supported GPU type has to redeploy the exporter DaemonSet.
 
     The regional release re-applies the DaemonSet only when the ``dcgm``
     component digest changed, and that digest is the content of the files
     ``component_inputs.dcgm`` matches. The affinity list is rendered from
-    ``node_installer_reconciler._INVENTORY``, so while that module was not an
-    input, a release that added a GPU type shipped an installer for it and left
-    the exporter pinned to the old list -- the very outage the rendered affinity
-    exists to prevent (``§F4`` / ``§F1``), reintroduced one release later.
+    ``gpu_instance_inventory.GPU_INSTANCE_INVENTORY``, so while that table's
+    module was not an input, a release that added a GPU type shipped an
+    installer for it and left the exporter pinned to the old list -- the very
+    outage the rendered affinity exists to prevent (``§F4`` / ``§F1``),
+    reintroduced one release later.
     """
 
     patterns = _dcgm_component_patterns()
-    for pattern in patterns:
-        for source in sorted(ROOT.glob(pattern)):
-            destination = tmp_path / source.relative_to(ROOT)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source.read_bytes())
-    inventory = tmp_path / "src/gpu_fault/node_installer_reconciler.py"
+    _copy_component_inputs(tmp_path, patterns)
+    inventory = tmp_path / "src/gpu_fault/gpu_instance_inventory.py"
 
     assert inventory.is_file(), (
         "no dcgm release input matches the instance-type inventory the "
@@ -608,7 +783,7 @@ def test_a_new_instance_type_changes_the_dcgm_component_digest(tmp_path: Path) -
     # reformat of the inventory into a failure of this test rather than of the
     # thing it guards.
     source = inventory.read_text(encoding="utf-8")
-    known = sorted(RECONCILER_INVENTORY)[-1]
+    known = sorted(GPU_INSTANCE_INVENTORY)[-1]
     entry = next(
         (line for line in source.splitlines(keepends=True) if f'"{known}": (' in line),
         None,

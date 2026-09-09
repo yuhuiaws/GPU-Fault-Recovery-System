@@ -2668,7 +2668,7 @@ configure_dcgm_exporter() {
     # failing with nothing to explain it.
     sed \
         -e "s#${DEFAULT_DCGM_EXPORTER_IMAGE}#${DCGM_EXPORTER_IMAGE}#g" \
-        -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" \
+        -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" -e "s#REPLACE_WITH_DCGM_EXPORTER_COLLECT_INTERVAL_MS#15000#g" \
         "${REPO_DIR}/deploy/dataplane/hyperpod-dcgm-exporter.yaml" |
         kubectl apply -f -
     kubectl -n "${NAMESPACE}" patch daemonset \

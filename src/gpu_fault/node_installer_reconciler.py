@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.dcgm_exporter_cadence import DCGM_EXPORTER_COLLECT_INTERVAL_MS
+from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.logging_setup import configure_logging
 
 LOGGER = logging.getLogger(__name__)
@@ -94,15 +96,6 @@ POD_NEVER_STARTED_REASONS = frozenset(
 # Image pulls and container creation are not instant, and a verdict that fires
 # on a transient reason would delete a Job that was about to start.
 POD_NEVER_STARTED_GRACE_SECONDS = 120
-
-_INVENTORY = {
-    "p5.4xlarge": (1, 1),
-    "p5.48xlarge": (8, 32),
-    "p5e.48xlarge": (8, 32),
-    "p5en.48xlarge": (8, 16),
-    "p6-b200.48xlarge": (8, 8),
-    "p6-b300.48xlarge": (8, 16),
-}
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -274,16 +267,6 @@ def _internal_ip(node: Any) -> str:
         if _value(address, "type") == "InternalIP":
             return str(_value(address, "address"))
     raise ValueError("node has no InternalIP")
-
-
-def _inventory(instance_type: str) -> tuple[int, int]:
-    normalized = instance_type.removeprefix("ml.")
-    try:
-        return _INVENTORY[normalized]
-    except KeyError as error:
-        raise ValueError(
-            f"unsupported GPU instance type: {instance_type or 'UNKNOWN'}"
-        ) from error
 
 
 class NodeInstallerReconciler:
@@ -792,7 +775,7 @@ class NodeInstallerReconciler:
         node_uid = str(_value(metadata, "uid"))
         labels = dict(_value(metadata, "labels", {}) or {})
         instance_type = labels.get("node.kubernetes.io/instance-type", "")
-        expected_gpus, expected_efa = _inventory(instance_type)
+        expected_gpus, expected_efa = gpu_instance_inventory(instance_type)
         node_ip = _internal_ip(node)
         metrics_url = self.dcgm_metrics_url_template.replace(
             "{node_name}", node_name
@@ -850,6 +833,11 @@ class NodeInstallerReconciler:
             "EXPECTED_GPU_COUNT": str(expected_gpus),
             "EXPECTED_EFA_DEVICE_COUNT": str(expected_efa),
             "DCGM_METRICS_URL_B64": base64.b64encode(metrics_url.encode()).decode(),
+            # The exporter on this node is our DaemonSet, whose period the
+            # installer cannot see from the host: without it `--dcgm-exporter
+            # existing` leaves the collector's exporter-interval seconds unset
+            # and its duty-cycle check never runs in production.
+            "DCGM_EXPORTER_INTERVAL_MS": str(DCGM_EXPORTER_COLLECT_INTERVAL_MS),
         }
         for env in container.get("env", []):
             name = env.get("name")

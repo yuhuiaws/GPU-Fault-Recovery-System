@@ -19,10 +19,11 @@ DRIVER_BRANCH=""
 CUDA_VERSION=""
 METRICS_MODE="auto"
 METRICS_INTERVAL="15"
-# The dedicated exporter's own collect period, in MILLISECONDS (DCGM's ``-c``).
-# Kept at the collector's scrape period: on DCGM's 30 s default every second
-# sample repeats the previous one, so a throttling episode cannot be graded.
+# The exporter's collect period in MILLISECONDS (DCGM's ``-c``), kept at the
+# collector's scrape period so no sample repeats the previous one. Known in
+# docker mode, or when --dcgm-exporter-interval-ms passes the DaemonSet's value.
 DCGM_EXPORTER_COLLECT_INTERVAL_MS="${GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS:-15000}"
+DCGM_EXPORTER_INTERVAL_TOLD="false"
 GPU_INVENTORY_INTERVAL_SECONDS="${GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS:-60}"
 DCGM_EDGE_FILTER_ENABLED="${GPU_FAULT_DCGM_EDGE_FILTER_ENABLED:-true}"
 DCGM_HEALTH_SUMMARY_SECONDS="${GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS:-300}"
@@ -184,6 +185,7 @@ usage() {
         "  --dcgm-exporter existing|docker|disabled" \
         "  --dcgm-metrics-url URL          Default: http://127.0.0.1:9400/metrics" \
         "  --dcgm-exporter-image IMAGE     Required with --dcgm-exporter docker" \
+        "  --dcgm-exporter-interval-ms MS  Period of an existing exporter, for the collector's checks" \
         "  --wheel PATH                    Default: newest wheel under dist/" \
         "  --wheel-sha256 HEX              Required expected wheel SHA-256 (from the release, not the bundle)" \
         "  --wheelhouse DIR                Install dependencies without an index" \
@@ -535,6 +537,7 @@ while [[ $# -gt 0 ]]; do
         --dcgm-exporter) require_value "$@"; DCGM_EXPORTER_MODE="$2"; shift 2 ;;
         --dcgm-metrics-url) require_value "$@"; DCGM_METRICS_URL="$2"; shift 2 ;;
         --dcgm-exporter-image) require_value "$@"; DCGM_EXPORTER_IMAGE="$2"; shift 2 ;;
+        --dcgm-exporter-interval-ms) require_value "$@"; DCGM_EXPORTER_COLLECT_INTERVAL_MS="$2"; DCGM_EXPORTER_INTERVAL_TOLD="true"; shift 2 ;;
         --wheel) require_value "$@"; WHEEL="$2"; shift 2 ;;
         --wheel-sha256) require_value "$@"; EXPECTED_WHEEL_SHA256="$2"; shift 2 ;;
         --wheelhouse) require_value "$@"; WHEELHOUSE="$2"; shift 2 ;;
@@ -649,12 +652,11 @@ fi
 [[ "${GPU_INVENTORY_INTERVAL_SECONDS}" =~ ^[1-9][0-9]*$ ]] ||
     die "GPU inventory interval must be a positive integer"
 [[ "${METRICS_INTERVAL}" != "0" ]] || die "--metrics-interval must be positive"
-# Whole milliseconds, and at least a second: the collector's own window is
-# derived by integer division, so 500 would hand it 0 seconds and it would
-# refuse to start after the exporter had already been installed.
+# Whole milliseconds, at least a second: the collector's window is derived by
+# integer division, so 500 would hand it 0 seconds and it would refuse to start.
 { [[ "${DCGM_EXPORTER_COLLECT_INTERVAL_MS}" =~ ^[1-9][0-9]*$ ]] &&
     ((DCGM_EXPORTER_COLLECT_INTERVAL_MS >= 1000)); } ||
-    die "GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS must be whole milliseconds >= 1000"
+    die "--dcgm-exporter-interval-ms / GPU_FAULT_DCGM_EXPORTER_COLLECT_INTERVAL_MS must be whole milliseconds >= 1000"
 [[ "${DCGM_EDGE_FILTER_ENABLED}" =~ ^(true|false)$ ]] ||
     die "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED must be true or false"
 for dcgm_filter_count in \
@@ -1030,11 +1032,10 @@ command -v "${PYTHON_COMMAND}" >/dev/null ||
     die "Python 3.12 or newer is required"
 command -v systemctl >/dev/null || die "systemd is required"
 record_unit_state
-# 升级期间重启 Agent 之前必须排空在途动作。
-# `lifespan` shuts the action pool down without waiting, so a stop or restart
-# in the middle of a handler lets systemd SIGKILL the cgroup -- the running
-# `nvidia-smi --gpu-reset` or driver install dies with it and the ledger row is
-# left INTERRUPTED, which then needs manual confirmation.
+# 升级期间重启 Agent 之前必须排空在途动作。`lifespan` shuts the action pool
+# down without waiting, so a stop or restart mid-handler lets systemd SIGKILL the
+# cgroup: the running `nvidia-smi --gpu-reset` or driver install dies with it and
+# the ledger row is left INTERRUPTED, which then needs manual confirmation.
 NODE_ACTION_DB="/var/lib/gpu-fault/node-actions.db"
 # Keep in step with TimeoutStopSec= in the node-agent unit (deploy/systemd/):
 # the installer must not give up on an in-flight command earlier than systemd
@@ -1270,9 +1271,8 @@ dcgm_ready() {
 # "collector wheel not found"。指针存在时用指针并核对 wheel_sha256，
 # 避免在多份 release 里按 mtime 猜。
 #
-# 期望的 wheel 摘要必须来自安装包之外（--wheel-sha256，由 Job 从控制面
-# 钉住的 release 渲染）。安装包内的 current-release.json 只做一致性
-# 交叉核对，不能替代外部摘要，也没有"为空即放行"的旁路。
+# 期望的 wheel 摘要必须来自安装包之外（--wheel-sha256，由 Job 从控制面钉住的
+# release 渲染）。安装包内的 current-release.json 只做交叉核对，不能替代外部摘要，也没有"为空即放行"的旁路。
 MANIFEST_WHEEL_SHA256=""
 RELEASE_MANIFEST="${REPO_DIR}/dist/current-release.json"
 if [[ -z "${WHEEL}" ]]; then
@@ -1527,11 +1527,11 @@ install -m 0600 /dev/null /etc/gpu-fault/collector.env
     write_env GPU_FAULT_DRIVER_BRANCH "${DRIVER_BRANCH}"
     write_env GPU_FAULT_CUDA_VERSION "${CUDA_VERSION}"
     write_env GPU_FAULT_METRICS_INTERVAL_SECONDS "${METRICS_INTERVAL}"
-    if [[ "${DCGM_EXPORTER_MODE}" == "docker" ]]; then
-        # Only this mode knows the exporter's period, so only it can state the
-        # seconds the collector checks its stale carry-over window against.
-        # With an 'existing' exporter the period belongs to somebody else and
-        # stays unset, which the collector reads as unknown rather than wrong.
+    if [[ "${DCGM_EXPORTER_MODE}" == "docker" || ( "${DCGM_EXPORTER_MODE}" == "existing" &&
+        "${DCGM_EXPORTER_INTERVAL_TOLD}" == "true" ) ]]; then
+        # The seconds the collector checks its carry-over window against: known
+        # in docker mode, and for an existing exporter only when the install Job
+        # passed our DaemonSet's period. A customer exporter stays unset (unknown).
         write_env GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS \
             "$((DCGM_EXPORTER_COLLECT_INTERVAL_MS / 1000))"
     fi

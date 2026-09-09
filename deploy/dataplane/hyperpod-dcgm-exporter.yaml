@@ -30,8 +30,8 @@ spec:
       # regional_release_rendering.render_dcgm_exporter_manifest -- the one
       # renderer behind both the plan payload and the apply, so the DaemonSet an
       # approver reads is the one that lands -- from
-      # node_installer_reconciler._INVENTORY, the same table the installer sizes
-      # GPU/EFA counts from, with and without the `ml.` prefix, because HyperPod
+      # gpu_instance_inventory.GPU_INSTANCE_INVENTORY, the same table the
+      # installer sizes GPU/EFA counts from, with and without the `ml.` prefix, because HyperPod
       # labels nodes `ml.<type>` and self-managed EKS does not. It stays
       # fail-closed twice over: an unsupported instance type still gets no
       # exporter Pod at all, and a render that leaves the placeholder behind
@@ -54,12 +54,16 @@ spec:
           # namespace, and the only consumer is the node's collector, which
           # dials loopback. Binding 0.0.0.0 published GPU UUIDs and hostnames
           # to the VPC unauthenticated.
-          # -c 15000: DCGM's default collection interval is 30 s while the
-          # collector scrapes every 15 s, so half of every throttling episode
-          # was a repeat of the previous sample and could not be graded. Kept
-          # in step with -c 15000 in
+          # -c: DCGM's default collection interval is 30 s while the collector
+          # scrapes every 15 s, so half of every throttling episode was a
+          # repeat of the previous sample and could not be graded. The period
+          # is rendered from
+          # gpu_fault.dcgm_exporter_cadence.DCGM_EXPORTER_COLLECT_INTERVAL_MS,
+          # the one constant behind this DaemonSet, the install Job's
+          # --dcgm-exporter-interval-ms (how the host collector learns the
+          # period of an `existing` exporter) and the docker-mode default in
           # deploy/systemd/gpu-fault-dcgm-exporter.service.
-          args: ["-a", "127.0.0.1:9400", "-c", "15000"]
+          args: ["-a", "127.0.0.1:9400", "-c", "REPLACE_WITH_DCGM_EXPORTER_COLLECT_INTERVAL_MS"]
           env:
             - name: DCGM_REMOTE_HOSTENGINE_INFO
               value: "127.0.0.1:5555"

@@ -70,6 +70,12 @@ FIRMWARE_VERIFY_COMMAND="${GPU_FAULT_FIRMWARE_VERIFY_COMMAND:-}"
 FIRMWARE_VERIFY_SHA256="${GPU_FAULT_FIRMWARE_VERIFY_SHA256:-}"
 DCGM_EXPORTER_MODE="${GPU_FAULT_DCGM_EXPORTER_MODE:-existing}"
 DCGM_METRICS_URL="${GPU_FAULT_DCGM_METRICS_URL:-http://127.0.0.1:9400/metrics}"
+# The collect period of the exporter DaemonSet, in milliseconds. Filled per Job
+# by the node installer reconciler from
+# gpu_fault.dcgm_exporter_cadence.DCGM_EXPORTER_COLLECT_INTERVAL_MS; empty here
+# because a shell template cannot read the constant, and an empty value makes
+# the installer leave the collector's period unknown rather than guess it.
+DCGM_EXPORTER_INTERVAL_MS=""
 EXPECTED_GPU_COUNT="${GPU_FAULT_EXPECTED_GPU_COUNT:-}"
 EXPECTED_EFA_DEVICE_COUNT="${GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT:-}"
 INVENTORY_MISMATCH_SAMPLES="${GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES:-2}"
@@ -524,6 +530,8 @@ ${CONTROL_PLANE_ENV}
               value: "${DCGM_EXPORTER_MODE}"
             - name: DCGM_METRICS_URL_B64
               value: "${DCGM_METRICS_URL_B64}"
+            - name: DCGM_EXPORTER_INTERVAL_MS
+              value: "${DCGM_EXPORTER_INTERVAL_MS}"
             - name: EXPECTED_GPU_COUNT
               value: "${EXPECTED_GPU_COUNT}"
             - name: NODE_INSTANCE_TYPE
@@ -641,6 +649,7 @@ ${CONTROL_PLANE_ENV}
                 FIRMWARE_VERIFY_SHA256="\${FIRMWARE_VERIFY_SHA256}" \
                 DCGM_EXPORTER_MODE="\${DCGM_EXPORTER_MODE}" \
                 DCGM_METRICS_URL_B64="\${DCGM_METRICS_URL_B64}" \
+                DCGM_EXPORTER_INTERVAL_MS="\${DCGM_EXPORTER_INTERVAL_MS}" \
                 EXPECTED_GPU_COUNT="\${EXPECTED_GPU_COUNT}" \
                 NODE_INSTANCE_TYPE="\${NODE_INSTANCE_TYPE}" \
                 EXPECTED_EFA_DEVICE_COUNT="\${EXPECTED_EFA_DEVICE_COUNT}" \
@@ -704,6 +713,12 @@ ${CONTROL_PLANE_ENV}
                   dcgm_metrics_url="\$(
                     decode "\${DCGM_METRICS_URL_B64}"
                   )"
+                  exporter_args=()
+                  if [[ -n "\${DCGM_EXPORTER_INTERVAL_MS}" ]]; then
+                    exporter_args=(
+                      --dcgm-exporter-interval-ms "\${DCGM_EXPORTER_INTERVAL_MS}"
+                    )
+                  fi
                   diagnostic_args=()
                   diagnostic_s3_uri="\$(decode "\${DIAGNOSTIC_S3_URI_B64}")"
                   if [[ -n "\${diagnostic_s3_uri}" ]]; then
@@ -814,6 +829,7 @@ ${CONTROL_PLANE_ENV}
                     --metrics-mode "\${metrics_mode}" \
                     --dcgm-exporter "\${DCGM_EXPORTER_MODE}" \
                     --dcgm-metrics-url "\${dcgm_metrics_url}" \
+                    "\${exporter_args[@]}" \
                     "\${interface_args[@]}" \
                     "\${diagnostic_args[@]}" \
                     "\${inventory_args[@]}" \
