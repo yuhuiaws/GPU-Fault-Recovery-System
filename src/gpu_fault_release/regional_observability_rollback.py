@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_manifest_snapshot import (
     apply_snapshot_objects,
     capture_declared_objects,
@@ -36,7 +37,7 @@ from gpu_fault_release.regional_manifest_snapshot import (
 )
 from gpu_fault_release.regional_release_config import ReleaseError
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 ADOT_MANIFEST = ROOT / "deploy/observability/adot-control-plane.yaml"
 ADOT_ROLLOUT_TIMEOUT = "300s"
 

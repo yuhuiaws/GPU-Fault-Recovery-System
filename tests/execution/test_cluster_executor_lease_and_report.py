@@ -23,13 +23,18 @@ The executor itself is always the real one.
 
 from __future__ import annotations
 
+import socket
 from threading import Event
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from gpu_fault.cluster_executor import ClusterActionExecutor, ClusterExecutorError
+from gpu_fault.cluster_executor import (
+    ClusterActionExecutor,
+    ClusterExecutorError,
+    transport_degraded_idle_delay,
+)
 from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.regional import (
@@ -589,3 +594,173 @@ def test_a_reclaimed_command_replays_its_recorded_details_to_the_adapter() -> No
     # The replay is a copy: the claimed command still carries the record the
     # control plane sent, so reporting cannot echo a fabricated execution back.
     assert command.workflow.step_executions == []
+
+
+# --------------------------------------------------------------------------- #
+# Network-degraded back-off
+#
+# An executor whose own connectivity is broken (its node was just rebooted, its
+# CNI sandbox never came back) meets every action with a retryable *transport*
+# failure -- a gaierror, a refused connection -- yet its claim and complete
+# round trips to the control plane keep working, so it re-claims the same
+# WAITING command every poll and out-races a healthy replica for the whole
+# per-step waiting cap. Once this executor has spent several whole cycles doing
+# nothing but failing on transport grounds it backs itself off, so the healthy
+# replica claims the released command instead. Remote-transient WAITINGs (an
+# adapter 5xx, a control-plane 503) are not this executor's fault and must not
+# trigger the back-off.
+# --------------------------------------------------------------------------- #
+def _gaierror() -> socket.gaierror:
+    return socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+
+def test_a_transport_failure_keeps_the_adapters_recorded_details() -> None:
+    """One DNS blip must not erase a reboot in flight.
+
+    The command's ``result_details`` are the adapter's memory between claims
+    (the isolation it observed, the nodes it submitted). Live 2026-09-09
+    (DESTR-014 attempt 9) a gaierror mid-reboot replaced them with the four
+    error keys, and the next poll's isolation re-assertion had nothing to read.
+    """
+
+    recorded = {
+        "observed_isolation": {"node-a": {"kubernetes_node": "node-a"}},
+        "submitted_nodes": ["logical-a"],
+    }
+    client = FakeExecutorClient([remote_command("command-a", result_details=recorded)])
+    executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
+
+    assert executor.run_once() == 1
+
+    reported = client.reported("command-a")
+    assert reported.status is WorkflowStepStatus.WAITING or str(reported.status) in (
+        "WAITING",
+        "RemoteCommandStatus.WAITING",
+    ), reported
+    assert reported.details["retryable_transport_error"] is True, reported.details
+    assert reported.details["observed_isolation"] == recorded["observed_isolation"]
+    assert reported.details["submitted_nodes"] == ["logical-a"], reported.details
+
+
+def test_the_replay_hands_the_adapter_its_record_without_the_error_markers() -> None:
+    """A dead replica's ``executor_id`` is not the operation's state."""
+
+    command = remote_command(
+        "command-a",
+        result_details={
+            "observed_isolation": {"node-a": {}},
+            "retryable_transport_error": True,
+            "reason": "temporary DNS failure",
+            "executor_id": "cluster/dead-pod",
+            "exception_type": "gaierror",
+        },
+    )
+    adapter = RecordingAdapter(status=WorkflowStepStatus.WAITING)
+    executor = build_executor(FakeExecutorClient([command]), [adapter])
+
+    assert executor.run_once() == 1
+
+    seen = adapter.contexts[0].workflow.step_executions[0].details
+    assert seen == {"observed_isolation": {"node-a": {}}}, seen
+
+
+def test_repeated_transport_failures_count_as_network_degraded_cycles() -> None:
+    client = FakeExecutorClient(*[[remote_command(f"command-{i}")] for i in range(3)])
+    executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
+
+    for _ in range(3):
+        assert executor.run_once() == 1
+
+    assert executor.last_cycle_advanced is False
+    assert executor.consecutive_transport_degraded_cycles == 3
+    assert executor.retryable_transport_errors_total == 3
+
+
+def test_a_cycle_that_advances_resets_network_degradation() -> None:
+    client = FakeExecutorClient(
+        [remote_command("command-a")],
+        [remote_command("command-b")],
+        [remote_command("command-c")],
+    )
+    executor = build_executor(
+        client,
+        [
+            RecordingAdapter(
+                operation=WorkflowOperation.VALIDATE_HOST, raises=_gaierror()
+            )
+        ],
+    )
+
+    assert executor.run_once() == 1
+    assert executor.run_once() == 1
+    assert executor.consecutive_transport_degraded_cycles == 2
+
+    # A batch that succeeds proves the connectivity is back.
+    executor.adapters = [RecordingAdapter(operation=WorkflowOperation.VALIDATE_HOST)]
+    assert executor.run_once() == 1
+    assert executor.last_cycle_advanced is True
+    assert executor.consecutive_transport_degraded_cycles == 0
+
+
+def test_a_remote_transient_waiting_is_not_network_degradation() -> None:
+    """A control-plane 503 is every executor's problem, not this one's local
+    connectivity, so it must never back this executor off its claims."""
+
+    client = FakeExecutorClient(
+        [remote_command("command-a")], [remote_command("command-b")]
+    )
+    executor = build_executor(
+        client,
+        [
+            RecordingAdapter(
+                raises=ClusterExecutorError(
+                    "regional control plane rejected request (503): store unavailable",
+                    status_code=503,
+                )
+            )
+        ],
+    )
+
+    assert executor.run_once() == 1
+    assert executor.run_once() == 1
+    assert executor.last_cycle_advanced is False
+    assert executor.consecutive_transport_degraded_cycles == 0
+    assert executor.retryable_transport_errors_total == 0
+
+
+def test_an_empty_claim_clears_network_degradation() -> None:
+    client = FakeExecutorClient([remote_command("command-a")])
+    executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
+
+    assert executor.run_once() == 1
+    assert executor.consecutive_transport_degraded_cycles == 1
+    # No further batches: the claim round trip still worked.
+    assert executor.run_once() == 0
+    assert executor.consecutive_transport_degraded_cycles == 0
+
+
+@pytest.mark.parametrize(
+    ("cycles", "expected"),
+    [(0, 2.0), (1, 2.0), (2, 2.0), (3, 4.0), (4, 8.0), (5, 16.0), (99, 60.0)],
+)
+def test_the_idle_delay_grows_only_past_the_degraded_threshold(
+    cycles: int, expected: float
+) -> None:
+    assert transport_degraded_idle_delay(
+        cycles=cycles, backoff_after=3, poll_seconds=2, cap=60
+    ) == pytest.approx(expected)
+
+
+def test_the_degraded_backoff_after_is_validated() -> None:
+    client = FakeExecutorClient()
+    with pytest.raises(ClusterExecutorError, match="degraded"):
+        build_executor(client, [RecordingAdapter()], transport_degraded_backoff_after=0)
+
+
+def test_metrics_expose_transport_degradation() -> None:
+    client = FakeExecutorClient([remote_command("command-a")])
+    executor = build_executor(client, [RecordingAdapter(raises=_gaierror())])
+    assert executor.run_once() == 1
+    snapshot = executor.metrics_snapshot()
+    assert snapshot["retryable_transport_errors_total"] == 1
+    assert snapshot["consecutive_transport_degraded_cycles"] == 1

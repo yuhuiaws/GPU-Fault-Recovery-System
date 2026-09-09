@@ -27,6 +27,7 @@ from ._executor_cases_1 import (
     test_terminal_quarantine_dag_finishes_without_shared_restart,
 )
 from ._executor_cases_2 import (
+    test_a_dag_step_wait_is_measured_from_the_lifetime_stamp_not_the_sliding_deadline,
     test_a_delegated_operation_waits_on_its_own_clock,
     test_acknowledgement_wait_is_measured_from_its_own_claim,
     test_an_override_below_the_default_cap_is_refused,

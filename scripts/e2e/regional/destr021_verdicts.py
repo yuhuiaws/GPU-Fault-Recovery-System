@@ -22,6 +22,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+
 CASE_ID = "GF-REGIONAL-DESTR-021"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-020"
 CONFIRMATION = "DESTR021_ADVERSARIAL_NODE_METADATA"
@@ -66,7 +68,16 @@ FORBIDDEN_OPERATIONS = frozenset(
 BASELINE_KEYS = ("unschedulable", "taint_keys", "resource_version")
 WRITER_INTERVAL_SECONDS = 0.5
 WRITER_MAX_SECONDS = 900
-WRITER_MIN_PATCHES = 60
+# The race is judged by coverage, not by a count derived from the requested
+# interval: each ``kubectl patch`` from the runner host costs ~1.3 s of exec
+# auth and API round trip on top of the 0.5 s pause, so 60 patches was a
+# 0.5 s-cadence assumption the writer cannot honour (34 patches in 63 s live,
+# 2026-09-08). What the executor's MARK_UNSCHEDULABLE / RESTORE_SCHEDULING
+# writes have to race is a tick landing inside their 5 s+ step windows, so the
+# writer must have landed a patch at least every 3 s and enough of them to
+# span the workflow.
+WRITER_MIN_PATCHES = 10
+WRITER_MAX_ACHIEVED_INTERVAL_SECONDS = 3.0
 WORKFLOW_TIMEOUT_SECONDS = 600
 
 
@@ -163,7 +174,7 @@ def preflight_errors(
         errors.append("target node reports no allocatable EFA devices")
     if bound_efa_functions < 1:
         errors.append("target node has no bound EFA function to unbind")
-    if int(queue.get("depth") or 0):
+    if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
     if remote_commands.get("open_by_cluster"):
         errors.append("remote command queue is not empty")
@@ -410,10 +421,23 @@ def restore_errors(
     return errors
 
 
+def writer_achieved_interval(report: dict[str, Any]) -> float | None:
+    """Seconds between two landed patches, from the writer's own elapsed time."""
+
+    patches = int(report.get("patches") or 0)
+    elapsed = float(report.get("elapsed_seconds") or 0.0)
+    if patches <= 0 or elapsed <= 0:
+        return None
+    return elapsed / patches
+
+
 def writer_errors(
-    report: dict[str, Any], *, min_patches: int = WRITER_MIN_PATCHES
+    report: dict[str, Any],
+    *,
+    min_patches: int = WRITER_MIN_PATCHES,
+    max_achieved_interval: float = WRITER_MAX_ACHIEVED_INTERVAL_SECONDS,
 ) -> list[str]:
-    """The concurrent writer really ran: enough patches, bounded, cleared."""
+    """The concurrent writer really ran: dense enough, bounded, cleared."""
 
     errors: list[str] = []
     patches = int(report.get("patches") or 0)
@@ -421,6 +445,13 @@ def writer_errors(
         errors.append(
             f"the annotation writer issued only {patches} patches (< {min_patches}); "
             "the race was not real"
+        )
+    achieved = writer_achieved_interval(report)
+    if achieved is not None and achieved > max_achieved_interval:
+        errors.append(
+            f"the annotation writer landed a patch every {achieved:.2f} s "
+            f"(> {max_achieved_interval} s); the executor's node writes could "
+            "pass between ticks"
         )
     if report.get("stopped") is not True:
         errors.append("the annotation writer did not stop")

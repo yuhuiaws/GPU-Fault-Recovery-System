@@ -33,6 +33,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 SPARE_LABEL = "gpu-fault.io/spare"
 SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
 SPARE_POOL_STATE_ANNOTATION = "gpu-fault.io/spare-pool-state"
+SPARE_RESERVED_AT_ANNOTATION = "gpu-fault.io/spare-reserved-at"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
 INSTANCE_TYPE_LABELS = (
@@ -43,6 +44,16 @@ OWNERSHIP_ANNOTATIONS = (
     "gpu-fault.io/incident-id",
     "gpu-fault.io/fencing-token",
     "gpu-fault.io/previous-unschedulable",
+)
+# Every spare-pool annotation a snapshot reports. ``spare-reserved-at`` was
+# missing until 2026-09-08: DESTR-022 wrote a back-dated reservation and read
+# its own snapshot back without the key, failing "was not written" on a value
+# that was on the node.
+SNAPSHOT_ANNOTATIONS = (
+    SPARE_RESERVATION_ANNOTATION,
+    SPARE_RESERVED_AT_ANNOTATION,
+    SPARE_POOL_STATE_ANNOTATION,
+    *OWNERSHIP_ANNOTATIONS,
 )
 QUARANTINE_TAINT = "gpu-fault.io/quarantined"
 PROVIDER_REPLACE_EVENTS = {
@@ -487,14 +498,7 @@ class WarmSpareLiveFixture:
                     *INSTANCE_TYPE_LABELS,
                 )
             },
-            "annotations": {
-                key: annotations.get(key)
-                for key in (
-                    SPARE_RESERVATION_ANNOTATION,
-                    SPARE_POOL_STATE_ANNOTATION,
-                    *OWNERSHIP_ANNOTATIONS,
-                )
-            },
+            "annotations": {key: annotations.get(key) for key in SNAPSHOT_ANNOTATIONS},
         }
 
     def spare_nodes(self) -> list[str]:

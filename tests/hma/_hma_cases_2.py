@@ -440,6 +440,8 @@ def test_delayed_cross_source_event_merges_within_five_minutes() -> None:
 
 
 def test_cross_source_pci_mismatch_does_not_merge() -> None:
+    # The events name an ACTIVE workload: RESTART_APP on an IDLE node is
+    # MONITOR_ONLY and writes no active marker to correlate against.
     context = build_context()
 
     async def scenario() -> None:
@@ -460,7 +462,8 @@ def test_cross_source_pci_mismatch_does_not_merge() -> None:
                     "driver_branch": 575,
                     "cuda_version": "12.9",
                     "runtime_profile_version": "simulated-v1",
-                    "workload_state": "IDLE",
+                    "workload_state": "ACTIVE",
+                    "affected_workload_ids": ["ml/pytorchjob/train-1"],
                 },
             )
             second = await client.post(
@@ -478,7 +481,8 @@ def test_cross_source_pci_mismatch_does_not_merge() -> None:
                     "driver_branch": 575,
                     "cuda_version": "12.9",
                     "runtime_profile_version": "simulated-v1",
-                    "workload_state": "IDLE",
+                    "workload_state": "ACTIVE",
+                    "affected_workload_ids": ["ml/pytorchjob/train-1"],
                 },
             )
         assert first.json()["incident_id"] != second.json()["incident_id"]
@@ -488,6 +492,8 @@ def test_cross_source_pci_mismatch_does_not_merge() -> None:
 
 
 def test_same_kernel_source_prefers_monotonic_time() -> None:
+    # The events name an ACTIVE workload: RESTART_APP on an IDLE node is
+    # MONITOR_ONLY and writes no active marker to correlate against.
     context = build_context()
 
     async def scenario() -> None:
@@ -508,7 +514,8 @@ def test_same_kernel_source_prefers_monotonic_time() -> None:
                     "driver_branch": 575,
                     "cuda_version": "12.9",
                     "runtime_profile_version": "simulated-v1",
-                    "workload_state": "IDLE",
+                    "workload_state": "ACTIVE",
+                    "affected_workload_ids": ["ml/pytorchjob/train-1"],
                 },
             )
             second = await client.post(
@@ -527,7 +534,8 @@ def test_same_kernel_source_prefers_monotonic_time() -> None:
                     "driver_branch": 575,
                     "cuda_version": "12.9",
                     "runtime_profile_version": "simulated-v1",
-                    "workload_state": "IDLE",
+                    "workload_state": "ACTIVE",
+                    "affected_workload_ids": ["ml/pytorchjob/train-1"],
                 },
             )
             different_boot = await client.post(
@@ -546,7 +554,8 @@ def test_same_kernel_source_prefers_monotonic_time() -> None:
                     "driver_branch": 575,
                     "cuda_version": "12.9",
                     "runtime_profile_version": "simulated-v1",
-                    "workload_state": "IDLE",
+                    "workload_state": "ACTIVE",
+                    "affected_workload_ids": ["ml/pytorchjob/train-1"],
                 },
             )
 

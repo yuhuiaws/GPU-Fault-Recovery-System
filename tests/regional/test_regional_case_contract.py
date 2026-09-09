@@ -117,6 +117,10 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         "GF-REGIONAL-DESTR-014": "GF-REGIONAL-DESTR-008",
         "GF-REGIONAL-HA-003": "GF-REGIONAL-DESTR-008",
         "GF-REGIONAL-E2E-002": "GF-REGIONAL-ISO-001",
+        "GF-REGIONAL-COLLECT-021": "GF-REGIONAL-COLLECT-016",
+        # COLLECT-017 reads COLLECT-016's evidence; COLLECT-021 sits between
+        # them in the order, so the anchor has to be explicit.
+        "GF-REGIONAL-COLLECT-017": "GF-REGIONAL-COLLECT-016",
         "GF-REGIONAL-COLLECT-015": "GF-REGIONAL-COLLECT-017",
     }
     ordered = contract.ordered_case_ids()

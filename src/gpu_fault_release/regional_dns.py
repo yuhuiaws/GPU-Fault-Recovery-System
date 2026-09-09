@@ -5,13 +5,13 @@ import json
 import socket
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError, render_nlb_manifest
 from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 SERVICE_HOSTNAME_JSONPATH = "{.status.loadBalancer.ingress[0].hostname}"
 SERVICE_HOSTNAME_POLL_SECONDS = 5.0
 

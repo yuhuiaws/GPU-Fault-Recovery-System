@@ -3376,11 +3376,11 @@ test_cases:
     会以 executor-internal-error FAILED 收尾并升级到 ESCALATE_SUPPORT。ARCH-INTEGRATION 已把 retryable_adapter_error
     接进 cluster executor 的异常出口（计数 retryable_adapter_errors_total）。本用例是这条对称契约在区域部署上的验收。
   injection: >-
-    （设计，尚未实现驱动）在 GPU EKS 上为目标节点创建一条 ValidatingWebhookConfiguration：rules 仅 nodes 的 UPDATE，
+    在 GPU EKS 上为目标节点创建一条 ValidatingWebhookConfiguration：rules 仅 nodes 的 UPDATE，
     objectSelector 仅 kubernetes.io/hostname=<目标节点>，matchConditions 仅 executor ServiceAccount 的 username，
     failurePolicy=Fail、timeoutSeconds=1、clientConfig 指向不存在的 Service，使该节点上 executor 的 node patch 得到 HTTP 500；
     随后按 COLLECT-017 A 段解绑一个 EFA function 开出 REMEDIATE_EFA_DRIVER 工作流（含 MARK_UNSCHEDULABLE 与 RESTORE_SCHEDULING），
-    60 s 后删除 webhook；由执行器镜像运行的 Job 作为 deadman 在到点时独立删除同名 webhook。不重启节点，不做 reset。
+    首次观察到隔离步骤以可重试标记 WAITING 后再保持 60 s 才删除 webhook（600 s 内未命中则删除并判 FAIL）；由执行器镜像运行的 Job 作为 deadman 在到点时独立删除同名 webhook。不重启节点，不做 reset。
   expected:
   - 命中 500 的节点隔离步骤在 remote command 上为 WAITING，result_details 带可重试标记（retryable_transport_error 或区域回放的 retryable_adapter_error），控制面 step_execution 为 WAITING 而非 FAILED
   - webhook 删除后同一步骤 SUCCEEDED，工作流按 COLLECT-017 A 段七步收尾为 SUCCEEDED，incident RECOVERED，节点最终 Ready 且可调度
@@ -3626,9 +3626,9 @@ test_cases:
     verified:
       case_digest: 236e13dc556a3744a39d5761372a3f72c15d348c196605ef546c141c636c0e8d
       components:
-        control_plane: e83ac83c4f778130ed7c6cdfad5e2a50fdcae944f7cbfe463a28150e44f728c7
-        executor: bdca2144e5d9880d63190fb698523dfa0d65b9e52bb05cb932d5fc755924e7ef
-        node_runtime: bc636274bb8542723ab546d4a3743227099e641dc2bc4c15e62ed4ca1cb70f36
+        control_plane: 52b038819f3ec15226a587a0430c9e8e4d4342325763cdf64c4599a6e28e2ee3
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr003_requires_local_warm_spare_rebinding_and_notification
@@ -3761,9 +3761,9 @@ test_cases:
     verified:
       case_digest: e79a81ac4ccfe9aff6b4e35602346de6991ed126587e1f57e25a6d65035b6c97
       components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+        control_plane: 52b038819f3ec15226a587a0430c9e8e4d4342325763cdf64c4599a6e28e2ee3
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
   related_pytest: tests/regional/test_destr008_shortage_matrix.py::test_notification_semantics_distinguish_no_pool_from_shortage
@@ -3896,7 +3896,13 @@ test_cases:
   - CloudTrail 中 BatchRebootClusterNodes、BatchReplaceClusterNodes、BatchDeleteClusterNodes 均为空；控制面日志无 Kubernetes workload 写操作；控制面 EKS 比对结果为 IDENTICAL
   - 清理后：测试作业已删除且远端命令静默；探针 Pod/ConfigMap 与预热 Pod 无残留；若某分支失败留下隔离，只允许经 validated-restore 工作流解除
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0898992083cbf303933b7cd5839b6d5d9a0816040a85938b4fedf72075ebca9d
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-015
   related_pytest: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
@@ -3935,7 +3941,13 @@ test_cases:
   - 节点回到 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；GPU 容量回到基线；quiesce state 文件与 NVIDIA compute client 无残留，基线 active 的服务全部回到 active
   - 清理后：持有者与 arm 单元已幂等解除、探针 Pod 与 ConfigMap 无残留、远端命令静默；若节点仍隔离，只允许经 validated-restore 工作流解除，任何清理失败直接判 FAIL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4a4d0394c3e7a8440e2dce837442a513c07704e53041719225a88f2205538525
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-016
   related_pytest: tests/regional/test_destr016_preempting_reboot.py::test_destr016_workflow_contract_preempts_the_reset_and_reboots_once
@@ -3977,7 +3989,13 @@ test_cases:
   - 清理后：未点火的 reboot 定时器已取消、设备占用已解除、节点 Ready 且 schedulable、无 gpu-fault taint 与 ownership 注解、GPU 数与基线一致、基线 active 的服务全部回到 active、quiesce state 与 gpu-fault timer 无残留、探针 Pod/ConfigMap 零残留
   - 隔离只允许经 validated-restore 工作流解除（先 support 后继 incident、再原 incident 走 already_restored 空操作路径），任何情况下不得手工删除 taint 或注解
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ae0b1af2ed5074f8abacf757a905c90c0b04225c467cfd6968692e1142bb7938
+      components:
+        control_plane: 3b9a67cf7f07ff00c976a1df35e230ec6b5d35de32b90ebf50ea1f9ceeee04bc
+        executor: 0bf62a4edc3325cfc893fdc536dcb346cbd03ce2705f272decc62b168179b6e7
+        node_runtime: e406a538bc103718405da5e0ab602e17728dbf9690d5c63294893918ed7311d9
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-017
   related_pytest: tests/regional/test_destr017_out_of_band_reboot_fence.py::test_the_fenced_workflow_contract_accepts_the_expected_terminal_record
@@ -4028,7 +4046,13 @@ test_cases:
   - 清理后：持有者单元已解除、隔离只经 validated-restore 工作流解除、环境窗口回到记录的基线、
     探针零残留、control-worker 模板摘要回到开窗前的值（只允许 generation 前进两次写入）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f72375e49f507092bc4a5035200679229855826ba6be87a0eb75ee7141ed5761
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-018
   related_pytest: tests/regional/test_destr018_lifetime_deadline.py::test_the_lifetime_contract_passes_on_the_intended_terminal_state
@@ -4060,7 +4084,13 @@ test_cases:
   - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
   - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 04848fabe2eee7ef2c3ca0d391df46c9fb04bde5b6808a8e0f05f638d66eaa2f
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-019
   related_pytest: tests/regional/test_destr019_node_probe.py::test_the_migration_drill_report_satisfies_the_case_verdict
@@ -4089,7 +4119,13 @@ test_cases:
   - 全部真实 GPU 节点的 unschedulable/taint/gpu-fault 注解与基线逐项相同，别名未成为节点；CloudTrail provider 变更动词集合为空
   - 遗留的 FAILED incident 与 support 记录以 leftover_records 记入证据（无节点需恢复）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f6052b29ed81ea3e4dfb250d15af06009555f0f14e27bf9016d7dbfdad6f236a
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-020
   related_pytest: tests/regional/test_destr020_identity_mismatch_isolation.py::test_the_old_memory_based_isolation_is_a_failure
@@ -4116,7 +4152,13 @@ test_cases:
   - 结束后节点 Ready、可调度、无 gpu-fault.io 注解/taint、无 tick 注解、EFA allocatable 与基线一致、uid/boot_id 不变
   - CloudTrail provider 变更动词集合为空；探针 Pod/ConfigMap 零残留；runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0c1d12930d9843379aed954e6eda93ceebc29d63cccc46f9abf2c6f10b7c779d
+      components:
+        control_plane: ed54a10bc97f281b044f5d2dbaab4ca2624edb30a65305a17f1fcb14829ed80e
+        executor: 151bdadf01cf65ddb7c7bddc873fb14ffdb99c1e129447fc3c4fb31de15d3d1d
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-021
   related_pytest: tests/regional/test_destr021_adversarial_node_metadata.py::test_the_stale_foreign_annotation_is_taken_over_and_cleared
@@ -4142,7 +4184,13 @@ test_cases:
   - 清理后热备节点的三项注解与 cordon 状态逐项等于声明基线，spare 标签与 taint 不变；其他 GPU 节点调度状态与基线相同；CloudTrail provider 变更动词集合为空
   - 预置门禁：executor 必须 GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true 且 breadcrumb 含该计数器，否则拒绝执行（这是部署事实，不是用例缺陷）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3a83007748ea571fdd9497f3ac2d8a33ce6cbaab7f166abc6cd1efbd99764e2f
+      components:
+        control_plane: c061dde1320cc50fe7e5a620ad44bcb298396a9cc4d4fcd1c17af88ad525be25
+        executor: 4439a6a2d010b51e13108dec8e8af5c52ca121d65c62e8f8ad14ed811ef6b78b
+        node_runtime: 773d471a5e6bef6c9ee1c1885433a91faaf1908590166b059caaf16d40b76e31
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
   related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
@@ -6021,27 +6069,24 @@ test_cases:
   title: XID RESTART_APP 从 API 重放换成真 kmsg 注入
   category: regional-collector
   level: live
-  risk: live-isolation
+  risk: live-kernel-log-injection
   problem: >-
     RESTART_APP 这 48 条是占比最大的一类，此前只走过 API 重放， kmsg 采集器的正则、去重与权限从未被这一类驱动。
   injection: 通过真实 /dev/kmsg 注入 RESTART_APP 类 XID，并复核一条最常见的 MMU fault。
   expected:
   - kmsg 采集链走通，record_id、evidence_ref 与三元组齐全
   - 两次写入相同文本因kernel sequence不同形成两条不同record_id；相同原始sequence的去重由隔离重放夹具验证
-  - 判定结果与目录一致
-  - 空闲节点上有一道真实安全闸阻止执行段完成
+  - 空闲节点判定 official=RESTART_APP、disposition=MONITOR_ONLY、action=NO_ACTION，reasons 含空闲节点无可重启应用
+  - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault taint、boot_id 不变
   - 本用例只验采集层前半段与判定正确性，不验执行
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: bc5cc1b7ea56c0148c778579eda0e06951c83d7c084b1f2c3c20ea3ed38415e4
-      components:
-        control_plane: cf8ddccb23415e6a419e5c921067e56df1b969b74d8f9a28b2895dbe09018044
-        executor: 684e9ae8349344c75963994f94872b0576a83eb94d71cc050299c12d7a0a351e
-        node_runtime: e00afc9da398971e2cb65f9397510a065c95a16866ebb8d38ecd1033ee56da65
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-012
-  related_pytest: tests/orchestration/test_misc.py::test_restart_app_requires_workload_identity
+  related_pytest: tests/orchestration/test_misc.py::test_restart_app_on_an_idle_node_does_not_open_a_workflow
+  # 55272a0 起空闲节点上的 RESTART_APP 不再 quarantine 而是 MONITOR_ONLY/NO_ACTION，
+  # runner 契约随之从"BLOCKED 安全链 + validated restore"改为"无 workflow、节点零改动"，
+  # 旧 PASS 证据不再覆盖当前代码，按 da62b12 重置 PASS 用例的先例复位为 NOT_RUN，owed 一次真机复验。
 - id: GF-REGIONAL-COLLECT-013
   title: XID RESET_GPU 真 kmsg 注入并真的执行单卡 reset
   category: regional-collector
@@ -6205,6 +6250,30 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
   related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow
+- id: GF-REGIONAL-COLLECT-021
+  title: Pod 先死、RESTART_APP XID 后到——空闲判定 MONITOR_ONLY，被动路径仍重启
+  category: regional-collector
+  level: live
+  risk: live-workload-restart
+  problem: >-
+    RESTART_APP 类 XID 杀掉训练进程后，Pod 终止先于内核行被采集，topology 解析为
+    IDLE。55272a0 之前该竞态会把空闲节点 quarantine（SAFETY_PENDING→BLOCKED），
+    且因 incident 被 QUARANTINED，attempt 自身的失败无法经被动 quick triage 重启。
+  injection: >-
+    提交托管 24-GPU 训练作业（restart_budget=1）并等 RUNNING 与 ACTIVE observation；
+    在任何 XID 之前用宿主 PID 命名空间 SIGKILL 目标 Pod cgroup 内的训练进程（不删 Pod/PyTorchJob），
+    使容器非零退出；待 store 显示该 attempt observation 终止、workload_phase=FAILED 后，
+    立即向 /dev/kmsg 写入迟到的 RESTART_APP 类 XID 13。
+  expected:
+  - 事件 workload_state=IDLE、affected_workload_ids 为空
+  - 判定 official=RESTART_APP、disposition=MONITOR_ONLY、action=NO_ACTION，reasons 含空闲节点无可重启应用
+  - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault.io taint、无 ownership 注解、boot_id 不变、无 remote command
+  - 被动路径经 quick triage 重启该 attempt：旧 Pod UID 全部消失、3 个新 Pod RUNNING、restart_count 由 0→1、新 attempt observation 出现
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-021
+  related_pytest: tests/completion/test_pod_dies_before_xid_ingest.py::test_pod_dies_before_xid_ingest_keeps_node_and_restarts_without_evidence
 - id: GF-REGIONAL-COLLECT-015
   title: SXID ALWAYS_FATAL 经 provider 真机整机重启
   category: regional-collector

@@ -7,7 +7,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[2]
+from gpu_fault_release import repository_root
+
+ROOT = repository_root()
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
 QUICK_VALIDATION_EVIDENCE_FILE = "quick-validation.json"
 QUICK_VALIDATION_MAX_AGE_SECONDS = 600

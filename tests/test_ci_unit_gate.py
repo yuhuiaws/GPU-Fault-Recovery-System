@@ -271,7 +271,14 @@ def test_deployment_only_coverage_scope_matches_distribution_split() -> None:
         for component in APPLICATION_COMPONENT_NAMES
         for module in component_modules(component)
     }
-    deploy_host_only = set(component_modules("deploy_host")) - application_modules
+    # The deploy-host wheel also carries the release engine it imports
+    # (``gpu_fault_release``); those modules are the deployment-only *root*
+    # files below, not application-package files.
+    deploy_host_only = {
+        module
+        for module in set(component_modules("deploy_host")) - application_modules
+        if module == "gpu_fault" or module.startswith("gpu_fault.")
+    }
     expected_package_files = {
         (
             "src/"

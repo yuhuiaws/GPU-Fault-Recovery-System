@@ -10,12 +10,13 @@ from typing import Any
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_rendering import DEFAULT_DCGM_EXPORTER_IMAGE
 from gpu_fault_release.regional_release_rollout_wait import bounded_kubectl_wait
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 ENDPOINT_CHECK_POLL_SECONDS = 5.0
 INSTALLER_JOB_SELECTOR = "gpu-fault.io/node-installer=true"
 TERMINAL_JOB_CONDITIONS = frozenset({"Complete", "Failed"})

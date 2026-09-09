@@ -249,7 +249,18 @@ class NodeHealthPlanBuilder:
             ]
             if finding.official_action == "RUN_FIELD_DIAGNOSTIC_FOR_RMA":
                 operations += [WorkflowOperation.RUN_FIELD_DIAGNOSTIC]
-            operations += [WorkflowOperation.VALIDATE_GPU]
+            # DRAIN findings are RMA-class (row-remap failure, DBE totals,
+            # NVLink error counters): NVIDIA's guidance is drain and replace,
+            # so there is deliberately no RESTORE_SCHEDULING and the node
+            # stays cordoned and tainted. The hand-off has to be explicit:
+            # ESCALATE_SUPPORT drafts the vendor ticket and ends the incident
+            # ESCALATED, the one state an operator may close by hand once
+            # the RMA is done. Without it the workflow ended SUCCEEDED with
+            # the node held forever and nobody told (logic item 8).
+            operations += [
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ]
         elif action is RecoveryAction.QUARANTINE:
             operations += [
                 WorkflowOperation.MARK_UNSCHEDULABLE,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from gpu_fault.policy import ActionDisposition
 from gpu_fault.store.shared.errors import StaleWriteError
 from tests._builders import (
     copy_model,
@@ -613,3 +614,22 @@ def test_passive_recovery_waits_for_proactive_incident(
     resumed = context.executor.execute(plan)
 
     assert resumed.status is PlanStatus.SUCCEEDED
+
+
+def test_restart_app_on_an_idle_node_does_not_open_a_workflow(
+    context: ApplicationContext,
+) -> None:
+    """An idle node has no application to restart: record, do not quarantine.
+
+    Before the policy carried this rule, the compiled STOP/RESTART plan had
+    no workload to act on, the generic fail-closed path made it
+    SAFETY_PENDING, and the node was cordoned and quarantined for an
+    application-level XID.
+    """
+
+    decision, incident, workflow = ingest(context, event(13, event_id="restart-idle"))
+
+    assert decision.disposition is ActionDisposition.MONITOR_ONLY
+    assert decision.action is RecoveryAction.NO_ACTION
+    assert workflow is None
+    assert incident.state is IncidentState.RECOVERED

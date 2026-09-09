@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 from typing import Any
 
@@ -544,6 +546,91 @@ def snapshot(_arguments: argparse.Namespace) -> None:
     )
 
 
+SAFE_POD_UID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def workload_processes(
+    pod_uid: str,
+    *,
+    proc: Path = Path("/proc"),
+    excluded_pids: Iterable[int] = (),
+) -> list[dict[str, Any]]:
+    """Every process whose cgroup names ``pod_uid``, both kubelet spellings.
+
+    kubelet writes the Pod UID into the cgroup path with the dashes either
+    kept (``pod<uid>``) or replaced by underscores
+    (``kubepods-pod<uid>_.slice``), depending on the cgroup driver; a probe
+    that matched only one spelling silently killed nothing on the other. The
+    ``pause`` sandbox container shares the Pod's cgroup but is not the training
+    process and is left alone -- SIGKILLing it would tear the Pod down as a
+    sandbox failure rather than let the trainer exit non-zero.
+    """
+
+    if SAFE_POD_UID.fullmatch(pod_uid) is None:
+        raise ProbeError("unsafe pod UID")
+    spellings = (f"pod{pod_uid}", f"pod{pod_uid.replace('-', '_')}")
+    excluded = {int(item) for item in excluded_pids} | {os.getpid(), 1}
+    matched: list[dict[str, Any]] = []
+    for entry in sorted(
+        (item for item in proc.iterdir() if item.name.isdigit()),
+        key=lambda item: int(item.name),
+    ):
+        pid = int(entry.name)
+        if pid in excluded:
+            continue
+        try:
+            cgroup = entry.joinpath("cgroup").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not any(spelling in cgroup for spelling in spellings):
+            continue
+        try:
+            comm = entry.joinpath("comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            comm = ""
+        if comm == "pause":
+            continue
+        matched.append({"pid": pid, "comm": comm})
+    return matched
+
+
+def kill_workload(
+    arguments: argparse.Namespace,
+    *,
+    proc: Path = Path("/proc"),
+    kill: Callable[[int, int], None] = os.kill,
+) -> None:
+    """SIGKILL the training processes of one Pod so the container exits non-zero.
+
+    The Pod object and PyTorchJob are never touched: deleting the Pod reads as
+    a user stop and suppresses the passive restart, so the drill has to make
+    the container die on its own. Refusing when nothing matched keeps a
+    mistyped UID from reading as a silent success.
+    """
+
+    pod_uid = arguments.pod_uid
+    processes = workload_processes(pod_uid, proc=proc)
+    if not processes:
+        raise ProbeError(f"no process found in the cgroup of pod {pod_uid}")
+    killed: list[dict[str, Any]] = []
+    already_exited: list[dict[str, Any]] = []
+    for process in processes:
+        try:
+            kill(process["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            already_exited.append(process)
+        else:
+            killed.append(process)
+    emit(
+        {
+            "pod_uid": pod_uid,
+            "signal": "SIGKILL",
+            "killed": killed,
+            "already_exited": already_exited,
+        }
+    )
+
+
 def write_xid(arguments: argparse.Namespace) -> None:
     xid = int(arguments.xid)
     if xid not in ALLOWED_XIDS:
@@ -885,6 +972,10 @@ def parser() -> argparse.ArgumentParser:
     xid.add_argument("--pid", type=int, default=931000)
     xid.add_argument("--message", default="regional collector acceptance")
     xid.set_defaults(handler=write_xid)
+
+    kill = commands.add_parser("kill-workload")
+    kill.add_argument("--pod-uid", required=True)
+    kill.set_defaults(handler=kill_workload)
 
     sxid = commands.add_parser("append-sxid")
     sxid.add_argument("--sxid", type=int, choices=sorted(ALLOWED_SXIDS), required=True)

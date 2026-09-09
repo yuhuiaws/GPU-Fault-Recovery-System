@@ -437,21 +437,28 @@ def test_collector_store_probe_scopes_fabric_manager_workflows_by_injection_time
     assert "and not injected_since" in probe
 
 
-def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
+def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
     tmp_path: Path,
 ) -> None:
-    """XID 31 must reach BLOCKED on a node XID 13 no longer owns.
+    """XID 13/31 on an idle node are MONITOR_ONLY, not a BLOCKED quarantine.
 
     Samples 1 and 2 write the same XID 13 line under one marker, so the kernel
     collector must give the second write its own kmsg sequence and evidence_ref
-    (``kmsg-<boot_id>-<seq>``) and the runner must wait for two records before
-    it judges sample 2."""
+    (``kmsg-<boot_id>-<seq>``); the runner waits for two records before it
+    judges sample 2. Since nothing quarantines the node, there is no restore
+    step between the two XIDs (55272a0)."""
 
     calls: list[str] = []
     minimum_evidence_seen: list[int] = []
 
+    class Regional:
+        def node_snapshot(self, node: str) -> dict:
+            return {"ready": "True", "unschedulable": False, "taints": []}
+
     class Fixture:
         boot_id = "boot-1"
+        node = "hyperpod-node"
+        regional = Regional()
 
         def __init__(self) -> None:
             self.sequence = 0
@@ -461,18 +468,14 @@ def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
             return {
                 "gpu_inventory": [{"pci_bdf": "0000:59:00.0"}],
                 "boot_id": self.boot_id,
+                "services": {},
             }
 
         def execute(self, *arguments: str, timeout: int = 180) -> dict:
+            # Each write of the marker's line earns a fresh kmsg sequence even
+            # when the text is identical.
             calls.append("inject:" + arguments[arguments.index("--xid") + 1])
-            return {}
-
-        def wait_marker(
-            self, marker: str, *, minimum_evidence: int = 1, **_kwargs: object
-        ) -> dict:
-            # Every wait follows one more write of the marker's line; the node
-            # gives it a fresh kmsg sequence even when the text is identical.
-            minimum_evidence_seen.append(minimum_evidence)
+            marker = arguments[arguments.index("--marker") + 1]
             self.sequence += 1
             self.records.setdefault(marker, []).append(
                 {
@@ -482,23 +485,49 @@ def test_collect012_restores_the_quarantine_before_injecting_the_second_xid(
                     ),
                 }
             )
-            evidence = list(self.records[marker])
-            assert len(evidence) >= minimum_evidence, (marker, evidence)
+            return {}
+
+        def store_snapshot(
+            self, marker: str, *, observed_after=None, scan_evidence: bool = True
+        ) -> dict:
             return {
-                "evidence": evidence,
-                "workflows": [{"status": "BLOCKED"}],
-                "incidents": [{"incident_id": f"inc-{marker}"}],
+                "evidence": list(self.records.get(marker, [])) if scan_evidence else [],
+                "decisions": [
+                    {
+                        "official_action": "RESTART_APP",
+                        "disposition": "MONITOR_ONLY",
+                        "action": "NO_ACTION",
+                        "reasons": ["no managed application to restart"],
+                        "workflow_request_id": None,
+                        "incident_id": f"inc-{marker}",
+                    }
+                ],
+                "workflows": [],
+                "incidents": [
+                    {
+                        "incident_id": f"inc-{marker}",
+                        "state": "RECOVERED",
+                        "workflow_request_id": None,
+                    }
+                ],
             }
 
-        def restore_incidents(self, state: dict, **_kwargs: object) -> list:
-            calls.append("restore")
-            return [{"status": "SUCCEEDED"}]
+    fixture = Fixture()
+    original = collect.wait_monitor_only
 
-    result = collect.run_collect012(Fixture(), tmp_path, 1, "hyperpod-v1")
+    def tracking_wait(f, marker, *, minimum_evidence=1, **kwargs):
+        minimum_evidence_seen.append(minimum_evidence)
+        return original(f, marker, minimum_evidence=minimum_evidence, **kwargs)
+
+    collect.wait_monitor_only = tracking_wait  # type: ignore[assignment]
+    try:
+        result = collect.run_collect012(fixture, tmp_path, 1, "hyperpod-v1")
+    finally:
+        collect.wait_monitor_only = original  # type: ignore[assignment]
 
     assert result["verdict"] == "PASS", result
-    assert calls == ["inject:13", "inject:13", "restore", "inject:31", "restore"], calls
-    assert len(result["restore_workflows"]) == 2, result["restore_workflows"]
+    assert calls == ["inject:13", "inject:13", "inject:31"], calls
+    assert "restore_workflows" not in result, "nothing to restore"
     # Sample 2 alone waits for the second record of the shared marker.
     assert minimum_evidence_seen == [1, 2, 1], minimum_evidence_seen
     assert result["boot_id"] == "boot-1", result

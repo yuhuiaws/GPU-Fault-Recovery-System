@@ -141,3 +141,44 @@ def test_sweep_rejects_a_non_positive_ttl(ttl: float) -> None:
         SpareReservationSweep(
             _coordinator({}, []), ttl_seconds=ttl, interval_seconds=300.0
         )
+
+
+def test_sweep_judges_the_spare_label_on_the_kubernetes_node() -> None:
+    """Live 2026-09-08 (DESTR-022): the regional executor's provider view
+    carried no kubernetes_labels at all, so a sweep keyed on them skipped
+    every node and a two-day-old reservation was never reclaimed. The label
+    the declaration writes is on the Kubernetes Node; that is what counts."""
+    from gpu_fault.hyperpod import HyperPodNode
+
+    unenriched = HyperPodNode(
+        node_logical_id="worker-i-9",
+        instance_id="i-9",
+        instance_group_name="workers",
+        instance_type="ml.p5.48xlarge",
+        status="Running",
+        kubernetes_labels={"kubernetes.io/hostname": "hyperpod-i-9"},
+    )
+    stale = reserved_node("incident-stale", reserved_at=NOW - timedelta(days=2))
+    stale["metadata"]["labels"]["gpu-fault.io/spare"] = "true"
+    not_a_spare = reserved_node("incident-other", reserved_at=NOW - timedelta(days=2))
+    plain = HyperPodNode(
+        node_logical_id="worker-i-8",
+        instance_id="i-8",
+        instance_group_name="workers",
+        instance_type="ml.p5.48xlarge",
+        status="Running",
+        kubernetes_labels={"kubernetes.io/hostname": "hyperpod-i-8"},
+    )
+    core_nodes = {"hyperpod-i-9": stale, "hyperpod-i-8": not_a_spare}
+    sweep = SpareReservationSweep(
+        _coordinator(core_nodes, [unenriched, plain]),
+        ttl_seconds=86400.0,
+        interval_seconds=300.0,
+        now=lambda: NOW,
+    )
+
+    released = sweep.run()
+
+    assert released == ["hyperpod-i-9"], f"released set differs: {released}"
+    assert _released(stale), "the labeled Node's expired reservation was kept"
+    assert not _released(not_a_spare), "a node without the spare label was swept"

@@ -27,6 +27,7 @@ from gpu_fault.adapters.kubernetes.restart_source_guard import (
     restart_source_failure,
     workload_lifecycle_identity,
 )
+from gpu_fault.adapters.kubernetes.stop_state import stop_state_after_mutation
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -475,20 +476,44 @@ class KubernetesWorkloadOperationsMixin:
             for item in context.workflow.step_executions
         )
         if not previous_waiting:
-            return WorkflowStepOutcome.waiting(
+            # First call: the suspend patch and the grace-0 Pod deletes have
+            # just gone out. Read each workload back once and settle the stop
+            # in this same tick when the controller has already reconciled,
+            # instead of unconditionally paying a WAITING round trip (5 s
+            # locally, plus a remote-command hop on the regional path).
+            #
+            # Pod absence is not re-listed here on purpose. A grace-0 delete
+            # removes the Pod object synchronously (404 on a repeat delete is
+            # already tolerated), and the poll path below treats an inactive
+            # workload as SUCCEEDED even when a re-list still shows Pods, so
+            # "workload inactive" is the same authoritative signal either way.
+            active, unknown = stop_state_after_mutation(
+                state.workloads, self._workload_active
+            )
+            first_call_details = {
+                "workloads": context.step.workload_ids,
+                "suspended": True,
+                "deleted_pods": [
+                    f"{namespace}/{name}" for namespace, name in state.terminating_pods
+                ],
+                "workload_log_evidence": state.log_evidence,
+                "workload_log_errors": state.log_errors,
+                "already_absent_workloads": (state.absent_workload_ids),
+            }
+            if active or unknown:
+                return WorkflowStepOutcome.waiting(
+                    operation_id=context.idempotency_key,
+                    details={
+                        **first_call_details,
+                        "waiting_for_active_workloads": active,
+                        "unknown_stop_state": unknown,
+                    },
+                )
+            # The evidence the WAITING record used to carry rides on the
+            # SUCCEEDED outcome instead, so skipping the tick loses nothing.
+            return WorkflowStepOutcome.succeeded(
                 operation_id=context.idempotency_key,
-                details={
-                    "workloads": context.step.workload_ids,
-                    "suspended": True,
-                    "waiting_for_active_workloads": (context.step.workload_ids),
-                    "deleted_pods": [
-                        f"{namespace}/{name}"
-                        for namespace, name in state.terminating_pods
-                    ],
-                    "workload_log_evidence": state.log_evidence,
-                    "workload_log_errors": state.log_errors,
-                    "already_absent_workloads": (state.absent_workload_ids),
-                },
+                details=first_call_details,
             )
         if (
             context.step.parameters.get("termination_initiator_incident_id")

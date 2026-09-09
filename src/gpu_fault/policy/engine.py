@@ -11,6 +11,7 @@ from gpu_fault.models import (
     NodeMarker,
     RecoveryAction,
     Severity,
+    WorkloadState,
 )
 from gpu_fault.policy.catalog import (
     load_sxid_policy,
@@ -57,6 +58,13 @@ from gpu_fault.policy.product_families import (
 # window is still open. So the propagation guard tests the catalog token, which
 # keeps every piece of XID 154 routing keyed the same way as the table.
 XID_154_ACTION = "XID_154"
+# The catalog Immediate Action that names an application rather than a device.
+RESTART_APP_ACTION = "RESTART_APP"
+# Reason recorded when RESTART_APP meets an IDLE node (see _direct_resolution).
+RESTART_APP_IDLE_REASON = (
+    "no managed application to restart on an IDLE node; "
+    "recorded for investigation without mutating the node"
+)
 
 
 class _XidCorrelation(NamedTuple):
@@ -212,7 +220,11 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         # The annotated action overrides a *companion* event's own Immediate
         # Action, never the XID 154 event carrying it; see XID_154_ACTION.
         if event.xid_154_action is not None and official != XID_154_ACTION:
-            return self._dynamic_recovery_resolution(event.xid_154_action, rule)
+            return self._dynamic_recovery_resolution(
+                event.xid_154_action,
+                rule,
+                workload_state=event.workload_state,
+            )
 
         if official is None:
             return _Resolution(
@@ -235,6 +247,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             resolution = self._direct_resolution(
                 official,
                 rule,
+                workload_state=event.workload_state,
                 reason=(
                     f"exact NVIDIA Catalog {self.policy.catalog_version} "
                     f"Immediate Action for XID {event.xid}"
@@ -389,8 +402,20 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         *,
         source: ActionSource = ActionSource.NVIDIA_CATALOG,
         reason: str,
+        workload_state: WorkloadState | None = None,
     ) -> _Resolution:
         action = DIRECT_ACTION_MAP[official]
+        reasons = [reason]
+        if official == RESTART_APP_ACTION and workload_state is WorkloadState.IDLE:
+            # RESTART_APP names an application. An IDLE node runs no managed
+            # one, so there is nothing to stop or restart; compiling the
+            # restart anyway left a plan with no workload, and the generic
+            # fail-closed path quarantined the node for an application-level
+            # XID. Record and notify instead, like every IGNORE-class XID.
+            # UNKNOWN is not IDLE: monitoring loss still means "someone may
+            # be using it" and is refused downstream by the workload gate.
+            action = RecoveryAction.NO_ACTION
+            reasons.append(RESTART_APP_IDLE_REASON)
         return _Resolution(
             source=source,
             disposition=(
@@ -402,7 +427,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             investigatory_action=rule.investigatory_action,
             action=action,
             containment=self._xid_containment(rule.xid),
-            reasons=[reason],
+            reasons=reasons,
             pre_actions=(
                 [
                     RecoveryAction.MARK_UNSCHEDULABLE,
@@ -419,6 +444,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         rule: CatalogRule,
         *,
         correlated_event_id: str | None = None,
+        workload_state: WorkloadState | None = None,
     ) -> _Resolution:
         official = action.value
         if action is DynamicRecoveryAction.DRAIN_P2P:
@@ -445,6 +471,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             mapped.value,
             rule,
             source=ActionSource.NVIDIA_XID_154,
+            workload_state=workload_state,
             reason=(
                 "followed the driver-reported XID 154 Data Center "
                 f"GPU Recovery Action {official}"
@@ -498,6 +525,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             event.xid_154_action,
             rule,
             correlated_event_id=(companion.event_id if companion is not None else None),
+            workload_state=event.workload_state,
         )
 
     def _workflow_xid_45(
@@ -805,11 +833,14 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             )
 
         if "XID_154_EVAL" in recovery_actions and xid154_action:
-            result = self._dynamic_recovery_resolution(xid154_action, rule)
+            result = self._dynamic_recovery_resolution(
+                xid154_action, rule, workload_state=event.workload_state
+            )
         else:
             result = self._direct_resolution(
                 official,
                 rule,
+                workload_state=event.workload_state,
                 reason=(
                     "matched the pinned official XID 144-150 decode "
                     "table: " + ", ".join(item.subcode_name for item in matched)

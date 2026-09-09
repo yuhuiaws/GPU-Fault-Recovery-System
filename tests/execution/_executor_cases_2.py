@@ -742,6 +742,63 @@ def test_inherited_step_start_time_cannot_fire_the_cap_early() -> None:
     assert "step_waiting_slow" not in execution.details
 
 
+def test_a_dag_step_wait_is_measured_from_the_lifetime_stamp_not_the_sliding_deadline() -> (
+    None
+):
+    """A job DAG's per-step cap must count from the step, not from the last claim.
+
+    ``claim_deadlines`` re-stamps a DAG's ``execution_deadline`` to ``now +
+    budget`` on every claim (the job lifetime is its real bound), so recovering
+    the window start from that deadline put the start at the *current* claim and
+    ``step_waiting_seconds`` read 0 for as long as the deadline slid. Live
+    2026-09-08 (DESTR-014 attempt 7): a sibling RESTART_NODE waited 60 min
+    against an 1800 s cap, the cap never fired, the workflow lifetime ended the
+    step instead and the branch never escalated. The lifetime is stamped once,
+    at the first claim; a DAG's window starts there.
+    """
+
+    store = build_store()
+    operation = WorkflowOperation.QUIESCE_GPU_SERVICES
+    _, workflow = workflow_state(store, [operation])
+    now = datetime.now(timezone.utc)
+    waited = 900
+    workflow = copy_model(
+        workflow,
+        dag_enabled=True,
+        dag_revision=1,
+        # Stamped by the first claim, ``waited`` seconds ago: job lifetime 3600.
+        lifetime_deadline_at=now + timedelta(seconds=3600 - waited),
+        step_executions=[
+            workflow_step_execution(
+                0,
+                operation,
+                WorkflowStepStatus.WAITING,
+                adapter_operation_id="provider-op-1",
+                started_at=now - timedelta(seconds=waited),
+            )
+        ],
+    )
+    store.save_workflow(workflow)
+    adapter = FakeAdapter(
+        {operation: WorkflowStepOutcome.waiting(operation_id="provider-op-1")}
+    )
+    active = active_workflow_executor(
+        store,
+        [adapter],
+        [operation],
+        step_waiting_timeout_seconds=120,
+        step_waiting_warning_seconds=60,
+    )
+
+    execute_workflow(active, workflow.request_id)
+
+    execution = store.get_workflow(workflow.request_id).step_executions[-1]
+    assert execution.status is WorkflowStepStatus.FAILED, execution
+    assert execution.details["step_waiting_timeout_seconds"] == 120, execution.details
+    reported = execution.details["step_waiting_seconds"]
+    assert waited - 5 <= reported <= waited + 60, execution.details
+
+
 def test_acknowledgement_wait_is_measured_from_its_own_claim() -> None:
     """CHECK_MECHANICALS reports how long it has really waited, never a negative.
 

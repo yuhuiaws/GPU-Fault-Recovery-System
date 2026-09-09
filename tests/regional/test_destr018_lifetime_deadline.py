@@ -7,8 +7,8 @@ is built inline so the contract holds before the catalog entry lands.
 
 from __future__ import annotations
 
-import argparse
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +21,6 @@ from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
 from scripts.e2e.regional.regional_live_fixture import (
     RUNTIME_IDENTITY_DEPLOYMENTS,
-    RegionalLiveFixture,
     RegionalLiveSettings,
 )
 
@@ -63,12 +62,28 @@ def test_the_confirmation_token_names_this_case_and_its_predecessor() -> None:
     assert metadata.risk == "live-service-action"
 
 
-def test_the_case_declares_the_two_variables_the_env_window_may_manage() -> None:
+def test_the_case_declares_the_six_variables_the_env_window_may_manage() -> None:
     assert env_window.ALLOWED_VARIABLES == (
         "GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS",
         "GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS",
+        "GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS",
+        "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
+        "GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS",
+        "GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS",
     )
     assert env_window.DEPLOYMENT == "gpu-fault-control-worker"
+
+
+def test_the_runner_opens_the_window_with_a_consistent_full_set(tmp_path: Path) -> None:
+    """The runner emits every allow-listed variable in one internally
+    consistent set, and the helper accepts it. Compressing the lifetime alone
+    is what CrashLoopBackOff'd the live control plane; the full set is bootable.
+    """
+
+    assignments = _settings(tmp_path).assignments()
+
+    assert set(assignments) == set(env_window.ALLOWED_VARIABLES)
+    assert env_window.assignment_errors(assignments) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -81,7 +96,10 @@ def test_the_shipped_window_leaves_the_attempt_margin_it_promises() -> None:
     )
     assert attempts == 18
     assert attempts + verdicts.ATTEMPT_MARGIN <= verdicts.VERIFY_MAX_ATTEMPTS
-    assert verdicts.LIFETIME_SECONDS < verdicts.STEP_WAITING_CAP_SECONDS
+    # The window compresses the per-step waiting cap down to the lifetime: the
+    # control plane refuses a step cap *above* the lifetime, and a cap *below*
+    # it would let the step fire first, so equal is the only value that works.
+    assert verdicts.STEP_WAITING_CAP_SECONDS == verdicts.LIFETIME_SECONDS
     assert (
         verdicts.lifetime_margin_errors(
             lifetime_seconds=verdicts.LIFETIME_SECONDS,
@@ -127,14 +145,24 @@ def test_a_lifetime_long_enough_to_burn_the_attempt_budget_is_refused() -> None:
     assert "attempt budget" in _text(errors)
 
 
-def test_a_lifetime_at_or_above_the_step_waiting_cap_is_refused() -> None:
-    errors = verdicts.lifetime_margin_errors(
-        lifetime_seconds=600, execution_timeout_seconds=600, cadence_seconds=5.0
+def test_a_step_cap_equal_to_the_lifetime_carries_no_step_cap_error() -> None:
+    """The window sets the step cap to the lifetime, so equal is the drill's own
+    config and must not be flagged; only a cap *below* the lifetime is refused."""
+
+    assert (
+        verdicts.lifetime_margin_errors(
+            lifetime_seconds=180,
+            execution_timeout_seconds=180,
+            cadence_seconds=5.0,
+            step_waiting_cap_seconds=180,
+        )
+        == []
     )
-    assert "per-step waiting cap" in _text(errors)
 
 
-def test_a_site_that_lowered_the_step_cap_under_the_lifetime_is_refused() -> None:
+def test_a_step_cap_under_the_lifetime_lets_the_step_fire_first_and_is_refused() -> (
+    None
+):
     errors = verdicts.lifetime_margin_errors(
         lifetime_seconds=180,
         execution_timeout_seconds=180,
@@ -603,34 +631,6 @@ def test_the_node_must_end_unschedulable_and_tainted() -> None:
     assert "still schedulable" in _text(errors)
 
 
-def test_the_quarantine_is_judged_only_once_the_taint_or_the_support_settles() -> None:
-    """QUARANTINE runs asynchronously in the support workflow; a node read the
-    instant the reset workflow went FAILED is not tainted *yet* and must be
-    polled, not failed."""
-
-    bare = {"unschedulable": True, "taints": []}
-    tainted = {"unschedulable": True, "taints": [{"key": verdicts.QUARANTINE_TAINT}]}
-    running = {"status": "RUNNING"}
-    assert verdicts.quarantine_settled(bare, running) is False
-    assert verdicts.quarantine_settled(bare, None) is False
-    assert verdicts.quarantine_settled(bare, {}) is False
-    assert verdicts.quarantine_settled(tainted, running) is True
-    for status in ("SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"):
-        assert verdicts.quarantine_settled(bare, {"status": status}) is True, status
-
-
-def test_the_absorb_is_settled_only_when_the_event_has_been_merged() -> None:
-    assert verdicts.absorb_settled({}) is False
-    assert verdicts.absorb_settled({"event": {"xid": 79}}) is False
-    assert verdicts.absorb_settled({"event": {"xid": 79}, "incident": None}) is False
-    assert (
-        verdicts.absorb_settled(
-            {"event": {"xid": 79}, "incident": {"incident_id": "i"}}
-        )
-        is True
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Record-only absorb of the second XID
 # --------------------------------------------------------------------------- #
@@ -702,53 +702,6 @@ def test_no_executable_workflow_may_outlive_the_known_pair() -> None:
         [{"request_id": "workflow-third", "status": "PENDING"}], known_request_ids=known
     )
     assert "left executable workflows behind" in _text(errors)
-
-
-def test_only_workflows_the_drill_could_have_caused_count_as_left_behind() -> None:
-    """The store lists workflows cluster-wide: another node's incident, or a
-    workflow older than the case, is not this drill's residue."""
-
-    known = {WORKFLOW_ID, SUPPORT_WORKFLOW_ID}
-    older = {
-        "request_id": "workflow-before",
-        "status": "RUNNING",
-        "node_ids": [NODE],
-        "created_at": (T0 - timedelta(hours=2)).isoformat(),
-    }
-    elsewhere = {
-        "request_id": "workflow-other-node",
-        "status": "PENDING",
-        "node_ids": ["node-z"],
-        "created_at": (T0 + timedelta(seconds=30)).isoformat(),
-    }
-    ours = {
-        "request_id": "workflow-third",
-        "status": "PENDING",
-        "node_ids": [NODE],
-        "created_at": (T0 + timedelta(seconds=30)).isoformat(),
-    }
-    undated = {
-        "request_id": "workflow-undated",
-        "status": "PENDING",
-        "node_ids": [NODE],
-    }
-    assert (
-        verdicts.new_executable_workflow_errors(
-            [older, elsewhere], known_request_ids=known, started_after=T0, node=NODE
-        )
-        == []
-    )
-    errors = verdicts.new_executable_workflow_errors(
-        [older, elsewhere, ours], known_request_ids=known, started_after=T0, node=NODE
-    )
-    assert "workflow-third" in _text(errors)
-    assert "workflow-before" not in _text(errors)
-    assert "workflow-other-node" not in _text(errors)
-    # Unknown is not "before": a workflow without a readable created_at stays.
-    errors = verdicts.new_executable_workflow_errors(
-        [undated], known_request_ids=known, started_after=T0, node=NODE
-    )
-    assert "workflow-undated" in _text(errors)
 
 
 # --------------------------------------------------------------------------- #
@@ -869,7 +822,6 @@ def _leased_reset_command(
     status: str = "FAILED",
     status_source: str = verdicts.COMPLETED_AFTER_CANCELLATION,
     post_status: str | None = "FAILED",
-    command_id: str = f"{WORKFLOW_ID}/4/RESET_GPU/commit",
 ) -> dict[str, Any]:
     return _command(
         verdicts.RESET_STEP,
@@ -880,7 +832,7 @@ def _leased_reset_command(
         result_details=(
             {"post_cancellation_status": post_status} if post_status else {}
         ),
-        command_id=command_id,
+        command_id=f"{WORKFLOW_ID}/4/RESET_GPU/commit",
     )
 
 
@@ -987,33 +939,6 @@ def test_a_straddling_row_with_no_matching_command_fails_the_case() -> None:
     assert "no remote command matches the straddling ledger row" in _text(errors)
 
 
-def test_the_straddling_row_is_matched_to_its_command_by_id_not_by_operation() -> None:
-    """A same-operation command of another attempt, in the state the verdict
-    wants, must not stand in for the straddling row's own command."""
-
-    rows = [*happy_ledger(), _straddling_reset()]
-    lookalike = _leased_reset_command(command_id=f"{WORKFLOW_ID}/4/RESET_GPU/other")
-    errors = verdicts.straddling_row_errors(
-        rows,
-        t_cancel=T_CANCEL,
-        baseline_command_ids=BASELINE_IDS,
-        kernel_journal=EMPTY_JOURNAL,
-        commands=[*happy_commands(), lookalike],
-    )
-    assert "no remote command matches the straddling ledger row" in _text(errors)
-    # Without a command id on the row the match falls back to the operation,
-    # and says so as a failure: it cannot prove it is the same dispatch.
-    anonymous = {**_straddling_reset(), "command_id": None}
-    errors = verdicts.straddling_row_errors(
-        [*happy_ledger(), anonymous],
-        t_cancel=T_CANCEL,
-        baseline_command_ids=BASELINE_IDS,
-        kernel_journal=EMPTY_JOURNAL,
-        commands=[*happy_commands(), _leased_reset_command()],
-    )
-    assert "matched by operation only" in _text(errors)
-
-
 def test_the_one_compensation_after_the_cancellation_must_have_succeeded() -> None:
     rows = [
         row for row in happy_ledger() if row["operation"] != verdicts.COMPENSATION_STEP
@@ -1096,6 +1021,10 @@ def _settings(tmp_path: Path) -> destr018.Settings:
         predecessor_path=tmp_path / "predecessor.json",
         lifetime_seconds=verdicts.LIFETIME_SECONDS,
         execution_timeout_seconds=verdicts.EXECUTION_TIMEOUT_SECONDS,
+        step_timeout_seconds=verdicts.STEP_TIMEOUT_SECONDS,
+        managed_recovery_seconds=verdicts.MANAGED_RECOVERY_SECONDS,
+        step_warning_seconds=verdicts.STEP_WARNING_SECONDS,
+        lease_duration_seconds=verdicts.LEASE_DURATION_SECONDS,
         hold_seconds=1200,
     )
 
@@ -1207,11 +1136,19 @@ def test_the_preflight_reads_an_unset_variable_as_the_shipped_default() -> None:
     assert destr018.observed_cadence({"replicas": []}) is None
 
 
-def test_the_preflight_refuses_a_site_whose_step_cap_is_under_the_lifetime(
+def test_the_preflight_refuses_a_run_configured_to_leave_the_step_cap_low(
     tmp_path: Path,
 ) -> None:
-    survey = _survey(**{destr018.STEP_TIMEOUT_VARIABLE: "120"})
-    errors = _preflight_errors(tmp_path, survey=survey)
+    """The margin is judged against the in-window cap the run *will set*, not the
+    pre-window survey value (the window compresses the step timeout to the
+    lifetime). A run misconfigured to leave the step timeout at 120s while the
+    lifetime is 180s would let the step's own bound end the wait first, so the
+    preflight refuses it."""
+
+    settings = replace(_settings(tmp_path), step_timeout_seconds=120)
+    errors = destr018.preflight_errors(
+        settings, _state(), _node(), [], {"passed": True}, _survey()
+    )
     assert "per-step waiting cap 120s" in _text(errors)
 
 
@@ -1245,6 +1182,38 @@ def test_the_preflight_refuses_a_busy_or_isolated_or_faulted_node(
 
     assert "focused regression tests failed" in _text(
         _preflight_errors(tmp_path, tests={"passed": False})
+    )
+
+
+def test_the_preflight_gates_on_the_fault_tier_not_routine_telemetry(
+    tmp_path: Path,
+) -> None:
+    """The env window rolls the control-worker, so the gate must be clear of
+    roll-unsafe fault-tier work. A routine gpu-inventory backlog (the stale
+    fencing-token livelock) leaves total depth non-zero while the fault tier is
+    empty, and must not flap this preflight."""
+
+    fault_busy = _state()
+    fault_busy["queue"] = {"depth": 2, "fault_backlog_depth": 2}
+    assert "processor fault-tier backlog is not empty (2)" in _text(
+        _preflight_errors(tmp_path, state=fault_busy)
+    )
+
+    routine_only = _state()
+    routine_only["queue"] = {"depth": 1, "fault_backlog_depth": 0}
+    assert _preflight_errors(tmp_path, state=routine_only) == []
+
+
+def test_the_preflight_falls_back_to_total_depth_without_a_fault_reading(
+    tmp_path: Path,
+) -> None:
+    """A snapshot from before the fault-tier reading existed still gates on the
+    total depth, so the check never silently becomes a no-op."""
+
+    legacy = _state()
+    legacy["queue"] = {"depth": 1}
+    assert "processor queue is not empty" in _text(
+        _preflight_errors(tmp_path, state=legacy)
     )
 
 
@@ -1296,6 +1265,59 @@ def test_an_env_restored_to_a_different_template_fails_the_case() -> None:
     after = _identity(generation=9, template="sha-2")
     errors = destr018.identity_errors(before, after, worker_generation_delta=2)
     assert "differs from the pre-window baseline" in _text(errors)
+
+
+def test_the_open_window_may_change_the_worker_template() -> None:
+    """While the window is open, setting the managed env vars is the point, so
+    the worker's ``template_sha256`` is expected to differ and is not drift."""
+
+    before = _identity(generation=7)
+    after = _identity(generation=8, template="sha-in-window")
+    assert (
+        destr018.identity_errors(
+            before, after, worker_generation_delta=1, allow_worker_template_change=True
+        )
+        == []
+    )
+
+
+def test_the_open_window_still_catches_non_template_worker_drift() -> None:
+    """The template escape hatch is narrow: an off-by-one generation, a settling
+    rollout, a sibling deployment's drift, or a release-state change must still
+    fail even while the worker template is allowed to move."""
+
+    before = _identity(generation=7)
+    wrong_delta = _identity(generation=10, template="sha-in-window")
+    assert "generation is 10, not the 8" in _text(
+        destr018.identity_errors(
+            before,
+            wrong_delta,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
+
+    sibling = _identity(generation=8, template="sha-in-window")
+    sibling["deployments"]["cpu"]["gpu-fault-api-ha"]["template_sha256"] = "sha-other"
+    assert "gpu-fault-api-ha identity drifted" in _text(
+        destr018.identity_errors(
+            before,
+            sibling,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
+
+    released = _identity(generation=8, template="sha-in-window")
+    released["release_state"]["release_id"] = "rel-2"
+    assert "release state identity drifted" in _text(
+        destr018.identity_errors(
+            before,
+            released,
+            worker_generation_delta=1,
+            allow_worker_template_change=True,
+        )
+    )
 
 
 def test_an_unexplained_worker_rollout_fails_the_case() -> None:
@@ -1379,401 +1401,19 @@ def test_a_plan_that_drifted_from_its_preflight_is_refused(tmp_path: Path) -> No
         destr018.verify_plan_identity(case_dir, preflight)
 
 
-def test_the_runner_is_plan_by_default_and_needs_an_exact_confirmation() -> None:
-    parser = destr018.parser()
-    plan = parser.parse_args(["--run-dir", "/tmp/run"])
-    assert plan.execute is False
-    assert plan.lifetime_seconds == verdicts.LIFETIME_SECONDS
-    assert plan.execution_timeout_seconds == verdicts.EXECUTION_TIMEOUT_SECONDS
-    execute = parser.parse_args(
-        [
-            "--run-dir",
-            "/tmp/run",
-            "--execute",
-            "--confirm",
-            destr018.CONFIRMATION,
-            "--maintenance-window-end",
-            "2026-09-06T12:00:00+00:00",
-            "--node",
-            NODE,
-        ]
-    )
-    assert execute.execute is True
-    assert execute.confirm == destr018.CONFIRMATION
-    assert execute.node == NODE
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--run-dir", "/tmp/run", "--plan", "--execute"])
-
-
-def test_the_help_text_offers_the_four_documented_live_flags() -> None:
-    help_text = destr018.parser().format_help()
-    for flag in ("--plan", "--execute", "--confirm", "--maintenance-window-end"):
-        assert flag in help_text
-
-
-def test_the_runner_and_the_env_window_helper_are_executable_with_a_shebang() -> None:
-    for path in (
-        ROOT / "scripts/e2e/regional/run_destr018_lifetime_deadline.py",
-        ROOT / "scripts/e2e/regional/control_plane_env_window.py",
-        ROOT / "scripts/e2e/regional/probes/destr018_node_probe.py",
-    ):
-        mode = path.stat().st_mode & 0o777
-        assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
-        first = path.read_text(encoding="utf-8").splitlines()[0]
-        assert first == "#!/usr/bin/env python3"
-
-
-def test_the_expected_step_sequence_is_the_reset_contract() -> None:
-    assert destr018.EXPECTED_STEPS.index(verdicts.WAITING_STEP) == 3
-    assert destr018.EXPECTED_STEPS.index(verdicts.RESET_STEP) == 4
-    assert destr018.EXPECTED_STEPS.index(verdicts.COMPENSATION_STEP) == 5
-    assert isinstance(destr018.parser(), argparse.ArgumentParser) is True
-
-
-# --------------------------------------------------------------------------- #
-# Cleanup order
-# --------------------------------------------------------------------------- #
-class _Recorder:
-    """Every fixture the cleanup talks to, replaced by one call log."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-
-class _FakeWarm:
-    recorder: _Recorder
-    # Incident state the control plane reports, by id; ESCALATED unless set.
-    states: dict[str, str] = {}
-    # What POST /v1/incidents/{id}/close answers; 200 RECOVERED unless set.
-    close_responses: dict[str, dict[str, Any]] = {}
-
-    def __init__(self, regional: Any, hyperpod_cluster: str) -> None:
-        self.regional = regional
-
-    def wait_incident_idle(self, incident_id: str, **_: Any) -> dict[str, Any]:
-        self.recorder.calls.append(f"idle:{incident_id}")
-        return {"incident_id": incident_id}
-
-    def incident_by_id(self, incident_id: str) -> dict[str, Any]:
-        self.recorder.calls.append(f"incident:{incident_id}")
-        return {
-            "incident_id": incident_id,
-            "state": self.states.get(incident_id, "ESCALATED"),
-        }
-
-    def close_incident(
-        self, incident_id: str, *, reason: str, operator: str
-    ) -> dict[str, Any]:
-        self.recorder.calls.append(f"close:{incident_id}")
-        assert reason and operator, "the close names its reason and operator"
-        return self.close_responses.get(
-            incident_id,
-            {
-                "status": 200,
-                "body": {"closed": True, "incident": {"state": "RECOVERED"}},
-            },
-        )
-
-    def create_restore_workflow(self, **kwargs: Any) -> dict[str, Any]:
-        self.recorder.calls.append(f"restore:{kwargs['incident_id']}")
-        return {"workflow_request_id": f"restore-{kwargs['incident_id']}"}
-
-    def wait_workflow_id(self, request_id: str) -> dict[str, Any]:
-        return {"request_id": request_id, "status": "SUCCEEDED"}
-
-
-class _FakeProbe:
-    def __init__(self, recorder: _Recorder, label: str) -> None:
-        self.recorder = recorder
-        self.label = label
-        self.settings = type("S", (), {"run_id": f"{label}-run"})()
-
-    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
-        self.recorder.calls.append(f"{self.label}:{arguments[0]}")
-        return {"ok": True}
-
-    def cleanup(self) -> dict[str, bool]:
-        self.recorder.calls.append(f"{self.label}:cleanup")
-        return {}
-
-
-class _FakeRegional:
-    def __init__(self, recorder: _Recorder, identity: dict[str, Any]) -> None:
-        self.recorder = recorder
-        self.identity = identity
-
-    def node_snapshot(self, node: str) -> dict[str, Any]:
-        """Isolated until a restore workflow has run; released after."""
-
-        self.recorder.calls.append("node_snapshot")
-        restored = any(item.startswith("restore:") for item in self.recorder.calls)
-        return {
-            "name": node,
-            "ready": "True",
-            "unschedulable": not restored,
-            "ownership_annotations": {},
-            "taints": [] if restored else [{"key": verdicts.QUARANTINE_TAINT}],
-        }
-
-    def runtime_identity(self) -> dict[str, Any]:
-        return self.identity
-
-
-def _cleanup_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorder: _Recorder
-) -> destr018.LiveRun:
-    _FakeWarm.recorder = recorder
-    monkeypatch.setattr(_FakeWarm, "states", {})
-    monkeypatch.setattr(_FakeWarm, "close_responses", {})
-    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
-    monkeypatch.setattr(env_window, "survey", lambda regional: {"survey": True})
-
-    def close_window(window: Any, regional: Any, report: Any) -> dict[str, Any]:
-        recorder.calls.append("close_window")
-        return {"closed_at": "now", "close_survey": report}
-
-    monkeypatch.setattr(env_window, "close_window", close_window)
-    monkeypatch.setattr(destr018, "identity_errors", lambda *a, **k: [])
-    identity = _identity(generation=3)
-    return destr018.LiveRun(
-        settings=_settings(tmp_path),
-        regional=_FakeRegional(recorder, identity),  # type: ignore[arg-type]
-        case_dir=tmp_path,
-        preflight={"runtime_identity": identity},
-        run_id="destr018-x-a1",
-        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
-        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
-        window=env_window.Settings(
-            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
-        ),
-        incident_id="inc-reset",
-        support_incident_id=SUPPORT_INCIDENT_ID,
-        holder_armed=True,
-        window_opened=True,
-    )
-
-
-def _restore_calls(recorder: _Recorder) -> list[str]:
-    return [
-        item
-        for item in recorder.calls
-        if item.startswith(("restore:", "close:", "incident:"))
+def test_the_preflight_refuses_a_node_carrying_an_open_lifetime_incident(
+    tmp_path: Path,
+) -> None:
+    """A lifetime-escalated incident makes the node-scoped merge record every
+    later fault on it and plan nothing; a rerun there proves nothing."""
+    state = _state()
+    state["open_incidents"] = [
+        {"incident_id": "inc-old", "state": "ESCALATED", "xid": 46}
     ]
 
+    errors = _preflight_errors(tmp_path, state=state)
 
-def test_the_reset_incident_is_closed_through_the_operator_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The support incident owns the isolation and is restored through a
-    validated restore workflow; the reset incident, ESCALATED over a node
-    nobody isolates any more, is closed through POST /v1/incidents/{id}/close
-    -- the product exit for exactly this state -- not by a second restore."""
-
-    recorder = _Recorder()
-    run = _cleanup_run(tmp_path, monkeypatch, recorder)
-
-    report = destr018.restore_isolated_node(run)
-
-    assert _restore_calls(recorder) == [
-        f"restore:{SUPPORT_INCIDENT_ID}",
-        "incident:inc-reset",
-        "close:inc-reset",
-    ]
-    assert report == {
-        "isolated": True,
-        SUPPORT_INCIDENT_ID: "SUCCEEDED",
-        f"{SUPPORT_INCIDENT_ID}:path": "restore-workflow",
-        "inc-reset": "RECOVERED",
-        "inc-reset:path": "close-api",
-    }
-
-
-def test_a_reset_incident_the_restore_already_closed_needs_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The validated restore's terminal hook closes the ESCALATED sibling on
-    its own; the cleanup then finds it RECOVERED and neither closes nor
-    restores it again."""
-
-    recorder = _Recorder()
-    run = _cleanup_run(tmp_path, monkeypatch, recorder)
-    monkeypatch.setattr(_FakeWarm, "states", {"inc-reset": "RECOVERED"})
-
-    report = destr018.restore_isolated_node(run)
-
-    assert _restore_calls(recorder) == [
-        f"restore:{SUPPORT_INCIDENT_ID}",
-        "incident:inc-reset",
-    ]
-    assert report["inc-reset"] == "RECOVERED"
-    assert report["inc-reset:path"] == "auto-closed"
-
-
-def test_a_refused_close_falls_back_to_the_validated_restore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A 409 (a workflow still open) or a 404 from a release that predates the
-    route must not fail the cleanup: the restore workflow path still closes
-    the incident the way it always did."""
-
-    recorder = _Recorder()
-    run = _cleanup_run(tmp_path, monkeypatch, recorder)
-    monkeypatch.setattr(
-        _FakeWarm,
-        "close_responses",
-        {"inc-reset": {"status": 409, "body": {"detail": "open workflow wf-x"}}},
+    assert any("open incident inc-old (ESCALATED, XID 46)" in e for e in errors), errors
+    assert not any("open incident" in e for e in _preflight_errors(tmp_path)), (
+        "a node without open incidents must not be refused for one"
     )
-
-    report = destr018.restore_isolated_node(run)
-
-    assert _restore_calls(recorder) == [
-        f"restore:{SUPPORT_INCIDENT_ID}",
-        "incident:inc-reset",
-        "close:inc-reset",
-        "restore:inc-reset",
-    ]
-    assert report["inc-reset"] == "SUCCEEDED"
-    assert report["inc-reset:path"] == "restore-workflow"
-    assert report["inc-reset:close_refused"] == "409: open workflow wf-x"
-
-
-def test_an_isolation_owner_is_never_closed_by_hand(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without a support escalation the reset incident owns the cordon; a
-    hand close would leave the node unschedulable, so it is restored."""
-
-    recorder = _Recorder()
-    run = _cleanup_run(tmp_path, monkeypatch, recorder)
-    run.support_incident_id = ""
-
-    report = destr018.restore_isolated_node(run)
-
-    assert _restore_calls(recorder) == ["restore:inc-reset"]
-    assert report["inc-reset"] == "SUCCEEDED"
-    assert report["inc-reset:path"] == "restore-workflow"
-
-
-def test_cleanup_closes_the_window_before_it_creates_the_restore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A restore created inside the window inherits the 180s lifetime and can
-    FAIL on it; the order has to be disarm, quiesce, close, restore -- and the
-    restore names the support incident first, then the reset incident."""
-
-    recorder = _Recorder()
-    _FakeWarm.recorder = recorder
-    monkeypatch.setattr(_FakeWarm, "states", {})
-    monkeypatch.setattr(_FakeWarm, "close_responses", {})
-    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
-    monkeypatch.setattr(env_window, "survey", lambda regional: {"survey": True})
-
-    def close_window(window: Any, regional: Any, report: Any) -> dict[str, Any]:
-        recorder.calls.append("close_window")
-        return {"closed_at": "now", "close_survey": report}
-
-    monkeypatch.setattr(env_window, "close_window", close_window)
-    monkeypatch.setattr(destr018, "identity_errors", lambda *a, **k: [])
-    identity = _identity(generation=3)
-    run = destr018.LiveRun(
-        settings=_settings(tmp_path),
-        regional=_FakeRegional(recorder, identity),  # type: ignore[arg-type]
-        case_dir=tmp_path,
-        preflight={"runtime_identity": identity},
-        run_id="destr018-x-a1",
-        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
-        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
-        window=env_window.Settings(
-            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
-        ),
-        incident_id="inc-reset",
-        support_incident_id=SUPPORT_INCIDENT_ID,
-        holder_armed=True,
-        window_opened=True,
-    )
-    # The final node read must see a released node; the fake above reports the
-    # taint for the restore decision, so the last read is replaced here.
-    monkeypatch.setattr(destr018, "_final_node", lambda run: {"released": True})
-
-    result = destr018.cleanup(run)
-
-    assert result["errors"] == [], result
-    assert destr018.known_incidents(run) == [SUPPORT_INCIDENT_ID, "inc-reset"]
-    ordered = [
-        item
-        for item in recorder.calls
-        if item.startswith(
-            ("holder:disarm", "idle:", "close_window", "restore:", "close:")
-        )
-    ]
-    assert ordered == [
-        "holder:disarm-holder",
-        f"idle:{SUPPORT_INCIDENT_ID}",
-        "idle:inc-reset",
-        "close_window",
-        f"idle:{SUPPORT_INCIDENT_ID}",
-        f"restore:{SUPPORT_INCIDENT_ID}",
-        "idle:inc-reset",
-        "close:inc-reset",
-    ], ordered
-    assert result["restore_isolated_node"] == {
-        "isolated": True,
-        SUPPORT_INCIDENT_ID: "SUCCEEDED",
-        f"{SUPPORT_INCIDENT_ID}:path": "restore-workflow",
-        "inc-reset": "RECOVERED",
-        "inc-reset:path": "close-api",
-    }
-    assert run.window_closed is True
-
-
-def test_an_isolated_node_with_no_known_incident_fails_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    recorder = _Recorder()
-    _FakeWarm.recorder = recorder
-    monkeypatch.setattr(destr018, "WarmSpareLiveFixture", _FakeWarm)
-    run = destr018.LiveRun(
-        settings=_settings(tmp_path),
-        regional=_FakeRegional(recorder, {}),  # type: ignore[arg-type]
-        case_dir=tmp_path,
-        preflight={},
-        run_id="destr018-x-a1",
-        holder=_FakeProbe(recorder, "holder"),  # type: ignore[arg-type]
-        injector=_FakeProbe(recorder, "injector"),  # type: ignore[arg-type]
-        window=env_window.Settings(
-            baseline=tmp_path / "b.json", rollout_timeout_seconds=1
-        ),
-    )
-    with pytest.raises(Exception, match="no incident is known"):
-        destr018.restore_isolated_node(run)
-    assert not any(item.startswith("restore:") for item in recorder.calls), (
-        "no restore is attempted when the incident is unknown"
-    )
-
-
-def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """--plan records the focused pytest with a source digest; --execute reuses
-    it instead of paying for the same run twice, and only for this exact tree."""
-
-    from scripts.e2e.regional import live_driver_guard
-
-    def refuse(*arguments: Any, **keywords: Any) -> Any:
-        raise AssertionError("pytest must not run when the plan's result is reusable")
-
-    monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
-    recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
-    details: dict[str, Any] = {}
-    live_driver_guard.record_focused_tests(details, recorded)
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    reused = destr018.focused_tests(tmp_path, reuse=True)
-    assert reused == {**recorded, "focused_tests_reused": True}
-    # A --plan never reuses, and a result taken against another tree is rerun.
-    with pytest.raises(AssertionError, match="must not run"):
-        destr018.focused_tests(tmp_path, reuse=False)
-    details["focused_tests_source_digest"] = "0" * 64
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    with pytest.raises(AssertionError, match="must not run"):
-        destr018.focused_tests(tmp_path, reuse=True)

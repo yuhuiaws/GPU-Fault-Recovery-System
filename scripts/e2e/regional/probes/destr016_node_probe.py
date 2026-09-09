@@ -17,7 +17,12 @@ Every shell command is on an allow-list. The Node Agent unit may only be read,
 never stopped, disabled or restarted: this case needs the Agent alive to take
 the reboot command and to re-register after it. Nothing here resets a GPU,
 reboots a node, or writes to /dev/kmsg -- the shared destructive probe owns the
-XID writes.
+XID writes. This probe only *schedules* two of them: ``QUIESCE_GPU_SERVICES``
+stops kubelet, and with it the ``kubectl exec`` channel every probe answers
+over, so the absorb (XID 46) and escalation (XID 79) writes that must land
+inside the WAITING window are handed to ``systemd-run --on-active`` timers the
+moment the holder starts, and the runner watches them arrive through the
+control plane instead of exec'ing into a node that can no longer answer.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ STATE_DIR = Path("/var/lib/gpu-fault-acceptance")
 AGENT_UNIT = "gpu-fault-node-agent.service"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_DEVICE = re.compile(r"^/dev/nvidia(?:[0-9]|1[0-5])$")
+SAFE_BDF = re.compile(r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}(?:\.[0-7])?$")
+SAFE_INJECT_SCRIPT = re.compile(r"^/run/gpu-fault-host-probe-[0-9a-f]{6,32}\.py$")
+INJECTION_PHASES: dict[str, str] = {"absorb": "write-xid46", "escalate": "write-xid79"}
+MIN_INJECTION_DELAY_SECONDS = 10
 LEDGER_OPERATIONS = (
     "QUIESCE_GPU_SERVICES",
     "VERIFY_NO_GPU_CLIENTS",
@@ -144,13 +153,92 @@ def arm_unit(run_id: str) -> str:
     return f"gpu-fault-destr016-arm-{_run_digest(run_id)}"
 
 
+def injection_unit(run_id: str, phase: str) -> str:
+    if phase not in INJECTION_PHASES:
+        raise ProbeError("unknown injection phase")
+    return f"gpu-fault-destr016-{phase}-{_run_digest(run_id)}"
+
+
 def _owned_units(run_id: str) -> set[str]:
-    return {
+    owned = {
         holder_unit(run_id),
         holder_unit(run_id) + ".service",
         arm_unit(run_id),
         arm_unit(run_id) + ".service",
     }
+    for phase in INJECTION_PHASES:
+        unit = injection_unit(run_id, phase)
+        owned.update({unit, unit + ".service", unit + ".timer"})
+    return owned
+
+
+def injection_plan(arguments: argparse.Namespace) -> list[dict[str, Any]]:
+    """The scheduled XID writes ``arm-holder`` was asked for, validated.
+
+    Empty when no ``--inject-script`` was given (the holder alone). Each entry
+    is stored in the run state and turned into one ``systemd-run --on-active``
+    timer by ``watch-ledger`` right after the holder starts.
+    """
+
+    script = str(getattr(arguments, "inject_script", "") or "")
+    if not script:
+        return []
+    if SAFE_INJECT_SCRIPT.fullmatch(script) is None:
+        raise ProbeError("inject script is not an installed host probe script")
+    bdf = str(getattr(arguments, "pci_bdf", "") or "")
+    if SAFE_BDF.fullmatch(bdf) is None:
+        raise ProbeError("unsafe PCI BDF")
+    plan = []
+    for phase, subcommand in INJECTION_PHASES.items():
+        marker = getattr(arguments, f"{phase}_marker", "") or ""
+        drill_id = getattr(arguments, f"{phase}_drill_id", "") or ""
+        delay = int(getattr(arguments, f"{phase}_after_seconds", 0) or 0)
+        if not marker and not drill_id:
+            continue
+        safe_id(marker, f"{phase} marker")
+        safe_id(drill_id, f"{phase} drill ID")
+        if delay < MIN_INJECTION_DELAY_SECONDS:
+            raise ProbeError(f"{phase} delay is below {MIN_INJECTION_DELAY_SECONDS}s")
+        plan.append(
+            {
+                "phase": phase,
+                "subcommand": subcommand,
+                "script": script,
+                "marker": marker,
+                "drill_id": drill_id,
+                "pci_bdf": bdf,
+                "after_seconds": delay,
+            }
+        )
+    if (
+        plan
+        and max(item["after_seconds"] for item in plan) >= arguments.max_hold_seconds
+    ):
+        raise ProbeError(
+            "an injection is scheduled after the holder's bounded lifetime"
+        )
+    return plan
+
+
+def injection_command(run_id: str, item: dict[str, Any]) -> list[str]:
+    unit = injection_unit(run_id, str(item["phase"]))
+    return [
+        "systemd-run",
+        "--unit",
+        unit,
+        f"--on-active={int(item['after_seconds'])}",
+        "--timer-property=AccuracySec=1s",
+        "--property=RuntimeMaxSec=120",
+        "/opt/gpu-fault/current/venv/bin/python",
+        str(item["script"]),
+        str(item["subcommand"]),
+        "--marker",
+        str(item["marker"]),
+        "--drill-id",
+        str(item["drill_id"]),
+        "--pci-bdf",
+        str(item["pci_bdf"]),
+    ]
 
 
 def unit_name(value: str, run_id: str) -> str:
@@ -377,12 +465,26 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             str(max_hold),
         ]
     )
+    scheduled = []
+    for item in state.get("injections") or []:
+        injection = injection_unit(run_id, str(item["phase"]))
+        _clear_unit(injection + ".timer", run_id)
+        _clear_unit(injection + ".service", run_id)
+        run(injection_command(run_id, item))
+        scheduled.append(
+            {
+                **item,
+                "unit": injection + ".timer",
+                "scheduled_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
     update_state(
         path,
         {
             "matched_row": matched,
             "hold_started_at": started_at,
             "holder_unit": unit + ".service",
+            "scheduled_injections": scheduled,
         },
     )
     update_state(
@@ -398,19 +500,6 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
     )
 
 
-def checked_probe_script(value: str) -> str:
-    """The path the watcher unit will run must be *this* file, on the host.
-
-    Compared as a resolved full path, not a basename: a Pod-side
-    ``/host/run/...`` path has the right basename while the systemd unit,
-    which runs on the host, cannot find it.
-    """
-
-    if Path(value).resolve() != Path(__file__).resolve():
-        raise ProbeError("probe script identity mismatch")
-    return value
-
-
 def arm_holder(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     safe_id(arguments.drill_id, "drill ID")
@@ -418,7 +507,9 @@ def arm_holder(arguments: argparse.Namespace) -> None:
     max_hold = checked_max_hold(arguments.max_hold_seconds)
     if arguments.after_ledger_op not in ARM_LEDGER_OPERATIONS:
         raise ProbeError("after-ledger-op is not permitted for arming")
-    checked_probe_script(arguments.probe_script)
+    if Path(arguments.probe_script).name != Path(__file__).name:
+        raise ProbeError("probe script identity mismatch")
+    injections = injection_plan(arguments)
     rows = ledger_rows()
     baseline_ids = [
         row["command_id"]
@@ -440,6 +531,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "baseline_command_ids": baseline_ids,
             "verify_baseline_ids": verify_baseline_ids,
             "armed_at": datetime.now(timezone.utc).isoformat(),
+            "injections": injections,
         },
     )
     unit = arm_unit(run_id)
@@ -465,6 +557,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "after_ledger_op": arguments.after_ledger_op,
             "baseline_command_ids": baseline_ids,
             "verify_baseline_ids": verify_baseline_ids,
+            "injections": injections,
         }
     )
 
@@ -476,6 +569,9 @@ def disarm_holder(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     _clear_unit(arm_unit(run_id) + ".service", run_id)
     _clear_unit(holder_unit(run_id) + ".service", run_id)
+    for phase in INJECTION_PHASES:
+        _clear_unit(injection_unit(run_id, phase) + ".timer", run_id)
+        _clear_unit(injection_unit(run_id, phase) + ".service", run_id)
     path = state_path(run_id)
     if path.is_file():
         update_state(path, {"disarmed_at": datetime.now(timezone.utc).isoformat()})
@@ -502,6 +598,7 @@ def holder_status(arguments: argparse.Namespace) -> None:
             "hold_started_at": state.get("hold_started_at"),
             "arm_race_lost": state.get("arm_race_lost"),
             "holder_error": state.get("holder_error"),
+            "scheduled_injections": state.get("scheduled_injections"),
             "boot_id": _boot_id(),
         }
     )
@@ -539,6 +636,14 @@ def parser() -> argparse.ArgumentParser:
     arm.add_argument("--max-hold-seconds", type=int, default=900)
     arm.add_argument("--run-id", required=True)
     arm.add_argument("--probe-script", required=True)
+    # Optional: schedule the shared destructive probe's absorb (XID 46) and
+    # escalation (XID 79) writes N seconds after the holder starts.
+    arm.add_argument("--inject-script", default="")
+    arm.add_argument("--pci-bdf", default="")
+    for phase in INJECTION_PHASES:
+        arm.add_argument(f"--{phase}-marker", default="")
+        arm.add_argument(f"--{phase}-drill-id", default="")
+        arm.add_argument(f"--{phase}-after-seconds", type=int, default=0)
     arm.set_defaults(handler=arm_holder)
 
     watch = commands.add_parser("watch-ledger")

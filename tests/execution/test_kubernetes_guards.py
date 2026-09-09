@@ -15,7 +15,7 @@ from gpu_fault.adapters.kubernetes.primitives import (
     build_kubernetes_clients,
     kubernetes_request_timeout_seconds,
 )
-from tests._builders import build_store, copy_model
+from tests._builders import build_store, copy_model, workflow_step_execution
 
 from ._support import (
     FakeCoreApi,
@@ -525,6 +525,80 @@ def test_hyperpod_preflight_refuses_when_no_kubernetes_adapter_can_observe() -> 
     assert lifecycle.calls == 0
 
 
+def _unconfirmed_reboot_context(
+    store, core, incident_id: str, *, owner: str | None = None
+):
+    """A RESTART_NODE already submitted (WAITING with an operation id) whose
+    node the provider's bootstrap has uncordoned after the reboot."""
+    request = WorkflowExecutionRequest(
+        expected_fencing_token=3, confirm_cluster_name="hp-cluster"
+    )
+    context = _hyperpod_context(store, request)
+    core.node["spec"]["unschedulable"] = False
+    if owner is not None:
+        core.node["metadata"]["annotations"]["gpu-fault.io/incident-id"] = owner
+    previous = workflow_step_execution(
+        0,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowStepStatus.WAITING,
+        adapter_operation_id="reboot-op-1",
+        details={
+            "observed_isolation": {
+                "node-a": {"kubernetes_node": "node-a", "unschedulable": True}
+            }
+        },
+    )
+    return WorkflowStepContext(
+        workflow=copy_model(context.workflow, step_executions=[previous]),
+        incident=context.incident,
+        step=context.step,
+        step_index=0,
+        request=request,
+        idempotency_key=context.idempotency_key,
+    )
+
+
+def test_a_rebooting_node_the_provider_uncordoned_is_re_isolated_while_waiting() -> (
+    None
+):
+    """HyperPod's node bootstrap clears ``spec.unschedulable`` after a managed
+    reboot (audit 2026-09-09: hyperpod-service-linked-role, bootstrap/v0.0.0);
+    the ownership annotations survive. Left alone the node is schedulable until
+    RESTORE_SCHEDULING, and the REPLACE_NODE rung an unconfirmed reboot escalates
+    into refuses it as "not isolated" (DESTR-014 attempt 8). Each poll of the
+    unconfirmed reboot re-cordons a node this incident still owns."""
+    store = build_store()
+    core = _isolated_node("incident-active")
+    context = _unconfirmed_reboot_context(store, core, "incident-active")
+    lifecycle = FakeHyperPodLifecycle()
+    adapter = HyperPodLifecycleStepAdapter(lifecycle, kubernetes_adapter=_adapter(core))
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert core.node["spec"]["unschedulable"] is True, core.node["spec"]
+    assert outcome.details["isolation_reasserted"] == ["node-a"], outcome.details
+    assert outcome.details["observed_isolation"], "the submit-time record is kept"
+    assert lifecycle.calls == 0, "no second reboot is submitted"
+
+
+def test_a_node_another_incident_owns_is_left_alone_while_waiting() -> None:
+    store = build_store()
+    core = _isolated_node("incident-active")
+    context = _unconfirmed_reboot_context(
+        store, core, "incident-active", owner="incident-other"
+    )
+    adapter = HyperPodLifecycleStepAdapter(
+        FakeHyperPodLifecycle(), kubernetes_adapter=_adapter(core)
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert core.node["spec"]["unschedulable"] is False, core.node["spec"]
+    assert "isolation_reasserted" not in outcome.details, outcome.details
+
+
 def test_hyperpod_preflight_passes_observed_isolation_to_the_provider() -> None:
     store = build_store()
     request = WorkflowExecutionRequest(
@@ -661,3 +735,53 @@ def test_isolate_and_restore_record_the_node_scheduling_baseline() -> None:
     assert "gpu-fault.io/quarantined" in baseline["before"]["taint_keys"]
     assert baseline["after"]["unschedulable"] is False
     assert "gpu-fault.io/quarantined" not in baseline["after"]["taint_keys"]
+
+
+def test_restore_keeps_an_unreserved_warm_spare_cordoned() -> None:
+    """Live 2026-09-08 (DESTR-003): a declared spare, uncordoned by its
+    failover and later quarantined, was restored with previous-unschedulable
+    false and left labeled but schedulable -- a state the pool health check
+    refuses and no supported path re-cordons. An unreserved spare stays
+    cordoned; only the quarantine and ownership come off."""
+    store = build_store()
+    context = _context(store, WorkflowOperation.RESTORE_SCHEDULING)
+    core = _isolated_node(context.incident.incident_id)
+    core.node["metadata"]["labels"] = {"gpu-fault.io/spare": "true"}
+    core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] = "AVAILABLE"
+
+    outcome = _adapter(core).execute(context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED
+    assert core.node["spec"]["unschedulable"] is True, (
+        "an unreserved spare stays cordoned"
+    )
+    assert "gpu-fault.io/incident-id" not in core.node["metadata"]["annotations"]
+    assert not any(
+        item["key"] == "gpu-fault.io/quarantined"
+        for item in core.node["spec"]["taints"]
+    ), "the quarantine still comes off"
+    assert core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] == (
+        "AVAILABLE"
+    ), "the pool state is the pool's to change, not the restore's"
+
+
+def test_restore_uncordons_an_allocated_spare_and_an_ordinary_node() -> None:
+    """A spare ALLOCATED to an incident is serving as the replacement node and
+    is uncordoned like any other node; so is a node without the spare label."""
+    for labels, pool_state in (
+        ({"gpu-fault.io/spare": "true"}, "ALLOCATED"),
+        ({}, None),
+    ):
+        store = build_store()
+        context = _context(store, WorkflowOperation.RESTORE_SCHEDULING)
+        core = _isolated_node(context.incident.incident_id)
+        core.node["metadata"]["labels"] = labels
+        if pool_state:
+            core.node["metadata"]["annotations"]["gpu-fault.io/spare-pool-state"] = (
+                pool_state
+            )
+
+        outcome = _adapter(core).execute(context)
+
+        assert outcome.status is WorkflowStepStatus.SUCCEEDED
+        assert core.node["spec"]["unschedulable"] is False, (labels, pool_state)

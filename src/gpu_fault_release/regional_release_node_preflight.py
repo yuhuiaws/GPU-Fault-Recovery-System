@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from gpu_fault.hyperpod_spares import (
@@ -11,11 +10,12 @@ from gpu_fault.hyperpod_spares import (
     SPARE_RESERVATION_ANNOTATION,
     SparePoolState,
 )
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_rendering import build_reconciler_environment
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 CORDON_TAINT = "node.kubernetes.io/unschedulable"
 BLOCKING_TAINT_KEYS = frozenset(
     {

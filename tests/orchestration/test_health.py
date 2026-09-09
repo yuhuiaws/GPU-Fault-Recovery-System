@@ -641,7 +641,7 @@ def test_efa_hung_finding_requests_process_diagnostic_bundle(
         WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
         WorkflowOperation.VALIDATE_FABRIC,
     ]
-    assert workflow.dag_enabled
+    assert workflow.dag_enabled, "a two-node hung triage compiles as a DAG"
     assert workflow.dag_revision == 1
     assert [step.depends_on_step_indexes for step in workflow.official_steps] == [
         [],
@@ -651,7 +651,7 @@ def test_efa_hung_finding_requests_process_diagnostic_bundle(
     ]
     assert all(
         step.node_ids == ["node-a", "node-b"] for step in workflow.official_steps
-    )
+    ), [step.node_ids for step in workflow.official_steps]
     triage = workflow.official_steps[1]
     assert triage.parameters == {
         **parameters,
@@ -702,3 +702,131 @@ def test_node_health_without_ingested_at_matches_running_attempt(
 
     assert matched is not None
     assert matched.attempt_id == "attempt-a"
+
+
+def _rma_drain_finding(
+    workload_state: WorkloadState,
+    *,
+    official_action: str | None = "RUN_FIELD_DIAGNOSTIC_FOR_RMA",
+) -> NodeHealthFinding:
+    return node_health_finding(
+        "finding-row-remap-failure",
+        "row-remap-failure",
+        observed_at=NOW,
+        category=NodeHealthCategory.GPU,
+        severity="critical",
+        reason="row_remap_failure=1 exceeds NVIDIA RMA threshold",
+        recommended_action=RecoveryAction.DRAIN,
+        official_action=official_action,
+        gpu_uuids=["GPU-a"],
+        runtime_profile_version="simulated-v1",
+        workload_state=workload_state,
+        affected_workload_ids=(
+            ["training/job/job-a"] if workload_state is WorkloadState.ACTIVE else []
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("workload_state", "official_action", "expected"),
+    [
+        pytest.param(
+            WorkloadState.ACTIVE,
+            "RUN_FIELD_DIAGNOSTIC_FOR_RMA",
+            [
+                WorkflowOperation.FREEZE_EVIDENCE,
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.STOP_WORKLOADS,
+                WorkflowOperation.QUARANTINE,
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.RUN_FIELD_DIAGNOSTIC,
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ],
+            id="active-rma",
+        ),
+        pytest.param(
+            WorkloadState.IDLE,
+            None,
+            [
+                WorkflowOperation.FREEZE_EVIDENCE,
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.QUARANTINE,
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ],
+            id="idle-plain-drain",
+        ),
+    ],
+)
+def test_drain_chain_ends_in_a_support_escalation(
+    context: ApplicationContext,
+    workload_state: WorkloadState,
+    official_action: str | None,
+    expected: list[WorkflowOperation],
+) -> None:
+    """A DRAIN finding is RMA-class: the node stays isolated on purpose, so
+    the chain must end by handing it to an operator (ESCALATE_SUPPORT), not
+    fall silent after VALIDATE_GPU with the node held and nobody told."""
+    incident, workflow = context.orchestrator.ingest_node_health(
+        _rma_drain_finding(workload_state, official_action=official_action)
+    )
+
+    assert incident.effective_action is RecoveryAction.DRAIN
+    assert workflow.status is WorkflowStatus.PENDING, workflow.blocked_reasons
+    operations = [step.operation for step in workflow.official_steps]
+    assert operations == expected
+    assert operations[-1] is WorkflowOperation.ESCALATE_SUPPORT
+    assert WorkflowOperation.QUARANTINE in operations
+    assert WorkflowOperation.RESTORE_SCHEDULING not in operations
+    support = workflow.official_steps[-1]
+    assert support.execution_owner == "simulated-runtime"
+    assert support.node_ids == ["node-a"]
+
+
+def test_a_completed_drain_chain_leaves_the_incident_escalated(
+    context: ApplicationContext,
+) -> None:
+    """Running the compiled DRAIN chain to the end must leave the node
+    quarantined and the incident ESCALATED, not QUARANTINED: only an ESCALATED
+    incident can be closed by an operator once the RMA is done."""
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import IncidentState, WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    incident, workflow = context.orchestrator.ingest_node_health(
+        _rma_drain_finding(WorkloadState.IDLE)
+    )
+    operations = [step.operation for step in workflow.official_steps]
+
+    class _SimulatedRuntime:
+        def __init__(self) -> None:
+            self.executed: list[WorkflowOperation] = []
+
+        def supports(self, step: WorkflowStepSpec) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            self.executed.append(step_context.step.operation)
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    adapter = _SimulatedRuntime()
+    executor = active_workflow_executor(context.store, [adapter], operations)
+
+    result = executor.execute(
+        workflow.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+    )
+
+    assert result.status is WorkflowStatus.SUCCEEDED
+    assert adapter.executed == operations
+    saved = context.store.get_workflow(workflow.request_id)
+    assert WorkflowOperation.QUARANTINE in saved.completed_operations
+    assert WorkflowOperation.RESTORE_SCHEDULING not in saved.completed_operations
+    assert WorkflowOperation.ESCALATE_SUPPORT in saved.completed_operations
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.ESCALATED
+    )

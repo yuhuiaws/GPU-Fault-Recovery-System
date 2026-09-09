@@ -11,8 +11,9 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
+from gpu_fault_release import repository_root
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
 MAX_UPGRADE_PARALLEL_CLUSTERS = 8
 DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")

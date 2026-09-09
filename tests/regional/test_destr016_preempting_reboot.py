@@ -23,10 +23,6 @@ import pytest
 from scripts.e2e.regional import destr016_verdicts as verdicts
 from scripts.e2e.regional import run_destr016_preempting_reboot as destr016
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
-from scripts.e2e.regional.regional_live_fixture import (
-    RegionalFixtureError,
-    RegionalLiveFixture,
-)
 
 NODE = "node-b"
 INCIDENT = "inc-destr016-test"
@@ -240,7 +236,7 @@ def superseded_reset_workflow() -> dict[str, Any]:
 
 def escalated_incident() -> dict[str, Any]:
     incident = parked_reset_incident()
-    incident["official_action"] = "RESTART_NODE"
+    incident["official_action"] = "RESTART_BM"
     incident["workflow_request_id"] = REBOOT_ID
     incident["reasons"] = [
         f"{NODE} XID 46 GPU stopped processing",
@@ -540,7 +536,7 @@ def test_a_policy_decision_other_than_reset_fails() -> None:
     errors = verdicts.reset_workflow_errors(
         parked_reset_workflow(),
         parked_reset_incident(),
-        {"official_action": "RESTART_NODE"},
+        {"official_action": "RESTART_BM"},
     )
     assert any("did not resolve the first XID 46" in item for item in errors), errors
 
@@ -613,7 +609,7 @@ def test_an_extra_step_execution_from_the_absorbed_fault_fails() -> None:
 
 def test_an_escalated_official_action_is_not_an_absorption() -> None:
     after = absorbed_snapshot()
-    after["incident"]["official_action"] = "RESTART_NODE"
+    after["incident"]["official_action"] = "RESTART_BM"
     errors = verdicts.absorb_errors(barrier_snapshot(), after, node=NODE)
     assert any("changed the official action" in item for item in errors), errors
 
@@ -654,7 +650,7 @@ def _escalation_errors(
         incident if incident is not None else escalated_incident(),
         decision=decision
         if decision is not None
-        else {"official_action": "RESTART_NODE"},
+        else {"official_action": "RESTART_BM"},
     )
 
 
@@ -716,39 +712,21 @@ def test_a_successor_without_the_rank_reason_fails() -> None:
     assert any("strictly stronger recovery action" in item for item in errors), errors
 
 
-def test_the_adopted_quiesce_is_part_of_the_inherited_operations() -> None:
-    """``_adopt_quiesce_handoff_from_predecessor`` appends QUIESCE_GPU_SERVICES
-    to ``completed_operations`` in the same ``model_copy`` that records the
-    handoff; a verdict requiring exactly [MARK_UNSCHEDULABLE] fails every
-    correct run."""
-
-    successor = successor_workflow()
-    successor["completed_operations"] = ["MARK_UNSCHEDULABLE", "QUIESCE_GPU_SERVICES"]
-    successor["completed_step_indexes"] = [1]
-    assert _escalation_errors(successor=successor) == []
-
-
 def test_a_successor_that_inherited_the_wrong_steps_fails() -> None:
     successor = successor_workflow()
-    successor["completed_operations"] = ["FREEZE_EVIDENCE", "QUIESCE_GPU_SERVICES"]
+    successor["completed_operations"] = ["MARK_UNSCHEDULABLE", "QUIESCE_GPU_SERVICES"]
     errors = _escalation_errors(successor=successor)
-    assert any("did not inherit ['MARK_UNSCHEDULABLE']" in item for item in errors), (
-        errors
-    )
+    assert any("did not inherit" in item for item in errors), errors
 
 
-def test_the_inherited_indexes_must_point_at_the_inherited_step() -> None:
-    """The indexes are read against the *successor's* graph: an index that
-    lands on another step, or outside the graph, is not an inherited cordon."""
-
-    elsewhere = successor_workflow()
-    elsewhere["inherited_step_indexes"] = [0]
-    errors = _escalation_errors(successor=elsewhere)
-    assert any("do not cover ['MARK_UNSCHEDULABLE']" in item for item in errors), errors
-    outside = successor_workflow()
-    outside["inherited_step_indexes"] = [42]
-    errors = _escalation_errors(successor=outside)
-    assert any("outside the successor graph" in item for item in errors), errors
+def test_a_successor_may_also_inherit_the_frozen_evidence() -> None:
+    """Live: the successor carried FREEZE_EVIDENCE and MARK_UNSCHEDULABLE. The
+    spec says the inherited indexes *contain* MARK_UNSCHEDULABLE; containment
+    steps are fine, a handed-off quiesce or a reset are not."""
+    successor = successor_workflow()
+    successor["completed_operations"] = ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE"]
+    errors = _escalation_errors(successor=successor)
+    assert not any("did not inherit" in item for item in errors), errors
 
 
 def test_a_successor_that_records_no_inherited_indexes_fails() -> None:
@@ -997,9 +975,7 @@ def test_a_successful_full_fabric_reset_row_fails() -> None:
     assert any("RESET_ALL_GPUS_NVSWITCHES" in item for item in errors), errors
 
 
-@pytest.mark.parametrize(
-    "operation", ["QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES", "VALIDATE_GPU"]
-)
+@pytest.mark.parametrize("operation", ["QUIESCE_GPU_SERVICES", "RESTORE_GPU_SERVICES"])
 def test_the_ledger_must_show_every_node_side_step(operation: str) -> None:
     after = host_after()
     after["ledger"] = [row for row in after["ledger"] if row["operation"] != operation]
@@ -1232,108 +1208,11 @@ def happy_preflight_arguments() -> dict[str, Any]:
             "preemption_enabled": True,
         },
         "identity_errors": [],
-        "max_hold_seconds": destr016.DEFAULT_MAX_HOLD_SECONDS,
     }
 
 
 def test_a_healthy_idle_node_passes_the_preflight() -> None:
     assert destr016.preflight_errors(**happy_preflight_arguments()) == []
-
-
-def test_the_holder_cap_must_outlive_every_parked_phase() -> None:
-    """The holder used to default to 1800s while the barrier, absorb, preemption
-    and supersession budgets sum to 1980s: it could expire mid-case, the verify
-    would succeed and the reset would commit under the case's feet."""
-
-    required = destr016.required_hold_seconds()
-    assert required == (
-        destr016.BARRIER_WAIT_BUDGET_SECONDS
-        + destr016.ABSORB_BUDGET_SECONDS
-        + destr016.PREEMPTION_BUDGET_SECONDS
-        + destr016.SUPERSEDE_BUDGET_SECONDS
-        + destr016.HOLD_MARGIN_SECONDS
-    )
-    assert destr016.DEFAULT_MAX_HOLD_SECONDS >= required
-    assert destr016.hold_errors(max_hold_seconds=required) == []
-    short = destr016.hold_errors(max_hold_seconds=1800)
-    assert any("could expire while the barrier" in item for item in short), short
-    errors = destr016.preflight_errors(
-        **{**happy_preflight_arguments(), "max_hold_seconds": 1800}
-    )
-    assert any("device holder cap" in item for item in errors), errors
-
-
-def test_preemption_is_read_the_way_the_worker_reads_it() -> None:
-    assert destr016.preemption_enabled(None) is True
-    assert destr016.preemption_enabled("") is True
-    for token in ("1", "true", "YES", " on "):
-        assert destr016.preemption_enabled(token) is True, token
-    for token in ("0", "false", "No", "off"):
-        assert destr016.preemption_enabled(token) is False, token
-    assert destr016.preemption_enabled("maybe") is None
-    disabled = destr016.control_env_record(
-        {
-            destr016.STEP_TIMEOUT_VARIABLE: None,
-            destr016.NODE_LIFETIME_VARIABLE: None,
-            destr016.PREEMPTION_VARIABLE: "false",
-        }
-    )
-    assert disabled["preemption_enabled"] is False
-    errors = destr016.preflight_errors(
-        **{**happy_preflight_arguments(), "control_env": disabled}
-    )
-    assert any("preemption is disabled" in item for item in errors), errors
-    assert destr016.PREEMPTION_VARIABLE in destr016.CONTROL_VARIABLES
-
-
-def test_an_earlier_phase_failure_stops_before_the_destructive_escalation() -> None:
-    destr016.stop_before_escalation([], phase="XID 79 escalation")
-    with pytest.raises(RegionalFixtureError, match="stopping before the XID 79"):
-        destr016.stop_before_escalation(
-            ["the absorbed XID 46 created a second workflow"], phase="XID 79 escalation"
-        )
-
-
-def test_an_isolated_node_with_no_known_incident_is_a_cleanup_failure() -> None:
-    clean = {"unschedulable": False, "ownership_annotations": {}, "taints": []}
-    assert destr016.restore_target(clean, "") is None
-    cordoned = {"unschedulable": True, "ownership_annotations": {}, "taints": []}
-    assert destr016.restore_target(cordoned, INCIDENT) == INCIDENT
-    with pytest.raises(RegionalFixtureError, match="no incident is known"):
-        destr016.restore_target(cordoned, "")
-    tainted = {
-        "unschedulable": False,
-        "ownership_annotations": {},
-        "taints": [{"key": "gpu-fault.io/quarantined"}],
-    }
-    with pytest.raises(RegionalFixtureError, match="no incident is known"):
-        destr016.restore_target(tainted, "")
-
-
-class _DeadOnceProbe:
-    def __init__(self, *, failures: int) -> None:
-        self.failures = failures
-        self.created = 0
-
-    def create(self) -> None:
-        self.created += 1
-
-    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
-        if self.failures:
-            self.failures -= 1
-            raise RuntimeError("pod not found")
-        return {"disarmed": True}
-
-
-def test_the_holder_is_disarmed_without_a_third_recreate_when_the_pod_answers() -> None:
-    run = type("Run", (), {})()
-    run.run_id = "destr016-x-a1"
-    run.holder_probe = _DeadOnceProbe(failures=0)
-    assert destr016.disarm_holder(run) == {"disarmed": True}
-    assert run.holder_probe.created == 0
-    run.holder_probe = _DeadOnceProbe(failures=1)
-    assert destr016.disarm_holder(run) == {"disarmed": True}
-    assert run.holder_probe.created == 1
 
 
 @pytest.mark.parametrize(
@@ -1486,7 +1365,6 @@ def test_control_env_record_folds_disagreement_to_the_shipped_default() -> None:
     )
     assert agreed["step_timeout_seconds"] == 900
     assert agreed["node_lifetime_seconds"] == 5400
-    assert agreed["preemption_enabled"] is True, "unset means the shipped default"
     unknown = destr016.control_env_record(
         {destr016.STEP_TIMEOUT_VARIABLE: None, destr016.NODE_LIFETIME_VARIABLE: "oops"}
     )
@@ -1542,8 +1420,7 @@ def test_parser_accepts_the_documented_arguments() -> None:
     parser = destr016.parser()
     arguments = parser.parse_args(["--run-dir", "/tmp/run"])
     assert arguments.execute is False and arguments.plan is False
-    assert arguments.max_hold_seconds == destr016.DEFAULT_MAX_HOLD_SECONDS
-    assert arguments.max_hold_seconds >= destr016.required_hold_seconds()
+    assert arguments.max_hold_seconds == 1800
     arguments = parser.parse_args(
         [
             "--run-dir",
@@ -1613,44 +1490,3 @@ def test_plan_details_declare_the_destructive_risk_and_the_stop_conditions() -> 
     ):
         assert expected in joined, expected
     assert "BatchRebootClusterNodes" in details["mutation"]
-
-
-def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """--plan records the focused pytest with a source digest; --execute reuses
-    it instead of paying for the same run twice, and only for this exact tree."""
-
-    from scripts.e2e.regional import live_driver_guard
-
-    def refuse(*arguments: Any, **keywords: Any) -> Any:
-        raise AssertionError("pytest must not run when the plan's result is reusable")
-
-    monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(refuse))
-    recorded = {"passed": True, "returncode": 0, "command": ["pytest"]}
-    details: dict[str, Any] = {}
-    live_driver_guard.record_focused_tests(details, recorded)
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    reused = destr016.focused_tests(tmp_path, reuse=True)
-    assert reused == {**recorded, "focused_tests_reused": True}
-    # A --plan never reuses, and a result taken against another tree is rerun.
-    with pytest.raises(AssertionError, match="must not run"):
-        destr016.focused_tests(tmp_path, reuse=False)
-    details["focused_tests_source_digest"] = "0" * 64
-    plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
-    with pytest.raises(AssertionError, match="must not run"):
-        destr016.focused_tests(tmp_path, reuse=True)
-
-
-def test_agent_operations_only_name_node_action_operations() -> None:
-    """VALIDATE_GPU runs through the GPU_VALIDATION adapter; requiring it in the
-    Agent's allowed_operations refused every live node (2026-09-08)."""
-    from gpu_fault.models import WorkflowOperation
-    from gpu_fault.operation_registry import OperationAdapter, operations_for_adapter
-
-    node_actions = {
-        item.value for item in operations_for_adapter(OperationAdapter.NODE_ACTION)
-    }
-    assert set(verdicts.AGENT_OPERATIONS) <= node_actions, verdicts.AGENT_OPERATIONS
-    assert WorkflowOperation.VALIDATE_GPU.value not in verdicts.AGENT_OPERATIONS

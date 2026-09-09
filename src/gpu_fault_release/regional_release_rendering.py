@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
@@ -17,7 +17,7 @@ from gpu_fault_release.regional_release_config import (
     render_nlb_manifest,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = repository_root()
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
 

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Open or close a temporary env window on the cluster executor Deployment.
 
-`GF-REGIONAL-DESTR-014` needs two executor variables changed for one
-maintenance window and then restored exactly:
+`GF-REGIONAL-DESTR-014` needs one executor variable changed for one
+maintenance window and then restored exactly (HA-004 lowers the lease and poll
+the same way):
 
 * ``GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`` -- lowered so node-b's RESET_GPU
   reaches FAILED in tens of seconds rather than ~5 minutes.
-* ``GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`` -- lowered so
-  node-c's RESTART_NODE reaches its bounded-waiting timeout inside the window.
+
+The managed-recovery timeout the same case compresses is *not* an executor
+variable: ``execution/config.py`` reads it on the control-worker to derive the
+RESTART_NODE/REPLACE_NODE waiting caps, so it goes through
+``control_plane_env_window.py``. Until 2026-09-08 this window carried it too,
+and seven live attempts set it where nothing read it.
 
 Modeled on ``synthetic_replacement_route.py``: it records the Deployment's
 pre-window env in a baseline file before mutating, waits until *every ready
@@ -34,6 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    replica_vanished,
     write_json_atomic,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -51,14 +57,15 @@ from scripts.e2e.regional.site_profile import (  # noqa: E402
 
 DEPLOYMENT = "gpu-fault-cluster-executor"
 CONTAINER = "executor"
-# DESTR-014 lowers the two verify/recovery bounds; HA-004 lowers the executor's
-# lease and poll so a WAITING command is re-claimed inside its window. All four
-# are positive second/attempt counts, so the same validation applies.
+# DESTR-014 lowers the GPU client verify attempts; HA-004 lowers the executor's
+# lease and poll so a WAITING command is re-claimed inside its window. All are
+# positive second/attempt counts, so the same validation applies. The
+# managed-recovery timeout is a control-worker variable and is deliberately
+# absent (see the module docstring).
 ALLOWED_VARIABLES = (
     "GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS",
     "GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS",
     "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS",
-    "GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS",
 )
 OPEN_CONFIRMATION = "OPEN_EXECUTOR_ENV_WINDOW"
 CLOSE_CONFIRMATION = "CLOSE_EXECUTOR_ENV_WINDOW"
@@ -77,9 +84,9 @@ def now() -> str:
 def parse_assignments(pairs: list[str]) -> dict[str, str]:
     """Validate ``NAME=VALUE`` pairs against the compiled-in allow-list.
 
-    Values must be positive integers -- both variables are second/attempt
-    counts, and the case exists to *lower* them, so a non-numeric or zero value
-    is a typo that would silently disable the very timeout it means to tighten.
+    Values must be positive integers -- the variable is an attempt count, and
+    the case exists to *lower* it, so a non-numeric or zero value is a typo that
+    would silently disable the very bound it means to tighten.
     """
 
     result: dict[str, str] = {}
@@ -207,16 +214,24 @@ def replica_values(regional: RegionalLiveFixture) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     names = ",".join(repr(name) for name in ALLOWED_VARIABLES)
     for pod in regional.ready_pods("gpu", DEPLOYMENT):
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{names}]}}))",
-            timeout=60,
-        )
+        try:
+            output = regional.kubectl(
+                "gpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{n: os.getenv(n) for n in [{names}]}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as error:
+            # The window rolls the executor Deployment; a replica terminated
+            # between the listing and this exec is no longer a ready replica.
+            # Drop it and let ``converge`` re-poll (DESTR-014, 2026-09-08).
+            if replica_vanished(error):
+                continue
+            raise
         result.append(
             {
                 "pod": str(pod["name"]),

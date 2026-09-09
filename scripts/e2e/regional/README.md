@@ -108,6 +108,7 @@ them would turn every `--plan` into an execute against a real node.
 - `run_collector_acceptance.py`
 - `run_collector_destructive.py`
 - `run_collect016_training_recovery.py`
+- `run_collect021_late_xid_after_pod_death.py`
 - `run_collect017_efa_plugin.py`
 - `run_iso006_cluster_offline.py`
 - `run_e2e002_multicluster_fault.py`
@@ -591,7 +592,9 @@ Current classification:
 - COLLECT manual cases use two shared entry points:
   `run_collector_acceptance.py` for 001/002/003/005/009/010/011/012 and
   `run_collector_destructive.py` for 004/008/013/014/015. COLLECT-016 and
-  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers.
+  COLLECT-017 have dedicated managed-training and EFA/device-plugin drivers;
+  COLLECT-021 (`run_collect021_late_xid_after_pod_death.py`) reuses the
+  COLLECT-016 managed-training fixtures to drive the Pod-dies-before-XID race.
   Every driver is plan-only by default and requires the previous formal case
   evidence before mutation.
 - ISO-006 and E2E-002 have dedicated two-physical-cluster drivers.
@@ -659,7 +662,10 @@ restore a quarantined node. Direct taint or ownership-annotation deletion is
 not an equivalent cleanup.
 
 `declare_warm_spare.py` declares or releases the one warm spare node
-`DESTR-003`/`DESTR-008` require. It is read-only unless `--declare` or
+`DESTR-003`/`DESTR-008` require. It is a thin wrapper over the supported operator
+command, `gpu-fault-admin config spare` (`src/gpu_fault/admin/warm_spare.py`):
+the wrapper binds a site profile and a `--baseline` file to the same checks and
+the same mutation, and holds no logic of its own. It is read-only unless `--declare` or
 `--release` is given, each with its own confirmation string, and it records the
 node's pre-declaration labels and cordon state in a `--baseline` file so the
 release restores exactly that — a node that was already cordoned stays cordoned.

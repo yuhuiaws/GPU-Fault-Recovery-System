@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Sequence
 
@@ -35,6 +35,9 @@ _REQUIRED_RESTART_PARAMETERS = frozenset(
         "restart_budget",
     }
 )
+# ``details["reason"]`` of the one preflight failure that does not abort the
+# workflow (see ``withhold_exhausted_restart``).
+BUDGET_EXHAUSTED_REASON = "RESTART_BUDGET_EXHAUSTED"
 
 
 @dataclass(frozen=True)
@@ -302,7 +305,7 @@ def reserve_restart_budgets(
                 f"{state.cluster_id}/{state.job_id}: "
                 f"{state.restart_count}/{state.budget}",
                 details={
-                    "reason": "RESTART_BUDGET_EXHAUSTED",
+                    "reason": BUDGET_EXHAUSTED_REASON,
                     "restart_count": state.restart_count,
                     "restart_budget": state.budget,
                 },
@@ -372,28 +375,123 @@ def prepare_claimed_workflow(
             ),
         )
     steps = workflow.safety_steps if is_safety else workflow.official_steps
-    failure = reserve_restart_budgets(
-        executor.store,
-        workflow,
-        incident,
-        steps,
-        phase="safety" if is_safety else "official",
-    )
-    return ClaimedWorkflowPreparation(
-        workflow=workflow,
-        execution_epoch=execution_epoch,
-        result=(
-            fail_restart_preflight(
-                executor,
-                workflow,
-                incident,
-                execution_epoch,
-                failure,
+    # Each pass either reserves every pending restart, withholds one whose
+    # budget is spent and goes round again for the rest (the withheld step is
+    # resolved, so the next pass skips it), or aborts on a malformed context.
+    while True:
+        failure = reserve_restart_budgets(
+            executor.store,
+            workflow,
+            incident,
+            steps,
+            phase="safety" if is_safety else "official",
+        )
+        if failure is None:
+            return ClaimedWorkflowPreparation(
+                workflow=workflow,
+                execution_epoch=execution_epoch,
             )
-            if failure is not None
-            else None
-        ),
+        if (failure.outcome.details or {}).get("reason") != BUDGET_EXHAUSTED_REASON:
+            return ClaimedWorkflowPreparation(
+                workflow=workflow,
+                execution_epoch=execution_epoch,
+                result=fail_restart_preflight(
+                    executor,
+                    workflow,
+                    incident,
+                    execution_epoch,
+                    failure,
+                ),
+            )
+        workflow = withhold_exhausted_restart(
+            executor,
+            workflow,
+            incident,
+            execution_epoch,
+            failure,
+        )
+
+
+def withhold_exhausted_restart(
+    executor: Any,
+    workflow: WorkflowRequest,
+    incident: FaultIncident,
+    execution_epoch: int,
+    failure: RestartBudgetPreflightFailure,
+) -> WorkflowRequest:
+    """Keep the chain, drop only the restart, when the job's budget is spent.
+
+    逻辑 4. Failing the whole workflow here left the faulty GPU untouched with
+    the job still on it: no cordon, no stop, no reset ran, and the escalation
+    classifier opened no successor because the only FAILED execution was the
+    restart. The budget says "do not restart this job again", not "do not
+    repair this node", so the repair steps go ahead as planned and only the
+    restart is withheld: its FAILED record is written now, before any adapter
+    runs, and the index is superseded so both step loops skip it (F-C2) --
+    no reservation is taken and no adapter is ever called for it, and
+    ``release_unattempted_restart_reservations`` finds a FAILED record without
+    the waiting-cap detail and leaves the (nonexistent) reservation alone.
+    ``terminal_failure_reason`` then makes ``_complete_claimed_workflow`` end
+    the workflow FAILED instead of SUCCEEDED once the rest ran: the job was
+    stopped and not restarted, and someone has to resubmit it.
+
+    The other preflight failures (missing, mismatched or invalid safety
+    context) keep aborting before the first step: they mean the plan itself is
+    malformed, and a stop-and-reset chain compiled from a broken context is
+    not one to run on trust.
+
+    The BUDGET_EXHAUSTED notice uses the restart adapter's builder -- same
+    template, same deduplication key -- saved once and sent through the
+    executor's alert path; the preflight is the only site that sends it now
+    that the adapter no longer reserves budget.
+    """
+
+    parameters = failure.step.parameters
+    outcome = failure.outcome
+    details = dict(outcome.details or {})
+    notification = executor.restart_email_builder.build_budget_exhausted(
+        cluster_id=str(parameters["cluster_id"]),
+        incident_id=incident.incident_id,
+        job_id=str(parameters["job_id"]),
+        attempt_id=str(parameters["source_attempt_id"]),
+        restart_count=int(details["restart_count"]),
+        restart_budget=int(details["restart_budget"]),
     )
+    notification = executor.store.save_notification_if_absent(notification)
+    if executor.notification_sender is not None:
+        executor.notification_sender(notification.notification_id)
+    outcome = WorkflowStepOutcome.failed(
+        outcome.error or "restart budget exhausted",
+        details={**details, "notification_id": notification.notification_id},
+    )
+    workflow = step_bounds.record_attempt(
+        workflow,
+        failure.step,
+        failure.step_index,
+        outcome,
+    )
+    workflow = workflow.model_copy(
+        update={
+            "superseded_step_indexes": sorted(
+                set(workflow.superseded_step_indexes) | {failure.step_index}
+            ),
+            "terminal_failure_reason": (
+                workflow.terminal_failure_reason or outcome.error
+            ),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+    executor._save_leased(workflow, execution_epoch)
+    LOGGER.warning(
+        "restart withheld for an exhausted budget; the remaining steps run "
+        "and the workflow will end FAILED: workflow=%s step=%s error=%s "
+        "notification=%s",
+        workflow.request_id,
+        failure.step_index,
+        outcome.error,
+        notification.notification_id,
+    )
+    return workflow
 
 
 def fail_restart_preflight(
@@ -405,31 +503,13 @@ def fail_restart_preflight(
 ) -> Any:
     """Persist a restart preflight failure without invoking an adapter.
 
-    An exhausted budget is also the operator's business: the preflight is the
-    only site that refuses a restart for it, so the preflight sends the mail
-    (the restart adapter no longer reserves, and so never learns the budget
-    is gone).
+    Only the malformed-context failures come here; an exhausted budget is
+    routed to ``withhold_exhausted_restart`` by ``prepare_claimed_workflow``,
+    and that is where the operator's mail is sent (the restart adapter no
+    longer reserves, and so never learns the budget is gone).
     """
 
     outcome = failure.outcome
-    details = outcome.details or {}
-    if details.get("reason") == "RESTART_BUDGET_EXHAUSTED":
-        parameters = failure.step.parameters
-        notification = executor.restart_email_builder.build_budget_exhausted(
-            cluster_id=incident.cluster_id,
-            incident_id=incident.incident_id,
-            job_id=str(parameters["job_id"]),
-            attempt_id=str(parameters["source_attempt_id"]),
-            restart_count=int(details["restart_count"]),
-            restart_budget=int(details["restart_budget"]),
-        )
-        notification = executor.store.save_notification_if_absent(notification)
-        if executor.notification_sender is not None:
-            executor.notification_sender(notification.notification_id)
-        outcome = replace(
-            outcome,
-            details={**details, "notification_id": notification.notification_id},
-        )
     workflow = step_bounds.record_attempt(
         workflow,
         failure.step,
