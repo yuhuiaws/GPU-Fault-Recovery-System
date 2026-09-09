@@ -79,15 +79,26 @@ class IdentityRunner(Runner):
         self.permissions = [dict(item) for item in permissions]
         self.identitystore_denied = identitystore_denied
 
-    # The region the Identity Center calls are expected in; Grafana stays in
-    # the CPU cluster's region whatever the site says.
+    # The region Identity Center is homed in: list-instances answers only
+    # there, identitystore is only ever asked there. Grafana stays in the CPU
+    # cluster's region whatever the site says.
     identity_region = REGION
+    # The account's enabled regions, as ``ec2 describe-regions`` lists them.
+    enabled_regions: Sequence[str] = (
+        "ap-south-1",
+        "eu-west-1",
+        "us-east-1",
+        "us-west-2",
+    )
+    # Regions whose list-instances call is refused (no permission / opt-in).
+    refusing_regions: Sequence[str] = ()
 
     def aws_json(self, region: str, *arguments: str, **keywords: Any) -> Any:
-        if arguments[0] in {"sso-admin", "identitystore"}:
+        if arguments[0] == "identitystore":
             assert region == self.identity_region, (
                 f"Identity Center was asked in {region}, not {self.identity_region}"
             )
+        if arguments[0] in {"sso-admin", "identitystore", "ec2"}:
             return json.loads(
                 self.run(["aws", *arguments, "--region", region], **keywords)
             )
@@ -99,7 +110,23 @@ class IdentityRunner(Runner):
             self.calls.append((argv, keywords))
             assert argv[2] == "list-instances", argv
             assert not keywords.get("mutate"), "listing instances is a read"
+            region = argv[argv.index("--region") + 1]
+            if region in self.refusing_regions:
+                raise BootstrapError(
+                    "command failed (254): aws sso-admin list-instances: An error "
+                    "occurred (AccessDeniedException) when calling the ListInstances "
+                    f"operation in {region}"
+                )
+            if region != self.identity_region:
+                return json.dumps({"Instances": []})
             return json.dumps({"Instances": self.instances})
+        if argv[1] == "ec2":
+            self.calls.append((argv, keywords))
+            assert argv[2] == "describe-regions", argv
+            assert not keywords.get("mutate"), "listing regions is a read"
+            return json.dumps(
+                {"Regions": [{"RegionName": name} for name in self.enabled_regions]}
+            )
         if argv[1] == "identitystore":
             self.calls.append((argv, keywords))
             return self._identitystore(argv, keywords)
@@ -199,6 +226,7 @@ def test_the_administrator_is_derived_from_the_email_and_granted_admin(
     assert result["admin_grant"] == {
         "email": ADMIN_EMAIL,
         "sso_user_id": USER_ID,
+        "identity_center_region": REGION,
         "role": "ADMIN",
         "status": "granted",
     }
@@ -342,7 +370,15 @@ def test_two_identity_center_instances_are_never_guessed_between(
     assert "update-permissions" not in runner.operations()
 
 
-def test_no_identity_center_instance_is_not_derivable(tmp_path: Path) -> None:
+def _regions_asked(runner: IdentityRunner, operation: str) -> list[str]:
+    return [
+        argv[argv.index("--region") + 1]
+        for argv, _k in runner.calls
+        if argv[0] == "aws" and argv[2] == operation
+    ]
+
+
+def test_no_identity_center_instance_anywhere_is_not_derivable(tmp_path: Path) -> None:
     runner = IdentityRunner(
         instances=[], users={("emails.value", ADMIN_EMAIL): USER_ID}
     )
@@ -353,10 +389,91 @@ def test_no_identity_center_instance_is_not_derivable(tmp_path: Path) -> None:
     assert grant["status"] == "not-derivable"
     assert "no IAM Identity Center instance" in grant["reason"]
     assert REGION in grant["reason"], "the reason does not say which region was asked"
-    assert "set spec.health.identityCenterRegion" in grant["reason"], (
-        "the reason does not name the setting for an Identity Center homed elsewhere"
-    )
+    assert "3 other enabled regions" in grant["reason"], grant["reason"]
+    assert "enable IAM Identity Center" in grant["reason"]
+    assert "spec.health.identityCenterRegion" in grant["reason"]
+    assert _regions_asked(runner, "list-instances") == [
+        REGION,
+        "ap-south-1",
+        "eu-west-1",
+        "us-west-2",
+    ], "the workspace region first, then every other enabled region"
     assert "get-user-id" not in runner.operations()
+
+
+# --- the home region is discovered, not configured ---------------------------------------
+
+
+def test_an_identity_center_homed_elsewhere_is_found_by_scanning_the_enabled_regions(
+    tmp_path: Path,
+) -> None:
+    """An Identity Center ARN names no region and list-instances answers only
+    from the home region, so with nothing configured the deploy asks every
+    enabled region until one answers (production 2026-09-09: workspace in
+    us-west-2, Identity Center homed in us-east-1, nobody granted)."""
+
+    runner = IdentityRunner(users={("emails.value", ADMIN_EMAIL): USER_ID})
+    runner.identity_region = "eu-west-1"
+
+    result = _ensure(runner, tmp_path)
+
+    grant = result["admin_grant"]
+    assert grant["status"] == "granted", grant
+    assert grant["sso_user_id"] == USER_ID
+    assert grant["identity_center_region"] == "eu-west-1"
+    assert _regions_asked(runner, "list-instances") == [
+        REGION,
+        "ap-south-1",
+        "eu-west-1",
+    ], "the scan stops at the first region that holds an instance"
+    assert _regions_asked(runner, "get-user-id") == ["eu-west-1"]
+    assert _regions_asked(runner, "update-permissions") == [REGION], (
+        "the Grafana write stays in the workspace's region"
+    )
+
+
+def test_a_region_that_refuses_list_instances_is_skipped_by_the_scan(
+    tmp_path: Path,
+) -> None:
+    runner = IdentityRunner(users={("emails.value", ADMIN_EMAIL): USER_ID})
+    runner.identity_region = "us-west-2"
+    runner.refusing_regions = ("ap-south-1", "eu-west-1")
+
+    result = _ensure(runner, tmp_path)
+
+    assert result["admin_grant"]["status"] == "granted", result["admin_grant"]
+    assert result["admin_grant"]["identity_center_region"] == "us-west-2"
+
+
+def test_the_discovered_region_is_persisted_into_the_site_health(
+    tmp_path: Path,
+) -> None:
+    """The next deploy must ask the discovered region directly, exactly as if
+    the operator had set spec.health.identityCenterRegion."""
+
+    runner = IdentityRunner(users={("emails.value", ADMIN_EMAIL): USER_ID})
+    runner.identity_region = "eu-west-1"
+    result = _ensure(runner, tmp_path)
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id=SITE)
+    state.record("monitoring_install", {"grafana": result})
+
+    health = grafana_site_health(state, GrafanaSettings())
+
+    assert health["identityCenterRegion"] == "eu-west-1"
+    assert health["grafanaWorkspaceId"] == result["workspace_id"]
+
+
+def test_the_workspace_region_holding_the_instance_never_triggers_a_scan(
+    tmp_path: Path,
+) -> None:
+    runner = IdentityRunner(users={("emails.value", ADMIN_EMAIL): USER_ID})
+
+    result = _ensure(runner, tmp_path)
+
+    assert result["admin_grant"]["status"] == "granted"
+    assert "describe-regions" not in runner.operations(), (
+        "the enabled regions were listed although the workspace region answered"
+    )
 
 
 # --- spec.health.identityCenterRegion --------------------------------------------------
@@ -398,8 +515,11 @@ def test_no_instance_in_the_overridden_region_names_the_setting_as_the_cause(
 
     reason = result["admin_grant"]["reason"]
     assert "eu-west-1" in reason and "spec.health.identityCenterRegion" in reason
-    assert "homed elsewhere" not in reason, (
-        "the reason suggests setting the override that is already set"
+    assert "enabled regions" not in reason, (
+        "the reason suggests a scan that the configured region rules out"
+    )
+    assert "describe-regions" not in runner.operations(), (
+        "the configured region must be asked alone, never scanned around"
     )
 
 

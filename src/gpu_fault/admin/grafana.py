@@ -28,8 +28,12 @@ command as sensitive).
 Opening the dashboards needs a person with a role on the workspace: Amazon
 Managed Grafana only authenticates IAM Identity Center or SAML users. After the
 import the deploy derives that person from the site's administrator email --
-``sso-admin list-instances`` names the one identity store, ``identitystore
-get-user-id`` finds the user by ``emails.value`` (then ``userName``),
+``sso-admin list-instances`` names the one identity store (asked in the
+workspace's region first, then in every other region enabled for the account,
+because an Identity Center ARN names no region and only the home region
+answers; ``spec.health.identityCenterRegion`` pins it and records the region
+found), ``identitystore get-user-id`` finds the user by ``emails.value`` (then
+``userName``),
 ``grafana list-permissions`` makes the grant idempotent -- and grants ADMIN, so
 the administrator can add viewers in the Grafana UI. ``--grafana-viewer
 <sso-user-id>`` still grants VIEWER to an explicitly named user (operator input:
@@ -39,8 +43,9 @@ recorded as ``not-derivable`` with the reason, and the deploy prints the exact
 ``aws grafana update-permissions`` line for the resolved workspace next to it.
 The read-only probe repeats the derivation on later deploys while it stays
 ``not-derivable``, so creating the user is enough for the next deploy to grant.
-The deploy host therefore needs ``sso:ListInstances``, ``identitystore:GetUserId``
-and ``grafana:ListPermissions`` next to ``grafana:UpdatePermissions``.
+The deploy host therefore needs ``sso:ListInstances``, ``identitystore:GetUserId``,
+``ec2:DescribeRegions`` (the region scan) and ``grafana:ListPermissions`` next to
+``grafana:UpdatePermissions``.
 """
 
 from __future__ import annotations
@@ -222,9 +227,9 @@ def grafana_site_health(
 ) -> dict[str, Any]:
     """The ``spec.health`` keys that persist this run's Grafana decision.
 
-    ``identityCenterRegion`` is the operator's, not derived: the regenerated
-    site must carry it forward or the next deploy would look the administrator
-    up in the wrong region again.
+    ``identityCenterRegion`` is carried forward whether the operator set it or
+    this run discovered it by scanning the enabled regions: either way the
+    next deploy must ask that region directly, not scan again.
     """
 
     result = _state_result(state) or {}
@@ -232,8 +237,15 @@ def grafana_site_health(
     health: dict[str, Any] = {}
     if workspace_id:
         health["grafanaWorkspaceId"] = str(workspace_id)
-    if settings.identity_center_region:
-        health["identityCenterRegion"] = settings.identity_center_region
+    admin_grant = result.get("admin_grant")
+    discovered = (
+        admin_grant.get("identity_center_region")
+        if isinstance(admin_grant, Mapping)
+        else None
+    )
+    identity_region = settings.identity_center_region or discovered
+    if identity_region:
+        health["identityCenterRegion"] = str(identity_region)
     return health
 
 
@@ -1052,11 +1064,11 @@ def grant_admin(
             "status": "not-derivable",
             "reason": "the deploy has no administrator email to derive the user from",
         }
-    identity_region = identity_center_region or region
     try:
-        store_id = _identity_store_id(
-            runner, identity_region, configured=identity_center_region is not None
+        identity_region, store_id = _identity_center_home(
+            runner, identity_center_region or region, configured=identity_center_region
         )
+        outcome["identity_center_region"] = identity_region
         sso_user_id = _identity_center_user_id(runner, identity_region, store_id, email)
         outcome["sso_user_id"] = sso_user_id
         held = _sso_user_role(runner, region, workspace_id, sso_user_id)
@@ -1074,25 +1086,43 @@ def grant_admin(
     return {**outcome, "status": "granted"}
 
 
-def _identity_store_id(
-    runner: CommandRunner, region: str, *, configured: bool = False
-) -> str:
-    """The identity store of the one IAM Identity Center instance; never a guess.
+def _identity_center_home(
+    runner: CommandRunner, region: str, *, configured: str | None = None
+) -> tuple[str, str]:
+    """The region IAM Identity Center is homed in and its identity store.
 
-    ``configured`` says the region came from ``spec.health.identityCenterRegion``;
-    otherwise an empty answer names that setting as the way out.
+    An Identity Center instance ARN (``arn:aws:sso:::instance/ssoins-…``) names
+    no region and ``sso-admin list-instances`` answers only from the home
+    region, so the home cannot be read off any ARN. ``configured`` is
+    ``spec.health.identityCenterRegion``: when set only that region is asked.
+    Otherwise the workspace's region is asked first and, when it holds no
+    instance, every other region enabled for the account is asked in turn (the
+    first Identity Center found wins; a region that refuses the call is
+    skipped). The discovered region is persisted into the site so the next
+    deploy asks it directly.
     """
 
-    instances = cast(
-        list[dict[str, Any]],
-        runner.aws_json(region, "sso-admin", "list-instances").get("Instances", []),
-    )
+    instances = _identity_center_instances(runner, region)
+    scanned: list[str] = []
+    if not instances and configured is None:
+        for candidate in _enabled_regions(runner, region):
+            if candidate == region:
+                continue
+            scanned.append(candidate)
+            try:
+                instances = _identity_center_instances(runner, candidate)
+            except BootstrapError:
+                continue
+            if instances:
+                region = candidate
+                break
     if not instances:
         where = (
             f"{region} (spec.health.identityCenterRegion)"
             if configured
-            else f"{region}; if Identity Center is homed elsewhere set "
-            "spec.health.identityCenterRegion"
+            else f"{region} or the {len(scanned)} other enabled regions "
+            "scanned; enable IAM Identity Center for the account, or set "
+            "spec.health.identityCenterRegion if the scan could not reach it"
         )
         raise BootstrapError(f"no IAM Identity Center instance is visible from {where}")
     if len(instances) > 1:
@@ -1107,7 +1137,27 @@ def _identity_store_id(
             f"IAM Identity Center instance {instances[0].get('InstanceArn')} "
             "carries no IdentityStoreId"
         )
-    return store_id
+    return region, store_id
+
+
+def _identity_center_instances(
+    runner: CommandRunner, region: str
+) -> list[dict[str, Any]]:
+    return cast(
+        list[dict[str, Any]],
+        runner.aws_json(region, "sso-admin", "list-instances").get("Instances", []),
+    )
+
+
+def _enabled_regions(runner: CommandRunner, region: str) -> list[str]:
+    """Every region enabled for the account, in name order."""
+
+    answer = runner.aws_json(region, "ec2", "describe-regions").get("Regions", [])
+    return sorted(
+        str(item.get("RegionName"))
+        for item in cast(list[dict[str, Any]], answer)
+        if item.get("RegionName")
+    )
 
 
 def _identity_center_user_id(
