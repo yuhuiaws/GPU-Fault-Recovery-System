@@ -59,7 +59,8 @@ BROKEN: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], str]] = 
         {},
         {},
         "step waiting ceilings exceed the node workflow lifetime (1700s): "
-        "REPLACE_NODE 1800s, RESTART_NODE 1800s",
+        "REMEDIATE_DRIVER 1900s, REMEDIATE_EFA_DRIVER 1900s, REPLACE_NODE 1800s, "
+        "RESTART_NODE 1800s, UPDATE_SOFTWARE_FIRMWARE 1900s",
     ),
     (
         "default ceiling above the node lifetime",

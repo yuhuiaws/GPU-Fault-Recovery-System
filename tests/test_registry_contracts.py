@@ -20,6 +20,10 @@ from gpu_fault.channel_registry import (
     ChannelPriorityMode,
     validate_channel_registry,
 )
+from gpu_fault.execution.config import (
+    DEFAULT_NODE_INSTALL_STEP_TIMEOUT_SECONDS,
+    NODE_INSTALL_OPERATIONS,
+)
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.executor import NodeActionExecutor
 from gpu_fault.node_agent.operations.registry import (
@@ -170,6 +174,23 @@ def test_registry_semantic_sets_match_declared_membership() -> None:
     # fleet has actually attempted on the device.
     assert HARDWARE_ESCALATION_RELEVANT_OPERATIONS
     assert not (HARDWARE_ESCALATION_RELEVANT_OPERATIONS & CONTAINMENT_ONLY_OPERATIONS)
+
+
+def test_the_install_step_ceiling_covers_exactly_the_generation_stable_commands() -> (
+    None
+):
+    """The executor's raised waiting ceiling and the stable command_id name the
+    same three installs. Both exist because the action runs for up to 1800 s on
+    the node: long enough for an agent restart (hence the stable id and the
+    ledger replay) and longer than the 600 s default step cap (hence the
+    ceiling). An operation added to one set without the other either reinstalls
+    on a restart or is failed by the control plane while the agent still works."""
+
+    assert set(NODE_INSTALL_OPERATIONS) == set(GENERATION_STABLE_COMMAND_OPERATIONS)
+    assert DEFAULT_NODE_INSTALL_STEP_TIMEOUT_SECONDS == 1900, (
+        "matches TimeoutStopSec in deploy/systemd/gpu-fault-node-agent.service and "
+        "clears the 1800 s install subprocess timeout in operations/remediation.py"
+    )
 
 
 def test_generation_stable_commands_are_unpinned_mutating_node_actions() -> None:

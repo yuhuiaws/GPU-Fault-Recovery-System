@@ -27,12 +27,13 @@ from __future__ import annotations
 import io
 import json
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from tests._builders import copy_model, workflow_step_execution
 
+from gpu_fault.execution import step_bounds
 from gpu_fault.node_agent import NodeActionExecutionState, NodeActionSubmission
 
 from tests.execution._support import (
@@ -133,12 +134,81 @@ def succeeded(command_id: str, operation: WorkflowOperation) -> NodeActionSubmis
     )
 
 
+def interrupted(command_id: str, operation: WorkflowOperation) -> NodeActionSubmission:
+    """The row the agent closes when it restarts under a running install."""
+
+    return NodeActionSubmission(
+        command_id=command_id,
+        state=NodeActionExecutionState.FAILED,
+        result=NodeActionResult(
+            command_id=command_id,
+            operation=operation,
+            status=NodeActionStatus.INTERRUPTED,
+            error="agent restarted during attempt 1",
+            retryable=False,
+            attempt=1,
+        ),
+    )
+
+
+def retryable_failure(
+    command_id: str, operation: WorkflowOperation
+) -> NodeActionSubmission:
+    return NodeActionSubmission(
+        command_id=command_id,
+        state=NodeActionExecutionState.FAILED,
+        result=NodeActionResult(
+            command_id=command_id,
+            operation=operation,
+            status=NodeActionStatus.FAILED,
+            error="apt lock held",
+            retryable=True,
+            attempt=1,
+        ),
+    )
+
+
 def wire(
     monkeypatch: pytest.MonkeyPatch, ledger: dict[str, NodeActionSubmission]
 ) -> FakeAgentLedgerWire:
     fake = FakeAgentLedgerWire(ledger)
     monkeypatch.setattr("gpu_fault.adapters.node_action.transport.urlopen", fake)
     return fake
+
+
+def unreachable_wire(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An agent that is being restarted: every request fails to connect."""
+
+    def refuse(request: Any, timeout: float | None = None, *, ssl_context: Any = None):
+        raise URLError("[Errno 111] Connection refused")
+
+    monkeypatch.setattr("gpu_fault.adapters.node_action.transport.urlopen", refuse)
+
+
+def _step_context(operation: WorkflowOperation, executions: list, *, generation: int):
+    """The adapter and one step context over ``executions`` (the step's records)."""
+
+    store = build_store()
+    incident, workflow = workflow_state(store, [operation])
+    registry = StubFleetRegistry({"node-a": ENDPOINT}, generation=generation)
+    adapter = NodeActionWorkflowAdapter({}, SECRET, registry=registry)
+    step = copy_model(
+        workflow.official_steps[0],
+        execution_owner=adapter.owner,
+        node_ids=["node-a"],
+        gpu_uuids=["GPU-a"],
+    )
+    context = WorkflowStepContext(
+        workflow=copy_model(
+            workflow, official_steps=[step], step_executions=list(executions)
+        ),
+        incident=incident,
+        step=step,
+        step_index=0,
+        request=WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+        idempotency_key=KEY,
+    )
+    return adapter, context
 
 
 def _poll(
@@ -304,3 +374,106 @@ def test_diagnostic_actions_do_not_read_a_legacy_id(
     assert fake.polled == [f"{NEW_ID}/agent-{LIVE_GENERATION}"]
     assert fake.submitted == [f"{NEW_ID}/agent-{LIVE_GENERATION}"]
     assert outcome.status is WorkflowStepStatus.WAITING
+
+
+def test_a_transport_retry_between_the_upgrade_and_an_agent_restart_keeps_the_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy pointer must survive a poll that never reached the agent.
+
+    Old control plane: submitted under ``agent-5`` and recorded that pointer.
+    Upgrade. New control plane, poll 1: the agent is mid-restart, the request
+    fails to connect, and the TRANSPORT_RETRY record replaces the step's only
+    record with a NEW-shape pointer (``record_attempt`` keeps one record per
+    step). The agent comes back as generation 6 and has closed the ``agent-5``
+    row INTERRUPTED. Poll 2 must still read ``agent-5`` back: guessing only
+    ``agent-6`` reads 404 and submits a second install on top of an interrupted
+    one that needs an operator.
+    """
+
+    operation = WorkflowOperation.REMEDIATE_DRIVER
+    recorded = f"{NEW_ID}/agent-5"
+    old_record = workflow_step_execution(
+        0,
+        operation,
+        WorkflowStepStatus.WAITING,
+        adapter_operation_id=KEY,
+        details={"node_action_command_id": recorded, "node_action_state": "PENDING"},
+    )
+
+    unreachable_wire(monkeypatch)
+    adapter, context = _step_context(operation, [old_record], generation=5)
+    first = adapter.execute(context)
+    assert first.status is WorkflowStepStatus.WAITING, first
+    assert first.details["node_action_state"] == "TRANSPORT_RETRY", first.details
+    after_retry = step_bounds.record_attempt(context.workflow, context.step, 0, first)
+    assert [
+        item.details["node_action_command_id"] for item in after_retry.step_executions
+    ] == [NEW_ID], "the retry record replaced the step's record with the new pointer"
+
+    fake = wire(monkeypatch, {recorded: interrupted(recorded, operation)})
+    adapter, context = _step_context(
+        operation, after_retry.step_executions, generation=6
+    )
+    second = adapter.execute(context)
+
+    assert fake.submitted == [], (
+        "a second install was submitted on top of the interrupted agent-5 row"
+    )
+    assert recorded in fake.polled, fake.polled
+    assert fake.polled[0] == NEW_ID, fake.polled
+    assert second.status is WorkflowStepStatus.FAILED, second
+    assert second.details["manual_confirmation_required"] is True, second.details
+    assert second.details["node_action_interrupted"] is True, second.details
+
+
+def test_every_distinct_legacy_pointer_across_the_steps_records_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regional executor appends records; every old-shape pointer counts.
+
+    Oldest first, deduplicated, then the live-generation guess -- and the
+    read-back stops at the first row that answers.
+    """
+
+    operation = WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE
+    first_pointer = f"{NEW_ID}/agent-4"
+    second_pointer = f"{NEW_ID}/agent-5"
+    records = [
+        workflow_step_execution(
+            0,
+            operation,
+            WorkflowStepStatus.WAITING,
+            details={"node_action_command_id": pointer},
+        )
+        for pointer in (first_pointer, second_pointer, second_pointer)
+    ]
+    fake = wire(monkeypatch, {second_pointer: in_progress(second_pointer)})
+    adapter, context = _step_context(operation, records, generation=LIVE_GENERATION)
+
+    outcome = adapter.execute(context)
+
+    assert fake.polled == [NEW_ID, first_pointer, second_pointer], fake.polled
+    assert fake.submitted == []
+    assert outcome.status is WorkflowStepStatus.WAITING
+    assert outcome.details["node_action_command_id"] == second_pointer
+
+
+def test_a_retryable_legacy_failure_is_resubmitted_as_attempt_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent has no history for the NEW id, so it runs attempt 1, not 2."""
+
+    operation = WorkflowOperation.REMEDIATE_EFA_DRIVER
+    fake = wire(monkeypatch, {LEGACY_ID: retryable_failure(LEGACY_ID, operation)})
+
+    outcome = _poll(operation, previous_pointer=LEGACY_ID)
+
+    assert fake.submitted == [NEW_ID], fake.submitted
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome
+    assert outcome.details["node_action_resubmitted"] is True, outcome.details
+    assert outcome.details["node_action_legacy_command_id"] == LEGACY_ID
+    assert outcome.details["node_action_attempt"] == 1, (
+        "the detail must say what the agent will run under the new id"
+    )
+    assert outcome.details["node_action_last_error"] == "apt lock held"

@@ -63,6 +63,13 @@ TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
 # REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE / REMEDIATE_EFA_DRIVER step is
 # PENDING" remains the operator rule for the rollback direction only.
 LEGACY_COMMAND_ID_SUFFIX = "/agent-"
+# The old-shape ids this step has ever recorded, carried on every outcome that
+# did not reach a ledger row (a refused connection, a 5xx, a new-envelope
+# demand). ``record_attempt`` keeps ONE record per step, and those outcomes
+# stamp ``node_action_command_id`` with the id of the envelope they built --
+# the new shape -- so without this key one unanswered poll between the upgrade
+# and an agent restart erased the only exact pointer to the running install.
+LEGACY_COMMAND_IDS_KEY = "node_action_legacy_command_ids"
 
 
 def _control_plane_did_not_answer(exc: BaseException) -> bool:
@@ -214,11 +221,15 @@ class NodeActionTransportMixin:
             return WorkflowStepOutcome.failed(str(exc))
         now = datetime.now(timezone.utc)
         command_id = f"{context.idempotency_key}/{command_suffix}"
+        recorded_legacy_ids: tuple[str, ...] = ()
         legacy_command_ids: tuple[str, ...] = ()
         if agent_generation is not None:
             if operation in GENERATION_STABLE_COMMAND_OPERATIONS:
+                recorded_legacy_ids = self._recorded_legacy_command_ids(
+                    context, command_id
+                )
                 legacy_command_ids = self._legacy_command_ids(
-                    context, command_id, agent_generation
+                    recorded_legacy_ids, command_id, agent_generation
                 )
             else:
                 # The suffix is right for an action a fresh agent should simply
@@ -279,7 +290,13 @@ class NodeActionTransportMixin:
                 },
             )
         except urllib_error.HTTPError as exc:
-            return self._classify_http_error(context, node_id, command, exc)
+            return self._classify_http_error(
+                context,
+                node_id,
+                command,
+                exc,
+                legacy_command_ids=recorded_legacy_ids,
+            )
         except (
             TimeoutError,
             urllib_error.URLError,
@@ -291,6 +308,7 @@ class NodeActionTransportMixin:
                     "node_action_command_id": command.command_id,
                     "node_action_state": "TRANSPORT_RETRY",
                     "transport_error": (f"{type(exc).__name__}: {exc}"),
+                    **self._carried_legacy_ids(recorded_legacy_ids),
                 },
             )
         except Exception as exc:
@@ -299,40 +317,83 @@ class NodeActionTransportMixin:
             )
 
     @staticmethod
-    def _legacy_command_ids(
+    def _recorded_legacy_command_ids(
         context: WorkflowStepContext,
         command_id: str,
-        agent_generation: int,
     ) -> tuple[str, ...]:
-        """The pre-R4 ids this step's node action may be filed under (shim).
+        """Every pre-R4 id this step has ever recorded for this node (shim).
 
-        Exact first: the ``node_action_command_id`` pointer the step's last
-        WAITING record carries is the id the previous control plane actually
-        submitted, whatever generation the agent was at then. The live
-        generation is only a guess -- right when the agent has not restarted
-        since -- and is the fallback when the pointer is absent or already in
-        the new shape. Deduplicated so the common case (pointer == guess) is
-        one extra read, and never more than two.
+        Read from ALL of the step's execution records, not the latest: the
+        regional executor appends a record per cycle, and the record the local
+        executor keeps may itself be a TRANSPORT_RETRY whose pointer is already
+        the new shape -- so the ``node_action_command_id`` pointer of each
+        record counts when it carries the old shape for this node, and so does
+        the ``LEGACY_COMMAND_IDS_KEY`` list an earlier poll carried forward.
+        Oldest first, deduplicated. Bounded: each record contributes its own
+        pointer and what it carried, so the tuple holds at most one id per
+        agent generation the previous control plane ever recorded for this
+        step -- in practice one, rarely two.
 
         REMOVE WITH THE SHIM: see ``LEGACY_COMMAND_ID_SUFFIX``.
         """
 
         prefix = f"{command_id}{LEGACY_COMMAND_ID_SUFFIX}"
-        candidates: list[str] = []
-        for item in reversed(context.workflow.step_executions):
+        recorded: list[str] = []
+
+        def note(candidate: Any) -> None:
+            if (
+                isinstance(candidate, str)
+                and candidate.startswith(prefix)
+                and candidate not in recorded
+            ):
+                recorded.append(candidate)
+
+        for item in context.workflow.step_executions:
             if (
                 item.step_index != context.step_index
                 or item.operation is not context.step.operation
             ):
                 continue
-            pointer = item.details.get("node_action_command_id")
-            if isinstance(pointer, str) and pointer.startswith(prefix):
-                candidates.append(pointer)
-            break
-        guess = f"{prefix}{agent_generation}"
-        if guess not in candidates:
-            candidates.append(guess)
-        return tuple(candidates)
+            carried = item.details.get(LEGACY_COMMAND_IDS_KEY)
+            if isinstance(carried, list):
+                for candidate in carried:
+                    note(candidate)
+            note(item.details.get("node_action_command_id"))
+        return tuple(recorded)
+
+    @staticmethod
+    def _legacy_command_ids(
+        recorded: tuple[str, ...],
+        command_id: str,
+        agent_generation: int,
+    ) -> tuple[str, ...]:
+        """The pre-R4 ids to read back, in order (shim).
+
+        Exact first: a recorded pointer is the id the previous control plane
+        actually submitted, whatever generation the agent was at then. The
+        live generation is only a guess -- right when the agent has not
+        restarted since -- and comes last, when it is not already recorded.
+        The common case (one pointer == the guess) is one extra read.
+
+        REMOVE WITH THE SHIM: see ``LEGACY_COMMAND_ID_SUFFIX``.
+        """
+
+        guess = f"{command_id}{LEGACY_COMMAND_ID_SUFFIX}{agent_generation}"
+        if guess in recorded:
+            return recorded
+        return (*recorded, guess)
+
+    @staticmethod
+    def _carried_legacy_ids(recorded: tuple[str, ...]) -> dict[str, Any]:
+        """The detail entry that keeps recorded legacy ids across a failed poll.
+
+        Empty outside the transition so steady-state records gain no key.
+        REMOVE WITH THE SHIM: see ``LEGACY_COMMAND_IDS_KEY``.
+        """
+
+        if not recorded:
+            return {}
+        return {LEGACY_COMMAND_IDS_KEY: list(recorded)}
 
     @staticmethod
     def _classify_http_error(
@@ -340,6 +401,8 @@ class NodeActionTransportMixin:
         node_id: str,
         command: NodeActionCommand,
         exc: urllib_error.HTTPError,
+        *,
+        legacy_command_ids: tuple[str, ...] = (),
     ) -> WorkflowStepOutcome:
         raw_detail = exc.read().decode(errors="replace")
         structured: dict[str, Any] = {}
@@ -360,6 +423,9 @@ class NodeActionTransportMixin:
             "node_action_retryable": retryable,
             "node_action_requires_new_command": requires_new_command,
             "http_status": exc.code,
+            # None of the branches below reached a ledger row, so the exact
+            # legacy pointer must outlive this record (shim).
+            **NodeActionTransportMixin._carried_legacy_ids(legacy_command_ids),
         }
         if requires_new_command:
             # STALE_AGENT_GENERATION, COMMAND_EXPIRED, STALE_FENCING_TOKEN: the
@@ -544,10 +610,15 @@ class NodeActionTransportMixin:
             # the step spinning on that row until its bound.
             failed = state.result
             if failed is not None:
+                # A legacy row is resubmitted under the NEW id (shim), and the
+                # agent has no history for that id: it runs attempt 1, so the
+                # detail says 1 rather than the old row's attempt + 1. The
+                # retry bound is therefore +N once, during the transition only.
+                legacy = "node_action_legacy_command_id" in pending_details
                 pending_details.update(
                     {
                         "node_action_resubmitted": True,
-                        "node_action_attempt": failed.attempt + 1,
+                        "node_action_attempt": 1 if legacy else failed.attempt + 1,
                         "node_action_last_error": failed.error,
                     }
                 )

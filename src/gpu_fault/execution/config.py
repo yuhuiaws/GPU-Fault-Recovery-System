@@ -55,6 +55,64 @@ def managed_recovery_step_overrides(
     return {operation: window for operation in MANAGED_RECOVERY_OPERATIONS}
 
 
+# The operations whose node action is an install the agent runs for up to
+# 1800 s (``node_agent/operations/remediation.py``, the driver and firmware
+# subprocess timeout) inside a unit systemd allows 1900 s to stop
+# (``deploy/systemd/gpu-fault-node-agent.service``, TimeoutStopSec). The same
+# three the registry names ``generation_stable_command_id`` -- a restart under
+# one of them replays from the ledger rather than reinstalling -- which is why
+# the wait is long by design and ``tests/test_registry_contracts.py`` pins the
+# two sets to each other.
+NODE_INSTALL_OPERATIONS = (
+    WorkflowOperation.REMEDIATE_DRIVER,
+    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+    WorkflowOperation.REMEDIATE_EFA_DRIVER,
+)
+DEFAULT_NODE_INSTALL_STEP_TIMEOUT_SECONDS = 1900
+
+
+def node_install_step_timeout_seconds(values: Mapping[str, str]) -> int:
+    """How long a driver, firmware or EFA-driver install step may stay WAITING.
+
+    The step's clock runs from its first record and a WAITING poll does not
+    move it (``step_bounds.record_attempt``), so this has to clear the agent's
+    own 1800 s install timeout plus its verification, or the control plane
+    fails a running install on the generic "past the per-step cap" path before
+    the agent's verdict can land. 1900 s matches the unit's ``TimeoutStopSec``.
+    Written out for ``scripts/generate-env-reference.py``.
+
+    Note the workflow execution budget (``GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_
+    SECONDS``, 1800 s from the first claim) still bounds the whole workflow:
+    this ceiling stops the step cap from firing first, it does not buy an
+    install more time than the workflow has.
+    """
+
+    value = int(
+        values.get(
+            "GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS",
+            "1900",
+        )
+    )
+    if value <= 0:
+        raise WorkflowExecutionError("workflow install step timeout must be positive")
+    return value
+
+
+def node_install_step_overrides(
+    values: Mapping[str, str],
+) -> dict[WorkflowOperation, int]:
+    """One ceiling for the three installs, derived rather than configured thrice."""
+
+    ceiling = node_install_step_timeout_seconds(values)
+    return {operation: ceiling for operation in NODE_INSTALL_OPERATIONS}
+
+
+def _adapter_owned_step_overrides() -> dict[WorkflowOperation, int]:
+    """The overrides a directly built config must not lose (see the field)."""
+
+    return {**managed_recovery_step_overrides({}), **node_install_step_overrides({})}
+
+
 # Steps whose whole purpose is to wait for a human to act and confirm
 # (a mechanical inspection). Their waiting ceiling and the deadlines of the
 # workflow that contains them follow the operator's clock, not the machine's.
@@ -106,6 +164,7 @@ def default_step_waiting_overrides(
     acknowledgement = operator_acknowledgement_timeout_seconds(values)
     return {
         **managed_recovery_step_overrides(values),
+        **node_install_step_overrides(values),
         **{
             operation: acknowledgement
             for operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
@@ -171,9 +230,10 @@ class ProductionExecutorConfig:
     # Defaulted rather than empty, because a config built directly -- the
     # simulation context, a test fixture -- would otherwise cap a delegated
     # replacement at the default and lose the observer's escalation, which is the
-    # exact defect the derivation above exists to prevent.
+    # exact defect the derivation above exists to prevent; the same default
+    # would fail a 20-minute driver install at 600 s while the agent still runs.
     step_waiting_timeout_overrides: Mapping[WorkflowOperation, int] = field(
-        default_factory=lambda: managed_recovery_step_overrides({})
+        default_factory=_adapter_owned_step_overrides
     )
     # Rule A: the window a job waits on a node under another remediation. The
     # same variable as ``WorkflowDispatcherConfig.node_busy_wait_seconds``;
