@@ -727,7 +727,7 @@ groups:
             ago; gpu_fault_periodic_job_errors_total and
             gpu_fault_periodic_lease_errors_total say how often. The runner keeps
             going, so the job is skipped for the tick and the service it
-            provides (training health, spare health, cleanup, reclaim, triage)
+            provides (training health, spare health, cleanup, reclaim)
             is late by one interval per failure. Read the control-worker log
             for the traceback.
   # The regional control plane deliberately does not run Prometheus
@@ -1636,8 +1636,8 @@ groups:
           runbook_url: docs/管理员日常运维.md#gpufaultcompletioneventswithoutdecision
           description: >-
             {{ $value }} completion event(s) have had no decision for 30
-            minutes. The attempt outcome was stored and then dropped by the
-            triage step, so a failed attempt may be sitting with no recovery
+            minutes. The attempt outcome was stored but its decision was never
+            written, so a failed attempt may be sitting with no recovery
             planned. Match the events to their attempts before replaying them;
             do not delete the event rows.
       # ESCALATED is where an incident parks when the system has handed a

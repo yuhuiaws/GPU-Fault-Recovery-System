@@ -57,7 +57,7 @@ SPARE_BLOCKING_ACTIONS: frozenset[RecoveryAction] = frozenset(
 #: node-wide -- so a new action cannot be advisory here and mutating there.
 #: A marker recommending one of these says "look at this node", never "this
 #: node is being repaired": it must not make its incident the owner of a
-#: failed attempt's recovery (the terminal goes to triage as if the marker
+#: failed attempt's recovery (the terminal is decided as if the marker
 #: were absent), and it must not hold a restart behind the incident's
 #: ``RECOVERED`` gate.
 DIAGNOSTIC_ACTIONS: frozenset[RecoveryAction] = frozenset(
@@ -79,8 +79,8 @@ def marker_is_diagnostic(marker: NodeMarker) -> bool:
     workflow never repaired anything, and the marker outlived the incident
     until its TTL, so the job could not restart for an hour. A diagnostic
     marker that names a stored incident is therefore skipped there and the
-    terminal goes to quick triage; the marker itself stays live, it is still
-    a valid observation. A marker without a stored incident is not affected:
+    terminal is decided without it (a budgeted restart when nothing else
+    matches); the marker itself stays live, it is still a valid observation. A marker without a stored incident is not affected:
     it still plans the diagnostic it asks for through ``from_marker``.
 
     A marker with no recommended action is treated as the strongest action

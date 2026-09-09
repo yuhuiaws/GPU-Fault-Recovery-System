@@ -22,6 +22,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.service import CompletionService
 from gpu_fault.store import InMemoryStore, NotFoundError, SqliteStore
+from gpu_fault.store.shared.record_models import record_models
 from tests.store._postgres_processor_claim_support import (
     _truncate,
     postgres_store_instance,
@@ -129,4 +130,84 @@ def test_postgres_terminal_event_and_decision_are_one_transaction() -> None:
         with pytest.raises(NotFoundError):
             store.get_event_by_attempt(event.cluster_id, event.attempt_id)
         assert store.count_completion_events_without_decision() == 0
+    _truncate()
+
+
+# --------------------------------------------------------------------------
+# Final review F-1: rows written before the quick-triage cutover carry
+# ``"diagnostic_request_id": null`` and some carry ``status: "PENDING_TRIAGE"``.
+# ``StrictModel`` forbids extras, so without tolerant decoding every read of
+# such a row (a redelivered terminal, ``/decision``, ``submit_remediation``)
+# raised until the 30-day retention removed it.
+
+LEGACY_ROW = (
+    '{"cluster_id":"cluster-a","attempt_id":"attempt-legacy",'
+    '"event_key":"cluster-a/attempt-legacy/TrainingAttemptTerminal",'
+    '"status":"NO_ACTION","reason":"controller-initiated or user stop",'
+    '"duplicate":false,"matched_marker_ids":[],"diagnostic_request_id":null,'
+    '"recovery_plan_id":null}'
+)
+LEGACY_TRIAGE_ROW = (
+    '{"cluster_id":"cluster-a","attempt_id":"attempt-triage",'
+    '"event_key":"cluster-a/attempt-triage/TrainingAttemptTerminal",'
+    '"status":"PENDING_TRIAGE","reason":"quick diagnostics requested",'
+    '"duplicate":false,"matched_marker_ids":[],'
+    '"diagnostic_request_id":"diag-attempt-triage","recovery_plan_id":null}'
+)
+
+
+def test_a_pre_cutover_decision_row_still_decodes() -> None:
+    decision = record_models()["decision"].model_validate_json(LEGACY_ROW)
+
+    assert isinstance(decision, CompletionDecision), "decision kind decodes rows"
+    assert decision.status is DecisionStatus.NO_ACTION, "status is kept"
+    assert decision.reason == "controller-initiated or user stop", "reason is kept"
+    assert "diagnostic_request_id" not in decision.model_dump(), (
+        "the legacy key is dropped, not carried"
+    )
+
+
+def test_a_pre_cutover_pending_triage_row_reads_as_no_action_with_its_history() -> None:
+    decision = CompletionDecision.model_validate_json(LEGACY_TRIAGE_ROW)
+
+    assert decision.status is DecisionStatus.NO_ACTION, (
+        "PENDING_TRIAGE no longer exists; the row reads as a closed decision"
+    )
+    assert decision.reason.startswith("pre-cutover triage decision"), (
+        "operators must see that this was a triage-era decision"
+    )
+    assert "quick diagnostics requested" in decision.reason, (
+        "the original reason is kept behind the prefix"
+    )
+    assert decision.recovery_plan_id is None, "a triage row never had a plan"
+
+
+def test_postgres_reads_a_pre_cutover_decision_row() -> None:
+    """The row is written as the old release wrote it (raw JSON, no model) and
+    read back through the store, which is the path that actually parses it."""
+
+    url = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
+    for store in postgres_store_instance():
+        event = _event("attempt-legacy")
+        assert store.save_event_if_absent(event), "event row was not inserted"
+        with psycopg.connect(url) as connection:
+            connection.execute(
+                """
+                INSERT INTO gpu_fault_objects(kind, key, payload)
+                VALUES ('decision', %s, %s::jsonb)
+                ON CONFLICT(kind, key) DO UPDATE SET payload=excluded.payload
+                """,
+                (event.event_key, LEGACY_ROW),
+            )
+
+        by_event = store.get_decision_by_event(event.event_key)
+        by_attempt = store.get_decision_by_attempt(event.cluster_id, event.attempt_id)
+
+        assert by_event is not None, "the legacy row must be readable"
+        assert by_event.status is DecisionStatus.NO_ACTION, "status is kept"
+        assert by_attempt == by_event, "both read paths decode the same row"
     _truncate()

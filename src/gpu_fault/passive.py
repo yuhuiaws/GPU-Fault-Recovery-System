@@ -123,6 +123,11 @@ class PassiveWorkflowCompiler:
             ),
             event_type="TRAINING_ATTEMPT_TERMINAL",
             cluster_id=event.cluster_id,
+            # ``_withdraw_job_workflows`` finds the workflows of a stopped job
+            # through the incident's ``job_id``; without it a pending passive
+            # restart survived the user's stop and ran anyway (F-N1 §7).
+            job_id=event.job_id,
+            attempt_id=event.attempt_id,
             node_ids=sorted({item.node_id for item in event.allocation}),
             gpu_uuids=sorted(
                 {gpu for item in event.allocation for gpu in item.gpu_uuids}

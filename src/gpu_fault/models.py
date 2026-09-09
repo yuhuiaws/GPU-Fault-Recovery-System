@@ -616,6 +616,36 @@ class CompletionDecision(StrictModel):
     matched_marker_ids: list[str] = Field(default_factory=list)
     recovery_plan_id: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _decode_pre_cutover_rows(cls, data: Any) -> Any:
+        """Read decision rows written before quick triage was removed.
+
+        Those rows carry ``diagnostic_request_id`` -- a field this model no
+        longer has, and ``StrictModel`` forbids extras -- and some carry the
+        retired ``PENDING_TRIAGE`` status. Without this every read of such a
+        row (a redelivered terminal, ``GET .../decision``, an operator
+        remediation) raised until the 30-day completion retention removed it.
+        The legacy key is dropped; a triage-era row reads as a closed
+        NO_ACTION decision whose reason says so, so an operator can tell it
+        from a decision this release made.
+        """
+
+        if not isinstance(data, dict):
+            return data
+        legacy_status = data.get("status") == "PENDING_TRIAGE"
+        if "diagnostic_request_id" not in data and not legacy_status:
+            return data
+        decoded = dict(data)
+        decoded.pop("diagnostic_request_id", None)
+        if legacy_status:
+            decoded["status"] = DecisionStatus.NO_ACTION.value
+            decoded["reason"] = (
+                "pre-cutover triage decision (quick triage was removed; no "
+                f"recovery was planned): {decoded.get('reason', '')}"
+            )
+        return decoded
+
 
 class CapabilityClaim(StrictModel):
     capability: CapabilityName

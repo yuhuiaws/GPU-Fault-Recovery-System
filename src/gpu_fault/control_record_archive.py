@@ -10,7 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
-from gpu_fault.models import WorkflowStatus
+from gpu_fault.models import (
+    EXECUTABLE_WORKFLOW_STATUSES,
+    OCCUPYING_BLOCKED_KINDS,
+    WorkflowStatus,
+)
 from gpu_fault.store.shared.time import utc_text as _utc_text
 
 LOGGER = logging.getLogger(__name__)
@@ -70,6 +74,23 @@ _INACTIVE_WORKFLOW_SQL = """(
         AND payload->>'failure_handled_at' IS NOT NULL
     )
 )"""
+# A successor holds its predecessor's incident only while it may still read
+# the predecessor row (the dispatcher's predecessor hold): executable, or
+# BLOCKED and still occupying its node -- ``workflow_is_open`` spelled in SQL
+# the way ``list_active_workflow_incidents`` spells it. Every passive recovery
+# names its containment workflow as predecessor, so a recovery that ended
+# FAILED/ESCALATED used to pin the containment incident for ever.
+_OPEN_WORKFLOW_SQL = """(
+    payload->>'status' = ANY(%s)
+    OR (
+        payload->>'status' = 'BLOCKED'
+        AND payload->>'blocked_kind' = ANY(%s)
+    )
+)"""
+_EXECUTABLE_STATUS_VALUES = sorted(
+    status.value for status in EXECUTABLE_WORKFLOW_STATUSES
+)
+_OCCUPYING_BLOCKED_KIND_VALUES = sorted(kind.value for kind in OCCUPYING_BLOCKED_KINDS)
 
 
 RELATED_RECORDS_SQL = """
@@ -111,6 +132,9 @@ objects AS (
      OR (kind='plan' AND key IN (SELECT key FROM plan_ids))
      OR (kind IN ('decision','event')
          AND key IN (SELECT key FROM decision_ids))
+     -- 'diagnostic' and 'triage' were retired with quick triage: nothing
+     -- decodes or cleans those rows any more, so archiving them with their
+     -- incident is what removes the ones written before the cutover.
      OR (kind IN ('diagnostic','triage')
          AND key IN (SELECT key FROM diagnostic_ids))
      OR (kind='marker' AND payload->>'incident_id'=%s)
@@ -241,8 +265,16 @@ class ControlRecordArchiver:
                 SELECT key FROM gpu_fault_objects
                 WHERE kind='workflow' AND payload->>'incident_id'=%s
               )
+              AND """
+            + _OPEN_WORKFLOW_SQL
+            + """
             """,
-            (incident_id, incident_id),
+            (
+                incident_id,
+                incident_id,
+                _EXECUTABLE_STATUS_VALUES,
+                _OCCUPYING_BLOCKED_KIND_VALUES,
+            ),
         )
         if cursor.fetchone()[0]:
             raise ArchiveSafetyError("incident has external successor")

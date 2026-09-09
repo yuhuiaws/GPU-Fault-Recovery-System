@@ -96,7 +96,8 @@ class CompletionService:
 
         Args:
             cluster_id: Target cluster
-            job_id: Job identifier (not currently persisted)
+            job_id: Job identifier, persisted on the incident so a user
+                stop of the job can find and withdraw its workflows
             attempt_id: Attempt identifier
             runtime_profile_version: Runtime profile version
             workload_ids: Workload identifiers to stop
@@ -145,6 +146,8 @@ class CompletionService:
                 event_id=event_key,
                 event_type=("TRAINING_ATTEMPT_FAILURE_DETECTED"),
                 cluster_id=cluster_id,
+                job_id=job_id,
+                attempt_id=attempt_id,
                 node_ids=node_ids,
                 gpu_uuids=gpu_uuids,
                 policy_version="passive-containment-v1",
@@ -481,7 +484,9 @@ class CompletionService:
                 else self.planner.from_marker(event, selected, profile)
             )
             plan = self._save_plan(
-                plan, event, predecessor_workflow_id=predecessor_workflow_id
+                self._premised_on_containment(plan, passive_containment),
+                event,
+                predecessor_workflow_id=predecessor_workflow_id,
             )
             return CompletionDecision(
                 cluster_id=event.cluster_id,
@@ -518,7 +523,10 @@ class CompletionService:
 
         profile = self.store.get_profile(event.runtime_profile_version)
         plan = self._save_plan(
-            self.planner.without_hardware_evidence(event, profile),
+            self._premised_on_containment(
+                self.planner.without_hardware_evidence(event, profile),
+                passive_containment,
+            ),
             event,
             predecessor_workflow_id=predecessor_workflow_id,
         )
@@ -535,6 +543,29 @@ class CompletionService:
                 "the workload; escalated to an operator"
             ),
             recovery_plan_id=plan.plan_id,
+        )
+
+    def _premised_on_containment(
+        self, plan: RecoveryPlan, passive_containment: FaultIncident | None
+    ) -> RecoveryPlan:
+        """Gate the restart on how the containment ended, not only on when.
+
+        ``predecessor_workflow_id`` makes the dispatcher order the recovery
+        after the containment workflow; it says nothing about how that
+        workflow ended. A STOP that FAILED leaves the containment incident
+        ESCALATED and the old Pods may still hold the GPUs, so the restart
+        must not run beside them. Naming the containment incident as
+        ``restart_after_incident_id`` makes the compiler write
+        ``requires_incident_state=RECOVERED`` onto the RESTART_WORKLOAD step
+        and the data-plane guard refuse, fail-closed, once that can never be
+        met. A plan that already carries a premise (``after_incident``: the
+        node repair the restart waits on) keeps it; the model has one.
+        """
+
+        if passive_containment is None or plan.restart_after_incident_id:
+            return plan
+        return plan.model_copy(
+            update={"restart_after_incident_id": passive_containment.incident_id}
         )
 
     def _save_plan(
@@ -570,7 +601,16 @@ class CompletionService:
             return
         now = datetime.now(timezone.utc)
         for incident, workflow in pairs:
-            if incident.attempt_id not in (None, event.attempt_id):
+            if (
+                incident.attempt_id not in (None, event.attempt_id)
+                and incident.event_type != "TRAINING_ATTEMPT_TERMINAL"
+            ):
+                # An orchestration incident about another attempt of the job
+                # is left alone. A passive recovery incident is only ever a
+                # restart of this job: its own attempt's terminal is already
+                # decided (that is what created it), so the only STOPPED or
+                # SUCCEEDED that can reach here for its job is a later
+                # attempt's -- and that means the job is gone (F-N1 §7).
                 continue
             if workflow.workload_withdrawn_at is not None or not any(
                 step.operation is WorkflowOperation.RESTART_WORKLOAD
@@ -659,7 +699,7 @@ class CompletionService:
                 incident.incident_id,
                 reason=(
                     f"incident recovered for attempt {incident.attempt_id}; "
-                    f"terminal of attempt {event.attempt_id} goes to triage"
+                    f"terminal of attempt {event.attempt_id} is decided without it"
                 ),
                 retired_by="completion-service",
             )

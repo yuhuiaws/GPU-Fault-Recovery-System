@@ -282,3 +282,57 @@ def test_the_candidate_predicate_matches_the_declared_index_shape():
     assert "i.payload->>'updated_at' <= %s" in ARCHIVE_CANDIDATE_SQL
     assert "ORDER BY i.payload->>'updated_at', i.key" in ARCHIVE_CANDIDATE_SQL
     assert "::timestamptz" not in ARCHIVE_CANDIDATE_SQL
+
+
+# --------------------------------------------------------------------------
+# Final review, minor 9 / 10 (passive-terminal-simplify).
+
+
+def test_pre_cutover_diagnostic_and_triage_rows_are_still_swept_with_their_incident():
+    """Nothing decodes or cleans ``diagnostic``/``triage`` rows any more; the
+    archive is the only path that removes the ones written before the cutover."""
+
+    from gpu_fault.control_record_archive import RELATED_RECORDS_SQL
+
+    assert "kind IN ('diagnostic','triage')" in RELATED_RECORDS_SQL, (
+        "the archive bundle must keep selecting the pre-cutover kinds"
+    )
+
+
+def test_a_closed_successor_no_longer_holds_its_predecessor_out_of_the_archive(store):
+    """Every passive recovery names its containment workflow as predecessor;
+    a recovery that ended ESCALATED (FAILED, handled) must not pin the
+    containment incident for ever -- only an open successor still reads it."""
+
+    _old_incident(store, "inc-pred", WorkflowStatus.SUCCEEDED)
+    successor_incident = fault_incident(
+        "inc-succ",
+        "event-succ",
+        state=IncidentState.ESCALATED,
+        workflow_request_id="wf-succ",
+    )
+    store.save_incident_and_workflow(
+        successor_incident,
+        workflow_request(
+            "wf-succ",
+            "inc-succ",
+            status=WorkflowStatus.FAILED,
+            official_steps=[workflow_step(WorkflowOperation.RESTART_WORKLOAD)],
+            predecessor_workflow_id="wf-inc-pred",
+            failure_handled_at=OLD,
+        ),
+    )
+    s3 = _FakeS3()
+    archiver = _archiver(s3)
+
+    archived = archiver.run_once()
+
+    assert len(archived) == 1 and "inc-pred" in archived[0], (
+        "the containment behind a closed recovery is archived"
+    )
+    assert archiver.withheld_total == {}, "nothing was withheld"
+    with pytest.raises(NotFoundError):
+        store.get_incident("inc-pred")
+    assert store.get_incident("inc-succ").incident_id == "inc-succ", (
+        "the successor itself is recent and stays"
+    )

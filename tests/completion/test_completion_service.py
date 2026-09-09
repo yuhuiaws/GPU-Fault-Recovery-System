@@ -21,6 +21,7 @@ from gpu_fault.service import CompletionService
 from gpu_fault.telemetry import EvidenceKind
 from gpu_fault.watcher import (
     AllocationCompleteness,
+    FailureContainmentDecision,
     FailureDetectedEvent,
     failure_containment_ids,
 )
@@ -275,6 +276,14 @@ def test_failed_terminal_before_failure_detection_creates_the_containment(
         context.store.get_workflow(plan.workflow_request_id).predecessor_workflow_id
         == workflow_id
     )
+    assert plan.restart_after_incident_id == incident_id, (
+        "the restart is premised on the containment it was created with"
+    )
+    containment_incident = context.store.get_incident(incident_id)
+    assert (containment_incident.job_id, containment_incident.attempt_id) == (
+        event.job_id,
+        event.attempt_id,
+    ), "the terminal-created containment names the job and attempt it stops"
     late = context.completion.handle_failure_detected(
         FailureDetectedEvent(
             cluster_id=event.cluster_id,
@@ -358,6 +367,106 @@ def test_untagged_stop_with_failing_ranks_and_no_containment_is_a_user_stop(
             f"{stopped.cluster_id}/{stopped.attempt_id}/TrainingAttemptFailureDetected"
         )
         is None
+    )
+
+
+def _detected_failure(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> FailureContainmentDecision:
+    return context.completion.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=failed_event.cluster_id,
+            job_id=failed_event.job_id,
+            attempt_id=failed_event.attempt_id,
+            detected_at=ended_at,
+            runtime_profile_version=failed_event.runtime_profile_version,
+            workload_ids=["training/pytorchjob/distributed-training"],
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+
+
+def test_recovery_after_a_containment_is_premised_on_the_containment_outcome(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """Final review F-2: a containment whose STOP failed leaves the incident
+    ESCALATED and the old Pods may still hold the GPUs; the restart must read
+    that outcome at execution time instead of running as soon as the
+    predecessor stops being open."""
+
+    containment = _detected_failure(context, failed_event, ended_at)
+
+    decision = compiled_completion(context).handle_terminal(failed_event)
+
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.restart_after_incident_id == containment.incident_id, (
+        "the plan names the containment incident as the restart premise"
+    )
+    restart = context.store.get_workflow(plan.workflow_request_id).official_steps[-1]
+    assert restart.operation is WorkflowOperation.RESTART_WORKLOAD, (
+        "the last compiled step is the restart"
+    )
+    assert restart.parameters["requires_incident_state"] == (
+        IncidentState.RECOVERED.value
+    ), "the compiler derived the incident premise onto the step"
+    assert restart.parameters["incident_id"] == containment.incident_id, (
+        "the premise names the containment incident"
+    )
+
+
+def test_recovery_without_a_containment_carries_no_incident_premise(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    decision = compiled_completion(context).handle_terminal(failed_event)
+
+    plan = context.store.get_plan(decision.recovery_plan_id)
+    assert plan.restart_after_incident_id is None, (
+        "no containment exists, so nothing gates the restart"
+    )
+    restart = context.store.get_workflow(plan.workflow_request_id).official_steps[-1]
+    assert "requires_incident_state" not in restart.parameters, (
+        "no premise is compiled without a containment"
+    )
+
+
+def test_a_user_stop_of_a_later_attempt_withdraws_the_pending_passive_restart(
+    context: ApplicationContext, failed_event: TerminalEvent
+) -> None:
+    """Final review F-3 / F-N1 §7: the compiled recovery incident must name
+    its job, or ``_withdraw_job_workflows`` cannot find the restart it owns
+    and a job the user stopped is restarted anyway."""
+
+    completion = compiled_completion(context)
+    first = completion.handle_terminal(failed_event)
+    plan = context.store.get_plan(first.recovery_plan_id)
+    incident = context.store.get_incident(plan.incident_id)
+    assert (incident.job_id, incident.attempt_id) == (
+        failed_event.job_id,
+        failed_event.attempt_id,
+    ), "the compiled recovery incident names the job and attempt it restarts"
+    stopped = copy_model(
+        failed_event,
+        attempt_id="train-123-a2",
+        terminal_status=TerminalStatus.STOPPED,
+        rank_exit_status=[],
+        termination_initiator_incident_id=None,
+    )
+
+    decision = completion.handle_terminal(stopped)
+
+    assert decision.status is DecisionStatus.NO_ACTION, "a user stop plans nothing"
+    workflow = context.store.get_workflow(plan.workflow_request_id)
+    assert workflow.workload_withdrawn_at is not None, (
+        "the pending passive restart of the stopped job is withdrawn"
+    )
+    assert "stop" in (workflow.workload_withdrawn_reason or ""), (
+        "the withdrawal names the user stop"
     )
 
 
