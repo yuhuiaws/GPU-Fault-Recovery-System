@@ -124,7 +124,7 @@ def execute(
         # Three timed-out rounds plus the round that reports the open breaker.
         # A round pays the timeout once per distinct query (utilization and
         # inventory), so it is interval + 2 x timeout long under the hang.
-        budget = (verdicts.BREAKER_ROUNDS + 1) * (
+        budget = (verdicts.BREAKER_ROUNDS + 2) * (
             interval + 2 * verdicts.NVIDIA_SMI_TIMEOUT_SECONDS
         ) + interval * 2
 

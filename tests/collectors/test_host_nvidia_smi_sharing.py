@@ -77,8 +77,9 @@ def test_host_collector_opens_breaker_after_consecutive_timeouts(
         calls.append(list(argv))
         raise subprocess.TimeoutExpired(argv, timeout=kwargs.get("timeout", 0))
 
+    sink = RecordingSink()
     collector = HostTelemetryCollector(
-        RecordingSink(),
+        sink,
         context(),
         node_id="worker-1",
         expected_gpu_count=8,
@@ -91,10 +92,13 @@ def test_host_collector_opens_breaker_after_consecutive_timeouts(
 
     per_round: list[int] = []
     batches = []
+    delivered_per_round: list[int] = []
     for round_index in range(7):
         before = len(_nvidia_smi_calls(calls))
+        delivered_before = len(sink.requests)
         batches.append(collector.collect_once())
         per_round.append(len(_nvidia_smi_calls(calls)) - before)
+        delivered_per_round.append(len(sink.requests) - delivered_before)
 
     # Rounds 1-3: the hung query is attempted once per round (never three
     # times), plus the separate compute-apps probe. Rounds 4-5: the breaker
@@ -112,6 +116,16 @@ def test_host_collector_opens_breaker_after_consecutive_timeouts(
     assert any("timed out" in error for error in batches[0].collection_errors), batches[
         0
     ].collection_errors
+    # The breaker opening is an edge of its own: rounds 2-3 repeat round 1's
+    # contributor errors and stay filtered, round 4 must reach the control
+    # plane so the status row says "circuit breaker open" (COLLECT-019).
+    assert delivered_per_round[0] == 1, delivered_per_round
+    assert delivered_per_round[1:3] == [0, 0], delivered_per_round
+    assert delivered_per_round[3] == 1, delivered_per_round
+    _, breaker_payload = sink.requests[-1]
+    assert (
+        collector.NVIDIA_SMI_BREAKER_REASON in breaker_payload["edge_filter_reasons"]
+    ), breaker_payload["edge_filter_reasons"]
 
 
 def test_host_collector_bounds_nvidia_smi_timeout_per_call() -> None:

@@ -587,11 +587,23 @@ class HostTelemetryCollector(
         """Collect only RDMA/EFA counters without delivering a full batch."""
         return self._rdma(observed_at or self.now())
 
+    #: Edge reason for the round that opens the nvidia-smi circuit breaker.
+    #: The breaker's collection errors name the same contributors as the
+    #: timed-out rounds before it, so on contributor names alone the
+    #: transition was not an edge and the batch that said "skipping GPU
+    #: queries" was never delivered unless something else happened to be.
+    NVIDIA_SMI_BREAKER_REASON = "nvidia-smi-breaker-open"
+
     def _edge_reasons(self, batch: HostTelemetryBatch) -> set[str]:
         reasons = {
             f"collection-error:{item.split(':', 1)[0]}"
             for item in batch.collection_errors
         }
+        if any(
+            "nvidia-smi circuit breaker open" in item
+            for item in batch.collection_errors
+        ):
+            reasons.add(self.NVIDIA_SMI_BREAKER_REASON)
         sustained = {
             "memory_available_percent": (
                 "lte",
