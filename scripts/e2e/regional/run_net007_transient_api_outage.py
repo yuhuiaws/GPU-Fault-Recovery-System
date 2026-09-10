@@ -174,10 +174,33 @@ def server_minor(regional: RegionalLiveFixture) -> int:
     return int(digits or 0)
 
 
+CLASSIFIER_MODULES = (
+    "gpu_fault.cluster_executor.dispatch",
+    "gpu_fault.cluster_executor",
+)
+CLASSIFIER_PROBE = (
+    "import importlib, json\n"
+    f"names = {CLASSIFIER_MODULES!r}\n"
+    "found = False\n"
+    "for name in names:\n"
+    "    try:\n"
+    "        module = importlib.import_module(name)\n"
+    "    except ImportError:\n"
+    "        continue\n"
+    "    with open(module.__file__, encoding='utf-8') as handle:\n"
+    "        found = found or 'retryable_adapter_error' in handle.read()\n"
+    "print(json.dumps({'classifier': found}))\n"
+)
+
+
 def executor_has_classifier(regional: RegionalLiveFixture) -> bool:
     """Whether the deployed GPU-plane executor routes adapter exceptions
     through ``retryable_adapter_error`` (the spec's stated precondition)."""
 
+    # The exception exit lives in ``cluster_executor/dispatch.py`` since the
+    # F6a split (``CommandDispatch.execute``); the package ``__init__`` never
+    # named the classifier, so reading only that file said "absent" on a
+    # release that carries it (attempt 1, 2026-09-10).
     output = regional.kubectl(
         "gpu",
         "exec",
@@ -185,14 +208,20 @@ def executor_has_classifier(regional: RegionalLiveFixture) -> bool:
         "--",
         "python",
         "-c",
-        (
-            "import json, gpu_fault.cluster_executor as m; "
-            "print(json.dumps({'classifier': 'retryable_adapter_error' in "
-            "open(m.__file__, encoding='utf-8').read()}))"
-        ),
+        CLASSIFIER_PROBE,
         timeout=60,
     )
     return bool(json.loads(output.strip().splitlines()[-1]).get("classifier"))
+
+
+def node_labels(regional: RegionalLiveFixture, node: str) -> dict[str, str]:
+    """The node's labels, which ``node_snapshot`` does not carry."""
+
+    output = regional.kubectl(
+        "gpu", "get", "node", node, "-o", "jsonpath={.metadata.labels}", timeout=60
+    )
+    value = json.loads(output.strip() or "{}")
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
 
 
 def can_i(regional: RegionalLiveFixture, verb: str, resource: str) -> bool:
@@ -280,7 +309,13 @@ def preflight_errors(
 
 def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     regional = RegionalLiveFixture(settings.regional)
-    node = regional.node_snapshot(settings.node)
+    node = {
+        **regional.node_snapshot(settings.node),
+        # The objectSelector pins the node by its hostname label; the snapshot
+        # carries no labels, so the check read "differs" on every node
+        # (attempt 1, 2026-09-10).
+        "labels": node_labels(regional, settings.node),
+    }
     workloads = regional.business_workloads(settings.node)
     state = regional.store_snapshot(
         node=settings.node,

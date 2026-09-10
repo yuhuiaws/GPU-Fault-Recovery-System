@@ -8,6 +8,7 @@ accepts as that proof and how tightly it scopes the outage it injects.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -414,3 +415,29 @@ def test_case_constants_match_the_spec() -> None:
     assert verdicts.executor_username("ns", "sa") == "system:serviceaccount:ns:sa"
     names = net007.resource_names("net007-x-a1")
     assert len(set(names.values())) == 2, "the webhook name and one deadman name"
+
+
+def test_the_classifier_probe_reads_the_dispatch_module_and_the_node_labels_come_from_kubectl() -> (
+    None
+):
+    """The exception exit moved to cluster_executor/dispatch.py (F6a) and
+    node_snapshot carries no labels; attempt 1 (2026-09-10) failed both
+    preflight checks on a release that satisfied them."""
+    calls: list[tuple[str, ...]] = []
+
+    def kubectl(plane, *args, **_kwargs):
+        calls.append((plane, *args))
+        if args[0] == "exec":
+            return '{"classifier": true}\n'
+        return '{"kubernetes.io/hostname": "hp-node-1", "role": "gpu"}'
+
+    regional = SimpleNamespace(kubectl=kubectl)
+    assert net007.executor_has_classifier(regional) is True
+    probe = calls[-1][-1]
+    assert "gpu_fault.cluster_executor.dispatch" in net007.CLASSIFIER_MODULES
+    assert probe == net007.CLASSIFIER_PROBE and "importlib" in probe
+    assert net007.node_labels(regional, "hp-node-1") == {
+        "kubernetes.io/hostname": "hp-node-1",
+        "role": "gpu",
+    }
+    assert calls[-1][:4] == ("gpu", "get", "node", "hp-node-1")
