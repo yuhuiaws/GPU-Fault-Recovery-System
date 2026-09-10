@@ -69,7 +69,7 @@ Collectors / Watcher -> Regional ingress and queue -> Policy / Incident / Workfl
 
 - [文档索引](docs/README.md) / [贡献指南](CONTRIBUTING.md)
 - [管理员快速部署](docs/管理员快速部署.md) / [Runtime Profile变更审批](docs/管理员Profile变更审批.md) / [管理员日常运维](docs/管理员日常运维.md) / [安全与参数参考](docs/安全与参数参考.md)
-- [概要设计](docs/概要设计.md) / [概要设计 v2](docs/概要设计-v2.md)
+- [概要设计](docs/概要设计.md) / [概要设计 v2](docs/概要设计-v2.md) / [故障类别与处置动作总表](docs/故障类别与处置动作总表.md)
 - [详细设计](docs/详细设计.md) / [详细设计 v2](docs/详细设计-v2.md)
 - [NVIDIA 策略供应链与实现](docs/components/nvidia-policy.md) / [部署和运维详细参考](docs/部署和运维手册.md) / [逐章解读](docs/部署和运维手册逐章解读.md)
 - [EC2源码统一部署流程](docs/EC2源码Staging复现流程.md) / [CI 发布流程](docs/CI发布流程.md) / [开发者部署实现](docs/开发者部署实现.md)
