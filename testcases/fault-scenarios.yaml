@@ -4741,7 +4741,13 @@ test_cases:
   - 采样时间线覆盖整个窗口：首个样本早于 failover 请求，末个样本晚于 readiness 恢复截止时刻；每 Pod 的 readiness 中断总秒数记入证据
   - 全程无任何 remote command 在飞、processor 队列为空；三个 Deployment 回到期望副本数，runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6b57256815154187ec000907768feaa16893b7e26459012678d86cb6b3e108b1
+      components:
+        control_plane: ec6237508f0abbd7b12b952136105d91644fb71e0dd5a6f138d6640e246ef879
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-010
   related_pytest: tests/regional/test_ha010_aurora_blackout_liveness.py::test_a_healthz_500_is_a_crash_not_a_refusal
