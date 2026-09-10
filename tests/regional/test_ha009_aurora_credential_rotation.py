@@ -428,3 +428,34 @@ def test_the_background_poll_collects_new_ids_and_records_its_errors(
 
     assert ledger.settled_count() == 1, "the poll never collected the receipt"
     assert ledger.last_error == "RuntimeError: probe exec hiccup"
+
+
+def test_probe_pod_reads_the_pods_own_port_instead_of_assuming_8080(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempt 6 read every control-worker as /healthz 0: the probe was pinned
+    to 8080 while that role serves 8081. The port comes from the Pod spec."""
+
+    calls: list[tuple[str, ...]] = []
+
+    def control(*arguments: str, **_keywords: object) -> str:
+        calls.append(arguments)
+        if arguments[0] == "get":
+            return "8081\n"
+        return '{"healthz_status": 200, "metrics_status": 200, "metrics_text": ""}\n'
+
+    monkeypatch.setattr(ha009.BASE, "control", control)
+    ha009.POD_PORTS.clear()
+
+    first = ha009.probe_pod("gpu-fault-control-worker-x")
+    second = ha009.probe_pod("gpu-fault-control-worker-x")
+
+    assert first["healthz_status"] == 200 and second["healthz_status"] == 200, (
+        first,
+        second,
+    )
+    scripts = [call[-1] for call in calls if call[0] == "exec"]
+    assert len(scripts) == 2 and all("127.0.0.1:8081" in s for s in scripts), scripts
+    assert sum(1 for call in calls if call[0] == "get") == 1, (
+        "the port was re-read per sample"
+    )

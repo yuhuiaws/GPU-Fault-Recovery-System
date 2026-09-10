@@ -275,6 +275,29 @@ def parse_pool_metrics(text: str) -> dict[str, float]:
     return values
 
 
+POD_PORTS: dict[str, int] = {}
+
+
+def pod_local_port(pod: str) -> int:
+    """The loopback port a Pod serves ``/healthz`` and ``/metrics`` on.
+
+    The roles differ -- ingress 8080, control-worker 8081, spool worker 8082 --
+    so the port is read from the Pod's own containerPort rather than assumed;
+    a probe pinned to 8080 read every control-worker as down (attempt 6).
+    """
+
+    if pod not in POD_PORTS:
+        raw = BASE.control(
+            "get",
+            "pod",
+            pod,
+            "-o",
+            "jsonpath={.spec.containers[0].ports[0].containerPort}",
+        )
+        POD_PORTS[pod] = int(raw.strip() or 8080)
+    return POD_PORTS[pod]
+
+
 def probe_pod(pod: str) -> dict:
     """``/healthz`` status and the pool metrics of one Pod, read from inside it.
 
@@ -283,6 +306,7 @@ def probe_pod(pod: str) -> dict:
     password. Loopback ``/metrics`` needs no token.
     """
 
+    base_url = f"http://127.0.0.1:{pod_local_port(pod)}"
     raw = BASE.control(
         "exec",
         pod,
@@ -292,7 +316,7 @@ def probe_pod(pod: str) -> dict:
         "import json, urllib.error, urllib.request\n"
         "def get(path):\n"
         "    try:\n"
-        "        with urllib.request.urlopen('http://127.0.0.1:8080' + path, "
+        f"        with urllib.request.urlopen({base_url!r} + path, "
         "timeout=10) as response:\n"
         "            return response.status, response.read().decode()\n"
         "    except urllib.error.HTTPError as exc:\n"
