@@ -4772,7 +4772,13 @@ test_cases:
   - 演练前后生产的 gpu_fault_notification_total{status=FAILED} 与 delivery_total{status=DEAD} 不上升
   - GpuFaultNotificationDeliveryFailing 只读 result=FAILED、不读 RETRY，且其与 GpuFaultNotificationUndeliveredTooLong 的 runbook 锚点存在
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 09b46dab3ede8377cdb2755e26f0655fc6523121a8cb99f433afbb9821e316b4
+      components:
+        control_plane: 7dd256f855728a13b82437a349b0d9f0b82105dcfb4a4e1ea6922963c4abf759
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-007
   related_pytest: tests/regional/test_notify007_delivery_states.py::test_the_retry_phase_contract_passes_when_retry_is_not_failed
