@@ -4544,7 +4544,7 @@ test_cases:
   - uninstall删除方案资源但保留声明为keep的CPU/GPU底层集群
   - join-cluster 发布新 registry revision 后，新集群 executor/Agent 的首个心跳与 claim 在任何 CPU Pod 重启之前即被接受（无 409 unknown cluster）；三个 CPU Deployment 的 Pod UID 与 restartCount 在 join 前后相同，且每个 Pod /healthz 的 regional_registry.secret_drift=false
   evidence:
-    verdict: NOT_RUN
+    verdict: BLOCKED
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-019
   related_pytest: tests/regional/test_regional_acceptance_fixtures.py::test_boot019_runner_executes_and_records_the_full_lifecycle
