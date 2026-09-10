@@ -189,20 +189,33 @@ def master_secret_arn() -> str:
 
 
 def secret_versions(secret_arn: str) -> dict:
-    value = aws(
-        "secretsmanager",
-        "list-secret-version-ids",
-        "--secret-id",
-        secret_arn,
-        "--include-deprecated",
-    )
+    """Every version of the managed secret with its stages, across all pages.
+
+    ``list-secret-version-ids`` answers ten versions a page and the CLI does
+    not follow ``NextToken`` for it; after ten rotations the newest version --
+    the one carrying AWSCURRENT -- sat on the second page, so the rotation
+    wait never saw it and timed out (attempt 7). Deprecated versions carry no
+    stage and are not asked for.
+    """
+
+    items: list[dict] = []
+    token: str | None = None
+    while True:
+        arguments = ["--secret-id", secret_arn, "--max-results", "100"]
+        if token:
+            arguments += ["--next-token", token]
+        value = aws("secretsmanager", "list-secret-version-ids", *arguments)
+        items.extend(value.get("Versions", []))
+        token = value.get("NextToken") or None
+        if not token:
+            break
     versions = [
         {
             "version_id": str(item.get("VersionId") or ""),
             "stages": sorted(str(stage) for stage in item.get("VersionStages", [])),
             "created_at": str(item.get("CreatedDate") or ""),
         }
-        for item in value.get("Versions", [])
+        for item in items
     ]
     stages = {
         stage: item["version_id"] for item in versions for stage in item["stages"]

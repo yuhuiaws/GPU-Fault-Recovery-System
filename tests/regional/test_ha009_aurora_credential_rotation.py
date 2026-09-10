@@ -459,3 +459,49 @@ def test_probe_pod_reads_the_pods_own_port_instead_of_assuming_8080(
     assert sum(1 for call in calls if call[0] == "get") == 1, (
         "the port was re-read per sample"
     )
+
+
+def test_secret_versions_follows_next_token_so_the_newest_version_is_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ten rotations the AWSCURRENT version sat on the second page of
+    list-secret-version-ids and the rotation wait ran out its budget."""
+
+    pages = {
+        None: {
+            "Versions": [
+                {"VersionId": f"old-{i}", "VersionStages": []} for i in range(9)
+            ]
+            + [{"VersionId": "prev", "VersionStages": ["AWSPREVIOUS"]}],
+            "NextToken": "page-2",
+        },
+        "page-2": {
+            "Versions": [
+                {"VersionId": "new", "VersionStages": ["AWSCURRENT", "AWSPENDING"]}
+            ]
+        },
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def aws(service: str, *arguments: str) -> dict:
+        calls.append((service, *arguments))
+        token = (
+            arguments[arguments.index("--next-token") + 1]
+            if "--next-token" in arguments
+            else None
+        )
+        return pages[token]
+
+    monkeypatch.setattr(ha009, "aws", aws)
+
+    result = ha009.secret_versions("arn:secret")
+
+    assert result["stages"] == {
+        "AWSPREVIOUS": "prev",
+        "AWSCURRENT": "new",
+        "AWSPENDING": "new",
+    }
+    assert len(calls) == 2 and "--include-deprecated" not in calls[0], calls
+    assert ha009.managed_rotation_complete(
+        result, old_current="prev", cluster_status="available"
+    ), "the rotation on the second page was not recognised"
