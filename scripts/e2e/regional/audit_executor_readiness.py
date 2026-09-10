@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+
+from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
 from pathlib import Path
 import re
 import ssl
@@ -217,7 +219,7 @@ def main() -> None:
     owners = list(state["execution_owners"])
     base = {
         "executor_id": "regional-readiness-audit",
-        "executor_protocol_version": 2,
+        "executor_protocol_version": CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
         "executor_artifact_sha256": artifact,
         "executor_compatibility_digest": digest,
         "execution_owners": owners,

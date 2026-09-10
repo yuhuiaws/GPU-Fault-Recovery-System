@@ -14,11 +14,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
-from scripts.e2e.regional.host_probe_fixture import (
-    HostProbeFixture,
-    HostProbeSettings,
-)
+from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeSettings
 from scripts.e2e.regional.identity_acceptance_common import (
     ACCEPTANCE_PROBE_OWNER,
     EXECUTOR_APP,
@@ -532,9 +530,11 @@ def direct_claim(
     # The probe owner never has commands, so the claim authenticates exactly
     # like the executor's own and leases nothing (identity["owners"] leased the
     # real executor's work for 60 s per sample, every 2 s, for eight minutes).
+    # The claim route answers 503 to a protocol version the control plane no
+    # longer accepts; a probe pinned to the old number read 503 in every phase.
     payload = {
         "executor_id": "token-rotation-probe",
-        "executor_protocol_version": 2,
+        "executor_protocol_version": CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
         "executor_artifact_sha256": identity["artifact"],
         "executor_compatibility_digest": identity["compatibility"],
         "execution_owners": [ACCEPTANCE_PROBE_OWNER],

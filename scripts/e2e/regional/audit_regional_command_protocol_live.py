@@ -33,6 +33,7 @@ from typing import Any
 from uuid import uuid4
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
 from gpu_fault.execution import (
     ProductionExecutorConfig,
     ProductionWorkflowExecutor,
@@ -48,10 +49,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepSpec,
 )
-from gpu_fault.regional import (
-    RegionalRemoteWorkflowAdapter,
-    RemoteActionCommand,
-)
+from gpu_fault.regional import RegionalRemoteWorkflowAdapter, RemoteActionCommand
 from gpu_fault.store import NotFoundError
 
 try:
@@ -237,7 +235,7 @@ class LiveProtocolAudit:
             token=token or self.tokens[target],
             payload={
                 "executor_id": executor_id or f"{self.run_id}-executor",
-                "executor_protocol_version": 2,
+                "executor_protocol_version": CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
                 "executor_artifact_sha256": self.executor_sha256,
                 "executor_compatibility_digest": self.executor_digest,
                 "execution_owners": ([self.test_owner] if owners is None else owners),

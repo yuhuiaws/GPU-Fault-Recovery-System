@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gpu_fault.regional_compatibility import (  # noqa: E402
+    CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
+)
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -185,7 +188,7 @@ def claim_payload(
 ) -> dict[str, Any]:
     return {
         "executor_id": executor_id,
-        "executor_protocol_version": 2,
+        "executor_protocol_version": CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
         "executor_artifact_sha256": artifact_sha256,
         "executor_compatibility_digest": compatibility_digest,
         "execution_owners": [ACCEPTANCE_PROBE_OWNER],
