@@ -2653,7 +2653,13 @@ test_cases:
   - 基线中的 remote command 未被误终止，状态仍为 PENDING、WAITING 或 LEASED
   - 报告只记录 token 摘要，不记录任何明文
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6bd2da051f784942888b2796604d59a2a2d2ebf9f9a34662825b8ad66b956e9e
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-auth-016
   related_pytest: tests/regional/test_regional_token_rotation.py::test_overlap_window_accepts_both_tokens
