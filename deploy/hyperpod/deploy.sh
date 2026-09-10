@@ -1375,6 +1375,9 @@ for item in json.loads(os.environ["SUBNET_JSON"]):
             --promotion-tier 0 \
             --region "${AWS_REGION}" >/dev/null
     fi
+    # The reader waits for the cluster and its writer (else InvalidDBClusterStateFault).
+    aws rds wait db-instance-available --db-instance-identifier "${writer_id}" --region "${AWS_REGION}"
+    aws rds wait db-cluster-available --db-cluster-identifier "${AURORA_CLUSTER_ID}" --region "${AWS_REGION}"
     if ! aws rds describe-db-instances \
         --db-instance-identifier "${reader_id}" \
         --region "${AWS_REGION}" >/dev/null 2>&1; then
@@ -1387,9 +1390,6 @@ for item in json.loads(os.environ["SUBNET_JSON"]):
             --promotion-tier 0 \
             --region "${AWS_REGION}" >/dev/null
     fi
-    aws rds wait db-instance-available \
-        --db-instance-identifier "${writer_id}" \
-        --region "${AWS_REGION}"
     aws rds wait db-instance-available \
         --db-instance-identifier "${reader_id}" \
         --region "${AWS_REGION}"

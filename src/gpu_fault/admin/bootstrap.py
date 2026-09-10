@@ -28,7 +28,7 @@ from gpu_fault.admin.bootstrap_aurora import (
     bootstrap_aurora_capacity,
     ensure_cluster_parameter_group,
     ensure_rds_site_tag,
-    ensure_serverless_instances,
+    ensure_serverless_writer,
     ensure_subnet_group,
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
@@ -1425,13 +1425,13 @@ def _ensure_aurora(
     site_id: str,
     capacity: AuroraCapacityConfig,
 ) -> dict[str, Any]:
-    """The foundation ``aurora`` task: everything up to the instance creates.
+    """The foundation ``aurora`` task: everything up to the writer's create.
 
-    Subnet group, security group, parameter group, the cluster and the two
-    ``create-db-instance`` calls -- but not the five-to-ten-minute wait for the
-    instances, nor the credential read that needs them. Those are
+    Subnet group, security group, parameter group, the cluster and the writer's
+    ``create-db-instance`` -- not the five-to-ten-minute waits, the reader (RDS
+    refuses it until the writer is available) nor the credential read. Those are
     ``_aurora_ready``, a platform-graph task that depends on this one, so the
-    wait overlaps the monitoring and node-key installs instead of holding them.
+    waits overlap the monitoring and node-key installs instead of holding them.
     ``master_secret_arn`` is reported here when RDS already exposes it (it does
     on an existing cluster and in the create response); ``_aurora_ready`` is
     the authoritative source and overrides it.
@@ -1556,19 +1556,19 @@ def _ensure_aurora(
             mutate=True,
         )
         master_secret = (created.get("DBCluster") or {}).get("MasterUserSecret") or {}
-    instance_ids = ensure_serverless_instances(
+    # Only the writer: RDS refuses a replica until the cluster and its primary
+    # are available, so ``aurora_ready`` creates the reader after its writer wait.
+    instance_ids = ensure_serverless_writer(
         runner,
         aws_region=cpu.region,
         cluster_id=cluster_id,
         availability_zones=availability_zones,
         safe_name=_safe_name,
-        wait=False,
     )
     if cluster_exists:
-        # After the instance creates: the shared reconciler proves the window on
+        # After the writer create: the shared reconciler proves the window on
         # both members (waiting for any still creating), so a resumed bootstrap
-        # that had created the cluster but not its instances must not reach it
-        # first.
+        # that had created the cluster but not its writer must not reach it first.
         reconcile_existing_capacity(
             runner,
             aws_region=cpu.region,
@@ -1580,9 +1580,8 @@ def _ensure_aurora(
     aurora: dict[str, Any] = {
         "cluster_id": cluster_id,
         "cluster_ownership": "CREATED",
-        "instance_ids": [
-            *instance_ids,
-        ],
+        "instance_ids": [*instance_ids],
+        "availability_zones": [*availability_zones],  # positional, like the ids
         "subnet_group": subnet_group,
         "subnet_group_ownership": "CREATED",
         "security_group": security_group["group_id"],
@@ -1607,17 +1606,17 @@ def _aurora_ready(
     aurora: Mapping[str, Any],
     probe_only: bool = False,
 ) -> dict[str, Any]:
-    """The platform ``aurora_ready`` task: wait for the writer and reader the
-    foundation created, then hand the control plane its DSN Secret.
-
-    The credential refresh CronJob and the release's schema Jobs are what wait
-    on this; the monitoring and node-key installs do not, and run alongside it.
+    """The platform ``aurora_ready`` task: wait for the writer the foundation
+    created, create and wait for the reader, then hand the control plane its
+    DSN Secret. The credential refresh CronJob and the release's schema Jobs
+    are what wait on this; the monitoring and node-key installs run alongside.
     ``probe_only`` is the read-only re-proof on a rerun -- both instances
     available and the Secret present -- and costs two reads.
     """
 
     cluster_id = str(aurora["cluster_id"])
     instance_ids = [str(item) for item in aurora["instance_ids"]]
+    availability_zones = [str(item) for item in aurora.get("availability_zones") or ()]
     if probe_only:
         assert_aurora_ready(
             runner,
@@ -1633,6 +1632,7 @@ def _aurora_ready(
         aws_region=cpu.region,
         cluster_id=cluster_id,
         instance_ids=instance_ids,
+        availability_zones=availability_zones,
     )
     manifest = _secret_manifest(
         name=AURORA_SECRET_NAME,

@@ -490,7 +490,7 @@ def _aurora(
     )
     if stub_instances:
         monkeypatch.setattr(
-            admin_bootstrap, "ensure_serverless_instances", lambda *_a, **_k: ["w", "r"]
+            admin_bootstrap, "ensure_serverless_writer", lambda *_a, **_k: ["w", "r"]
         )
     return _ensure_aurora(
         account,
@@ -558,6 +558,9 @@ def test_the_foundation_aurora_task_neither_waits_for_instances_nor_reads_the_se
         "gpu-fault-site-a-aurora-reader",
     ]
     assert result["master_secret_arn"] == "arn:aws:secretsmanager:x"
+    assert result["availability_zones"] == ["us-east-1a", "us-east-1b"], (
+        "aurora_ready cannot place the reader without the zones the foundation chose"
+    )
 
 
 class _ReadyAccount(_AuroraAccount):

@@ -293,71 +293,124 @@ def _capacity_is_quiet(
     )
 
 
-def ensure_serverless_instances(
+def serverless_instance_ids(
+    cluster_id: str, *, safe_name: Callable[..., str]
+) -> list[str]:
+    """The writer's and the reader's identifiers, in that order."""
+
+    return [
+        safe_name(f"{cluster_id}-{suffix}", maximum=63)
+        for suffix in ("writer", "reader")
+    ]
+
+
+def ensure_serverless_writer(
     runner: CommandRunner,
     *,
     aws_region: str,
     cluster_id: str,
-    availability_zones: list[str],
+    availability_zones: Sequence[str],
     safe_name: Callable[..., str],
-    wait: bool = True,
 ) -> list[str]:
-    """Create the writer and the reader that are missing; returns both ids.
+    """Create the writer when it is missing, without waiting; returns both ids.
 
-    The foundation ``aurora`` task passes ``wait=False``: the five-to-ten-minute
-    instance wait then belongs to ``aurora_ready``, which runs alongside the
-    platform tasks that need no database. ``wait=True`` keeps the old contract
-    of returning only once both instances are available.
+    Only the writer is created here. RDS refuses a replica while the cluster or
+    its primary is still ``creating`` (``InvalidDBClusterStateFault``), and the
+    first instance to finish creating becomes the writer whatever it is named,
+    so the reader is created by ``await_aurora_ready`` once the writer is
+    available. The foundation ``aurora`` task therefore only issues one create;
+    the waits belong to ``aurora_ready``, which runs alongside the platform
+    tasks that need no database. ``availability_zones`` is positional: the
+    writer takes the first, the reader the second.
     """
 
-    instance_ids = [
-        safe_name(f"{cluster_id}-{suffix}", maximum=63)
-        for suffix in ("writer", "reader")
-    ]
-    for instance_id, availability_zone in zip(
-        instance_ids,
-        availability_zones,
-        strict=True,
-    ):
-        existing = describe_or_absent(
+    instance_ids = serverless_instance_ids(cluster_id, safe_name=safe_name)
+    if len(availability_zones) < len(instance_ids):
+        raise BootstrapError(
+            f"Aurora cluster {cluster_id} needs {len(instance_ids)} availability "
+            f"zones, got {list(availability_zones)}"
+        )
+    writer_id = instance_ids[0]
+    existing = describe_or_absent(
+        runner,
+        aws_region,
+        "rds",
+        "describe-db-instances",
+        "--db-instance-identifier",
+        writer_id,
+        not_found=("DBInstanceNotFound",),
+    )
+    if existing is None:
+        create_serverless_instance(
             runner,
-            aws_region,
-            "rds",
-            "describe-db-instances",
-            "--db-instance-identifier",
-            instance_id,
-            not_found=("DBInstanceNotFound",),
-        )
-        if existing is not None:
-            continue
-        runner.run(
-            [
-                "aws",
-                "rds",
-                "create-db-instance",
-                "--region",
-                aws_region,
-                "--db-instance-identifier",
-                instance_id,
-                "--db-cluster-identifier",
-                cluster_id,
-                "--engine",
-                "aurora-postgresql",
-                "--db-instance-class",
-                "db.serverless",
-                "--availability-zone",
-                availability_zone,
-                "--promotion-tier",
-                "0",
-            ],
-            mutate=True,
-            capture=False,
-        )
-    if wait:
-        await_serverless_instances(
-            runner, aws_region=aws_region, instance_ids=instance_ids
+            aws_region=aws_region,
+            cluster_id=cluster_id,
+            instance_id=writer_id,
+            availability_zone=availability_zones[0],
         )
     return instance_ids
+
+
+def create_serverless_instance(
+    runner: CommandRunner,
+    *,
+    aws_region: str,
+    cluster_id: str,
+    instance_id: str,
+    availability_zone: str,
+) -> None:
+    """One ``create-db-instance`` for a Serverless v2 member; does not wait."""
+
+    runner.run(
+        [
+            "aws",
+            "rds",
+            "create-db-instance",
+            "--region",
+            aws_region,
+            "--db-instance-identifier",
+            instance_id,
+            "--db-cluster-identifier",
+            cluster_id,
+            "--engine",
+            "aurora-postgresql",
+            "--db-instance-class",
+            "db.serverless",
+            "--availability-zone",
+            availability_zone,
+            "--promotion-tier",
+            "0",
+        ],
+        mutate=True,
+        capture=False,
+    )
+
+
+def await_cluster_available(
+    runner: CommandRunner, *, aws_region: str, cluster_id: str
+) -> None:
+    """Block until the cluster reads ``available``.
+
+    A replica may only be added to an available cluster with an available
+    primary; the writer wait covers the primary, this covers the cluster. Like
+    the instance waits it is a mutation to the read-only probe runner: a probe
+    must answer in seconds.
+    """
+
+    runner.run(
+        [
+            "aws",
+            "rds",
+            "wait",
+            "db-cluster-available",
+            "--region",
+            aws_region,
+            "--db-cluster-identifier",
+            cluster_id,
+        ],
+        mutate=True,
+        capture=False,
+    )
 
 
 def await_serverless_instances(
@@ -402,6 +455,31 @@ def await_serverless_instances(
         raise failures[0]
 
 
+def serverless_instance_statuses(
+    runner: CommandRunner, *, aws_region: str, cluster_id: str
+) -> dict[str, str]:
+    """``DBInstanceIdentifier -> DBInstanceStatus`` for the cluster's members,
+    from one filtered describe. An instance that is absent from the mapping
+    has no create behind it yet (or one still propagating)."""
+
+    listed = (
+        runner.aws_json(
+            aws_region,
+            "rds",
+            "describe-db-instances",
+            "--filters",
+            f"Name=db-cluster-id,Values={cluster_id}",
+        ).get("DBInstances")
+        or []
+    )
+    return {
+        str(instance.get("DBInstanceIdentifier") or ""): str(
+            instance.get("DBInstanceStatus") or ""
+        )
+        for instance in listed
+    }
+
+
 def pending_serverless_instances(
     runner: CommandRunner,
     *,
@@ -416,22 +494,9 @@ def pending_serverless_instances(
     appears rather than letting this read stand in for it.
     """
 
-    listed = (
-        runner.aws_json(
-            aws_region,
-            "rds",
-            "describe-db-instances",
-            "--filters",
-            f"Name=db-cluster-id,Values={cluster_id}",
-        ).get("DBInstances")
-        or []
+    statuses = serverless_instance_statuses(
+        runner, aws_region=aws_region, cluster_id=cluster_id
     )
-    statuses = {
-        str(instance.get("DBInstanceIdentifier") or ""): str(
-            instance.get("DBInstanceStatus") or ""
-        )
-        for instance in listed
-    }
     return [
         instance_id
         for instance_id in instance_ids
@@ -529,21 +594,55 @@ def await_aurora_ready(
     aws_region: str,
     cluster_id: str,
     instance_ids: Sequence[str],
+    availability_zones: Sequence[str] = (),
 ) -> AuroraReadiness:
-    """Wait for the instances the foundation created, then read the credentials.
+    """Bring both instances to ``available`` in the order RDS accepts, then read
+    the credentials.
 
-    One describe decides which instances still need an ``rds wait``, so a rerun
-    against an available cluster issues no wait at all; the writer and reader
-    still creating on a first deploy are waited for together.
+    One describe decides what is left to do, so a rerun against an available
+    cluster issues no wait at all. On a first deploy the writer the foundation
+    created is waited for; only then is the reader created -- RDS answers
+    ``InvalidDBClusterStateFault`` to a replica while the cluster or its primary
+    is still creating, and whichever instance finishes first becomes the writer
+    -- and waited for in turn. ``availability_zones`` is positional like the
+    ids; a reader the listing does not know and no zone recorded for it (a
+    checkpoint from before the reader moved here) is waited for as before, and
+    that wait fails closed on an instance that never appears.
     """
 
-    pending = pending_serverless_instances(
+    writer_id, *reader_ids = instance_ids
+    statuses = serverless_instance_statuses(
+        runner, aws_region=aws_region, cluster_id=cluster_id
+    )
+    if statuses.get(writer_id) != "available":
+        await_serverless_instances(
+            runner, aws_region=aws_region, instance_ids=[writer_id]
+        )
+    zones = dict(zip(instance_ids, availability_zones))
+    to_create = [
+        instance_id
+        for instance_id in reader_ids
+        if instance_id not in statuses and instance_id in zones
+    ]
+    if to_create:
+        await_cluster_available(runner, aws_region=aws_region, cluster_id=cluster_id)
+        for instance_id in to_create:
+            create_serverless_instance(
+                runner,
+                aws_region=aws_region,
+                cluster_id=cluster_id,
+                instance_id=instance_id,
+                availability_zone=zones[instance_id],
+            )
+    await_serverless_instances(
         runner,
         aws_region=aws_region,
-        cluster_id=cluster_id,
-        instance_ids=instance_ids,
+        instance_ids=[
+            instance_id
+            for instance_id in reader_ids
+            if statuses.get(instance_id) != "available"
+        ],
     )
-    await_serverless_instances(runner, aws_region=aws_region, instance_ids=pending)
     return read_master_secret(runner, aws_region=aws_region, cluster_id=cluster_id)
 
 

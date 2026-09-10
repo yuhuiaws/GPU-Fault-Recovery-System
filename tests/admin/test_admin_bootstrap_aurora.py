@@ -257,68 +257,55 @@ def test_settle_gives_up_rather_than_polling_a_stuck_cluster_forever(
         )
 
 
-def test_missing_instances_are_created_in_their_own_availability_zone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Writer and reader must not land in the same AZ.
-
-    Both replicas in one zone makes the Aurora failover the alerting runbook
-    depends on a no-op, and the zone is only pinned at create time.
-    """
-
-    runner = Runner(missing=["describe-db-instances"])
-
-    instance_ids = aurora.ensure_serverless_instances(
+def _ensure_writer(runner: Runner, zones: Sequence[str] = ("us-east-1a", "us-east-1b")):
+    return aurora.ensure_serverless_writer(
         runner,
         aws_region="us-east-1",
         cluster_id="aurora-a",
-        availability_zones=["us-east-1a", "us-east-1b"],
+        availability_zones=list(zones),
         safe_name=lambda value, maximum: value[:maximum],
     )
 
-    assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
-    assert _operations(runner) == [
-        "describe-db-instances",
-        "create-db-instance",
-        "describe-db-instances",
-        "create-db-instance",
-        "wait",
-        "wait",
-    ]
-    zones = [
+
+def _zones(runner: Runner) -> list[str]:
+    return [
         arguments[arguments.index("--availability-zone") + 1]
         for arguments in runner.calls
         if "--availability-zone" in arguments
     ]
-    assert zones == ["us-east-1a", "us-east-1b"]
 
 
-def test_existing_instances_are_waited_for_but_not_recreated(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Re-running bootstrap must be idempotent and still confirm availability.
+def test_the_foundation_creates_only_the_writer_in_its_own_zone_and_does_not_wait() -> (
+    None
+):
+    """RDS refuses a replica while the cluster or its primary is still creating,
+    and whichever instance finishes first becomes the writer whatever its name,
+    so the foundation issues exactly one create: the writer, in the first zone.
+    The reader's zone is the second one and is pinned only at create time, so
+    both ids are returned and the zone list rides along to ``aurora_ready``."""
 
-    ``create-db-instance`` on an existing identifier fails the whole bootstrap,
-    and skipping the wait would let the deploy continue against an instance still
-    in ``creating``.
-    """
+    runner = Runner(missing=["describe-db-instances"])
+
+    instance_ids = _ensure_writer(runner)
+
+    assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
+    assert _operations(runner) == ["describe-db-instances", "create-db-instance"], (
+        "the foundation created the reader or waited for an instance"
+    )
+    create = next(call for call in runner.calls if call[2] == "create-db-instance")
+    assert create[create.index("--db-instance-identifier") + 1] == "aurora-a-writer"
+    assert _zones(runner) == ["us-east-1a"]
+
+
+def test_an_existing_writer_is_not_recreated() -> None:
+    """``create-db-instance`` on an existing identifier fails the whole
+    bootstrap; a rerun reads once and issues nothing."""
 
     runner = Runner()
 
-    aurora.ensure_serverless_instances(
-        runner,
-        aws_region="us-east-1",
-        cluster_id="aurora-a",
-        availability_zones=["us-east-1a", "us-east-1b"],
-        safe_name=lambda value, maximum: value[:maximum],
-    )
+    _ensure_writer(runner)
 
-    assert _operations(runner) == [
-        "describe-db-instances",
-        "describe-db-instances",
-        "wait",
-        "wait",
-    ]
+    assert _operations(runner) == ["describe-db-instances"]
 
 
 def test_a_throttled_instance_read_is_not_read_as_a_missing_instance() -> None:
@@ -336,34 +323,23 @@ def test_a_throttled_instance_read_is_not_read_as_a_missing_instance() -> None:
     runner = Throttled()
 
     with pytest.raises(BootstrapError, match="Throttling"):
-        aurora.ensure_serverless_instances(
-            runner,
-            aws_region="us-east-1",
-            cluster_id="aurora-a",
-            availability_zones=["us-east-1a", "us-east-1b"],
-            safe_name=lambda value, maximum: value[:maximum],
-        )
+        _ensure_writer(runner)
 
     assert "create-db-instance" not in _operations(runner)
 
 
 def test_a_missing_availability_zone_is_refused_rather_than_defaulted() -> None:
-    """One zone for two instances is a configuration error, not a placement.
-
-    ``zip`` without ``strict`` would silently create only the writer, leaving a
-    single-instance cluster that reads as a successful bootstrap.
-    """
+    """One zone for two instances is a configuration error, not a placement:
+    both members in one zone make the Aurora failover the runbook depends on a
+    no-op, and the reader's zone would only be missed once ``aurora_ready``
+    reached for it, minutes later."""
 
     runner = Runner(missing=["describe-db-instances"])
 
-    with pytest.raises(ValueError, match="argument 2 is shorter"):
-        aurora.ensure_serverless_instances(
-            runner,
-            aws_region="us-east-1",
-            cluster_id="aurora-a",
-            availability_zones=["us-east-1a"],
-            safe_name=lambda value, maximum: value[:maximum],
-        )
+    with pytest.raises(BootstrapError, match="availability zones"):
+        _ensure_writer(runner, ["us-east-1a"])
+
+    assert "create-db-instance" not in _operations(runner)
 
 
 class DiagnosticsRunner(Runner):
@@ -659,29 +635,105 @@ def _await_ready(runner: ReadinessRunner) -> aurora.AuroraReadiness:
     )
 
 
-def test_the_foundation_creates_the_instances_without_waiting_for_them() -> None:
-    """The writer and reader take five to ten minutes to come up; the foundation
-    task only has to issue the creates, so the wait can overlap the platform
-    tasks that need no database."""
+_INVALID_STATE = BootstrapError(
+    "command failed (254): aws: An error occurred (InvalidDBClusterStateFault) when "
+    "calling the CreateDBInstance operation: The requested operation can't be "
+    "performed while the cluster is in this state."
+)
 
-    runner = Runner(missing=["describe-db-instances"])
 
-    instance_ids = aurora.ensure_serverless_instances(
+class RdsOrderRunner(ReadinessRunner):
+    """Plays the rule RDS enforces on a replica: ``create-db-instance`` for a
+    second member answers ``InvalidDBClusterStateFault`` unless the cluster has
+    been waited for and the primary already reads ``available``. An instance
+    wait moves that instance to ``available``; a create leaves the new one
+    ``creating``."""
+
+    def __init__(self) -> None:
+        super().__init__(instance_statuses={"aurora-a-writer": "creating"})
+        self.cluster_waited = False
+
+    def run(self, arguments: Sequence[str], **keywords: Any) -> str:
+        argv = list(arguments)
+        if argv[2] == "wait" and argv[3] == "db-cluster-available":
+            self.cluster_waited = True
+        if argv[2] == "wait" and argv[3] == "db-instance-available":
+            waited = argv[argv.index("--db-instance-identifier") + 1]
+            self.instance_statuses[waited] = "available"
+        if argv[2] == "create-db-instance":
+            primary_available = (
+                self.instance_statuses.get("aurora-a-writer") == "available"
+            )
+            if not (primary_available and self.cluster_waited):
+                self.calls.append(tuple(argv))
+                raise _INVALID_STATE
+            created = argv[argv.index("--db-instance-identifier") + 1]
+            self.instance_statuses[created] = "creating"
+        return super().run(arguments, **keywords)
+
+
+def test_the_reader_is_created_only_once_the_cluster_and_writer_are_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first deploy: the foundation left one writer still creating. Readiness
+    waits for it, waits for the cluster, creates the reader in its own zone and
+    waits for that in turn before the credentials are read. Two creates issued
+    back to back -- the shape before this -- raise here the way RDS does."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = RdsOrderRunner()
+
+    ready = aurora.await_aurora_ready(
         runner,
         aws_region="us-east-1",
         cluster_id="aurora-a",
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
         availability_zones=["us-east-1a", "us-east-1b"],
-        safe_name=lambda value, maximum: value[:maximum],
-        wait=False,
     )
 
-    assert instance_ids == ["aurora-a-writer", "aurora-a-reader"]
     assert _operations(runner) == [
         "describe-db-instances",
+        "wait",
+        "wait",
         "create-db-instance",
-        "describe-db-instances",
-        "create-db-instance",
-    ], "the foundation task waited for an instance"
+        "wait",
+        "describe-db-clusters",
+        "get-secret-value",
+    ], "the reader was not created strictly after the writer and cluster waits"
+    waits = [call for call in runner.calls if call[2] == "wait"]
+    assert [call[3] for call in waits] == [
+        "db-instance-available",
+        "db-cluster-available",
+        "db-instance-available",
+    ]
+    assert [
+        call[call.index("--db-instance-identifier") + 1]
+        for call in waits
+        if "--db-instance-identifier" in call
+    ] == ["aurora-a-writer", "aurora-a-reader"]
+    assert _zones(runner) == ["us-east-1b"], "the reader did not take the second zone"
+    assert ready.username == "gpu_fault"
+
+
+def test_a_reader_unknown_to_an_old_checkpoint_is_waited_for_not_invented(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint from before the reader moved here carries no zones; a reader
+    the listing does not know is then waited for -- failing closed on one that
+    never appears -- rather than created in a zone this code would have to
+    guess."""
+
+    monkeypatch.setattr(aurora.time, "sleep", lambda _seconds: None)
+    runner = ReadinessRunner(instance_statuses={"aurora-a-writer": "available"})
+
+    _await_ready(runner)
+
+    operations = _operations(runner)
+    assert "create-db-instance" not in operations, operations
+    waits = [call for call in runner.calls if call[2] == "wait"]
+    assert [call[call.index("--db-instance-identifier") + 1] for call in waits] == [
+        "aurora-a-reader"
+    ]
 
 
 def test_both_instance_waits_are_in_flight_at_the_same_time() -> None:
@@ -745,6 +797,9 @@ def test_only_the_instances_still_creating_are_waited_for_and_the_secret_follows
     ], "an available instance was waited for, or a creating one was not"
     assert operations.index("wait") < operations.index("get-secret-value"), (
         "the master secret was read before the instances were available"
+    )
+    assert "create-db-instance" not in operations, (
+        "a reader that already exists (still creating) was created again"
     )
 
 
