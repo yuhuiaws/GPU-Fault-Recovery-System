@@ -6296,7 +6296,13 @@ test_cases:
   - gpu_fault_collector_erroring_nodes{channel=HOST_TELEMETRY}>=1 且 silent_nodes 不上升
   - 关窗后一个 summary 周期内 last_success_at > last_error_at；drop-in 与窗口目录被删除
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3e3e9eccd19b16d9747e3eb4a28f82407a77040b46976ce373fcbcf0c2630a47
+      components:
+        control_plane: 98dce2a26e5799895334263d76571ec866f64fd988f77232c6e7ce8a552d0089
+        executor: f7cb4f2d77528333bac4dcaeac45fe7a58f0f387918a9048b489a4abbaa041d2
+        node_runtime: e95a084ff7d0e37ea914b57e14ae6a75a503372a211ed861e737474c06f1f4bd
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-019
   related_pytest: tests/regional/test_collect019_nvidia_smi_hang.py::test_the_erroring_status_contract_passes_on_timeout_then_breaker
