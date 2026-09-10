@@ -6326,7 +6326,13 @@ test_cases:
   - 无 gpu_expected_count_unknown、无 gpu_inventory_mismatch，boot_id 不变
   - restore 后 RECOVERED incident 的每个 marker 带 retired_at 与 retired_reason；节点无 ownership、无 taint、可调度
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 644943d235817d6ad224989bd1bc0759416680d9ad4154540f23d9fa8ac79315
+      components:
+        control_plane: 63bc28e135dcf3159fc263432fa34c9241fc5e49dfcfb9c5271536f31bfc2370
+        executor: 6bc222f1e8ccd995031d62b17cda7f1cb163f7f40f3e6f86c0cdc40ded9b8cea
+        node_runtime: e95a084ff7d0e37ea914b57e14ae6a75a503372a211ed861e737474c06f1f4bd
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
   related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow
