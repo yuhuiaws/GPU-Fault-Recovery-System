@@ -230,7 +230,7 @@ def preflight_residuals(probe: SeededCommandProbe, case_dir: Path) -> dict[str, 
 _SEED_COMMAND = r"""
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
@@ -243,7 +243,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner, operation_name, raw_node_ids = sys.argv[1:]
+run_id, cluster_id, owner, operation_name, raw_node_ids, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 node_ids = [item for item in raw_node_ids.split(",") if item]
 operation = WorkflowOperation(operation_name)
 incident_id = f"incident-{run_id}"
@@ -267,6 +268,12 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Leased to the probe's seed identity: an unleased seeded workflow is claimed
+# by the deployed dispatcher, whose executor then drives the step against a
+# node no cluster carries and fails the workflow, and the orphan sweep cancels
+# the seeded command under the probe (NET-006 attempt 1 and CMD-018 attempt 1,
+# 2026-09-09/10). Only the probe may own these commands; the lease outlives the
+# synthetic registry entry.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
@@ -274,6 +281,9 @@ workflow = WorkflowRequest(
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 command = RemoteActionCommand(
     command_id=command_id,
@@ -305,6 +315,12 @@ print(json.dumps({
 """
 
 
+# The seeded workflow's execution lease: as long as the synthetic registry
+# entry lives, so the deployed dispatcher never claims the workflow while a
+# case's probe can still be working on its command.
+SEED_LEASE_SECONDS = 30 * 60
+
+
 def seed_command(
     run_id: str,
     *,
@@ -312,11 +328,22 @@ def seed_command(
     operation: str,
     node_ids: list[str],
     cluster_id: str = SYNTHETIC_CLUSTER_ID,
+    lease_seconds: int = SEED_LEASE_SECONDS,
 ) -> dict[str, Any]:
     if not node_ids or any("," in item or not item for item in node_ids):
         raise SeededCommandError("seeded node ids must be non-empty and comma-free")
+    if lease_seconds < 60:
+        raise SeededCommandError(
+            "the seeded workflow lease must be at least 60 seconds"
+        )
     return cpu_python(
-        _SEED_COMMAND, run_id, cluster_id, owner, operation, ",".join(node_ids)
+        _SEED_COMMAND,
+        run_id,
+        cluster_id,
+        owner,
+        operation,
+        ",".join(node_ids),
+        str(lease_seconds),
     )
 
 

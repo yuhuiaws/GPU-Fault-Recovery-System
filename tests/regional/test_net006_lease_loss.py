@@ -322,6 +322,31 @@ def test_the_seed_refuses_node_ids_that_cannot_round_trip() -> None:
         seeded.seed_command("run", owner="o", operation="FREEZE_EVIDENCE", node_ids=[])
 
 
+def test_the_seed_leases_the_workflow_to_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unleased seeded workflow is claimed by the deployed dispatcher, which
+    fails it and has the seeded command cancelled under the probe (attempt 1,
+    2026-09-10); the seed script receives the lease length as its last argument."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        seeded, "cpu_python", lambda script, *args: calls.append(tuple(args)) or {}
+    )
+    seeded.seed_command("run", owner="o", operation="FREEZE_EVIDENCE", node_ids=["n-a"])
+    assert calls[-1][-1] == str(seeded.SEED_LEASE_SECONDS)
+    assert seeded.SEED_LEASE_SECONDS >= 30 * 60, (
+        "must outlive the synthetic registry entry"
+    )
+    with pytest.raises(seeded.SeededCommandError, match="at least 60"):
+        seeded.seed_command(
+            "run",
+            owner="o",
+            operation="FREEZE_EVIDENCE",
+            node_ids=["n-a"],
+            lease_seconds=5,
+        )
+
+
 def test_a_finished_document_is_residual_free_only_when_every_postflight_is_zero() -> (
     None
 ):
