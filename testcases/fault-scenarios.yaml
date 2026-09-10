@@ -4250,7 +4250,13 @@ test_cases:
   - 其余全部等于 DESTR-001 的 reset 契约：八步 official_steps、SUCCEEDED、远端 WAITING 明细 mutation_submitted_by_control_plane=false、Node Agent ledger 恰一条 RESET_GPU、宿主采样器看到目标 GPU 离开并回来、服务与 timer 回到基线、无 provider 变更、控制面 EKS 状态不变
   - 清理后节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；探针 Pod/ConfigMap 无残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4d2cda8b8fb26d2abb590e32b006ef6d545ee255cc6e9527b7229db6cb8e2ede
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-023
   related_pytest: tests/regional/test_destr023_idle_cluster_reset.py::test_fresh_coverage_refuses_idle_that_a_leftover_job_could_explain
