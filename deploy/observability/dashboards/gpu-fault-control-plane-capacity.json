@@ -261,6 +261,162 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
+      "description": "Threads that can hold a pooled connection over the pool ceiling, per role. A configuration constant, not an alert: both roles sit above 1 by design and admission_runtime logs the same figure as a startup WARNING; whether anyone actually waits is the next panel (G-7).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 10
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (service_role) (gpu_fault_postgres_pool_oversubscription_ratio{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{service_role}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "PostgreSQL pool oversubscription ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "The ratio's numerator broken down by thread family next to the pool ceiling and the remaining headroom (negative when the threads outnumber the pool); read this before changing a role's worker count or POOL_MAX_SIZE.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 10
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (service_role, consumer) (gpu_fault_postgres_pool_demand_connections{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{service_role}} {{consumer}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (service_role) (gpu_fault_postgres_pool_max_size{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{service_role}} pool ceiling",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (service_role) (gpu_fault_postgres_pool_headroom_connections{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{service_role}} headroom",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "PostgreSQL pool demand by consumer",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
       "description": "Callers blocked on pool checkout right now; sustained above 0 the pool is saturated or losing slots (G-7).\n\nAlert GpuFaultPostgresPoolCheckoutQueueing (warning, for 2m, > 0): docs/管理员日常运维.md#gpufaultpostgrespoolcheckoutqueueing",
       "fieldConfig": {
         "defaults": {
@@ -296,10 +452,10 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 0,
+        "x": 16,
         "y": 10
       },
-      "id": 6,
+      "id": 8,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -366,11 +522,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 10
+        "w": 12,
+        "x": 0,
+        "y": 18
       },
-      "id": 7,
+      "id": 9,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -437,11 +593,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 10
+        "w": 12,
+        "x": 12,
+        "y": 18
       },
-      "id": 8,
+      "id": 10,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -486,9 +642,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 26
       },
-      "id": 9,
+      "id": 11,
       "panels": [],
       "title": "Control-loop review counters",
       "type": "row"
@@ -534,9 +690,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 19
+        "y": 27
       },
-      "id": 10,
+      "id": 12,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -605,9 +761,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 19
+        "y": 27
       },
-      "id": 11,
+      "id": 13,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -676,9 +832,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 19
+        "y": 27
       },
-      "id": 12,
+      "id": 14,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -712,9 +868,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 27
+        "y": 35
       },
-      "id": 13,
+      "id": 15,
       "panels": [],
       "title": "Processor queue",
       "type": "row"
@@ -764,9 +920,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 28
+        "y": 36
       },
-      "id": 14,
+      "id": 16,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -835,9 +991,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 28
+        "y": 36
       },
-      "id": 15,
+      "id": 17,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -906,9 +1062,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 28
+        "y": 36
       },
-      "id": 16,
+      "id": 18,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -973,9 +1129,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 28
+        "y": 36
       },
-      "id": 17,
+      "id": 19,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1009,9 +1165,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 44
       },
-      "id": 18,
+      "id": 20,
       "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
@@ -1053,9 +1209,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 37
+        "y": 45
       },
-      "id": 19,
+      "id": 21,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1120,9 +1276,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 37
+        "y": 45
       },
-      "id": 20,
+      "id": 22,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1156,9 +1312,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       },
-      "id": 21,
+      "id": 23,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -1204,9 +1360,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 46
+        "y": 54
       },
-      "id": 22,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1275,9 +1431,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 46
+        "y": 54
       },
-      "id": 23,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1350,9 +1506,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 46
+        "y": 54
       },
-      "id": 24,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1386,9 +1542,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 62
       },
-      "id": 25,
+      "id": 27,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -1434,9 +1590,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 63
       },
-      "id": 26,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1505,9 +1661,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 63
       },
-      "id": 27,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1576,9 +1732,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 63
       },
-      "id": 28,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1623,9 +1779,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 71
       },
-      "id": 29,
+      "id": 31,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -1658,9 +1814,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 64
+        "y": 72
       },
-      "id": 30,
+      "id": 32,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -1732,9 +1888,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 64
+        "y": 72
       },
-      "id": 31,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1803,9 +1959,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 64
+        "y": 72
       },
-      "id": 32,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1874,9 +2030,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 72
+        "y": 80
       },
-      "id": 33,
+      "id": 35,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1945,9 +2101,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 72
+        "y": 80
       },
-      "id": 34,
+      "id": 36,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1981,9 +2137,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 88
       },
-      "id": 35,
+      "id": 37,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -2029,9 +2185,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 89
       },
-      "id": 36,
+      "id": 38,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2100,9 +2256,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 89
       },
-      "id": 37,
+      "id": 39,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2167,9 +2323,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 89
       },
-      "id": 38,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2234,9 +2390,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 89
+        "y": 97
       },
-      "id": 39,
+      "id": 41,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2301,9 +2457,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 89
+        "y": 97
       },
-      "id": 40,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2348,9 +2504,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 105
       },
-      "id": 41,
+      "id": 43,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -2396,9 +2552,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 98
+        "y": 106
       },
-      "id": 42,
+      "id": 44,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2478,9 +2634,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 98
+        "y": 106
       },
-      "id": 43,
+      "id": 45,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2549,9 +2705,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 98
+        "y": 106
       },
-      "id": 44,
+      "id": 46,
       "options": {
         "legend": {
           "displayMode": "list",

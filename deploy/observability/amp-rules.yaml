@@ -1287,28 +1287,14 @@ groups:
             successor, so each one still holds a GPU node out of the training
             pool. Read the blocking reason per workflow; do not clear BLOCKED by
             editing Store rows.
-      # The ratio is configuration arithmetic (threads that may hold a
-      # connection / pool ceiling) and the worker role has run at ~1.5x since
-      # the day it was deployed without ever queueing on checkout, so it is
-      # information, not a page (G-7). The two rules after it read the live
+      # gpu_fault_postgres_pool_oversubscription_ratio (threads that may hold
+      # a connection / pool ceiling) is configuration arithmetic: both roles
+      # have run above 1 since the day they were deployed without ever queueing
+      # on checkout, so a rule on it fired permanently and taught operators to
+      # ignore the channel. It is a dashboard reading (Control-plane capacity)
+      # and a startup WARNING, not an alert. The two rules here read the live
       # pool: callers actually waiting, and connection attempts actually
-      # failing -- the shape a rotated password or a failover takes.
-      - alert: GpuFaultPostgresPoolOversubscribed
-        expr: >-
-          max by (control_plane_cluster, region, service_role)
-          (gpu_fault_postgres_pool_oversubscription_ratio) > 1
-        for: 10m
-        labels:
-          severity: info
-        annotations:
-          summary: A control-plane role can hold more connections than its pool has
-          runbook_url: docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed
-          description: >-
-            Role {{ $labels.service_role }}: the threads that can each hold a pooled PostgreSQL connection
-            outnumber the pool ceiling by {{ $value | printf "%.1f" }}x; under load callers queue
-            on checkout and the request deadline, not the database, becomes the
-            limit. Informational: GpuFaultPostgresPoolCheckoutQueueing says
-            whether anyone is actually waiting.
+      # failing -- the shape a rotated password or a failover takes (G-7).
       - alert: GpuFaultPostgresPoolCheckoutQueueing
         expr: >-
           max by (control_plane_cluster, region, service_role, pod)

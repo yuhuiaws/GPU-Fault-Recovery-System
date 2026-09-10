@@ -1335,7 +1335,7 @@ RECOVERY_OUTCOME = Dashboard(
             ),
         ),
         Row(
-            "Completion, incidents and pool",
+            "Completion and incidents",
             (
                 Panel(
                     "Completion decisions by status",
@@ -1372,22 +1372,6 @@ RECOVERY_OUTCOME = Dashboard(
                         ),
                     ),
                     description="ESCALATED is the operator queue the alert watches.",
-                ),
-                Panel(
-                    "PostgreSQL pool oversubscription",
-                    (
-                        Target(
-                            "max by (service_role) ("
-                            + series("gpu_fault_postgres_pool_oversubscription_ratio")
-                            + ")",
-                            "{{service_role}}",
-                        ),
-                    ),
-                    unit="percentunit",
-                    description=(
-                        "Pooled connection demand over the pool ceiling; above 1 "
-                        "callers queue on checkout."
-                    ),
                 ),
             ),
         ),

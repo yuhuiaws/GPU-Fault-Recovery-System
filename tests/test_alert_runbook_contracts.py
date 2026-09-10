@@ -937,7 +937,8 @@ def test_contributor_failures_are_alerted_and_reach_amp() -> None:
 
 
 def test_pool_alerts_read_the_live_pool_statistics() -> None:
-    """The constant oversubscription ratio fired from deploy day (G-7)."""
+    """The oversubscription ratio is configuration arithmetic; a rule on it
+    fired permanently from deploy day, so it is a dashboard reading (G-7)."""
     queueing = _rule("GpuFaultPostgresPoolCheckoutQueueing")
     errors = _rule("GpuFaultPostgresPoolConnectionErrors")
 
@@ -949,10 +950,10 @@ def test_pool_alerts_read_the_live_pool_statistics() -> None:
         _expression("GpuFaultPostgresPoolConnectionErrors")
     )
     assert errors["labels"]["severity"] == "critical"  # type: ignore[index]
-    assert (
-        _rule("GpuFaultPostgresPoolOversubscribed")["labels"]["severity"]  # type: ignore[index]
-        == "info"
-    )
+    for rule in amp_rules():
+        assert "gpu_fault_postgres_pool_oversubscription_ratio" not in str(
+            rule["expr"]
+        ), f"{rule['alert']} alerts on a configuration constant"
     for alert in (
         "GpuFaultPostgresPoolCheckoutQueueing",
         "GpuFaultPostgresPoolConnectionErrors",

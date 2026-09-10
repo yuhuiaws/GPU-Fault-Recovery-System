@@ -117,6 +117,49 @@ CONSUMER_LIVENESS_PANEL = _panel(
 
 POOL_AND_CREDENTIAL_PANELS = (
     _panel(
+        "PostgreSQL pool oversubscription ratio",
+        (
+            (
+                "max by (service_role) ("
+                + series("gpu_fault_postgres_pool_oversubscription_ratio")
+                + ")",
+                "{{service_role}}",
+            ),
+        ),
+        "Threads that can hold a pooled connection over the pool ceiling, per "
+        "role. A configuration constant, not an alert: both roles sit above 1 "
+        "by design and admission_runtime logs the same figure as a startup "
+        "WARNING; whether anyone actually waits is the next panel (G-7).",
+        unit="percentunit",
+    ),
+    _panel(
+        "PostgreSQL pool demand by consumer",
+        (
+            (
+                "max by (service_role, consumer) ("
+                + series("gpu_fault_postgres_pool_demand_connections")
+                + ")",
+                "{{service_role}} {{consumer}}",
+            ),
+            (
+                "max by (service_role) ("
+                + series("gpu_fault_postgres_pool_max_size")
+                + ")",
+                "{{service_role}} pool ceiling",
+            ),
+            (
+                "max by (service_role) ("
+                + series("gpu_fault_postgres_pool_headroom_connections")
+                + ")",
+                "{{service_role}} headroom",
+            ),
+        ),
+        "The ratio's numerator broken down by thread family next to the pool "
+        "ceiling and the remaining headroom (negative when the threads outnumber "
+        "the pool); read this before changing a role's worker count or "
+        "POOL_MAX_SIZE.",
+    ),
+    _panel(
         "PostgreSQL pool callers waiting",
         (
             (

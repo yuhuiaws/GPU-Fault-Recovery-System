@@ -1160,7 +1160,7 @@
       },
       "id": 21,
       "panels": [],
-      "title": "Completion, incidents and pool",
+      "title": "Completion and incidents",
       "type": "row"
     },
     {
@@ -1198,7 +1198,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
         "y": 46
       },
@@ -1269,8 +1269,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 8,
         "y": 46
       },
       "id": 23,
@@ -1340,8 +1340,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
+        "w": 8,
+        "x": 16,
         "y": 46
       },
       "id": 24,
@@ -1373,77 +1373,6 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "gpu-fault-amp"
-      },
-      "description": "Pooled connection demand over the pool ceiling; above 1 callers queue on checkout.\n\nAlert GpuFaultPostgresPoolOversubscribed (info, for 10m, > 1): docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": false,
-            "thresholdsStyle": {
-              "mode": "line"
-            }
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "blue",
-                "value": 1.0
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 46
-      },
-      "id": 25,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "gpu-fault-amp"
-          },
-          "expr": "max by (service_role) (gpu_fault_postgres_pool_oversubscription_ratio{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
-          "instant": false,
-          "legendFormat": "{{service_role}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "PostgreSQL pool oversubscription",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1451,7 +1380,7 @@
         "x": 0,
         "y": 54
       },
-      "id": 26,
+      "id": 25,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1499,7 +1428,7 @@
         "x": 0,
         "y": 55
       },
-      "id": 27,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1570,7 +1499,7 @@
         "x": 8,
         "y": 55
       },
-      "id": 28,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1641,7 +1570,7 @@
         "x": 16,
         "y": 55
       },
-      "id": 29,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1712,7 +1641,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 30,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1794,7 +1723,7 @@
         "x": 12,
         "y": 63
       },
-      "id": 31,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
