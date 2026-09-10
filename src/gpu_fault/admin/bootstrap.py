@@ -96,14 +96,16 @@ from gpu_fault.admin.bootstrap_tasks import (
     run_bootstrap_tasks,
 )
 from gpu_fault.admin.config import AuroraCapacityConfig
-from gpu_fault.admin.deploy_consent import refuse_unconsented_release
 from gpu_fault.admin.grafana import (
     grafana_access_lines,
     grafana_settings,
     grafana_site_health,
 )
 from gpu_fault.admin.notifications import NotificationRouting
-from gpu_fault.admin.release_repositories import prepare_signed_release
+from gpu_fault.admin.release_repositories import (
+    SignedReleaseBuild,
+    prepare_signed_release,
+)
 from gpu_fault.admin.site import bootstrap_archive_s3_uri
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
@@ -1882,8 +1884,10 @@ def bootstrap_from_arns(
     managed_gpu_clusters = bootstrap_gpu_scope(state, existing_site, cpu, gpu_clusters)
     _remember_hyperpod_hints(state, cpu, gpu_clusters)
     state.phase("discovered")
-    release = prepare_signed_release(
-        active_runner,
+    release_build = SignedReleaseBuild(
+        prepare_signed_release,
+        existing_site=existing_site,
+        runner=active_runner,
         request=request,
         cpu=cpu,
         gpu_clusters=tuple(managed_gpu_clusters),
@@ -1893,11 +1897,6 @@ def bootstrap_from_arns(
     # The candidate is known now; a candidate the operator has not consented to
     # (superseding a failed transaction, crossing a schema version) is refused
     # here, before the AWS re-validation and the rollout, in the engine's words.
-    refuse_unconsented_release(
-        state_dir=request.state_dir,
-        manifest_path=Path(str(release["manifest"])),
-        existing_site=existing_site,
-    )
     admin_email, routing = notification_routing(
         active_runner, cpu, request, state, existing_site=existing_site
     )
@@ -1917,7 +1916,6 @@ def bootstrap_from_arns(
         site_id=site_id,
         ensure_pod_identity_agent=_ensure_pod_identity_agent,
     )
-    adot_image = str(release["images"]["adot"])
 
     grafana = grafana_settings(request, existing_site=existing_site, state=state)
     # One dependency-aware graph: monitoring, node keys and the Aurora instance
@@ -1955,15 +1953,16 @@ def bootstrap_from_arns(
             gpu_kubeconfig=gpu_kubeconfig,
             namespace=namespace,
             site_id=site_id,
-            adot_image=adot_image,
             alert_email=admin_email,
-            release_manifest=Path(release["manifest"]),
-            runtime_image=str(release["images"]["runtime"]),
+            release=release_build.result,
             fleet_master_file=fleet_master_file,
             ensure_aurora_ready=_aurora_ready,
             grafana=grafana,
         ),
     )
+    release = release_build.result()
+    release_build.close()
+    adot_image = str(release["images"]["adot"])
     # The readiness task owns the master Secret ARN; a checkpoint written before
     # the split still carries it on ``aurora`` itself, and either shape serves.
     aurora = cast(

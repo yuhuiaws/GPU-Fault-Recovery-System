@@ -98,10 +98,8 @@ def platform_task_graph(
     gpu_kubeconfig: Path,
     namespace: str,
     site_id: str,
-    adot_image: str,
     alert_email: str | None,
-    release_manifest: Path,
-    runtime_image: str,
+    release: Callable[[], Mapping[str, Any]],
     fleet_master_file: Path,
     ensure_aurora_ready: Callable[..., Any],
     grafana: GrafanaSettings | None = None,
@@ -117,6 +115,11 @@ def platform_task_graph(
     follows ``aurora_ready``; ``node_keys:*`` need only the kubeconfigs and the
     fleet master the preamble made. Each reads its inputs from ``state`` when it
     starts, which is after its dependencies were recorded.
+
+    ``release`` is read lazily, on the task's own thread: the signed release is
+    built beside this graph (``SignedReleaseBuild``), so ``monitoring_install``
+    and ``aurora_refresh`` -- the two that ship an image -- wait for the build
+    while ``aurora_ready`` and ``node_keys:*`` run regardless of it.
 
     All of them converge live resources whose desired state no static digest
     can fully describe -- node membership changes on its own, manifests can be
@@ -143,7 +146,7 @@ def platform_task_graph(
                 namespace=namespace,
                 site_id=site_id,
                 monitoring=state.result("monitoring_resources"),
-                adot_image=adot_image,
+                adot_image=str(release()["images"]["adot"]),
                 alert_email=alert_email,
                 probe_only=probe_only,
                 grafana=grafana,
@@ -163,8 +166,8 @@ def platform_task_graph(
                 cpu_kubeconfig=cpu_kubeconfig,
                 namespace=namespace,
                 site_id=site_id,
-                release_manifest=release_manifest,
-                runtime_image=runtime_image,
+                release_manifest=Path(str(release()["manifest"])),
+                runtime_image=str(release()["images"]["runtime"]),
                 # The readiness result carries the master Secret ARN; a
                 # checkpoint written before the split carries it on ``aurora``.
                 aurora={**state.result("aurora"), **state.result("aurora_ready")},

@@ -160,10 +160,11 @@ def _platform_graph(
         gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
         namespace="gpu-fault-system",
         site_id="site-a",
-        adot_image="adot:1",
         alert_email=None,
-        release_manifest=tmp_path / "manifest.json",
-        runtime_image="runtime:1",
+        release=lambda: {
+            "manifest": str(tmp_path / "manifest.json"),
+            "images": {"adot": "adot:1", "runtime": "runtime:1"},
+        },
         fleet_master_file=tmp_path / "master",
         ensure_aurora_ready=ensure_aurora_ready or Recorder("aurora_ready", log),
     )
@@ -750,3 +751,77 @@ def test_a_completed_graph_reruns_only_what_a_probe_re_proves(
         "a re-proved task used the mutating runner"
     )
     assert results["aurora"] == {"task": "aurora"}, "a one-time task was re-entered"
+
+
+def test_only_the_image_shipping_platform_tasks_wait_for_the_release_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The signed release is built beside the graph, not before it.
+
+    ``monitoring_install`` and ``aurora_refresh`` ship an image, so they read
+    the release and block until it is built; ``node_keys:*`` and
+    ``aurora_ready`` need nothing from it and must not wait. Here the release
+    "build" refuses to finish until both node-key tasks have started.
+    """
+
+    log: list[tuple[str, bool, bool]] = []
+    _stub_foundation_services(monkeypatch, log)
+    _stub_platform_services(monkeypatch, log)
+    node_keys_started = {"gpu-a": threading.Event(), "gpu-b": threading.Event()}
+    release_read_from: list[str] = []
+
+    def node_keys(_runner: CommandRunner, **keywords: Any) -> dict:
+        node_keys_started[keywords["cluster_id"]].set()
+        log.append((f"node_keys:{keywords['cluster_id']}", False, False))
+        return {}
+
+    def release() -> dict[str, Any]:
+        release_read_from.append(threading.current_thread().name)
+        assert all(event.wait(timeout=5) for event in node_keys_started.values()), (
+            "node keys waited for the release build"
+        )
+        return {
+            "manifest": str(tmp_path / "manifest.json"),
+            "images": {"adot": "adot:lazy", "runtime": "runtime:lazy"},
+        }
+
+    monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
+    monitoring = Recorder("install_monitoring", log)
+    monkeypatch.setattr(bootstrap_services, "install_monitoring", monitoring)
+    refresh = Recorder("install_aurora_refresh", log)
+    monkeypatch.setattr(bootstrap_services, "install_aurora_refresh", refresh)
+    state = _state(tmp_path)
+
+    bootstrap_tasks.run_bootstrap_tasks(
+        state=state,
+        foundation=_foundation_graph(tmp_path, state, log),
+        platform=bootstrap_tasks.platform_task_graph(
+            runner=CommandRunner(),
+            state=state,
+            repository_root=tmp_path,
+            cpu=_cluster(),
+            gpu_clusters=[_gpu("gpu-a"), _gpu("gpu-b")],
+            cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+            gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+            namespace="gpu-fault-system",
+            site_id="site-a",
+            alert_email=None,
+            release=release,
+            fleet_master_file=tmp_path / "master",
+            ensure_aurora_ready=Recorder("aurora_ready", log),
+        ),
+    )
+
+    assert monitoring.keywords[0]["adot_image"] == "adot:lazy", (
+        "monitoring ships the image the lazily built release names"
+    )
+    assert refresh.keywords[0]["runtime_image"] == "runtime:lazy", (
+        "the credential refresh renders the lazily built runtime image"
+    )
+    assert str(refresh.keywords[0]["release_manifest"]).endswith("manifest.json"), (
+        "the manifest path comes from the built release"
+    )
+    assert release_read_from, "the image-shipping tasks read the release"
+    assert all("MainThread" != name for name in release_read_from), (
+        "the release is read on the task's own worker thread, not the caller's"
+    )

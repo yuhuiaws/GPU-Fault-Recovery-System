@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
+from pathlib import Path
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Mapping
 
 from gpu_fault.admin.bootstrap_checkpoint import bind_bootstrap_inputs
+from gpu_fault.admin.deploy_consent import refuse_unconsented_release
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     BootstrapError,
@@ -275,6 +279,57 @@ def ensure_release_repositories(
             "runtime": runtime.result(),
             "cache": cache.result(),
         }
+
+
+class SignedReleaseBuild:
+    """``prepare_signed_release`` on its own thread, joined by whoever needs it.
+
+    The release build -- ECR repositories, the release gates, the wheels and
+    the runtime image -- reads only the source snapshot; the AWS foundation
+    (Aurora, the NLB, PKI, roles, notification resources) reads none of it.
+    Bootstrap used to run the two back to back, so on a first deployment the
+    ten-minute Aurora wait and the ten-minute cold build added up. Now the
+    build starts as soon as the scope is discovered and the graph runs
+    beside it; only the platform tasks that ship an image (``monitoring_install``,
+    ``aurora_refresh``) block on ``result()``, from their own worker threads.
+
+    ``result()`` re-raises the build's failure to every caller and applies the
+    release-consent refusal once, so an unconsented release is refused the
+    first time anything needs it. ``prepare`` is injected so the caller's
+    module attribute -- what tests replace -- is what runs.
+    """
+
+    def __init__(
+        self,
+        prepare: Callable[..., dict[str, Any]],
+        *,
+        existing_site: Mapping[str, Any] | None,
+        request: BootstrapRequest,
+        **arguments: Any,
+    ) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="release-build"
+        )
+        self._future = self._executor.submit(prepare, request=request, **arguments)
+        self._existing_site = existing_site
+        self._state_dir = request.state_dir
+        self._lock = threading.Lock()
+        self._checked = False
+
+    def result(self) -> dict[str, Any]:
+        release = self._future.result()
+        with self._lock:
+            if not self._checked:
+                refuse_unconsented_release(
+                    state_dir=self._state_dir,
+                    manifest_path=Path(str(release["manifest"])).expanduser(),
+                    existing_site=self._existing_site,
+                )
+                self._checked = True
+        return release
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
 
 def prepare_signed_release(
