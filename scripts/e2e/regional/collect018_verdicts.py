@@ -52,6 +52,40 @@ FORBIDDEN_OPERATIONS = frozenset(
     }
 )
 REJECTION_TIMEOUT_SECONDS = 240
+# The kernel collector's all-zero health summary refreshes ``last_success_at``
+# every 300 s (G4), and a success newer than the rejection is exactly what
+# clears the rejected-event entry. A heartbeat landing in the first seconds of
+# the poll would erase the evidence before the first read, so the runner posts
+# the rejection right *after* a heartbeat when the next one is this close.
+KERNEL_HEARTBEAT_INTERVAL_SECONDS = 300
+KERNEL_HEARTBEAT_GUARD_SECONDS = 90
+KERNEL_HEARTBEAT_BATCH_PREFIX = "kernel-health-"
+
+
+def kernel_heartbeat_age_seconds(
+    statuses: list[dict[str, Any]], *, now: datetime
+) -> float | None:
+    """Seconds since the kernel channel's last health summary, or None."""
+
+    status = kernel_status(statuses)
+    if status is None:
+        return None
+    if not str(status.get("batch_id") or "").startswith(KERNEL_HEARTBEAT_BATCH_PREFIX):
+        return None
+    observed = _stamp(status.get("observed_at"))
+    if observed is None:
+        return None
+    return (now - observed).total_seconds()
+
+
+def heartbeat_is_imminent(age_seconds: float | None) -> bool:
+    return (
+        age_seconds is not None
+        and age_seconds
+        >= KERNEL_HEARTBEAT_INTERVAL_SECONDS - KERNEL_HEARTBEAT_GUARD_SECONDS
+    )
+
+
 FINDING_TIMEOUT_SECONDS = 300
 RECOVERY_TIMEOUT_SECONDS = 420
 
@@ -69,8 +103,18 @@ def kernel_status(statuses: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def rejected_status_errors(statuses: list[dict[str, Any]]) -> list[str]:
-    """The node's kernel channel must say "data rejected", not "no data"."""
+def rejected_status_errors(
+    statuses: list[dict[str, Any]], *, marker: str | None = None
+) -> list[str]:
+    """The node's kernel channel must say "data rejected", not "no data".
+
+    ``marker`` is the value the probe put in the forbidden field; the status
+    may name the field (pydantic's ``loc``) but never carry the value. The
+    first two live runs matched the words "input" and "acceptance" instead
+    and read the legitimate ``body.acceptance_unknown_field Extra inputs are
+    not permitted`` detail as an echo -- every sample was refused until the
+    kernel heartbeat cleared the entry, and the case failed on a clean row.
+    """
 
     status = kernel_status(statuses)
     if status is None:
@@ -89,7 +133,7 @@ def rejected_status_errors(statuses: list[dict[str, Any]]) -> list[str]:
     if not status.get("last_error_at"):
         errors.append("the rejected event did not stamp last_error_at")
     for item in rejected:
-        if "input" in str(item).lower() and "acceptance" in str(item).lower():
+        if marker and marker in str(item):
             errors.append("the rejected-event status echoes the payload body")
     return errors
 

@@ -111,7 +111,32 @@ def execute(
         "statuses_before": statuses_before,
     }
 
-    # Phase A: the rejected payload.
+    # Phase A: the rejected payload. Post it just after a kernel heartbeat,
+    # never just before one: the heartbeat's success clears the entry.
+    heartbeat_age = verdicts.kernel_heartbeat_age_seconds(
+        statuses_before, now=utc_now()
+    )
+    evidence["heartbeat_age_before_seconds"] = heartbeat_age
+    if verdicts.heartbeat_is_imminent(heartbeat_age):
+        previous_row = verdicts.kernel_status(statuses_before) or {}
+        aligned = fixture.wait_until(
+            lambda: (
+                {"records": records}
+                if (
+                    row := verdicts.kernel_status(
+                        records := fixture.collector_statuses()
+                    )
+                )
+                is not None
+                and row.get("observed_at") != previous_row.get("observed_at")
+                else None
+            ),
+            timeout_seconds=verdicts.KERNEL_HEARTBEAT_GUARD_SECONDS + 60,
+            poll_seconds=5,
+            case_dir=case_dir,
+            name="heartbeat-align",
+        )
+        evidence["heartbeat_aligned"] = aligned is not None
     posted = fixture.execute(
         "post-rejected-event",
         "--marker",
@@ -127,7 +152,7 @@ def execute(
         lambda: (
             {"records": records}
             if not verdicts.rejected_status_errors(
-                records := fixture.collector_statuses()
+                records := fixture.collector_statuses(), marker=marker
             )
             else None
         ),
@@ -147,7 +172,9 @@ def execute(
     )
     (case_dir / "control-plane.log").write_text(logs, encoding="utf-8")
     (case_dir / "control-plane.log").chmod(0o600)
-    stages["rejected_status"] = verdicts.rejected_status_errors(statuses_after)
+    stages["rejected_status"] = verdicts.rejected_status_errors(
+        statuses_after, marker=marker
+    )
     stages["rejection_metrics"] = verdicts.rejection_metric_errors(
         metrics_before, metrics_after
     )

@@ -9,6 +9,7 @@ itself is checked to be plan-only by default. Nothing here touches a cluster.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +74,54 @@ def test_the_rejected_status_contract_rejects_silence_and_payload_echo() -> None
     )
     assert "echoes the payload" in _text(
         verdicts.rejected_status_errors(
-            [_status(errors=["rejected-event: HTTP 422 input acceptance marker"])]
+            [_status(errors=["rejected-event: HTTP 422 body.field c018-1-a1"])],
+            marker="c018-1-a1",
         )
     )
+    assert (
+        verdicts.rejected_status_errors(
+            [
+                _status(
+                    errors=[
+                        "rejected-event: HTTP 422 body.acceptance_unknown_field "
+                        "Extra inputs are not permitted"
+                    ]
+                )
+            ],
+            marker="c018-1-a1",
+        )
+        == []
+    ), "pydantic's loc names the field; only the value counts as an echo"
+
+
+def test_the_rejection_is_posted_after_a_heartbeat_not_before_one() -> None:
+    """A heartbeat in the poll's first seconds would clear the entry unseen."""
+
+    now = datetime(2030, 1, 1, 0, 10, tzinfo=timezone.utc)
+    fresh = [
+        _status(
+            batch_id="kernel-health-node-1", observed_at="2030-01-01T00:09:30+00:00"
+        )
+    ]
+    stale = [
+        _status(
+            batch_id="kernel-health-node-1", observed_at="2030-01-01T00:05:30+00:00"
+        )
+    ]
+    event_row = [_status(batch_id="kmsg-1", observed_at="2030-01-01T00:05:30+00:00")]
+    assert verdicts.kernel_heartbeat_age_seconds(fresh, now=now) == 30.0, (
+        "the age is measured from the heartbeat row's observed_at"
+    )
+    assert not verdicts.heartbeat_is_imminent(
+        verdicts.kernel_heartbeat_age_seconds(fresh, now=now)
+    ), "a heartbeat 30 s ago leaves the whole interval to read the entry"
+    assert verdicts.heartbeat_is_imminent(
+        verdicts.kernel_heartbeat_age_seconds(stale, now=now)
+    ), "270 s after the last heartbeat the next one is due inside the poll"
+    assert verdicts.kernel_heartbeat_age_seconds(event_row, now=now) is None, (
+        "a row last written by an event says nothing about the heartbeat phase"
+    )
+    assert not verdicts.heartbeat_is_imminent(None), "unknown phase does not wait"
 
 
 def test_the_metric_contract_needs_both_g1_counters_to_move() -> None:
