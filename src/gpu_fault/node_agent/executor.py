@@ -16,8 +16,10 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.ledger import NodeActionLedger, canonical_digest
+from gpu_fault.collectors.outbox_maintenance import DEFAULT_OUTBOX_DIRECTORY
 from gpu_fault.node_agent.operations import (
     ClientOperationsMixin,
+    CollectorOutboxOperationsMixin,
     DiagnosticOperationsMixin,
     EfaOperationsMixin,
     FlightRecorderOperationsMixin,
@@ -26,6 +28,7 @@ from gpu_fault.node_agent.operations import (
     RemediationOperationsMixin,
     ResetOperationsMixin,
 )
+from gpu_fault.node_agent.operations.collector_outbox import CollectorOutboxRefused
 from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
 from gpu_fault.node_agent.operations.reset import ResetProgressError
 from gpu_fault.node_agent.operations.registry import (
@@ -82,6 +85,7 @@ class NodeActionExecutor(
     EfaOperationsMixin,
     ClientOperationsMixin,
     ResetOperationsMixin,
+    CollectorOutboxOperationsMixin,
 ):
     OPERATIONS = frozenset(OPERATION_HANDLERS)
 
@@ -98,6 +102,7 @@ class NodeActionExecutor(
         fabric_manager_restart_enabled: bool = False,
         service_quiesce_enabled: bool = False,
         diagnostic_output_dir: str = ("/var/lib/gpu-fault/diagnostics"),
+        collector_outbox_directory: str = DEFAULT_OUTBOX_DIRECTORY,
         diagnostic_s3_uri: str | None = None,
         diagnostic_retention_seconds: int = 604800,
         diagnostic_max_archives: int = 20,
@@ -173,6 +178,9 @@ class NodeActionExecutor(
         self.fabric_manager_restart_enabled = fabric_manager_restart_enabled
         self.service_quiesce_enabled = service_quiesce_enabled
         self.diagnostic_output_dir = Path(diagnostic_output_dir)
+        # Where every ``gpu-fault-collector <c>`` on this node buffers its
+        # outbox (``collectors_cli.main`` pins the same default path).
+        self.collector_outbox_directory = Path(collector_outbox_directory)
         self.diagnostic_s3_uri = (
             diagnostic_s3_uri.rstrip("/") if diagnostic_s3_uri else None
         )
@@ -513,10 +521,18 @@ class NodeActionExecutor(
                 # nobody can read and which were never attempted decides
                 # reboot versus replace, and only the node knows it. An
                 # install killed at its deadline carries the unknown-outcome
-                # flags the escalation ladder hands to an operator.
+                # flags the escalation ladder hands to an operator. A refused
+                # outbox maintenance carries the lock holder it met.
                 details=(
                     dict(exc.action_details)
-                    if isinstance(exc, (ResetProgressError, InstallOutcomeUnknownError))
+                    if isinstance(
+                        exc,
+                        (
+                            ResetProgressError,
+                            InstallOutcomeUnknownError,
+                            CollectorOutboxRefused,
+                        ),
+                    )
                     else {}
                 ),
                 error=f"{type(exc).__name__}: {exc}",

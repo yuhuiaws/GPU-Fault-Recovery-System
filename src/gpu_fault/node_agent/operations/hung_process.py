@@ -14,7 +14,7 @@ class HungProcessOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     expand_python_cgroup_processes: Any
     now: Callable[..., Any]
-    proc_root: Any
+    proc_root: Path
     python_stack_tool: Any
     runner: Callable[..., Any]
     sleep: Callable[..., Any]

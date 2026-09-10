@@ -1,4 +1,7 @@
 from gpu_fault.node_agent.operations.clients import ClientOperationsMixin
+from gpu_fault.node_agent.operations.collector_outbox import (
+    CollectorOutboxOperationsMixin,
+)
 from gpu_fault.node_agent.operations.diagnostics import DiagnosticOperationsMixin
 from gpu_fault.node_agent.operations.efa import EfaOperationsMixin
 from gpu_fault.node_agent.operations.flight_recorder import (
@@ -11,6 +14,7 @@ from gpu_fault.node_agent.operations.reset import ResetOperationsMixin
 
 __all__ = [
     "ClientOperationsMixin",
+    "CollectorOutboxOperationsMixin",
     "DiagnosticOperationsMixin",
     "EfaOperationsMixin",
     "FlightRecorderOperationsMixin",

@@ -495,10 +495,33 @@ class OutboxFile:
         rewrite.
         """
 
+        return self.requeue_dead_report(
+            path_filter=path_filter, require_lock=require_lock
+        )["requeued"]
+
+    def requeue_dead_report(
+        self,
+        *,
+        path_filter: str | None = None,
+        require_lock: bool = True,
+        error_prefix: str = "requeued by operator: ",
+    ) -> dict[str, int]:
+        """:meth:`requeue_dead` with the counts an operator reads back.
+
+        ``requeued``, ``skipped_payload_truncated`` (left dead: only a digest of
+        the body exists), ``dead_before`` and ``dead_after``. ``error_prefix``
+        is what the requeued record's ``error`` starts with; the node agent
+        passes the operator identity and reference in it so the record on the
+        node names who asked. It is bounded so the previous error survives in
+        the record's 500-character field.
+        """
+
+        prefix = error_prefix[:200]
         with self.locked(required=require_lock, forced=not require_lock):
             records = self.read()
             requeued = 0
             skipped_truncated = 0
+            dead_before = sum(1 for record in records if not record.get("replayable"))
             for record in records:
                 if record.get("replayable"):
                     continue
@@ -511,7 +534,7 @@ class OutboxFile:
                     continue
                 record["replayable"] = True
                 previous = str(record.get("error") or "")
-                record["error"] = f"requeued by operator: {previous}"[:500]
+                record["error"] = f"{prefix}{previous}"[:500]
                 requeued += 1
             if requeued:
                 self.write(records)
@@ -522,4 +545,38 @@ class OutboxFile:
                 skipped_truncated,
                 self.path,
             )
-        return requeued
+        return {
+            "requeued": requeued,
+            "skipped_payload_truncated": skipped_truncated,
+            "dead_before": dead_before,
+            "dead_after": dead_before - requeued,
+        }
+
+    def lock_holder(self) -> str | None:
+        """Who holds ``<outbox>.lock`` right now, or ``None`` when nobody does.
+
+        A metadata read for ``stats``: one non-blocking ``flock`` probe on a
+        fresh descriptor, released at once, so a live collector's replay is
+        named without waiting for it. Never raises; a lock file that cannot be
+        opened reads as nobody.
+        """
+
+        try:
+            handle = os.open(
+                self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+            )
+        except OSError:
+            return None
+        try:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    return describe_lock_holder(handle)
+                return None
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            return None
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(handle)

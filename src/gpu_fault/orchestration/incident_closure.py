@@ -74,6 +74,12 @@ from gpu_fault.orchestration.workflow_merge import never_executed_operator_block
 from gpu_fault.orchestration.validated_restore import (
     build_validated_restore_workflow as build_validated_restore_workflow,
 )
+
+# Same reason: ``gpu-fault-admin collector-outbox`` imports the outbox
+# maintenance builder inside the CPU Pod.
+from gpu_fault.orchestration.collector_outbox_maintenance import (
+    build_collector_outbox_workflow as build_collector_outbox_workflow,
+)
 from gpu_fault.store.shared.errors import NotFoundError, StaleWriteError
 
 if TYPE_CHECKING:

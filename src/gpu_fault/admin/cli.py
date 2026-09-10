@@ -71,6 +71,10 @@ from gpu_fault.admin.incident_close import escalated_selector
 from gpu_fault.admin.incident_close import exit_code as incident_close_exit_code
 from gpu_fault.admin.incident_close import quarantined_selector
 from gpu_fault.admin.incident_close import result_lines as incident_close_lines
+from gpu_fault.admin.collector_outbox import (
+    add_collector_outbox_command,
+    run_collector_outbox_command,
+)
 from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.notification_precheck import WAIT_FLAG
@@ -625,6 +629,7 @@ def parser() -> argparse.ArgumentParser:
     add_failure_domain_map_command(commands, _add_managed_site_arguments)
     add_rotate_token_command(commands, _add_managed_site_arguments)
     add_submit_remediation_command(commands, _add_managed_site_arguments)
+    add_collector_outbox_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -1524,6 +1529,14 @@ def run(arguments: argparse.Namespace) -> int:
             arguments,
             site=load_site(
                 cast(Path, _managed_site_file(arguments, command="submit-remediation")),
+                repository_root=arguments.repo_root,
+            ),
+        )
+    if arguments.command == "collector-outbox":
+        return run_collector_outbox_command(
+            arguments,
+            site=load_site(
+                cast(Path, _managed_site_file(arguments, command="collector-outbox")),
                 repository_root=arguments.repo_root,
             ),
         )

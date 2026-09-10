@@ -49,6 +49,7 @@ EXPECTED_NODE_ACTION_OPERATIONS = {
     WorkflowOperation.REMEDIATE_DRIVER,
     WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
     WorkflowOperation.RESTART_FABRIC_MANAGER,
+    WorkflowOperation.COLLECTOR_OUTBOX_MAINTENANCE,
 }
 
 

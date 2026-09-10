@@ -21,6 +21,7 @@ OPERATION_HANDLERS: dict[WorkflowOperation, str] = {
     WorkflowOperation.REMEDIATE_DRIVER: "_remediate_driver",
     WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE: "_update_firmware",
     WorkflowOperation.RESTART_FABRIC_MANAGER: ("_restart_fabric_manager"),
+    WorkflowOperation.COLLECTOR_OUTBOX_MAINTENANCE: "_collector_outbox_maintenance",
 }
 
 

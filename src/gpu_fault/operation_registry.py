@@ -446,6 +446,18 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         hardware_escalation_relevant=False,
         resource_claims=frozenset({OperationResourceClaim.SCHEDULER_MUTATION}),
     ),
+    # An operator's remote ``gpu-fault-collector outbox`` (ARCH-G2): reads or
+    # requeues a collector's dead letters on the node. Metadata only, no GPU
+    # or EFA claim, not node-exclusive, allowed while workloads run; a
+    # workflow of nothing but this step is diagnostic-only to the executor.
+    WorkflowOperation.COLLECTOR_OUTBOX_MAINTENANCE: _semantics(
+        CapabilityName.DIAGNOSTIC_BUNDLE_CAPTURE,
+        OperationScope.NODE,
+        OperationAdapter.NODE_ACTION,
+        zero_rank_action=True,
+        safe_remote_waiting_preempt=True,
+        hardware_escalation_relevant=False,
+    ),
 }
 
 

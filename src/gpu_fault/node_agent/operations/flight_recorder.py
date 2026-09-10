@@ -28,7 +28,7 @@ class FlightRecorderUnpickler(pickle.Unpickler):
 
 class FlightRecorderOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
-    proc_root: Any
+    proc_root: Path
     sleep: Callable[..., Any]
 
     def _await_flight_dumps(

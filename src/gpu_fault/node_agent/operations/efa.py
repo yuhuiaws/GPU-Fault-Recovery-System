@@ -13,7 +13,7 @@ from gpu_fault.node_agent.protocol import (
 
 class EfaOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
-    infiniband_root: Any
+    infiniband_root: Path
     runner: Callable[..., Any]
 
     def _capture_efa_rdma_state(
