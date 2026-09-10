@@ -174,7 +174,10 @@ def window_paths(run_id: str) -> dict[str, Path]:
         "state": root / "window.json",
         "override_env": root / "override.env",
         "shadow_dir": root / "bin",
-        "shadow_state": root / "shadow-calls.json",
+        # Written by the shadow from inside the unit, so it must be a path the
+        # unit can write: its PrivateTmp, not the read-only /run window root.
+        "shadow_state": Path("/tmp")
+        / f"gpu-fault-acceptance-{digest}-shadow-calls.json",
         "probe_copy": root / "probe.py",
     }
 
@@ -393,6 +396,10 @@ def snapshot(arguments: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # nvidia-smi shadow
 # --------------------------------------------------------------------------- #
+# The exact nvidia-smi query the metrics collector's inventory uses; the
+# drop-uuid shadow edits only this one and passes every other query through.
+INVENTORY_QUERY = "--query-gpu=index,uuid,pci.bus_id,name"
+
 SHADOW_SCRIPT = r'''#!/usr/bin/env python3
 """Acceptance shadow of nvidia-smi; see collector_window_probe.py."""
 import fcntl
@@ -405,19 +412,36 @@ import time
 MODE = %(mode)r
 REAL = %(real)r
 STATE = %(state)r
-INVENTORY_QUERY = "--query-gpu=index,uuid,pci.bus_id,name"
+INVENTORY_QUERY = %(inventory_query)r
 
 
 def _take_call() -> int:
-    with open(STATE, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.seek(0)
-        text = handle.read().strip()
-        count = int(text) if text else 0
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(count + 1))
-        return count
+    """Count this call; a counter that cannot be kept means "never drop".
+
+    The collector units run with ``ProtectSystem=strict``: everything but
+    ``/dev``, ``/proc``, ``/sys`` and their ``ReadWritePaths`` is read-only for
+    the unit and its children, this script included. The counter therefore
+    lives in the unit's ``PrivateTmp`` (``/tmp``), which a window's restart
+    starts empty. If even that write fails, the safe answer is to pass the
+    query through unchanged: a shadow that drops a GPU on every call would
+    walk the host collector's mismatch counter into REBOOT_NODE, and the
+    first live COLLECT-020 run showed the failure mode already -- the crash
+    here made every inventory query fail for the whole window.
+    """
+
+    try:
+        with open(STATE, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            handle.seek(0)
+            text = handle.read().strip()
+            count = int(text) if text else 0
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(count + 1))
+            return count
+    except OSError as exc:
+        sys.stderr.write(f"acceptance shadow: call counter unavailable ({exc}); passing through\n")
+        return 1 << 30
 
 
 argv = sys.argv[1:]
@@ -471,11 +495,14 @@ def write_shadow(paths: dict[str, Path], mode: tuple[str, str, str]) -> str:
             "mode": mode,
             "real": os.path.realpath(real),
             "state": str(paths["shadow_state"]),
+            "inventory_query": INVENTORY_QUERY,
         },
         encoding="utf-8",
     )
     script.chmod(0o755)
-    paths["shadow_state"].write_text("0", encoding="utf-8")
+    # The counter is created by the shadow's first call inside the unit's
+    # PrivateTmp; a file written here, on the host, would not be the one the
+    # unit sees.
     return str(shadow_dir)
 
 

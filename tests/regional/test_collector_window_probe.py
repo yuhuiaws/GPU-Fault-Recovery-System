@@ -10,6 +10,8 @@ owning unit is stopped. Nothing here runs systemd or touches a node.
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -171,3 +173,84 @@ def test_the_probe_parser_exposes_every_subcommand_the_cases_use() -> None:
         parser.parse_args(
             ["open-window", "--run-id", "r", "--unit", "gpu-fault-node-agent.service"]
         )
+
+
+def _fake_nvidia_smi(tmp_path: Path) -> Path:
+    real = tmp_path / "fake-gpu-query"
+    real.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "print('0, GPU-aaaa, 0000:10:00.0, NVIDIA H100')\n"
+        "print('1, GPU-bbbb, 0000:20:00.0, NVIDIA H100')\n",
+        encoding="utf-8",
+    )
+    real.chmod(0o755)
+    return real
+
+
+def _shadow(tmp_path: Path, state: Path) -> Path:
+    script = tmp_path / "shadow-gpu-query.py"
+    script.write_text(
+        probe.SHADOW_SCRIPT
+        % {
+            "mode": ("drop-uuid", "GPU-bbbb", "1"),
+            "real": str(_fake_nvidia_smi(tmp_path)),
+            "state": str(state),
+            "inventory_query": probe.INVENTORY_QUERY,
+        },
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _run_shadow(script: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(script), probe.INVENTORY_QUERY, "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_the_drop_uuid_shadow_drops_one_query_and_then_passes_through(
+    tmp_path: Path,
+) -> None:
+    script = _shadow(tmp_path, tmp_path / "calls.json")
+
+    first = _run_shadow(script)
+    assert first.returncode == 0, first.stderr
+    assert "GPU-bbbb" not in first.stdout, "the first inventory query hides the GPU"
+    assert "GPU-aaaa" in first.stdout, first.stdout
+
+    second = _run_shadow(script)
+    assert second.returncode == 0, second.stderr
+    assert "GPU-bbbb" in second.stdout, "the second query is passed through"
+
+
+def test_the_drop_uuid_shadow_passes_through_when_its_counter_cannot_be_kept(
+    tmp_path: Path,
+) -> None:
+    """ProtectSystem=strict made the /run counter unwritable and crashed the shadow.
+
+    Every inventory query then failed for the whole window and no snapshot
+    reached the control plane. An unwritable counter must never drop a GPU
+    (that path walks into REBOOT_NODE) and must never fail the query.
+    """
+
+    unwritable = tmp_path / "read-only-dir"
+    unwritable.mkdir()
+    script = _shadow(tmp_path, unwritable)  # a directory: open() raises
+
+    result = _run_shadow(script)
+    assert result.returncode == 0, result.stderr
+    assert "GPU-bbbb" in result.stdout, "an unkept counter must not drop a GPU"
+    assert "call counter unavailable" in result.stderr, result.stderr
+
+
+def test_the_shadow_counter_lives_in_the_units_private_tmp() -> None:
+    paths = probe.window_paths("c020-a1-1")
+    assert str(paths["shadow_state"]).startswith("/tmp/"), paths["shadow_state"]
+    assert not str(paths["shadow_state"]).startswith(str(paths["root"])), (
+        "the window root under /run is read-only for the unit"
+    )

@@ -229,13 +229,18 @@ def execute(
             return value
         return None
 
-    activity = fixture.wait_until(
-        workflows_terminal,
-        timeout_seconds=verdicts.WORKFLOW_TIMEOUT_SECONDS,
-        poll_seconds=15,
-        case_dir=case_dir,
-        name="workflow",
-    ) or fixture.node_activity(since, evidence_kind="GPU_INVENTORY")
+    if not (activity.get("incidents") or activity.get("workflows")):
+        # The finding never opened: there is no workflow to wait a quarter of
+        # an hour for. Judge what is there and fail on the missing finding.
+        stages["finding"] = ["no identity finding opened inside the finding budget"]
+    else:
+        activity = fixture.wait_until(
+            workflows_terminal,
+            timeout_seconds=verdicts.WORKFLOW_TIMEOUT_SECONDS,
+            poll_seconds=15,
+            case_dir=case_dir,
+            name="workflow",
+        ) or fixture.node_activity(since, evidence_kind="GPU_INVENTORY")
     write_json_atomic(case_dir / "activity.json", activity)
     stages["inventory_evidence"] = verdicts.inventory_evidence_errors(
         activity.get("evidence") or [],
