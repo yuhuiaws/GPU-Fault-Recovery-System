@@ -6356,7 +6356,13 @@ test_cases:
   - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault.io taint、无 ownership 注解、boot_id 不变、无 remote command
   - 被动路径经 quick triage 重启该 attempt：旧 Pod UID 全部消失、3 个新 Pod RUNNING、restart_count 由 0→1、新 attempt observation 出现
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 74d4a10f87229da03a295d166df54d3f187c8dc7fb373a1e35aa2ae326b048c5
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-021
   related_pytest: tests/completion/test_pod_dies_before_xid_ingest.py::test_pod_dies_before_xid_ingest_keeps_node_and_restarts_without_evidence
