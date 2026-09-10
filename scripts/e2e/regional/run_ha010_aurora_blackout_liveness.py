@@ -198,6 +198,19 @@ def pods_by_deployment(
     return result
 
 
+def deployments_scaled_to_zero(regional: RegionalLiveFixture) -> frozenset[str]:
+    """The CPU Deployments the site runs at 0 replicas (spool admission off)."""
+
+    zero = set()
+    for deployment in verdicts.CPU_DEPLOYMENTS:
+        replicas = regional.kubectl(
+            "cpu", "get", "deployment", deployment, "-o", "jsonpath={.spec.replicas}"
+        ).strip()
+        if replicas in {"", "0"}:
+            zero.add(deployment)
+    return frozenset(zero)
+
+
 def healthz_by_pod(
     regional: RegionalLiveFixture,
     pods: dict[str, list[dict[str, Any]]],
@@ -267,6 +280,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         api_pod,
         (verdicts.STALE_SECONDS_VARIABLE, verdicts.STARTUP_RETRY_VARIABLE),
     )
+    scaled_to_zero = deployments_scaled_to_zero(regional)
     errors = verdicts.preflight_errors(
         pods=pods,
         rds=rds,
@@ -274,6 +288,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         remote_commands=state.get("remote_commands") or {},
         healthz=healthz,
         predecessor_valid=bool(predecessor["valid"]),
+        scaled_to_zero=scaled_to_zero,
     )
     errors.extend(runtime_identity_errors(runtime_identity))
     budgets: dict[str, float] = {}

@@ -87,12 +87,16 @@ def preflight_errors(
     remote_commands: dict[str, Any],
     healthz: dict[str, dict[str, Any]],
     predecessor_valid: bool,
+    scaled_to_zero: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Refuse a run that could not prove what the case claims.
 
     ``pods`` maps each Deployment to its Pod records (``name``, ``ready``,
     ``restarts``, ``port``); ``healthz`` maps Pod name to the ``/healthz``
-    payload read before the failover.
+    payload read before the failover. ``scaled_to_zero`` names the Deployments
+    whose ``spec.replicas`` is 0 on the site -- the telemetry spool tier is
+    scaled away wherever spool admission is off -- which therefore have no
+    Pod to sample and are not a missing tier.
     """
 
     errors: list[str] = []
@@ -101,7 +105,8 @@ def preflight_errors(
     for deployment in CPU_DEPLOYMENTS:
         records = pods.get(deployment) or []
         if not records:
-            errors.append(f"{deployment} has no Pods")
+            if deployment not in scaled_to_zero:
+                errors.append(f"{deployment} has no Pods")
             continue
         not_ready = sorted(
             str(item.get("name")) for item in records if not item.get("ready")

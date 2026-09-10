@@ -256,6 +256,24 @@ def test_the_preflight_refuses_each_unsafe_precondition(
     assert any(fragment in item for item in errors), _text(errors)
 
 
+def test_a_tier_the_site_runs_at_zero_replicas_is_not_a_missing_tier() -> None:
+    """The telemetry spool worker is scaled to zero wherever spool admission is
+    off; it has no Pod to sample and must not refuse the run (first live run)."""
+    pods = _pods(**{"gpu-fault-telemetry-spool-worker": []})
+    refused = _preflight(pods=pods)
+    assert any("no Pods" in item for item in refused), _text(refused)
+    assert (
+        _preflight(
+            pods=pods, scaled_to_zero=frozenset({"gpu-fault-telemetry-spool-worker"})
+        )
+        == []
+    )
+    # A tier that is scaled to zero but somehow has Pods is still judged.
+    assert (
+        _preflight(scaled_to_zero=frozenset({"gpu-fault-telemetry-spool-worker"})) == []
+    )
+
+
 def test_the_preflight_refuses_a_pod_that_already_drifts_from_its_secret() -> None:
     pods = _pods()
     healthz = _healthz_by_pod(pods)
