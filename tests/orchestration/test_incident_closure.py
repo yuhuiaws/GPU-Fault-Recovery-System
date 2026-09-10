@@ -730,3 +730,50 @@ def test_after_the_close_the_next_xid_opens_a_new_remediation() -> None:
         context.store.get_incident(incident.incident_id).state
         is IncidentState.RECOVERED
     )
+
+
+def test_a_succeeded_diagnostic_only_workflow_retires_its_recovered_incidents_markers(
+    store,
+) -> None:
+    """ARCH-I4 on the success path (COLLECT-020).
+
+    The isolating shape retires through RESTORE_SCHEDULING and a failed
+    diagnostic through its inconclusive close; a diagnostic that *passed* left
+    its marker active until the TTL while the incident read RECOVERED.
+    """
+
+    from gpu_fault.orchestration.incident_closure import RECOVERED_RETIREMENT_ACTOR
+    from tests.orchestration._incident_closure_support import _marker
+
+    diagnostic = _restore_workflow(
+        "inc-identity",
+        operations=(
+            FREEZE,
+            WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
+            WorkflowOperation.VALIDATE_GPU,
+        ),
+    )
+    incident = _recovered("inc-identity", diagnostic)
+    store.save_incident(incident)
+    store.save_workflow(diagnostic)
+    store.add_marker(_marker("inc-identity", "node-a"))
+    service = IncidentClosureService(store)
+
+    closed = service.on_terminal(diagnostic, incident, list(diagnostic.official_steps))
+
+    assert closed == [], (
+        "a diagnostic-only workflow restores nothing and closes nothing"
+    )
+    (marker,) = store.list_markers_for_incident("inc-identity")
+    assert marker.active is False, "a RECOVERED incident leaves no live marker"
+    assert marker.retired_at is not None, "retirement is dated"
+    assert marker.retired_reason == (
+        f"workflow {diagnostic.request_id} SUCCEEDED: incident RECOVERED"
+    )
+    assert marker.retired_by == RECOVERED_RETIREMENT_ACTOR
+
+    # Replaying the hook keeps the first retirement's stamp.
+    stamp = marker.retired_at
+    service.on_terminal(diagnostic, incident, list(diagnostic.official_steps))
+    (again,) = store.list_markers_for_incident("inc-identity")
+    assert again.retired_at == stamp, "retirement is idempotent"

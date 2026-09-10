@@ -12,8 +12,9 @@ on the node as record-only (DESTR-018, product gap fixed 2026-09-08).
 
 Two exits, one write path:
 
-* ``on_terminal`` -- an executor ``TerminalHook``. A SUCCEEDED workflow that
-  restored a node (``restores_node``) closes every other ESCALATED incident of
+* ``on_terminal`` -- an executor ``TerminalHook``. Every SUCCEEDED workflow whose
+  incident ended RECOVERED retires that incident's markers (ARCH-I4); one that
+  restored a node (``restores_node``) also closes every other ESCALATED incident of
   the cluster whose nodes it covers and that has no open workflow.
 * ``close_incident`` -- the operator API (``POST /v1/incidents/{id}/close``
   and ``gpu-fault-admin workflow-reconcile --close-incident``). A QUARANTINED
@@ -90,6 +91,8 @@ LOGGER = logging.getLogger(__name__)
 # Actor stamped on the audit event of an automatic close; an operator close is
 # signed by the operator identity the caller supplied.
 AUTO_CLOSE_ACTOR = "incident-closure:restore"
+# Names the terminal hook as the path that retired a RECOVERED incident's markers.
+RECOVERED_RETIREMENT_ACTOR = "incident-closure:recovered"
 # The only state an operator may close on a signature alone. QUARANTINED means
 # the node is still isolated and needs a validated restore workflow -- unless
 # node evidence shows the isolation is already gone (``EVIDENCE_CLOSABLE_STATES``);
@@ -379,8 +382,23 @@ class IncidentClosureService:
             incident is None
             or workflow.status is not WorkflowStatus.SUCCEEDED
             or incident.state is not IncidentState.RECOVERED
-            or not restores_node(workflow)
         ):
+            return []
+        # ARCH-I4: a RECOVERED incident leaves no live marker. The isolating
+        # shape retires through RESTORE_SCHEDULING and a failed diagnostic
+        # through its inconclusive close, but a workflow that only froze
+        # evidence, diagnosed and validated -- the node-health RUN_DIAGNOSTICS
+        # shape -- ended RECOVERED with its marker active until the TTL,
+        # holding the GPU "under remediation" an hour after the verdict said
+        # it was fine (COLLECT-020). Idempotent: an earlier retirement keeps
+        # its own reason.
+        retire_markers_for_incident(
+            self.store,
+            incident.incident_id,
+            reason=f"workflow {workflow.request_id} SUCCEEDED: incident RECOVERED",
+            retired_by=RECOVERED_RETIREMENT_ACTOR,
+        )
+        if not restores_node(workflow):
             return []
         restored = {node for step in steps for node in step.node_ids} or set(
             incident.node_ids

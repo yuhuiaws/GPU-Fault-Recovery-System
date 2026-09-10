@@ -177,8 +177,8 @@ def execute(
 
         def finding_opened() -> dict[str, Any] | None:
             value = fixture.node_activity(since, evidence_kind="GPU_INVENTORY")
-            if not verdicts.identity_finding_errors(
-                {**value, "workflows": []}, dropped_uuid=dropped_uuid
+            if not verdicts.identity_incident_errors(
+                value, dropped_uuid=dropped_uuid
             ) or verdicts.no_reboot_errors(
                 value,
                 boot_id_before=baseline["boot_id"],

@@ -120,6 +120,30 @@ def inventory_evidence_errors(
     return errors
 
 
+def identity_incident_errors(
+    activity: dict[str, Any], *, dropped_uuid: str
+) -> list[str]:
+    """The finding-phase check: the incident exists and names the UUID.
+
+    The workflow checks belong to the terminal phase; asking for them while
+    polling for the finding kept the first live runs waiting the whole finding
+    budget on an incident that had already opened.
+    """
+
+    incidents = [
+        item
+        for item in activity.get("incidents") or []
+        if "GPU inventory identity changed" in str(item.get("reasons"))
+        or IDENTITY_METRIC in str(item.get("reasons"))
+        or IDENTITY_METRIC in str(item.get("event_type"))
+    ]
+    if not incidents:
+        return [f"no incident names {IDENTITY_METRIC}"]
+    if not any(dropped_uuid in str(item.get("reasons")) for item in incidents):
+        return [f"no identity-changed incident names the removed UUID {dropped_uuid}"]
+    return []
+
+
 def identity_finding_errors(
     activity: dict[str, Any], *, dropped_uuid: str
 ) -> list[str]:
