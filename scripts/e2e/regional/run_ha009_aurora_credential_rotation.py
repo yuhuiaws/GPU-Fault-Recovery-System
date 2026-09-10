@@ -967,6 +967,13 @@ def _run_rotation_case(
     image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
     create_probe(image, identity, run_id)
     state["probe_created"] = True
+    # Receipts are collected for the whole case: the processor retires
+    # COMPLETED requests after 600 s and this case outlives that.
+    ledger = BASE.ReceiptLedger(
+        lambda: BASE.read_probe().get("accepted_request_ids", [])
+    )
+    state["ledger"] = ledger
+    ledger.start()
     probe_baseline = BASE.wait_probe_samples(
         minimum_events=BASELINE_EVENT_SAMPLES,
         minimum_claims=BASELINE_CLAIM_SAMPLES,
@@ -1055,7 +1062,8 @@ def _run_rotation_case(
     runtime = wait_runtime_records(seed)
     write_json_atomic(case_dir / "runtime-final.json", runtime)
     accepted_ids = sorted(set(final_probe.get("accepted_request_ids", [])))
-    receipts = BASE.wait_receipts(
+    ledger.stop()
+    receipts = ledger.wait(
         accepted_ids, timeout_seconds=PHASE_BUDGETS["processor_receipts"]
     )
     write_json_atomic(case_dir / "processor-receipts.json", receipts)
@@ -1292,6 +1300,8 @@ def _cleanup_rotation(
                 "left_armed": True,
                 "reason": "credential refresh never succeeded",
             }
+    if state.get("ledger") is not None:
+        state["ledger"].stop()
     if state["probe_created"]:
         final_log = BASE.dataplane("logs", BASE.POD, check=False, timeout=120)
         write_text(case_dir / "probe.log", final_log)
@@ -1361,6 +1371,7 @@ def run_case(
     result: dict = {"case_id": CASE_ID, "attempt": attempt, "verdict": "FAIL"}
     state: dict = {
         "seed": {},
+        "ledger": None,
         "probe_created": False,
         "rotation_started": False,
         "refresh_succeeded": False,

@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -470,18 +471,101 @@ print(json.dumps({"requests": requests, "missing": missing}, sort_keys=True))
     return cpu_python(script, *request_ids)
 
 
+def _settled(item: dict | None) -> bool:
+    return (
+        bool(item) and item["status"] == "COMPLETED" and item["response_status"] == 200
+    )
+
+
+class ReceiptLedger:
+    """Processor receipts collected across a whole case, not read once at its end.
+
+    The processor retires COMPLETED requests after
+    ``GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`` (600 s as shipped). A
+    case that runs longer -- HA-009 with its pool idle window takes 13 to 18
+    minutes -- read its earliest accepted requests as "missing" at the end and
+    failed a rotation the product had completed. A receipt seen COMPLETED/200
+    is kept from the moment it is observed; ``start`` polls on a thread so no
+    accepted request goes unobserved for longer than the retention. Only ids
+    not yet settled are asked for again.
+    """
+
+    def __init__(
+        self,
+        read_accepted_ids: Callable[[], list[str]],
+        *,
+        interval_seconds: float = 60.0,
+    ) -> None:
+        self.receipts: dict[str, dict] = {}
+        self.polls = 0
+        self.last_error: str | None = None
+        self._read_accepted_ids = read_accepted_ids
+        self._interval = interval_seconds
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def collect(self, request_ids: list[str]) -> dict:
+        with self._lock:
+            pending = [
+                item for item in request_ids if not _settled(self.receipts.get(item))
+            ]
+        last = processor_receipts(pending)
+        with self._lock:
+            for item in last["requests"]:
+                self.receipts[item["request_id"]] = item
+            self.polls += 1
+        return last
+
+    def settled_count(self) -> int:
+        with self._lock:
+            return sum(1 for item in self.receipts.values() if _settled(item))
+
+    def _poll(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                self.collect(list(self._read_accepted_ids()))
+            except Exception as exc:  # the final wait decides; this only records
+                self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+
+    def wait(self, request_ids: list[str], timeout_seconds: int = 180) -> dict:
+        deadline = time.monotonic() + timeout_seconds
+        last: dict = {}
+        while True:
+            last = self.collect(request_ids)
+            with self._lock:
+                receipts = {item: self.receipts.get(item) for item in request_ids}
+            if all(_settled(item) for item in receipts.values()):
+                return {
+                    "requests": [receipts[item] for item in request_ids],
+                    "missing": [],
+                    "ledger": {"polls": self.polls, "last_error": self.last_error},
+                }
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        unsettled = {
+            item: receipt for item, receipt in receipts.items() if not _settled(receipt)
+        }
+        raise CaseError(
+            "processor receipts did not converge: "
+            f"{len(unsettled)} of {len(request_ids)} unsettled "
+            f"(missing={sorted(k for k, v in unsettled.items() if v is None)[:5]}..., "
+            f"last read={last})"
+        )
+
+
 def wait_receipts(request_ids: list[str], timeout_seconds: int = 180) -> dict:
-    deadline = time.monotonic() + timeout_seconds
-    last = {}
-    while time.monotonic() < deadline:
-        last = processor_receipts(request_ids)
-        if not last["missing"] and all(
-            item["status"] == "COMPLETED" and item["response_status"] == 200
-            for item in last["requests"]
-        ):
-            return last
-        time.sleep(2)
-    raise CaseError(f"processor receipts did not converge: {last}")
+    return ReceiptLedger(lambda: []).wait(request_ids, timeout_seconds=timeout_seconds)
 
 
 def rollout_targets(all_deployments: bool) -> list[str]:

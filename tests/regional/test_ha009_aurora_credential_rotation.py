@@ -341,3 +341,90 @@ def test_stop_process_group_kills_sleep_child_too(tmp_path: Path) -> None:
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
+
+
+def _receipt(request_id: str, status: str = "COMPLETED", response: int = 200) -> dict:
+    return {
+        "request_id": request_id,
+        "status": status,
+        "response_status": response,
+        "path": "/v1/collector-events/host-telemetry",
+        "retry_count": 0,
+    }
+
+
+def test_a_receipt_seen_completed_survives_the_processor_retiring_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempt 5 (13 minutes of probe traffic) read its earliest requests as
+    missing: COMPLETED rows are retired after 600 s. Observed once, a receipt
+    stays settled; only unsettled ids are asked for again."""
+
+    monkeypatch.setattr(ha005.time, "sleep", lambda _seconds: None)
+    reads: list[list[str]] = []
+
+    def receipts(ids: list[str]) -> dict:
+        reads.append(list(ids))
+        if len(reads) == 1:
+            return {"requests": [_receipt("early")], "missing": ["late"]}
+        # The early row has been retired by now; the late one completed.
+        return {"requests": [_receipt("late")], "missing": ["early"]}
+
+    monkeypatch.setattr(ha005, "processor_receipts", receipts)
+    ledger = ha005.ReceiptLedger(lambda: ["early", "late"])
+
+    ledger.collect(["early", "late"])
+    result = ledger.wait(["early", "late"], timeout_seconds=5)
+
+    assert reads == [["early", "late"], ["late"]], "a settled id was read again"
+    assert result["missing"] == [], result
+    assert [item["request_id"] for item in result["requests"]] == ["early", "late"]
+    assert result["ledger"]["polls"] == 2, result["ledger"]
+
+
+def test_an_id_never_seen_completed_still_fails_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ha005.time, "sleep", lambda _seconds: None)
+    clock = iter([0.0, 0.0, 100.0, 100.0, 200.0, 200.0, 300.0, 300.0])
+    monkeypatch.setattr(ha005.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        ha005,
+        "processor_receipts",
+        lambda ids: {"requests": [_receipt("a", "FAILED", 500)], "missing": ["gone"]},
+    )
+
+    with pytest.raises(ha005.CaseError, match="2 of 2 unsettled"):
+        ha005.ReceiptLedger(lambda: []).wait(["a", "gone"], timeout_seconds=150)
+
+
+def test_the_background_poll_collects_new_ids_and_records_its_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The poll must outpace the retention on its own: the case body is busy
+    waiting on RDS and kubelet for minutes at a time."""
+
+    answers = iter(
+        [
+            RuntimeError("probe exec hiccup"),
+            {"requests": [_receipt("x")], "missing": []},
+        ]
+    )
+
+    def receipts(ids: list[str]) -> dict:
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(ha005, "processor_receipts", receipts)
+    ledger = ha005.ReceiptLedger(lambda: ["x"], interval_seconds=0.01)
+
+    ledger.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not ledger.settled_count():
+        time.sleep(0.01)
+    ledger.stop()
+
+    assert ledger.settled_count() == 1, "the poll never collected the receipt"
+    assert ledger.last_error == "RuntimeError: probe exec hiccup"
