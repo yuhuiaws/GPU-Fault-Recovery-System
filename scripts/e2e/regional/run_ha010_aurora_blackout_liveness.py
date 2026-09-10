@@ -387,6 +387,23 @@ def verify_plan_identity(case_dir: Path, preflight: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Samplers
 # --------------------------------------------------------------------------- #
+def feed_script(process: subprocess.Popen[str], text: str) -> None:
+    """Hand the probe its script on stdin and detach the pipe.
+
+    ``Popen.communicate`` flushes ``stdin`` whenever the attribute is set, and
+    a pipe that was closed by hand is a closed file: the first live run that
+    reached the collection step died with ``I/O operation on closed file``.
+    Dropping the attribute after the close tells ``communicate`` there is no
+    stdin left to flush.
+    """
+
+    if process.stdin is None:
+        raise RegionalFixtureError("sampler stdin pipe was not opened")
+    process.stdin.write(text)
+    process.stdin.close()
+    process.stdin = None
+
+
 @dataclass
 class Sampler:
     pod: str
@@ -448,10 +465,7 @@ def start_sampler(
         stderr=subprocess.PIPE,
         text=True,
     )
-    if process.stdin is None:
-        raise RegionalFixtureError("sampler stdin pipe was not opened")
-    process.stdin.write(PROBE_SCRIPT.read_text(encoding="utf-8"))
-    process.stdin.close()
+    feed_script(process, PROBE_SCRIPT.read_text(encoding="utf-8"))
     return Sampler(
         pod=str(record["name"]),
         process=process,

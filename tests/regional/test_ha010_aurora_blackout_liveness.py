@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -741,3 +742,29 @@ def test_the_failover_step_unpacks_ha003s_document_and_samples(
     assert after["writer"] == "db-2" and "available_at" in after, after
     samples = json.loads((tmp_path / "rds-failover-samples.json").read_text())
     assert samples == {"samples": [{"t": 1}]}
+
+
+def test_a_sampler_fed_on_stdin_can_still_be_collected() -> None:
+    """communicate() flushes a stdin attribute that is set; a pipe closed by
+    hand is a closed file and the first live collection died on it."""
+    import subprocess
+    from datetime import datetime, timezone
+
+    from scripts.e2e.regional import run_ha010_aurora_blackout_liveness as ha010
+
+    process = subprocess.Popen(
+        [sys.executable, "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ha010.feed_script(process, 'import json\nprint(json.dumps({"samples": [1, 2]}))\n')
+    assert process.stdin is None, "the fed pipe must be detached"
+
+    report = ha010.Sampler(
+        pod="p", process=process, started_at=datetime.now(timezone.utc)
+    ).collect(30)
+
+    assert report["returncode"] == 0, report
+    assert report["samples"] == [1, 2], report
