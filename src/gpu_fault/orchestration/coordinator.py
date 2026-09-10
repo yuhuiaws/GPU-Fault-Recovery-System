@@ -277,13 +277,14 @@ class IncidentOrchestrator:
                 reopen_if_terminal=self._reopen_if_terminal,
                 generation_fence=self._generation_fence,
                 active_job_recovery_workflow=(self._active_job_recovery_workflow),
-                candidate_recovery_workflow=(self._candidate_recovery_workflow),
                 claims_node_exclusively=(self._claims_node_exclusively),
                 active_node_exclusive_workflow=(self._active_node_exclusive_workflow),
                 merge_disposition=self._merge_disposition,
                 widen_node_action_scope=(self._widen_node_action_scope),
                 aggregation_deadlines=(self._aggregation_deadlines),
                 prepare_preempting_successor=(self._prepare_preempting_successor),
+                preempt_parallel_job_branch=(self._preempt_parallel_job_branch),
+                incident_state_for_workflow=(self._incident_state_for_workflow),
                 quiesce_parameters=self._quiesce_parameters,
             ),
             multi_node_aggregation_window_seconds=(
@@ -291,11 +292,10 @@ class IncidentOrchestrator:
             ),
             target_driver_branch=self.target_driver_branch,
             target_firmware_version=(self.target_firmware_version),
+            workflow_preemption_enabled=(self.workflow_preemption_enabled),
         )
 
-    def _create_node_lifecycle_service(
-        self,
-    ) -> NodeLifecycleOperationService:
+    def _create_node_lifecycle_service(self) -> NodeLifecycleOperationService:
         callbacks = NodeLifecycleCallbacks(
             active_job_recovery_workflow=(self._active_job_recovery_workflow),
             active_node_exclusive_workflow=(self._active_node_exclusive_workflow),

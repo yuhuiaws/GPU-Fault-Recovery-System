@@ -339,6 +339,7 @@ class ScenarioState:
     reset_reboot_workflow_id: str = ""
     reset_reboot_incident_id: str = ""
     strong_sent: bool = False
+    strong_in_record: bool = False
     primary_reset_failed: bool = False
     primary_reboot_succeeded: bool = False
     reset_attempt_started: bool = False
@@ -475,8 +476,15 @@ def _handle_scenario_command(
             ),
         )
         state.strong_workflow_id = str(strong.get("workflow_request_id") or "")
-        if not state.strong_workflow_id or state.strong_workflow_id == weak_workflow_id:
-            raise RuntimeError("strong event did not create a successor")
+        if not state.strong_workflow_id:
+            raise RuntimeError("strong event did not join or create a workflow")
+        # A clean boundary (containment done, nothing physical in flight)
+        # preempts inside the weak record: the fabric reset becomes the
+        # node's successor branch under the same workflow id. A preemption
+        # that lands on an in-flight physical step is a separate successor
+        # record (DESTR-016's shape). Both are accepted; the audit tells them
+        # apart.
+        state.strong_in_record = state.strong_workflow_id == weak_workflow_id
         state.strong_sent = True
     if operation != "RESTART_NODE":
         return
@@ -524,6 +532,7 @@ def _scenario_output(
         "reset_reboot_incident_id": state.reset_reboot_incident_id,
         "reset_reboot_succeeded": state.reset_reboot_succeeded,
         "strong_sent": state.strong_sent,
+        "strong_in_record": state.strong_in_record,
         "primary_reset_failed": state.primary_reset_failed,
         "reset_attempt_started": state.reset_attempt_started,
         "reset_gpu_failed": state.reset_gpu_failed,

@@ -99,24 +99,45 @@ def test_concurrent_node_sxids_merge_into_one_attempt_workflow(tmp_path) -> None
         assert workflow.not_before is not None
         assert len(stores[0].list_workflows()) == 1
 
-        reset = next(
-            step
+        # One branch per node: the regional executor has no barrier
+        # coordinator, so a reset step naming two nodes could never run.
+        assert workflow.dag_enabled, "two nodes make the plan a DAG"
+        resets = {
+            step.branch_id: step
             for step in workflow.official_steps
             if step.operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+        }
+        # Either event may have arrived first: the first node's branch is
+        # ``branch:initial`` and the other node's is ``branch:<node>``.
+        assert "branch:initial" in resets and len(resets) == 2, (
+            f"each node resets in its own branch: {sorted(map(str, resets))}"
         )
-        assert reset.node_ids == ["node-0", "node-1"]
-        assert reset.parameters["gpu_uuids_by_node"] == {
-            "node-0": ["GPU-0-0", "GPU-0-1"],
-            "node-1": ["GPU-1-0", "GPU-1-1"],
-        }
-        assert reset.parameters["fabric_partitions_by_node"] == {
-            "node-0": "cluster-a/node-0/local-nvswitch",
-            "node-1": "cluster-a/node-1/local-nvswitch",
-        }
-        assert reset.parameters["sxids_by_node"] == {
-            "node-0": [11001],
-            "node-1": [11001],
-        }
+        assert {tuple(step.node_ids) for step in resets.values()} == {
+            ("node-0",),
+            ("node-1",),
+        }, "each branch names exactly its own node"
+        for step in resets.values():
+            (node_id,) = step.node_ids
+            rank = node_id[-1]
+            assert step.parameters["gpu_uuids_by_node"] == {
+                node_id: [f"GPU-{rank}-0", f"GPU-{rank}-1"]
+            }
+            assert step.parameters["fabric_partitions_by_node"] == {
+                node_id: f"cluster-a/{node_id}/local-nvswitch"
+            }
+            assert step.parameters["sxids_by_node"] == {node_id: [11001]}
+            assert step.parameters["fabric_partition"] == (
+                f"cluster-a/{node_id}/local-nvswitch"
+            )
+            assert step.parameters["sxid"] == 11001
+        stop_steps = [
+            step
+            for step in workflow.official_steps
+            if step.operation is WorkflowOperation.STOP_WORKLOADS
+        ]
+        assert len(stop_steps) == 1, "one shared STOP for the attempt"
+        assert stop_steps[0].branch_id == "shared"
+        assert stop_steps[0].node_ids == ["node-0", "node-1"]
 
         restart_steps = [
             step
@@ -124,6 +145,7 @@ def test_concurrent_node_sxids_merge_into_one_attempt_workflow(tmp_path) -> None
             if step.operation is WorkflowOperation.RESTART_WORKLOAD
         ]
         assert len(restart_steps) == 1
+        assert restart_steps[0].branch_id == "join"
         assert restart_steps[0].node_ids == ["node-0", "node-1"]
         assert restart_steps[0].parameters == {
             "cluster_id": "cluster-a",
@@ -157,16 +179,29 @@ def test_concurrent_access_sxids_merge_into_one_attempt_reset(tmp_path) -> None:
 
         assert len({incident.incident_id for incident, _ in results}) == 1
         workflow = store.get_workflow(results[-1][1].request_id)
-        reset = next(
-            step
+        assert workflow.dag_enabled, "two nodes make the plan a DAG"
+        resets = {
+            step.branch_id: step
             for step in workflow.official_steps
             if step.operation is WorkflowOperation.RESET_GPU
-        )
-        assert reset.node_ids == ["node-0", "node-1"]
-        assert reset.parameters["gpu_uuids_by_node"] == {
-            "node-0": ["GPU-0-0", "GPU-0-1"],
-            "node-1": ["GPU-1-0", "GPU-1-1"],
         }
+        assert set(resets) == {"branch:initial", "branch:node-1"}, (
+            "each node resets in its own branch"
+        )
+        assert resets["branch:initial"].node_ids == ["node-0"]
+        assert resets["branch:initial"].parameters["gpu_uuids_by_node"] == {
+            "node-0": ["GPU-0-0", "GPU-0-1"]
+        }
+        assert resets["branch:node-1"].node_ids == ["node-1"]
+        assert resets["branch:node-1"].parameters["gpu_uuids_by_node"] == {
+            "node-1": ["GPU-1-0", "GPU-1-1"]
+        }
+        stop_steps = [
+            step
+            for step in workflow.official_steps
+            if step.operation is WorkflowOperation.STOP_WORKLOADS
+        ]
+        assert len(stop_steps) == 1 and stop_steps[0].node_ids == ["node-0", "node-1"]
         assert not any(
             step.operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
             for step in workflow.official_steps

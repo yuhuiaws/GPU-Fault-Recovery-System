@@ -1,3 +1,16 @@
+"""Attempt-grouped SXID ingestion.
+
+Fatal access/trunk SXIDs on a training attempt share one workflow keyed by
+``cluster + job + attempt``. The first event compiles the SXID plan for its
+node; every later event compiles the same plan for *its* node and hands the
+merge verdict to :class:`DispositionApplier`, exactly as the XID family does,
+so a second node with a different reset class becomes a ``branch:<node>``
+beside ``branch:initial`` under one ``shared`` STOP and one ``join`` RESTART.
+This module used to apply the verdict itself and rewrote the plan in place
+with only the newest node's reset, or minted a successor workflow with a
+second STOP/RESTART once the first was running.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,17 +21,17 @@ from uuid import uuid4
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
-    IncidentState,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepSpec,
     WorkloadState,
     bounded_reasons,
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher
-from gpu_fault.orchestration.disposition import MERGING_DISPOSITIONS, Disposition
+from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
@@ -36,13 +49,14 @@ class SxidIngestionCallbacks:
     reopen_if_terminal: Callable
     generation_fence: Callable
     active_job_recovery_workflow: Callable
-    candidate_recovery_workflow: Callable
     claims_node_exclusively: Callable
     active_node_exclusive_workflow: Callable
     merge_disposition: Callable
     widen_node_action_scope: Callable
     aggregation_deadlines: Callable
     prepare_preempting_successor: Callable
+    preempt_parallel_job_branch: Callable
+    incident_state_for_workflow: Callable
     quiesce_parameters: Callable
 
 
@@ -59,42 +73,31 @@ class _SxidContext:
 
 
 @dataclass(frozen=True)
-class _SxidBuildState:
-    now: datetime
-    existing_incident: FaultIncident | None
-    existing_workflow: WorkflowRequest | None
-    serialization_predecessor: WorkflowRequest | None
-    reset_operation: WorkflowOperation
-    has_existing: bool
-    mutable: bool
-    candidate_preview: WorkflowRequest
-    disposition: str | None
-
-
-@dataclass
-class _SxidScope:
-    incident_id: str
-    workflow_id: str
-    primary_event_id: str
-    opened_at: datetime
-    predecessor_workflow_id: str | None
-    not_before: datetime | None
-    aggregation_max_deadline: datetime | None
-    incident_nodes: list[str]
-    fault_nodes: list[str]
-    reasons: list[str]
-    gpu_mapping: dict[str, list[str]]
-    partition_mapping: dict[str, str]
-    sxid_mapping: dict[str, list[int]]
-    all_gpu_uuids: list[str]
-
-
-@dataclass(frozen=True)
 class _CompiledSxidWorkflow:
     status: WorkflowStatus
-    official_steps: list
-    safety_steps: list
+    official_steps: list[WorkflowStepSpec]
+    safety_steps: list[WorkflowStepSpec]
     errors: list[str]
+
+
+_WORKLOAD_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.STOP_WORKLOADS,
+        WorkflowOperation.RESTART_WORKLOAD,
+    }
+)
+_NODE_ACTION_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RESTORE_GPU_SERVICES,
+        WorkflowOperation.REMEDIATE_DRIVER,
+        WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+    }
+)
 
 
 def merge_sxid_step_scope(
@@ -113,7 +116,13 @@ def merge_sxid_step_scope(
     }
     steps = []
     for index, step in enumerate(workflow.official_steps):
-        if step.operation not in scoped_operations or index in untouchable:
+        if (
+            step.operation not in scoped_operations
+            or index in untouchable
+            # In a DAG each node's reset lives in its own branch; another
+            # node's branch does not take this event's GPUs (F-B6 (2)).
+            or (workflow.dag_enabled and event.node_id not in step.node_ids)
+        ):
             steps.append(step)
             continue
         parameters = dict(step.parameters)
@@ -159,12 +168,21 @@ class SxidIngestionService:
         multi_node_aggregation_window_seconds: int,
         target_driver_branch: int | None,
         target_firmware_version: str | None,
+        workflow_preemption_enabled: bool = True,
     ) -> None:
         self.store = store
         self.builder = builder
         self.arbiter = arbiter
         self.brancher = brancher
         self.callbacks = callbacks
+        self.dispositions = DispositionApplier(
+            arbiter=arbiter,
+            brancher=brancher,
+            aggregation_deadlines=callbacks.aggregation_deadlines,
+            prepare_preempting_successor=callbacks.prepare_preempting_successor,
+            preempt_parallel_job_branch=callbacks.preempt_parallel_job_branch,
+            workflow_preemption_enabled=workflow_preemption_enabled,
+        )
         self.multi_node_aggregation_window_seconds = (
             multi_node_aggregation_window_seconds
         )
@@ -281,26 +299,9 @@ class SxidIngestionService:
                 ),
                 existing_workflow,
             )
-        state = self._build_state(
-            context,
-            now,
-            existing_incident,
-            existing_workflow,
-        )
-        if state.disposition in MERGING_DISPOSITIONS:
-            return self._merge_existing(context, state)
-        scope = self._scope(context, state)
-        compiled = self._compile(context, state, scope)
-        return self._emit(context, state, scope, compiled)
-
-    def _build_state(
-        self,
-        context: _SxidContext,
-        now: datetime,
-        existing_incident: FaultIncident | None,
-        existing_workflow: WorkflowRequest | None,
-    ) -> _SxidBuildState:
         if existing_incident is None and existing_workflow is None:
+            # An XID on this attempt may already have opened the job workflow;
+            # the SXID joins it instead of racing it.
             active_recovery = self.callbacks.active_job_recovery_workflow(
                 context.observation
             )
@@ -309,134 +310,90 @@ class SxidIngestionService:
                 and active_recovery[0].attempt_id == context.observation.attempt_id
             ):
                 existing_incident, existing_workflow = active_recovery
-        reset_operation = (
-            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
-            if context.decision.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES"
-            else WorkflowOperation.RESET_GPU
-        )
-        has_existing = existing_incident is not None and existing_workflow is not None
-        mutable = bool(
-            has_existing
-            and existing_workflow is not None
-            and workflow_is_mutable(existing_workflow)
-        )
-        candidate = self.callbacks.candidate_recovery_workflow(
-            context.event, context.decision
+        if existing_incident is None or existing_workflow is None:
+            return self._new_workflow(context, now)
+        return self._merge(context, now, existing_incident, existing_workflow)
+
+    def _new_workflow(
+        self,
+        context: _SxidContext,
+        now: datetime,
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        incident, workflow = self._candidate(
+            context, now, context.decision.marker.incident_id
         )
         predecessor = None
-        if not has_existing and self.callbacks.claims_node_exclusively(
-            candidate.official_steps
-        ):
-            predecessor = self.callbacks.active_node_exclusive_workflow(
+        if self.callbacks.claims_node_exclusively(workflow.official_steps):
+            incumbent = self.callbacks.active_node_exclusive_workflow(
                 context.event.cluster_id,
                 {context.event.node_id},
-                exclude_request_ids=frozenset({candidate.request_id}),
-                candidate_steps=candidate.official_steps,
+                exclude_request_ids=frozenset({workflow.request_id}),
+                candidate_steps=workflow.official_steps,
             )
-        disposition = (
+            if incumbent is not None:
+                predecessor = incumbent.request_id
+        not_before, maximum = self.callbacks.aggregation_deadlines(now)
+        return incident, workflow.model_copy(
+            update={
+                "predecessor_workflow_id": predecessor,
+                "not_before": not_before,
+                "aggregation_max_deadline": maximum,
+            }
+        )
+
+    def _merge(
+        self,
+        context: _SxidContext,
+        now: datetime,
+        existing_incident: FaultIncident,
+        existing_workflow: WorkflowRequest,
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        event = context.event
+        event_gpus = set(event.participating_gpu_uuids)
+        candidate, candidate_workflow = self._candidate(
+            context, now, existing_incident.incident_id
+        )
+        mutable = workflow_is_mutable(existing_workflow)
+        disposition = Disposition(
             self.callbacks.merge_disposition(
                 existing_workflow,
-                candidate,
-                context.event.node_id,
-                set(context.event.participating_gpu_uuids),
+                candidate_workflow,
+                event.node_id,
+                event_gpus,
                 allow_job_branch_merge=(
                     existing_incident.attempt_id == context.observation.attempt_id
                 ),
             )
-            if has_existing
-            else None
         )
-        if disposition == Disposition.REPLACE_IN_PLACE:
-            # ``disposition`` says so for a mutable row, and (C-03) for a
-            # BLOCKED(NEEDS_OPERATOR) row that never ran a step. In this
-            # family "mutable" is what selects the in-place rewrite -- same
-            # ``request_id``, ``fencing_token + 1`` -- in ``_scope``/``_emit``.
-            mutable = True
-        return _SxidBuildState(
-            now=now,
+        workflow, winner = self.dispositions.apply(
+            disposition,
+            node_id=event.node_id,
+            candidate=candidate,
+            candidate_workflow=candidate_workflow,
             existing_incident=existing_incident,
             existing_workflow=existing_workflow,
-            serialization_predecessor=predecessor,
-            reset_operation=reset_operation,
-            has_existing=has_existing,
+            gpu_uuids=event_gpus,
             mutable=mutable,
-            candidate_preview=candidate,
-            disposition=disposition,
+            now=now,
         )
-
-    def _merge_existing(
-        self,
-        context: _SxidContext,
-        state: _SxidBuildState,
-    ) -> tuple[FaultIncident, WorkflowRequest]:
-        event = context.event
-        existing_incident = state.existing_incident
-        existing_workflow = state.existing_workflow
-        assert existing_incident is not None
-        assert existing_workflow is not None
-        event_gpus = set(event.participating_gpu_uuids)
-        if state.disposition == "WIDEN_BRANCH":
-            merged = self.brancher.widen_parallel_job_branch(
-                existing_workflow,
-                state.candidate_preview,
-                event.node_id,
-                event_gpus,
-            )
-        elif state.disposition == "WIDEN_IN_PLACE" or (
-            state.disposition == "ABSORB" and state.mutable
-        ):
-            merged = self.callbacks.widen_node_action_scope(
-                existing_workflow,
-                self.arbiter.merged_gpu_scope(
-                    existing_workflow,
-                    event.node_id,
-                    event_gpus,
-                ),
-            )
-        else:
-            merged = existing_workflow
-        merged = merge_sxid_step_scope(merged, event)
-        workflow_updates = {"updated_at": state.now}
-        if state.mutable and state.disposition == "ABSORB":
-            not_before, maximum = self.callbacks.aggregation_deadlines(
-                state.now, existing_workflow
-            )
-            workflow_updates.update(
-                {
-                    "not_before": not_before,
-                    "aggregation_max_deadline": maximum,
-                }
-            )
-        merged = merged.model_copy(update=workflow_updates)
-        candidate_wins = self.arbiter.workflow_recovery_rank(
-            state.candidate_preview
-        ) > self.arbiter.workflow_recovery_rank(existing_workflow)
+        workflow = self._scope_merged(context, workflow, existing_workflow)
         decision = context.decision
         incident = existing_incident.model_copy(
             update={
                 "event_type": "GPU_FAULT_GROUP",
+                "event_source": winner.event_source or existing_incident.event_source,
+                "source_boot_id": (
+                    winner.source_boot_id or existing_incident.source_boot_id
+                ),
                 "node_ids": sorted(set(existing_incident.node_ids) | {event.node_id}),
                 "gpu_uuids": sorted(set(existing_incident.gpu_uuids) | event_gpus),
-                "official_action": (
-                    decision.official_action
-                    if candidate_wins
-                    else existing_incident.official_action
-                ),
-                "effective_action": (
-                    decision.action
-                    if candidate_wins
-                    else existing_incident.effective_action
-                ),
-                "policy_source": (
-                    decision.source.value
-                    if candidate_wins
-                    else existing_incident.policy_source
-                ),
-                "policy_version": (
-                    decision.policy_version
-                    if candidate_wins
-                    else existing_incident.policy_version
-                ),
+                "official_action": winner.official_action,
+                "effective_action": winner.effective_action,
+                "policy_source": winner.policy_source,
+                "policy_version": winner.policy_version,
+                "fencing_token": workflow.fencing_token,
+                "workflow_request_id": workflow.request_id,
+                "state": self.callbacks.incident_state_for_workflow(workflow),
                 "reasons": bounded_reasons(
                     [
                         *existing_incident.reasons,
@@ -446,127 +403,162 @@ class SxidIngestionService:
                         ),
                     ]
                 ),
-                "updated_at": state.now,
+                "updated_at": now,
             }
         )
-        return incident, merged
+        return incident, workflow
 
-    def _scope(
+    def _scope_merged(
         self,
         context: _SxidContext,
-        state: _SxidBuildState,
-    ) -> _SxidScope:
+        workflow: WorkflowRequest,
+        existing_workflow: WorkflowRequest,
+    ) -> WorkflowRequest:
+        """Point the merged plan's pending steps at the attempt as it is now.
+
+        Finished, superseded and in-flight steps are history or a command an
+        agent already holds (F-B6, C-08); only steps still to run take this
+        event's observation. A flat plan then widens its node steps to the
+        merged GPU scope; a DAG keeps each node's scope in its own branch.
+        """
         event = context.event
-        existing_incident = state.existing_incident
-        existing_workflow = state.existing_workflow
-        previous_reset = None
-        reset_parameters = {}
-        predecessor_id = (
-            state.serialization_predecessor.request_id
-            if state.serialization_predecessor is not None
-            else None
-        )
-        if state.has_existing:
-            assert existing_incident is not None
-            assert existing_workflow is not None
-            previous_reset = next(
-                (
-                    step
-                    for step in existing_workflow.official_steps
-                    if step.operation is state.reset_operation
-                ),
-                None,
-            )
-            if previous_reset is not None:
-                reset_parameters = previous_reset.parameters
-            incident_id = existing_incident.incident_id
-            workflow_id = (
-                existing_workflow.request_id if state.mutable else f"workflow-{uuid4()}"
-            )
-            if state.mutable:
-                not_before, maximum = self.callbacks.aggregation_deadlines(
-                    state.now, existing_workflow
+        restart_parameters = self._restart_parameters(context)
+        untouchable = set(resolved_step_indexes(workflow)) | {
+            execution.step_index for execution in workflow.step_executions
+        }
+        steps = []
+        for index, step in enumerate(workflow.official_steps):
+            if index in untouchable:
+                steps.append(step)
+                continue
+            parameters = step.parameters
+            if step.operation is WorkflowOperation.STOP_WORKLOADS:
+                parameters = {
+                    **parameters,
+                    "termination_initiator_incident_id": workflow.incident_id,
+                }
+            elif step.operation is WorkflowOperation.RESTART_WORKLOAD:
+                parameters = {**parameters, **restart_parameters}
+            elif step.operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
+                parameters = self.callbacks.quiesce_parameters(
+                    parameters, context.observation
                 )
-            else:
-                not_before = maximum = None
-                predecessor_id = existing_workflow.request_id
-            incident_nodes = sorted(set(existing_incident.node_ids) | {event.node_id})
-            fault_nodes = sorted(
-                set(previous_reset.node_ids if previous_reset is not None else [])
-                | {event.node_id}
+            steps.append(
+                step.model_copy(
+                    update={
+                        "node_ids": (
+                            context.allocation_nodes
+                            if step.operation in _WORKLOAD_OPERATIONS
+                            else step.node_ids
+                        ),
+                        "workload_ids": context.resolved_workload_ids,
+                        "parameters": parameters,
+                    }
+                )
             )
-            primary_event_id = existing_incident.event_id
-            opened_at = existing_incident.created_at
-            reasons = list(existing_incident.reasons)
-        else:
-            incident_id = context.decision.marker.incident_id
-            workflow_id = f"workflow-{uuid4()}"
-            primary_event_id = event.event_id
-            opened_at = state.now
-            not_before, maximum = self.callbacks.aggregation_deadlines(state.now)
-            incident_nodes = fault_nodes = [event.node_id]
-            reasons = []
-        gpu_mapping = {
-            node_id: list(values)
-            for node_id, values in (
-                reset_parameters.get("gpu_uuids_by_node", {})
-            ).items()
-        }
-        partitions = dict(reset_parameters.get("fabric_partitions_by_node", {}))
-        sxids = {
-            node_id: list(values)
-            for node_id, values in (reset_parameters.get("sxids_by_node", {})).items()
-        }
-        gpu_mapping[event.node_id] = sorted(
-            set(gpu_mapping.get(event.node_id, [])) | set(event.participating_gpu_uuids)
-        )
-        if event.fabric_partition:
-            partitions[event.node_id] = event.fabric_partition
-        sxids[event.node_id] = sorted(set(sxids.get(event.node_id, [])) | {event.sxid})
-        all_gpu_uuids = sorted(
-            (set(existing_incident.gpu_uuids) if state.has_existing else set())
-            | {gpu_uuid for values in gpu_mapping.values() for gpu_uuid in values}
-        )
-        reasons = list(
-            dict.fromkeys(
-                [
-                    *reasons,
-                    *(
-                        f"{event.node_id}: SXID {event.sxid}: {reason}"
-                        for reason in context.decision.reasons
-                    ),
-                ]
+        workflow = workflow.model_copy(update={"official_steps": steps})
+        if not workflow.dag_enabled:
+            scope_source = (
+                existing_workflow
+                if workflow.request_id == existing_workflow.request_id
+                else None
             )
-        )
-        return _SxidScope(
+            workflow = self.callbacks.widen_node_action_scope(
+                workflow,
+                self.arbiter.merged_gpu_scope(
+                    scope_source,
+                    event.node_id,
+                    set(event.participating_gpu_uuids),
+                ),
+            )
+        return merge_sxid_step_scope(workflow, event)
+
+    def _candidate(
+        self,
+        context: _SxidContext,
+        now: datetime,
+        incident_id: str,
+    ) -> tuple[FaultIncident, WorkflowRequest]:
+        """The SXID plan for this event's node alone, under ``incident_id``.
+
+        The first event of an attempt persists this as is; a later event
+        hands it to the disposition applier, whose branching copies these
+        steps -- so they already carry the per-node GPU/SXID/partition
+        mappings, the diagnostics parameters and the site remediation.
+        """
+        event = context.event
+        decision = context.decision
+        compiled = self._compile(context, incident_id)
+        workflow_id = f"workflow-{uuid4()}"
+        workflow = WorkflowRequest(
+            request_id=workflow_id,
             incident_id=incident_id,
-            workflow_id=workflow_id,
-            primary_event_id=primary_event_id,
-            opened_at=opened_at,
-            predecessor_workflow_id=predecessor_id,
-            not_before=not_before,
-            aggregation_max_deadline=maximum,
-            incident_nodes=incident_nodes,
-            fault_nodes=fault_nodes,
-            reasons=reasons,
-            gpu_mapping=gpu_mapping,
-            partition_mapping=partitions,
-            sxid_mapping=sxids,
-            all_gpu_uuids=all_gpu_uuids,
+            runtime_profile_version=context.profile_version,
+            status=compiled.status,
+            official_action=decision.official_action,
+            fencing_token=1,
+            safety_steps=compiled.safety_steps,
+            official_steps=compiled.official_steps,
+            blocked_reasons=compiled.errors,
+            safety_only=compiled.status is WorkflowStatus.SAFETY_PENDING,
+            blocked_kind=(
+                BlockedKind.NEEDS_OPERATOR
+                if compiled.status is WorkflowStatus.BLOCKED
+                else None
+            ),
+            created_at=now,
+            updated_at=now,
         )
+        incident = FaultIncident(
+            incident_id=incident_id,
+            event_id=event.event_id,
+            event_type="GPU_FAULT_GROUP",
+            event_source=event.event_source,
+            source_boot_id=event.source_boot_id,
+            cluster_id=event.cluster_id,
+            node_ids=[event.node_id],
+            gpu_uuids=sorted(set(event.participating_gpu_uuids)),
+            job_id=context.observation.job_id,
+            attempt_id=context.observation.attempt_id,
+            workload_identity_source=(
+                event.workload_identity_source or "SOLE_ACTIVE_ATTEMPT_ON_NODE"
+            ),
+            policy_version=decision.policy_version,
+            policy_source=decision.source.value,
+            official_action=decision.official_action,
+            effective_action=None,
+            drill_id=event.drill_id,
+            state=self.callbacks.incident_state_for_workflow(workflow),
+            workflow_request_id=workflow_id,
+            fencing_token=1,
+            reasons=list(
+                dict.fromkeys(
+                    f"{event.node_id}: SXID {event.sxid}: {reason}"
+                    for reason in decision.reasons
+                )
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+        return incident, workflow
 
     def _compile(
         self,
         context: _SxidContext,
-        state: _SxidBuildState,
-        scope: _SxidScope,
+        incident_id: str,
     ) -> _CompiledSxidWorkflow:
+        event = context.event
         profile = None
         errors = []
         try:
             profile = self.store.get_profile(context.profile_version)
         except NotFoundError:
             errors.append(f"runtime profile does not exist: {context.profile_version}")
+        reset_operation = (
+            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+            if context.decision.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES"
+            else WorkflowOperation.RESET_GPU
+        )
         operations = [
             WorkflowOperation.FREEZE_EVIDENCE,
             WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
@@ -574,23 +566,25 @@ class SxidIngestionService:
             WorkflowOperation.STOP_WORKLOADS,
             WorkflowOperation.QUIESCE_GPU_SERVICES,
             WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
-            *self.builder.sxid_remediation_operations(context.event),
-            state.reset_operation,
+            *self.builder.sxid_remediation_operations(event),
+            reset_operation,
             WorkflowOperation.RESTORE_GPU_SERVICES,
             WorkflowOperation.VALIDATE_GPU,
             WorkflowOperation.VALIDATE_FABRIC,
             WorkflowOperation.RESTORE_SCHEDULING,
             WorkflowOperation.RESTART_WORKLOAD,
         ]
+        node_ids = [event.node_id]
+        gpu_uuids = sorted(set(event.participating_gpu_uuids))
         steps, compile_errors = self.builder.compile_steps(
             operations,
             profile,
-            scope.fault_nodes,
-            scope.all_gpu_uuids,
+            node_ids,
+            gpu_uuids,
             context.resolved_workload_ids,
         )
         errors.extend(compile_errors)
-        scoped_steps = self._scope_steps(context, state, scope, steps)
+        scoped_steps = self._scope_steps(context, incident_id, steps)
         safety_steps, safety_errors = self.builder.compile_steps(
             [
                 WorkflowOperation.FREEZE_EVIDENCE,
@@ -598,8 +592,8 @@ class SxidIngestionService:
                 WorkflowOperation.QUARANTINE,
             ],
             profile,
-            scope.fault_nodes,
-            scope.all_gpu_uuids,
+            node_ids,
+            gpu_uuids,
             context.resolved_workload_ids,
         )
         errors.extend(safety_errors)
@@ -620,65 +614,40 @@ class SxidIngestionService:
     def _scope_steps(
         self,
         context: _SxidContext,
-        state: _SxidBuildState,
-        scope: _SxidScope,
-        steps,
-    ) -> list:
-        workload_operations = {
-            WorkflowOperation.STOP_WORKLOADS,
-            WorkflowOperation.RESTART_WORKLOAD,
-        }
-        node_action_operations = {
-            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
-            WorkflowOperation.QUIESCE_GPU_SERVICES,
-            WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
-            WorkflowOperation.RESET_GPU,
-            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-            WorkflowOperation.RESTORE_GPU_SERVICES,
-            WorkflowOperation.REMEDIATE_DRIVER,
-            WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
-        }
-        restart_parameters = {
-            "cluster_id": context.event.cluster_id,
-            "job_id": context.observation.job_id,
-            "source_attempt_id": context.observation.attempt_id,
-            "source_gpu_count": context.source_gpu_count,
-            "restart_budget": context.observation.restart_budget,
-        }
+        incident_id: str,
+        steps: list[WorkflowStepSpec],
+    ) -> list[WorkflowStepSpec]:
+        event = context.event
+        gpu_mapping = {event.node_id: sorted(set(event.participating_gpu_uuids))}
         reset_parameters = {
-            "gpu_uuids_by_node": scope.gpu_mapping,
-            "fabric_partitions_by_node": scope.partition_mapping,
-            "sxids_by_node": scope.sxid_mapping,
+            "gpu_uuids_by_node": gpu_mapping,
+            "fabric_partitions_by_node": (
+                {event.node_id: event.fabric_partition}
+                if event.fabric_partition
+                else {}
+            ),
+            "sxids_by_node": {event.node_id: [event.sxid]},
+            "fabric_partition": event.fabric_partition,
+            "sxid": event.sxid,
         }
-        if len(scope.fault_nodes) == 1:
-            reset_parameters.update(
-                {
-                    "fabric_partition": (context.event.fabric_partition),
-                    "sxid": context.event.sxid,
-                }
-            )
         scoped_steps = []
         for step in steps:
             parameters = step.parameters
             if step.operation is WorkflowOperation.STOP_WORKLOADS:
                 parameters = {
                     **parameters,
-                    "termination_initiator_incident_id": (scope.incident_id),
+                    "termination_initiator_incident_id": incident_id,
                 }
             elif step.operation is WorkflowOperation.RESTART_WORKLOAD:
                 parameters = {
                     **parameters,
-                    **restart_parameters,
+                    **self._restart_parameters(context),
                 }
-            elif step.operation in node_action_operations:
-                parameters = {
-                    **parameters,
-                    "gpu_uuids_by_node": scope.gpu_mapping,
-                }
+            elif step.operation in _NODE_ACTION_OPERATIONS:
                 parameters = self._node_action_parameters(
                     context,
                     step.operation,
-                    parameters,
+                    {**parameters, "gpu_uuids_by_node": gpu_mapping},
                     reset_parameters,
                 )
             scoped_steps.append(
@@ -686,10 +655,9 @@ class SxidIngestionService:
                     update={
                         "node_ids": (
                             context.allocation_nodes
-                            if step.operation in workload_operations
-                            else scope.fault_nodes
+                            if step.operation in _WORKLOAD_OPERATIONS
+                            else [event.node_id]
                         ),
-                        "gpu_uuids": scope.all_gpu_uuids,
                         "parameters": parameters,
                     }
                 )
@@ -700,9 +668,9 @@ class SxidIngestionService:
         self,
         context: _SxidContext,
         operation: WorkflowOperation,
-        parameters: dict,
-        reset_parameters: dict,
-    ) -> dict:
+        parameters: dict[str, object],
+        reset_parameters: dict[str, object],
+    ) -> dict[str, object]:
         if operation is WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE:
             parameters.update(
                 {
@@ -729,86 +697,12 @@ class SxidIngestionService:
             )
         return parameters
 
-    def _emit(
-        self,
-        context: _SxidContext,
-        state: _SxidBuildState,
-        scope: _SxidScope,
-        compiled: _CompiledSxidWorkflow,
-    ) -> tuple[FaultIncident, WorkflowRequest]:
-        existing_workflow = state.existing_workflow
-        generation_token = (
-            existing_workflow.fencing_token + 1
-            if state.has_existing and state.mutable
-            else existing_workflow.fencing_token
-            if state.has_existing
-            else 1
-        )
-        incident = FaultIncident(
-            incident_id=scope.incident_id,
-            event_id=scope.primary_event_id,
-            event_type="GPU_FAULT_GROUP",
-            event_source=context.event.event_source,
-            source_boot_id=context.event.source_boot_id,
-            cluster_id=context.event.cluster_id,
-            node_ids=scope.incident_nodes,
-            gpu_uuids=scope.all_gpu_uuids,
-            job_id=context.observation.job_id,
-            attempt_id=context.observation.attempt_id,
-            workload_identity_source=(
-                context.event.workload_identity_source or "SOLE_ACTIVE_ATTEMPT_ON_NODE"
-            ),
-            policy_version=context.decision.policy_version,
-            policy_source=context.decision.source.value,
-            official_action=context.decision.official_action,
-            effective_action=None,
-            drill_id=context.event.drill_id,
-            state=(
-                IncidentState.ACTION_PENDING
-                if compiled.status is WorkflowStatus.PENDING
-                else IncidentState.SAFETY_PENDING
-                if compiled.status is WorkflowStatus.SAFETY_PENDING
-                else IncidentState.ESCALATED
-            ),
-            workflow_request_id=scope.workflow_id,
-            fencing_token=generation_token,
-            reasons=scope.reasons,
-            created_at=scope.opened_at,
-            updated_at=state.now,
-        )
-        workflow = WorkflowRequest(
-            request_id=scope.workflow_id,
-            incident_id=scope.incident_id,
-            predecessor_workflow_id=(scope.predecessor_workflow_id),
-            runtime_profile_version=context.profile_version,
-            status=compiled.status,
-            official_action=context.decision.official_action,
-            fencing_token=generation_token,
-            safety_steps=compiled.safety_steps,
-            official_steps=compiled.official_steps,
-            blocked_reasons=compiled.errors,
-            safety_only=compiled.status is WorkflowStatus.SAFETY_PENDING,
-            blocked_kind=(
-                BlockedKind.NEEDS_OPERATOR
-                if compiled.status is WorkflowStatus.BLOCKED
-                else None
-            ),
-            not_before=scope.not_before,
-            aggregation_max_deadline=(scope.aggregation_max_deadline),
-            lifetime_deadline_at=(
-                existing_workflow.lifetime_deadline_at
-                if existing_workflow is not None
-                else None
-            ),
-            created_at=scope.opened_at,
-            updated_at=state.now,
-        )
-        if (
-            state.has_existing
-            and not state.mutable
-            and scope.predecessor_workflow_id == existing_workflow.request_id
-        ):
-            workflow = self.callbacks.prepare_preempting_successor(
-                existing_workflow, workflow
-            )
-        return incident, workflow
+    @staticmethod
+    def _restart_parameters(context: _SxidContext) -> dict[str, object]:
+        return {
+            "cluster_id": context.event.cluster_id,
+            "job_id": context.observation.job_id,
+            "source_attempt_id": context.observation.attempt_id,
+            "source_gpu_count": context.source_gpu_count,
+            "restart_budget": context.observation.restart_budget,
+        }

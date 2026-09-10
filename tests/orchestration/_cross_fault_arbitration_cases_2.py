@@ -6,7 +6,13 @@ from datetime import timedelta
 import pytest
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import WorkflowOperation, WorkflowStatus, WorkflowStepStatus
+from gpu_fault.models import (
+    WorkflowEventCode,
+    WorkflowEventKind,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
 from gpu_fault.orchestration import IncidentOrchestrator
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 from tests._builders import (
@@ -419,6 +425,14 @@ def test_dag_appends_same_node_successor_after_branch_started() -> None:
 
 
 def test_running_weaker_workflow_queues_stronger_successor() -> None:
+    """A stronger node action on a running job workflow joins it as a branch.
+
+    XID 11 plans only the job restart; the trunk SXID on the same node is a
+    strictly stronger node action. Both families apply the verdict through
+    ``DispositionApplier``: the fabric reset becomes ``branch:node-a`` behind
+    the one shared STOP and ahead of the one join RESTART, under the same
+    record and generation -- not a second workflow with its own STOP/RESTART.
+    """
     context = build_context()
     context.store.save_attempt_observation(observation())
     first = asyncio.run(
@@ -443,21 +457,62 @@ def test_running_weaker_workflow_queues_stronger_successor() -> None:
     )[0]
 
     assert second["incident_id"] == first["incident_id"]
-    assert second["workflow_request_id"] != first["workflow_request_id"]
-    successor = context.store.get_workflow(second["workflow_request_id"])
-    assert successor.predecessor_workflow_id == (first["workflow_request_id"])
-    assert successor.fencing_token == workflow.fencing_token
+    assert second["workflow_request_id"] == first["workflow_request_id"], (
+        "the stronger node action is a branch of the running job workflow, "
+        "not a successor record with a second STOP and RESTART"
+    )
+    merged = context.store.get_workflow(second["workflow_request_id"])
+    assert merged.dag_enabled, "a second node action turns the flat plan into a DAG"
+    branch = [
+        step for step in merged.official_steps if step.branch_id == "branch:node-a"
+    ]
+    assert WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in {
+        step.operation for step in branch
+    }, "the fabric reset runs in the node's own branch"
+    stops = [
+        index
+        for index, step in enumerate(merged.official_steps)
+        if step.operation is WorkflowOperation.STOP_WORKLOADS
+    ]
+    joins = [
+        (index, step)
+        for index, step in enumerate(merged.official_steps)
+        if step.operation is WorkflowOperation.RESTART_WORKLOAD
+    ]
+    assert len(stops) == 1 and len(joins) == 1, "one STOP and one RESTART per attempt"
+    assert merged.official_steps[stops[0]].branch_id == "shared", (
+        "the STOP is the attempt's, shared by every branch"
+    )
+    assert joins[0][1].branch_id == "join", "the RESTART is the attempt's join"
+    branch_tail = max(
+        index
+        for index, step in enumerate(merged.official_steps)
+        if step.branch_id == "branch:node-a"
+    )
+    assert branch_tail in joins[0][1].depends_on_step_indexes, (
+        "the job restarts only after the fabric reset branch finished"
+    )
+    assert merged.fencing_token == workflow.fencing_token, (
+        "a branch is not a re-plan under the executor: no generation bump"
+    )
     assert (
         context.store.get_incident(second["incident_id"]).fencing_token
-        == successor.fencing_token
+        == merged.fencing_token
+    ), "the incident shares the workflow's generation"
+    assert merged.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES", (
+        "the workflow takes the higher-rank action"
     )
-    assert WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in {
-        step.operation for step in successor.official_steps
-    }
-    assert len(context.store.list_workflows()) == 2
+    assert len(context.store.list_workflows()) == 1, "one attempt, one record"
 
 
 def test_preemption_marks_stronger_successor_and_reuses_containment() -> None:
+    """A stronger same-node action preempts the pending reset inside the DAG.
+
+    The weaker record already cordoned the node and stopped the job. The
+    fabric SXID does not re-run either: its branch is queued behind that
+    containment, the not-yet-started reset steps are retired in the same
+    write, and the workflow records the preemption with what it replaced.
+    """
     context = build_context()
     context.orchestrator = IncidentOrchestrator(
         context.store, workflow_preemption_enabled=True
@@ -478,7 +533,12 @@ def test_preemption_marks_stronger_successor_and_reuses_containment() -> None:
         for index, step in enumerate(workflow.official_steps)
         if step.operation in inherited_operations
     ]
-    assert len(completed_indexes) == 2
+    assert len(completed_indexes) == 2, "the weaker plan cordons and stops once each"
+    reset_index = next(
+        index
+        for index, step in enumerate(workflow.official_steps)
+        if step.operation is WorkflowOperation.RESET_GPU
+    )
     context.store.save_workflow(
         workflow.model_copy(
             update={
@@ -506,21 +566,51 @@ def test_preemption_marks_stronger_successor_and_reuses_containment() -> None:
     )[0]
 
     successor = context.store.get_workflow(second["workflow_request_id"])
-    assert successor.predecessor_workflow_id == workflow.request_id
-    assert successor.preempt_predecessor
-    assert "rank 30 -> 40" in (successor.preemption_reason or "")
-    inherited = {
-        successor.official_steps[index].operation
-        for index in successor.inherited_step_indexes
-    }
-    assert inherited == inherited_operations
-    assert set(successor.inherited_step_indexes) == set(
-        successor.completed_step_indexes
+    assert successor.request_id == workflow.request_id, (
+        "the preempting action is a branch of the record it preempts"
     )
-    assert all(
-        execution.details["inherited_from_workflow_id"] == workflow.request_id
-        for execution in successor.step_executions
+    assert set(completed_indexes) <= set(successor.completed_step_indexes), (
+        "the containment that already ran stays completed"
     )
+    for index in completed_indexes:
+        assert (
+            successor.official_steps[index].operation
+            is workflow.official_steps[index].operation
+        ), "a completed step is history; the merge does not rewrite it"
+    assert reset_index in successor.superseded_step_indexes, (
+        "the weaker reset that had not started is retired, not run first"
+    )
+    stops = [
+        step
+        for step in successor.official_steps
+        if step.operation is WorkflowOperation.STOP_WORKLOADS
+    ]
+    assert len(stops) == 1, "the completed STOP is reused, not issued again"
+    branch = [
+        step
+        for step in successor.official_steps
+        if step.branch_id not in {None, "shared", "join", "branch:initial"}
+    ]
+    assert WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in {
+        step.operation for step in branch
+    }, "the fabric reset runs in the successor branch"
+    assert successor.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES", (
+        "the record takes the stronger action"
+    )
+    preemption = next(
+        event
+        for event in successor.events
+        if event.kind is WorkflowEventKind.PREEMPTION
+    )
+    assert preemption.code in {
+        WorkflowEventCode.PREEMPTED,
+        WorkflowEventCode.PREEMPTION_BOUNDARY_CLOSED,
+    }, "where the boundary sat is recorded; what was retired is the contract"
+    assert preemption.details["node_id"] == "node-a", "the event names the node"
+    assert reset_index in preemption.details["replaced_indexes"], (
+        "the preemption event names the reset it replaced"
+    )
+    assert len(context.store.list_workflows()) == 1, "one attempt, one record"
 
 
 def test_running_same_action_widens_unsubmitted_reset_for_new_gpu() -> None:

@@ -493,7 +493,8 @@ class CommandDispatch:
         node-action adapter is therefore built with ``barriers=None`` here,
         and ``_execute_multi_node_reset`` would answer with a bare FAILED that
         reads like the reset itself failed. Refuse at the claim boundary
-        instead, with a reason and a counter.
+        instead, with a reason and a counter. Planners now emit one reset
+        branch per node, so this hold is a defensive guard, not a product path.
         """
 
         if not (

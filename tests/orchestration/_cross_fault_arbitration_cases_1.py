@@ -617,6 +617,14 @@ def test_running_stronger_workflow_ignores_later_weaker_action() -> None:
 
 
 def test_later_weaker_event_does_not_reverse_existing_preemption() -> None:
+    """Once the fabric reset preempted the GPU reset, a weaker event changes nothing.
+
+    The trunk SXID on the running XID 48 workflow preempts the pending reset
+    inside the DAG (same record, reset retired, fabric reset branch queued).
+    A later XID 11 -- a bare job restart -- is absorbed: no step comes back
+    from the superseded set, the action stays the fabric reset, and the
+    duplicate of that event is a duplicate of the same record.
+    """
     context = build_context()
     context.orchestrator = IncidentOrchestrator(
         context.store, workflow_preemption_enabled=True
@@ -629,24 +637,26 @@ def test_later_weaker_event_does_not_reverse_existing_preemption() -> None:
     )[0]
     low_workflow = context.store.get_workflow(low["workflow_request_id"])
     context.store.save_workflow(copy_model(low_workflow, status=WorkflowStatus.RUNNING))
+    reset_index = next(
+        index
+        for index, step in enumerate(low_workflow.official_steps)
+        if step.operation is WorkflowOperation.RESET_GPU
+    )
     high = asyncio.run(
         post_faults(
             context, [("/v1/gpu-events/sxid", sxid_payload("reverse-preempt-high"))]
         )
     )[0]
+    assert high["workflow_request_id"] == low_workflow.request_id, (
+        "the stronger action preempts inside the record, not beside it"
+    )
     high_workflow = context.store.get_workflow(high["workflow_request_id"])
-    assert high_workflow.preempt_predecessor
-    context.store.save_workflow(
-        copy_model(
-            low_workflow,
-            status=WorkflowStatus.SUPERSEDED,
-            preempted_by_workflow_id=high_workflow.request_id,
-        )
+    assert reset_index in high_workflow.superseded_step_indexes, (
+        "the pending GPU reset is retired by the fabric reset"
     )
-    context.store.save_workflow(
-        copy_model(high_workflow, status=WorkflowStatus.RUNNING)
+    assert high_workflow.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES", (
+        "the record takes the stronger action"
     )
-    high_before_weaker = context.store.get_workflow(high_workflow.request_id)
     incident_before_weaker = context.store.get_incident(high["incident_id"])
 
     weaker = asyncio.run(
@@ -664,10 +674,34 @@ def test_later_weaker_event_does_not_reverse_existing_preemption() -> None:
     assert weaker["workflow_request_id"] == high_workflow.request_id
     current = context.store.get_workflow(high_workflow.request_id)
     assert current.status is WorkflowStatus.RUNNING
-    assert current.preempt_predecessor
-    assert current.predecessor_workflow_id == high_before_weaker.predecessor_workflow_id
-    assert current.inherited_step_indexes == high_before_weaker.inherited_step_indexes
-    assert current.official_action == high_before_weaker.official_action
+    assert current.superseded_step_indexes == high_workflow.superseded_step_indexes, (
+        "a weaker event brings nothing back from the superseded set"
+    )
+    node_actions = {
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RESTART_NODE,
+    }
+    assert [
+        (index, step.operation, step.branch_id)
+        for index, step in enumerate(current.official_steps)
+        if step.operation in node_actions
+    ] == [
+        (index, step.operation, step.branch_id)
+        for index, step in enumerate(high_workflow.official_steps)
+        if step.operation in node_actions
+    ], "a weaker event plans no node action and moves none"
+    for operation in (
+        WorkflowOperation.STOP_WORKLOADS,
+        WorkflowOperation.RESTART_WORKLOAD,
+    ):
+        assert (
+            len(
+                [step for step in current.official_steps if step.operation is operation]
+            )
+            == 1
+        ), f"still one {operation.value} for the attempt"
+    assert current.official_action == high_workflow.official_action
     current_incident = context.store.get_incident(high["incident_id"])
     assert current_incident.official_action == incident_before_weaker.official_action
     assert current_incident.effective_action == incident_before_weaker.effective_action
@@ -675,7 +709,7 @@ def test_later_weaker_event_does_not_reverse_existing_preemption() -> None:
     assert duplicate["duplicate"]
     assert duplicate["incident_id"] == high["incident_id"]
     assert duplicate["workflow_request_id"] == high_workflow.request_id
-    assert len(context.store.list_workflows(limit=10)) == 2
+    assert len(context.store.list_workflows(limit=10)) == 1
 
 
 def test_disjoint_node_scope_uses_independent_workflows_or_shared_dag() -> None:

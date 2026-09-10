@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from gpu_fault.models import (
     RecoveryAction,
+    WorkflowEventKind,
     WorkflowOperation,
     WorkflowStatus,
     WorkflowStepStatus,
@@ -265,10 +266,15 @@ def test_correlated_action_verdict_requires_full_chain() -> None:
         ],
         "audit": {
             "incident_count": 4,
-            "workflow_count": 10,
+            # Clean-boundary preemption stays in the weak record: per cluster
+            # one preempted record, its reboot successor, the reset-lane
+            # record and its reboot successor.
+            "workflow_count": 8,
             "command_count": 24,
             "weak_workflow_count": 2,
             "strong_workflow_count": 2,
+            "in_record_preemption_count": 2,
+            "cross_record_preemption_count": 0,
             "reset_gpu_workflow_count": 2,
             "reboot_workflow_count": 4,
             "preemption_pair_count": 2,
@@ -280,7 +286,7 @@ def test_correlated_action_verdict_requires_full_chain() -> None:
             "unique_reboot_predecessor_count": 4,
             "duplicate_reboot_successors": 0,
             "unexpected_reboot_predecessors": 0,
-            "terminal_workflow_count": 10,
+            "terminal_workflow_count": 8,
             "terminal_command_count": 24,
             "duplicate_idempotency_keys": 0,
             "duplicate_workflow_steps": 0,
@@ -290,10 +296,27 @@ def test_correlated_action_verdict_requires_full_chain() -> None:
     }
 
     assert suite.verdict(summary, 2) == ("PASS", [])
+    # A preemption that landed on an in-flight physical step is a separate
+    # successor record (DESTR-016's shape); the audit counts it as well.
+    cross = json.loads(json.dumps(summary))
+    cross["audit"].update(
+        {
+            "workflow_count": 9,
+            "terminal_workflow_count": 9,
+            "in_record_preemption_count": 1,
+            "cross_record_preemption_count": 1,
+        }
+    )
+    assert suite.verdict(cross, 2) == ("PASS", [])
     summary["audit"]["weak_superseded_count"] = 1
     status, errors = suite.verdict(summary, 2)
     assert status == "FAIL"
     assert "weak_superseded_count does not equal 2" in errors
+    summary["audit"]["weak_superseded_count"] = 2
+    summary["audit"]["in_record_preemption_count"] = 1
+    status, errors = suite.verdict(summary, 2)
+    assert status == "FAIL"
+    assert "preemption shape counts do not add up to 2" in errors
 
 
 def test_correlated_action_verdict_rejects_incomplete_job_and_claim_errors() -> None:
@@ -324,6 +347,8 @@ def test_correlated_action_verdict_rejects_incomplete_job_and_claim_errors() -> 
             "command_count": 12,
             "weak_workflow_count": 1,
             "strong_workflow_count": 1,
+            "in_record_preemption_count": 0,
+            "cross_record_preemption_count": 1,
             "reset_gpu_workflow_count": 1,
             "reboot_workflow_count": 2,
             "preemption_pair_count": 1,
@@ -430,18 +455,59 @@ def test_correlated_action_chain_preempts_and_escalates_fabric_reset() -> None:
     strong_decision = context.policy.evaluate_sxid(strong_event)
     strong_incident, strong = context.orchestrator.ingest(strong_event, strong_decision)
 
+    # Clean boundary (PREEMPT-002): the stronger fabric reset preempts inside
+    # the record, exactly as the XID family does for a stronger XID. The weak
+    # plan's pending steps are retired, its completed containment stays, and
+    # the fabric reset runs as the node's successor branch behind one join.
     assert strong_incident.incident_id == weak_incident.incident_id
-    assert strong.request_id != weak.request_id
-    assert strong.predecessor_workflow_id == weak.request_id
-    assert strong.preempt_predecessor is True
+    assert strong.request_id == weak.request_id, (
+        "a clean-boundary preemption stays in the record it preempts"
+    )
+    assert strong.dag_enabled, "the successor branch makes the plan a DAG"
+    weak_pending = {
+        index
+        for index, step in enumerate(aggregate.official_steps)
+        if index not in inherited_indexes
+        and step.operation is not WorkflowOperation.RESTART_WORKLOAD
+    }
+    assert set(strong.superseded_step_indexes) == weak_pending, (
+        "every not-yet-started step of the weak plan is retired"
+    )
+    assert set(inherited_indexes) <= set(strong.completed_step_indexes)
+    assert not set(inherited_indexes) & set(strong.superseded_step_indexes), (
+        "completed containment is history, not retired work"
+    )
+    for index in inherited_indexes:
+        assert (
+            strong.official_steps[index].operation
+            is aggregate.official_steps[index].operation
+        )
+    successor_branch = f"branch:{identity['node_id']}:successor:1"
+    successor_operations = [
+        step.operation
+        for step in strong.official_steps
+        if step.branch_id == successor_branch
+    ]
     assert {
-        strong.official_steps[index].operation
-        for index in strong.inherited_step_indexes
-    } == inherited_operations
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUIESCE_GPU_SERVICES,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+    } <= set(successor_operations), successor_operations
+    assert any(event.kind is WorkflowEventKind.PREEMPTION for event in strong.events), (
+        "the record says who preempted whom"
+    )
+    assert (
+        sum(
+            step.operation is WorkflowOperation.RESTART_WORKLOAD
+            for step in strong.official_steps
+        )
+        == 1
+    ), "one join restart for the attempt"
     reset_index = next(
         index
         for index, step in enumerate(strong.official_steps)
         if step.operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+        and step.branch_id == successor_branch
     )
     failed = copy_model(
         strong,

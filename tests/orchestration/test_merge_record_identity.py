@@ -8,11 +8,14 @@ looked at:
   Keeping the id is what makes the store treat the write as an in-place merge
   and bump ``merge_revision`` -- the optimistic fence an executor holding the
   old plan is checked against (F-B5, F-N1).
-* ``WorkflowMergeService.prepare_preempting_successor`` marks a stronger
-  successor, and the merge transaction stamps
-  ``preemption_pending_by_workflow_id`` on the predecessor so the dispatcher
-  holds it immediately instead of starting work a successor is about to
-  supersede (F-C1).
+* ``DispositionApplier`` routes a stronger action on a claimed job record
+  through ``WorkflowMergeService.preempt_parallel_branch``: the record keeps
+  its id and generation, the reset that had not started is retired in the
+  same write, and the fabric reset becomes the node's branch -- so the
+  dispatcher has nothing left to start that the successor is about to
+  supersede (F-C1). The cross-record hold
+  (``preemption_pending_by_workflow_id``) belongs to the QUEUE_SUCCESSOR
+  rung and is pinned in ``tests/store/test_preemption_pending_marker.py``.
 
 Both are exercised here through the ingest API, so the orchestration decision
 and the store write that carries it are pinned together.
@@ -150,8 +153,19 @@ def test_an_in_place_plan_replacement_keeps_the_records_lifetime_deadline():
 
 
 def test_a_preempting_successor_holds_its_predecessor_on_the_way_in():
+    """A claimed record is neither re-planned nor shadowed: the stronger
+    fabric reset joins it as a preempting branch, and the reset it supersedes
+    is retired in the same write -- so the dispatcher has nothing to start
+    that the fabric reset is about to supersede, and no cross-record hold is
+    needed."""
+
     context = _context()
     reset = _run_containment(context, _post_xid(context, RESET_XID, "hold-reset"))
+    reset_index = next(
+        index
+        for index, step in enumerate(reset.official_steps)
+        if step.operation is WorkflowOperation.RESET_GPU
+    )
 
     fabric = asyncio.run(
         post_faults(
@@ -159,21 +173,26 @@ def test_a_preempting_successor_holds_its_predecessor_on_the_way_in():
         )
     )[0]
 
-    successor = context.store.get_workflow(fabric["workflow_request_id"])
-    predecessor = context.store.get_workflow(reset.request_id)
-    assert successor.request_id != reset.request_id, (
+    merged = context.store.get_workflow(fabric["workflow_request_id"])
+    assert merged.request_id == reset.request_id, (
+        "a stronger node action on a claimed record is a branch of that record"
+    )
+    assert merged.fencing_token == reset.fencing_token, (
         "a claimed record is not re-planned under its executor"
     )
-    assert successor.preempt_predecessor is True, (
-        "the successor is a strictly stronger node action, not a queued one"
+    assert merged.status is WorkflowStatus.RUNNING, (
+        "the executor keeps its lease; only the plan grew"
     )
-    assert predecessor.preemption_pending_by_workflow_id == successor.request_id, (
-        "the predecessor is held in the same merge; otherwise the dispatcher "
+    assert reset_index in merged.superseded_step_indexes, (
+        "the weaker reset is retired in the same merge; otherwise the dispatcher "
         "starts a reset the fabric reset is about to supersede"
     )
-    assert predecessor.status is WorkflowStatus.RUNNING, (
-        "the hold is a marker, not a status change the executor did not make"
+    assert WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in {
+        step.operation
+        for step in merged.official_steps
+        if step.branch_id not in {None, "shared", "join", "branch:initial"}
+    }, "the fabric reset is the node's new branch"
+    assert merged.preemption_pending_by_workflow_id is None, (
+        "there is no second record, so no cross-record hold to stamp"
     )
-    assert successor.preemption_pending_by_workflow_id is None, (
-        "nothing is preempting the successor, so its own marker stays clear"
-    )
+    assert len(context.store.list_workflows()) == 1, "one node, one attempt, one record"

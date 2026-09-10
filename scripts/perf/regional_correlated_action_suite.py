@@ -359,23 +359,50 @@ with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
 """
 
 
-def _database_audit_script_suffix() -> str:
-    return f"""
+def _database_audit_script_shapes() -> str:
+    """Classify the run's workflows: preempted, preempting, reset-lane, reboot."""
+    return """
 
-by_id={{item['request_id']:item for item in workflows}}
+by_id={item['request_id']:item for item in workflows}
 def operations(item):
-    return {{step.get('operation') for step in item.get('official_steps',[])}}
-weak=[
+    return {step.get('operation') for step in item.get('official_steps',[])}
+def step_operation(item,index):
+    steps=item.get('official_steps',[])
+    return steps[index].get('operation') if 0<=index<len(steps) else None
+def in_record_preemption(item):
+    # Clean boundary: the stronger fabric reset preempted the weak GPU reset
+    # inside one record -- the weak plan's pending steps (its RESET_GPU among
+    # them) are superseded, the fabric reset lives in a successor branch, and
+    # the record carries a PREEMPTION event.
+    superseded=set(item.get('superseded_step_indexes') or [])
+    return bool(
+        superseded
+        and any(step_operation(item,i)=='RESET_GPU' for i in superseded)
+        and any(
+            step.get('operation')=='RESET_ALL_GPUS_NVSWITCHES'
+            and index not in superseded
+            for index,step in enumerate(item.get('official_steps',[]))
+        )
+        and any(
+            event.get('kind')=='PREEMPTION' for event in item.get('events',[])
+        )
+    )
+in_record=[item for item in workflows if in_record_preemption(item)]
+# Cross-record shape: the preemption landed on an in-flight physical step, so
+# the fabric reset is its own successor record marked preempt_predecessor.
+weak_cross=[
     item for item in workflows
     if item.get('status')=='SUPERSEDED'
     and item.get('preempted_by_workflow_id')
     and 'RESET_GPU' in operations(item)
 ]
-strong=[
+strong_cross=[
     item for item in workflows
     if item.get('preempt_predecessor') is True
     and 'RESET_ALL_GPUS_NVSWITCHES' in operations(item)
 ]
+weak=[*weak_cross,*in_record]
+strong=[*strong_cross,*in_record]
 reset_gpu=[
     item for item in workflows
     if item.get('status')=='FAILED'
@@ -389,16 +416,16 @@ reboot=[
     item for item in workflows
     if 'RESTART_NODE' in operations(item)
 ]
-weak_by_id={{item['request_id']:item for item in weak}}
-required_containment={{'MARK_UNSCHEDULABLE','STOP_WORKLOADS'}}
-allowed_inherited=required_containment|{{'QUIESCE_GPU_SERVICES'}}
+weak_by_id={item['request_id']:item for item in weak_cross}
+required_containment={'MARK_UNSCHEDULABLE','STOP_WORKLOADS'}
+allowed_inherited=required_containment|{'QUIESCE_GPU_SERVICES'}
 preemption_pairs=[]
-for item in strong:
+for item in strong_cross:
     predecessor=weak_by_id.get(item.get('predecessor_workflow_id'))
-    inherited={{
+    inherited={
         item['official_steps'][index].get('operation')
         for index in item.get('inherited_step_indexes',[])
-    }}
+    }
     if (
         predecessor is not None
         and predecessor.get('preempted_by_workflow_id')==item['request_id']
@@ -406,11 +433,24 @@ for item in strong:
         and required_containment<=inherited<=allowed_inherited
     ):
         preemption_pairs.append((predecessor,item))
+for item in in_record:
+    # In-record pair: the completed containment stays completed and is not
+    # retired; the fabric reset sits in the node's successor branch.
+    superseded=set(item.get('superseded_step_indexes') or [])
+    completed=set(item.get('completed_step_indexes') or [])
+    kept={step_operation(item,i) for i in completed-superseded}
+    successor_branch=any(
+        str(step.get('branch_id') or '').endswith(':successor:1')
+        and step.get('operation')=='RESET_ALL_GPUS_NVSWITCHES'
+        for step in item.get('official_steps',[])
+    )
+    if required_containment<=kept and successor_branch:
+        preemption_pairs.append((item,item))
 weak_ok=sum(
     item.get('status')=='SUPERSEDED'
     and bool(item.get('preempted_by_workflow_id'))
-    for item in weak
-)
+    for item in weak_cross
+)+len(in_record)
 strong_ok=sum(
     item.get('status')=='FAILED'
     and any(
@@ -420,6 +460,12 @@ strong_ok=sum(
     )
     for item in strong
 )
+"""
+
+
+def _database_audit_script_metrics() -> str:
+    """Reboot pairing, terminal drain, idempotency and fencing counters."""
+    return f"""
 failed_sources={{
     item['request_id']:item
     for item in [*strong,*reset_gpu]
@@ -517,6 +563,8 @@ out={{
     'command_count':len(commands),
     'weak_workflow_count':len(weak),
     'strong_workflow_count':len(strong),
+    'in_record_preemption_count':len(in_record),
+    'cross_record_preemption_count':len(strong_cross),
     'reset_gpu_workflow_count':len(reset_gpu),
     'reboot_workflow_count':len(reboot),
     'preemption_pair_count':len(preemption_pairs),
@@ -557,6 +605,10 @@ out={{
 }}
 print(json.dumps(out,sort_keys=True))
 """
+
+
+def _database_audit_script_suffix() -> str:
+    return _database_audit_script_shapes() + _database_audit_script_metrics()
 
 
 def database_audit(run_id: str) -> dict:
@@ -651,9 +703,17 @@ def verdict(summary: dict, clusters: int) -> tuple[str, list[str]]:
             errors.append("scenario result errors are nonzero")
         if int(item.get("ownership_errors", 0)):
             errors.append("scenario ownership errors are nonzero")
+    # A clean-boundary preemption stays inside the weak record (one record per
+    # cluster: preempted record, its reboot, the reset-lane record, its
+    # reboot); a preemption on an in-flight physical step adds a separate
+    # successor record. The two shapes must account for every cluster.
+    in_record = int(audit.get("in_record_preemption_count", 0))
+    cross_record = int(audit.get("cross_record_preemption_count", 0))
+    if in_record + cross_record != clusters:
+        errors.append(f"preemption shape counts do not add up to {clusters}")
     expected_counts = {
         "incident_count": clusters * 2,
-        "workflow_count": clusters * 5,
+        "workflow_count": clusters * 4 + cross_record,
         "weak_workflow_count": clusters,
         "strong_workflow_count": clusters,
         "reset_gpu_workflow_count": clusters,

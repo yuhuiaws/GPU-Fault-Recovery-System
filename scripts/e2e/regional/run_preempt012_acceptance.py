@@ -56,9 +56,11 @@ LIMITATIONS = [
     "remain deliberately unsubmitted because PREEMPT-012 targets the "
     "boundaries before or immediately after quiesce.",
     "Clean group: the predecessor is superseded at a step boundary before "
-    "QUIESCE (PREEMPT-002 shape) and the successor then executes with the "
-    "predecessor's containment inherited, so only RESTART_NODE reaches an "
-    "adapter.",
+    "QUIESCE and the successor then executes with the predecessor's "
+    "containment inherited, so only RESTART_NODE reaches an adapter. The "
+    "pair is seeded as two records (the cross-record successor shape); the "
+    "planner's own PREEMPT-002 clean boundary now preempts inside one record "
+    "as a successor branch, which this case does not exercise.",
     "Dirty group: the boundary exercised is 'QUIESCE done, reset not "
     "submitted' (PREEMPT-008 shape): the quiesce is handed to the successor "
     "and no RESET_GPU is issued. The LEASED-reset boundary -- a reset already "
@@ -241,7 +243,7 @@ def save_pair(label, completed, *, inherit_containment):
         updated_at=now,
     )
     if inherit_containment:
-        # The merge's PREEMPT-002 shape: the stronger successor carries the
+        # The cross-record successor shape: the stronger successor carries the
         # predecessor's completed containment as its own completed steps.
         successor_operations = [
             WorkflowOperation.MARK_UNSCHEDULABLE,
