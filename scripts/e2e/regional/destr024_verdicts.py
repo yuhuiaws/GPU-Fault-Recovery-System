@@ -113,9 +113,10 @@ def blocked_workflow_errors(state: dict[str, Any], *, xid: int = 46) -> list[str
             f"blocked_kind is {workflow.get('blocked_kind')}, not {EXPECTED_BLOCKED_KIND}"
         )
     physical = set(PHYSICAL_OPERATIONS)
-    compiled = physical & set(_operations(workflow.get("official_steps")))
-    if compiled:
-        errors.append(f"physical steps were compiled: {sorted(compiled)}")
+    # ``official_steps`` may still name the refused plan: a BLOCKED workflow
+    # keeps what it would have run for the operator to review (the product's
+    # workload-state gate contract), so only what completed, executed or was
+    # dispatched proves a physical step got past the gate.
     completed = physical & {
         str(item) for item in workflow.get("completed_operations") or []
     }

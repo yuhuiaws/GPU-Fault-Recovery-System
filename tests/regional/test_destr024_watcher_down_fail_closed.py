@@ -83,7 +83,19 @@ def blocked_state() -> dict[str, Any]:
             "blocked_kind": "SAFETY_SETTLED",
             "blocked_reasons": [verdicts.WORKLOAD_STATE_UNKNOWN_REASON],
             "official_action": "RESET_GPU",
-            "official_steps": [],
+            # The refused plan stays on the record for the operator; live the
+            # BLOCKED workflow listed the full eight-step reset here while
+            # nothing past the safety steps executed or was dispatched.
+            "official_steps": [
+                {"operation": item}
+                for item in (
+                    "FREEZE_EVIDENCE",
+                    "MARK_UNSCHEDULABLE",
+                    *verdicts.PHYSICAL_OPERATIONS,
+                    "VALIDATE_GPU",
+                    "RESTORE_SCHEDULING",
+                )
+            ],
             "safety_steps": [{"operation": item} for item in containment],
             "completed_operations": containment,
             "step_executions": [_execution(item) for item in containment],
