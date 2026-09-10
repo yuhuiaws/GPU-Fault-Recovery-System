@@ -3437,7 +3437,13 @@ test_cases:
   - 中断前后 kernel 采集器 PID、InvocationID 与 /dev/kmsg fd 集合不变，fdinfo pos 不回退；中断期间写入的行在解封后恰到达一次
   - 清理：窗口、防火墙规则、种子记录、Pod/ConfigMap 均为零残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 04296f03bc797366dfb8cb118b1b537cae39925835967bda4481aabc57a43138
+      components:
+        control_plane: ec6237508f0abbd7b12b952136105d91644fb71e0dd5a6f138d6640e246ef879
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-008
   related_pytest: tests/regional/test_net008_outbox_dead_letter.py::test_the_transient_outbox_contract_passes_on_replayable_403_records
