@@ -3372,7 +3372,13 @@ test_cases:
   - claim-state breadcrumb 的 counters 与 executor 最终 metrics_snapshot 逐项相等
   - 清理后数据库、注册表、Kubernetes 三处残留均为零
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 50b99a9870342328b4f69ba5d53a5222abfdbf8d3eb96cb7ccf4ffe6e8aca2ee
+      components:
+        control_plane: 7dd256f855728a13b82437a349b0d9f0b82105dcfb4a4e1ea6922963c4abf759
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-006
   related_pytest: tests/regional/test_net006_lease_loss.py::test_the_counter_contract_passes_on_one_withheld_result_and_one_reclaim
