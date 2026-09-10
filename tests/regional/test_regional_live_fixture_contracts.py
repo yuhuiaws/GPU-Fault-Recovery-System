@@ -587,3 +587,35 @@ def test_waiting_projection_keeps_timestamps_only_when_the_record_has_them() -> 
     assert projected_bare["error"] is None
     assert projected_stamped["started_at"] == "2026-09-06T10:02:00+00:00"
     assert "updated_at" not in projected_stamped, projected_stamped
+
+
+def test_store_snapshot_widens_observed_after_for_a_marker_tagged_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kmsg line lands a little before the wall clock that timed its injection.
+
+    COLLECT-021 read its XID at 10:51:08.9 against an injected_at of 10:51:09.x
+    and an exact cut dropped the event the control plane had already decided.
+    The marker identifies the line; the time bound only limits the scan.
+    """
+
+    regional = _regional(tmp_path)
+    seen: list[tuple[str, ...]] = []
+
+    def cpu_python(_script: str, *arguments: str, **_kwargs: Any) -> dict[str, Any]:
+        seen.append(arguments)
+        return {"release_id": "release-a"}
+
+    monkeypatch.setattr(regional, "cpu_python", cpu_python)
+    injected_at = datetime(2026, 9, 10, 10, 51, 9, 500000, tzinfo=timezone.utc)
+
+    regional.store_snapshot(node="node-a", marker="c021-1", observed_after=injected_at)
+    regional.store_snapshot(node="node-a", observed_after=injected_at)
+
+    widened = datetime.fromisoformat(seen[0][3])
+    assert widened == injected_at - timedelta(
+        seconds=live_fixture_module.KMSG_CLOCK_SKEW_SECONDS
+    ), "a marker-tagged read tolerates the kernel clock trailing the wall clock"
+    assert datetime.fromisoformat(seen[1][3]) == injected_at, (
+        "without a marker the bound is the only filter and stays exact"
+    )

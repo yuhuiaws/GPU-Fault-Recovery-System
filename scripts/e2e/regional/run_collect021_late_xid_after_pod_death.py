@@ -25,6 +25,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     CollectorAcceptanceFixture,
 )
+from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
 )
@@ -553,7 +554,7 @@ def run_late_xid_section(
         regional,
         node=target_node,
         marker=marker,
-        observed_after=injected_at,
+        observed_after=marker_observed_after(marker, injected_at),
         case_dir=case_dir / "proactive",
         timeout_seconds=600,
         job_id=job_id,

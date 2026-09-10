@@ -65,6 +65,14 @@ class ContainerObservation(StrictModel):
     signal: int | None = Field(default=None, ge=0)
     finished_at: datetime | None = None
     restart_count: int = Field(default=0, ge=0)
+    # The Pod carried ``metadata.deletionTimestamp`` when it was observed:
+    # somebody asked the API to remove it. A graceful ``kubectl delete`` of a
+    # PyTorchJob SIGTERMs torchrun, which exits 1, and that non-zero exit used
+    # to read as a training failure -- the passive path then spent a restart
+    # on a cleanup or, with the budget gone, ESCALATED and mailed the operator
+    # (COLLECT-021's teardown). A deletion the operator or user requested is a
+    # stop, the same verdict a Pod that has already vanished gets.
+    deletion_requested: bool = False
 
     @model_validator(mode="after")
     def validate_termination(self) -> ContainerObservation:
@@ -254,6 +262,7 @@ class CompletionWatcher:
                     if item.terminated
                     and item.exit_code is not None
                     and item.exit_code != 0
+                    and not item.deletion_requested
                 ),
                 key=lambda item: (
                     item.finished_at or observation.observed_at,

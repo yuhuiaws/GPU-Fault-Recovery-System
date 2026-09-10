@@ -133,6 +133,7 @@ def pod(
     gpu_count: int = 0,
     start_time: datetime | None = None,
     creation_time: datetime | None = None,
+    deletion_time: datetime | None = None,
 ):
     annotations = {
         "gpu-fault.io/expected-critical-ranks": str(expected_ranks),
@@ -184,6 +185,8 @@ def pod(
     }
     if creation_time is not None:
         metadata["creationTimestamp"] = creation_time.isoformat()
+    if deletion_time is not None:
+        metadata["deletionTimestamp"] = deletion_time.isoformat()
     if owner_references is not None:
         metadata["ownerReferences"] = owner_references
     effective_rank = rank if rank is not None else completion_index

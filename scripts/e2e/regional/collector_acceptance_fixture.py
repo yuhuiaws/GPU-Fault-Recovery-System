@@ -19,6 +19,7 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
 )
+from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -276,12 +277,13 @@ class CollectorAcceptanceFixture:
         observed_after: datetime | None = None,
         scan_evidence: bool = True,
     ) -> dict[str, Any]:
+        bound = marker_observed_after(marker, observed_after)
         return self.regional.cpu_python(
             STORE_PROBE,
             self.regional.settings.cluster_id,
             self.node,
             marker,
-            observed_after.isoformat() if observed_after is not None else "",
+            bound.isoformat() if bound is not None else "",
             "1" if scan_evidence else "",
         )
 

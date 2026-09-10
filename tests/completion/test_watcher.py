@@ -27,6 +27,7 @@ def container(
     gpu_count: int = 0,
     workload_log_snapshot: dict | None = None,
     finished_at: datetime | None = None,
+    deletion_requested: bool = False,
 ) -> ContainerObservation:
     return container_observation(
         f"pod-{rank}",
@@ -39,6 +40,7 @@ def container(
         terminated=terminated,
         exit_code=exit_code,
         finished_at=finished_at,
+        deletion_requested=deletion_requested,
     )
 
 
@@ -406,3 +408,45 @@ def test_success_requires_all_expected_critical_ranks() -> None:
     assert partial.terminal_event is None
     assert complete.phase is AttemptPhase.TERMINAL_SUCCEEDED
     assert complete.terminal_event.terminal_status is TerminalStatus.SUCCEEDED
+
+
+def test_nonzero_exits_of_pods_being_deleted_are_a_stop_not_a_failure() -> None:
+    """A graceful delete SIGTERMs torchrun, which exits 1.
+
+    COLLECT-021's teardown deleted its PyTorchJob; the watcher read the exit
+    as a training failure, the passive path spent the last restart on it and
+    ESCALATED. A Pod the API was asked to remove is a stop, like a Pod that
+    has already vanished -- no FAILED, no budget, no escalation.
+    """
+
+    watcher = CompletionWatcher()
+    result = watcher.observe(
+        observation(
+            phase=WorkloadPhase.STOPPED,
+            observed_at=NOW,
+            containers=[
+                container(
+                    0,
+                    terminated=True,
+                    exit_code=1,
+                    node_id="node-a",
+                    gpu_uuid="GPU-a",
+                    finished_at=NOW,
+                    deletion_requested=True,
+                ),
+                container(
+                    1,
+                    terminated=True,
+                    exit_code=1,
+                    node_id="node-b",
+                    gpu_uuid="GPU-b",
+                    finished_at=NOW,
+                    deletion_requested=True,
+                ),
+            ],
+        )
+    )
+
+    assert result.failure_detected is None, "a requested deletion is not a failure"
+    assert result.phase is AttemptPhase.TERMINAL_STOPPED
+    assert result.terminal_event.terminal_status is TerminalStatus.STOPPED

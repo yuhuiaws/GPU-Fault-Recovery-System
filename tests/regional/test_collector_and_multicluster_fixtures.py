@@ -1014,3 +1014,25 @@ def test_device_plugin_discovery_ignores_daemonsets_that_schedule_nowhere() -> N
     items[1]["status"]["desiredNumberScheduled"] = 4
     with pytest.raises(RegionalFixtureError, match="found 2"):
         plugin.discover()
+
+
+def test_a_marker_tagged_store_read_tolerates_the_kernel_clock_trailing_the_wall_clock() -> (
+    None
+):
+    """COLLECT-021's XID read 10:51:08.9 against an injection at 10:51:09.x."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from scripts.e2e.regional.kmsg_clock import (
+        KMSG_CLOCK_SKEW_SECONDS,
+        marker_observed_after,
+    )
+
+    injected_at = datetime(2026, 9, 10, 10, 51, 9, 500000, tzinfo=timezone.utc)
+    assert marker_observed_after("c021-1", injected_at) == injected_at - timedelta(
+        seconds=KMSG_CLOCK_SKEW_SECONDS
+    ), "a marker identifies the line; the time bound only limits the scan"
+    assert marker_observed_after("", injected_at) == injected_at, (
+        "without a marker the bound is the only filter and stays exact"
+    )
+    assert marker_observed_after("c021-1", None) is None, "no bound stays no bound"

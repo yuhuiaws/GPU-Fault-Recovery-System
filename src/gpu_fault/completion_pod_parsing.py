@@ -120,8 +120,11 @@ class CompletionPodParsingMixin:
         failed = [
             item
             for item in terminated
-            if item.exit_code is not None and item.exit_code != 0
+            if item.exit_code is not None
+            and item.exit_code != 0
+            and not item.deletion_requested
         ]
+        deleting = any(item.deletion_requested for item in containers)
         if (
             spec.termination_initiator_incident_id
             and len(terminated) >= spec.expected_critical_ranks
@@ -129,6 +132,10 @@ class CompletionPodParsingMixin:
             phase = WorkloadPhase.STOPPED
         elif failed:
             phase = WorkloadPhase.FAILED
+        elif deleting and len(terminated) >= spec.expected_critical_ranks:
+            # Every rank is down and at least one Pod was asked to go: an
+            # operator's or user's delete, read as a stop like a vanished Pod.
+            phase = WorkloadPhase.STOPPED
         elif len(terminated) >= spec.expected_critical_ranks and all(
             item.exit_code == 0 for item in terminated
         ):
@@ -387,6 +394,9 @@ class CompletionPodParsingMixin:
             restart_count=selected.get(
                 "restartCount",
                 selected.get("restart_count", 0),
+            ),
+            deletion_requested=bool(
+                metadata.get("deletionTimestamp") or metadata.get("deletion_timestamp")
             ),
         )
 

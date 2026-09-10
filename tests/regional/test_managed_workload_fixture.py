@@ -62,7 +62,12 @@ def test_managed_workload_delete_also_removes_restarted_copies(
     fixture.delete()
 
     assert [call[:4] for call in calls] == [
+        ("gpu", "delete", "pod", "-l"),
         ("gpu", "delete", "job", "gpu-fault-xid11-auto-resume-guard"),
         ("gpu", "delete", "job", "-l"),
     ], calls
-    assert "gpu-fault.io/job-id=destr012-d-abc" in calls[1], calls[1]
+    # The Pods go first, forced: a graceful job delete SIGTERMs torchrun (exit
+    # 1) and the watcher read that as a training failure (COLLECT-021).
+    assert "gpu-fault.io/job-id=destr012-d-abc" in calls[0], calls[0]
+    assert "--force" in calls[0] and "--grace-period=0" in calls[0], calls[0]
+    assert "gpu-fault.io/job-id=destr012-d-abc" in calls[2], calls[2]

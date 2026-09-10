@@ -794,3 +794,33 @@ def test_controller_can_publish_running_workload_observation() -> None:
 
     assert sink.posts[0][0] == "/v1/workload-observations"
     assert sink.posts[0][1]["containers"][0]["rank"] == 0
+
+
+def test_a_pod_the_api_was_asked_to_delete_stops_the_attempt_instead_of_failing_it() -> (
+    None
+):
+    """``kubectl delete`` of the job: exit 1 on SIGTERM with deletionTimestamp set."""
+
+    from datetime import datetime, timezone
+
+    deleting = datetime(2026, 9, 10, 11, 1, 20, tzinfo=timezone.utc)
+    core = FakeCoreApi(
+        [
+            pod(0, exit_code=1, expected_ranks=2, deletion_time=deleting),
+            pod(1, exit_code=1, expected_ranks=2, deletion_time=deleting),
+        ]
+    )
+    sink = FakeSink()
+    subject = controller(core, sink)
+
+    subject.run_once()
+
+    paths = [path for path, _payload in sink.posts]
+    assert "/v1/attempts/failure-detected" not in paths, (
+        "a deletion the operator asked for must not be read as a training failure"
+    )
+    terminals = [
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    ]
+    assert len(terminals) == 1, sink.posts
+    assert terminals[0]["terminal_status"] == "STOPPED"

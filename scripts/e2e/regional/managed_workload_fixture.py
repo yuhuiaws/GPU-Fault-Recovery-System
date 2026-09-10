@@ -284,6 +284,26 @@ class ManagedWorkloadFixture:
         return self.kind.lower()
 
     def delete(self) -> None:
+        # Take the Pods away before the job: a graceful job delete first
+        # SIGTERMs torchrun, which exits 1, and the watcher reads that non-zero
+        # exit as a training failure -- the passive path then spends a restart
+        # (or, with the budget gone, ESCALATES and mails the operator) over a
+        # cleanup. A Pod object that simply disappears is read as a user stop
+        # (the tombstone path), which is what a fixture tearing down its own
+        # workload is.
+        self.regional.kubectl(
+            "gpu",
+            "delete",
+            "pod",
+            "-l",
+            f"gpu-fault.io/job-id={self.settings.job_id}",
+            "--ignore-not-found",
+            "--grace-period=0",
+            "--force",
+            "--wait=false",
+            check=False,
+            timeout=120,
+        )
         self.regional.kubectl(
             "gpu",
             "delete",
