@@ -23,6 +23,9 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
 )
+from scripts.e2e.regional.remote_command_shapes import (  # noqa: E402
+    command_operations,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -314,9 +317,10 @@ def workflow_errors(
         "RESTORE_SCHEDULING",
     }
     observed = {
-        item.get("step", {}).get("operation")
+        operation
         for item in commands
         if item.get("status") == "SUCCEEDED"
+        for operation in command_operations(item)
     }
     if not remote_operations <= observed:
         errors.append("not every remote reset operation reached SUCCEEDED")

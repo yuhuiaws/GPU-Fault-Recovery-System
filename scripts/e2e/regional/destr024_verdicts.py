@@ -27,6 +27,8 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
+from scripts.e2e.regional.remote_command_shapes import command_operations
+
 from scripts.e2e.regional.destr023_verdicts import (
     WATCHER_DEPLOYMENT,
     WORKLOAD_STATE_UNKNOWN_REASON,
@@ -127,7 +129,9 @@ def blocked_workflow_errors(state: dict[str, Any], *, xid: int = 46) -> list[str
     if executed:
         errors.append(f"physical step executions exist: {sorted(executed)}")
     dispatched = physical & {
-        _command_operation(item) for item in state.get("commands") or []
+        operation
+        for item in state.get("commands") or []
+        for operation in command_operations(item)
     }
     if dispatched:
         errors.append(f"physical remote commands were dispatched: {sorted(dispatched)}")

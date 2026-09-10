@@ -363,3 +363,44 @@ def test_plan_identity_pins_release_node_agent_profile_and_watcher() -> None:
         "runtime_profile_version": "v9",
         "watcher_deployment_uid": "dep-1",
     }
+
+
+def test_the_reset_contract_reads_the_operations_a_batched_command_carried() -> None:
+    """DESTR-023's live reset ran QUIESCE..RESTORE_GPU_SERVICES as one command.
+
+    With protocol-3 batching a node command carries the head step in ``step``
+    and the rest in ``batched_steps``; a verdict that read only the head saw
+    three of six remote operations and failed a SUCCEEDED workflow.
+    """
+
+    from scripts.e2e.regional import run_destr001_gpu_reset as destr001
+    from scripts.e2e.regional.remote_command_shapes import command_operations
+
+    def command(head: str, *batched: str) -> dict[str, Any]:
+        return {
+            "status": "SUCCEEDED",
+            "step": {"operation": head},
+            "batched_steps": [{"step": {"operation": item}} for item in batched],
+        }
+
+    assert command_operations(
+        command("QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS", "RESET_GPU")
+    ) == ["QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS", "RESET_GPU"], (
+        "the head step comes first, then the batch in order"
+    )
+    assert command_operations({"status": "SUCCEEDED"}) == [], "no step, no operations"
+
+    state = reset_state()
+    state["commands"] = [
+        command("MARK_UNSCHEDULABLE"),
+        command(
+            "QUIESCE_GPU_SERVICES",
+            "VERIFY_NO_GPU_CLIENTS",
+            "RESET_GPU",
+            "RESTORE_GPU_SERVICES",
+        ),
+        command("RESTORE_SCHEDULING"),
+    ]
+    assert destr001.workflow_errors(state) == [], (
+        "a batched reset command satisfies the remote-operation contract"
+    )
