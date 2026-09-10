@@ -42,7 +42,11 @@ from gpu_fault.store.shared.transactional_workflows import (
     stale_workflow_versions,
     workflow_matches_expected,
 )
-from gpu_fault.store.shared.workflow_scan import dispatch_order_key, held_reason
+from gpu_fault.store.shared.workflow_scan import (
+    dispatch_order_key,
+    held_reason,
+    recent_workflow_slice,
+)
 from gpu_fault.workflow_resolution import (
     reconciled_restore_records,
     retired_generation_records,
@@ -582,6 +586,21 @@ class MemoryWorkflowMixin:
                     is None
                 ]
             return workflows[:limit]
+
+    def list_recent_workflows(
+        self,
+        open_statuses: set[WorkflowStatus],
+        *,
+        updated_since: datetime | None,
+        limit: int,
+    ) -> list[WorkflowRequest]:
+        with self._lock:
+            return recent_workflow_slice(
+                list(self._workflows.values()),
+                open_statuses,
+                updated_since=updated_since,
+                limit=limit,
+            )
 
     def amend_workflow(
         self,

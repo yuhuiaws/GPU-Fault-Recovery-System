@@ -687,8 +687,8 @@ def test_metrics_reading_extracts_cluster_depth_and_rejections() -> None:
             "# HELP x",
             'gpu_fault_processor_cluster_queue_depth{cluster_id="b"} 4',
             'gpu_fault_processor_cluster_queue_depth{cluster_id="a"} 1',
-            'gpu_fault_store_io_rejections_total{process_id="7"} 2',
-            'gpu_fault_store_io_rejections_total{process_id="8"} 3',
+            'gpu_fault_store_io_rejections_total{reason="capacity"} 2',
+            'gpu_fault_store_io_rejections_total{reason="backend_unavailable"} 3',
             "gpu_fault_ingress_backpressure_rejections_total 0",
         ]
     )

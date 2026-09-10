@@ -307,6 +307,16 @@ def _node_scheduling_evidence(
     node_id: str,
     node: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """What ``node`` (a ``kubectl get node -o json`` item) carries.
+
+    ``quarantine_taint_value`` and ``isolation_annotation_values`` (key ->
+    value) are the ownership facts ``IncidentClosureService`` needs to judge a
+    QUARANTINED close: whether the taint or the annotations belong to the
+    incident being closed or to another one. The boolean ``quarantine_taint``
+    and the key list ``isolation_annotations`` are the older shape the BLOCKED
+    reconcile plan reads and hashes.
+    """
+
     if node is None:
         return {
             "node_id": node_id,
@@ -329,13 +339,18 @@ def _node_scheduling_evidence(
     unschedulable = bool(
         spec.get("unschedulable", False) if isinstance(spec, dict) else False
     )
-    quarantine = any(
-        isinstance(item, dict) and item.get("key") == QUARANTINE_TAINT
-        for item in taints
-    )
-    isolation_annotations = sorted(
-        key for key in ISOLATION_ANNOTATIONS if annotations.get(key) not in (None, "")
-    )
+    taint_value: str | None = None
+    for item in taints:
+        if isinstance(item, dict) and item.get("key") == QUARANTINE_TAINT:
+            taint_value = str(item.get("value") or "")
+            break
+    quarantine = taint_value is not None
+    isolation_annotation_values = {
+        key: str(annotations[key])
+        for key in ISOLATION_ANNOTATIONS
+        if annotations.get(key) not in (None, "")
+    }
+    isolation_annotations = sorted(isolation_annotation_values)
     blockers = []
     if unschedulable:
         blockers.append("node remains unschedulable")
@@ -348,10 +363,47 @@ def _node_scheduling_evidence(
         "exists": True,
         "unschedulable": unschedulable,
         "quarantine_taint": quarantine,
+        "quarantine_taint_value": taint_value,
         "isolation_annotations": isolation_annotations,
+        "isolation_annotation_values": isolation_annotation_values,
         "restored": not blockers,
         "blockers": blockers,
     }
+
+
+def node_isolation_evidence(
+    site: RenderedSite,
+    cluster_id: str,
+    node_ids: Sequence[str],
+    *,
+    inventory: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """``NodeIsolationEvidence`` mappings for ``node_ids`` on ``cluster_id``.
+
+    Read through the site's GPU kubeconfig (``cluster_nodes``; a site without
+    one is refused there, never the shell's default kubeconfig). The shape is
+    what ``IncidentClosureService`` consumes
+    (``NodeIsolationEvidence.from_mapping``): existence, the cordon flag, the
+    quarantine taint's value and the isolation annotations with their values.
+    ``inventory`` lets a caller reuse one ``kubectl get nodes`` per cluster.
+    """
+
+    nodes = inventory if inventory is not None else cluster_nodes(site, cluster_id)
+    evidence: list[dict[str, Any]] = []
+    for node_id in sorted({str(item) for item in node_ids}):
+        raw = _node_scheduling_evidence(node_id, nodes.get(node_id))
+        evidence.append(
+            {
+                "node_id": node_id,
+                "exists": bool(raw["exists"]),
+                "unschedulable": bool(raw.get("unschedulable", False)),
+                "quarantine_taint_value": raw.get("quarantine_taint_value"),
+                "isolation_annotations": dict(
+                    raw.get("isolation_annotation_values") or {}
+                ),
+            }
+        )
+    return evidence
 
 
 def _scheduling_evidence(

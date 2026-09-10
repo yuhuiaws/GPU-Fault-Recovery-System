@@ -441,6 +441,7 @@ class IncidentOrchestrator:
             preemption_scope_matches=self._preemption_scope_matches,
             prepare_preempting_successor=(self._prepare_preempting_successor),
             sample_hung_triage_nodes=(self._sample_hung_triage_nodes),
+            record_host_resource_absorb=self._record_host_resource_absorb,
         )
         plan_builder = NodeHealthPlanBuilder(
             self.store,
@@ -453,6 +454,12 @@ class IncidentOrchestrator:
             plan_builder,
             callbacks,
         )
+
+    def _record_host_resource_absorb(self) -> None:
+        # The merge service owns the record-only accounting the metrics
+        # endpoint exports by reason; the health family reports its absorb
+        # there so one counter family covers every "recorded, not planned".
+        self._workflow_merger.unsettled_host_resource_record_only_total += 1
 
     @cached_property
     def _workflow_merger(self) -> WorkflowMergeService:

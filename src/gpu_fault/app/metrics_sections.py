@@ -203,14 +203,15 @@ def render_processor_metrics_2(
             "# HELP gpu_fault_store_io_max_in_flight Configured per-process Store I/O admission capacity.",
             "# TYPE gpu_fault_store_io_max_in_flight gauge",
             f"gpu_fault_store_io_max_in_flight {store_io.max_in_flight}",
-            "# HELP gpu_fault_store_io_rejections_total Store calls rejected because I/O capacity was exhausted.",
+            # One series per reason and no process label: the Pod-level merge
+            # (process_metrics, SUM) adds the four uvicorn processes' counts
+            # for each reason, so a scrape sees three Pod-wide series instead
+            # of one per process. The reasons are the closed set in
+            # gpu_fault.async_store.STORE_IO_REJECTION_REASONS.
+            "# HELP gpu_fault_store_io_rejections_total Store calls rejected, by reason: capacity (the executor lane was full past the admission timeout), deadline (the caller's own budget passed first), backend_unavailable (a retryable PostgreSQL failure answered as 503 + Retry-After).",
             "# TYPE gpu_fault_store_io_rejections_total counter",
-            "gpu_fault_store_io_rejections_total"
-            f'{{process_id="{os.getpid()}"}} {store_io.rejected_total}',
-            "# HELP gpu_fault_store_io_rejections_by_reason_total Store calls rejected, by reason: the caller's deadline passed, capacity was exhausted, or the writer was unavailable (F-E1).",
-            "# TYPE gpu_fault_store_io_rejections_by_reason_total counter",
             *(
-                f'gpu_fault_store_io_rejections_by_reason_total{{reason="{reason}"}} {count}'
+                f'gpu_fault_store_io_rejections_total{{reason="{reason}"}} {count}'
                 for reason, count in sorted(
                     getattr(store_io, "rejected_by_reason", {}).items()
                 )

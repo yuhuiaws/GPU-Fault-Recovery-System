@@ -67,7 +67,9 @@ from gpu_fault.admin.grafana import (
     grafana_environment,
     grafana_request_fields,
 )
+from gpu_fault.admin.incident_close import escalated_selector
 from gpu_fault.admin.incident_close import exit_code as incident_close_exit_code
+from gpu_fault.admin.incident_close import quarantined_selector
 from gpu_fault.admin.incident_close import result_lines as incident_close_lines
 from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import administrator_operation_lock
@@ -351,11 +353,18 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         usage=(
             "gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
             "[--workflow-id ID ...] [--incident-id ID ...] [--max-items N] "
-            "[--reference REFERENCE] [--dry-run]"
+            "[--reference REFERENCE] [--dry-run]\n"
+            "       gpu-fault-admin workflow-reconcile --state-dir STATE_DIR "
+            "(--close-incident INCIDENT_ID ... | --close-escalated [--max-items N] "
+            "| --close-quarantined [--max-items N]) "
+            "[--reason TEXT] [--reference REFERENCE] [--dry-run]"
         ),
         help=(
             "close BLOCKED workflow records a later workflow already restored "
-            "(plans and applies in one run; --dry-run only prints the plan)"
+            "(plans and applies in one run; --dry-run only prints the plan); "
+            "with --close-incident / --close-escalated close ESCALATED incidents, "
+            "with --close-quarantined close QUARANTINED incidents whose node "
+            "isolation is gone"
         ),
     )
     _add_managed_site_arguments(reconcile)
@@ -404,16 +413,49 @@ def _add_incident_close_arguments(reconcile: argparse.ArgumentParser) -> None:
     Pod calling the service the API route calls). ``--reference`` is the
     verb's existing approved-change reference; ``--dry-run`` reports the
     verdicts and writes nothing.
+
+    ``--close-escalated`` is the same disposition without the ids: it discovers
+    every ESCALATED incident of the site (all registered clusters, oldest
+    first, ``--max-items`` caps the batch) and judges or closes each one exactly
+    as ``--close-incident`` would. ``--close-quarantined`` discovers the
+    QUARANTINED queue the same way; those close only on node isolation
+    evidence read through the site's GPU kubeconfig (no cordon, no quarantine
+    taint of the incident, no isolation annotation of it). The three are
+    mutually exclusive.
     """
 
-    reconcile.add_argument(
+    selection = reconcile.add_mutually_exclusive_group()
+    selection.add_argument(
         "--close-incident",
         action="append",
         default=[],
         metavar="INCIDENT_ID",
         help=(
             "close this ESCALATED incident RECOVERED (repeatable); needs --reason "
-            "and --reference; refused while a workflow of it is still open"
+            "and --reference; refused while a workflow of it is still open; a "
+            "QUARANTINED id is judged on node isolation evidence read through "
+            "the GPU kubeconfig"
+        ),
+    )
+    selection.add_argument(
+        "--close-escalated",
+        action="store_true",
+        help=(
+            "discover every ESCALATED incident of the site (all registered "
+            "clusters, oldest first; --max-items caps the batch) and close each "
+            "one as --close-incident would; --dry-run lists the ids and verdicts "
+            "without writing, otherwise --reason and --reference are required"
+        ),
+    )
+    selection.add_argument(
+        "--close-quarantined",
+        action="store_true",
+        help=(
+            "discover every QUARANTINED incident of the site and close those "
+            "whose nodes carry no cordon, no gpu-fault quarantine taint of the "
+            "incident and no isolation annotation of it (read through the GPU "
+            "kubeconfig); --dry-run lists the verdicts without writing, "
+            "otherwise --reason and --reference are required"
         ),
     )
     reconcile.add_argument(
@@ -793,21 +835,52 @@ def _run_uninstall(arguments: argparse.Namespace) -> int:
 def _run_incident_close(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="workflow-reconcile")
     assert site_file is not None
+    close_escalated = bool(getattr(arguments, "close_escalated", False))
+    close_quarantined = bool(getattr(arguments, "close_quarantined", False))
+    if close_escalated:
+        flag = "--close-escalated"
+    elif close_quarantined:
+        flag = "--close-quarantined"
+    else:
+        flag = "--close-incident"
     if arguments.state_dir is None:
+        raise SiteConfigError(f"workflow-reconcile {flag} requires --state-dir")
+    selectors = sum(
+        1
+        for chosen in (
+            close_escalated,
+            close_quarantined,
+            bool(getattr(arguments, "close_incident", None)),
+        )
+        if chosen
+    )
+    if selectors > 1:
         raise SiteConfigError(
-            "workflow-reconcile --close-incident requires --state-dir"
+            "workflow-reconcile takes one of --close-escalated, --close-quarantined "
+            "or --close-incident, not several"
         )
     state_dir = arguments.state_dir.expanduser().resolve()
+    options: dict[str, Any] = {}
+    if close_escalated:
+        # The discovery: ESCALATED only, every registered cluster, oldest
+        # first, capped by the verb's --max-items.
+        options["selector"] = escalated_selector(max_items=arguments.max_items)
+    elif close_quarantined:
+        # QUARANTINED only; each one is then judged on node isolation
+        # evidence read through the site's GPU kubeconfig.
+        options["selector"] = quarantined_selector(max_items=arguments.max_items)
+    else:
+        options["incident_ids"] = tuple(arguments.close_incident)
     try:
         with administrator_operation_lock(state_dir):
             site = load_site(site_file, repository_root=arguments.repo_root)
             result = run_incident_close(
                 site,
                 state_dir,
-                incident_ids=tuple(arguments.close_incident),
                 reason=arguments.reason or "",
                 reference=arguments.reference,
                 dry_run=bool(getattr(arguments, "dry_run", False)),
+                **options,
             )
     except BootstrapError as exc:
         raise SiteConfigError(str(exc)) from exc
@@ -817,7 +890,11 @@ def _run_incident_close(arguments: argparse.Namespace) -> int:
 
 
 def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
-    if getattr(arguments, "close_incident", None):
+    if (
+        getattr(arguments, "close_incident", None)
+        or getattr(arguments, "close_escalated", False)
+        or getattr(arguments, "close_quarantined", False)
+    ):
         return _run_incident_close(arguments)
     site_file = _managed_site_file(arguments, command="workflow-reconcile")
     assert site_file is not None

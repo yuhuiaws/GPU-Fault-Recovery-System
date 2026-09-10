@@ -68,6 +68,56 @@ class PostgresWorkflowMixin:
             rows = cursor.fetchall()
         return [self._decode("workflow", row[0]) for row in rows]
 
+    def list_recent_workflows(
+        self,
+        open_statuses: set[WorkflowStatus],
+        *,
+        updated_since: datetime | None,
+        limit: int,
+    ) -> list[WorkflowRequest]:
+        # Two range scans rather than one OR (G-2): the open half walks the
+        # executable/BLOCKED partial indexes, the recent half walks
+        # ``gpu_fault_workflow_updated_all`` backwards from now to the window
+        # edge and stops there, so terminal history older than the window is
+        # never read however much of it retention has yet to reclaim. Open
+        # rows fill the budget first; the cap only ever cuts terminal rows.
+        if limit <= 0:
+            return []
+        rows: list[WorkflowRequest] = []
+        if open_statuses:
+            rows.extend(self._scan(set(open_statuses), limit=limit, newest_first=True))
+        remaining = limit - len(rows)
+        recent_statuses = set(WorkflowStatus) - set(open_statuses)
+        if remaining > 0 and recent_statuses:
+            rows.extend(
+                self._scan(
+                    recent_statuses,
+                    limit=remaining,
+                    newest_first=True,
+                    updated_since=updated_since,
+                )
+            )
+        return rows
+
+    def _scan(
+        self,
+        statuses: set[WorkflowStatus],
+        *,
+        limit: int,
+        newest_first: bool,
+        updated_since: datetime | None = None,
+    ) -> list[WorkflowRequest]:
+        sql, parameters = self.workflow_scan_query(
+            statuses,
+            limit=limit,
+            newest_first=newest_first,
+            updated_since=updated_since,
+        )
+        with self._db.cursor() as cursor:
+            cursor.execute(sql, parameters)
+            rows = cursor.fetchall()
+        return [self._decode("workflow", row[0]) for row in rows]
+
     # A predecessor that is still open holds its successor: the three
     # executable statuses, plus a BLOCKED row waiting for an operator or
     # parked by an internal error (F-A4). A settled safety plan and a legacy
@@ -124,6 +174,7 @@ class PostgresWorkflowMixin:
         dispatchable_at: datetime | None = None,
         exclude_request_ids: Collection[str] = (),
         after: WorkflowRequest | None = None,
+        updated_since: datetime | None = None,
     ) -> tuple[str, tuple[object, ...]]:
         """The SQL behind ``list_workflows``, exposed so tests can EXPLAIN it.
 
@@ -136,6 +187,11 @@ class PostgresWorkflowMixin:
         With ``dispatchable_at`` the order is the eligibility key rather than
         ``updated_at`` (F-A2a) and ``after`` becomes a row-value cursor on
         that key (F-A2c), so a page is one index range scan.
+
+        ``updated_since`` is the recency bound of ``list_recent_workflows``:
+        text comparison on ``payload->>'updated_at'`` like every payload
+        timestamp here, so ``gpu_fault_workflow_updated_all`` serves it as a
+        range scan that ends at the window edge.
         """
 
         if after is not None and dispatchable_at is None:
@@ -153,6 +209,9 @@ class PostgresWorkflowMixin:
             dispatchable_at, exclude_request_ids
         )
         clauses.extend(pushdown)
+        if updated_since is not None:
+            clauses.append("w.payload->>'updated_at' >= %s")
+            parameters.append(_utc_text(updated_since))
         direction = "DESC" if newest_first else "ASC"
         if dispatchable_at is not None:
             order_key = cls._DISPATCH_ORDER_SQL

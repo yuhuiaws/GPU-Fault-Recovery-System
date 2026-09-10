@@ -1,4 +1,4 @@
-"""Report whether a Pod's store-I/O rejection counter is per-process and idle.
+"""Report whether a Pod's store-I/O rejection counter is split by reason and idle.
 
 Parameters arrive as **one JSON object in argv**, not on stdin::
 
@@ -12,11 +12,11 @@ in ``sys.argv[1]`` with nothing else to arrange.
 
 Response: ``{"series_count": N, "all_labeled": bool, "all_zero": bool}``.
 
-``all_labeled`` is the real subject. The four uvicorn workers behind one port
-each keep their own copy of this counter and the Pod's /metrics merges every
-live process's samples, so the family is only summable if every series carries
-``process_id``; an unlabeled series means one worker's rejections are silently
-overwriting another's in the merge. ``all_zero`` is the health part. Both are
+``all_labeled`` is the real subject. The counter is split by ``reason``
+(capacity / deadline / backend_unavailable) and the Pod's /metrics sums the
+four uvicorn workers' samples per reason, so every series must carry
+``reason``; an unlabeled series is the pre-split shape, whose value the alert
+rules can no longer classify. ``all_zero`` is the health part. Both are
 ``bool(series) and ...`` so that "no series at all" is false rather than
 vacuously true -- a Pod not publishing the family must not read as ready.
 """
@@ -44,7 +44,7 @@ def main() -> None:
         name, raw = line.rsplit(None, 1)
         series.append(
             {
-                "labeled": 'process_id="' in name,
+                "labeled": 'reason="' in name,
                 "value": float(raw),
             }
         )

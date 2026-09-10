@@ -457,7 +457,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             "retry_after_values": retry_after_values,
             "retry_status_counts": retry_status_counts,
             "store_io_rejections": self.metric_value(
-                metrics, "gpu_fault_store_io_rejections_total"
+                metrics, "gpu_fault_store_io_rejections_total", reason="capacity"
             ),
         }
         behavior["passed"] = all(
@@ -499,7 +499,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
             "max_in_flight": maximum,
             "ratio": ratio,
             "rejections": self.metric_value(
-                values, "gpu_fault_store_io_rejections_total"
+                values, "gpu_fault_store_io_rejections_total", reason="capacity"
             ),
         }
         write_json(case_dir / "saturation-sample.json", sample)

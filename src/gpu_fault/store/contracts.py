@@ -417,6 +417,25 @@ class WorkflowStore(Protocol):
         """
         ...
 
+    def list_recent_workflows(
+        self,
+        open_statuses: set[WorkflowStatus],
+        *,
+        updated_since: datetime | None,
+        limit: int,
+    ) -> list[WorkflowRequest]:
+        """The ``/metrics`` detail scan: what is in flight plus recent history.
+
+        Every workflow in ``open_statuses`` regardless of age, then every
+        other workflow whose ``updated_at`` is at or after ``updated_since``
+        (``None`` places no recency bound), each half newest first with the
+        open half ahead, capped at ``limit`` rows in total. The recency filter
+        runs in the store so the read stops growing with audit history: a
+        table of terminal rows older than the window costs nothing here. The
+        caller asks for one row past its budget to observe truncation.
+        """
+        ...
+
     def amend_workflow(
         self,
         request_id: str,

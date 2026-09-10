@@ -250,7 +250,7 @@ groups:
           summary: Completion Watcher write-ahead appends are failing
           runbook_url: docs/管理员日常运维.md#gpufaultcompletionoutboxappendfailures
           description: >-
-            {{ $value }} critical completion event(s) on {{ $labels.gpu_cluster }}
+            {{ $value | printf "%.0f" }} critical completion event(s) on {{ $labels.gpu_cluster }}
             in the last 10 minutes got no write-ahead ConfigMap copy, so a
             restart of that watcher can lose
             an event it never delivered or replay one it already did. Check the
@@ -404,10 +404,12 @@ groups:
             node-level fault storm is in progress. The per-cluster quota is an
             isolation mechanism: do not widen it to clear this alert, because
             that spends other clusters' capacity.
-      # The workflow table outgrew the /metrics scan budget, so the step,
-      # duration and milestone families now describe only its newest slice.
-      # Without this alert those families would quietly stop being a census and
-      # nothing else in the pipeline would say so.
+      # More workflows are open or were updated inside the /metrics scan window
+      # than the scan budget, so the step, duration and milestone families now
+      # describe only part of that set. Terminal rows older than the window are
+      # not scanned and cannot raise this: it is a storm or a mass stall, not
+      # audit growth. Without this alert those families would quietly stop
+      # being a census and nothing else in the pipeline would say so.
       - alert: GpuFaultWorkflowMetricScanTruncated
         expr: max by (control_plane_cluster, region) (gpu_fault_workflow_scan_truncated) == 1
         for: 30m
@@ -417,16 +419,18 @@ groups:
           summary: Workflow metric scan is truncated
           runbook_url: docs/管理员日常运维.md#gpufaultworkflowmetricscantruncated
           description: >-
+            More workflows are open or were updated within
+            gpu_fault_workflow_scan_window_seconds than
+            gpu_fault_workflow_scan_limit allows, so
             gpu_fault_workflow_step_total,
             gpu_fault_workflow_duration_seconds and
-            gpu_fault_closed_loop_milestone_seconds now describe only the newest
-            slice of the workflow table, not the whole census.
+            gpu_fault_closed_loop_milestone_seconds describe only part of that
+            set. Terminal workflows older than the window are not scanned, so
+            this is a workflow storm or a mass stall, not audit history.
             gpu_fault_workflow_total is a database-side aggregate and stays
-            exact. Compare gpu_fault_workflow_scan_size against
-            gpu_fault_workflow_scan_limit and decide whether retention stopped
-            reclaiming or the fleet genuinely grew; raising
-            GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT alone just moves the cost to
-            Aurora and to every scrape.
+            exact: read its open statuses to size the backlog and find what is
+            creating workflows; raising GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT
+            alone just moves the cost to Aurora and to every scrape.
       # The attempt-observation table is retained for a week by default
       # (GPU_FAULT_ATTEMPT_OBSERVATION_MAX_AGE_SECONDS), so the ownership
       # family's scan is the one most likely to hit its budget on a busy fleet.
@@ -482,20 +486,54 @@ groups:
             flight, and gpu_fault_store_io_admission_wait_seconds_max. Confirm
             it is not a single slow query before widening the lane; widening it
             only moves the pressure onto Aurora.
+      # gpu_fault_store_io_rejections_total carries a `reason` label with a
+      # closed set (gpu_fault.async_store.STORE_IO_REJECTION_REASONS). Only
+      # `capacity` is the lane being full; `backend_unavailable` is a retryable
+      # PostgreSQL failure the request layer answered as 503 + Retry-After
+      # (F-E3) and `deadline` is the caller's own budget running out. Before
+      # the split, three such 503s during one Aurora failover paged critical,
+      # and the ~1/min idle-connection closure baseline kept re-firing it.
       - alert: GpuFaultStoreIoRejected
-        expr: sum(rate(gpu_fault_store_io_rejections_total[5m])) > 0
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (rate(gpu_fault_store_io_rejections_total{reason="capacity"}[5m])) > 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: GPU fault control-plane rejected Store I/O work
+          summary: GPU fault control-plane rejected Store I/O work for capacity
           runbook_url: docs/管理员日常运维.md#gpufaultstoreiorejected
           description: >-
-            The write path is incomplete while this fires, so orchestration
+            The Store I/O lane is full and requests waited past the admission
+            timeout ({{ $value | printf "%.2f" }} rejections/s, reason=capacity),
+            so the write path is incomplete while this fires and orchestration
             state may lag the real cluster state. Check the same signals as
             GpuFaultStoreIoSaturated and whether workflows moved to retry or
             fail-closed as a result. After recovery, reconcile the workflows
-            from that window against actual node state.
+            from that window against actual node state. A writer that was
+            briefly unreachable is GpuFaultStoreIoBackendUnavailable, not this.
+      - alert: GpuFaultStoreIoBackendUnavailable
+        expr: >-
+          sum by (control_plane_cluster, region)
+          (increase(gpu_fault_store_io_rejections_total{reason=~"backend_unavailable|deadline"}[10m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: GPU fault control-plane keeps answering 503 because the writer is unreachable
+          runbook_url: docs/管理员日常运维.md#gpufaultstoreiobackendunavailable
+          description: >-
+            {{ $value | printf "%.0f" }} Store calls in 10 minutes were answered
+            503 + Retry-After because the PostgreSQL writer was briefly
+            unreachable (a failover, a credential rotation, an idle connection
+            the server closed) or the caller's deadline ran out waiting for it.
+            The lane itself is not full; the clients replay from their outbox,
+            so nothing is lost while the count stays low. It becomes a problem
+            when it is sustained: check the Aurora failover and credential
+            refresh signals (GpuFaultAuroraCredentialRefreshFailing, the RDS
+            events for the cluster) and compare against the idle-connection
+            closure baseline before treating it as an outage. A rate of about
+            one closure per minute is the known baseline, not a fault.
       - alert: GpuFaultProcessorP95Slow
         expr: histogram_quantile(0.95, sum by (le) (rate(gpu_fault_processor_request_processing_seconds_bucket[5m]))) > 5
         for: 10m
@@ -535,7 +573,7 @@ groups:
           summary: Expired processor leases were returned to PENDING
           runbook_url: docs/管理员日常运维.md#gpufaultprocessorexpiredleasesreclaimed
           description: >-
-            {{ $value }} queued request(s) sat LEASED past their lease and were
+            {{ $value | printf "%.0f" }} queued request(s) sat LEASED past their lease and were
             reclaimed by the periodic job, so a processor worker died or
             stalled mid-request. The requests are not lost, but each waited at
             least one lease longer. Find the worker Pod that restarted or the
@@ -808,7 +846,7 @@ groups:
           summary: Processor lease renewals were refused or failed
           runbook_url: docs/管理员日常运维.md#gpufaultprocessorleaserenewalfailing
           description: >-
-            {{ $value }} lease renewal(s) in 15 minutes were fenced (another
+            {{ $value | printf "%.0f" }} lease renewal(s) in 15 minutes were fenced (another
             owner holds the lane, so a request may have run on two workers) or
             hit a store error. Compare with GpuFaultProcessorExpiredLeasesReclaimed:
             a reclaim followed by a fence is a worker that stalled past its lease
@@ -833,7 +871,7 @@ groups:
           summary: Fault-layer collector events were rejected after the ingress 202
           runbook_url: docs/管理员日常运维.md#gpufaultprocessorfaulteventsrejected
           description: >-
-            {{ $value }} fault-layer event(s) in 15 minutes were accepted at the
+            {{ $value | printf "%.0f" }} fault-layer event(s) in 15 minutes were accepted at the
             ingress and then completed with a 4xx on replay, so the fault they
             carried reached no policy decision. The processor log line
             "rejected-event" names request_id, path, status and the Pydantic
@@ -861,9 +899,10 @@ groups:
           summary: A periodic service job raised or could not take its task lease
           runbook_url: docs/管理员日常运维.md#gpufaultperiodicserviceerrors
           description: >-
-            A periodic tick ended in an exception ({{ $labels.job }}) or could
-            not take a task lease from the store {{ $value | humanizeDuration }}
-            ago; gpu_fault_periodic_job_errors_total and
+            {{ if $labels.job }}The periodic job {{ $labels.job }} raised an
+            exception{{ else }}A periodic tick could not take a task lease from
+            the store{{ end }} {{ $value | humanizeDuration }} ago;
+            gpu_fault_periodic_job_errors_total and
             gpu_fault_periodic_lease_errors_total say how often. The runner keeps
             going, so the job is skipped for the tick and the service it
             provides (training health, spare health, cleanup, reclaim)
@@ -924,7 +963,7 @@ groups:
           summary: A remote command was dead-lettered because no executor ever claimed it
           runbook_url: docs/管理员日常运维.md#gpufaultremotecommandunclaimedexpired
           description: >-
-            {{ $value }} remote command(s) passed
+            {{ $value | printf "%.0f" }} remote command(s) passed
             GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS still PENDING and
             were failed with status_source=unclaimed-deadline-exceeded, so their
             workflows failed without any node action being attempted. Find the
@@ -980,7 +1019,7 @@ groups:
           description: >-
             Recovery is currently fail-closed for cluster
             {{ $labels.cluster_id }} GPU node {{ $labels.gpu_node }} because
-            {{ $value }} fresh attempts claim it. Stale observations are
+            {{ $value | printf "%.0f" }} fresh attempts claim it. Stale observations are
             excluded from ownership and alerted separately.
       - alert: GpuFaultStaleAttemptObservation
         expr: >-
@@ -994,7 +1033,7 @@ groups:
           runbook_url: docs/管理员日常运维.md#gpufaultstaleattemptobservation
           description: >-
             Cluster {{ $labels.cluster_id }} GPU node
-            {{ $labels.gpu_node }} retains {{ $value }} active-phase
+            {{ $labels.gpu_node }} retains {{ $value | printf "%.0f" }} active-phase
             observations older than the ownership freshness window. They are
             excluded from node mutation ownership. Check the live training Pod,
             Completion Watcher health/logs, and observation delivery; do not
@@ -1031,7 +1070,7 @@ groups:
           summary: Workflows exist that nothing will dispatch, fence or sweep
           runbook_url: docs/管理员日常运维.md#gpufaultorphanworkflows
           description: >-
-            {{ $value }} PENDING or SAFETY_PENDING workflow(s) past the
+            {{ $value | printf "%.0f" }} PENDING or SAFETY_PENDING workflow(s) past the
             aggregation window have an incident that is gone or points
             elsewhere and no successor. Each may still hold a node claim.
             List them with the orphan inspection in gpu-fault-admin
@@ -1048,7 +1087,7 @@ groups:
           summary: Incidents point at workflow rows that do not exist
           runbook_url: docs/管理员日常运维.md#gpufaultincidentdanglingworkflowpointers
           description: >-
-            {{ $value }} incident(s) carry a workflow_request_id no workflow row
+            {{ $value | printf "%.0f" }} incident(s) carry a workflow_request_id no workflow row
             answers to. A later event on the same node follows that pointer,
             finds nothing, and the duplicate-event fast path has to rebuild the
             chain (gpu_fault_ingest_stale_event_link_repairs_total). Read the
@@ -1069,7 +1108,7 @@ groups:
           summary: ACTIVE node agents have stopped heartbeating
           runbook_url: docs/管理员日常运维.md#gpufaultstaleagents
           description: >-
-            {{ $value }} ACTIVE agent(s) have no live heartbeat lease. Every
+            {{ $value | printf "%.0f" }} ACTIVE agent(s) have no live heartbeat lease. Every
             node action on those nodes fails readiness and the collector
             silence alerts for them follow. List them with GET /v1/fleet/agents
             and check the node's gpu-fault-node-agent unit, its cluster token
@@ -1090,7 +1129,7 @@ groups:
           summary: A control-plane pin names a build no live agent runs
           runbook_url: docs/管理员日常运维.md#gpufaultfleetpinaheadoffleet
           description: >-
-            Cluster {{ $labels.cluster_id }}: {{ $value }} node(s) fail
+            Cluster {{ $labels.cluster_id }}: {{ $value | printf "%.0f" }} node(s) fail
             readiness because a pinned value (agent version, artifact sha256,
             policy, profile or config digest) is run by no live agent in the
             cluster, so the pin -- not the nodes -- is what changed. Correct
@@ -1164,7 +1203,7 @@ groups:
           summary: A remote command was failed by the stale-fence sweep
           runbook_url: docs/管理员日常运维.md#gpufaultremotecommandstalefenceswept
           description: >-
-            {{ $value }} LEASED remote command(s) whose workflow moved to
+            {{ $value | printf "%.0f" }} LEASED remote command(s) whose workflow moved to
             another fencing token had their lease lapse without the data plane
             reporting a result, and the periodic sweep failed them with
             status_source=stale-fence (D-9). Each one is a node action that ran
@@ -1183,7 +1222,7 @@ groups:
           summary: Notification outbox deliveries are raising
           runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryerrors
           description: >-
-            {{ $value }} outbox deliveries in fifteen minutes raised inside the
+            {{ $value | printf "%.0f" }} outbox deliveries in fifteen minutes raised inside the
             provider call or the bookkeeping after it (F-3); each row was
             released for retry and the rest of the batch continued, so this is
             a slower outbox, not a lost one, unless it keeps firing. The
@@ -1200,7 +1239,7 @@ groups:
           summary: The control-record archiver is failing on candidates
           runbook_url: docs/管理员日常运维.md#gpufaultcontrolrecordarchiveerrors
           description: >-
-            {{ $value }} archive candidate(s) in the last hour failed with an
+            {{ $value | printf "%.0f" }} archive candidate(s) in the last hour failed with an
             exception other than a safety refusal (F-8); the run continued and
             the incident stays in the database for the next run. Read the
             reason label (exception type) and the archiver log; S3 permission
@@ -1244,7 +1283,7 @@ groups:
           summary: Fail-closed recovery workflows are accumulating
           runbook_url: docs/管理员日常运维.md#gpufaultrecoveryblockedbacklog
           description: >-
-            {{ $value }} recovery workflows are BLOCKED with no verified restore
+            {{ $value | printf "%.0f" }} recovery workflows are BLOCKED with no verified restore
             successor, so each one still holds a GPU node out of the training
             pool. Read the blocking reason per workflow; do not clear BLOCKED by
             editing Store rows.
@@ -1266,7 +1305,7 @@ groups:
           runbook_url: docs/管理员日常运维.md#gpufaultpostgrespooloversubscribed
           description: >-
             Role {{ $labels.service_role }}: the threads that can each hold a pooled PostgreSQL connection
-            outnumber the pool ceiling by {{ $value }}x; under load callers queue
+            outnumber the pool ceiling by {{ $value | printf "%.1f" }}x; under load callers queue
             on checkout and the request deadline, not the database, becomes the
             limit. Informational: GpuFaultPostgresPoolCheckoutQueueing says
             whether anyone is actually waiting.
@@ -1363,7 +1402,7 @@ groups:
           summary: A node branch went to an operator because the cluster budget was full
           runbook_url: docs/管理员日常运维.md#gpufaultbranchescalationbudgetrefused
           description: >-
-            {{ $value }} node branch(es) could not take their next rung
+            {{ $value | printf "%.0f" }} node branch(es) could not take their next rung
             (reboot or replacement) because the cluster remediation budget was
             full, and were retired to an operator instead of exceeding it.
       - alert: GpuFaultWorkflowLifetimeExceeded
@@ -1377,7 +1416,7 @@ groups:
           summary: A recovery workflow ran out of its hard lifetime
           runbook_url: docs/管理员日常运维.md#gpufaultworkflowlifetimeexceeded
           description: >-
-            {{ $value }} workflow(s) failed in the last 30 minutes because their
+            {{ $value | printf "%.0f" }} workflow(s) failed in the last 30 minutes because their
             lifetime deadline passed. Each is now ESCALATED to an operator and
             later events for the same node or job are only recorded on the
             incident until it is closed.
@@ -1392,7 +1431,7 @@ groups:
           summary: A training job was stopped because its nodes stayed under repair
           runbook_url: docs/管理员日常运维.md#gpufaultjobworkflownodebusytimeout
           description: >-
-            {{ $value }} job workflow(s) waited out the node-busy window and were
+            {{ $value | printf "%.0f" }} job workflow(s) waited out the node-busy window and were
             failed by suspending the job. The job owner sees a controller-initiated
             stop; the node remediation that held the node keeps running.
       # F-B4 (3): an unrecognised exception in a dispatch attempt leaves the
@@ -1452,7 +1491,7 @@ groups:
           summary: Processor requests kept failing past the retry horizon
           runbook_url: docs/管理员日常运维.md#gpufaultprocessorretryhorizonfailures
           description: >-
-            {{ $value }} queued request(s) were completed as failed (503) because
+            {{ $value | printf "%.0f" }} queued request(s) were completed as failed (503) because
             their releases kept failing for longer than the retry horizon. The
             lane is no longer blocked, but the request's side effects were never
             confirmed; read the completion body for the failure reason.
@@ -1536,7 +1575,7 @@ groups:
           summary: Business notifications were given up on undelivered
           runbook_url: docs/管理员日常运维.md#gpufaultnotificationdeliveryfailing
           description: >-
-            {{ $value }} notification(s) reached a terminal FAILED result in the
+            {{ $value | printf "%.0f" }} notification(s) reached a terminal FAILED result in the
             last 15 minutes: the outbox exhausted its delivery attempts
             (gpu_fault_notification_dead_lettered_total) or an inline send
             failed with nothing behind it to retry. An administrator decision
@@ -1591,7 +1630,7 @@ groups:
           summary: Notifications are queued but no dispatcher is draining the outbox
           runbook_url: docs/管理员日常运维.md#gpufaultnotificationoutboxnotdraining
           description: >-
-            {{ $value }} notification(s) are PENDING or RETRY and no replica has
+            {{ $value | printf "%.0f" }} notification(s) are PENDING or RETRY and no replica has
             started a dispatch cycle for five minutes. Either
             GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED is on no control-worker
             replica, or the dispatcher thread died; read the startup line
@@ -1709,7 +1748,7 @@ groups:
           summary: Recovery workflows have waited 30 minutes for remediation capacity
           runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetstarved
           description: >-
-            {{ $value }} workflows are held by a remediation budget. Compare
+            {{ $value | printf "%.0f" }} workflows are held by a remediation budget. Compare
             gpu_fault_remediation_budget_active_claims against the configured
             scope limits and check whether an active claim belongs to a
             workflow that is no longer making progress.
@@ -1740,7 +1779,7 @@ groups:
           summary: One GPU cluster's remediation budget has been saturated for 30 minutes
           runbook_url: docs/管理员日常运维.md#gpufaultremediationbudgetclustersaturated
           description: >-
-            Cluster {{ $labels.cluster_id }} has {{ $value }} recovery workflows
+            Cluster {{ $labels.cluster_id }} has {{ $value | printf "%.0f" }} recovery workflows
             waiting on its remediation budget while its active claims sit at
             the per-cluster limit. This is EXPECTED during a correlated
             whole-cluster fault: the cluster drains at
@@ -1774,7 +1813,7 @@ groups:
           summary: Completion events were recorded but never decided
           runbook_url: docs/管理员日常运维.md#gpufaultcompletioneventswithoutdecision
           description: >-
-            {{ $value }} completion event(s) have had no decision for 30
+            {{ $value | printf "%.0f" }} completion event(s) have had no decision for 30
             minutes. The attempt outcome was stored but its decision was never
             written, so a failed attempt may be sitting with no recovery
             planned. Match the events to their attempts before replaying them;
@@ -1797,7 +1836,7 @@ groups:
           summary: Escalated incidents have waited a day for an operator
           runbook_url: docs/管理员日常运维.md#gpufaultincidentsawaitingoperator
           description: >-
-            {{ $value }} incident(s) have been ESCALATED for at least 24 hours.
+            {{ $value | printf "%.0f" }} incident(s) have been ESCALATED for at least 24 hours.
             Each one is a decision the control plane deliberately handed to a
             person and will not take back. Work the list in §9; an incident
             leaves this state only through an operator action, never through a

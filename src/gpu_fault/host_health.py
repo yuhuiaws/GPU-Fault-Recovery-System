@@ -270,6 +270,63 @@ _HOST_VALIDATION_LATEST_METRICS = {
 }
 
 
+class _BatchManagedAttempt:
+    """Resolve the managed attempt that owns a telemetry batch, once.
+
+    A batch carries eight GPUs times several rules and the resolver walks
+    every attempt observation in the cluster; the answer cannot change inside
+    one ``evaluate_metrics`` call, so it is memoised here and discarded with
+    the call. Nothing lands on the policy, so no state leaks across batches.
+    """
+
+    __slots__ = ("_attempt", "_batch", "_explained", "_policy", "_resolved")
+
+    def __init__(self, policy: NodeHealthPolicy, batch: HostTelemetryBatch) -> None:
+        self._policy = policy
+        self._batch = batch
+        self._resolved = False
+        self._attempt: Any = None
+        self._explained = False
+
+    def resolve(self) -> Any:
+        """The one managed attempt on the batch's node, or ``None``; memoized."""
+
+        if not self._resolved:
+            self._attempt = self._policy._active_attempt(self._batch)
+            self._resolved = True
+        return self._attempt
+
+    def explain_inactive(self, rule_id: str, sample: HostMetricSample) -> None:
+        """Debug-log, once per batch, why an active-workload rule stays idle."""
+
+        if self._explained:
+            return
+        self._explained = True
+        batch = self._batch
+        if (
+            batch.workload_state is not WorkloadState.ACTIVE
+            or not batch.affected_workload_ids
+        ):
+            reason = "collector reports no ACTIVE workload"
+        else:
+            reason = (
+                "collector declares an ACTIVE workload but no single managed "
+                "attempt with a live container resolves on this node"
+            )
+        LOGGER.debug(
+            "%s on cluster=%s node=%s (first breach %s%s) treated as inactive: %s; "
+            "workload_state=%s affected_workload_ids=%s",
+            rule_id,
+            batch.cluster_id,
+            batch.node_id,
+            sample.name,
+            f"/{sample.device}" if sample.device else "",
+            reason,
+            batch.workload_state.value,
+            batch.affected_workload_ids,
+        )
+
+
 class NodeHealthPolicy:
     LATEST_METRICS_REQUIRED = _HOST_VALIDATION_LATEST_METRICS | {
         "gpu_inventory_expected_count",
@@ -710,6 +767,7 @@ class NodeHealthPolicy:
 
         findings = []
         related_metrics = {sample.name: sample.value for sample in batch.samples}
+        managed_attempt = _BatchManagedAttempt(self, batch)
         latest_metrics = []
         transitions = []
         transition_findings = []
@@ -734,6 +792,7 @@ class NodeHealthPolicy:
                     sample,
                     sustained_rule,
                     related_metrics,
+                    managed_attempt,
                 )
                 transitions.append(transition)
                 transition_findings.append(finding)
@@ -793,7 +852,7 @@ class NodeHealthPolicy:
             for finding, emit in zip(transition_findings, emitted, strict=True)
             if emit
         )
-        findings.extend(self._evaluate_efa_traffic(batch))
+        findings.extend(self._evaluate_efa_traffic(batch, managed_attempt))
         return findings
 
     @staticmethod
@@ -846,6 +905,7 @@ class NodeHealthPolicy:
         sample: HostMetricSample,
         rule,
         related_metrics: dict[str, float],
+        managed_attempt: _BatchManagedAttempt,
     ):
         (
             rule_id,
@@ -881,10 +941,17 @@ class NodeHealthPolicy:
             if comparison == "lte"
             else sample.value >= threshold
         )
-        if active_workload_only and (
-            batch.workload_state is not WorkloadState.ACTIVE
-            or not batch.affected_workload_ids
-        ):
+        # ``workload_state``/``affected_workload_ids`` are the collector's
+        # static environment, not an observation: a node configured ACTIVE
+        # reports ACTIVE while a placeholder job holds it idle. The signal only
+        # counts while the control plane resolves one real managed attempt with
+        # a live container on this node (the resolver the EFA-traffic rule
+        # already trusts). Anything else is an idle sample and resets the
+        # sustain window exactly as a healthy reading would.
+        attempt = managed_attempt.resolve() if active_workload_only else None
+        if active_workload_only and attempt is None:
+            if active:
+                managed_attempt.explain_inactive(rule_id, sample)
             active = False
         signal_key = "/".join(
             [
@@ -923,6 +990,8 @@ class NodeHealthPolicy:
                 runtime_profile_version=batch.runtime_profile_version,
                 workload_state=batch.workload_state,
                 affected_workload_ids=batch.affected_workload_ids,
+                job_id=attempt.job_id if attempt is not None else None,
+                attempt_id=attempt.attempt_id if attempt is not None else None,
                 diagnostic_parameters={
                     **sample.labels,
                     "signal": rule_id,
@@ -961,8 +1030,7 @@ class NodeHealthPolicy:
         identities = {(item.job_id, item.attempt_id) for item in candidates}
         if len(identities) > 1:
             LOGGER.warning(
-                "ambiguous EFA traffic attempt ownership: "
-                "cluster=%s node=%s identities=%s",
+                "ambiguous managed attempt ownership: cluster=%s node=%s identities=%s",
                 batch.cluster_id,
                 batch.node_id,
                 sorted(identities),
@@ -1048,7 +1116,9 @@ class NodeHealthPolicy:
         }
 
     def _evaluate_efa_traffic(
-        self, batch: HostTelemetryBatch
+        self,
+        batch: HostTelemetryBatch,
+        managed_attempt: _BatchManagedAttempt | None = None,
     ) -> list[NodeHealthFinding]:
         samples = [
             item
@@ -1057,7 +1127,11 @@ class NodeHealthPolicy:
         ]
         if len(samples) != 1:
             return []
-        observation = self._active_attempt(batch)
+        observation = (
+            managed_attempt.resolve()
+            if managed_attempt is not None
+            else self._active_attempt(batch)
+        )
         if observation is None:
             return []
         sample = samples[0]

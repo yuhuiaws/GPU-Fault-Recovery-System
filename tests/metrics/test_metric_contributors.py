@@ -14,6 +14,7 @@ from gpu_fault.app.builtin_metric_contributors import (
 )
 from gpu_fault.app.collector_metrics import CollectorMetricsSnapshot
 from gpu_fault.app.metric_contributors import MetricContributorRegistry
+from gpu_fault.app.metric_scan_cache import MetricScanCache
 from gpu_fault.app.metrics import collector_silence_lines
 from gpu_fault.app.metrics_sections import render_capacity_metrics
 from gpu_fault.models import (
@@ -67,10 +68,14 @@ def test_collector_metrics_use_background_snapshot_only() -> None:
     assert collector_silence_lines(runtime) == ["snapshot 1"]
 
 
-def test_process_local_store_rejection_counter_has_process_label(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("gpu_fault.app.metrics_sections.os.getpid", lambda: 4321)
+def test_store_rejection_counter_is_split_by_reason_with_no_process_label() -> None:
+    """One zero series per reason from the first scrape, and no ``process_id``.
+
+    The per-process label used to keep the four uvicorn workers' counts from
+    overwriting each other; the Pod-level merge now sums them per reason, and
+    the alert rules select on ``reason``, so a bare or process-labelled series
+    would be invisible to both.
+    """
     app = create_app(ApplicationContext(store=build_store()))
 
     async def fetch() -> str:
@@ -80,9 +85,19 @@ def test_process_local_store_rejection_counter_has_process_label(
             return response.text
 
     metrics = asyncio.run(fetch())
+    series = [
+        line
+        for line in metrics.splitlines()
+        if line.startswith("gpu_fault_store_io_rejections_total")
+    ]
 
-    assert 'gpu_fault_store_io_rejections_total{process_id="4321"} 0' in metrics, (
-        metrics
+    assert series == [
+        'gpu_fault_store_io_rejections_total{reason="backend_unavailable"} 0',
+        'gpu_fault_store_io_rejections_total{reason="capacity"} 0',
+        'gpu_fault_store_io_rejections_total{reason="deadline"} 0',
+    ], series
+    assert "gpu_fault_store_io_rejections_by_reason_total" not in metrics, (
+        "the by_reason family is folded into the reason label"
     )
 
 
@@ -273,8 +288,15 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
         )
     )
 
+    # The fixture is dated against ``NOW``; the detail scan windows terminal
+    # rows against the cache's clock, so pin that clock next to the fixture.
     lines = closed_loop_metric_lines(
-        SimpleNamespace(context=ApplicationContext(store=store))
+        SimpleNamespace(
+            context=ApplicationContext(store=store),
+            metric_scan_cache=MetricScanCache(
+                store, ttl_seconds=0.0, now=lambda: NOW + timedelta(hours=1)
+            ),
+        )
     )
 
     assert 'gpu_fault_workflow_total{status="SUCCEEDED"} 1' in lines
@@ -366,7 +388,7 @@ def test_blocked_backlog_gauge_is_a_server_side_aggregate(monkeypatch) -> None:
             "workflow-held", "incident-held", status=WorkflowStatus.BLOCKED
         )
     )
-    monkeypatch.setattr(store, "list_workflows", lambda *_args, **_keywords: [])
+    monkeypatch.setattr(store, "list_recent_workflows", lambda *_args, **_keywords: [])
 
     lines = closed_loop_metric_lines(
         SimpleNamespace(context=ApplicationContext(store=store))

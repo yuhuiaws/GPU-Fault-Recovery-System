@@ -139,6 +139,41 @@ def test_the_outbox_append_failure_alert_reads_a_windowed_increase() -> None:
     ), f"unexpected expression shape: {expression}"
 
 
+def test_the_store_io_rejection_page_reads_only_the_capacity_reason() -> None:
+    """``gpu_fault_store_io_rejections_total`` also counts the retryable
+    PostgreSQL failures the request layer answers as 503 + Retry-After (F-E3);
+    three of those during one Aurora failover paged critical. The critical
+    rule must select the lane-full reason alone."""
+    rule = _rule("GpuFaultStoreIoRejected")
+
+    assert _expression("GpuFaultStoreIoRejected") == (
+        "sum by (control_plane_cluster, region) "
+        '(rate(gpu_fault_store_io_rejections_total{reason="capacity"}[5m])) > 0'
+    )
+    assert rule["for"] == "1m"
+    assert rule["labels"]["severity"] == "critical"
+    assert "GpuFaultStoreIoBackendUnavailable" in rule["annotations"]["description"]
+
+
+def test_the_writer_unreachable_rejections_are_a_sustained_warning() -> None:
+    """A brief failover, a rotation or the ~1/min idle-connection closure
+    baseline produce a handful of 503s the clients replay from their outbox;
+    only a sustained count over a window is worth a warning."""
+    rule = _rule("GpuFaultStoreIoBackendUnavailable")
+
+    assert _expression("GpuFaultStoreIoBackendUnavailable") == (
+        "sum by (control_plane_cluster, region) (increase("
+        'gpu_fault_store_io_rejections_total{reason=~"backend_unavailable|deadline"}'
+        "[10m])) > 5"
+    )
+    assert rule["for"] == "5m"
+    assert rule["labels"]["severity"] == "warning"
+    description = rule["annotations"]["description"]
+    assert '{{ $value | printf "%.0f" }}' in description
+    assert "Retry-After" in description and "outbox" in description
+    assert "baseline" in description
+
+
 def defects_for(alert: str, annotations: dict[str, str]) -> list[str]:
     """Report only the defects about ``alert``.
 

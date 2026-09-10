@@ -94,6 +94,10 @@ class WorkflowMergeService:
         self.absorbed_record_only_total = 0
         self.lifetime_record_only_total = 0
         self.withdrawn_record_only_total = 0
+        # Sustained host-resource findings recorded on a same-signal incident
+        # that is still ESCALATED / ACTION_PENDING for the node; incremented
+        # by the health family through the coordinator.
+        self.unsettled_host_resource_record_only_total = 0
 
     def disposition(
         self,

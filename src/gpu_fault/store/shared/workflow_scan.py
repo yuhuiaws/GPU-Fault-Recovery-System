@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, Collection
+from typing import Callable, Collection, Iterable
 
 from gpu_fault.models import WorkflowRequest, WorkflowStatus, workflow_is_open
 from gpu_fault.store.shared.time import utc_text
@@ -68,3 +68,40 @@ def dispatch_order_key(workflow: WorkflowRequest) -> tuple[str, str]:
     """
 
     return utc_text(dispatch_eligible_at(workflow)), workflow.request_id
+
+
+def recent_workflow_slice(
+    workflows: Iterable[WorkflowRequest],
+    open_statuses: Collection[WorkflowStatus],
+    *,
+    updated_since: datetime | None,
+    limit: int,
+) -> list[WorkflowRequest]:
+    """``list_recent_workflows`` for the Python-filtered backends.
+
+    Mirrors the two Postgres range scans: every row in ``open_statuses``
+    whatever its age, then every other row whose ``updated_at`` is at or after
+    ``updated_since`` (all of them when it is ``None``), each half newest
+    first, the open half ahead so the cap falls on old terminal history before
+    it falls on anything still in flight.
+    """
+
+    if limit <= 0:
+        return []
+
+    def newest_first(rows: Iterable[WorkflowRequest]) -> list[WorkflowRequest]:
+        return sorted(
+            rows,
+            key=lambda item: (utc_text(item.updated_at), item.request_id),
+            reverse=True,
+        )
+
+    since = None if updated_since is None else utc_text(updated_since)
+    open_rows = newest_first(item for item in workflows if item.status in open_statuses)
+    recent_rows = newest_first(
+        item
+        for item in workflows
+        if item.status not in open_statuses
+        and (since is None or utc_text(item.updated_at) >= since)
+    )
+    return (open_rows + recent_rows)[:limit]

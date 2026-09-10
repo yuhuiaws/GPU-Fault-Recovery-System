@@ -39,6 +39,7 @@ def test_review_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
     merger.absorbed_record_only_total = 6
     merger.lifetime_record_only_total = 7
     merger.withdrawn_record_only_total = 8
+    merger.unsettled_host_resource_record_only_total = 14
     processor = app.state.processor
     processor._completion_failure_releases_total = 9
     processor._retry_horizon_failures_total = 10
@@ -57,11 +58,12 @@ def test_review_counters_reach_the_metrics_endpoint(monkeypatch) -> None:
         'gpu_fault_workflow_merge_record_only_total{reason="covered_read_only"} 6',
         'gpu_fault_workflow_merge_record_only_total{reason="lifetime_exceeded"} 7',
         'gpu_fault_workflow_merge_record_only_total{reason="workload_withdrawn"} 8',
+        'gpu_fault_workflow_merge_record_only_total{reason="unsettled_host_resource_incident"} 14',
         "gpu_fault_processor_completion_failure_releases_total 9",
         "gpu_fault_processor_retry_horizon_failures_total 10",
         "gpu_fault_processor_renewal_errors_total 11",
         "gpu_fault_processor_renewal_fenced_total 12",
-        'gpu_fault_store_io_rejections_by_reason_total{reason="deadline"} 13',
+        'gpu_fault_store_io_rejections_total{reason="deadline"} 13',
     ):
         assert line in text, line
 

@@ -38,6 +38,20 @@ class StoreIoCapacityExceeded(RuntimeError):
     pass
 
 
+# The closed set of ``reason`` values on ``gpu_fault_store_io_rejections_total``.
+# Every rejection the executor counts -- or that a caller wrapping a store
+# failure into ``StoreIoCapacityExceeded`` on its behalf counts -- lands in
+# exactly one of these, so an alert can tell a lane that is genuinely full
+# (``capacity``) from a writer that was briefly unreachable
+# (``backend_unavailable``): the second is a 503 + Retry-After the client
+# replays from its outbox, not a capacity page.
+STORE_IO_REJECTION_REASONS: tuple[str, ...] = (
+    "backend_unavailable",
+    "capacity",
+    "deadline",
+)
+
+
 class RequestDeadlineExceeded(StoreIoCapacityExceeded):
     """The caller's own deadline passed before store I/O admission (F-E1).
 
@@ -73,13 +87,27 @@ class AsyncStoreExecutor:
         self.in_flight = 0
         self.rejected_total = 0
         self.rejected_by_reason: dict[str, int] = {
-            "deadline": 0,
-            "capacity": 0,
-            "writer_unavailable": 0,
+            reason: 0 for reason in STORE_IO_REJECTION_REASONS
         }
         self.admission_wait_count = 0
         self.admission_wait_sum_seconds = 0.0
         self.admission_wait_max_seconds = 0.0
+
+    def record_rejection(self, reason: str) -> None:
+        """Count one rejected store call under ``reason``.
+
+        The executor calls this for the rejections it raises itself; the
+        processor admission batcher calls it when it wraps a retryable store
+        failure on the executor's behalf (F-E3), so the metric sees every
+        ``StoreIoCapacityExceeded`` a client is answered with.
+        """
+        if reason not in self.rejected_by_reason:
+            raise ValueError(
+                f"unknown store I/O rejection reason {reason!r}; expected one of "
+                + ", ".join(STORE_IO_REJECTION_REASONS)
+            )
+        self.rejected_total += 1
+        self.rejected_by_reason[reason] += 1
 
     async def run(self, function: Callable[..., T], /, *args, **kwargs) -> T:
         wait_started = time.monotonic()
@@ -87,8 +115,7 @@ class AsyncStoreExecutor:
         if budget <= 0:
             # The caller's deadline already passed, so the work would be
             # thrown away on return. Reject without taking a slot.
-            self.rejected_total += 1
-            self.rejected_by_reason["deadline"] += 1
+            self.record_rejection("deadline")
             raise RequestDeadlineExceeded(
                 "request deadline exceeded before store I/O admission"
             )
@@ -98,8 +125,7 @@ class AsyncStoreExecutor:
                 timeout=budget,
             )
         except TimeoutError as exc:
-            self.rejected_total += 1
-            self.rejected_by_reason["capacity"] += 1
+            self.record_rejection("capacity")
             raise StoreIoCapacityExceeded(
                 "store I/O executor capacity exceeded"
             ) from exc
@@ -134,8 +160,7 @@ class AsyncStoreExecutor:
             except Exception as exc:
                 if not is_retryable_store_unavailable(exc):
                     raise
-                self.rejected_total += 1
-                self.rejected_by_reason["writer_unavailable"] += 1
+                self.record_rejection("backend_unavailable")
                 raise StoreIoCapacityExceeded(
                     "PostgreSQL writer is temporarily unavailable"
                 ) from exc

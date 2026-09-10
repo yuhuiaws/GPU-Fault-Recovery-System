@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.models import (
     IncidentState,
     WorkflowEventCode,
@@ -36,6 +37,7 @@ from gpu_fault.orchestration.incident_closure import (
     AUTO_CLOSE_ACTOR,
     IncidentClosureService,
     IncidentNotClosable,
+    NodeIsolationEvidence,
     restores_node,
 )
 from gpu_fault.store import NotFoundError, SqliteStore
@@ -259,12 +261,244 @@ def test_dry_run_preview_names_the_verdict_without_writing(store) -> None:
         "closable": True,
         "refusal": None,
         "open_workflow_id": None,
+        "cluster_id": "cluster-a",
+        "node_ids": ["node-a"],
+        "evidence_required": False,
+        "isolation_reasons": [],
     }
     assert refused["closable"] is False
     assert refused["open_workflow_id"] == "wf-inc-running"
     assert "RUNNING" in refused["refusal"]
     assert missing["closable"] is False and "not found" in missing["refusal"]
     assert store.get_incident(incident.incident_id).state is IncidentState.ESCALATED
+
+
+# ------------------------------------------- QUARANTINED close on node evidence
+
+
+def _quarantined(store, incident_id: str = "inc-q", node_ids=("node-a",)):
+    """A quarantine whose workflow ended; the incident still says QUARANTINED."""
+
+    incident, workflow = _escalated_reset(
+        store, incident_id=incident_id, node_ids=node_ids
+    )
+    quarantined = copy_model(incident, state=IncidentState.QUARANTINED)
+    store.save_incident(quarantined, expected=incident)
+    return quarantined, workflow
+
+
+def _clean(node_id: str = "node-a") -> NodeIsolationEvidence:
+    return NodeIsolationEvidence(node_id=node_id)
+
+
+def test_a_quarantined_incident_closes_on_evidence_that_its_isolation_is_gone(
+    store,
+) -> None:
+    incident, workflow = _quarantined(store)
+    service = IncidentClosureService(store)
+
+    closed, changed = service.close_incident(
+        incident.incident_id,
+        reason="node repaired by hand, isolation released by cleanup",
+        operator=OPERATOR,
+        reference="CHG-1",
+        evidence=[_clean()],
+    )
+
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    stored = store.get_incident(incident.incident_id)
+    assert stored.reasons[-2:] == [
+        "operator closed: node repaired by hand, isolation released by cleanup "
+        f"by {OPERATOR}",
+        "isolation no longer present on node node-a",
+    ]
+    events = store.get_workflow(workflow.request_id).events
+    close_event = [
+        event
+        for event in events
+        if event.code == WorkflowEventCode.INCIDENT_CLOSED.value
+    ][-1]
+    assert close_event.kind is WorkflowEventKind.OPERATOR_RECONCILED
+    assert close_event.actor == OPERATOR
+    assert close_event.details["previous_incident_state"] == "QUARANTINED"
+    assert close_event.details["isolation_evidence"] == [
+        {
+            "node_id": "node-a",
+            "exists": True,
+            "unschedulable": False,
+            "quarantine_taint_value": None,
+            "isolation_annotations": {},
+        }
+    ], "the evidence the close rested on is on the audit event"
+    assert all(
+        not marker.active for marker in store.list_markers_for_incident("inc-q")
+    ), "markers retire like an ESCALATED close"
+    assert service.operator_closed_total == 1
+
+
+def test_a_quarantined_incident_still_holding_its_own_taint_is_refused(store) -> None:
+    incident, _ = _quarantined(store)
+    service = IncidentClosureService(store)
+    own_taint = NodeIsolationEvidence(
+        node_id="node-a",
+        quarantine_taint_value=quarantine_taint_value(incident.incident_id),
+    )
+
+    with pytest.raises(IncidentNotClosable) as refused:
+        service.close_incident(
+            incident.incident_id, reason="x", operator=OPERATOR, evidence=[own_taint]
+        )
+
+    assert "taint of incident inc-q" in str(refused.value)
+    assert store.get_incident(incident.incident_id).state is IncidentState.QUARANTINED
+    assert service.operator_closed_total == 0
+
+
+@pytest.mark.parametrize(
+    ("evidence", "match"),
+    [
+        pytest.param(
+            NodeIsolationEvidence(node_id="node-a", unschedulable=True),
+            "still cordoned",
+            id="cordoned",
+        ),
+        pytest.param(
+            NodeIsolationEvidence(
+                node_id="node-a",
+                isolation_annotations={"gpu-fault.io/incident-id": "inc-q"},
+            ),
+            "isolation annotations of incident inc-q",
+            id="own-annotation",
+        ),
+        pytest.param(
+            NodeIsolationEvidence(node_id="node-a", exists=False),
+            "not in the cluster",
+            id="node-missing",
+        ),
+        pytest.param(
+            NodeIsolationEvidence(node_id="node-other"),
+            "no isolation evidence was supplied for node node-a",
+            id="wrong-node",
+        ),
+        pytest.param(
+            NodeIsolationEvidence(node_id="node-a", quarantine_taint_value="inc-q"),
+            "taint of incident inc-q",
+            id="raw-id-taint-value",
+        ),
+    ],
+)
+def test_evidence_that_does_not_clear_every_node_refuses_the_close(
+    store, evidence, match
+) -> None:
+    incident, _ = _quarantined(store)
+    service = IncidentClosureService(store)
+
+    with pytest.raises(IncidentNotClosable, match=match):
+        service.close_incident(
+            incident.incident_id, reason="x", operator=OPERATOR, evidence=[evidence]
+        )
+
+    assert store.get_incident(incident.incident_id).state is IncidentState.QUARANTINED
+
+
+def test_a_taint_owned_by_another_incident_does_not_block_and_is_recorded(
+    store,
+) -> None:
+    incident, _ = _quarantined(store)
+    service = IncidentClosureService(store)
+    other = NodeIsolationEvidence(
+        node_id="node-a",
+        quarantine_taint_value=quarantine_taint_value("inc-other"),
+        isolation_annotations={
+            "gpu-fault.io/incident-id": "inc-other",
+            "gpu-fault.io/fencing-token": "4",
+        },
+    )
+
+    preview = service.preview(incident.incident_id, evidence=[other])
+    closed, changed = service.close_incident(
+        incident.incident_id, reason="x", operator=OPERATOR, evidence=[other]
+    )
+
+    assert preview["closable"] is True and preview["evidence_required"] is False
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    last = store.get_incident(incident.incident_id).reasons[-1]
+    assert last.startswith("isolation no longer present on node node-a ("), last
+    assert "owned by incident inc-other" in last, "the other owner is named, not judged"
+
+
+def test_a_quarantined_incident_with_an_open_workflow_is_refused_despite_evidence(
+    store,
+) -> None:
+    incident, _ = _quarantined(store)
+    successor = workflow_request(
+        "wf-successor",
+        incident.incident_id,
+        status=WorkflowStatus.RUNNING,
+        official_steps=[workflow_step(RESTORE, node_ids=["node-a"])],
+    )
+    store.save_workflow(successor)
+    service = IncidentClosureService(store)
+
+    with pytest.raises(IncidentNotClosable, match="wf-successor"):
+        service.close_incident(
+            incident.incident_id, reason="x", operator=OPERATOR, evidence=[_clean()]
+        )
+
+
+def test_every_node_of_a_multi_node_incident_needs_clearing_evidence(store) -> None:
+    incident, _ = _quarantined(store, node_ids=("node-a", "node-b"))
+    service = IncidentClosureService(store)
+
+    with pytest.raises(IncidentNotClosable, match="node node-b"):
+        service.close_incident(
+            incident.incident_id, reason="x", operator=OPERATOR, evidence=[_clean()]
+        )
+
+    closed, _ = service.close_incident(
+        incident.incident_id,
+        reason="x",
+        operator=OPERATOR,
+        evidence=[_clean("node-b"), _clean("node-a")],
+    )
+    assert closed.reasons[-2:] == [
+        "isolation no longer present on node node-a",
+        "isolation no longer present on node node-b",
+    ]
+
+
+def test_without_evidence_a_quarantined_incident_is_refused_as_before(store) -> None:
+    incident, _ = _quarantined(store)
+    service = IncidentClosureService(store)
+
+    preview = service.preview(incident.incident_id)
+    with pytest.raises(IncidentNotClosable) as refused:
+        service.close_incident(incident.incident_id, reason="x", operator=OPERATOR)
+
+    assert preview["closable"] is False
+    assert preview["evidence_required"] is True, (
+        "the caller that can read the nodes is told to come back with evidence"
+    )
+    assert preview["cluster_id"] == "cluster-a" and preview["node_ids"] == ["node-a"]
+    assert "QUARANTINED" in str(refused.value) and "ESCALATED" in str(refused.value)
+    assert store.get_incident(incident.incident_id).state is IncidentState.QUARANTINED
+
+
+def test_evidence_is_ignored_for_an_escalated_incident(store) -> None:
+    incident, _ = _escalated_reset(store)
+    service = IncidentClosureService(store)
+    tainted = NodeIsolationEvidence(
+        node_id="node-a", quarantine_taint_value=quarantine_taint_value("inc-reset")
+    )
+
+    closed, changed = service.close_incident(
+        incident.incident_id, reason="x", operator=OPERATOR, evidence=[tainted]
+    )
+
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    assert closed.reasons[-1] == f"operator closed: x by {OPERATOR}", (
+        "ESCALATED closes on the signature alone; no isolation line is added"
+    )
 
 
 # ------------------------------------------------------- auto-close by restore

@@ -581,10 +581,10 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                     "Store I/O rejections",
                     (
                         Target(
-                            "sum by (pod) (rate("
+                            "sum by (pod, reason) (rate("
                             + series("gpu_fault_store_io_rejections_total")
                             + "[5m]))",
-                            "{{pod}}",
+                            "{{pod}} {{reason}}",
                         ),
                     ),
                 ),

@@ -146,16 +146,13 @@ def test_scan_ttl_default_holds_the_store_to_one_aggregate_per_pod_per_minute(
 
 class _StatusRecordingStore:
     def __init__(self, rows_per_call: int) -> None:
-        self.status_calls: list[frozenset[WorkflowStatus] | None] = []
-        self.limits: list[int] = []
+        self.calls: list[tuple[frozenset[WorkflowStatus], datetime | None, int]] = []
         self._rows = rows_per_call
 
-    def list_workflows(self, statuses=None, *, limit=100, newest_first=False):
-        self.status_calls.append(None if statuses is None else frozenset(statuses))
-        self.limits.append(limit)
-        assert newest_first is True
+    def list_recent_workflows(self, open_statuses, *, updated_since, limit):
+        self.calls.append((frozenset(open_statuses), updated_since, limit))
         return [
-            SimpleNamespace(request_id=f"wf-{len(self.status_calls)}-{index}")
+            SimpleNamespace(request_id=f"wf-{len(self.calls)}-{index}")
             for index in range(min(self._rows, limit))
         ]
 
@@ -163,26 +160,36 @@ class _StatusRecordingStore:
 def test_workflow_detail_scan_never_asks_for_every_status_at_once() -> None:
     # G-2: ``list_workflows(statuses=None, newest_first=True)`` has no index --
     # every updated_at index is partial per status -- so it read and sorted the
-    # whole workflow kind on disk. The open slice walks the executable/BLOCKED
-    # partial indexes; the terminal slice walks ``gpu_fault_workflow_updated_all``.
+    # whole workflow kind on disk. The cache names the open set and the window
+    # edge and the store runs the two range scans: the open half over the
+    # executable/BLOCKED partial indexes, the recent terminal half over
+    # ``gpu_fault_workflow_updated_all`` down to the window edge.
     store = _StatusRecordingStore(rows_per_call=2)
-    scan = MetricScanCache(store, workflow_limit=3, ttl_seconds=0.0).workflows()
+    scan = MetricScanCache(
+        store,
+        workflow_limit=3,
+        workflow_window_seconds=600,
+        ttl_seconds=0.0,
+        now=lambda: datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    ).workflows()
 
-    assert None not in store.status_calls, store.status_calls
-    assert store.status_calls == [
-        frozenset(OPEN_WORKFLOW_STATUSES),
-        frozenset(TERMINAL_WORKFLOW_STATUSES),
+    assert store.calls == [
+        (
+            frozenset(OPEN_WORKFLOW_STATUSES),
+            datetime(2026, 9, 10, 11, 50, tzinfo=timezone.utc),
+            4,
+        )
     ]
     assert OPEN_WORKFLOW_STATUSES | TERMINAL_WORKFLOW_STATUSES == set(WorkflowStatus)
-    assert store.limits == [4, 4]
-    assert len(scan.workflows) == 4
+    assert len(scan.workflows) == 2
     assert scan.limit == 3
+    assert scan.window_seconds == 600
     assert scan.truncated is False
 
     truncated = MetricScanCache(
         _StatusRecordingStore(rows_per_call=4), workflow_limit=3, ttl_seconds=0.0
     ).workflows()
-    assert len(truncated.workflows) == 6
+    assert len(truncated.workflows) == 3
     assert truncated.truncated is True
 
 

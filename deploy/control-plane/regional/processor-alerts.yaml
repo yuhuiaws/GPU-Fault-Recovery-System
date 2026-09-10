@@ -50,7 +50,7 @@ spec:
           annotations:
             summary: GPU fault control-plane Store I/O capacity exceeds 90 percent
         - alert: GpuFaultStoreIoRejected
-          expr: sum(rate(gpu_fault_store_io_rejections_total[5m])) > 0
+          expr: sum(rate(gpu_fault_store_io_rejections_total{reason="capacity"}[5m])) > 0
           for: 1m
           labels:
             severity: critical
@@ -174,7 +174,7 @@ spec:
             description: >-
               Recovery is currently fail-closed for cluster
               {{ $labels.cluster_id }} GPU node {{ $labels.gpu_node }} because
-              {{ $value }} fresh attempts claim it. Stale observations are
+              {{ $value | printf "%.0f" }} fresh attempts claim it. Stale observations are
               excluded from ownership and alerted separately.
         - alert: GpuFaultStaleAttemptObservation
           expr: max by (cluster_id, gpu_node) (gpu_fault_stale_attempt_observations) > 0
@@ -185,7 +185,7 @@ spec:
             summary: Stale active attempt observations remain
             description: >-
               Cluster {{ $labels.cluster_id }} GPU node
-              {{ $labels.gpu_node }} retains {{ $value }} active-phase
+              {{ $labels.gpu_node }} retains {{ $value | printf "%.0f" }} active-phase
               observations older than the ownership freshness window. They
               are excluded from node mutation ownership. Check the live
               training Pod, Completion Watcher health/logs, and observation
@@ -208,7 +208,7 @@ spec:
           annotations:
             summary: One GPU cluster's remediation budget has been saturated for 30 minutes
             description: >-
-              Cluster {{ $labels.cluster_id }} has {{ $value }} recovery
+              Cluster {{ $labels.cluster_id }} has {{ $value | printf "%.0f" }} recovery
               workflows waiting on its remediation budget while its active
               claims sit at the per-cluster limit. EXPECTED during a
               correlated whole-cluster fault, which drains at the limit's

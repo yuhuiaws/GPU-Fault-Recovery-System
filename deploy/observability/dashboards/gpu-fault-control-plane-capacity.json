@@ -1310,7 +1310,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultStoreIoRejected (critical, for 1m, > 0): docs/管理员日常运维.md#gpufaultstoreiorejected",
+      "description": "Alert GpuFaultStoreIoRejected (critical, for 1m, > 0): docs/管理员日常运维.md#gpufaultstoreiorejected\n\nAlert GpuFaultStoreIoBackendUnavailable (warning, for 5m, > 5): docs/管理员日常运维.md#gpufaultstoreiobackendunavailable",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1335,6 +1335,10 @@
               {
                 "color": "red",
                 "value": 0.0
+              },
+              {
+                "color": "orange",
+                "value": 5.0
               }
             ]
           },
@@ -1366,9 +1370,9 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "sum by (pod) (rate(gpu_fault_store_io_rejections_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
+          "expr": "sum by (pod, reason) (rate(gpu_fault_store_io_rejections_total{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
           "instant": false,
-          "legendFormat": "{{pod}}",
+          "legendFormat": "{{pod}} {{reason}}",
           "range": true,
           "refId": "A"
         }

@@ -21,10 +21,21 @@ generation, deadline passed), and submits:
     the acknowledgement, then a trusted ``operator-change`` marker and the
     operator terminal trigger that compile a *new* fenced workflow for the
     hardware action; the original incident is never rewritten.
+``restore``
+    not a CHECK_MECHANICALS answer but the exit of a QUARANTINED incident whose
+    node was repaired by hand: a validated restore workflow (VALIDATE_GPU ->
+    VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING) under the *same*
+    incident and fencing token, built by
+    ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod. Refused
+    unless the incident is QUARANTINED with no open workflow and every node
+    carries the ``gpu-fault.io/quarantined`` taint this incident owns; a node
+    another incident quarantined is named. Until 2026-09-10 only the
+    acceptance fixture could create this workflow.
 
 Resubmitting the same disposition is a no-op: the annotation is compared
 before it is written, and the terminal decision for the same attempt is
-returned as ``duplicate`` by the control plane rather than re-planned.
+returned as ``duplicate`` by the control plane rather than re-planned; a
+``restore`` rerun while its workflow is PENDING/RUNNING returns that id.
 """
 
 from __future__ import annotations
@@ -37,7 +48,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
-from gpu_fault.adapters.common import ANNOTATION_MECHANICAL_INSPECTION_COMPLETE
+from gpu_fault.adapters.common import (
+    ANNOTATION_INCIDENT,
+    ANNOTATION_MECHANICAL_INSPECTION_COMPLETE,
+    QUARANTINE_TAINT,
+)
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault.admin.operator_identity import resolve_operator_identity
@@ -47,17 +62,27 @@ from gpu_fault.admin.workflow_reconcile import (
     gpu_kubectl_command,
     run_control_plane_script,
 )
-from gpu_fault.models import RecoveryAction
+from gpu_fault.models import FaultIncident, RecoveryAction
+from gpu_fault.orchestration.incident_closure import owned_quarantine_taint_values
+from gpu_fault.orchestration.validated_restore import (
+    build_validated_restore_workflow,
+    is_validated_restore_workflow,
+    restore_reason,
+)
 
 STATE_ROOT = "submit-remediation"
 DISPOSITION_INSPECTED = "inspected"
+DISPOSITION_RESTORE = "restore"
 DISPOSITION_ACTIONS: dict[str, RecoveryAction | None] = {
     DISPOSITION_INSPECTED: None,
     "reset-gpu": RecoveryAction.RESET_GPU,
     "reboot-node": RecoveryAction.REBOOT_NODE,
     "quarantine": RecoveryAction.QUARANTINE,
 }
-DISPOSITIONS = tuple(DISPOSITION_ACTIONS)
+DISPOSITIONS = (*DISPOSITION_ACTIONS, DISPOSITION_RESTORE)
+# A workflow in one of these still owns its node; ``restore`` waits for it.
+OPEN_WORKFLOW_STATUSES = frozenset({"PENDING", "RUNNING", "SAFETY_PENDING"})
+QUARANTINED_STATE = "QUARANTINED"
 OPERATOR_MARKER_SOURCE = "operator-change"
 OPERATOR_MAPPING_VERSION = "operator-change-v1"
 OPERATOR_MARKER_TTL = timedelta(hours=1)
@@ -69,13 +94,20 @@ INCIDENT_ANNOTATION = "gpu-fault.io/incident-id"
 REMEDIATION_SCRIPT = """
 import json
 import sys
+from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import NodeMarker, TerminalEvent, WorkflowOperation
+from gpu_fault.models import (
+    NodeMarker,
+    TerminalEvent,
+    WorkflowOperation,
+    WorkflowStatus,
+)
 
 payload = json.load(sys.stdin)
 context = ApplicationContext.from_environment()
 store = context.store
+OPEN = {WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.SAFETY_PENDING}
 
 
 def dump(model):
@@ -92,6 +124,22 @@ def load(incident_id):
     return incident, workflow
 
 
+def open_workflows(incident):
+    # Every open workflow of the incident on its nodes, the pointer included.
+    rows = {}
+    if incident.workflow_request_id:
+        current = store.get_workflow(incident.workflow_request_id)
+        if current.status in OPEN:
+            rows[current.request_id] = current
+    if incident.node_ids:
+        for owner, workflow in store.list_active_workflow_incidents(
+            incident.cluster_id, node_ids=set(incident.node_ids)
+        ):
+            if owner.incident_id == incident.incident_id and workflow.status in OPEN:
+                rows[workflow.request_id] = workflow
+    return [rows[key] for key in sorted(rows)]
+
+
 if payload["mode"] == "inspect":
     incident, workflow = load(payload["incident_id"])
     nodes = set(incident.node_ids)
@@ -105,6 +153,7 @@ if payload["mode"] == "inspect":
     result = {
         "incident": dump(incident),
         "workflow": dump(workflow),
+        "open_workflows": [dump(item) for item in open_workflows(incident)],
         "active_observations": observations,
         "existing_markers": [
             dump(item)
@@ -116,6 +165,52 @@ if payload["mode"] == "inspect":
             )
         ),
     }
+elif payload["mode"] == "restore":
+    from gpu_fault.orchestration.validated_restore import (
+        build_validated_restore_workflow,
+        is_validated_restore_workflow,
+    )
+
+    incident, workflow = load(payload["incident_id"])
+    expected = payload["expected"]
+    observed = {
+        "fencing_token": incident.fencing_token,
+        "workflow_request_id": incident.workflow_request_id,
+        "state": incident.state.value,
+        "node_ids": sorted(incident.node_ids),
+    }
+    drift = {
+        key: {"expected": expected[key], "observed": observed[key]}
+        for key in expected
+        if expected[key] != observed[key]
+    }
+    if drift:
+        raise SystemExit(
+            "submit-remediation: incident moved since inspection: "
+            + json.dumps(drift, sort_keys=True)
+        )
+    still_open = open_workflows(incident)
+    existing = [
+        item for item in still_open if is_validated_restore_workflow(item.request_id)
+    ]
+    if existing:
+        result = {"no_op": True, "workflow": dump(existing[0]), "incident": dump(incident)}
+    elif still_open:
+        raise SystemExit(
+            "submit-remediation: incident still has an open workflow "
+            + ", ".join(f"{item.request_id} ({item.status.value})" for item in still_open)
+        )
+    else:
+        updated, created = build_validated_restore_workflow(
+            incident,
+            operator=payload["operator"],
+            reference=payload.get("reference"),
+            now=datetime.now(timezone.utc),
+            runtime_profile_version=payload.get("runtime_profile_version"),
+        )
+        store.save_incident_and_workflow(updated, created)
+        context.dispatcher.wake()
+        result = {"no_op": False, "workflow": dump(created), "incident": dump(updated)}
 elif payload["mode"] == "submit":
     incident, workflow = load(payload["incident_id"])
     expected = payload["expected"]
@@ -177,7 +272,7 @@ class SubmitRemediationRequest:
     plan_only: bool = False
 
     def __post_init__(self) -> None:
-        if self.disposition not in DISPOSITION_ACTIONS:
+        if self.disposition not in DISPOSITIONS:
             raise BootstrapError(
                 f"unknown disposition {self.disposition!r}; choose one of "
                 + ", ".join(DISPOSITIONS)
@@ -235,9 +330,51 @@ class RemediationPlan:
         }
 
 
+@dataclass(frozen=True)
+class RestorePlan:
+    """The validated restore ``--disposition restore`` will create, derived
+    from the QUARANTINED incident record and the live nodes.
+
+    ``steps`` are the exact steps the product builder yields (operation,
+    owner, nodes, GPU scope); the request id is minted in the Pod at submit
+    time. ``existing_restore_workflow_id`` is set when such a workflow is
+    already PENDING/RUNNING under the incident: the rerun is a no-op.
+    """
+
+    incident_id: str
+    cluster_id: str
+    node_ids: tuple[str, ...]
+    gpu_uuids: tuple[str, ...]
+    fencing_token: int
+    workflow_request_id: str
+    state: str
+    reason: str
+    steps: tuple[dict[str, Any], ...]
+    existing_restore_workflow_id: str | None = None
+    warnings: tuple[str, ...] = ()
+    disposition: str = DISPOSITION_RESTORE
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "incident_id": self.incident_id,
+            "cluster_id": self.cluster_id,
+            "disposition": self.disposition,
+            "node_ids": list(self.node_ids),
+            "gpu_uuids": list(self.gpu_uuids),
+            "fencing_token": self.fencing_token,
+            "workflow_request_id": self.workflow_request_id,
+            "state": self.state,
+            "reason": self.reason,
+            "steps": [dict(item) for item in self.steps],
+            "existing_restore_workflow_id": self.existing_restore_workflow_id,
+            "next_operations": [str(item["operation"]) for item in self.steps],
+            "warnings": list(self.warnings),
+        }
+
+
 @dataclass
 class SubmissionResult:
-    plan: RemediationPlan
+    plan: RemediationPlan | RestorePlan
     acknowledgement: dict[str, Any] = field(default_factory=dict)
     submission: dict[str, Any] | None = None
     no_op: bool = False
@@ -642,6 +779,257 @@ def build_remediation_plan(
 
 
 # --------------------------------------------------------------------------
+# restore: the validated restore of a QUARANTINED incident
+
+
+def _quarantine_taint(node: Mapping[str, Any]) -> str | None:
+    spec = node.get("spec")
+    if not isinstance(spec, dict):
+        return None
+    for item in spec.get("taints") or []:
+        if isinstance(item, dict) and item.get("key") == QUARANTINE_TAINT:
+            return str(item.get("value") or "")
+    return None
+
+
+def _node_annotations(node: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = cast(dict[str, Any], node.get("metadata") or {})
+    return dict(metadata.get("annotations") or {})
+
+
+def _validate_restore_record(
+    inspection: Mapping[str, Any],
+    *,
+    incident_id: str,
+    live_nodes: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    """The restore preconditions, all before any write.
+
+    Returns the incident, its last workflow and the id of a validated restore
+    workflow already open under it (the idempotent rerun), or raises the
+    first refusal: not QUARANTINED; another workflow still open; a node
+    missing from the cluster, without the quarantine taint, or quarantined by
+    another incident (named); incident and workflow fencing tokens differing
+    (a stale generation the node's annotation would reject).
+    """
+
+    incident = cast(dict[str, Any] | None, inspection.get("incident"))
+    workflow = cast(dict[str, Any] | None, inspection.get("workflow"))
+    if incident is None:
+        raise BootstrapError(f"incident {incident_id} was not returned")
+    if str(incident.get("incident_id")) != incident_id:
+        raise BootstrapError("the control plane returned a different incident")
+    state = str(incident.get("state"))
+    if state != QUARANTINED_STATE:
+        raise BootstrapError(
+            f"incident {incident_id} is {state}, not {QUARANTINED_STATE}; "
+            f"{DISPOSITION_RESTORE} applies to a quarantined node only"
+        )
+    if workflow is None:
+        raise BootstrapError(
+            f"incident {incident_id} has no workflow; the quarantine it records "
+            "was not placed by this product"
+        )
+    if workflow.get("request_id") != incident.get("workflow_request_id"):
+        raise BootstrapError(
+            f"incident {incident_id} points at workflow "
+            f"{incident.get('workflow_request_id')} but "
+            f"{workflow.get('request_id')} was returned"
+        )
+    if int(workflow.get("fencing_token") or 0) != int(
+        incident.get("fencing_token") or 0
+    ):
+        raise BootstrapError(
+            f"stale generation: incident fencing token {incident.get('fencing_token')} "
+            f"differs from workflow {workflow.get('fencing_token')}"
+        )
+    node_ids = [str(item) for item in incident.get("node_ids") or []]
+    if not node_ids:
+        raise BootstrapError(f"incident {incident_id} names no nodes")
+    open_rows = (
+        [dict(workflow)] if workflow.get("status") in OPEN_WORKFLOW_STATUSES else []
+    )
+    for item in inspection.get("open_workflows") or []:
+        if isinstance(item, dict) and item.get("request_id") != workflow.get(
+            "request_id"
+        ):
+            open_rows.append(item)
+    existing = [
+        str(item.get("request_id"))
+        for item in open_rows
+        if is_validated_restore_workflow(str(item.get("request_id") or ""))
+    ]
+    if existing:
+        return incident, workflow, existing[0]
+    if open_rows:
+        raise BootstrapError(
+            f"incident {incident_id} still has an open workflow "
+            + ", ".join(
+                f"{item.get('request_id')} ({item.get('status')})" for item in open_rows
+            )
+            + "; wait for it to end or reconcile it first"
+        )
+    missing = sorted(set(node_ids) - set(live_nodes))
+    if missing:
+        raise BootstrapError(
+            f"incident nodes are missing from cluster {incident['cluster_id']}: "
+            + ", ".join(missing)
+        )
+    owned = owned_quarantine_taint_values(incident_id)
+    for node_id in node_ids:
+        node = live_nodes[node_id]
+        annotations = _node_annotations(node)
+        owner = annotations.get(ANNOTATION_INCIDENT)
+        taint = _quarantine_taint(node)
+        if owner and str(owner) != incident_id:
+            raise BootstrapError(
+                f"node {node_id} is isolated by incident {owner}, not {incident_id}"
+            )
+        if taint is None:
+            raise BootstrapError(
+                f"node {node_id} carries no {QUARANTINE_TAINT} taint; there is no "
+                f"isolation of {incident_id} to restore -- close the incident with "
+                "gpu-fault-admin workflow-reconcile --close-incident instead"
+            )
+        if taint not in owned:
+            # No incident-id annotation named another owner above, so the
+            # taint value is all that identifies who placed it.
+            raise BootstrapError(
+                f"node {node_id} is quarantined by another incident (taint {taint}), "
+                f"not {incident_id}"
+            )
+    return incident, workflow, None
+
+
+def build_restore_plan(
+    inspection: Mapping[str, Any],
+    *,
+    incident_id: str,
+    operator: str,
+    reference: str | None,
+    live_nodes: Mapping[str, Mapping[str, Any]],
+    now: datetime | None = None,
+) -> RestorePlan:
+    """Turn the QUARANTINED record into the restore it will get, or refuse."""
+
+    stamp = now or _utc_now()
+    incident, workflow, existing = _validate_restore_record(
+        inspection, incident_id=incident_id, live_nodes=live_nodes
+    )
+    record = FaultIncident.model_validate(incident)
+    _, preview = build_validated_restore_workflow(
+        record, operator=operator, reference=reference, now=stamp
+    )
+    return RestorePlan(
+        incident_id=incident_id,
+        cluster_id=str(incident["cluster_id"]),
+        node_ids=tuple(str(item) for item in incident["node_ids"]),
+        gpu_uuids=tuple(str(item) for item in incident.get("gpu_uuids") or []),
+        fencing_token=int(incident["fencing_token"]),
+        workflow_request_id=str(workflow["request_id"]),
+        state=str(incident["state"]),
+        reason=restore_reason(operator, reference),
+        steps=tuple(
+            {
+                "operation": step.operation.value,
+                "execution_owner": step.execution_owner,
+                "node_ids": list(step.node_ids),
+                "gpu_uuids": list(step.gpu_uuids),
+            }
+            for step in preview.official_steps
+        ),
+        existing_restore_workflow_id=existing,
+    )
+
+
+def submit_restore(
+    site: RenderedSite,
+    plan: RestorePlan,
+    *,
+    operator: str,
+    reference: str | None,
+) -> dict[str, Any]:
+    """Create the restore workflow in the Pod, re-checking the record first."""
+
+    return run_control_plane_script(
+        site,
+        {
+            "mode": "restore",
+            "incident_id": plan.incident_id,
+            "expected": {
+                "fencing_token": plan.fencing_token,
+                "workflow_request_id": plan.workflow_request_id,
+                "state": plan.state,
+                "node_ids": sorted(plan.node_ids),
+            },
+            "operator": operator,
+            "reference": reference,
+            "runtime_profile_version": str(
+                site.release_config["runtime_profile"]["version"]
+            ),
+        },
+        script=REMEDIATION_SCRIPT,
+    )
+
+
+def _submit_restore(
+    request: SubmitRemediationRequest, *, now: Callable[[], datetime]
+) -> SubmissionResult:
+    site = request.site
+    stamp = now()
+    operator = resolve_operator_identity()
+    inspection = inspect_incident(
+        site, request.incident_id, disposition=request.disposition
+    )
+    incident = cast(dict[str, Any], inspection.get("incident") or {})
+    live_nodes = cluster_nodes(site, str(incident.get("cluster_id") or ""))
+    plan = build_restore_plan(
+        inspection,
+        incident_id=request.incident_id,
+        operator=operator,
+        reference=request.reference,
+        live_nodes=live_nodes,
+        now=stamp,
+    )
+    result = SubmissionResult(plan=plan)
+    operations = " -> ".join(str(item["operation"]) for item in plan.steps)
+    if request.plan_only:
+        result.message = (
+            f"plan only; nothing was written (would create {operations} under "
+            f"incident {plan.incident_id}, fencing token {plan.fencing_token})"
+        )
+        return result
+    if plan.existing_restore_workflow_id:
+        result.no_op = True
+        result.message = (
+            f"restore workflow {plan.existing_restore_workflow_id} is already open "
+            f"under incident {plan.incident_id}; nothing to do"
+        )
+        record_submission(site, result, now=stamp)
+        return result
+    submission = submit_restore(
+        site, plan, operator=operator, reference=request.reference
+    )
+    result.submission = submission
+    workflow = cast(dict[str, Any], submission.get("workflow") or {})
+    if submission.get("no_op"):
+        result.no_op = True
+        result.message = (
+            f"restore workflow {workflow.get('request_id')} is already open under "
+            f"incident {plan.incident_id}; nothing to do"
+        )
+    else:
+        result.message = (
+            f"workflow {workflow.get('request_id')} (fencing token "
+            f"{workflow.get('fencing_token')}, {workflow.get('status')}) runs "
+            f"{operations}; incident {plan.incident_id} is now "
+            f"{(submission.get('incident') or {}).get('state')}"
+        )
+    record_submission(site, result, now=stamp)
+    return result
+
+
+# --------------------------------------------------------------------------
 # Writes
 
 
@@ -772,8 +1160,11 @@ def submit_remediation(
     *,
     now: Callable[[], datetime] = _utc_now,
 ) -> SubmissionResult:
-    """Inspect, validate, acknowledge and (for hardware dispositions) submit."""
+    """Inspect, validate, acknowledge and (for hardware dispositions) submit;
+    ``restore`` inspects, validates and creates the validated restore."""
 
+    if request.disposition == DISPOSITION_RESTORE:
+        return _submit_restore(request, now=now)
     site = request.site
     stamp = now()
     inspection = inspect_incident(
@@ -864,7 +1255,8 @@ def add_submit_remediation_command(
         help=(
             "acknowledge a CHECK_MECHANICALS inspection and, for a hardware "
             "disposition, submit the operator marker and terminal trigger built "
-            "from the incident record"
+            "from the incident record; restore: create the validated restore of "
+            "a QUARANTINED incident whose node was repaired by hand"
         ),
     )
     add_managed_site_arguments(command)
@@ -872,7 +1264,10 @@ def add_submit_remediation_command(
         "--incident-id",
         required=True,
         metavar="INCIDENT_ID",
-        help="the incident whose workflow is waiting on CHECK_MECHANICALS",
+        help=(
+            "the incident whose workflow is waiting on CHECK_MECHANICALS, or "
+            "(restore) the QUARANTINED incident that owns the node's isolation"
+        ),
     )
     command.add_argument(
         "--disposition",
@@ -880,7 +1275,9 @@ def add_submit_remediation_command(
         choices=DISPOSITIONS,
         help=(
             "inspected: inspection complete, no hardware action; reset-gpu, "
-            "reboot-node, quarantine: compile a new fenced workflow for that action"
+            "reboot-node, quarantine: compile a new fenced workflow for that action; "
+            "restore: VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> "
+            "RESTORE_SCHEDULING under the same QUARANTINED incident"
         ),
     )
     command.add_argument(

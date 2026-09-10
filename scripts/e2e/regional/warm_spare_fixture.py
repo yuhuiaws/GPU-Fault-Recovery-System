@@ -259,19 +259,20 @@ print(json.dumps(record.model_dump(mode="json"), sort_keys=True, default=str))
 """
 
 
+# The workflow itself comes from the product
+# (``gpu_fault.orchestration.validated_restore``), the same builder
+# ``gpu-fault-admin submit-remediation --disposition restore`` uses, so the
+# fixture cannot drift from what an operator gets. argv and the printed keys
+# are the fixture's contract and stay as they were.
 CREATE_RESTORE_WORKFLOW = r"""
 import json
 import sys
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import (
-    IncidentState,
-    WorkflowOperation,
-    WorkflowRequest,
-    WorkflowStatus,
-    WorkflowStepSpec,
+from gpu_fault.models import WorkflowStatus
+from gpu_fault.orchestration.validated_restore import (
+    build_validated_restore_workflow,
 )
 
 incident_id, node_id, profile_version, reason = sys.argv[1:]
@@ -287,41 +288,14 @@ if incident.workflow_request_id:
     }:
         raise RuntimeError("incident still has an active workflow")
 now = datetime.now(timezone.utc)
-workflow = WorkflowRequest(
-    request_id=f"workflow-validated-restore-{uuid4()}",
-    incident_id=incident.incident_id,
+incident, workflow = build_validated_restore_workflow(
+    incident,
+    operator="acceptance-fixture",
+    reference=None,
+    now=now,
+    node_ids=[node_id],
     runtime_profile_version=profile_version,
-    status=WorkflowStatus.PENDING,
-    official_action="RESTORE_SCHEDULING",
-    fencing_token=incident.fencing_token,
-    official_steps=[
-        WorkflowStepSpec(
-            operation=operation,
-            execution_owner=(
-                "gpu-fault-kubernetes-adapter"
-                if operation is WorkflowOperation.RESTORE_SCHEDULING
-                else "gpu-fault-validation-adapter"
-            ),
-            node_ids=[node_id],
-        )
-        for operation in (
-            WorkflowOperation.VALIDATE_GPU,
-            WorkflowOperation.VALIDATE_HOST,
-            WorkflowOperation.VALIDATE_FABRIC,
-            WorkflowOperation.RESTORE_SCHEDULING,
-        )
-    ],
-    created_at=now,
-    updated_at=now,
-)
-incident = incident.model_copy(
-    update={
-        "state": IncidentState.ACTION_PENDING,
-        "node_ids": sorted(set(incident.node_ids) | {node_id}),
-        "workflow_request_id": workflow.request_id,
-        "reasons": [*incident.reasons, reason],
-        "updated_at": now,
-    }
+    reason=reason,
 )
 store.save_incident_and_workflow(incident, workflow)
 context.dispatcher.wake()

@@ -34,6 +34,21 @@ slice through ``gpu_fault_workflow_updated_all``. And the other whole-kind
 aggregates a scrape used to run every time (orphan inspection, notification
 outbox, remote-command backlog, spool depth) go through :meth:`shared` so they
 too cost one read per TTL.
+
+The workflow detail scan is windowed, not merely capped. A "newest N" slice
+grows with audit history: once the table holds more terminal rows than the
+budget -- a removed rule's residue, retention that has not run yet -- the scan
+is truncated on every scrape although nothing operational changed, and the
+alert on that truncation says "storm" about a quiet fleet. The scan therefore
+reads every open workflow whatever its age, plus the terminal workflows whose
+``updated_at`` falls inside ``GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS``
+(default seven days; ``0`` disables the window and reads the newest rows up to
+the budget). The budget stays the hard cap on that union, and ``truncated``
+means the cap cut rows *inside* the window or the open set -- more workflows
+open or updated within the window than the budget -- never that old terminal
+rows fell outside it. The step, duration and milestone families are recomputed
+from the slice on every scrape, so the window is also their population: they
+describe the last seven days of closed loops, not the lifetime table.
 """
 
 from __future__ import annotations
@@ -41,6 +56,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any, Callable, TypeVar, cast
 
@@ -65,11 +81,17 @@ TERMINAL_WORKFLOW_STATUSES: frozenset[WorkflowStatus] = frozenset(
 
 @dataclass(frozen=True)
 class WorkflowScan:
-    """A bounded slice of the workflow table plus what it left out."""
+    """A bounded slice of the workflow table plus what it left out.
+
+    ``window_seconds`` is the recency bound on terminal rows (0 = none);
+    ``truncated`` is set only when ``limit`` cut rows inside that window or the
+    open set, never because older terminal rows fell outside it.
+    """
 
     workflows: tuple[Any, ...]
     limit: int
     truncated: bool
+    window_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +117,13 @@ def workflow_scan_limit_from_env() -> int:
     )
 
 
+def workflow_scan_window_seconds_from_env() -> int:
+    return max(
+        0,
+        int(os.getenv("GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS", "604800")),
+    )
+
+
 def observation_scan_limit_from_env() -> int:
     return max(
         1,
@@ -108,13 +137,20 @@ class MetricScanCache:
         store: Any,
         *,
         workflow_limit: int | None = None,
+        workflow_window_seconds: int | None = None,
         observation_limit: int | None = None,
         ttl_seconds: float | None = None,
         monotonic: Callable[[], float] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self.workflow_limit = (
             workflow_scan_limit_from_env() if workflow_limit is None else workflow_limit
+        )
+        self.workflow_window_seconds = (
+            workflow_scan_window_seconds_from_env()
+            if workflow_window_seconds is None
+            else max(0, workflow_window_seconds)
         )
         self.observation_limit = (
             observation_scan_limit_from_env()
@@ -125,6 +161,7 @@ class MetricScanCache:
             scan_ttl_seconds_from_env() if ttl_seconds is None else ttl_seconds
         )
         self._monotonic = monotonic or time.monotonic
+        self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
         self._entries: dict[str, tuple[float, Any]] = {}
 
@@ -148,33 +185,33 @@ class MetricScanCache:
         return self._cached("workflows", self._read_workflows)
 
     def _read_workflows(self) -> WorkflowScan:
-        # Two bounded slices rather than one all-status read (G-2). The open
-        # slice is what the step-waiting, overdue and budget families describe
-        # and is small by construction; the terminal slice is newest-first so
+        # One store call, two index range scans inside it (G-2): every open
+        # workflow whatever its age -- the step-waiting, overdue and budget
+        # families describe those and the set is small by construction -- then
+        # the terminal workflows updated inside the window, newest first, so
         # the duration and milestone summaries keep describing recent history
-        # -- GpuFaultClosedLoopSlow takes a 6 h delta over them. One row over
-        # the budget is requested on each so truncation is observed rather than
+        # (GpuFaultClosedLoopSlow takes a 6 h delta over them) without the read
+        # growing with the terminal rows retention has yet to reclaim. One row
+        # over the budget is requested so truncation is observed rather than
         # inferred from a full page, which cannot distinguish "exactly the
-        # limit" from "more than the limit".
+        # limit" from "more than the limit"; because the store only returns
+        # rows inside the window or the open set, an over-full page means the
+        # cap cut something that belonged in the census.
         limit = self.workflow_limit
-        open_rows = list(
-            self._store.list_workflows(
+        window = self.workflow_window_seconds
+        updated_since = None if window <= 0 else self._now() - timedelta(seconds=window)
+        rows = list(
+            self._store.list_recent_workflows(
                 set(OPEN_WORKFLOW_STATUSES),
+                updated_since=updated_since,
                 limit=limit + 1,
-                newest_first=True,
-            )
-        )
-        terminal_rows = list(
-            self._store.list_workflows(
-                set(TERMINAL_WORKFLOW_STATUSES),
-                limit=limit + 1,
-                newest_first=True,
             )
         )
         return WorkflowScan(
-            workflows=(*open_rows[:limit], *terminal_rows[:limit]),
+            workflows=tuple(rows[:limit]),
             limit=limit,
-            truncated=len(open_rows) > limit or len(terminal_rows) > limit,
+            truncated=len(rows) > limit,
+            window_seconds=window,
         )
 
     def shared(self, key: str, produce: Callable[[], T]) -> T:

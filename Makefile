@@ -153,6 +153,7 @@ POSTGRES_TESTS = \
 	tests/store/test_store_contracts.py \
 	tests/store/test_store_error_classification.py \
 	tests/store/test_store_migrate.py \
+	tests/store/test_workflow_recent_scan.py \
 	tests/store/test_workflow_scan_cursor.py \
 	tests/store/test_workflow_scan_pushdown.py \
 	tests/store/test_workflow_scan_whole_second.py \

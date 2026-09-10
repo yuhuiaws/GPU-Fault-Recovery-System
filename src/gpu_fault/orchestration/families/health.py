@@ -16,11 +16,58 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkloadState,
+    bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
+
+#: ``NodeHealthPolicy._sustained_rule`` stamps every sustained host-resource
+#: finding with this source; its event id is
+#: ``<batch>-<metric_name>-<device|node>-<rule_id lower>`` and the rule id
+#: travels in ``diagnostic_parameters["signal"]``.
+HOST_RESOURCE_POLICY_SOURCE = "SITE_HOST_RESOURCE_HEALTH"
+
+#: An incident in one of these states has not been settled: ACTION_PENDING
+#: means its diagnostic is queued or running, ESCALATED means the diagnostic
+#: ended and an operator owns the close. RECOVERED is an operator's close
+#: and QUARANTINED a hand-off; a finding after either rightly opens anew.
+UNSETTLED_INCIDENT_STATES = frozenset(
+    {IncidentState.ACTION_PENDING, IncidentState.ESCALATED}
+)
+
+
+def host_resource_signal(finding: NodeHealthFinding) -> tuple[str, str] | None:
+    """``(metric_name, rule_id)`` of a sustained host-resource finding, or
+    ``None`` for any other finding."""
+
+    if finding.policy_source != HOST_RESOURCE_POLICY_SOURCE:
+        return None
+    rule_id = finding.diagnostic_parameters.get("signal")
+    if not finding.metric_name or not isinstance(rule_id, str) or not rule_id:
+        return None
+    return finding.metric_name, rule_id
+
+
+def incident_opened_by_host_resource_signal(
+    incident: FaultIncident, metric_name: str, rule_id: str
+) -> bool:
+    """Whether ``incident`` was minted by a sustained host-resource finding of
+    ``metric_name`` + ``rule_id``, on any device.
+
+    The incident does not carry the signal; its ``event_id`` is the finding's,
+    ``<batch>-<metric_name>-<device|node>-<rule_id lower>``. Batch ids and
+    devices may themselves contain hyphens, so the match is "ends with the
+    rule" and "names the metric before it" rather than a positional split.
+    """
+
+    if incident.policy_source != HOST_RESOURCE_POLICY_SOURCE:
+        return False
+    suffix = f"-{rule_id.lower()}"
+    if not incident.event_id.endswith(suffix):
+        return False
+    return f"-{metric_name}-" in incident.event_id[: -len(suffix)]
 
 
 @dataclass(frozen=True)
@@ -38,6 +85,10 @@ class NodeHealthCallbacks:
     preemption_scope_matches: Callable
     prepare_preempting_successor: Callable
     sample_hung_triage_nodes: Callable
+    # Counts a sustained host-resource finding recorded on an unsettled
+    # same-signal incident instead of minting its own (record-only
+    # accounting, ``gpu_fault_workflow_merge_record_only_total``).
+    record_host_resource_absorb: Callable[[], None]
 
 
 @dataclass
@@ -742,6 +793,11 @@ class NodeHealthIngestionService:
                 finding.event_id,
                 existing.workflow_request_id,
             )
+        absorbed = self._absorb_into_unsettled_host_resource_incident(
+            finding, persist=persist
+        )
+        if absorbed is not None:
+            return absorbed
         covered = self.callbacks.active_workflow_covers_inventory_finding(finding)
         if covered is not None:
             incident, workflow = covered
@@ -791,6 +847,87 @@ class NodeHealthIngestionService:
         except NotFoundError:
             return None
         return workflow
+
+    def _absorb_into_unsettled_host_resource_incident(
+        self,
+        finding: NodeHealthFinding,
+        *,
+        persist: bool,
+    ) -> tuple[FaultIncident, WorkflowRequest | None] | None:
+        """Record a sustained host-resource finding on the node's unsettled
+        same-signal incident instead of minting another.
+
+        The signal is tracked per GPU device on purpose (several jobs may
+        share a node), so one activation of an 8-GPU node yields eight
+        findings and every re-arm yields eight more. Each used to mint its
+        own ``inc-<event_id>`` plus a RUN_DIAGNOSTICS workflow; once the
+        diagnostic failed the incident parked ESCALATED and the next finding
+        minted the next one -- 42 ESCALATED incidents on one node in a day,
+        each running ``dcgmi diag`` on it. While an incident for the same
+        cluster + node + metric + rule is ACTION_PENDING (diagnostic queued or
+        running) or ESCALATED (operator owns the close), a further finding
+        is linked to it with one bounded reason and nothing is scheduled.
+        """
+
+        signal = host_resource_signal(finding)
+        if signal is None:
+            return None
+        metric_name, rule_id = signal
+        incident = next(
+            (
+                candidate
+                for candidate in self.store.list_incidents_by_state(
+                    finding.cluster_id,
+                    UNSETTLED_INCIDENT_STATES,
+                    node_ids={finding.node_id},
+                )
+                if incident_opened_by_host_resource_signal(
+                    candidate, metric_name, rule_id
+                )
+            ),
+            None,
+        )
+        if incident is None:
+            return None
+        workflow = (
+            self._workflow_if_present(incident.workflow_request_id)
+            if incident.workflow_request_id
+            else None
+        )
+        if not persist:
+            return incident, workflow
+        disposition = (
+            "incident awaits operator"
+            if incident.state is IncidentState.ESCALATED
+            else "diagnostic already in flight"
+        )
+        reason = (
+            f"absorbed {rule_id} finding {finding.event_id} on device "
+            f"{finding.device or 'node'}: recorded only, {disposition}"
+        )
+        updated = incident.model_copy(
+            update={
+                "reasons": bounded_reasons([*incident.reasons, reason]),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        # Compare-and-set on the copy read above (ARCH-D1): a concurrent
+        # state change raises ``StaleWriteError`` out of the ingest and the
+        # data plane re-posts the batch against a fresh read.
+        self.store.save_incident(
+            updated, expected=incident, extra_event_ids=[finding.event_id]
+        )
+        self.callbacks.record_host_resource_absorb()
+        LOGGER.info(
+            "absorbed %s finding %s on %s/%s into unsettled incident %s (%s)",
+            rule_id,
+            finding.event_id,
+            finding.node_id,
+            finding.device or "node",
+            incident.incident_id,
+            incident.state.value,
+        )
+        return updated, workflow
 
     def _finalize(
         self,

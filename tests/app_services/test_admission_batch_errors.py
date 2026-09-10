@@ -40,6 +40,15 @@ def test_a_retryable_store_error_becomes_a_capacity_rejection():
 
     with pytest.raises(StoreIoCapacityExceeded):
         _submit_one(batcher, SimpleNamespace(cluster_id="a", path="/v1/x"))
+    # The executor never saw a rejection of its own (the batch ran), so the
+    # wrap has to count itself -- and as the writer answering with a retryable
+    # error, not as the lane being full.
+    assert executor.rejected_by_reason == {
+        "backend_unavailable": 1,
+        "capacity": 0,
+        "deadline": 0,
+    }
+    assert executor.rejected_total == 1
     executor.close()
 
 

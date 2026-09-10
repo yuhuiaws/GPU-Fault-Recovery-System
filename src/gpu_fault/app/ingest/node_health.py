@@ -132,8 +132,13 @@ class NodeHealthIngestionService:
                     finding.metric_name,
                     tuple(sorted(finding.affected_workload_ids)),
                 )
+                # ``opened``: this finding minted (or re-posted) the incident
+                # it came back with. A finding the health family absorbed into
+                # an unsettled same-signal incident comes back with that
+                # incident's event id instead.
+                opened = incident.event_id == finding.event_id
                 host_resource_notification_groups.setdefault(group_key, []).append(
-                    (incident, finding)
+                    (incident, finding, opened)
                 )
             elif (
                 finding.category is NodeHealthCategory.RDMA
@@ -147,9 +152,18 @@ class NodeHealthIngestionService:
                 self.context.advisory_notifications.send(notification.notification_id)
                 notifications.append(notification.notification_id)
         for grouped in host_resource_notification_groups.values():
-            incident, representative = grouped[0]
+            opened_entries = [entry for entry in grouped if entry[2]]
+            if not opened_entries:
+                # Every device finding in this group was recorded on an
+                # incident that is still ESCALATED / ACTION_PENDING for the
+                # same signal: the operator was mailed when it opened and
+                # nothing new has been decided since, so a re-arm mails
+                # nothing. Notifications are per incident, not per finding
+                # (GF-REGIONAL-NOTIFY-005 counts per node, not per GPU).
+                continue
+            incident, representative, _ = opened_entries[0]
             devices = sorted(
-                {finding.device for _, finding in grouped if finding.device}
+                {finding.device for _, finding, _ in grouped if finding.device}
             )
             aggregate = representative.model_copy(
                 update={

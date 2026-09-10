@@ -391,6 +391,10 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         ("covered_read_only", "absorbed_record_only_total"),
         ("lifetime_exceeded", "lifetime_record_only_total"),
         ("workload_withdrawn", "withdrawn_record_only_total"),
+        (
+            "unsettled_host_resource_incident",
+            "unsettled_host_resource_record_only_total",
+        ),
     ):
         value = getattr(merger, attribute, 0) if merger is not None else 0
         lines.append(
@@ -1272,13 +1276,22 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             "and milestone families are allowed to read per scrape.",
             "# TYPE gpu_fault_workflow_scan_limit gauge",
             f"gpu_fault_workflow_scan_limit {scan.limit}",
+            "# HELP gpu_fault_workflow_scan_window_seconds Recency window on "
+            "terminal workflows for the step, duration and milestone families: "
+            "open workflows are always read, terminal ones only when updated "
+            "within this many seconds; 0 means no window, newest rows up to "
+            "the limit.",
+            "# TYPE gpu_fault_workflow_scan_window_seconds gauge",
+            f"gpu_fault_workflow_scan_window_seconds {scan.window_seconds}",
             "# HELP gpu_fault_workflow_scan_size Workflows actually read for "
             "the step, duration and milestone families.",
             "# TYPE gpu_fault_workflow_scan_size gauge",
             f"gpu_fault_workflow_scan_size {len(workflows)}",
-            "# HELP gpu_fault_workflow_scan_truncated Set when the workflow "
-            "table is larger than the scan budget, so the step, duration and "
-            "milestone families describe only the newest slice.",
+            "# HELP gpu_fault_workflow_scan_truncated Set when more workflows "
+            "are open or were updated inside the scan window than the scan "
+            "budget, so the step, duration and milestone families describe "
+            "only part of that set; terminal rows older than the window do "
+            "not count.",
             "# TYPE gpu_fault_workflow_scan_truncated gauge",
             f"gpu_fault_workflow_scan_truncated {int(scan.truncated)}",
             "# HELP gpu_fault_workflow_step_total Persisted workflow step outcomes.",

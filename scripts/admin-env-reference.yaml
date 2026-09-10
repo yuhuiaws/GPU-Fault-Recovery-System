@@ -465,6 +465,10 @@ categories:
         description: "控制面 raw evidence 默认保留小时数。"
       - name: GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE
         description: "每节点 raw evidence 数量上限。"
+      - name: GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS
+        description: "/metrics 明细扫描中终态 workflow 的时间窗（秒）：非终态 workflow 不论多旧都读，终态只读 updated_at 在窗内的；step、duration、milestone 三族因此只描述窗内闭环。0 关闭窗口退回最新 N 行，会让 GpuFaultWorkflowMetricScanTruncated 随表大小而非在飞数量触发。"
+      - name: GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT
+        description: "/metrics 明细扫描的行数硬上限，作用于非终态与窗内终态的并集；超出即置 gpu_fault_workflow_scan_truncated。调大只是把成本转给 Aurora 和每次抓取，先处理制造 workflow 的源头。"
       - name: GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS
         description: "incident/workflow archive-first 保留天数；默认 0 = 关闭，永不归档删除。不直接设置：在 site.yaml 声明 spec.retention.controlRecordRetentionDays 后重跑 deploy --state-dir，只渲染进 control-worker。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI

@@ -122,7 +122,7 @@ def test_a_single_source_is_emitted_verbatim() -> None:
         "gpu_fault_store_io_admission_wait_seconds_sum 0.250000",
         "gpu_fault_store_io_admission_wait_seconds_count 3",
         "gpu_fault_store_io_admission_wait_seconds_max 0.100000",
-        'gpu_fault_store_io_rejections_total{process_id="4242"} 2',
+        'gpu_fault_store_io_rejections_total{reason="capacity"} 2',
     ]
 
     lines = process_metrics.pod_coherent_lines(source, environ={})

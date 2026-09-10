@@ -420,6 +420,11 @@ class _ProcessorAdmissionBatcher:
             if not isinstance(exc, StoreIoCapacityExceeded) and operation_should_retry(
                 exc
             ):
+                # The executor only counts the rejections it raises itself, so
+                # a failure wrapped here is counted here, under the reason the
+                # alert rules split on: the writer answered, briefly, with a
+                # retryable error -- not a full lane.
+                self.store_io.record_rejection("backend_unavailable")
                 error = StoreIoCapacityExceeded(
                     "PostgreSQL writer is temporarily unavailable"
                 )

@@ -5,6 +5,12 @@ and the closed-loop family needs the workflow table, so an unshared render reads
 the same rows several times on every scrape and grows with the fleet. These tests
 pin the sharing, the budget on the workflow read, and the requirement that a
 budget that is too small says so instead of quietly reporting a slice.
+
+The workflow read is windowed as well as capped: a "newest N" slice made the
+truncation gauge a function of audit history -- 19 699 terminal rows from a
+removed rule tripped the alert on a quiet fleet -- so the scan now reads every
+open workflow plus the terminal ones updated inside a recency window, and
+truncation means the cap cut rows inside that set.
 """
 
 from __future__ import annotations
@@ -17,7 +23,12 @@ from gpu_fault.app.builtin_metric_contributors import (
     closed_loop_metric_lines,
     orchestration_metric_lines,
 )
-from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
+from gpu_fault.app.metric_scan_cache import (
+    OPEN_WORKFLOW_STATUSES,
+    MetricScanCache,
+    metric_scan_cache,
+    workflow_scan_window_seconds_from_env,
+)
 from gpu_fault.models import WorkflowStatus
 from tests._builders import (
     attempt_observation,
@@ -40,6 +51,8 @@ class CountingStore:
         self.workflow_calls = 0
         self.observation_calls = 0
         self.workflow_limits: list[int] = []
+        self.workflow_open_statuses: list[frozenset] = []
+        self.workflow_since: list[datetime | None] = []
         self.observation_limits: list[int | None] = []
         self.observation_orders: list[bool] = []
         self._agents = [
@@ -57,13 +70,12 @@ class CountingStore:
         self.agent_calls += 1
         return list(self._agents)
 
-    def list_workflows(self, statuses=None, *, limit=100, newest_first=False) -> list:
+    def list_recent_workflows(self, open_statuses, *, updated_since, limit) -> list:
         self.workflow_calls += 1
         self.workflow_limits.append(limit)
-        rows = (
-            list(reversed(self._workflows)) if newest_first else list(self._workflows)
-        )
-        return rows[:limit]
+        self.workflow_open_statuses.append(frozenset(open_statuses))
+        self.workflow_since.append(updated_since)
+        return list(reversed(self._workflows))[:limit]
 
     def list_attempt_observation_states(
         self,
@@ -93,17 +105,17 @@ def test_repeated_reads_inside_one_ttl_cost_one_scan() -> None:
     cache.workflows()
     cache.workflows()
 
-    # One workflow scan is two bounded reads (open statuses, newest terminal;
-    # G-2), shared for the TTL like the agent read.
+    # One workflow scan is one store call (the store runs the two index range
+    # scans; G-2), shared for the TTL like the agent read.
     assert store.agent_calls == 1
-    assert store.workflow_calls == 2
+    assert store.workflow_calls == 1
 
     clock[0] = 11.0
     cache.agents()
     cache.workflows()
 
     assert store.agent_calls == 2
-    assert store.workflow_calls == 4
+    assert store.workflow_calls == 2
 
 
 def test_zero_ttl_disables_sharing_so_a_caller_can_demand_fresh_rows() -> None:
@@ -122,20 +134,58 @@ def test_workflow_scan_is_bounded_and_reports_its_truncation() -> None:
 
     scan = cache.workflows()
 
-    # One row past the budget is requested on each of the two slices (open
-    # statuses, then newest terminal; G-2), which is how truncation is observed
-    # instead of guessed from a full page. This fake ignores the status filter,
-    # so both slices see the same five rows and each is truncated to three.
-    assert store.workflow_limits == [4, 4]
-    assert len(scan.workflows) == 6
+    # One row past the budget is requested, which is how truncation is observed
+    # instead of guessed from a full page; the store only returns rows inside
+    # the window or the open set, so an over-full page means the cap cut rows
+    # that belonged in the census.
+    assert store.workflow_limits == [4]
+    assert len(scan.workflows) == 3
     assert scan.limit == 3
     assert scan.truncated is True
 
     cache.invalidate()
     within = MetricScanCache(store, workflow_limit=5, ttl_seconds=0.0).workflows()
 
-    assert len(within.workflows) == 10
+    assert len(within.workflows) == 5
     assert within.truncated is False
+
+
+def test_workflow_scan_passes_the_open_set_and_the_window_edge_to_the_store() -> None:
+    """The recency filter runs in the store, against a clock the cache owns."""
+
+    store = CountingStore(workflows=1)
+    cache = MetricScanCache(
+        store,
+        workflow_limit=10,
+        workflow_window_seconds=3600,
+        ttl_seconds=0.0,
+        now=lambda: NOW,
+    )
+
+    scan = cache.workflows()
+
+    assert store.workflow_open_statuses == [frozenset(OPEN_WORKFLOW_STATUSES)]
+    assert store.workflow_since == [NOW - timedelta(hours=1)]
+    assert scan.window_seconds == 3600
+
+
+def test_window_zero_places_no_recency_bound() -> None:
+    store = CountingStore(workflows=1)
+    cache = MetricScanCache(
+        store, workflow_limit=10, workflow_window_seconds=0, ttl_seconds=0.0
+    )
+
+    scan = cache.workflows()
+
+    assert store.workflow_since == [None]
+    assert scan.window_seconds == 0
+
+
+def test_workflow_scan_window_defaults_to_seven_days(monkeypatch) -> None:
+    monkeypatch.delenv("GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS", raising=False)
+    assert workflow_scan_window_seconds_from_env() == 7 * 24 * 3600
+    monkeypatch.setenv("GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS", "-5")
+    assert workflow_scan_window_seconds_from_env() == 0
 
 
 def test_observation_scan_is_shared_bounded_and_newest_first() -> None:
@@ -213,23 +263,40 @@ def test_a_runtime_without_a_cache_still_renders() -> None:
     assert len(cache.agents()) == 2
 
 
-def _persist_workflows(store, count: int) -> None:
+def _persist_workflows(
+    store,
+    count: int,
+    *,
+    status: WorkflowStatus = WorkflowStatus.SUCCEEDED,
+    updated_at: datetime = NOW,
+    prefix: str = "wf",
+) -> None:
     for index in range(count):
         incident = fault_incident(
-            incident_id=f"incident-{index}",
-            event_id=f"event-{index}",
+            incident_id=f"incident-{prefix}-{index}",
+            event_id=f"event-{prefix}-{index}",
             node_ids=[f"node-{index}"],
         )
         store.save_incident(incident)
         store.save_workflow(
             workflow_request(
-                request_id=f"wf-{index}",
+                request_id=f"{prefix}-{index}",
                 incident_id=incident.incident_id,
-                status=WorkflowStatus.SUCCEEDED,
-                created_at=NOW,
-                updated_at=NOW + timedelta(seconds=index),
+                status=status,
+                created_at=updated_at - timedelta(minutes=5),
+                updated_at=updated_at + timedelta(seconds=index),
             )
         )
+
+
+# The fixtures above are dated against ``NOW``; the closed-loop renders below
+# read the clock through the cache, so they are pinned an hour after it and
+# the seven-day default window never ages the fixture out.
+CLOCK = NOW + timedelta(hours=1)
+
+
+def _closed_loop_cache(store, **overrides) -> MetricScanCache:
+    return MetricScanCache(store, ttl_seconds=0.0, now=lambda: CLOCK, **overrides)
 
 
 def test_status_gauge_stays_exact_when_the_detail_scan_is_truncated() -> None:
@@ -244,8 +311,7 @@ def test_status_gauge_stays_exact_when_the_detail_scan_is_truncated() -> None:
     _persist_workflows(store, 5)
     context = ApplicationContext(store=store)
     runtime = SimpleNamespace(
-        context=context,
-        metric_scan_cache=MetricScanCache(store, workflow_limit=2, ttl_seconds=0.0),
+        context=context, metric_scan_cache=_closed_loop_cache(store, workflow_limit=2)
     )
 
     lines = closed_loop_metric_lines(runtime)
@@ -261,14 +327,96 @@ def test_untruncated_scan_publishes_a_zero_truncation_gauge() -> None:
     _persist_workflows(store, 2)
     context = ApplicationContext(store=store)
     runtime = SimpleNamespace(
-        context=context,
-        metric_scan_cache=MetricScanCache(store, workflow_limit=50, ttl_seconds=0.0),
+        context=context, metric_scan_cache=_closed_loop_cache(store, workflow_limit=50)
     )
 
     lines = closed_loop_metric_lines(runtime)
 
     assert "gpu_fault_workflow_scan_truncated 0" in lines
     assert "gpu_fault_workflow_scan_size 2" in lines
+    assert "gpu_fault_workflow_scan_window_seconds 604800" in lines
+
+
+def test_terminal_rows_older_than_the_window_leave_the_detail_scan() -> None:
+    """Audit history must not grow the scan or trip the truncation gauge.
+
+    Production on a quiet fleet: 19 699 SUCCEEDED rows from a removed rule
+    pushed a newest-N slice past its budget and held the alert up although
+    nothing was in flight. Old terminal rows are outside the census; the
+    status gauge still counts them.
+    """
+
+    store = build_store()
+    _persist_workflows(store, 30, updated_at=NOW - timedelta(days=10), prefix="old")
+    _persist_workflows(store, 2, updated_at=NOW, prefix="fresh")
+    runtime = SimpleNamespace(
+        context=ApplicationContext(store=store),
+        metric_scan_cache=_closed_loop_cache(store, workflow_limit=10),
+    )
+
+    lines = closed_loop_metric_lines(runtime)
+
+    assert 'gpu_fault_workflow_total{status="SUCCEEDED"} 32' in lines
+    assert "gpu_fault_workflow_scan_size 2" in lines
+    assert "gpu_fault_workflow_scan_truncated 0" in lines
+    # The duration summary is recomputed from the slice on every scrape, so
+    # its population is the window's: two terminal workflows, not thirty-two.
+    assert 'gpu_fault_workflow_duration_seconds_count{status="SUCCEEDED"} 2' in lines
+
+
+def test_open_rows_are_read_whatever_their_age() -> None:
+    store = build_store()
+    _persist_workflows(
+        store,
+        3,
+        status=WorkflowStatus.RUNNING,
+        updated_at=NOW - timedelta(days=30),
+        prefix="stuck",
+    )
+    _persist_workflows(store, 30, updated_at=NOW - timedelta(days=10), prefix="old")
+    cache = _closed_loop_cache(store, workflow_limit=10)
+
+    scan = cache.workflows()
+
+    assert sorted(item.request_id for item in scan.workflows) == [
+        "stuck-0",
+        "stuck-1",
+        "stuck-2",
+    ]
+    assert scan.truncated is False
+
+
+def test_window_zero_restores_the_newest_n_slice() -> None:
+    store = build_store()
+    _persist_workflows(store, 30, updated_at=NOW - timedelta(days=10), prefix="old")
+    _persist_workflows(store, 2, updated_at=NOW, prefix="fresh")
+    cache = _closed_loop_cache(store, workflow_limit=10, workflow_window_seconds=0)
+
+    scan = cache.workflows()
+
+    assert len(scan.workflows) == 10
+    assert scan.truncated is True
+    assert [item.request_id for item in scan.workflows[:2]] == ["fresh-1", "fresh-0"]
+    assert all(item.request_id.startswith("old-") for item in scan.workflows[2:]), (
+        "terminal rows inside the window must follow the open rows"
+    )
+
+
+def test_truncation_means_the_cap_cut_rows_inside_the_window() -> None:
+    """More workflows open or recently updated than the budget is a real storm."""
+
+    store = build_store()
+    _persist_workflows(store, 30, updated_at=NOW - timedelta(days=10), prefix="old")
+    _persist_workflows(store, 11, updated_at=NOW, prefix="fresh")
+    runtime = SimpleNamespace(
+        context=ApplicationContext(store=store),
+        metric_scan_cache=_closed_loop_cache(store, workflow_limit=10),
+    )
+
+    lines = closed_loop_metric_lines(runtime)
+
+    assert "gpu_fault_workflow_scan_size 10" in lines
+    assert "gpu_fault_workflow_scan_truncated 1" in lines
 
 
 def _persist_observations(store, count: int) -> None:

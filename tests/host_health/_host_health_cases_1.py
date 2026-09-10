@@ -373,7 +373,12 @@ def test_sustained_host_resource_risk_emits_once_and_rearms(
     monkeypatch.setenv("GPU_FAULT_MEMORY_PRESSURE_DURATION_SECONDS", "15")
     monkeypatch.setenv("GPU_FAULT_PAGE_CACHE_DURATION_SECONDS", "15")
     monkeypatch.setenv("GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS", "15")
-    policy = NodeHealthPolicy(build_store())
+    store = build_store()
+    # The low-utilization rules count only while a managed attempt is
+    # observed running on the node; the declared ACTIVE state alone is not
+    # enough. One observation covers the 75 s timeline below.
+    observe_running_attempt(store, NOW)
+    policy = NodeHealthPolicy(store)
 
     def batch(batch_id, metric_value, observed_at):
         return host_telemetry_batch(
@@ -707,6 +712,9 @@ def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
     notifier = RecordingNotifier()
     context = ApplicationContext(notification_notifier=notifier)
     clock = _IngestionClock(monkeypatch, NOW)
+    # A declared ACTIVE state is only a pre-filter; the rule counts while a
+    # managed attempt is observed running on the node.
+    observe_running_attempt(context.store, NOW)
 
     def batch(batch_id: str, observed_at: datetime):
         return host_telemetry_batch(
@@ -727,7 +735,7 @@ def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
                 ),
             ],
             workload_state="ACTIVE",
-            affected_workload_ids=["training/pytorchjob/train-a"],
+            affected_workload_ids=["training/job/job-a"],
         )
 
     async def scenario() -> None:
