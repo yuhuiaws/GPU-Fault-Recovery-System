@@ -5756,7 +5756,13 @@ test_cases:
   - 规则读 gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds、severity=critical、runbook 锚点存在于运维手册
   - 关窗后 Deployment env 与副本值精确回到基线（原本缺省则回到缺省），阈值秒内表达式变为 false
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 71d5f661cb5d662877fb34062e5602ad803eb98202e3d13881df970163f815d5
+      components:
+        control_plane: 7dd256f855728a13b82437a349b0d9f0b82105dcfb4a4e1ea6922963c4abf759
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-037调度循环判活
   related_pytest: tests/regional/test_preempt037_dispatcher_liveness.py::test_the_stall_timeline_contract_passes_when_the_expression_holds_for_the_rule_for
