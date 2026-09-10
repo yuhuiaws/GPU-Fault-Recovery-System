@@ -4571,7 +4571,13 @@ test_cases:
   - 空owner集合返回503且reason说明无法claim
   - 过旧claim年龄返回503且reason包含last successful claim
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: a2806d81cc7a11292eb578983e335599daccfe93054d2b11159177ae74b0378c
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-021
   related_pytest: tests/regional/test_regional_control_plane.py::test_executor_readiness_rejects_an_executor_that_cannot_claim
@@ -4588,7 +4594,13 @@ test_cases:
   - 已存在快照同版本不同内容被拒绝，不允许覆盖
   - gpu-training-submit与gpu-fault-workload-annotate使用site版本，显式不一致时拒绝
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 51540f4330856795858d248360ad1c262369625903b8dd3bff043b69e38da56a
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-022
   execution:
@@ -5622,7 +5634,13 @@ test_cases:
   - 硬件升级分类为 lifetime_exceeded → ESCALATE_SUPPORT，不再 reboot/replace
   - 到点后的同节点事件落在同一 incident 与同一 workflow 上，不产生新的 PENDING/RUNNING 工作流
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8d00db1e6deff541efebd5c65f50cd9b9f0a33fdf8776490cdf9b021de5e343f
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-032工作流生命周期硬截止
   execution:
@@ -5656,7 +5674,13 @@ test_cases:
   - RESTART_WORKLOAD 作废，工作流 SUPERSEDED，preemption_reason 含 stop
   - incident RECOVERED
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8858c2a051b4a11c2cee52fe7f3fc2129944f67083eb6d7fe7dc3a50ed9c07f3
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-033作业被外部停止后工作流收口
   execution:
@@ -5712,7 +5736,13 @@ test_cases:
   - 超时路径：STOP 执行且带发起者标记，工作流 FAILED、incident ESCALATED，node_busy_timeouts_total 计 1
   - 两条路径中节点自己的工作流保持 RUNNING、持有者不变
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f170797fbc4d9565847a74ab6d2d10c4e74293898e975516d858a304a4244e55
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-035新作业被观察到落在修复中节点的安置保留
   execution:

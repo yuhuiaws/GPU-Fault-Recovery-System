@@ -7,6 +7,8 @@
   "verdict_counts": {},
   "pass_case_bindings": {
     "bound": [
+      "GF-REGIONAL-BOOT-021",
+      "GF-REGIONAL-BOOT-022",
       "GF-REGIONAL-BOOT-023",
       "GF-REGIONAL-CMD-017",
       "GF-REGIONAL-CMD-018",
@@ -52,6 +54,9 @@
       "GF-REGIONAL-NOTIFY-005",
       "GF-REGIONAL-NOTIFY-006",
       "GF-REGIONAL-NOTIFY-007",
+      "GF-REGIONAL-PREEMPT-032",
+      "GF-REGIONAL-PREEMPT-033",
+      "GF-REGIONAL-PREEMPT-035",
       "GF-REGIONAL-PREEMPT-037",
       "GF-REGIONAL-PREEMPT-038"
     ],
