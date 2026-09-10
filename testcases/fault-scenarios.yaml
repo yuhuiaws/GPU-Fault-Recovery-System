@@ -4286,7 +4286,13 @@ test_cases:
   - validated restore 工作流 SUCCEEDED；节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；watchdog 在 watcher 真机恢复成功之后才解除
   - 全程无 provider 变更；控制面 EKS 状态与基线相同；探针资源无残留；若节点仍隔离且未经 validated restore，直接判 FAIL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8a7f52a3b89a044974110a14ee342aebdc2908d6662723252c2af79394219e15
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-024
   related_pytest: tests/regional/test_destr024_watcher_down_fail_closed.py::test_a_workflow_that_ran_is_the_failure_the_case_exists_to_catch
