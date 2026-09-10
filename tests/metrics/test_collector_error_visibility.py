@@ -23,9 +23,19 @@ from gpu_fault.collector_requirements import (
     CollectorEnabledState,
     CollectorServiceState,
 )
-from gpu_fault.host_health import NodeLogBatch, NodeLogEntry
+from gpu_fault.host_health import (
+    HostMetricSample,
+    HostTelemetryBatch,
+    NodeLogBatch,
+    NodeLogEntry,
+)
 from gpu_fault.telemetry import CollectorKind, CollectorStatus
-from tests._builders import asgi_client, build_context, build_store
+from tests._builders import (
+    asgi_client,
+    build_context,
+    build_store,
+    host_telemetry_batch,
+)
 
 NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 
@@ -298,4 +308,89 @@ def test_the_collectors_own_errors_are_never_carried_forward() -> None:
     status = store.list_collector_statuses("cluster-a", "node-a")[0]
     assert status.errors == ["gave up", REJECTED], (
         "the node's newest reason leads; the rejection rides along while erroring"
+    )
+
+
+def _post_host(context, batch: HostTelemetryBatch) -> None:
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            response = await client.post(
+                "/v1/collector-events/host-telemetry",
+                json=batch.model_dump(mode="json"),
+            )
+        assert response.status_code == 200, (
+            f"host-telemetry ingest returned {response.status_code}"
+        )
+
+    asyncio.run(scenario())
+
+
+def _host_batch(batch_id: str, observed_at: datetime, **values) -> HostTelemetryBatch:
+    return host_telemetry_batch(
+        batch_id,
+        observed_at,
+        [HostMetricSample(name="cpu_usage_percent", value=3.0)],
+        cluster_id="cluster-a",
+        node_id="node-a",
+        runtime_profile_version="simulated-v1",
+        **values,
+    )
+
+
+def _host_statuses(context) -> list[CollectorStatus]:
+    return [
+        item
+        for item in context.store.list_collector_statuses("cluster-a", "node-a")
+        if item.collector is CollectorKind.HOST_TELEMETRY
+    ]
+
+
+def test_the_control_planes_kubernetes_reader_does_not_speak_for_the_host_collector() -> (
+    None
+):
+    """Only the node's collector writes the node's HOST_TELEMETRY status.
+
+    The Kubernetes reader posts EFA/GPU allocatable counts on the same channel
+    for the same node. Its clean, fresher batch used to overwrite the node's
+    row -- and the node's next tick, stamped earlier because nvidia-smi was
+    hanging in it, was then dropped as a replay. COLLECT-019 read a clean row
+    while the host collector reported timeouts every round.
+    """
+
+    context = build_context(store=build_store())
+    _post_host(
+        context,
+        _host_batch(
+            "host-1", NOW, collection_errors=["nvidia-smi timed out after 15s"]
+        ),
+    )
+    assert is_erroring(_host_statuses(context)[0]), "the node's tick is erroring"
+
+    _post_host(
+        context,
+        _host_batch(
+            "k8s-efa-node-a-1", NOW + timedelta(seconds=10), producer="control-plane"
+        ),
+    )
+
+    statuses = _host_statuses(context)
+    assert len(statuses) == 1, "the reader must not add a second row either"
+    assert statuses[0].batch_id == "host-1", (
+        "the control plane's own reading replaced the node's status row"
+    )
+    assert is_erroring(statuses[0]), "a control-plane batch is not a node success"
+
+    _post_host(context, _host_batch("host-2", NOW + timedelta(seconds=15)))
+    assert not is_erroring(_host_statuses(context)[0]), (
+        "the node's own clean tick still clears the error state"
+    )
+
+
+def test_a_control_plane_batch_on_a_node_without_a_row_creates_none() -> None:
+    """A host collector that never posted must still read as absent, not alive."""
+
+    context = build_context(store=build_store())
+    _post_host(context, _host_batch("k8s-efa-node-a-2", NOW, producer="control-plane"))
+    assert _host_statuses(context) == [], (
+        "the Kubernetes reader made a node with no host collector look alive"
     )

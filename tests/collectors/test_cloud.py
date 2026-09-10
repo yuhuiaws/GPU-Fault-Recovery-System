@@ -133,6 +133,10 @@ def test_kubernetes_node_resource_collector_detects_allocatable_loss() -> None:
     assert payload["workload_state"] == "ACTIVE"
     assert payload["affected_workload_ids"] == ["training/pytorchjob/job-a"]
     assert by_name["gpu_kubernetes_allocatable_mismatch"]["value"] == 0
+    assert payload["producer"] == "control-plane", (
+        "the Kubernetes reader must not pose as the node's host collector: its "
+        "batches used to overwrite the node's HOST_TELEMETRY status row"
+    )
 
 
 def test_kubernetes_node_resource_summary_is_not_reported_as_a_recovery() -> None:

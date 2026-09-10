@@ -654,6 +654,7 @@ class KubernetesNodeResourceCollector:
             ),
             affected_workload_ids=workload_ids,
             evidence_ref=(f"k8s://nodes/{node_id}/status/allocatable"),
+            producer="control-plane",
             # Both resources can now land on the same reason, and a batch
             # reading `["health-summary", "health-summary"]` would no longer
             # match the control plane's steady-state test on the reason set.

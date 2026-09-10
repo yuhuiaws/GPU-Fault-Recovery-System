@@ -262,15 +262,18 @@ class TelemetryIngestionService:
             # Sustained-signal windows run on this clock, not the node's (F-M2).
             batch = batch.model_copy(update={"received_at": datetime.now(timezone.utc)})
         findings = self.context.node_health.evaluate_metrics(batch)
-        self.telemetry_context._record_collector_status(
-            CollectorKind.HOST_TELEMETRY,
-            batch.cluster_id,
-            batch.node_id,
-            batch.observed_at,
-            batch.batch_id,
-            len(batch.samples),
-            batch.collection_errors,
-        )
+        if batch.producer == "node":
+            # Only the node's collector speaks for the node's collector status;
+            # see ``HostTelemetryBatch.producer``.
+            self.telemetry_context._record_collector_status(
+                CollectorKind.HOST_TELEMETRY,
+                batch.cluster_id,
+                batch.node_id,
+                batch.observed_at,
+                batch.batch_id,
+                len(batch.samples),
+                batch.collection_errors,
+            )
         if (
             findings
             or batch.collection_errors

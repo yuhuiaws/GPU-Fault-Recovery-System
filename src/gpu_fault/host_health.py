@@ -61,6 +61,16 @@ class HostTelemetryBatch(StrictModel):
     evidence_ref: str | None = None
     edge_filter_reasons: list[str] = Field(default_factory=list)
     context_history: list[HostTelemetryHistoryPoint] = Field(default_factory=list)
+    # Who read the host. The node's own collector is the only producer whose
+    # batches say anything about that collector's health; the control plane's
+    # Kubernetes reader posts EFA/GPU allocatable counts on this same channel
+    # for the same node, and its clean, fresher batches used to overwrite the
+    # node's HOST_TELEMETRY status row -- erasing the collection errors and,
+    # because a node tick under a hung nvidia-smi is stamped earlier than the
+    # reader's snapshot, dropping the node's own status as a replay. A dead
+    # host collector looked alive the same way. Older node collectors omit the
+    # field and default to the node.
+    producer: Literal["node", "control-plane"] = "node"
 
 
 class NodeLogEntry(StrictModel):
