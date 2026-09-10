@@ -129,7 +129,9 @@ def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Residual checks
 # --------------------------------------------------------------------------- #
-_DATABASE_RESIDUALS = r"""
+_DATABASE_RESIDUALS = (
+    _registry.STORE_DSN_SNIPPET
+    + r"""
 import json
 import os
 import sys
@@ -161,7 +163,7 @@ parameters = {
     "processor_lanes": (),
 }
 result = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     with connection.cursor() as cursor:
         for name, query in queries.items():
             cursor.execute(query, parameters[name])
@@ -169,6 +171,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
 result["total"] = sum(result.values())
 print(json.dumps(result, sort_keys=True))
 """
+)
 
 
 def database_residuals(run_prefix: str) -> dict[str, Any]:
@@ -389,7 +392,9 @@ def command_snapshot(command_id: str) -> dict[str, Any]:
     return cpu_python(_COMMAND_SNAPSHOT, command_id)
 
 
-_PURGE_SEED = r"""
+_PURGE_SEED = (
+    _registry.STORE_DSN_SNIPPET
+    + r"""
 import json
 import os
 import sys
@@ -397,7 +402,7 @@ import psycopg
 
 command_id, workflow_id, incident_id, event_id = sys.argv[1:]
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' "
@@ -433,6 +438,7 @@ print(json.dumps({
     "remaining_links": remaining_links,
 }, sort_keys=True))
 """
+)
 
 
 def purge_seed(

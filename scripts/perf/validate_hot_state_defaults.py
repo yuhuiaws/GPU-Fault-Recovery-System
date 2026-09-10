@@ -46,8 +46,20 @@ def finding(finding_id: str, observed_at: datetime) -> GpuHealthFinding:
     )
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
-    url = os.environ["GPU_FAULT_STORE_URL"]
+    url = store_dsn()
     schema = f"gpu_fault_hot_state_guard_{uuid4().hex[:12]}"
     with psycopg.connect(url, autocommit=True) as connection:
         connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))

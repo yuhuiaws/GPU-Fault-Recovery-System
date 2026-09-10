@@ -162,9 +162,10 @@ def cpu_python(script: str, *arguments: str) -> dict:
 
 
 def database_residuals() -> dict:
-    script = r"""
+    script = (
+        _registry.STORE_DSN_SNIPPET
+        + r"""
 import json
-import os
 import psycopg
 queries = {
     "objects": (
@@ -190,7 +191,7 @@ queries = {
     ),
 }
 result = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     for name, query in queries.items():
         cursor.execute(query)
@@ -198,6 +199,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
 result["total"] = sum(result.values())
 print(json.dumps(result, sort_keys=True))
 """
+    )
     return cpu_python(script)
 
 
@@ -331,13 +333,14 @@ print(json.dumps({
 
 
 def notification_snapshot(deduplication_key: str) -> dict:
-    script = r"""
+    script = (
+        _registry.STORE_DSN_SNIPPET
+        + r"""
 import json
-import os
 import sys
 import psycopg
 key = sys.argv[1]
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "SELECT value FROM gpu_fault_links "
@@ -362,18 +365,20 @@ print(json.dumps({
     "objects": objects,
 }, sort_keys=True))
 """
+    )
     return cpu_python(script, deduplication_key)
 
 
 def cleanup_seed(seed: dict, notification_id: str | None) -> dict:
-    script = r"""
+    script = (
+        _registry.STORE_DSN_SNIPPET
+        + r"""
 import json
-import os
 import sys
 import psycopg
 incident_id, event_id, workflow_id, command_id, dedup_key, notification_id = sys.argv[1:]
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links "
@@ -415,6 +420,7 @@ print(json.dumps({
     "remaining_links": links,
 }, sort_keys=True))
 """
+    )
     result = cpu_python(
         script,
         str(seed["incident_id"]),

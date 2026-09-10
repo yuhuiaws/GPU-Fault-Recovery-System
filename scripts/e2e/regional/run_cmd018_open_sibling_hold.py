@@ -38,6 +38,9 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     run_plain_case,
 )
+from scripts.perf.regional_capacity_registry import (  # noqa: E402
+    STORE_DSN_SNIPPET,
+)
 
 CASE_ID = verdicts.CASE_ID
 CONFIRMATION = verdicts.CONFIRMATION
@@ -215,15 +218,16 @@ print(json.dumps({
 }, sort_keys=True, default=str))
 """
 
-_PURGE = r"""
+_PURGE = (
+    STORE_DSN_SNIPPET
+    + r"""
 import json
-import os
 import sys
 import psycopg
 
 workflow_id, incident_id, event_id, *command_ids = sys.argv[1:]
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' AND key=%s AND value=%s",
@@ -247,6 +251,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as conn
     remaining = int(cursor.fetchone()[0])
 print(json.dumps({"deleted": deleted, "remaining_commands": remaining}, sort_keys=True))
 """
+)
 
 
 def probe_definition() -> seeded.SeededCommandProbe:

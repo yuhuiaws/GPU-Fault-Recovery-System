@@ -17,6 +17,7 @@ if __package__:
         write_status,
     )
     from .regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         CONNECTION_SECRET,
         NAMESPACE,
         TOKEN_SECRET,
@@ -38,6 +39,7 @@ else:
     )
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         CONNECTION_SECRET,
         NAMESPACE,
         TOKEN_SECRET,
@@ -299,9 +301,10 @@ def collect_logs(target: Path) -> list[dict]:
 def _database_audit_script_prefix(run_id: str) -> str:
     return f"""
 import json, os, psycopg
+{STORE_DSN_SNIPPET}
 from datetime import datetime, timezone
 prefix='corr-live-{run_id}-%'
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
+with psycopg.connect(store_dsn()) as conn:
     cur=conn.cursor()
     cur.execute(
         "SELECT key,payload FROM gpu_fault_objects "
@@ -759,8 +762,9 @@ def purge_scenario_rows(run_id: str) -> None:
     ).strip()
     script = f"""
 import os, psycopg
+{STORE_DSN_SNIPPET}
 prefix='corr-live-{run_id}-%'
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'],autocommit=True) as conn:
+with psycopg.connect(store_dsn(), autocommit=True) as conn:
     cur=conn.cursor()
     cur.execute(
         "DELETE FROM gpu_fault_objects "

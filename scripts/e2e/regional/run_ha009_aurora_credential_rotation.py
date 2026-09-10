@@ -696,7 +696,9 @@ print(json.dumps({
 
 
 def runtime_snapshot(seed: dict) -> dict:
-    script = r"""
+    script = (
+        BASE.STORE_DSN_SNIPPET
+        + r"""
 import json
 import os
 import sys
@@ -705,7 +707,7 @@ from gpu_fault.app import ApplicationContext
 store = ApplicationContext.from_environment().store
 command = store.get_remote_command(sys.argv[1])
 notification_id = sys.argv[2]
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "SELECT kind, payload->>'status' FROM gpu_fault_objects "
@@ -726,6 +728,7 @@ print(json.dumps({
     "notification": notification,
 }, sort_keys=True))
 """
+    )
     return BASE.cpu_python(
         script,
         str(seed["command_id"]),
@@ -751,14 +754,16 @@ def wait_runtime_records(seed: dict, timeout_seconds: int | None = None) -> dict
 
 
 def cleanup_runtime_records(seed: dict) -> dict:
-    script = r"""
+    script = (
+        BASE.STORE_DSN_SNIPPET
+        + r"""
 import json
 import os
 import sys
 import psycopg
 incident_id, event_id, workflow_id, command_id, notification_id, dedup_key = sys.argv[1:]
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links WHERE "
@@ -819,6 +824,7 @@ print(json.dumps({
     "remaining_links": links,
 }, sort_keys=True))
 """
+    )
     result = BASE.cpu_python(
         script,
         str(seed["incident_id"]),

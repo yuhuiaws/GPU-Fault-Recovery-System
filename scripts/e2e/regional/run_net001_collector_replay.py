@@ -30,6 +30,9 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     predecessor_evidence,
 )
+from scripts.perf.regional_capacity_registry import (  # noqa: E402
+    STORE_DSN_SNIPPET,
+)
 
 CASE_ID = "GF-REGIONAL-NET-001"
 CONFIRMATION = "NET001_COLLECTOR_OUTBOX_REPLAY"
@@ -384,9 +387,10 @@ class Runner:
         return self.worker_pod
 
     def store_probe(self) -> dict[str, Any]:
-        script = r'''
+        script = (
+            STORE_DSN_SNIPPET
+            + r'''
 import json
-import os
 import sys
 
 from gpu_fault.store import PostgresStore
@@ -394,10 +398,7 @@ from gpu_fault.telemetry import EvidenceKind
 
 cluster_id, node_id, drill_id, *test_ids = sys.argv[1:]
 store = PostgresStore(
-    os.environ["GPU_FAULT_STORE_URL"],
-    initialize_schema=False,
-    pool_min_size=0,
-    pool_max_size=1,
+    store_dsn(), initialize_schema=False, pool_min_size=0, pool_max_size=1
 )
 try:
     evidence = store.list_raw_evidence(
@@ -491,6 +492,7 @@ try:
 finally:
     store.close()
 '''
+        )
         completed = self.cpu(
             "-n",
             self.settings.namespace,

@@ -49,6 +49,9 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     predecessor_evidence,
 )
+from scripts.perf.regional_capacity_registry import (  # noqa: E402
+    STORE_DSN_SNIPPET,
+)
 
 NetCommandProbe = seeded.SeededCommandProbe
 NetCommandError = seeded.SeededCommandError
@@ -167,9 +170,10 @@ def run_identity(run_dir: Path, attempt: int, prefix: str) -> str:
 # --------------------------------------------------------------------------- #
 # Residuals
 # --------------------------------------------------------------------------- #
-_DATABASE_RESIDUALS = r"""
+_DATABASE_RESIDUALS = (
+    STORE_DSN_SNIPPET
+    + r"""
 import json
-import os
 import sys
 import psycopg
 
@@ -214,7 +218,7 @@ queries = {
 }
 parameters = {"objects": (like,), "links": (like, like)}
 result = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     with connection.cursor() as cursor:
         for name, query in queries.items():
             cursor.execute(query, parameters.get(name, ()))
@@ -222,6 +226,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
 result["total"] = sum(result.values())
 print(json.dumps(result, sort_keys=True))
 """
+)
 
 
 def database_residuals(run_prefix: str) -> dict[str, Any]:

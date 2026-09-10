@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "perf"))
 _action_capacity = importlib.import_module("regional_action_capacity_suite")
 _registry = importlib.import_module("regional_capacity_registry")
 _capacity_suite = importlib.import_module("regional_capacity_suite")
+STORE_DSN_SNIPPET: str = _registry.STORE_DSN_SNIPPET
 executor_identity = _action_capacity.executor_identity
 NAMESPACE = _registry.NAMESPACE
 control = _registry.control
@@ -106,7 +107,9 @@ def cpu_python(script: str, *arguments: str) -> dict:
 
 
 def database_residuals() -> dict:
-    script = r"""
+    script = (
+        STORE_DSN_SNIPPET
+        + r"""
 import json
 import os
 import psycopg
@@ -150,7 +153,7 @@ queries = {
     ),
 }
 result = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     for name, query in queries.items():
         cursor.execute(query)
@@ -158,6 +161,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
 result["total"] = sum(result.values())
 print(json.dumps(result, sort_keys=True))
 """
+    )
     return cpu_python(script)
 
 

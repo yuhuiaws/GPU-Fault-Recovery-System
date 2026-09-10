@@ -12,6 +12,7 @@ from gpu_fault.models import WorkflowOperation
 if __package__:
     from .regional_capacity_results import collect_pod_json_logs
     from .regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         dataplane_identity,
         validate_registry_target,
     )
@@ -36,6 +37,7 @@ if __package__:
 else:
     from regional_capacity_results import collect_pod_json_logs
     from regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         dataplane_identity,
         validate_registry_target,
     )
@@ -485,9 +487,10 @@ def database_snapshot(run_id: str) -> dict:
     ).strip()
     script = f"""
 import json, os, psycopg
+{STORE_DSN_SNIPPET}
 pattern = 'workflow-actionperf-{run_id}-%'
 out = {{}}
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
+with psycopg.connect(store_dsn()) as conn:
     cur = conn.cursor()
     cur.execute(
         "SELECT payload->>'status', count(*) "
@@ -539,6 +542,7 @@ def database_details(run_id: str) -> dict:
     ).strip()
     script = f"""
 import json, os, re, statistics, psycopg
+{STORE_DSN_SNIPPET}
 from datetime import datetime
 pattern = 'workflow-actionperf-{run_id}-%'
 def stamp(value):
@@ -546,7 +550,7 @@ def stamp(value):
 def percentile(values, ratio):
     values = sorted(values)
     return values[int((len(values) - 1) * ratio)] if values else None
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
+with psycopg.connect(store_dsn()) as conn:
     cur = conn.cursor()
     cur.execute(
         "SELECT key, payload FROM gpu_fault_objects "

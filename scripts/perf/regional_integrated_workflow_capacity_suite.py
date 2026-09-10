@@ -30,6 +30,7 @@ if __package__:
     )
     from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         control,
@@ -73,6 +74,7 @@ else:
     )
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         control,
@@ -712,6 +714,7 @@ def workflow_audit(run_id: str) -> dict:
     ).strip()
     script = f"""
 import json, os, psycopg, statistics
+{STORE_DSN_SNIPPET}
 from datetime import datetime
 pattern='%integrated-{run_id}-%'
 terminal_workflows={{'SUCCEEDED','FAILED','BLOCKED','SUPERSEDED'}}
@@ -719,7 +722,7 @@ terminal_commands={{'SUCCEEDED','FAILED','CANCELLED'}}
 def percentile(values, ratio):
     values=sorted(values)
     return values[int((len(values)-1)*ratio)] if values else None
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL']) as conn:
+with psycopg.connect(store_dsn()) as conn:
     cur=conn.cursor()
     cur.execute(
         "SELECT key,payload FROM gpu_fault_objects "
@@ -974,9 +977,10 @@ def purge_integrated_rows(run_id: str) -> None:
     ).strip()
     script = f"""
 import os, psycopg
+{STORE_DSN_SNIPPET}
 pattern='%integrated-{run_id}-%'
 node_pattern='integrated-node-{run_id}-%'
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'],autocommit=True) as conn:
+with psycopg.connect(store_dsn(), autocommit=True) as conn:
     cur=conn.cursor()
     cur.execute(
         "SELECT key FROM gpu_fault_objects "

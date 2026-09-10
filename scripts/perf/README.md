@@ -67,6 +67,13 @@ Supported entry points:
 `regional_capacity_suite.py` are implementation inputs, not standalone entry
 points.
 
+Any script that opens psycopg inside a control-plane Pod -- an embedded
+`cpu_python(...)` literal or a whole file piped to `python3 -` -- must take the
+DSN from `store_dsn()` (the `STORE_DSN_SNIPPET` in `regional_capacity_registry.py`,
+or a verbatim local copy in a stand-alone tool) so it re-reads
+`GPU_FAULT_STORE_URL_FILE` across an Aurora password rotation instead of the
+`GPU_FAULT_STORE_URL` value frozen at Pod start.
+
 `benchmark_correlated_action_scenario.py` is likewise an implementation input
 for `regional_correlated_action_suite.py`. It must not be launched without the
 suite's synthetic registry, token, TLS, cleanup and evidence guards.

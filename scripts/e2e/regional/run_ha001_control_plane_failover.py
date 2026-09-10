@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -16,33 +17,27 @@ from typing import Any, Callable
 if __package__:
     from .acceptance_runner_common import write_json_atomic
     from .acceptance_scope import current_acceptance_scope
+    from ...perf.regional_capacity_registry import STORE_DSN_SNIPPET
     from .live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
         install_site_profile,
     )
-    from .live_driver_guard import (
-        authorize_execution as guard_authorize_execution,
-    )
-    from .regional_live_fixture import (
-        install_abort_signals,
-        run_case_main,
-    )
+    from .live_driver_guard import authorize_execution as guard_authorize_execution
+    from .regional_live_fixture import install_abort_signals, run_case_main
 else:
     from acceptance_runner_common import write_json_atomic
     from acceptance_scope import current_acceptance_scope
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "perf"))
+    from regional_capacity_registry import STORE_DSN_SNIPPET
     from live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
         install_site_profile,
     )
-    from live_driver_guard import (
-        authorize_execution as guard_authorize_execution,
-    )
-    from regional_live_fixture import (
-        install_abort_signals,
-        run_case_main,
-    )
+    from live_driver_guard import authorize_execution as guard_authorize_execution
+    from regional_live_fixture import install_abort_signals, run_case_main
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "ha001_probe.py"
 CPU_KUBECONFIG = Path()
@@ -1172,15 +1167,16 @@ def closure_errors(seed: dict, summary: dict, *, executor_id: str) -> list[str]:
 
 
 def cleanup_closure(seed: dict) -> dict:
-    script = r"""
+    script = (
+        STORE_DSN_SNIPPET
+        + r"""
 import json
-import os
 import sys
 import psycopg
 
 incident_id, event_id, workflow_id, *command_ids = sys.argv[1:]
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links "
@@ -1215,6 +1211,7 @@ print(json.dumps({
     "remaining_links": links,
 }, sort_keys=True))
 """
+    )
     result = cpu_python(
         script,
         str(seed["incident_id"]),
@@ -1275,11 +1272,11 @@ def verify_plan_targets(plan: dict) -> None:
 
 def database_residuals() -> dict:
     return cpu_python(
-        """
+        STORE_DSN_SNIPPET
+        + """
 import json
-import os
 import psycopg
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "SELECT count(*) FROM gpu_fault_objects WHERE key LIKE %s",

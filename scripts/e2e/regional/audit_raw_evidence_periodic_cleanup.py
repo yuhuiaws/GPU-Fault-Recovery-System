@@ -91,6 +91,18 @@ def _wait_deleted(connection: Any, key: str) -> float | None:
     return None
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
     suffix = uuid4().hex[:12]
     unrelated_key = f"audit-expired-evidence-{suffix}"
@@ -103,7 +115,7 @@ def main() -> None:
         "pinned_key": pinned_key,
         "incident_id": incident_id,
     }
-    with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+    with psycopg.connect(store_dsn()) as connection:
         with connection.cursor() as cursor:
             for kind, key, payload in (
                 (

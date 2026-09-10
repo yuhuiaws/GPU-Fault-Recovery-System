@@ -51,6 +51,7 @@ if __package__:
     )
     from .regional_capacity_job import build_job as _build_job
     from .regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         CONTROL_NAMESPACE,
@@ -89,6 +90,7 @@ else:
     )
     from regional_capacity_job import build_job as _build_job
     from regional_capacity_registry import (
+        STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
         CONTROL_NAMESPACE,
@@ -1028,6 +1030,7 @@ def purge_audit_rows() -> None:
         return
     script = f"""
 import os, psycopg
+{STORE_DSN_SNIPPET}
 prefix = {PERF_CLUSTER_PREFIX!r} + '%'
 patterns = {{
     "cluster": prefix,
@@ -1035,7 +1038,7 @@ patterns = {{
     "action_workflow": "workflow-actionperf-%",
 }}
 statements = {AUDIT_PURGE_STATEMENTS!r}
-with psycopg.connect(os.environ['GPU_FAULT_STORE_URL'], autocommit=True) as conn:
+with psycopg.connect(store_dsn(), autocommit=True) as conn:
     cur = conn.cursor()
     for table, sql, pattern_name in statements:
         try:

@@ -32,6 +32,25 @@ CONTROL_KUBECONFIG = os.getenv(
 )
 DATAPLANE_CONTEXT = os.getenv("GPU_FAULT_DATAPLANE_CONTEXT", "")
 AWS_REGION = os.getenv("GPU_FAULT_PERF_AWS_REGION", "us-west-2")
+
+# Scripts exec'd inside a control-plane Pod that open psycopg themselves must
+# connect with the DSN the product uses: ``GPU_FAULT_STORE_URL_FILE``, re-read
+# on every connect so it follows a master-password rotation. The
+# ``GPU_FAULT_STORE_URL`` env var is the value at Pod start and is stale the
+# moment HA-009 rotates the password (attempt 4, every post-rotation read
+# failed with "password authentication failed"). Prepend this to such a script
+# and call ``store_dsn()``; it has no braces, so it also fits an f-string, and
+# it falls back to the env var where no file is mounted (a deploy host).
+STORE_DSN_SNIPPET = """\
+def store_dsn():
+    import os
+    path = os.environ.get("GPU_FAULT_STORE_URL_FILE") or "/etc/gpu-fault/aurora/postgres-url"
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+"""
 REGISTRY_SECRET = os.getenv(
     "GPU_FAULT_PERF_REGISTRY_SECRET",
     "gpu-fault-regional-clusters",

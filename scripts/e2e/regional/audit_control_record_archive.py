@@ -35,9 +35,21 @@ def load_module(path: str):
     return module
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main(module_path: str, archive_uri: str) -> None:
     module = load_module(module_path)
-    dsn = os.environ["GPU_FAULT_STORE_URL"]
+    dsn = store_dsn()
     suffix = uuid4().hex
     incident_id = f"audit-archive-{suffix}"
     workflow_id = f"workflow-{incident_id}"

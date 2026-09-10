@@ -47,8 +47,20 @@ def insert_request(cursor, request: ProcessorRequest) -> None:
     )
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
-    url = os.environ["GPU_FAULT_STORE_URL"]
+    url = store_dsn()
     runtime_profile_version = os.environ["GPU_FAULT_RUNTIME_PROFILE_VERSION"]
     suffix = uuid4().hex[:12]
     cluster_id = f"audit-order-{suffix}"

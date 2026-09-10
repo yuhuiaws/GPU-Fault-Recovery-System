@@ -210,8 +210,20 @@ def run_scenario(
             )
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
-    url = os.environ["GPU_FAULT_STORE_URL"]
+    url = store_dsn()
     client_workers = int(os.getenv("CLIENT_WORKERS", "256"))
     use_batch = os.getenv("USE_BATCH", "false").lower() == "true"
     batch_size = int(os.getenv("BATCH_SIZE", "64"))

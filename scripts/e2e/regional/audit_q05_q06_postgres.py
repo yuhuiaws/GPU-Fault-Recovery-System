@@ -133,13 +133,25 @@ def run_q06_audit(
     block_leased(store, saved, owner)
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
     stamp = str(int(time.time()))
     now = datetime.now(timezone.utc)
     later = now + timedelta(hours=1)
     owner = f"audit-q056-{stamp}"
     store = PostgresStore(
-        os.environ["GPU_FAULT_STORE_URL"],
+        store_dsn(),
         pool_min_size=1,
         pool_max_size=2,
         pool_timeout_seconds=5,

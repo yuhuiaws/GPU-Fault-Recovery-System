@@ -256,12 +256,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store_url = args.store_url or os.environ.get("GPU_FAULT_STORE_URL")
+    try:
+        store_url = args.store_url or store_dsn()
+    except KeyError:
+        store_url = ""
     if not store_url:
         print(
-            "GPU_FAULT_STORE_URL is not set and --store-url was not given",
+            "--store-url was not given and neither GPU_FAULT_STORE_URL_FILE "
+            "nor GPU_FAULT_STORE_URL provides a DSN",
             file=sys.stderr,
         )
         return 2

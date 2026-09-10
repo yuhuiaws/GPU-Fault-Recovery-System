@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 import json
 from typing import Callable
 
+try:
+    from .regional_capacity_registry import STORE_DSN_SNIPPET
+except ImportError:
+    from regional_capacity_registry import STORE_DSN_SNIPPET
+
 
 AURORA_CLUSTER_DIMENSION_METRICS = {
     "DatabaseConnections",
@@ -90,6 +95,7 @@ def postgres_counters(
         return {"error": "no api pod available"}
     script = """
 import json, os, psycopg
+{STORE_DSN_SNIPPET}
 tables = [
     'gpu_fault_processor_queue',
     'gpu_fault_processor_lanes',
@@ -98,9 +104,7 @@ tables = [
     'gpu_fault_gpu_metric_latest',
 ]
 out = {}
-with psycopg.connect(
-    os.environ['GPU_FAULT_STORE_URL'], autocommit=True
-) as conn:
+with psycopg.connect(store_dsn(), autocommit=True) as conn:
     cur = conn.cursor()
     cur.execute(
         "SELECT deadlocks, xact_commit, xact_rollback "
@@ -156,10 +160,9 @@ def processor_priority_latency(
         return {"error": "no api pod available"}
     script = f"""
 import json, os, psycopg
+{STORE_DSN_SNIPPET}
 prefix = {cluster_prefix!r} + '%'
-with psycopg.connect(
-    os.environ['GPU_FAULT_STORE_URL'], autocommit=True
-) as conn:
+with psycopg.connect(store_dsn(), autocommit=True) as conn:
     cur = conn.cursor()
     cur.execute(
         \"\"\"

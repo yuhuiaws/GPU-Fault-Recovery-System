@@ -210,8 +210,20 @@ def run_suite(base_url: str, workdir: Path) -> dict[str, Any]:
     return summary
 
 
+def store_dsn() -> str:
+    path = (
+        os.environ.get("GPU_FAULT_STORE_URL_FILE")
+        or "/etc/gpu-fault/aurora/postgres-url"
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return os.environ["GPU_FAULT_STORE_URL"]
+
+
 def main() -> None:
-    base_url = os.environ["GPU_FAULT_STORE_URL"]
+    base_url = store_dsn()
     workdir = Path(os.getenv("GPU_FAULT_CAP005_WORKDIR", str(ROOT)))
     summary = run_suite(base_url, workdir)
     print(json.dumps(summary, sort_keys=True))

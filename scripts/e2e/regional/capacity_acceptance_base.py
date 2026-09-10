@@ -32,6 +32,9 @@ from gpu_fault.admin.site import load_site  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.perf.regional_capacity_registry import (  # noqa: E402
+    STORE_DSN_SNIPPET,
+)
 
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
@@ -670,16 +673,19 @@ class CapProbeHarness(CapCoreHarness):
         pod = sorted(
             pods, key=lambda item: item["metadata"].get("creationTimestamp", "")
         )[-1]["metadata"]["name"]
-        cleanup = r"""
-import os,sys
+        cleanup = (
+            STORE_DSN_SNIPPET
+            + r"""
+import sys
 import psycopg
 from psycopg import sql
 database=sys.argv[1]
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"],autocommit=True) as c:
+with psycopg.connect(store_dsn(),autocommit=True) as c:
   with c.cursor() as cur:
     cur.execute("select pg_terminate_backend(pid) from pg_stat_activity where datname=%s and pid<>pg_backend_pid()",(database,))
     cur.execute(sql.SQL("drop database if exists {} with (force)").format(sql.Identifier(database)))
 """
+        )
         self.kubectl(
             "exec",
             "-i",
@@ -930,13 +936,16 @@ with psycopg.connect(url) as c:
             .get("labels", {})
             .get("gpu-fault.io/capacity-probe")
         )
-        script = r"""
-import os,json,psycopg
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as c:
+        script = (
+            STORE_DSN_SNIPPET
+            + r"""
+import json,psycopg
+with psycopg.connect(store_dsn()) as c:
   with c.cursor() as cur:
     cur.execute("select current_setting('max_connections')::int")
     print(cur.fetchone()[0])
 """
+        )
         max_connections = int(
             self.kubectl(
                 "exec",

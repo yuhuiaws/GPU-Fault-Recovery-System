@@ -32,6 +32,9 @@ from scripts.e2e.regional import net_command_fixture as fixture  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
 )
+from scripts.perf.regional_capacity_registry import (  # noqa: E402
+    STORE_DSN_SNIPPET,
+)
 
 CASE_ID = "GF-REGIONAL-NET-003"
 CONFIRMATION = "NET003_RESULT_CONNECTION_RESET"
@@ -296,15 +299,16 @@ def seed_command(run_id: str) -> dict[str, Any]:
     )
 
 
-_NOTIFICATION_SNAPSHOT = r"""
+_NOTIFICATION_SNAPSHOT = (
+    STORE_DSN_SNIPPET
+    + r"""
 import json
-import os
 import sys
 import psycopg
 
 notification_id, deduplication_key = sys.argv[1:]
 objects = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
+with psycopg.connect(store_dsn()) as connection:
     with connection.cursor() as cursor:
         cursor.execute(
             '''
@@ -338,6 +342,7 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"]) as connection:
         link_count = int(cursor.fetchone()[0])
 print(json.dumps({"objects": objects, "dedup_link_count": link_count}, sort_keys=True))
 """
+)
 
 
 def notification_snapshot(
@@ -348,9 +353,10 @@ def notification_snapshot(
     )
 
 
-_PURGE_SEED = r"""
+_PURGE_SEED = (
+    STORE_DSN_SNIPPET
+    + r"""
 import json
-import os
 import sys
 import psycopg
 
@@ -358,7 +364,7 @@ command_id, workflow_id, incident_id, notification_id, dedup_key, event_id = (
     sys.argv[1:]
 )
 deleted = {}
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], autocommit=True) as connection:
+with psycopg.connect(store_dsn(), autocommit=True) as connection:
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM gpu_fault_links WHERE kind='incident_by_event' "
@@ -413,6 +419,7 @@ print(json.dumps({
     "remaining_links": remaining_links,
 }, sort_keys=True))
 """
+)
 
 
 def purge_seed(seed: dict[str, Any]) -> dict[str, Any]:
