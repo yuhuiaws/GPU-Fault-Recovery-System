@@ -260,10 +260,15 @@ coverage-combine:
 		--output-root "$(COVERAGE_COMBINED_ROOT)" \
 		$(if $(GITHUB_RUN_ID),--require-run-id "$(GITHUB_RUN_ID)",)
 
+# One database per xdist worker (tests/conftest.py rewrites the URL on each
+# worker), so the Postgres shard runs as wide as the in-memory suite instead of
+# serially against a single truncated database.
 test-postgres:
 	@test -n "$${GPU_FAULT_TEST_POSTGRES_URL}" || \
 		(printf 'GPU_FAULT_TEST_POSTGRES_URL is required\n' >&2; exit 2)
 	$(PYTHON) -m pytest $(POSTGRES_TESTS) \
+		-n $(PYTEST_XDIST_WORKERS) \
+		--dist=$(PYTEST_XDIST_DIST) \
 		--durations=$(PYTEST_DURATIONS)
 
 test-postgres-stress:

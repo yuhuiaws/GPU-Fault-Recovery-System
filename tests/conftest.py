@@ -26,6 +26,24 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         f"{MARKER}(*names): permit this test to execute the named cluster binaries.",
     )
+    _isolate_postgres_per_worker()
+
+
+def _isolate_postgres_per_worker() -> None:
+    """Point this xdist worker at its own database before any module imports.
+
+    The Postgres-gated modules read the URL at import and truncate every table
+    per test; sharing one database across workers is a race, so the shard ran
+    serially. See ``tests/_postgres_worker_database``.
+    """
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    base_url = os.environ.get("GPU_FAULT_TEST_POSTGRES_URL", "").strip()
+    if not worker or not base_url:
+        return
+    from tests._postgres_worker_database import worker_database_url
+
+    os.environ["GPU_FAULT_TEST_POSTGRES_URL"] = worker_database_url(base_url, worker)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
