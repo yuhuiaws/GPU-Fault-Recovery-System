@@ -693,3 +693,51 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         assert mode == 0o775, f"{path.name} is {oct(mode)}, not 0o775"
         first = source.splitlines()[0]
         assert first == "#!/usr/bin/env python3", first
+
+
+def test_the_failover_step_unpacks_ha003s_document_and_samples(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``wait_rds_failover`` returns ``(document, samples)``; the first live run
+    merged the tuple as a mapping and died with the failover requested and the
+    Pod deleted. The step now records both."""
+    from types import SimpleNamespace
+
+    from scripts.e2e.regional import run_ha010_aurora_blackout_liveness as ha010
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ha010, "_quiet_control_plane", lambda run: calls.append("quiet")
+    )
+    monkeypatch.setattr(
+        ha010.ha003, "aws_rds", lambda *_a, **_k: {"DBClusterIdentifier": "c"}
+    )
+    monkeypatch.setattr(
+        ha010.ha003,
+        "wait_rds_failover",
+        lambda *_a, **_k: ({"status": "available", "writer": "db-2"}, [{"t": 1}]),
+    )
+    monkeypatch.setattr(
+        ha010, "_first_ready_pod", lambda *_a, **_k: "gpu-fault-api-ha-a"
+    )
+    run = SimpleNamespace(
+        settings=SimpleNamespace(
+            rds_cluster_id="c", regional=SimpleNamespace(region="r")
+        ),
+        case_dir=tmp_path,
+        preflight={"rds": {"writer": "db-1"}, "pods": {}},
+        regional=SimpleNamespace(kubectl=lambda *a, **_k: calls.append(a[1]) or ""),
+        failover_requested_at=None,
+        deleted_pod=None,
+        deleted_at=None,
+        rds_available_at=None,
+    )
+
+    rds_after = ha010.request_failover(run)
+
+    assert rds_after == {"status": "available", "writer": "db-2"}
+    assert calls == ["quiet", "delete"], calls
+    after = json.loads((tmp_path / "rds-after.json").read_text())
+    assert after["writer"] == "db-2" and "available_at" in after, after
+    samples = json.loads((tmp_path / "rds-failover-samples.json").read_text())
+    assert samples == {"samples": [{"t": 1}]}

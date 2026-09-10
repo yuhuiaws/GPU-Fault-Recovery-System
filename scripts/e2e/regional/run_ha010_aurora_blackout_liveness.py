@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -524,7 +525,7 @@ def _start_samplers(run: _LiveRun) -> None:
     time.sleep(2 * verdicts.SAMPLE_INTERVAL_SECONDS + 3)
 
 
-def _failover(run: _LiveRun) -> dict[str, Any]:
+def request_failover(run: _LiveRun) -> dict[str, Any]:
     _quiet_control_plane(run)
     run.failover_requested_at = datetime.now(timezone.utc)
     failover = ha003.aws_rds(
@@ -550,7 +551,10 @@ def _failover(run: _LiveRun) -> dict[str, Any]:
         run.case_dir / "deleted-pod.json",
         {"pod": run.deleted_pod, "deleted_at": run.deleted_at.isoformat()},
     )
-    rds_after = ha003.wait_rds_failover(
+    # HA-003's wait returns the final RDS document *and* the samples it took
+    # on the way; the first live run unpacked neither and died on the merge
+    # below with the failover already requested and the Pod already deleted.
+    rds_after, failover_samples = ha003.wait_rds_failover(
         _rds(run.settings),
         previous_writer=str(run.preflight["rds"]["writer"]),
         timeout_seconds=verdicts.FAILOVER_TIMEOUT_SECONDS,
@@ -559,6 +563,9 @@ def _failover(run: _LiveRun) -> dict[str, Any]:
     write_json_atomic(
         run.case_dir / "rds-after.json",
         {**rds_after, "available_at": run.rds_available_at.isoformat()},
+    )
+    write_json_atomic(
+        run.case_dir / "rds-failover-samples.json", {"samples": failover_samples}
     )
     return rds_after
 
@@ -677,7 +684,7 @@ def execute_case(
             raise RegionalFixtureError(
                 "approved maintenance window ended before the failover"
             )
-        rds_after = _failover(run)
+        rds_after = request_failover(run)
         replacement = _wait_replacement(run)
         _wait_deployments_ready(run)
         reports = _collect_samplers(run)
@@ -728,6 +735,7 @@ def execute_case(
         )
     except Exception as exc:  # noqa: BLE001 - recorded as the case error
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["traceback"] = traceback.format_exc()[-4000:]
     finally:
         cleanup = _cleanup(run)
         result["cleanup"] = cleanup
