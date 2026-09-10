@@ -162,6 +162,52 @@ def _activity(**overrides: Any) -> dict[str, Any]:
     return activity
 
 
+def test_the_unparsed_finding_is_found_by_its_identifier_alone() -> None:
+    """Live incidents carry the kind in `incident_id`, not in their prose.
+
+    The first live run's incident read
+    `inc-kernel-log-kmsg-<uuid>-4155-unparsed_xid_line` with a reason that
+    said "could not be resolved into an XID/SXID event"; matching the prose
+    alone reported "no incident" and skipped every downstream check.
+    """
+
+    activity = _activity(
+        incidents=[
+            {
+                "incident_id": "inc-kernel-log-kmsg-1-4155-unparsed_xid_line",
+                "event_type": "NODE_HEALTH",
+                "reasons": ["a fault line from the node could not be resolved"],
+            }
+        ],
+        workflows=[
+            {
+                "request_id": "wf-1",
+                "incident_id": "inc-kernel-log-kmsg-1-4155-unparsed_xid_line",
+                "status": "SUCCEEDED",
+                "official_steps": [{"operation": "FREEZE_EVIDENCE"}],
+            }
+        ],
+        notifications=[
+            {
+                "incident_id": "inc-kernel-log-kmsg-1-4155-unparsed_xid_line",
+                "category": "OPERATOR_REVIEW",
+            }
+        ],
+    )
+    before = [
+        'gpu_fault_ingest_unresolved_fault_signals_total{kind="unparsed_xid_line"} 1'
+    ]
+    after = [
+        'gpu_fault_ingest_unresolved_fault_signals_total{kind="unparsed_xid_line"} 2'
+    ]
+    assert (
+        verdicts.unparsed_finding_errors(
+            activity, marker="m1", metrics_before=before, metrics_after=after
+        )
+        == []
+    ), "an incident named only by its identifier must still be found"
+
+
 def test_the_unparsed_finding_contract_passes_on_a_freeze_only_workflow() -> None:
     before = [
         'gpu_fault_ingest_unresolved_fault_signals_total{kind="unparsed_xid_line"} 1'

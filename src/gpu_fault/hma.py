@@ -279,6 +279,12 @@ class HmaProviderSignal(StrictModel):
     xid_codes: list[int] = Field(default_factory=list)
     sxid_codes: list[int] = Field(default_factory=list)
     unresolved_reasons: list[str] = Field(default_factory=list)
+    # The runtime profile the source record was collected under. An unresolved
+    # line opens a node-health finding, and the health family cannot compile
+    # even a FREEZE_EVIDENCE-only workflow without a profile to name the
+    # evidence-capture owner; without this the finding blocked as
+    # "runtime_profile_version is required for execution".
+    runtime_profile_version: str | None = None
 
 
 class HmaNormalizedBatch(StrictModel):
@@ -418,6 +424,7 @@ class HyperPodHmaNormalizer:
             cluster_id=snapshot.cluster_id,
             node_id=snapshot.node_id,
             observed_at=snapshot.observed_at,
+            runtime_profile_version=snapshot.runtime_profile_version,
             health_status=snapshot.labels.get(HMA_HEALTH_STATUS),
             fault_types=self._split_label(snapshot.labels.get(HMA_FAULT_TYPES)),
             fault_reasons=self._split_label(snapshot.labels.get(HMA_FAULT_REASONS)),
@@ -548,6 +555,7 @@ class HyperPodHmaNormalizer:
             cluster_id=event.cluster_id,
             node_id=event.node_id,
             observed_at=observed_at,
+            runtime_profile_version=event.runtime_profile_version,
             fault_reasons=reasons,
             fault_details=[raw],
             raw_message=event.message,
@@ -600,6 +608,7 @@ class HyperPodHmaNormalizer:
             cluster_id=event.cluster_id,
             node_id=event.node_id,
             observed_at=event.observed_at,
+            runtime_profile_version=event.runtime_profile_version,
             fault_details=[event.message],
             raw_message=event.message,
             xid_codes=sorted({code for _, code, _ in xid_matches}),
@@ -647,6 +656,7 @@ class HyperPodHmaNormalizer:
             cluster_id=event.cluster_id,
             node_id=event.node_id,
             observed_at=event.observed_at,
+            runtime_profile_version=event.runtime_profile_version,
             fault_details=[event.message],
             raw_message=event.message,
             xid_codes=sorted({code for _, code, _ in xid_matches}),

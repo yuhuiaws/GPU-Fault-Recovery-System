@@ -15,6 +15,7 @@ from gpu_fault.store.shared.group_commit import submit_group_commit
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
+from gpu_fault.telemetry import merge_collector_status
 from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
@@ -230,23 +231,12 @@ class PostgresCollectorTelemetryMixin:
         results = []
         final_by_key = {}
         for storage_key, status in zip(storage_keys, statuses, strict=True):
-            previous = current_by_key.get(storage_key)
-            if previous is not None and status.observed_at < previous.observed_at:
+            merged = merge_collector_status(current_by_key.get(storage_key), status)
+            if merged is None:
                 results.append(False)
                 continue
-            if previous is not None:
-                status = status.model_copy(
-                    update={
-                        "last_success_at": (
-                            status.last_success_at or previous.last_success_at
-                        ),
-                        "last_error_at": (
-                            status.last_error_at or previous.last_error_at
-                        ),
-                    }
-                )
-            current_by_key[storage_key] = status
-            final_by_key[storage_key] = status
+            current_by_key[storage_key] = merged
+            final_by_key[storage_key] = merged
             results.append(True)
         if final_by_key:
             keys = list(final_by_key)

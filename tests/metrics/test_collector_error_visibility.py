@@ -209,3 +209,93 @@ def test_a_node_reporting_errors_on_time_is_counted_but_not_called_silent() -> N
     assert [item["erroring"] for item in snapshot.details() if item["erroring"]] == [
         True
     ], "the per-node details name the erroring node for the runbook"
+
+
+def _kernel_status(**overrides) -> CollectorStatus:
+    values = {
+        "cluster_id": "cluster-a",
+        "node_id": "node-a",
+        "collector": CollectorKind.NVIDIA_KERNEL,
+        "observed_at": NOW,
+        "ingested_at": NOW,
+    }
+    values.update(overrides)
+    return CollectorStatus(**values)
+
+
+REJECTED = "rejected-event: HTTP 422 body.acceptance_unknown_field: extra"
+
+
+def test_a_rejected_event_entry_outlives_the_sinks_older_success() -> None:
+    """The node's own status right behind the rejection must not erase it.
+
+    The processor writes the rejection when it refuses the event on replay;
+    the node's sink only ever saw the 202 at the door and posts a clean
+    ``errors=[]`` status stamped with that earlier success. Replacing the list
+    left a row with a stale ``last_error_at`` and no word about rejected data
+    -- exactly what the first live COLLECT-018 run read.
+    """
+
+    store = build_store()
+    rejected_at = NOW + timedelta(seconds=2)
+    assert store.save_collector_status(
+        _kernel_status(
+            observed_at=rejected_at, last_error_at=rejected_at, errors=[REJECTED]
+        )
+    ), "the rejection row is the first write"
+    assert store.save_collector_status(
+        _kernel_status(
+            observed_at=rejected_at + timedelta(seconds=1),
+            last_success_at=NOW,
+            errors=[],
+        )
+    ), "the sink's newer status is accepted, not dropped"
+
+    status = store.list_collector_statuses("cluster-a", "node-a")[0]
+    assert status.errors == [REJECTED], "the rejection is still the newest verdict"
+    assert status.last_error_at == rejected_at, "the rejection clock is kept"
+    assert status.last_success_at == NOW, "the sink's success clock is kept"
+    assert is_erroring(status), "a success older than the rejection clears nothing"
+
+
+def test_a_success_newer_than_the_rejection_clears_the_entry() -> None:
+    store = build_store()
+    rejected_at = NOW + timedelta(seconds=2)
+    store.save_collector_status(
+        _kernel_status(
+            observed_at=rejected_at, last_error_at=rejected_at, errors=[REJECTED]
+        )
+    )
+    accepted_at = rejected_at + timedelta(seconds=30)
+    store.save_collector_status(
+        _kernel_status(observed_at=accepted_at, last_success_at=accepted_at)
+    )
+
+    status = store.list_collector_statuses("cluster-a", "node-a")[0]
+    assert status.errors == [], "one accepted batch after the rejection clears it"
+    assert not is_erroring(status), "a newer success ends the erroring state"
+    assert status.last_error_at == rejected_at, "history is kept, not rewritten"
+
+
+def test_the_collectors_own_errors_are_never_carried_forward() -> None:
+    """Only the processor's verdict is sticky; the node's reasons are its latest word."""
+
+    store = build_store()
+    store.save_collector_status(
+        _kernel_status(
+            last_error_at=NOW, errors=["journalctl exited 1: Failed to open journal"]
+        )
+    )
+    later = NOW + timedelta(seconds=30)
+    store.save_collector_status(
+        _kernel_status(observed_at=later, last_error_at=later, errors=[REJECTED])
+    )
+    latest = later + timedelta(seconds=30)
+    store.save_collector_status(
+        _kernel_status(observed_at=latest, last_error_at=latest, errors=["gave up"])
+    )
+
+    status = store.list_collector_statuses("cluster-a", "node-a")[0]
+    assert status.errors == ["gave up", REJECTED], (
+        "the node's newest reason leads; the rejection rides along while erroring"
+    )

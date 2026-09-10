@@ -27,6 +27,7 @@ from gpu_fault.store.shared.telemetry_models import (
     GpuMetricsBatchKey,
 )
 from gpu_fault.telemetry import (
+    merge_collector_status,
     CollectorMetricsSnapshotRecord,
     CollectorStatus,
     WorkloadCoverageHeartbeat,
@@ -249,22 +250,13 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
                     status.node_id,
                     status.collector.value,
                 )
-                previous = self._collector_statuses.get(key)
-                if previous is not None and status.observed_at < previous.observed_at:
+                merged = merge_collector_status(
+                    self._collector_statuses.get(key), status
+                )
+                if merged is None:
                     results.append(False)
                     continue
-                if previous is not None:
-                    status = status.model_copy(
-                        update={
-                            "last_success_at": (
-                                status.last_success_at or previous.last_success_at
-                            ),
-                            "last_error_at": (
-                                status.last_error_at or previous.last_error_at
-                            ),
-                        }
-                    )
-                self._collector_statuses[key] = status
+                self._collector_statuses[key] = merged
                 results.append(True)
             return results
 

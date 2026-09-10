@@ -278,3 +278,84 @@ def test_unparsed_episode_emits_once_until_a_parsed_line_clears_it() -> None:
     assert third is not None and third.incident_ids, (
         "a new drift episode after a parsed line stayed silent"
     )
+
+
+def _workflow_for(context, incident_id: str):
+    workflows = [
+        item
+        for item in context.store.list_workflows()
+        if item.incident_id == incident_id
+    ]
+    assert len(workflows) == 1, f"expected one workflow for {incident_id}"
+    return workflows[0]
+
+
+def test_unparsed_finding_carries_the_records_runtime_profile_and_compiles() -> None:
+    """Without a profile the health family cannot even freeze evidence.
+
+    The live finding was built with no ``runtime_profile_version``; the
+    coordinator answered "runtime_profile_version is required for execution"
+    and "no executable owner for evidenceCapture", so the workflow the
+    operator-review notification pointed at had zero steps. The kernel record
+    names its profile; the finding has to carry it through.
+    """
+
+    context = build_context()
+    service = FaultIngestionService(context)
+    unparsed = HyperPodHmaNormalizer().normalize_kernel(
+        _kernel_event(
+            "kmsg-drift-2", "NVRM: Xid (PCI:0000:b9:00): , pid=1234"
+        ).model_copy(update={"runtime_profile_version": "simulated-v1"})
+    )
+
+    result = service.ingest_unresolved_signals(unparsed, batch_id="kmsg-drift-2")
+
+    assert result is not None, "an unparsed fault line produced no finding"
+    finding = result.findings[0]
+    assert finding.runtime_profile_version == "simulated-v1", (
+        "the finding must execute under the profile the record was collected with"
+    )
+    workflow = _workflow_for(context, result.incident_ids[0])
+    operations = [step.operation.value for step in workflow.official_steps]
+    assert operations == ["FREEZE_EVIDENCE"], (
+        f"the unparsed-line workflow must compile to freeze-only, got {operations}"
+    )
+    assert not workflow.blocked_reasons, workflow.blocked_reasons
+
+
+def test_unparsed_finding_falls_back_to_the_node_agents_profile() -> None:
+    """A record with no profile of its own still names one.
+
+    Topology knows nothing about an idle node, so the last word is the node
+    agent's registration -- the profile the collectors on that node were
+    installed under.
+    """
+
+    from types import SimpleNamespace
+
+    from tests._builders import build_store
+
+    store = build_store(
+        get_agent=lambda cluster_id, node_id: SimpleNamespace(
+            runtime_profile_version="simulated-v1"
+        )
+    )
+    context = build_context(store=store)
+    service = FaultIngestionService(context)
+    unparsed = HyperPodHmaNormalizer().normalize_kernel(
+        _kernel_event("kmsg-drift-3", "NVRM: Xid (PCI:0000:b9:00): , pid=1234")
+    )
+    assert unparsed.provider_signals[0].runtime_profile_version is None, (
+        "the record itself must name no profile for the fallback to be exercised"
+    )
+
+    result = service.ingest_unresolved_signals(unparsed, batch_id="kmsg-drift-3")
+
+    assert result is not None, "an unparsed fault line produced no finding"
+    assert result.findings[0].runtime_profile_version == "simulated-v1", (
+        "the node agent's registered profile is the fallback"
+    )
+    workflow = _workflow_for(context, result.incident_ids[0])
+    assert [step.operation.value for step in workflow.official_steps] == [
+        "FREEZE_EVIDENCE"
+    ], "the fallback profile must let the freeze-only workflow compile"

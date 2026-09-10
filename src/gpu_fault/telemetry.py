@@ -57,6 +57,68 @@ class CollectorStatus(StrictModel):
     errors: list[str] = Field(default_factory=list)
 
 
+# The processor stamps a collector status with this prefix when a fault-layer
+# event that took a 202 at the door is refused on replay (ARCH-G1). The store's
+# merge keeps such an entry on the row until the channel has succeeded *after*
+# the rejection; see ``merge_collector_status``.
+REJECTED_EVENT_ERROR_PREFIX = "rejected-event:"
+
+
+def _newest(first: datetime | None, second: datetime | None) -> datetime | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
+
+
+def merge_collector_status(
+    previous: CollectorStatus | None, status: CollectorStatus
+) -> CollectorStatus | None:
+    """Fold one collector status over the stored row; ``None`` means drop it.
+
+    Every store used to apply the same three rules inline: a status older than
+    the row is a replay and is dropped, and ``last_success_at`` /
+    ``last_error_at`` are sticky so ``is_erroring`` can compare them. The
+    ``errors`` list, however, was replaced outright. That erased a
+    ``rejected-event:`` entry within the same second it was written: the
+    processor stamps it when it refuses an event on replay, and the node's
+    sink -- which only saw the 202 at the door -- posts its own ``errors=[]``
+    status right behind it. The operator then saw a clean row with a stale
+    ``last_error_at`` and nothing that said "your data was rejected".
+
+    So a rejected-event entry is carried forward while the row is still
+    erroring (no success newer than the rejection). One success that lands
+    after the rejection clears it, the same evidence that clears
+    ``is_erroring``; the collector's own errors are always the node's
+    latest word and are never carried.
+    """
+
+    if previous is None:
+        return status
+    if status.observed_at < previous.observed_at:
+        return None
+    last_success_at = _newest(status.last_success_at, previous.last_success_at)
+    last_error_at = _newest(status.last_error_at, previous.last_error_at)
+    errors = list(status.errors)
+    still_erroring = last_error_at is not None and (
+        last_success_at is None or last_error_at >= last_success_at
+    )
+    if still_erroring:
+        errors.extend(
+            error
+            for error in previous.errors
+            if error.startswith(REJECTED_EVENT_ERROR_PREFIX) and error not in errors
+        )
+    return status.model_copy(
+        update={
+            "last_success_at": last_success_at,
+            "last_error_at": last_error_at,
+            "errors": errors,
+        }
+    )
+
+
 class CollectorHealthSummary(StrictModel):
     summary_id: str
     cluster_id: str

@@ -163,10 +163,15 @@ def unparsed_finding_errors(
     """The code-less line becomes a bounded finding, evidence and a notification."""
 
     errors: list[str] = []
+    # The kind is spelled in the identifiers (`inc-kernel-log-<record>-<kind>`
+    # / `finding-<signal>-<kind>`), not in the incident's prose reasons; the
+    # first live run matched only the prose and saw no incident at all.
     incidents = [
         item
         for item in activity.get("incidents") or []
-        if _mentions(item.get("reasons"), UNPARSED_KIND)
+        if _mentions(item.get("incident_id"), UNPARSED_KIND)
+        or _mentions(item.get("event_id"), UNPARSED_KIND)
+        or _mentions(item.get("reasons"), UNPARSED_KIND)
         or _mentions(item.get("event_type"), UNPARSED_KIND)
     ]
     if not incidents:

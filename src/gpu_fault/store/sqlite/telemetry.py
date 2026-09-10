@@ -14,7 +14,7 @@ from gpu_fault.store.shared.telemetry_models import (
     GpuFindingKey,
     GpuMetricKey,
 )
-from gpu_fault.telemetry import CollectorStatus
+from gpu_fault.telemetry import CollectorStatus, merge_collector_status
 from gpu_fault.telemetry_models import (
     TelemetryMetricLatest,
     WorkloadObservationState,
@@ -236,23 +236,12 @@ class SqliteTelemetryMixin:
             results: list[bool] = []
             final_by_key: dict[str, CollectorStatus] = {}
             for storage_key, status in zip(storage_keys, statuses, strict=True):
-                previous = current_by_key.get(storage_key)
-                if previous is not None and status.observed_at < previous.observed_at:
+                merged = merge_collector_status(current_by_key.get(storage_key), status)
+                if merged is None:
                     results.append(False)
                     continue
-                if previous is not None:
-                    status = status.model_copy(
-                        update={
-                            "last_success_at": (
-                                status.last_success_at or previous.last_success_at
-                            ),
-                            "last_error_at": (
-                                status.last_error_at or previous.last_error_at
-                            ),
-                        }
-                    )
-                current_by_key[storage_key] = status
-                final_by_key[storage_key] = status
+                current_by_key[storage_key] = merged
+                final_by_key[storage_key] = merged
                 results.append(True)
             for storage_key, status in final_by_key.items():
                 self._put("collector_status", storage_key, status)

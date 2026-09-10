@@ -28,6 +28,8 @@ from gpu_fault.policy import (
     XidEvent,
 )
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
+from gpu_fault.store import NotFoundError
+from gpu_fault.telemetry import WorkloadContext
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
 
 LOGGER = logging.getLogger(__name__)
@@ -148,8 +150,8 @@ class FaultIngestionService:
             )
         return result
 
-    @staticmethod
     def _unresolved_signal_finding(
+        self,
         signal: HmaProviderSignal,
         *,
         kind: str,
@@ -164,6 +166,7 @@ class FaultIngestionService:
             cluster_id=signal.cluster_id,
             node_id=signal.node_id,
             observed_at=signal.observed_at,
+            runtime_profile_version=self._unresolved_signal_profile_version(signal),
             category=NodeHealthCategory.GPU,
             severity=Severity.WARNING,
             reason=(
@@ -185,6 +188,36 @@ class FaultIngestionService:
                 "unresolved fault lines fail closed into operator review"
             ),
         )
+
+    def _unresolved_signal_profile_version(
+        self, signal: HmaProviderSignal
+    ) -> str | None:
+        """The runtime profile the unresolved line's finding executes under.
+
+        The health family refuses to compile without one -- even the
+        FREEZE_EVIDENCE-only workflow this finding asks for needs the profile
+        to name the evidence-capture owner -- so a finding built without it
+        blocked as NEEDS_OPERATOR with no steps, no evidence frozen, and the
+        operator-review notification pointing at an empty workflow. The
+        source record's own version comes first (the kernel collector stamps
+        it from its environment); a record without one falls back to the
+        workload topology, the same source the XID path uses, and finally to
+        the node agent's registration.
+        """
+
+        if signal.runtime_profile_version:
+            return signal.runtime_profile_version
+        context: WorkloadContext = self.context.topology.resolve(
+            signal.cluster_id, signal.node_id, signal.observed_at
+        )
+        if context.runtime_profile_version:
+            return context.runtime_profile_version
+        try:
+            agent = self.context.store.get_agent(signal.cluster_id, signal.node_id)
+        except NotFoundError:
+            return None
+        version = agent.runtime_profile_version
+        return str(version) if version else None
 
     def _enrich_fault_identity(
         self,

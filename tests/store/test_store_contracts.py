@@ -1117,3 +1117,50 @@ def test_postgres_semantics_registry_points_at_postgres_shard_tests() -> None:
         name for name, path in POSTGRES_ONLY_PUBLIC_METHODS.items() if not path
     )
     assert len(gaps) <= 4, f"the known-gap list only grows with a review: {gaps}"
+
+
+def test_collector_status_merge_keeps_a_rejected_event_until_a_newer_success(
+    processor_store,
+) -> None:
+    """Every backend folds statuses through the one shared merge (ARCH-G1)."""
+
+    from gpu_fault.telemetry import CollectorKind, CollectorStatus
+
+    now = datetime(2026, 9, 10, 4, 8, 26, tzinfo=timezone.utc)
+
+    def status(**overrides):
+        values = {
+            "cluster_id": "cluster-a",
+            "node_id": "node-a",
+            "collector": CollectorKind.NVIDIA_KERNEL,
+            "observed_at": now,
+            "ingested_at": now,
+        }
+        values.update(overrides)
+        return CollectorStatus(**values)
+
+    rejected = "rejected-event: HTTP 422 body.field: extra"
+    assert processor_store.save_collector_status(
+        status(last_error_at=now, errors=[rejected])
+    ), "the rejection row is the first write"
+    assert processor_store.save_collector_status(
+        status(
+            observed_at=now + timedelta(seconds=1),
+            last_success_at=now - timedelta(seconds=1),
+            errors=[],
+        )
+    ), "the sink's newer status is accepted"
+    row = processor_store.list_collector_statuses("cluster-a", "node-a")[0]
+    assert row.errors == [rejected], "the sink's older success must not erase it"
+    assert row.last_error_at == now, "the rejection clock is kept"
+    assert processor_store.save_collector_status(
+        status(
+            observed_at=now + timedelta(minutes=2),
+            last_success_at=now + timedelta(minutes=2),
+        )
+    ), "the later success is accepted"
+    row = processor_store.list_collector_statuses("cluster-a", "node-a")[0]
+    assert row.errors == [], "a success newer than the rejection clears it"
+    assert not processor_store.save_collector_status(
+        status(observed_at=now - timedelta(minutes=1), errors=["stale"])
+    ), "a replay older than the row is still dropped"

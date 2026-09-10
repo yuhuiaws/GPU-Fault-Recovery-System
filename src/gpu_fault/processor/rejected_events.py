@@ -33,12 +33,16 @@ from gpu_fault.channel_registry import (
     channel_for_path,
 )
 from gpu_fault.processor.models import ProcessorRequest
-from gpu_fault.telemetry import CollectorKind, CollectorStatus
+from gpu_fault.telemetry import (
+    REJECTED_EVENT_ERROR_PREFIX,
+    CollectorKind,
+    CollectorStatus,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 #: Prefix of the ``CollectorStatus.errors`` entry a rejected event records.
-REJECTED_EVENT_ERROR_PREFIX = "rejected-event:"
+__all__ = ["REJECTED_EVENT_ERROR_PREFIX"]
 #: How much of the handler's detail is kept in the log and the status.
 DETAIL_LIMIT = 200
 
