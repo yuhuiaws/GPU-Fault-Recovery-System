@@ -355,6 +355,11 @@ def outbox_records(collector: str, marker: str | None) -> list[dict[str, Any]]:
                 "failed_at": record.get("failed_at"),
                 "error": str(record.get("error") or "")[:200],
                 "marker_present": marker is not None and marker in encoded,
+                # One outbox record is one POST body, and a collector batches
+                # every event of a cycle into it: two marked kmsg lines written
+                # ten seconds apart were one record (NET-008, 2026-09-10), so
+                # the count of marked events is reported beside the flag.
+                "marker_count": encoded.count(marker) if marker else 0,
             }
         )
     return records

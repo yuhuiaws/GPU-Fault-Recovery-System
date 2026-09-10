@@ -478,6 +478,7 @@ def _install_regional_auth(
             context=ctx,
             replay_authorized=processor_replay_authorized,
             authorization_bucket=registry.effective,
+            route_exists=registry.route_exists,
             authenticate_cluster=authenticate_regional_cluster,
             decode_io=decode_io,
             decode_json_body=decode_json_body,

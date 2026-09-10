@@ -212,6 +212,11 @@ def _phase_transient_403(run: _Run) -> None:
     run.window_open = True
     write_json_atomic(run.case_dir / "window-open.json", run.opened)
     run.stages["window"] = verdicts.window_errors(run.opened)
+    # open-window restarts the unit, and the restarted collector reopens
+    # /dev/kmsg at the live tail: a line written before its reader is up is
+    # never seen (attempt 1, 2026-09-10: the first transient marker vanished
+    # while the second, ten seconds later, was buffered). Let it settle first.
+    time.sleep(verdicts.COLLECTOR_SETTLE_SECONDS)
     for marker in run.transient_markers:
         run.write_kmsg(marker)
         time.sleep(10)

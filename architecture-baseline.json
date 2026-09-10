@@ -75,7 +75,7 @@
     "src/gpu_fault/app/factory.py:create_app": 291,
     "src/gpu_fault/app/lifespan.py:create_lifespan": 202,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 225,
-    "src/gpu_fault/app/middleware/auth.py:install_regional_authorization": 208,
+    "src/gpu_fault/app/middleware/auth.py:install_regional_authorization": 203,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor._execute_dag": 250,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor.execute": 219,
     "src/gpu_fault/node_agent/app.py:create_node_agent_app": 333,

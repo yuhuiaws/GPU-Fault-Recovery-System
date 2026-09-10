@@ -40,7 +40,7 @@ def test_the_transient_outbox_contract_rejects_a_dead_letter_or_a_missing_record
             expected=2,
         )
     )
-    assert "1 marked outbox records, expected 2" in _text(
+    assert "1 marked outbox events in 1 record(s), expected 2" in _text(
         verdicts.transient_outbox_errors(
             [_record()], {"replayable": 1, "dead": 0}, expected=2
         )
@@ -52,6 +52,22 @@ def test_the_transient_outbox_contract_rejects_a_dead_letter_or_a_missing_record
             expected=2,
         )
     )
+
+
+def test_two_transient_events_batched_into_one_record_count_as_two() -> None:
+    """A record is one POST body; the collector batches a cycle's events into
+    it, so two marked lines ten seconds apart were one record with two markers
+    (attempt 1, 2026-09-10). The verdict counts marked events."""
+    records = [_record(marker_count=2)]
+    stats = {"depth": 1, "replayable": 1, "dead": 0}
+    assert verdicts.transient_outbox_errors(records, stats, expected=2) == []
+    errors = verdicts.transient_outbox_errors(
+        [_record(marker_count=1)], stats, expected=2
+    )
+    assert any("1 marked outbox events in 1 record(s)" in item for item in errors), (
+        errors
+    )
+    assert verdicts.COLLECTOR_SETTLE_SECONDS >= 10
 
 
 def test_the_service_contract_counts_only_automatic_restarts() -> None:

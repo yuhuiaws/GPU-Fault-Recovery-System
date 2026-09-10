@@ -37,6 +37,11 @@ class RegionalAuthDependencies:
     # ``{"nul": n}`` shared with dispatch (E-3).
     decode_rejections: dict[str, int] | None = None
     retry_after_seconds: int = 2
+    # ``ExplicitAuthorizationRegistry.route_exists``: lets the default deny tell
+    # a route that declared no bucket (403, fail closed) from a path no route
+    # serves at all (404, what the router would say). Optional so an assembly
+    # that predates it keeps answering 403 for both.
+    route_exists: Callable[[str], bool] | None = None
 
 
 class _PayloadScanRejected(Exception):
@@ -46,6 +51,25 @@ class _PayloadScanRejected(Exception):
     the JSON decode, whose ``ValueError`` means "not JSON" and answers 400,
     while this one answers 422 as it always has.
     """
+
+
+def _unresolved_bucket_response(
+    dependencies: RegionalAuthDependencies, path: str
+) -> JSONResponse:
+    """No bucket resolved: 404 for a path no route serves, else fail closed.
+
+    The collector's outbox dead-letters a 404 and replays a 403 forever, so a
+    record for a retired channel must meet the router's answer, not the default
+    deny's (NET-008, 2026-09-10). A route that exists without a bucket is a
+    coding error and stays 403.
+    """
+
+    if dependencies.route_exists is not None and not dependencies.route_exists(path):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "regional route has no declared authorization bucket"},
+    )
 
 
 def install_regional_authorization(
@@ -66,12 +90,7 @@ def install_regional_authorization(
             request.method,
         )
         if bucket is None:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": ("regional route has no declared authorization bucket")
-                },
-            )
+            return _unresolved_bucket_response(dependencies, request.url.path)
         if bucket != "execution-token":
             return await call_next(request)
         supplied = request.headers.get("X-GPU-Fault-Execution-Token")

@@ -51,6 +51,20 @@ def test_unannotated_route_fails_closed_at_startup() -> None:
         ExplicitAuthorizationRegistry().load(app.routes)
 
 
+def test_route_exists_tells_an_unserved_path_from_a_declared_route() -> None:
+    """The default deny answers 403 for a path it cannot bucket; a path no route
+    serves must read 404 instead -- a collector's outbox dead-letters a 404 and
+    replays a 403 forever (NET-008, 2026-09-10)."""
+    app = create_app(build_context())
+    registry = ExplicitAuthorizationRegistry()
+    registry.load(app.routes)
+
+    served = ["/v1/capabilities/operations", DUAL_CREDENTIAL_PATH, "/healthz"]
+    unserved = ["/v1/collector-events/retired-acceptance-channel", "/v1/no-such-route"]
+    assert [registry.route_exists(path) for path in served] == [True] * 3, served
+    assert [registry.route_exists(path) for path in unserved] == [False] * 2, unserved
+
+
 def test_no_write_route_is_public_or_metrics() -> None:
     app = create_app(build_context())
     registry = ExplicitAuthorizationRegistry()

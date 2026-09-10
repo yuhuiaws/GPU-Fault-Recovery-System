@@ -181,6 +181,36 @@ class ExplicitAuthorizationRegistry:
     ) -> str | None:
         return self._declared(path, method)
 
+    def route_exists(self, path: str) -> bool:
+        """Whether any registered route claims ``path`` for some method.
+
+        The default-deny middleware answers 403 when it cannot resolve a bucket.
+        For a path no route serves that is the wrong status: a collector whose
+        outbox holds a record for a retired channel reads 403 as a token
+        rotation in progress and replays it forever, where the 404 the router
+        would have answered dead-letters it (NET-008, 2026-09-10). A path that
+        matches a route only partially (wrong method) still exists.
+        """
+
+        scope = {
+            "type": "http",
+            "path": path,
+            "root_path": "",
+            "method": "GET",
+            "headers": [],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("localhost", 80),
+            "client": ("127.0.0.1", 1),
+        }
+        return (
+            any(
+                entry.route.matches(scope)[0] in {Match.FULL, Match.PARTIAL}
+                for entry in self._routes
+            )
+            or path in UNDOCUMENTED_PUBLIC_PATHS
+        )
+
     def effective(
         self,
         path: str,

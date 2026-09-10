@@ -30,6 +30,9 @@ PREDECESSOR_CASE_ID = "GF-REGIONAL-NET-007"
 UNIT = "gpu-fault-kernel-collector.service"
 COLLECTOR = "kernel"
 RETIRED_CHANNEL_PATH = "/v1/collector-events/retired-acceptance-channel"
+# Seconds the restarted kernel collector gets to reopen /dev/kmsg and reach its
+# read loop before the first marked line is written.
+COLLECTOR_SETTLE_SECONDS = 15
 TRANSIENT_EVENTS = 2
 WINDOW_RESTORE_SECONDS = 600
 BLOCK_TTL_SECONDS = 300
@@ -55,8 +58,14 @@ def transient_outbox_errors(
 
     marked = [item for item in records if item.get("marker_present")]
     errors: list[str] = []
-    if len(marked) != expected:
-        errors.append(f"{len(marked)} marked outbox records, expected {expected}")
+    # A record is a whole POST body, so the two transient events may share one
+    # record; count the marked events, not the records that carry them.
+    events = sum(int(item.get("marker_count") or 1) for item in marked)
+    if events != expected:
+        errors.append(
+            f"{events} marked outbox events in {len(marked)} record(s), "
+            f"expected {expected}"
+        )
     for item in marked:
         if item.get("replayable") is not True:
             errors.append(f"a 403-refused record is not replayable: {item}")
@@ -66,10 +75,12 @@ def transient_outbox_errors(
         errors.append(
             f"outbox stats count {stats.get('dead')} dead record(s) after 403s"
         )
-    if int(stats.get("replayable") or 0) < expected:
+    # ``stats`` counts records, not events: every marked record must be
+    # replayable, however many events it batches.
+    if int(stats.get("replayable") or 0) < len(marked):
         errors.append(
             f"outbox stats count {stats.get('replayable')} replayable, expected "
-            f"at least {expected}"
+            f"at least {len(marked)}"
         )
     return errors
 

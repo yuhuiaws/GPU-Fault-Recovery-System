@@ -96,6 +96,8 @@ def _app_with_auth(
     dispatch_state=None,
     decode_rejections=None,
     retry_after_seconds=2,
+    authorization_bucket=lambda *_arguments: "cluster-token",
+    route_exists=None,
 ) -> FastAPI:
     app = FastAPI()
 
@@ -109,7 +111,7 @@ def _app_with_auth(
         RegionalAuthDependencies(
             context=SimpleNamespace(regional_mode=True, execution_token=None),
             replay_authorized=lambda _request: False,
-            authorization_bucket=lambda *_arguments: "cluster-token",
+            authorization_bucket=authorization_bucket,
             authenticate_cluster=lambda *_arguments: _registration(),
             decode_io=decode_io or _Runner("general"),
             decode_json_body=AdmissionRuntimeFactory._decode_json_body(MAX_BYTES),
@@ -120,6 +122,7 @@ def _app_with_auth(
             dispatch_state=dispatch_state,
             decode_rejections=decode_rejections,
             retry_after_seconds=retry_after_seconds,
+            route_exists=route_exists,
         ),
     )
     return app
@@ -311,6 +314,33 @@ def test_a_too_complex_payload_is_still_a_422_from_the_pool() -> None:
 
     assert status == 422
     assert "too structurally complex" in body["detail"]
+
+
+def test_an_unserved_path_is_404_and_an_unbucketed_route_stays_403() -> None:
+    """A collector replaying a record for a retired channel must meet the 404
+    that dead-letters it, not the default deny's 403 that it treats as a token
+    rotation in progress (NET-008, 2026-09-10). A route that exists without a
+    bucket is still refused fail-closed."""
+    app = _app_with_auth(
+        authorization_bucket=lambda *_arguments: None,
+        route_exists=lambda path: path == ROUTINE_PATH,
+    )
+
+    status, body, _ = _post(
+        app, "/v1/collector-events/retired-channel", headers={}, body=b"{}"
+    )
+    assert status == 404
+    assert body["detail"] == "Not Found"
+
+    status, body, _ = _post(app, ROUTINE_PATH, headers={}, body=b"{}")
+    assert status == 403
+    assert "no declared authorization bucket" in body["detail"]
+
+    legacy = _app_with_auth(authorization_bucket=lambda *_arguments: None)
+    status, _body, _ = _post(
+        legacy, "/v1/collector-events/retired-channel", headers={}, body=b"{}"
+    )
+    assert status == 403, "without route_exists the assembly keeps its old answer"
 
 
 def test_a_foreign_cluster_id_is_still_refused() -> None:
