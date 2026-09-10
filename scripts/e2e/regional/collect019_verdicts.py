@@ -55,7 +55,11 @@ def timing_errors(
             f"hang {hang_seconds}s does not exceed the {NVIDIA_SMI_TIMEOUT_SECONDS}s "
             "nvidia-smi timeout"
         )
-    rounds_to_breaker = breaker_rounds * (interval_seconds + NVIDIA_SMI_TIMEOUT_SECONDS)
+    # Utilization and inventory are distinct queries, so a hung round pays the
+    # timeout twice before it sleeps the interval.
+    rounds_to_breaker = breaker_rounds * (
+        interval_seconds + 2 * NVIDIA_SMI_TIMEOUT_SECONDS
+    )
     if rounds_to_breaker * 2 >= silent_after_seconds:
         errors.append(
             f"reaching the breaker takes {rounds_to_breaker}s per attempt; twice "
@@ -85,13 +89,25 @@ def host_status(statuses: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def erroring_status_errors(statuses: list[dict[str, Any]]) -> list[str]:
-    """The host channel reports the timeout and, after N rounds, the breaker."""
+def erroring_status_errors(
+    statuses: list[dict[str, Any]], *, seen: set[str] | None = None
+) -> list[str]:
+    """The host channel reports the timeout and, after N rounds, the breaker.
+
+    Every accepted batch replaces the row's ``errors``: the timed-out rounds
+    say "timed out", the round that opens the breaker says "circuit breaker
+    open" and no longer names the timeout. The two are never on the row at
+    once, so the runner accumulates the texts it has read across its polls
+    in ``seen``; the row itself only has to be erroring *now*.
+    """
 
     status = host_status(statuses)
     if status is None:
         return ["the node has no HOST_TELEMETRY collector status row"]
-    texts = [str(item) for item in status.get("errors") or []]
+    current = [str(item) for item in status.get("errors") or []]
+    if seen is not None:
+        seen.update(current)
+    texts = sorted(set(current) | (seen or set()))
     errors: list[str] = []
     if not any("nvidia-smi" in text and TIMEOUT_TEXT in text for text in texts):
         errors.append(f"no nvidia-smi timeout collection error: {texts!r}")

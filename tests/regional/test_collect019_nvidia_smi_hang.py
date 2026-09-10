@@ -48,6 +48,33 @@ def test_the_erroring_status_contract_passes_on_timeout_then_breaker() -> None:
     )
 
 
+def test_the_timeout_and_the_breaker_may_arrive_on_different_batches() -> None:
+    """The breaker round replaces the timeout text; the runner remembers it.
+
+    Live, the row read "timed out" for three rounds and then only "circuit
+    breaker open"; requiring both on one row failed a hang that behaved
+    exactly as specified.
+    """
+
+    seen: set[str] = set()
+    first = [_status(errors=["_gpu_utilization: nvidia-smi timed out after 15s"])]
+    assert "circuit breaker open" in _text(
+        verdicts.erroring_status_errors(first, seen=seen)
+    ), "the timeout alone is not yet the breaker"
+    later = [
+        _status(
+            errors=[
+                "_gpu_utilization: CollectorError: nvidia-smi circuit breaker open "
+                "(3 consecutive timeouts); GPU queries skipped this round"
+            ]
+        )
+    ]
+    assert verdicts.erroring_status_errors(later, seen=seen) == [], (
+        "a timeout read earlier and the breaker read now is the specified sequence"
+    )
+    assert any("timed out" in text for text in seen), "the runner keeps what it saw"
+
+
 def test_the_erroring_status_contract_rejects_a_missing_breaker_or_timeout() -> None:
     assert "no nvidia-smi timeout" in _text(
         verdicts.erroring_status_errors(

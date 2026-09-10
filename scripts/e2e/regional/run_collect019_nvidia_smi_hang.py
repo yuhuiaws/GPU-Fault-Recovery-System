@@ -106,6 +106,7 @@ def execute(
     opened: dict[str, Any] = {}
     statuses: list[dict[str, Any]] = []
     window_open = False
+    errors_seen: set[str] = set()
     try:
         opened = open_window_or_rollback(
             fixture,
@@ -121,13 +122,15 @@ def execute(
         write_json_atomic(case_dir / "window-open.json", opened)
         stages["window"] = verdicts.window_errors(opened)
         # Three timed-out rounds plus the round that reports the open breaker.
+        # A round pays the timeout once per distinct query (utilization and
+        # inventory), so it is interval + 2 x timeout long under the hang.
         budget = (verdicts.BREAKER_ROUNDS + 1) * (
-            interval + verdicts.NVIDIA_SMI_TIMEOUT_SECONDS
+            interval + 2 * verdicts.NVIDIA_SMI_TIMEOUT_SECONDS
         ) + interval * 2
 
         def erroring() -> dict[str, Any] | None:
             records = fixture.collector_statuses()
-            if verdicts.erroring_status_errors(records):
+            if verdicts.erroring_status_errors(records, seen=errors_seen):
                 return None
             return {"records": records}
 
@@ -145,7 +148,9 @@ def execute(
         )
         during = fixture.snapshot()
         metrics_during = fixture.control_plane_metrics()
-        stages["erroring_status"] = verdicts.erroring_status_errors(statuses)
+        stages["erroring_status"] = verdicts.erroring_status_errors(
+            statuses, seen=errors_seen
+        )
         stages["service"] = verdicts.service_errors(
             opened.get("after") or {}, during["services"][verdicts.UNIT]
         )
@@ -190,6 +195,7 @@ def execute(
         "host_interval_seconds": interval,
         "window_open": opened,
         "statuses_during": statuses,
+        "errors_seen_during_window": sorted(errors_seen),
         "statuses_final": final_statuses,
         "services_after": after["services"],
         "limitations": [
