@@ -6269,7 +6269,13 @@ test_cases:
   - 无编号行产生 unparsed_xid_line incident，其工作流只含 FREEZE_EVIDENCE、不含隔离/重启/reset，有 OPERATOR_REVIEW 通知，原始行保留为证据，gpu_fault_ingest_unresolved_fault_signals_total{kind=unparsed_xid_line} 增加
   - 一条真实接受的批次后 last_success_at > last_error_at；节点无 ownership、可调度
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 33af060d2f644f60043754deca55a0b047d116d1b320c78d35081a719e11400e
+      components:
+        control_plane: 69b5520bbb50a4161642fc4fabd5361a23e31a198006a5672d6fdb1c58c7cefb
+        executor: 96e29dc694ed68529755b46f2d80643cd1a62a0a1fd8bf17012990b3cb91fca2
+        node_runtime: 5e93fabe1f4971a095f2f686ab67e7a084c325e56139974cc58ae327aec7ae79
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-018
   related_pytest: tests/regional/test_collect018_rejected_event.py::test_the_rejected_status_contract_passes_on_a_rejected_event_row
