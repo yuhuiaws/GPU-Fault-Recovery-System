@@ -5799,7 +5799,13 @@ test_cases:
   - 再多跑一轮：workflow、incident、remote command 快照逐字段不变，事件不新增
   - 证据记录 store_backend（postgres 或 sqlite）、每轮 withhold 集合、前后状态与审计事件，且只含摘要、不含 URL 与口令
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6e171e0887f2d0e75b76219bf4a8a2f95c63ed1970f5e48c8d851924cb3a1714
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-036卡死工作流由dispatcher自动关闭
   execution:
