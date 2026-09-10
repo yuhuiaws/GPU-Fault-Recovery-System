@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
+from scripts.e2e.regional.auth016_command_baseline import SeededBaseline
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeSettings
 from scripts.e2e.regional.identity_acceptance_common import (
@@ -725,9 +726,9 @@ def auth016_result(
             "The retiring token stays valid for the whole overlap window, so this "
             "case proves there is no interruption, not that the old credential is "
             "revoked instantly; both original Secrets are restored.",
-            "remote_commands_not_misterminated needs at least one command open "
-            "before the rotation; on an idle site the check fails rather than "
-            "passing over an empty baseline.",
+            "remote_commands_not_misterminated is proven on one seeded command for "
+            "the synthetic cluster perf-cap-000 (never executed, purged after the "
+            "verdict) plus whatever real commands were open before the rotation.",
         ],
     }
 
@@ -751,168 +752,166 @@ def run_auth016(
     new_token = secrets.token_urlsafe(48)
     identity = executor_claim_identity(site, target)
     primary = site.regional(target)
-    before_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
-    deadline = datetime.now(timezone.utc) + timedelta(minutes=30)
-    token_lock = threading.Lock()
-    token_box = [old_token]
-    phase_box = ["baseline"]
-    stop = threading.Event()
-    samples: list[dict[str, Any]] = []
+    # One command stays open through the whole rotation and the restore, so
+    # the misterminated-command check has something real to prove; the seed is
+    # purged when this block exits, after the verdict below has read it.
+    with SeededBaseline.open(primary.cpu_python, case_dir):
+        before_commands = primary.cpu_python(REMOTE_STATUS_PROBE)
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=30)
+        token_lock = threading.Lock()
+        token_box = [old_token]
+        phase_box = ["baseline"]
+        stop = threading.Event()
+        samples: list[dict[str, Any]] = []
 
-    def sampler() -> None:
-        while not stop.is_set():
+        def sampler() -> None:
+            while not stop.is_set():
+                with token_lock:
+                    token = token_box[0]
+                    phase = phase_box[0]
+                # Re-check after the wait: a stop that arrived during the pause
+                # must not be answered with one more claim, which would run while
+                # the restore is republishing the original token.
+                if stop.is_set():
+                    return
+                samples.append(
+                    {
+                        "observed_at": utc_now(),
+                        "phase": phase,
+                        "status": direct_claim(
+                            primary, target, token=token, identity=identity
+                        ),
+                    }
+                )
+                stop.wait(2)
+
+        def enter(phase: str, *, token: str | None = None) -> None:
             with token_lock:
-                token = token_box[0]
-                phase = phase_box[0]
-            # Re-check after the wait: a stop that arrived during the pause
-            # must not be answered with one more claim, which would run while
-            # the restore is republishing the original token.
-            if stop.is_set():
-                return
-            samples.append(
-                {
-                    "observed_at": utc_now(),
-                    "phase": phase,
-                    "status": direct_claim(
-                        primary, target, token=token, identity=identity
-                    ),
-                }
+                phase_box[0] = phase
+                if token is not None:
+                    token_box[0] = token
+
+        thread = threading.Thread(target=sampler, daemon=True)
+        restored = False
+        control_rollout: float | None = None
+        executor_rollout = None
+        new_token_during_overlap: int | str | None = None
+        old_token_after_completion: int | str | None = None
+        registry_generation = site.registry_generation()
+        cleanup_errors: list[str] = []
+        cleanup: dict[str, Any] = {}
+
+        def partial() -> dict[str, Any]:
+            return {
+                "samples": samples,
+                "new_token_during_overlap": new_token_during_overlap,
+                "old_token_after_completion": old_token_after_completion,
+                "cleanup": cleanup,
+                "cleanup_errors": cleanup_errors,
+                "restored": restored,
+            }
+
+        try:
+            thread.start()
+            time.sleep(60)
+            # Control plane first: both slots live, data plane untouched.
+            site.write_registry(
+                update_registry_token(
+                    original_registry,
+                    target.cluster_id,
+                    new_token,
+                    retiring_token=old_token,
+                    rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
+                ),
+                reason="GF-REGIONAL-AUTH-016 overlap: new token live, old token retiring",
             )
-            stop.wait(2)
-
-    def enter(phase: str, *, token: str | None = None) -> None:
-        with token_lock:
-            phase_box[0] = phase
-            if token is not None:
-                token_box[0] = token
-
-    thread = threading.Thread(target=sampler, daemon=True)
-    restored = False
-    control_rollout: float | None = None
-    executor_rollout = None
-    new_token_during_overlap: int | str | None = None
-    old_token_after_completion: int | str | None = None
-    registry_generation = site.registry_generation()
-    cleanup_errors: list[str] = []
-    cleanup: dict[str, Any] = {}
-
-    def partial() -> dict[str, Any]:
-        return {
-            "samples": samples,
-            "new_token_during_overlap": new_token_during_overlap,
-            "old_token_after_completion": old_token_after_completion,
-            "cleanup": cleanup,
-            "cleanup_errors": cleanup_errors,
-            "restored": restored,
-        }
-
-    try:
-        thread.start()
-        time.sleep(60)
-        # Control plane first: both slots live, data plane untouched.
-        site.write_registry(
-            update_registry_token(
-                original_registry,
-                target.cluster_id,
-                new_token,
-                retiring_token=old_token,
-                rotation_expires_at=deadline.isoformat().replace("+00:00", "Z"),
-            ),
-            reason="GF-REGIONAL-AUTH-016 overlap: new token live, old token retiring",
-        )
-        # POST-to-last-ack propagation time; rollout_control is a no-op on a
-        # durable-revision site and would have measured ~1 s.
-        control_rollout = site.last_registry_ready_seconds or site.rollout_control()
-        enter("overlap")
-        time.sleep(30)
-        new_token_during_overlap = direct_claim(
-            primary,
-            target,
-            token=new_token,
-            identity=identity,
-        )
-        write_cluster_token(site, target, new_token)
-        executor_rollout = rollout_executor(site, target)
-        enter("cutover", token=new_token)
-        time.sleep(30)
-        # Finishing the rotation must withdraw the old credential at once
-        # instead of leaving it live until the deadline lapses.
-        site.write_registry(
-            update_registry_token(original_registry, target.cluster_id, new_token),
-            reason="GF-REGIONAL-AUTH-016 completed: retiring slot withdrawn",
-        )
-        site.rollout_control()
-        enter("completed")
-        old_token_after_completion = direct_claim(
-            primary,
-            target,
-            token=old_token,
-            identity=identity,
-        )
-        time.sleep(10)
-    except Exception as exc:
-        raise IdentityCaseFailure(str(exc), details=partial()) from exc
-    finally:
-        stop.set()
-        # The sampler's worst case is one whole direct_claim; a shorter join
-        # let a claim in flight land after the restore below.
-        thread.join(timeout=DIRECT_CLAIM_JOIN_SECONDS)
-        if thread.is_alive():
-            cleanup_errors.append("sampler thread did not stop before restore")
-
-        def verify_restored() -> bool:
-            return registry_token_digests(
-                site.registry(), target.cluster_id
-            ) == registry_token_digests(
-                original_registry, target.cluster_id
-            ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
-                old_token
+            # POST-to-last-ack propagation time; rollout_control is a no-op on a
+            # durable-revision site and would have measured ~1 s.
+            control_rollout = site.last_registry_ready_seconds or site.rollout_control()
+            enter("overlap")
+            time.sleep(30)
+            new_token_during_overlap = direct_claim(
+                primary, target, token=new_token, identity=identity
             )
+            write_cluster_token(site, target, new_token)
+            executor_rollout = rollout_executor(site, target)
+            enter("cutover", token=new_token)
+            time.sleep(30)
+            # Finishing the rotation must withdraw the old credential at once
+            # instead of leaving it live until the deadline lapses.
+            site.write_registry(
+                update_registry_token(original_registry, target.cluster_id, new_token),
+                reason="GF-REGIONAL-AUTH-016 completed: retiring slot withdrawn",
+            )
+            site.rollout_control()
+            enter("completed")
+            old_token_after_completion = direct_claim(
+                primary, target, token=old_token, identity=identity
+            )
+            time.sleep(10)
+        except Exception as exc:
+            raise IdentityCaseFailure(str(exc), details=partial()) from exc
+        finally:
+            stop.set()
+            # The sampler's worst case is one whole direct_claim; a shorter join
+            # let a claim in flight land after the restore below.
+            thread.join(timeout=DIRECT_CLAIM_JOIN_SECONDS)
+            if thread.is_alive():
+                cleanup_errors.append("sampler thread did not stop before restore")
 
-        # In place: the IdentityCaseFailure raised above holds these containers.
-        step_outcomes, step_errors = run_cleanup_steps(
-            [
-                (
-                    "restore_registry",
-                    lambda: site.write_registry(
-                        original_registry,
-                        reason=(
-                            "GF-REGIONAL-AUTH-016 restore: original token republished"
+            def verify_restored() -> bool:
+                return registry_token_digests(
+                    site.registry(), target.cluster_id
+                ) == registry_token_digests(
+                    original_registry, target.cluster_id
+                ) and secret_digest(read_cluster_token(site, target)) == secret_digest(
+                    old_token
+                )
+
+            # In place: the IdentityCaseFailure raised above holds these containers.
+            step_outcomes, step_errors = run_cleanup_steps(
+                [
+                    (
+                        "restore_registry",
+                        lambda: site.write_registry(
+                            original_registry,
+                            reason=(
+                                "GF-REGIONAL-AUTH-016 restore: original token republished"
+                            ),
                         ),
                     ),
-                ),
-                ("rollout_control", site.rollout_control),
-                (
-                    "restore_cluster_token",
-                    lambda: write_cluster_token(site, target, old_token),
-                ),
-                ("rollout_executor", lambda: rollout_executor(site, target)),
-                ("verify_restored", verify_restored),
-            ]
+                    ("rollout_control", site.rollout_control),
+                    (
+                        "restore_cluster_token",
+                        lambda: write_cluster_token(site, target, old_token),
+                    ),
+                    ("rollout_executor", lambda: rollout_executor(site, target)),
+                    ("verify_restored", verify_restored),
+                ]
+            )
+            cleanup.update(step_outcomes)
+            cleanup_errors.extend(step_errors)
+            restored = cleanup.get("verify_restored") is True and not cleanup_errors
+            write_json_atomic(case_dir / "auth016-details.json", partial())
+        if thread.is_alive():
+            raise IdentityCaseFailure(
+                "sampler thread outlived the restore; samples cannot be attributed",
+                details=partial(),
+            )
+        return auth016_result(
+            site,
+            primary,
+            samples=samples,
+            before_commands=before_commands,
+            new_token_during_overlap=new_token_during_overlap,
+            old_token_after_completion=old_token_after_completion,
+            restored=restored,
+            registry_generation=registry_generation,
+            control_rollout=control_rollout,
+            executor_rollout=executor_rollout,
+            old_token=old_token,
+            new_token=new_token,
         )
-        cleanup.update(step_outcomes)
-        cleanup_errors.extend(step_errors)
-        restored = cleanup.get("verify_restored") is True and not cleanup_errors
-        write_json_atomic(case_dir / "auth016-details.json", partial())
-    if thread.is_alive():
-        raise IdentityCaseFailure(
-            "sampler thread outlived the restore; samples cannot be attributed",
-            details=partial(),
-        )
-    return auth016_result(
-        site,
-        primary,
-        samples=samples,
-        before_commands=before_commands,
-        new_token_during_overlap=new_token_during_overlap,
-        old_token_after_completion=old_token_after_completion,
-        restored=restored,
-        registry_generation=registry_generation,
-        control_rollout=control_rollout,
-        executor_rollout=executor_rollout,
-        old_token=old_token,
-        new_token=new_token,
-    )
 
 
 TLS_BOUNDARY_PROBE = r"""

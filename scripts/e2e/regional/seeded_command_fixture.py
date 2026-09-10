@@ -329,14 +329,22 @@ def seed_command(
     node_ids: list[str],
     cluster_id: str = SYNTHETIC_CLUSTER_ID,
     lease_seconds: int = SEED_LEASE_SECONDS,
+    run: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Seed one command (with its workflow and incident) straight into the store.
+
+    ``run`` executes a script in a control-plane Pod; by default this module's
+    ``cpu_python`` (the perf environment, resolved at call time so a test can
+    replace it), a case that already holds a live fixture passes its own.
+    """
+
     if not node_ids or any("," in item or not item for item in node_ids):
         raise SeededCommandError("seeded node ids must be non-empty and comma-free")
     if lease_seconds < 60:
         raise SeededCommandError(
             "the seeded workflow lease must be at least 60 seconds"
         )
-    return cpu_python(
+    return (run or cpu_python)(
         _SEED_COMMAND,
         run_id,
         cluster_id,
@@ -427,8 +435,10 @@ print(json.dumps({
 """
 
 
-def purge_seed(seed: dict[str, Any]) -> dict[str, Any]:
-    result = cpu_python(
+def purge_seed(
+    seed: dict[str, Any], *, run: Callable[..., dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    result = (run or cpu_python)(
         _PURGE_SEED,
         str(seed["command_id"]),
         str(seed["workflow_id"]),

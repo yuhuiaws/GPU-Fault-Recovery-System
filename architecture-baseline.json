@@ -24,7 +24,7 @@
     "deploy/hyperpod/deploy.sh": 3345,
     "deploy/node/install-gpu-fault-collector.sh": 1937,
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1680,
-    "scripts/e2e/regional/identity_acceptance_auth.py": 1787,
+    "scripts/e2e/regional/identity_acceptance_auth.py": 1786,
     "scripts/e2e/regional/regional_live_fixture.py": 1627,
     "scripts/e2e/regional/run_collector_acceptance.py": 1807,
     "scripts/e2e/regional/run_collector_destructive.py": 1914,
