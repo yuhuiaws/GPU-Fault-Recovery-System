@@ -199,11 +199,20 @@ def restore_errors(record: dict[str, Any]) -> list[str]:
         errors.append(
             "the control-worker env was not restored to the recorded baseline"
         )
+    # The replicas must read what their processes read before the window --
+    # ``effective_before`` -- not the Deployment's literal entry: the variable
+    # reaches the process from an envFrom ConfigMap, so "absent" on the
+    # Deployment is "true" in the process (attempt 2, 2026-09-09, failed six
+    # replicas against None with the dispatcher correctly restored).
+    expected = record.get(
+        "effective_before", (record.get("baseline") or {}).get("value")
+    )
     for replica in record.get("replicas_after_close") or []:
-        expected = (record.get("baseline") or {}).get("value")
         if (replica.get("values") or {}).get(VARIABLE) != expected:
             errors.append(
-                f"replica {replica.get('pod')} does not read the baseline value"
+                f"replica {replica.get('pod')} reads "
+                f"{(replica.get('values') or {}).get(VARIABLE)!r}, not the pre-window "
+                f"value {expected!r}"
             )
     return errors
 

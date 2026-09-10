@@ -178,3 +178,24 @@ def test_the_restore_waits_for_the_value_the_processes_read_before_the_window() 
         verdicts.effective_variable_value(
             [*replicas, {"pod": "w-3", "values": {verdicts.VARIABLE: "false"}}]
         )
+
+
+def test_the_restore_verdict_compares_replicas_with_the_pre_window_value() -> None:
+    record = {
+        "baseline": {"present": False, "value": None},
+        "restored_state": {"present": False, "value": None},
+        "effective_before": "true",
+        "replicas_after_close": [
+            {"pod": "w-1", "values": {verdicts.VARIABLE: "true"}},
+            {"pod": "w-2", "values": {verdicts.VARIABLE: "true"}},
+        ],
+    }
+    assert verdicts.restore_errors(record) == []
+    record["replicas_after_close"].append({"pod": "w-3", "values": {}})
+    errors = verdicts.restore_errors(record)
+    assert len(errors) == 1 and "w-3" in errors[0] and "'true'" in errors[0], errors
+    legacy = {**record, "replicas_after_close": [{"pod": "w-1", "values": {}}]}
+    del legacy["effective_before"]
+    assert verdicts.restore_errors(legacy) == [], (
+        "without the record the literal baseline still applies"
+    )
