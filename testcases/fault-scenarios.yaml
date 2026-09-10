@@ -5784,7 +5784,13 @@ test_cases:
   - "control-worker 日志含 cleanup raw_evidence deleted N rows; keys[:20]=... 且分别点名两条被删的键；没有 0 行的清理日志"
   - finally 后以 audit- 为前缀的本次行数为 0
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 79d12477dd4931ca2d1842ac3b661c05918d0e06a91046f2f03dccbb489ebd79
+      components:
+        control_plane: 7dd256f855728a13b82437a349b0d9f0b82105dcfb4a4e1ea6922963c4abf759
+        executor: 24a222f107731c45f2b4d91489e749d4b0606787a31bdba1738ec316321325e7
+        node_runtime: 24c750231b39da1b9f794035be10571146a76995569a3eeb6da829e8cc793e9a
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-038证据钉在-incident-生命周期
   related_pytest: tests/regional/test_preempt038_evidence_pins.py::test_the_audit_contract_passes_when_only_the_pinned_row_survives
