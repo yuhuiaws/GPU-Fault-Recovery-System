@@ -63,14 +63,29 @@ def context_from_environment(
     if discover_product and discovery_mode != "disabled":
         try:
             discovered_product = discover_gpu_product(runner)
-        except GpuProductDiscoveryUnavailable:
-            if discovery_mode == "required" or product is None:
+        except GpuProductDiscoveryUnavailable as exc:
+            if discovery_mode == "required":
                 raise
-            LOGGER.warning(
-                "nvidia-smi product discovery unavailable; using "
-                "configured GPU product %s",
-                product,
-            )
+            if product is None:
+                # ``auto`` with nothing configured used to raise here too, so
+                # a driver that could not answer at startup took the whole
+                # collector down: the unit restart-looped and the node posted
+                # *no* host telemetry -- silent, the one state the erroring
+                # path exists to avoid. The product is identity metadata on
+                # the batches, not a precondition for reading the host, so
+                # start without it and let the timeouts be reported as the
+                # collection errors they are.
+                LOGGER.warning(
+                    "nvidia-smi product discovery unavailable and no GPU product "
+                    "is configured; starting without a product: %s",
+                    exc,
+                )
+            else:
+                LOGGER.warning(
+                    "nvidia-smi product discovery unavailable; using "
+                    "configured GPU product %s",
+                    product,
+                )
         else:
             if product is not None and product != discovered_product:
                 raise CollectorError(

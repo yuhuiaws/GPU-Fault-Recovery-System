@@ -6,6 +6,7 @@ from typing import Any
 
 from scripts.e2e.regional import collect019_verdicts as verdicts
 from scripts.e2e.regional import run_collect019_nvidia_smi_hang as collect019
+from scripts.e2e.regional.collector_window_fixture import open_window_or_rollback
 
 CLUSTER = "cluster-a"
 
@@ -149,3 +150,45 @@ def test_the_case_constants_and_plan_name_the_shadow(tmp_path: Any) -> None:
     assert (
         details["rollback"]["window_deadman_seconds"] == verdicts.WINDOW_RESTORE_SECONDS
     )
+
+
+class _HalfOpenProbe:
+    """open-window that fails after writing the window, as the live probe did."""
+
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.close_fails = close_fails
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        self.calls.append(arguments)
+        if arguments[0] == "open-window":
+            raise RuntimeError("systemctl restart failed: control process exited")
+        if self.close_fails:
+            raise RuntimeError("no collector window is open for this run")
+        return {"closed": True}
+
+
+def test_a_failed_open_closes_the_half_open_window_and_reports_the_open_error() -> None:
+    """The unit must not be left restart-looping behind a raised open."""
+
+    probe = _HalfOpenProbe()
+    try:
+        open_window_or_rollback(probe, "c019-a1-1", "--unit", verdicts.UNIT)
+    except RuntimeError as exc:
+        assert "systemctl restart failed" in str(exc), "the open error is reported"
+    else:
+        raise AssertionError("a failed open must raise")
+    assert [call[0] for call in probe.calls] == ["open-window", "close-window"], (
+        probe.calls
+    )
+    assert probe.calls[1][1:3] == ("--run-id", "c019-a1-1"), probe.calls[1]
+
+    stubborn = _HalfOpenProbe(close_fails=True)
+    try:
+        open_window_or_rollback(stubborn, "c019-a1-2", "--unit", verdicts.UNIT)
+    except RuntimeError as exc:
+        assert "systemctl restart failed" in str(exc), (
+            "a failing rollback must not mask the open error"
+        )
+    else:
+        raise AssertionError("a failed open must raise even when the close fails")

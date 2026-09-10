@@ -92,8 +92,11 @@ def test_context_uses_config_only_when_auto_discovery_unavailable(monkeypatch) -
     assert context_value.product == "H200"
 
     monkeypatch.delenv("GPU_FAULT_GPU_PRODUCT")
-    with pytest.raises(CollectorError, match="GPU identity query failed"):
-        context_from_environment(discover_product=True, runner=unavailable)
+    unconfigured = context_from_environment(discover_product=True, runner=unavailable)
+    assert unconfigured.product is None, (
+        "auto discovery with nothing configured starts without a product instead "
+        "of taking the collector down"
+    )
 
     monkeypatch.setenv("GPU_FAULT_GPU_PRODUCT", "H200")
     monkeypatch.setenv("GPU_FAULT_GPU_PRODUCT_DISCOVERY", "required")

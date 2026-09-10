@@ -421,6 +421,34 @@ class CollectorWindowFixture:
             time.sleep(poll_seconds)
 
 
+def open_window_or_rollback(
+    fixture: CollectorWindowFixture,
+    run_id: str,
+    *arguments: str,
+    timeout: int = 300,
+) -> dict[str, Any]:
+    """``open-window``, closing the half-open window if the probe raises.
+
+    The probe writes the drop-in, the window state and the deadman before it
+    restarts the unit; when that restart fails it raises with the window still
+    open and the unit down. The first COLLECT-019 run left the host collector
+    restart-looping for a quarter of an hour that way -- the deadman is the
+    last line, not the first. The close is best effort: the original error is
+    what the case reports.
+    """
+
+    try:
+        return fixture.execute(
+            "open-window", "--run-id", run_id, *arguments, timeout=timeout
+        )
+    except Exception:
+        try:
+            fixture.execute("close-window", "--run-id", run_id, timeout=timeout)
+        except Exception:  # noqa: BLE001 - the open error is the one to raise
+            pass
+        raise
+
+
 def read_only_preflight(settings: WindowSettings, case_dir: Path) -> dict[str, Any]:
     """What must be true before a window opens; the same errors stop --execute."""
 

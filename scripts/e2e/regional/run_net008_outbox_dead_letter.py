@@ -34,6 +34,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
 from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
+    open_window_or_rollback,
     CollectorWindowFixture,
     WindowSettings,
     run_case_main,
@@ -197,9 +198,8 @@ def _prepare_run(
 def _phase_transient_403(run: _Run) -> None:
     """Phase A: a wrong token makes every record replayable, never dead."""
 
-    run.opened = run.fixture.execute(
-        "open-window",
-        "--run-id",
+    run.opened = open_window_or_rollback(
+        run.fixture,
         run.run_id,
         "--unit",
         verdicts.UNIT,
@@ -207,7 +207,6 @@ def _phase_transient_403(run: _Run) -> None:
         "GPU_FAULT_CONTROL_PLANE_TOKEN=@invalid",
         "--restore-seconds",
         str(verdicts.WINDOW_RESTORE_SECONDS),
-        timeout=300,
     )
     run.window_open = True
     write_json_atomic(run.case_dir / "window-open.json", run.opened)

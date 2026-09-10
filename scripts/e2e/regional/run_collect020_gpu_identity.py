@@ -41,6 +41,7 @@ from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     collector_setting,
 )
 from scripts.e2e.regional.collector_window_fixture import (  # noqa: E402
+    open_window_or_rollback,
     CollectorWindowFixture,
     WindowSettings,
     run_case_main,
@@ -158,9 +159,8 @@ def execute(
     window_open = False
     activity: dict[str, Any] = {}
     try:
-        opened = fixture.execute(
-            "open-window",
-            "--run-id",
+        opened = open_window_or_rollback(
+            fixture,
             run_id,
             "--unit",
             verdicts.UNIT,
@@ -170,7 +170,6 @@ def execute(
             f"drop-uuid:{dropped_uuid}:{verdicts.DROP_CALLS}",
             "--restore-seconds",
             str(verdicts.WINDOW_RESTORE_SECONDS),
-            timeout=300,
         )
         window_open = True
         write_json_atomic(case_dir / "window-open.json", opened)
