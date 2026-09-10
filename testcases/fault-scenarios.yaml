@@ -3335,7 +3335,13 @@ test_cases:
   - HTTP400记录为replayable=false并且不会自动重发
   - 夹具结束后恢复全局HTTP函数且无临时文件残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 7e5ae86271d34d98000fbb0456baafdc235fc63e7a63fa4b8ad40a8c8a42946f
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-005
   execution:
