@@ -348,3 +348,45 @@ def test_close_quarantined_leaves_another_incidents_annotations_alone(
         "gpu-fault.io/previous-unschedulable": "false",
     }
     assert result["stripped_isolation_nodes"] == {}
+
+
+def test_close_incident_by_id_strips_the_same_orphaned_annotations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--close-incident <QUARANTINED id>`` takes the same evidence pass as
+    the discovery, so a hand-released taint's leftover annotations are
+    stripped there too -- pinned because the live fix was only exercised
+    through ``--close-quarantined``."""
+
+    calls: list[dict[str, Any]] = []
+    kubectl: list[list[str]] = []
+    monkeypatch.setattr(
+        incident_close,
+        "_run_reconcile",
+        _two_pass_runner(
+            {"results": [_quarantined_pending("inc-q1", "node-a")]}, calls
+        ),
+    )
+    monkeypatch.setattr(
+        reconcile.subprocess,
+        "run",
+        _kubectl_strip_double(_orphaned_node("inc-q1"), kubectl),
+    )
+
+    result = incident_close.run_incident_close(
+        _gpu_site(tmp_path),
+        tmp_path,
+        incident_ids=["inc-q1"],
+        reason="taint released by hand after repair",
+        reference="CHG-5",
+        dry_run=False,
+    )
+
+    assert "selector" not in calls[0]["payload"]
+    assert [call for call in kubectl if "patch" in call], "no strip happened"
+    assert calls[1]["payload"]["evidence"]["inc-q1"][0]["isolation_annotations"] == {}
+    assert incident_close.result_lines(result) == [
+        "inc-q1: closed (isolation absent on node-a; orphaned isolation annotations "
+        "stripped on node-a)"
+    ]
+    assert result["stripped_isolation_nodes"] == {"inc-q1": ["node-a"]}

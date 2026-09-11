@@ -171,10 +171,12 @@ def main() -> None:
         # it aside for the same reason as the compile-time shape: the record
         # blocked the very release that carried its close. ESCALATED stays a
         # blocker -- an operator may still act on that record.
+        # ``remediation_budget_claims`` left on a BLOCKED record are not live
+        # (occupancy counts RUNNING rows with a live lease) and the sweep
+        # releases them with the close, so they do not keep the record here.
         if (
             workflow.status is not WorkflowStatus.BLOCKED
             or workflow.execution_owner_id
-            or workflow.remediation_budget_claims
             or workflow.source_plan_id  # plan-driven: the restore reconcile's
         ):
             return False

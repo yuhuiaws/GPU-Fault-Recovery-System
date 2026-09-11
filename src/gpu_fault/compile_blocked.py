@@ -259,8 +259,10 @@ def settled_incident_blocked_reasons(
         reasons.append(f"workflow is {workflow.status.value}, not BLOCKED")
     if workflow.execution_owner_id:
         reasons.append("workflow still has an execution owner")
-    if workflow.remediation_budget_claims:
-        reasons.append("workflow holds remediation budget claims")
+    # ``remediation_budget_claims`` left on a BLOCKED record are not live:
+    # budget occupancy counts RUNNING rows with a live lease only, so they hold
+    # nothing and are released with the close (3 SAFETY_SETTLED records of
+    # 2026-09-06 sat refused on them for five days).
     if workflow.source_plan_id:
         # Plan-driven: the restore reconcile owns it and carries its audit.
         reasons.append(
@@ -297,6 +299,7 @@ def closed_settled_incident_record(
             ),
             "superseded_at": reconciled_at,
             "updated_at": reconciled_at,
+            "remediation_budget_claims": [],
         }
     )
     return record_operator_event(
@@ -313,6 +316,7 @@ def closed_settled_incident_record(
                 str(getattr(item, "value", item))
                 for item in workflow.completed_operations
             ],
+            "released_budget_claims": sorted(workflow.remediation_budget_claims),
         },
     )
 

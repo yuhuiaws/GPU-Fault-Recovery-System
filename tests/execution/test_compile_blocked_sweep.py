@@ -364,18 +364,36 @@ def test_a_blocked_workflow_of_a_recovered_incident_is_closed_on_the_tick() -> N
     assert store.get_incident(INCIDENT) == incident, "the incident is not rewritten"
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [{"execution_owner_id": "executor-a"}, {"remediation_budget_claims": ["budget-1"]}],
-    ids=["owned", "budget-claimed"],
-)
-def test_a_live_blocked_record_is_not_the_settled_shape(overrides) -> None:
+def test_an_owned_blocked_record_is_not_the_settled_shape() -> None:
     store = build_store()
-    settled_incident_pair(store, **overrides)
+    settled_incident_pair(store, execution_owner_id="executor-a")
 
     dispatcher(store).run_once()
 
-    assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED, overrides
+    assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED
+
+
+def test_stale_budget_claims_are_released_with_the_settled_close() -> None:
+    """Budget occupancy counts RUNNING rows with a live lease, so claims left on
+    a BLOCKED record hold nothing. Refusing on them kept three SAFETY_SETTLED
+    records of a RECOVERED incident open for five days (live 2026-09-11); the
+    close now drops them and says which it dropped."""
+
+    store = build_store()
+    settled_incident_pair(
+        store, remediation_budget_claims=["node:cluster-a:node-a", "region"]
+    )
+
+    dispatcher(store).run_once()
+
+    closed = store.get_workflow(WORKFLOW)
+    assert closed.status is WorkflowStatus.SUPERSEDED
+    assert closed.remediation_budget_claims == []
+    (event,) = reconcile_events(store)
+    assert event.details["released_budget_claims"] == [
+        "node:cluster-a:node-a",
+        "region",
+    ]
 
 
 def test_an_escalated_incidents_blocked_record_waits_for_the_operator() -> None:
