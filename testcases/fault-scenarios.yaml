@@ -5168,7 +5168,13 @@ test_cases:
   - 四节点 Ready、unschedulable=false、无 gpu-fault taint 与 ownership annotation
   - GPU count=8，quiesce state 与 timer 无残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 169fba084a2e127231f5aa45c79b36492b4e645d9945e04cfdd2fa656496b981
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-012真机验收
 - id: GF-REGIONAL-PREEMPT-013
