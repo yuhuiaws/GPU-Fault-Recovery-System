@@ -5142,7 +5142,13 @@ test_cases:
   - successor 只执行一次
   - dispatcher 恢复后继续完成抢占，不丢 preemption request
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 1429f3803b4a09809bd8aee9861a8acd8d62f4b38d985d5be1fa9c6ddf43e9ca
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: pytest
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-011多副本租约与aurora-failover
   pytest_nodeid: tests/execution/test_executor.py::test_preemption_survives_store_failover_and_lease_takeover
@@ -6091,7 +6097,13 @@ test_cases:
   - 动作优先级为 RESET_GPU 高于 XID_154_EVAL 高于纯 IGNORE，其余组合判 BLOCKED_WORKFLOW
   - action2 与 action2V 系列模式命中后并入动作集合
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8de7b0f3abf2ef86f5ed3220ada96bb46e1535e6d859f3c47af57d0f379d9b43
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: pytest
   pytest_nodeid: tests/policy/test_policy.py::test_every_nvlink5_decode_rule_resolves_as_the_catalog_says
 - id: GF-REGIONAL-COLLECT-007
@@ -6113,7 +6125,13 @@ test_cases:
   - WORKFLOW_XID_45、WORKFLOW_XID_48、XID_154、CHECK_UVM 与 NVLINK_ERR 的全部分支各自覆盖
   - 未授权 workflow 判 BLOCKED_WORKFLOW 加 QUARANTINE
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e3946d568f82f8107b3b8cbf7175934c73a5b1cef74d95541079a306599c0397
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: pytest
   pytest_nodeid: tests/policy/test_policy.py::test_every_catalog_rule_resolves_as_the_catalog_says
 - id: GF-REGIONAL-COLLECT-008
