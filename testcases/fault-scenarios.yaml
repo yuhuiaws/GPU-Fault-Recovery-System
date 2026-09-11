@@ -6057,7 +6057,13 @@ test_cases:
   - collector.env 的 sha256 在还原后与基线一致
   - 配置原字节恢复、节点reboot后完成DCGM与正式restore
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 674e6a3ff176772740e8d3d583d67adc69937e86f608591a801b9b0395047511
+      components:
+        control_plane: fdf1c574c908e43280eb468213d5251bb3b1e3610cc4491ed36fb356f6da1783
+        executor: 41462453d331007e9415ee1e7a0886260ba39a80ed28b4a0f5768705c3b117ee
+        node_runtime: 8ad9b09149d4229bf4db31fa722c4fdd1256aced813cc1182011fc982d603a34
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-004
   related_pytest: tests/collectors/test_gpu.py::test_host_collector_reports_persistent_gpu_and_efa_card_loss
