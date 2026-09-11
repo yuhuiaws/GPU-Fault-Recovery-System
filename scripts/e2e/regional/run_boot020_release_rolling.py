@@ -84,7 +84,7 @@ COMPATIBLE_EXECUTOR_PINS = "compatible-regional-executor-artifact-sha256s"
 class ReleaseRollingBackend(Protocol):
     def classify(self, scenario: str) -> dict[str, Any]: ...
 
-    def snapshot(self, scenario: str) -> dict[str, Any]: ...
+    def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]: ...
 
     def deploy(
         self,
@@ -536,9 +536,13 @@ def _stage_executor(
         executor_failed,
     )
     _assert_executor_pins(executor_failed, phase="staged")
+    # The interruption leaves the CPU Deployments on the candidate image and
+    # the GPU plane on the previous one; the engine's previous-release capture
+    # refuses that mixed fleet by design, and this snapshot only needs the CPU
+    # generations to prove the resume does not roll them a second time.
     executor_interrupted = recorder.stage(
         "executor_interrupted_snapshot",
-        lambda: backend.snapshot("executor"),
+        lambda: backend.snapshot("executor", live=False),
     )
     executor_resumed = recorder.stage(
         "executor_resumed",
@@ -890,8 +894,15 @@ class LiveReleaseRollingBackend:
         except Exception:
             return None
 
-    def snapshot(self, scenario: str) -> dict[str, Any]:
+    def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]:
         """Observe the live release once.
+
+        ``live=False`` skips the engine's previous-release capture and the
+        next-deploy classification: mid-transaction -- after an injected
+        interruption at ``cpu-staged`` -- the CPU and GPU planes run different
+        runtime images and ``_capture_previous`` refuses the mixed fleet
+        (``require_consistent_images``); the caller then wants only the phase
+        and the Deployment generations.
 
         Everything runs inside one read snapshot: the state ConfigMap is read
         once and shared with ``_capture_previous`` (its own nested snapshot
@@ -905,8 +916,8 @@ class LiveReleaseRollingBackend:
         release = self._release(scenario)
         with _read_snapshot(release):
             state = release._load_state()
-            live = release._capture_previous()
-            next_deploy = self._next_deploy(release, state)
+            captured = release._capture_previous() if live else None
+            next_deploy = self._next_deploy(release, state) if live else None
             cpu_generations = deployment_generations(
                 release,
                 release._cpu(),
@@ -923,7 +934,7 @@ class LiveReleaseRollingBackend:
         return {
             "phase": state.get("phase"),
             "release_id": state.get("release_id"),
-            "live": live,
+            "live": captured,
             "cpu_generations": cpu_generations,
             "gpu_generations": gpu_generations,
             "next_deploy": next_deploy,

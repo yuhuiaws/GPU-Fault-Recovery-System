@@ -59,7 +59,7 @@ class FakeBackend:
         )
         return {"kind": kind, "changed": [] if kind == "NOOP" else [scenario]}
 
-    def snapshot(self, scenario: str) -> dict[str, Any]:
+    def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]:
         return {
             "phase": "complete",
             "release_id": scenario,

@@ -64,8 +64,11 @@ class FakeReleaseRollingBackend:
         )
         return {"kind": kind, "changed": [] if kind == "NOOP" else [scenario]}
 
-    def snapshot(self, scenario: str) -> dict:
+    def snapshot(self, scenario: str, *, live: bool = True) -> dict:
         self.snapshots.append(scenario)
+        self.light_snapshots = getattr(self, "light_snapshots", []) + (
+            [] if live else [scenario]
+        )
         return {
             "phase": "complete",
             "release_id": scenario,
@@ -227,6 +230,10 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         stages["executor_interrupted_snapshot"]["cpu_generations"]
         == stages["executor_after"]["cpu_generations"]
     )
+    # Mid-transaction the two planes run different runtime images and the
+    # engine's previous-release capture refuses the mixed fleet (live
+    # 2026-09-11), so the interrupted snapshot must be the light form.
+    assert backend.light_snapshots == ["executor"], backend.light_snapshots
     before = stages["executor_before"]["gpu_generations"]["cluster-a"]
     after = stages["executor_after"]["gpu_generations"]["cluster-a"]
     assert {name for name in after if after[name] != before[name]} == {
