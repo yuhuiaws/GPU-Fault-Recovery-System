@@ -34,6 +34,13 @@ PARTIAL_RESUME_WARN_INTERVAL_SECONDS = 300.0
 #: files grows the persisted table forever otherwise (ARCH-G9).
 DEFAULT_MAX_TRACKED_FILES = 256
 
+#: A file line whose own timestamp is older than this, measured from the
+#: collector's read time, advances the checkpoint but is not delivered. The
+#: file is history the moment the checkpoint is lost (a fresh state file, a
+#: rewritten log); replaying it opened a four-day-old Always-Fatal SXID as a new
+#: incident after a node reboot and quarantined a healthy node.
+DEFAULT_MAX_LINE_AGE_SECONDS = 900.0
+
 SXID_SUMMARY_PATTERN = re.compile(
     r"\bSXid\b\s*\(PCI:[0-9a-fA-F:.]+\)\s*:\s*\d+\s*,\s*"
     r"(?:Non-fatal|Nonfatal|Fatal)\b",
@@ -83,9 +90,15 @@ class FabricManagerLogCollector:
         now: Callable[[], datetime] | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = (subprocess.run),
         max_tracked_files: int = DEFAULT_MAX_TRACKED_FILES,
+        max_line_age_seconds: float = DEFAULT_MAX_LINE_AGE_SECONDS,
     ) -> None:
         if max_tracked_files < 1:
             raise ValueError("Fabric Manager tracked file limit must be at least 1")
+        if max_line_age_seconds <= 0:
+            raise ValueError("Fabric Manager max line age must be positive")
+        self.max_line_age = timedelta(seconds=max_line_age_seconds)
+        #: Lines skipped as older than ``max_line_age``, over the collector's life.
+        self.stale_lines_skipped = 0
         self.sink = sink
         self.context = context
         self.node_id = node_id
@@ -454,13 +467,16 @@ class FabricManagerLogCollector:
                 plan.append((key, stat, inherited))
                 continue
             recorded = int(previous.get("offset", 0))
-            identity_changed = (
-                previous.get("device") != stat.st_dev
-                or previous.get("inode") != stat.st_ino
-            )
-            if identity_changed or stat.st_size < recorded:
+            if previous.get("inode") != stat.st_ino or stat.st_size < recorded:
                 plan.append((key, stat, 0))
                 continue
+            if previous.get("device") != stat.st_dev:
+                # st_dev is boot-scoped: the NVMe root moved from 66305 to 66306
+                # across one reboot. Same inode, no truncation: the same file,
+                # so the checkpoint stands -- resetting it here replayed every
+                # line the log ever held, including a four-day-old fatal SXID.
+                previous["device"] = stat.st_dev
+                self._state_dirty = True
             plan.append((key, stat, min(recorded, stat.st_size)))
         return plan
 
@@ -533,6 +549,8 @@ class FabricManagerLogCollector:
         """
 
         records: list[dict[str, Any]] = []
+        stale_in_round = 0
+        oldest_stale: datetime | None = None
         with Path(key).open("rb") as stream:
             if offset > 0:
                 stream.seek(offset - 1)
@@ -571,18 +589,22 @@ class FabricManagerLogCollector:
                     break
                 message = raw.decode("utf-8", errors="replace").rstrip("\n")
                 stable = f"{stat.st_dev}:{stat.st_ino}:{start}"
+                observed_at = self._file_timestamp(message, collected_at)
+                stale = collected_at - observed_at > self.max_line_age
+                if stale:
+                    self.stale_lines_skipped += 1
+                    stale_in_round += 1
+                    oldest_stale = min(oldest_stale or observed_at, observed_at)
                 records.append(
                     {
                         "record_id": (
                             "fm-file-"
                             + self._record_identity(stat.st_dev, stat.st_ino, start)
                         ),
-                        "observed_at": self._file_timestamp(
-                            message, collected_at
-                        ).isoformat(),
+                        "observed_at": observed_at.isoformat(),
                         "message": message,
                         "source": "file",
-                        "_eligible": True,
+                        "_eligible": not stale,
                         "_checkpoint": self._file_checkpoint(key, stat, stream.tell()),
                         "fields": {
                             "path": key,
@@ -593,6 +615,15 @@ class FabricManagerLogCollector:
                         "evidence_ref": (f"file://{self.node_id}{key}#{stable}"),
                     }
                 )
+        if stale_in_round:
+            LOGGER.warning(
+                "Fabric Manager log %s: %d line(s) older than %ss (oldest %s) "
+                "advanced the checkpoint without being reported",
+                key,
+                stale_in_round,
+                self.max_line_age.total_seconds(),
+                oldest_stale.isoformat() if oldest_stale else "?",
+            )
         return records
 
     @staticmethod
@@ -867,5 +898,8 @@ def build_from_environment(
         state_path=os.getenv(
             "GPU_FAULT_FABRIC_MANAGER_STATE_PATH",
             "/var/lib/gpu-fault/fabric-manager-collector-state.json",
+        ),
+        max_line_age_seconds=float(
+            os.getenv("GPU_FAULT_FABRIC_MANAGER_MAX_LINE_AGE_SECONDS", "900")
         ),
     )

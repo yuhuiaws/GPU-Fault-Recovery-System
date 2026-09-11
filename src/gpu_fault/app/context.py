@@ -246,6 +246,14 @@ class ApplicationContext:
                 "inventory delivery intervals"
             )
         self.gpu_inventory_max_age = timedelta(seconds=inventory_max_age_seconds)
+        # A Fabric Manager log line whose own timestamp trails the collector's
+        # read by more than this is history the collector re-read after losing
+        # its checkpoint, not a fault: it is recorded as a rejected event and
+        # opens no incident (a four-day-old Always-Fatal SXID replayed after a
+        # reboot quarantined a healthy node before this fence existed).
+        self.fabric_log_max_age = timedelta(
+            seconds=int(os.getenv("GPU_FAULT_FABRIC_LOG_MAX_AGE_SECONDS", "900"))
+        )
         self.legacy_gpu_metrics_inventory_max_age = timedelta(
             seconds=int(
                 os.getenv(

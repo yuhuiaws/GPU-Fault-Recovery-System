@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -56,6 +56,7 @@ from gpu_fault.store import (
     NotFoundError,
 )
 from gpu_fault.telemetry import (
+    REJECTED_EVENT_ERROR_PREFIX,
     CollectorHealthSummary,
     CollectorKind,
     EvidenceKind,
@@ -226,6 +227,24 @@ async def ingest_nvidia_kernel(
     return await _store_call(dependencies, ingest)
 
 
+def stale_log_line_age(
+    event: FabricManagerLogEvent, max_age: timedelta
+) -> timedelta | None:
+    """How far a file line's own timestamp trails the collector's read, when
+    that exceeds ``max_age``; ``None`` for a current line or a record without
+    ``collected_at``.
+
+    A collector that lost its checkpoint re-reads the whole log; the lines it
+    posts then are history, not faults. Measured collector-side to
+    collector-side, so clock skew against the control plane plays no part.
+    """
+
+    if event.collected_at is None:
+        return None
+    age = event.collected_at - event.observed_at
+    return age if age > max_age else None
+
+
 @router.post(
     FABRIC_MANAGER_PATH,
     response_model=HmaIngestionResult,
@@ -239,6 +258,34 @@ async def ingest_fabric_manager_log(
         ctx = dependencies.context
         report_processor_replay_phase("fabric_workload_context")
         enriched = dependencies.enrich_workload_context(event, event.observed_at)
+        stale_age = stale_log_line_age(event, ctx.fabric_log_max_age)
+        if stale_age is not None:
+            dependencies.record_collector_status(
+                CollectorKind.FABRIC_MANAGER_LOG,
+                enriched.cluster_id,
+                enriched.node_id,
+                enriched.observed_at,
+                enriched.record_id,
+                1,
+                errors=[
+                    f"{REJECTED_EVENT_ERROR_PREFIX} stale-log-line "
+                    f"age_seconds={int(stale_age.total_seconds())}"
+                ],
+            )
+            dependencies.capture_evidence(
+                record_id=f"fabric-manager/{enriched.record_id}",
+                cluster_id=enriched.cluster_id,
+                node_id=enriched.node_id,
+                kind=EvidenceKind.FABRIC_MANAGER_LOG,
+                observed_at=enriched.observed_at,
+                payload=enriched.model_dump(mode="json"),
+            )
+            return HmaIngestionResult(
+                normalized=ctx.hma.normalize_fabric_manager(enriched).model_copy(
+                    update={"xid_events": [], "sxid_events": []}
+                ),
+                decisions=[],
+            )
         report_processor_replay_phase("fabric_normalize")
         normalized = ctx.hma.normalize_fabric_manager(enriched)
         normalized = normalized.model_copy(

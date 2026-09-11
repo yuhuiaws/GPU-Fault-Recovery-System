@@ -18,7 +18,7 @@ refreshes ``last_success_at``.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -34,7 +34,11 @@ from gpu_fault.hma import (
     FabricManagerLogEvent,
     NvidiaKernelLogEvent,
 )
-from gpu_fault.telemetry import CollectorHealthSummary, CollectorKind
+from gpu_fault.telemetry import (
+    REJECTED_EVENT_ERROR_PREFIX,
+    CollectorHealthSummary,
+    CollectorKind,
+)
 from tests._builders import asgi_client, build_context
 
 NOW = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
@@ -186,3 +190,64 @@ def test_all_zero_kernel_health_summary_only_refreshes_success() -> None:
     assert status.errors == [], "a clean summary produced collector errors"
     assert status.last_error_at is None, "a clean summary set last_error_at"
     assert status.last_success_at is not None, "a clean summary did not refresh success"
+
+
+def _fatal_sxid(
+    observed_at: datetime, collected_at: datetime | None
+) -> FabricManagerLogEvent:
+    return FabricManagerLogEvent(
+        cluster_id="hp-cluster",
+        node_id="worker-1",
+        record_id=f"fm-file-{int(observed_at.timestamp())}",
+        observed_at=observed_at,
+        collected_at=collected_at,
+        source="file",
+        message=(
+            f"[{observed_at.isoformat()}] nvidia-nvswitch0: "
+            "SXid (PCI:0000:59:00.0): 23001, Fatal, Link 12 Always Fatal"
+        ),
+        product="H200",
+    )
+
+
+def test_fabric_manager_route_rejects_a_log_line_older_than_the_max_age() -> None:
+    """A collector that lost its checkpoint re-reads the whole log; a four-day-old
+    Always-Fatal SXID it posts is recorded as a rejected event, not an incident
+    (it quarantined a healthy node after a reboot). The same line read within
+    the age is still a fault."""
+
+    context = build_context()
+    stale = _fatal_sxid(NOW - timedelta(days=4), collected_at=NOW)
+
+    response = _post(context, FABRIC_MANAGER_PATH, stale)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["decisions"] == [] and body["normalized"]["sxid_events"] == [], (
+        "a stale log line opened a fault decision"
+    )
+    statuses = [
+        item
+        for item in context.store.list_collector_statuses("hp-cluster")
+        if item.collector is CollectorKind.FABRIC_MANAGER_LOG
+    ]
+    assert statuses and any(
+        error.startswith(REJECTED_EVENT_ERROR_PREFIX) and "stale-log-line" in error
+        for error in statuses[-1].errors
+    ), statuses
+    kept = [
+        item.record_id
+        for item in context.store.list_raw_evidence("hp-cluster", node_id="worker-1")
+    ]
+    assert "fabric-manager/" + stale.record_id in kept, (
+        "the stale line was not kept as evidence"
+    )
+
+    fresh = _post(
+        context,
+        FABRIC_MANAGER_PATH,
+        _fatal_sxid(NOW, collected_at=NOW + timedelta(seconds=5)),
+    )
+
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["decisions"], "a current fatal SXID no longer opens a decision"
