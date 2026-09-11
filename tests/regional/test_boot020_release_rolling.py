@@ -46,6 +46,9 @@ class FakeBackend:
         }
         self.resume_rolls_cpu = False
         self.executor_rolls_watcher = False
+        # The candidate rebuilt the runtime image: the classification carries
+        # ``runtime_image`` and the shared-image Deployments may roll.
+        self.executor_changes_runtime_image = False
         # Per-phase pin window a test wants the deploy result to carry instead
         # of the correct one; ``None`` drops the ``pins`` key altogether.
         self.pin_overrides: dict[str, dict[str, Any] | None] = {}
@@ -57,7 +60,14 @@ class FakeBackend:
         kind = (
             "NOOP" if scenario in self.completed else boot020.EXPECTED_KINDS[scenario]
         )
-        return {"kind": kind, "changed": [] if kind == "NOOP" else [scenario]}
+        changed = [] if kind == "NOOP" else [scenario]
+        if (
+            scenario == "executor"
+            and kind != "NOOP"
+            and self.executor_changes_runtime_image
+        ):
+            changed.append("runtime_image")
+        return {"kind": kind, "changed": changed}
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]:
         return {
@@ -201,6 +211,23 @@ def test_executor_stage_rejects_non_executor_generation_changes(tmp_path: Path) 
 
     with pytest.raises(boot020.AcceptanceCheckError, match="non-executor Deployments"):
         boot020.run_release_rolling(backend, _recorder(tmp_path))
+
+
+def test_executor_stage_accepts_shared_image_deployments_when_the_image_changed(
+    tmp_path: Path,
+) -> None:
+    """A rebuilt candidate changes the runtime image digest, and the watcher
+    and collector run that image beside the executor: the release engine rolls
+    them by image change (live 2026-09-11, generations +1 on all three). That is
+    within the classification, not beyond it."""
+
+    backend = FakeBackend()
+    backend.executor_rolls_watcher = True
+    backend.executor_changes_runtime_image = True
+
+    result = boot020.run_release_rolling(backend, _recorder(tmp_path))
+
+    assert "executor_passed" in result["stages"]
 
 
 def _pins(required: str, compatible: list[str]) -> dict[str, Any]:

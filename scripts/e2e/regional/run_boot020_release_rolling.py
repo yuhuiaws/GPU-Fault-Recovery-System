@@ -77,6 +77,15 @@ def _require(condition: bool, message: str, context: Any = None) -> None:
 
 
 EXECUTOR_DEPLOYMENT = regional_deployment_inventory.GPU_EXECUTOR_DEPLOYMENT
+# The data-plane Deployments that run the shared runtime image beside the
+# executor; a candidate whose image digest changed rolls them too.
+RUNTIME_IMAGE_DEPLOYMENTS = frozenset(
+    {
+        EXECUTOR_DEPLOYMENT,
+        regional_deployment_inventory.GPU_WATCHER_DEPLOYMENT,
+        regional_deployment_inventory.GPU_COLLECTOR_DEPLOYMENT,
+    }
+)
 REQUIRED_EXECUTOR_PIN = "required-regional-executor-artifact-sha256"
 COMPATIBLE_EXECUTOR_PINS = "compatible-regional-executor-artifact-sha256s"
 
@@ -161,6 +170,7 @@ def _assert_data_plane_changed(
     after: dict[str, Any],
     *,
     scenario: str,
+    diff: dict[str, Any] | None = None,
 ) -> None:
     before_clusters = before["live"]["clusters"]
     after_clusters = after["live"]["clusters"]
@@ -179,9 +189,17 @@ def _assert_data_plane_changed(
         before["gpu_generations"], after["gpu_generations"]
     )
     if scenario == "executor":
-        # An executor-only release rolls the executor Deployment and nothing
-        # else on the data plane; a collector or watcher generation moving
-        # means the release touched more than its classification claims.
+        # An executor-only release rolls the changed data-plane components and
+        # nothing else. The executor Deployment always moves; the watcher and
+        # the collector run the same runtime image, so a candidate whose image
+        # digest changed (``runtime_image`` in the classification -- every
+        # rebuilt candidate) rolls them too, and that is the release engine
+        # rolling by image change, not touching more than it classified. What
+        # must never move here is anything outside the shared-image set: the
+        # Node Runtime, its bundle and the installer reconciler.
+        allowed = {EXECUTOR_DEPLOYMENT}
+        if "runtime_image" in set((diff or {}).get("changed") or []):
+            allowed = set(RUNTIME_IMAGE_DEPLOYMENTS)
         _require(
             bool(generations),
             "executor-only release rolled no GPU Deployment",
@@ -189,9 +207,14 @@ def _assert_data_plane_changed(
         )
         for cluster_id, moved in generations.items():
             _require(
-                moved == {EXECUTOR_DEPLOYMENT},
-                f"executor-only release rolled non-executor Deployments in {cluster_id}",
+                EXECUTOR_DEPLOYMENT in moved,
+                f"executor-only release did not roll the executor in {cluster_id}",
                 sorted(moved),
+            )
+            _require(
+                moved <= allowed,
+                f"executor-only release rolled non-executor Deployments in {cluster_id}",
+                {"moved": sorted(moved), "allowed": sorted(allowed)},
             )
 
 
@@ -573,7 +596,9 @@ def _stage_executor(
         "resume repeated the staged CPU rollout (more than the finalize roll)",
         repeated,
     )
-    _assert_data_plane_changed(executor_before, executor_after, scenario="executor")
+    _assert_data_plane_changed(
+        executor_before, executor_after, scenario="executor", diff=executor_diff
+    )
     _assert_next_noop(backend, recorder, "executor")
 
 
