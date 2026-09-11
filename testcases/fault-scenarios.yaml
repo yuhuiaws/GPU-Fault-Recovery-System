@@ -3227,7 +3227,13 @@ test_cases:
   - 显式in-flight锁测试必须在并发执行模型下通过，不能依赖ASGI handler恰好同步
   - lease续租保持有效；强制续租失败时仍由command_id幂等防止重复物理动作
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 10b5f1094e2cb09efe62611e6af438afd4ad397aad0012022ec58bda6d7a9b4d
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
