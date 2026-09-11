@@ -24,6 +24,7 @@ from scripts.e2e.regional import run_destr016_preempting_reboot as destr016
 from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as destr017
 from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional import run_workload_acceptance as workload_acceptance
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
     SELECTION_REFERENCE_ENV,
@@ -1412,17 +1413,7 @@ def test_collect004_restores_the_collector_env_through_a_fresh_probe_after_a_reb
         def execute(self, *arguments: str, timeout: int = 180) -> dict:
             calls.append("execute" if self.alive else "execute-dead")
             if not self.alive:
-                raise (
-                    live_fixture_module.HostProbeError(
-                        "cannot exec into a container in a completed pod"
-                    )
-                    if hasattr(live_fixture_module, "HostProbeError")
-                    else (
-                        collector_destructive.HostProbeError(
-                            "cannot exec into a container in a completed pod"
-                        )
-                    )
-                )
+                raise HostProbeError("cannot exec into a container in a completed pod")
             return {"restored": True, "arguments": arguments}
 
         def recreate(self) -> None:
