@@ -101,6 +101,23 @@ def block_cluster_binaries(request: pytest.FixtureRequest, monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def deploy_consent_is_never_ambient(monkeypatch) -> None:
+    """The deploy carries operator consent down its process chain as
+    environment variables, and it runs this suite as a release gate inside
+    that chain: a `deploy --supersede-failed-transaction` on 2026-09-11 handed
+    every test `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION=1`, and six
+    resume tests took the supersede branch and failed the gate. Consent is an
+    input a test sets on purpose, never something it inherits."""
+
+    for name in (
+        "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION",
+        "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE",
+        "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def processor_replay_secret(monkeypatch) -> None:
     for name in ("GPU_FAULT_DOC_IMPACT", "GPU_FAULT_DOC_IMPACT_REASON"):
         monkeypatch.delenv(name, raising=False)
