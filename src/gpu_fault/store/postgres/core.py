@@ -90,6 +90,40 @@ class PostgresCoreMixin:
                 """,
                 (value.model_dump_json(), kind, key, expected.model_dump_json()),
             )
+            if cursor.rowcount == 1:
+                return
+            # The literal payload did not match. A row written before a model
+            # field existed decodes with that field's default and re-encodes
+            # with it, so its stored JSON never equals the copy the caller
+            # read even though nothing moved: 18 BLOCKED records from a week
+            # earlier failed every sweep tick this way (2026-09-11). Compare
+            # the decoded row with the caller's copy instead, and condition
+            # the write on the exact stored payload so a writer that lands
+            # between these two statements still makes this one miss.
+            cursor.execute(
+                """
+                SELECT payload::text FROM gpu_fault_objects
+                WHERE kind=%s AND key=%s
+                """,
+                (kind, key),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise StaleWriteError(f"{kind}/{key} changed since it was read")
+            stored = str(row[0])
+            if (
+                self._decode(kind, stored).model_dump_json()
+                != expected.model_dump_json()
+            ):
+                raise StaleWriteError(f"{kind}/{key} changed since it was read")
+            cursor.execute(
+                """
+                UPDATE gpu_fault_objects
+                SET payload=%s::jsonb
+                WHERE kind=%s AND key=%s AND payload=%s::jsonb
+                """,
+                (value.model_dump_json(), kind, key, stored),
+            )
             if cursor.rowcount != 1:
                 raise StaleWriteError(f"{kind}/{key} changed since it was read")
 

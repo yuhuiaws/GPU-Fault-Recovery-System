@@ -163,3 +163,53 @@ def test_save_then_read_round_trips_a_fresh_copy(store) -> None:
     for status in (WorkflowStatus.RUNNING, WorkflowStatus.SUCCEEDED):
         store.save_workflow(copy_model(store.get_workflow("wf-g"), status=status))
         assert store.get_workflow("wf-g").status is status
+
+
+def test_compare_and_set_matches_a_row_written_before_a_field_existed() -> None:
+    """A stored row from before a model field existed lacks that key; the
+    model decodes it with the default and re-encodes with it, so a literal
+    payload compare never matches even though nothing moved. Live 2026-09-11:
+    18 BLOCKED records from a week earlier failed the dispatcher's settled
+    sweep on every tick with StaleWriteError. The CAS compares the decoded row
+    instead, and still refuses a row that really changed."""
+
+    if not os.getenv("GPU_FAULT_TEST_POSTGRES_URL"):
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    import psycopg
+
+    for postgres in postgres_store_instance():
+        read = _seed(postgres)
+        with psycopg.connect(
+            os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+        ) as conn:
+            conn.execute(
+                """
+                UPDATE gpu_fault_objects
+                SET payload = payload - 'placement_hold' - 'superseded_step_indexes'
+                WHERE kind='workflow' AND key='wf-g'
+                """
+            )
+        assert postgres.get_workflow("wf-g") == read, "defaults decode alike"
+
+        postgres.save_workflow(
+            copy_model(read, status=WorkflowStatus.SUPERSEDED), expected=read
+        )
+        assert postgres.get_workflow("wf-g").status is WorkflowStatus.SUPERSEDED
+
+        moved = postgres.get_workflow("wf-g")
+        with psycopg.connect(
+            os.environ["GPU_FAULT_TEST_POSTGRES_URL"], autocommit=True
+        ) as conn:
+            # A concurrent writer moved the row after ``moved`` was read.
+            conn.execute(
+                """
+                UPDATE gpu_fault_objects
+                SET payload = jsonb_set(payload, '{fencing_token}', '9')
+                WHERE kind='workflow' AND key='wf-g'
+                """
+            )
+        with pytest.raises(StaleWriteError):
+            postgres.save_workflow(
+                copy_model(moved, status=WorkflowStatus.FAILED), expected=moved
+            )
+    _truncate()
