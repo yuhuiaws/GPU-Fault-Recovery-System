@@ -769,14 +769,22 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
                 # collector's first sample after the reboot still carries the
                 # override, reports the mismatch again, and the RESTART_NODE
                 # workflow's VALIDATE_GPU fails on a node that is fine
-                # (COLLECT-004 attempt 4). The restart in ExecStart is then a
-                # start of a unit that has not started yet, which is harmless.
+                # (COLLECT-004 attempt 4).
                 "After=local-fs.target",
                 f"Before={HOST_COLLECTOR_UNIT}",
                 "[Service]",
                 "Type=oneshot",
                 f"ExecStart=/bin/cp {backup} {COLLECTOR_ENV}",
-                f"ExecStart=/bin/systemctl restart {HOST_COLLECTOR_UNIT}",
+                # Restart the collector only when it is already running (the
+                # deadman timer path). Inside the boot transaction the
+                # collector's start job is queued behind this unit, and an
+                # unconditional `systemctl restart` of it from here cancelled
+                # that job: the node came back with no host collector at all
+                # (COLLECT-004 attempt 5). Not yet running means it will start
+                # after us and read the restored env on its own.
+                "ExecStart=/bin/sh -c "
+                f"'systemctl is-active --quiet {HOST_COLLECTOR_UNIT} && "
+                f"systemctl restart {HOST_COLLECTOR_UNIT} || true'",
                 # Enabled (not started) below: a oneshot wanted by
                 # multi-user.target runs once at the next boot, so the
                 # RESTART_NODE this case provokes comes back with the

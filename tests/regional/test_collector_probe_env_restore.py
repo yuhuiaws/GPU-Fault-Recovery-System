@@ -70,6 +70,12 @@ def test_override_arms_a_deadman_timer_and_a_boot_time_restore(
     assert f"Before={probe.HOST_COLLECTOR_UNIT}" in service, (
         "at boot the collector would read the override before the restore lands"
     )
+    assert (
+        f"ExecStart=/bin/systemctl restart {probe.HOST_COLLECTOR_UNIT}" not in service
+    ), "an unconditional restart from a Before= unit cancels the collector's boot start"
+    assert f"systemctl is-active --quiet {probe.HOST_COLLECTOR_UNIT} && " in service, (
+        "the deadman path must still restart a running collector"
+    )
     assert ["systemctl", "enable", f"{unit}.service"] in node["commands"], (
         "the boot-time restore was not enabled"
     )
