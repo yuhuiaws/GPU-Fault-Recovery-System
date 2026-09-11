@@ -120,7 +120,14 @@ def read_live_status(
         capture_output=True,
         pass_fds=(lock_fd,) if lock_fd is not None else (),
     )
-    if completed.returncode:
+    # ``status`` exits 1 when the site is not healthy and still prints the full
+    # report; that report is exactly what a deploy over a failed transaction
+    # needs (the consent refusals read ``live_release`` from it, and the
+    # classification must see that the live transaction is not committed).
+    # Live 2026-09-11: ``--supersede-failed-transaction`` could never start
+    # because the failed transaction's open compatibility window made the
+    # control-API check fail, and that exit code was treated as "no report".
+    if completed.returncode not in (0, 1):
         raise LiveEvidenceError(
             f"status failed ({completed.returncode}): "
             + (completed.stderr or "").strip()
@@ -128,6 +135,11 @@ def read_live_status(
     try:
         report = json.loads(completed.stdout or "")
     except json.JSONDecodeError as exc:
+        if completed.returncode:
+            raise LiveEvidenceError(
+                f"status failed ({completed.returncode}): "
+                + (completed.stderr or "").strip()
+            ) from exc
         raise LiveEvidenceError("live deployment status is invalid") from exc
     if not isinstance(report, dict):
         raise LiveEvidenceError("live deployment status must be a JSON object")

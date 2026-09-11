@@ -532,12 +532,22 @@ def classify_source_deploy(
     site_exists: bool,
     live_matches: bool = False,
     profile_change_pending: bool = False,
+    live_release_pending: bool = False,
 ) -> str:
     # A Runtime Profile template that differs from the live Profile needs the
     # release engine's plan/approve stop, whatever the source identities say:
     # DEPLOY_HOST_ONLY, QUALITY_ONLY and UNCHANGED all apply no release and
     # would record the pending change as a success.
     if profile_change_pending:
+        return "APPLICATION_RELEASE"
+    # The same holds for a live release transaction that is not committed --
+    # failed, rolled back, or mid-flight: the site moved since the last
+    # successful deploy even when the source did not, and only the release
+    # engine (resume, rollback recovery, supersede) can bring it back. Live
+    # 2026-09-11: an acceptance case left a foreign candidate FAILED at
+    # cpu-staged, the source differed from the last deploy in scripts only, and
+    # `deploy --supersede-failed-transaction` was classified DEPLOY_HOST_ONLY.
+    if live_release_pending:
         return "APPLICATION_RELEASE"
     if previous is None or not site_exists:
         return "APPLICATION_RELEASE"
@@ -572,6 +582,24 @@ def classify_source_deploy(
     if previous_source.get("fingerprint") == source.fingerprint:
         return "APPLICATION_RELEASE"
     return "QUALITY_ONLY"
+
+
+def live_release_transaction_pending(report: Mapping[str, object] | None) -> bool:
+    """Whether the live site's release transaction is anything but committed.
+
+    ``None`` (no report -- a first deploy, or a site whose status could not be
+    read at all) is not pending: the classification keeps its other rules.
+    """
+
+    if report is None:
+        return False
+    live = live_release_block(report)
+    if not live:
+        return False
+    return (
+        str(live.get("phase") or "") != "complete"
+        or live.get("transaction_committed") is not True
+    )
 
 
 def _impact_base(
@@ -1101,6 +1129,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             site_exists=not first_deploy,
             live_matches=successful_source_live_matches(previous, live_evidence),
             profile_change_pending=profile_change_pending,
+            live_release_pending=live_release_transaction_pending(report),
         )
         trusted_ci_candidate = (
             restore_trusted_ci_candidate(

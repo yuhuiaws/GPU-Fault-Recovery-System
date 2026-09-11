@@ -345,6 +345,34 @@ def test_source_deploy_classification_separates_application_and_host_changes() -
         )
         == "UNCHANGED"
     )
+    # A live transaction that is not committed (failed, rolled back, mid-flight)
+    # needs the release engine whatever the source identities say (live
+    # 2026-09-11: a foreign candidate FAILED at cpu-staged was classified
+    # DEPLOY_HOST_ONLY and --supersede-failed-transaction never ran).
+    assert (
+        staging_deploy.classify_source_deploy(
+            previous,
+            current,
+            source=source,
+            site_exists=True,
+            live_matches=True,
+            live_release_pending=True,
+        )
+        == "APPLICATION_RELEASE"
+    )
+
+
+def test_live_release_transaction_pending_reads_the_status_report() -> None:
+    committed = {"live_release": {"phase": "complete", "transaction_committed": True}}
+    failed = {"live_release": {"phase": "failed", "transaction_committed": False}}
+    rolled_back = {
+        "live_release": {"phase": "rolled-back", "transaction_committed": False}
+    }
+    assert staging_deploy.live_release_transaction_pending(committed) is False
+    assert staging_deploy.live_release_transaction_pending(failed) is True
+    assert staging_deploy.live_release_transaction_pending(rolled_back) is True
+    assert staging_deploy.live_release_transaction_pending(None) is False
+    assert staging_deploy.live_release_transaction_pending({}) is False
 
 
 def test_deploy_host_wheelhouse_cache_is_lock_scoped(

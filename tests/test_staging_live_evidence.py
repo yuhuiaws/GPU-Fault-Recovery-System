@@ -513,3 +513,55 @@ def test_pre_deploy_gate_accepts_the_quick_status_report(
     assert status_command[1:] == ["status", "--state-dir", str(state_dir)], (
         "the gate runs the default (quick) status, not --full"
     )
+
+
+def test_read_live_status_keeps_the_report_of_an_unhealthy_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` exits 1 for an unhealthy site and still prints the report.
+
+    A deploy over a failed transaction needs exactly that report (live release
+    phase and id feed the consent refusals and the classification); live
+    2026-09-11 the exit code alone was treated as "no report" and
+    --supersede-failed-transaction could not start. Only an exit code other
+    than 0/1, or an unparsable body, is a failed reading.
+    """
+
+    state_dir = tmp_path / "state"
+    unhealthy = {
+        **_status_report(),
+        "healthy": False,
+        "live_release": {
+            "phase": "failed",
+            "release_id": "cand",
+            "transaction_committed": False,
+        },
+    }
+    answers = {"rc": 1, "body": json.dumps(unhealthy)}
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[1] == "status", command
+        return _completed(answers["body"], returncode=answers["rc"])
+
+    monkeypatch.setattr(staging_live_evidence.subprocess, "run", run)
+
+    report = staging_live_evidence.read_live_status(
+        repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+    )
+    assert report["healthy"] is False
+    assert report["live_release"]["phase"] == "failed"
+
+    answers.update(rc=2, body="")
+    with pytest.raises(
+        staging_live_evidence.LiveEvidenceError, match="status failed \\(2\\)"
+    ):
+        staging_live_evidence.read_live_status(
+            repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+        )
+    answers.update(rc=1, body="not json")
+    with pytest.raises(
+        staging_live_evidence.LiveEvidenceError, match="status failed \\(1\\)"
+    ):
+        staging_live_evidence.read_live_status(
+            repository_root=tmp_path, state_dir=state_dir, venv=tmp_path / "venv"
+        )
