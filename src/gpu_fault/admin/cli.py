@@ -368,7 +368,7 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
             "(plans and applies in one run; --dry-run only prints the plan); "
             "with --close-incident / --close-escalated close ESCALATED incidents, "
             "with --close-quarantined close QUARANTINED incidents whose node "
-            "isolation is gone"
+            "isolation is gone (a hand-released taint's leftover annotations are stripped)"
         ),
     )
     _add_managed_site_arguments(reconcile)
@@ -424,8 +424,8 @@ def _add_incident_close_arguments(reconcile: argparse.ArgumentParser) -> None:
     as ``--close-incident`` would. ``--close-quarantined`` discovers the
     QUARANTINED queue the same way; those close only on node isolation
     evidence read through the site's GPU kubeconfig (no cordon, no quarantine
-    taint of the incident, no isolation annotation of it). The three are
-    mutually exclusive.
+    taint of the incident, no isolation annotation of it; annotations left by a
+    hand-released taint are stripped first). The three are mutually exclusive.
     """
 
     selection = reconcile.add_mutually_exclusive_group()

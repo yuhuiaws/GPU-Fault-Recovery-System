@@ -28,6 +28,17 @@ pass reported as ``evidence_required``. ``--close-quarantined`` discovers the
 QUARANTINED queue the way ``--close-escalated`` discovers the ESCALATED one
 (2026-09-10: 24 incidents sat QUARANTINED on nodes a later incident or a
 cleanup had already released).
+
+A node whose quarantine taint an operator released by hand keeps the
+incident's isolation annotations, and those orphan the incident between the
+levers: ``submit-remediation --disposition restore`` finds no isolation to
+restore, and the evidence verdict refuses because the annotations still name
+the incident (live 2026-09-11). The evidence pass treats that shape -- no
+cordon, no taint of the incident, annotations of the incident -- as the
+incident's own leftover: it strips them through the GPU kubeconfig before the
+close (``orphaned_isolation_nodes``, ``strip_node_isolation_annotations``) and
+reports it; a dry run judges the incident as it would stand after the strip
+and says so without touching the node.
 """
 
 from __future__ import annotations
@@ -43,11 +54,14 @@ from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import (
+    ISOLATION_ANNOTATIONS,
     REFERENCE_PATTERN,
     _run_reconcile,
     cluster_nodes,
     node_isolation_evidence,
+    strip_node_isolation_annotations,
 )
+from gpu_fault.adapters.common import ANNOTATION_INCIDENT, quarantine_taint_value
 
 INCIDENT_CLOSE_HISTORY_PATH = Path("workflow-reconcile/incident-close/history")
 REASON_LIMIT = 512
@@ -314,6 +328,107 @@ def gather_isolation_evidence(
     return evidence, refusals
 
 
+def orphaned_isolation_nodes(
+    incident_id: str,
+    evidence: Sequence[dict[str, Any]],
+) -> list[str]:
+    """Nodes whose only trace of ``incident_id`` is its isolation annotations.
+
+    Present, schedulable, no ``gpu-fault.io/quarantined`` taint owned by the
+    incident (digest or raw-id form), yet ``gpu-fault.io/incident-id`` names
+    it: the taint that was the isolation is gone and the annotations are the
+    incident's own leftover. A node that is cordoned, carries the incident's
+    taint, or whose annotations name another incident is not orphaned and is
+    left to the verdict.
+    """
+
+    owned = {incident_id, quarantine_taint_value(incident_id)}
+    nodes: list[str] = []
+    for item in evidence:
+        if not item.get("exists") or item.get("unschedulable"):
+            continue
+        if item.get("quarantine_taint_value") in owned:
+            continue
+        annotations = item.get("isolation_annotations") or {}
+        if annotations.get(ANNOTATION_INCIDENT) == incident_id:
+            nodes.append(str(item["node_id"]))
+    return sorted(nodes)
+
+
+def _without_isolation_annotations(
+    evidence: Sequence[dict[str, Any]],
+    nodes: Sequence[str],
+) -> list[dict[str, Any]]:
+    """``evidence`` as it would read once ``nodes`` lose their isolation
+    annotations -- what a dry run judges, and says it judged."""
+
+    stripped = set(nodes)
+    updated: list[dict[str, Any]] = []
+    for item in evidence:
+        entry = dict(item)
+        if entry.get("node_id") in stripped:
+            entry["isolation_annotations"] = {
+                key: value
+                for key, value in (entry.get("isolation_annotations") or {}).items()
+                if key not in ISOLATION_ANNOTATIONS
+            }
+        updated.append(entry)
+    return updated
+
+
+def _release_orphaned_annotations(
+    site: RenderedSite,
+    pending: Sequence[dict[str, Any]],
+    evidence: dict[str, list[dict[str, Any]]],
+    *,
+    dry_run: bool,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Strip (or, with ``dry_run``, pretend to strip) the orphaned isolation
+    annotations of every pending incident and refresh its evidence.
+
+    Returns ``(orphaned nodes by incident id, refusal by incident id)``. The
+    apply path patches each node through the GPU kubeconfig and re-reads the
+    cluster so the evidence handed to the Pod is what the node carries now; a
+    patch that conflicts or fails refuses that incident with the message and
+    leaves the others alone.
+    """
+
+    orphaned: dict[str, list[str]] = {}
+    refusals: dict[str, str] = {}
+    for item in pending:
+        incident_id = str(item.get("incident_id") or "")
+        items = evidence.get(incident_id)
+        if items is None:
+            continue
+        nodes = orphaned_isolation_nodes(incident_id, items)
+        if not nodes:
+            continue
+        orphaned[incident_id] = nodes
+        if dry_run:
+            evidence[incident_id] = _without_isolation_annotations(items, nodes)
+            continue
+        cluster_id = str(item.get("cluster_id") or "")
+        try:
+            inventory = cluster_nodes(site, cluster_id)
+            for node_id in nodes:
+                raw = inventory.get(node_id)
+                if raw is None:
+                    raise BootstrapError(
+                        f"node {node_id} disappeared from {cluster_id} before its "
+                        "isolation annotations could be stripped"
+                    )
+                strip_node_isolation_annotations(site, cluster_id, raw)
+            evidence[incident_id] = node_isolation_evidence(
+                site,
+                cluster_id,
+                [str(node) for node in item.get("node_ids") or []],
+            )
+        except BootstrapError as exc:
+            refusals[incident_id] = str(exc)
+            evidence.pop(incident_id, None)
+    return orphaned, refusals
+
+
 def _with_evidence(
     site: RenderedSite,
     payload: dict[str, Any],
@@ -321,13 +436,25 @@ def _with_evidence(
 ) -> dict[str, Any]:
     """The second pass: read node evidence for every ``evidence_required``
     result and re-judge exactly those incidents with it, replacing their
-    entries in place. A run without such results makes no second call."""
+    entries in place. A run without such results makes no second call.
+
+    Between the read and the judgment the orphaned isolation annotations of an
+    incident (``orphaned_isolation_nodes``) are stripped -- or, on a dry run,
+    judged as stripped -- and the entry says so
+    (``stripped_isolation_nodes`` / ``would_strip_isolation_nodes``).
+    """
 
     results = list(result.get("results") or [])
     pending = [item for item in results if item.get("evidence_required")]
     if not pending:
         return result
     evidence, refusals = gather_isolation_evidence(site, pending)
+    dry_run = bool(payload.get("dry_run"))
+    orphaned, strip_refusals = _release_orphaned_annotations(
+        site, pending, evidence, dry_run=dry_run
+    )
+    refusals = {**refusals, **strip_refusals}
+    strip_key = "would_strip_isolation_nodes" if dry_run else "stripped_isolation_nodes"
     replacements: dict[str, dict[str, Any]] = {}
     if evidence:
         follow_up = {key: value for key, value in payload.items() if key != "selector"}
@@ -340,7 +467,11 @@ def _with_evidence(
                 "incident close with node evidence returned no results"
             )
         for item in second_results:
-            replacements[str(item.get("incident_id"))] = dict(item)
+            entry = dict(item)
+            nodes = orphaned.get(str(entry.get("incident_id")))
+            if nodes and entry.get("outcome") != "refused":
+                entry[strip_key] = list(nodes)
+            replacements[str(entry.get("incident_id"))] = entry
     for incident_id, message in refusals.items():
         replacements[incident_id] = {
             "incident_id": incident_id,
@@ -352,6 +483,11 @@ def _with_evidence(
         replacements.get(str(item.get("incident_id")), item) for item in results
     ]
     result["isolation_evidence"] = evidence
+    result[strip_key] = {
+        incident_id: nodes
+        for incident_id, nodes in orphaned.items()
+        if incident_id not in strip_refusals
+    }
     return result
 
 
@@ -493,17 +629,32 @@ def discovery_lines(result: dict[str, Any]) -> list[str]:
 def result_lines(result: dict[str, Any]) -> list[str]:
     """One line per incident: ``<id>: closed | already-recovered | would-close
     | refused(<reason>)``; a verdict that rested on node evidence adds
-    ``(isolation absent on <nodes>)``; a discovery run is headed by
-    ``discovery_lines``."""
+    ``(isolation absent on <nodes>)``, one that stripped (or would strip) the
+    incident's orphaned isolation annotations says so in the same bracket; a
+    discovery run is headed by ``discovery_lines``."""
 
     lines = discovery_lines(result)
     for item in result.get("results") or []:
         outcome = str(item.get("outcome"))
         if outcome == "refused":
             outcome = f"refused({item.get('reason') or 'no reason given'})"
-        elif item.get("isolation_nodes"):
-            nodes = ", ".join(str(node) for node in item["isolation_nodes"])
-            outcome = f"{outcome} (isolation absent on {nodes})"
+        else:
+            notes: list[str] = []
+            if item.get("isolation_nodes"):
+                nodes = ", ".join(str(node) for node in item["isolation_nodes"])
+                notes.append(f"isolation absent on {nodes}")
+            if item.get("stripped_isolation_nodes"):
+                nodes = ", ".join(
+                    str(node) for node in item["stripped_isolation_nodes"]
+                )
+                notes.append(f"orphaned isolation annotations stripped on {nodes}")
+            if item.get("would_strip_isolation_nodes"):
+                nodes = ", ".join(
+                    str(node) for node in item["would_strip_isolation_nodes"]
+                )
+                notes.append(f"would strip orphaned isolation annotations on {nodes}")
+            if notes:
+                outcome = f"{outcome} ({'; '.join(notes)})"
         lines.append(f"{item.get('incident_id')}: {outcome}")
     return lines
 

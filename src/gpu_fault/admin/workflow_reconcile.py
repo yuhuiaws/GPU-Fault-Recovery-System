@@ -257,18 +257,85 @@ def gpu_kubectl_command(site: RenderedSite, target: dict[str, Any]) -> list[str]
 _gpu_kubectl = gpu_kubectl_command
 
 
-def cluster_nodes(
-    site: RenderedSite,
-    cluster_id: str,
-) -> dict[str, dict[str, Any]]:
-    targets = {
-        str(item["cluster_id"]): item for item in site.release_config["clusters"]
+def cluster_target(site: RenderedSite, cluster_id: str) -> dict[str, Any]:
+    targets: dict[str, dict[str, Any]] = {
+        str(item["cluster_id"]): dict(item) for item in site.release_config["clusters"]
     }
     target = targets.get(cluster_id)
     if target is None:
         raise BootstrapError(
             f"workflow reconcile cluster is not in the managed site: {cluster_id}"
         )
+    return target
+
+
+def strip_node_isolation_annotations(
+    site: RenderedSite,
+    cluster_id: str,
+    node: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove the isolation annotations a released quarantine left on ``node``.
+
+    The quarantine taint is the isolation; ``ISOLATION_ANNOTATIONS`` are the
+    bookkeeping ``RESTORE_SCHEDULING`` removes together with it. A node whose
+    taint an operator released by hand keeps them, and they then orphan the
+    incident between the levers: ``submit-remediation --disposition restore``
+    finds no isolation to restore and ``--close-quarantined`` refuses because
+    the annotations still name the incident (live 2026-09-11). The merge patch
+    carries the node's ``resourceVersion`` so a node the executor touched in
+    the meantime -- a fresh isolation -- makes the patch conflict instead of
+    stripping the new incident's record. ``node`` is the raw
+    ``kubectl get node -o json`` item the caller already holds.
+    """
+
+    metadata = node.get("metadata") if isinstance(node, dict) else None
+    if not isinstance(metadata, dict) or not metadata.get("name"):
+        raise BootstrapError("cannot strip isolation annotations: node has no name")
+    node_id = str(metadata["name"])
+    resource_version = str(metadata.get("resourceVersion") or "")
+    if not resource_version:
+        raise BootstrapError(
+            f"cannot strip isolation annotations of {node_id}: the node carries "
+            "no resourceVersion to fence the patch on"
+        )
+    patch = {
+        "metadata": {
+            "resourceVersion": resource_version,
+            "annotations": {key: None for key in ISOLATION_ANNOTATIONS},
+        }
+    }
+    completed = subprocess.run(
+        [
+            *_gpu_kubectl(site, cluster_target(site, cluster_id)),
+            "patch",
+            "node",
+            node_id,
+            "--type",
+            "merge",
+            "-p",
+            json.dumps(patch, sort_keys=True),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode:
+        raise BootstrapError(
+            f"cannot strip the orphaned isolation annotations of {node_id} on "
+            f"{cluster_id}: {completed.stderr.strip()}"
+        )
+    return {
+        "node_id": node_id,
+        "resource_version": resource_version,
+        "annotations": list(ISOLATION_ANNOTATIONS),
+    }
+
+
+def cluster_nodes(
+    site: RenderedSite,
+    cluster_id: str,
+) -> dict[str, dict[str, Any]]:
+    target = cluster_target(site, cluster_id)
     completed = subprocess.run(
         [*_gpu_kubectl(site, target), "get", "nodes", "-o", "json"],
         check=False,
