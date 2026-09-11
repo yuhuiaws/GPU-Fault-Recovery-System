@@ -442,9 +442,18 @@ def test_collect005_polls_the_cursor_and_samples_the_replay_count(
 
 
 def test_kmsg_records_for_identical_lines_share_the_boot_prefix() -> None:
-    first = [{"record_id": "kmsg-boot-1-100", "evidence_ref": "kmsg://n/boot-1/100"}]
+    # The stored shape: channel-prefixed id, evidence_ref inside the payload.
+    first = [
+        {
+            "record_id": "nvidia-kernel/kmsg-boot-1-100",
+            "payload": {"evidence_ref": "kmsg://n/boot-1/100"},
+        }
+    ]
     second = first + [
-        {"record_id": "kmsg-boot-1-107", "evidence_ref": "kmsg://n/boot-1/107"}
+        {
+            "record_id": "nvidia-kernel/kmsg-boot-1-107",
+            "payload": {"evidence_ref": "kmsg://n/boot-1/107"},
+        }
     ]
     assert acceptance.kmsg_record_errors(first, second, boot_id="boot-1") == []
     dedup = acceptance.kmsg_record_errors(first, first, boot_id="boot-1")
@@ -452,10 +461,10 @@ def test_kmsg_records_for_identical_lines_share_the_boot_prefix() -> None:
         "an identical second sample adds no record"
     )
     other_boot = acceptance.kmsg_record_errors(first, second, boot_id="boot-2")
-    assert any("is not kmsg-boot-2-<sequence>" in item for item in other_boot), (
-        "a record from another boot is named"
-    )
-    no_ref = [dict(item, evidence_ref="") for item in second]
+    assert any(
+        "is not nvidia-kernel/kmsg-boot-2-<sequence>" in item for item in other_boot
+    ), "a record from another boot is named"
+    no_ref = [dict(item, payload={"evidence_ref": ""}) for item in second]
     assert any(
         "distinct evidence_ref" in item
         for item in acceptance.kmsg_record_errors(first, no_ref, boot_id="boot-1")
@@ -496,8 +505,8 @@ def test_collect012_judges_the_idle_node_monitor_only_without_a_workflow(
             seq = next(sequence)
             records.setdefault(marker, []).append(
                 {
-                    "record_id": f"kmsg-boot-1-{seq}",
-                    "evidence_ref": f"kmsg://node-a/boot-1/{seq}",
+                    "record_id": f"nvidia-kernel/kmsg-boot-1-{seq}",
+                    "payload": {"evidence_ref": f"kmsg://node-a/boot-1/{seq}"},
                 }
             )
             return {}

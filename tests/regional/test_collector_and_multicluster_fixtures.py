@@ -444,7 +444,7 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
 
     Samples 1 and 2 write the same XID 13 line under one marker, so the kernel
     collector must give the second write its own kmsg sequence and evidence_ref
-    (``kmsg-<boot_id>-<seq>``); the runner waits for two records before it
+    (``nvidia-kernel/kmsg-<boot_id>-<seq>``); the runner waits for two records before it
     judges sample 2. Since nothing quarantines the node, there is no restore
     step between the two XIDs (55272a0)."""
 
@@ -479,10 +479,13 @@ def test_collect012_judges_monitor_only_and_gives_each_write_a_kmsg_sequence(
             self.sequence += 1
             self.records.setdefault(marker, []).append(
                 {
-                    "record_id": f"kmsg-{self.boot_id}-{self.sequence}",
-                    "evidence_ref": (
-                        f"kmsg://hyperpod-node/{self.boot_id}/{self.sequence}"
-                    ),
+                    # The stored shape: channel prefix, evidence_ref in payload.
+                    "record_id": f"nvidia-kernel/kmsg-{self.boot_id}-{self.sequence}",
+                    "payload": {
+                        "evidence_ref": (
+                            f"kmsg://hyperpod-node/{self.boot_id}/{self.sequence}"
+                        )
+                    },
                 }
             )
             return {}

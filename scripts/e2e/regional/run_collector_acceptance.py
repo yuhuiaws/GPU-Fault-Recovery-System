@@ -18,6 +18,9 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.kmsg_evidence_records import (  # noqa: E402
+    kmsg_record_errors,
+)
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     STORE_POLL_SECONDS,
     CollectorAcceptanceFixture,
@@ -1382,44 +1385,6 @@ def run_collect011(
         "selected_workflow_ids": [(item or {}).get("request_id") for item in selected],
         "restore_workflows": restores,
     }
-
-
-def kmsg_record_errors(
-    first: list[dict[str, Any]],
-    second: list[dict[str, Any]],
-    *,
-    boot_id: str,
-) -> list[str]:
-    """COLLECT-012 samples 1 and 2: same text, two kmsg sequences, two records.
-
-    The kernel collector names a record ``kmsg-<boot_id>-<sequence>`` and
-    points its evidence at ``kmsg://<node>/<boot_id>/...``; two writes of one
-    identical line therefore share the prefix and differ only in the suffix,
-    and each carries its own evidence_ref. Anything else means the second
-    write was deduplicated or attributed to another boot.
-    """
-
-    errors = []
-    prefix = f"kmsg-{boot_id}-"
-    first_ids = {str(item.get("record_id")) for item in first}
-    second_ids = {str(item.get("record_id")) for item in second}
-    new_ids = second_ids - first_ids
-    if len(first_ids) != 1:
-        errors.append(
-            f"sample 1 did not produce exactly one record: {sorted(first_ids)}"
-        )
-    if len(new_ids) != 1:
-        errors.append(
-            f"sample 2 did not add exactly one record: {sorted(second_ids)} "
-            f"after {sorted(first_ids)}"
-        )
-    for record_id in sorted(first_ids | second_ids):
-        if not record_id.startswith(prefix):
-            errors.append(f"record {record_id} is not kmsg-{boot_id}-<sequence>")
-    refs = {str(item.get("evidence_ref") or "") for item in second}
-    if len(refs) != len(second_ids) or any(not ref for ref in refs):
-        errors.append(f"kmsg records do not carry distinct evidence_ref values: {refs}")
-    return errors
 
 
 def restart_app_monitor_only_errors(

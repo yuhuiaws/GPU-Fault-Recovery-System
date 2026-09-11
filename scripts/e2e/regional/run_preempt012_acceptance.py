@@ -443,6 +443,7 @@ def read_only_preflight(
     regional: RegionalLiveFixture,
     *,
     node: str,
+    predecessor_id: str,
     predecessor_path_value: Path,
     case_dir: Path,
     plan_path: Path | None = None,
@@ -450,13 +451,12 @@ def read_only_preflight(
     node_state = regional.node_snapshot(node)
     store = regional.store_snapshot(node=node)
     tests = focused_tests(case_dir, reuse_from=plan_path)
-    predecessor = predecessor_evidence(
-        predecessor_path_value,
-        "GF-REGIONAL-PREEMPT-011",
-    )
+    # The predecessor is whatever the formal order names -- PREEMPT-009 today,
+    # the last PREEMPT contract case that writes evidence -- not a fixed id.
+    predecessor = predecessor_evidence(predecessor_path_value, predecessor_id)
     errors = []
     if not predecessor["valid"]:
-        errors.append("PREEMPT-011 predecessor evidence is not PASS")
+        errors.append(f"{predecessor_id} predecessor evidence is not PASS")
     if node_state["ready"] != "True" or node_state["unschedulable"]:
         errors.append("target node is not Ready and schedulable")
     if node_state["taints"] or node_state["ownership_annotations"]:
@@ -622,6 +622,7 @@ def execute_case(
     *,
     node: str,
     image: str,
+    predecessor_id: str,
     predecessor_path_value: Path,
     environment: dict[str, str],
 ) -> int:
@@ -635,6 +636,7 @@ def execute_case(
     )
     preflight = read_only_preflight(
         regional,
+        predecessor_id=predecessor_id,
         node=node,
         predecessor_path_value=predecessor_path_value,
         case_dir=case_dir,
@@ -817,7 +819,7 @@ def main() -> int:
         CASE_ID,
         arguments.predecessor_evidence,
     )
-    if predecessor_id != "GF-REGIONAL-PREEMPT-011" or predecessor_path_value is None:
+    if predecessor_id is None or predecessor_path_value is None:
         raise PreemptAcceptanceError("PREEMPT-012 predecessor resolution is invalid")
     environment = {
         **regional_settings.environment(),
@@ -831,6 +833,7 @@ def main() -> int:
     if not arguments.execute:
         preflight = read_only_preflight(
             regional,
+            predecessor_id=predecessor_id,
             node=node,
             predecessor_path_value=predecessor_path_value,
             case_dir=case_dir,
@@ -845,7 +848,7 @@ def main() -> int:
                 "preemption boundaries against the live PostgreSQL store"
             ),
             "stop_conditions": [
-                "PREEMPT-011 evidence is not PASS",
+                f"{predecessor_id} evidence is not PASS",
                 "target node is not Ready/schedulable/idle",
                 "quiesce fail-safe timer is not armed",
                 "host cycle does not report QUIESCED before the control audit",
@@ -876,6 +879,7 @@ def main() -> int:
         regional,
         node=node,
         image=image,
+        predecessor_id=predecessor_id,
         predecessor_path_value=predecessor_path_value,
         environment=environment,
     )
