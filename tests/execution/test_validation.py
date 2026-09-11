@@ -973,3 +973,119 @@ def test_local_validation_waiting_is_safe_to_preempt() -> None:
 
     assert result.status is WorkflowStatus.SUPERSEDED
     assert adapter.calls == []
+
+
+@pytest.mark.parametrize(
+    ("configured", "active", "expected_status"),
+    [(9, 8, WorkflowStepStatus.SUCCEEDED), (8, 7, WorkflowStepStatus.FAILED)],
+)
+def test_post_reboot_inventory_requirement_is_bounded_by_the_instance_type(
+    configured, active, expected_status
+) -> None:
+    """The plan freezes the finding's configured expected count. Above the
+    instance type's physical GPU count that is a configuration error no
+    hardware action can satisfy (live: expected=9 on an 8-GPU p5en failed a
+    healthy node and escalated to REPLACE_NODE); the physical count caps it
+    and the cap is recorded. At or below the physical count nothing changes:
+    7 of 8 still fails."""
+
+    now = datetime.now(timezone.utc)
+    rebooted_at = now - timedelta(seconds=5)
+
+    class ValidationStore:
+        def list_collector_statuses(self, cluster_id, node_id):
+            return [
+                CollectorStatus(
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    collector=collector,
+                    observed_at=now,
+                    ingested_at=now,
+                    last_success_at=now,
+                )
+                for collector in {
+                    CollectorKind.GPU_METRICS,
+                    CollectorKind.HOST_TELEMETRY,
+                }
+            ]
+
+        def list_telemetry_metrics_latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    name="gpu_inventory_active_count", value=active, observed_at=now
+                )
+            ]
+
+    class ValidationMetrics:
+        store = ValidationStore()
+
+        def latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    observed_at=now,
+                    sample=SimpleNamespace(canonical_name="gpu_temperature_c"),
+                )
+            ]
+
+        def findings(self, cluster_id, node_id):
+            return []
+
+    store = build_store()
+    incident, workflow = workflow_state(
+        store, [WorkflowOperation.RESTART_NODE, WorkflowOperation.VALIDATE_GPU]
+    )
+    validation_step = copy_model(
+        workflow.official_steps[1],
+        execution_owner="gpu-fault-validation-adapter",
+        parameters={
+            "inventory_requirements_by_node": {
+                "node-a": {
+                    "metrics": {
+                        "gpu_inventory_active_count": configured,
+                        "efa_inventory_active_count": 16,
+                    },
+                    "node_instance_type": "ml.p5en.48xlarge",
+                }
+            }
+        },
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[workflow.official_steps[0], validation_step],
+        step_executions=[
+            workflow_step_execution(
+                0, WorkflowOperation.RESTART_NODE, updated_at=rebooted_at
+            )
+        ],
+    )
+
+    outcome = GpuValidationAdapter(
+        ValidationMetrics(), store=ValidationMetrics.store
+    ).execute(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=incident,
+            step=validation_step,
+            step_index=1,
+            request=WorkflowExecutionRequest(expected_fencing_token=3),
+            idempotency_key="validation/bounded-inventory",
+        )
+    )
+
+    assert outcome.status is expected_status
+    if expected_status is WorkflowStepStatus.SUCCEEDED:
+        assert outcome.details["inventory_requirement_clamped"] == {
+            "node-a": {
+                "gpu_inventory_active_count": {
+                    "configured": 9,
+                    "physical": 8,
+                    "instance_type": "ml.p5en.48xlarge",
+                }
+            }
+        }, "the cap must be visible on the step, not silent"
+    else:
+        assert "inventory_requirement_clamped" not in outcome.details
+        assert (
+            "gpu_inventory_active_count=7,expected=8"
+            in (outcome.details["node_failures"]["node-a"])
+        )

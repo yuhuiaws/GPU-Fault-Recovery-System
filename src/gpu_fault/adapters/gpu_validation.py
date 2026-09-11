@@ -8,6 +8,7 @@ from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.models import (
     WorkflowOperation,
@@ -64,6 +65,7 @@ class GpuValidationAdapter:
         required = {"gpu_temperature_c"}
         pending: dict[str, dict[str, list[str]]] = {}
         failures: dict[str, list[str]] = {}
+        clamped: dict[str, dict[str, Any]] = {}
         operation = context.step.operation
         raw_inventory_requirements = context.step.parameters.get(
             "inventory_requirements_by_node", {}
@@ -162,6 +164,7 @@ class GpuValidationAdapter:
                 all_host_latest,
                 host_latest,
                 failures,
+                clamped,
             )
             if inventory_pending is not None:
                 pending[node_id] = inventory_pending
@@ -211,6 +214,7 @@ class GpuValidationAdapter:
                     "failed_nodes": failed_nodes,
                     "node_failures": failures,
                     "validation": operation.value,
+                    **({"inventory_requirement_clamped": clamped} if clamped else {}),
                 },
             )
         return WorkflowStepOutcome.succeeded(
@@ -218,6 +222,7 @@ class GpuValidationAdapter:
             details={
                 "validated_nodes": context.step.node_ids,
                 "validation": context.step.operation.value,
+                **({"inventory_requirement_clamped": clamped} if clamped else {}),
             },
         )
 
@@ -275,6 +280,7 @@ class GpuValidationAdapter:
         all_latest,
         latest,
         failures,
+        clamped=None,
     ):
         requirement = requirements.get(node_id)
         if (
@@ -303,6 +309,9 @@ class GpuValidationAdapter:
         if not isinstance(requirement, dict):
             return None
         required = self._required_inventory_metrics(requirement, operation)
+        required, bounded = self._bound_by_instance_inventory(requirement, required)
+        if bounded and clamped is not None:
+            clamped[node_id] = bounded
         executions = [
             item
             for item in context.workflow.step_executions
@@ -359,6 +368,51 @@ class GpuValidationAdapter:
             }
         metric = requirement.get("active_metric")
         return {str(metric): requirement.get("expected_count")} if metric else {}
+
+    @staticmethod
+    def _bound_by_instance_inventory(
+        requirement: dict[str, Any],
+        required: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Cap each expected count at what the node's instance type carries.
+
+        The requirement is the finding's configured expected count, frozen into
+        the plan. A configured count above the instance type's physical GPU
+        (or EFA device) count is a configuration error that no hardware action
+        can satisfy: validated literally it fails a healthy node for ever and
+        escalates a config mistake into REPLACE_NODE and a support ticket
+        (live: ``expected=9`` on an 8-GPU p5en, GF-REGIONAL-COLLECT-004). The
+        physical count is the ceiling; a configured count at or below it is
+        validated as configured, so a real loss (7 of 8) still fails. Returns
+        ``(bounded required metrics, {metric: {configured, physical,
+        instance_type}} for the ones that were capped)``.
+        """
+
+        instance_type = requirement.get("node_instance_type")
+        if not isinstance(instance_type, str) or not instance_type:
+            return required, {}
+        try:
+            gpu_count, efa_count = gpu_instance_inventory(instance_type)
+        except ValueError:
+            return required, {}
+        bounded: dict[str, Any] = {}
+        capped: dict[str, dict[str, Any]] = {}
+        for metric, expected in required.items():
+            ceiling = gpu_count if metric.startswith("gpu_inventory_") else efa_count
+            try:
+                configured = int(expected)
+            except (TypeError, ValueError):
+                bounded[metric] = expected
+                continue
+            if configured > ceiling:
+                capped[metric] = {
+                    "configured": configured,
+                    "physical": ceiling,
+                    "instance_type": instance_type,
+                }
+                configured = ceiling
+            bounded[metric] = configured
+        return bounded, capped
 
     @staticmethod
     def _validate_host_metrics(latest, node_id, failures):

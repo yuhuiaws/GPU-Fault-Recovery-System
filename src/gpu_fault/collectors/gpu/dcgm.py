@@ -314,6 +314,7 @@ class DcgmMetricsCollector:
         force_snapshot_path: str | None = None,
         violation_duty_cycle_threshold: float | None = None,
         failure_backoff_threshold: int = 3,
+        startup_grace_seconds: int | None = None,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -366,6 +367,21 @@ class DcgmMetricsCollector:
                 )
             )
         )
+        # A node that has just booted starts this collector before the DCGM
+        # exporter Pod is scheduled and listening, so the first scrapes fail
+        # for a minute or two on a healthy node. Reported as error batches
+        # they open a NODE_HEALTH incident and a diagnostic workflow on every
+        # reboot (live 2026-09-11: a dcgm-fields incident 4 min after the node
+        # came back). Until the exporter has answered once, a scrape failure
+        # inside this grace is logged and retried, not reported; a dead
+        # exporter is still reported once the grace is over (F5).
+        self.startup_grace_seconds = (
+            startup_grace_seconds
+            if startup_grace_seconds is not None
+            else int(os.getenv("GPU_FAULT_DCGM_STARTUP_GRACE_SECONDS", "300"))
+        )
+        if self.startup_grace_seconds < 0:
+            raise ValueError("GPU_FAULT_DCGM_STARTUP_GRACE_SECONDS cannot be negative")
         self.force_snapshot_path = Path(
             force_snapshot_path
             or os.getenv(
@@ -946,6 +962,21 @@ class DcgmMetricsCollector:
             self.interval_seconds * float(2 ** (excess + 1)),
         )
 
+    def _within_startup_grace(
+        self,
+        exc: BaseException,
+        started_at: datetime,
+        scraped_once: bool,
+    ) -> bool:
+        """A scrape failure that is still the exporter coming up, not a fault."""
+
+        if scraped_once or not isinstance(exc, CollectorError):
+            return False
+        if "cannot scrape DCGM exporter" not in str(exc):
+            return False
+        elapsed = (self.now() - started_at).total_seconds()
+        return elapsed < self.startup_grace_seconds
+
     def run(self) -> None:
         force_snapshot = self.force_snapshot_path.exists()
         if not force_snapshot:
@@ -962,19 +993,30 @@ class DcgmMetricsCollector:
             ).total_seconds()
             if delay > 0:
                 time.sleep(delay)
+        started_at = self.now()
+        scraped_once = False
         while True:
             succeeded = False
             try:
                 self.collect_once()
                 succeeded = True
+                scraped_once = True
                 self._consecutive_failures = 0
             except Exception as exc:
                 self._consecutive_failures += 1
-                LOGGER.exception(
-                    "DCGM metrics collection failed (%d consecutive)",
-                    self._consecutive_failures,
-                )
-                self._report_collection_error(exc)
+                if self._within_startup_grace(exc, started_at, scraped_once):
+                    LOGGER.warning(
+                        "DCGM exporter not reachable yet (%d consecutive); inside "
+                        "the %ss startup grace, retrying instead of reporting",
+                        self._consecutive_failures,
+                        self.startup_grace_seconds,
+                    )
+                else:
+                    LOGGER.exception(
+                        "DCGM metrics collection failed (%d consecutive)",
+                        self._consecutive_failures,
+                    )
+                    self._report_collection_error(exc)
             if force_snapshot and succeeded:
                 self.force_snapshot_path.unlink(missing_ok=True)
                 force_snapshot = False

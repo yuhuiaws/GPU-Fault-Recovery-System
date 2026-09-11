@@ -507,6 +507,8 @@ def test_dcgm_run_reports_scrape_failure_as_error_batch(
         node_id="worker-1",
         interval_seconds=15,
         startup_spread_seconds=1,
+        # The exporter is dead, not still coming up: no startup grace here.
+        startup_grace_seconds=0,
         force_snapshot_path=str(tmp_path / "gpu.request"),
         now=lambda: NOW,
         runner=_inventory_runner(8),
@@ -531,6 +533,62 @@ def test_dcgm_run_reports_scrape_failure_as_error_batch(
     ), errors[0]["collection_errors"]
     # The startup spread, then two plain intervals, then the doubling backoff.
     assert sleeps[1:] == [15, 15, 30], sleeps
+
+
+def test_dcgm_run_keeps_early_scrape_failures_inside_the_startup_grace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A freshly booted node starts the collector before the exporter Pod
+    listens; those first refusals are the exporter coming up, not a fault.
+    Inside the grace they are retried and not reported (live: every reboot
+    risked a dcgm-fields incident and a diagnostic workflow); once the grace
+    is over the same refusal is an error batch again."""
+
+    _dcgm_environment(monkeypatch, tmp_path)
+    clock = {"now": NOW}
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("gpu_fault.collectors.gpu.dcgm.urlopen", refuse)
+    sink = RecordingSink()
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        interval_seconds=15,
+        startup_spread_seconds=1,
+        startup_grace_seconds=120,
+        force_snapshot_path=str(tmp_path / "gpu.request"),
+        now=lambda: clock["now"],
+        runner=_inventory_runner(8),
+    )
+    ticks = iter([0, 30, 60, 90, 150, 200])
+
+    def advance(_seconds):
+        try:
+            clock["now"] = NOW + timedelta(seconds=next(ticks))
+        except StopIteration:
+            raise StopIteration from None
+
+    monkeypatch.setattr("gpu_fault.collectors.gpu.dcgm.time.sleep", advance)
+
+    with pytest.raises(StopIteration):
+        collector.run()
+
+    errors = [
+        payload
+        for path, payload in sink.requests
+        if path == GPU_METRICS_PATH and payload["collection_errors"]
+    ]
+    # Rounds at 0, 30, 60 and 90 s are inside the 120 s grace; 150 and 200 s
+    # are the exporter genuinely dead and are reported.
+    assert len(errors) == 2, sink.requests
+    assert all(
+        "cannot scrape DCGM exporter" in item
+        for payload in errors
+        for item in payload["collection_errors"]
+    ), errors
 
 
 def _inventory_runner(count: int):
