@@ -24,6 +24,7 @@ import pytest
 from gpu_fault.compile_blocked import (
     CLOSE_MARKER,
     DISPATCHER_ACTOR,
+    SETTLED_CLOSE_MARKER,
     close_compile_blocked_workflows,
 )
 from gpu_fault.execution.config import WorkflowDispatcherConfig
@@ -301,3 +302,88 @@ def test_a_row_that_moved_since_the_read_is_refused_and_the_sweep_goes_on() -> N
         "a refused compare-and-set must leave the row exactly as it was"
     )
     assert store.get_workflow("workflow-second").status is WorkflowStatus.SUPERSEDED
+
+
+# --------------------------------------------------------------------------- #
+# The second shape: a BLOCKED record whose incident is already RECOVERED.
+# --------------------------------------------------------------------------- #
+def settled_incident_pair(
+    store, *, incident_state=IncidentState.RECOVERED, **overrides
+):
+    """The live 2026-09-11 shape: an Always-Fatal SXID's RESTART_BM workflow,
+    FREEZE_EVIDENCE already run, BLOCKED SAFETY_SETTLED, its incident closed by
+    an operator after a validated restore of another incident freed the node."""
+
+    now = datetime.now(timezone.utc)
+    incident = fault_incident(
+        INCIDENT,
+        f"event-{INCIDENT}",
+        event_type="SXID",
+        node_ids=["node-a"],
+        state=incident_state,
+        fencing_token=1,
+        workflow_request_id=WORKFLOW,
+    )
+    values = {
+        "official_action": "RESTART_BM",
+        "official_steps": [
+            workflow_step(WorkflowOperation.FREEZE_EVIDENCE),
+            workflow_step(WorkflowOperation.RESTART_NODE),
+        ],
+        "blocked_reasons": ["NVIDIA Table 23 classifies SXID 23001 as Always Fatal"],
+        "blocked_kind": BlockedKind.SAFETY_SETTLED,
+        "completed_operations": [WorkflowOperation.FREEZE_EVIDENCE],
+        "completed_step_indexes": [0],
+        "created_at": now,
+        "updated_at": now,
+    }
+    values.update(overrides)
+    workflow = workflow_request(
+        WORKFLOW, INCIDENT, status=WorkflowStatus.BLOCKED, **values
+    )
+    store.save_incident(incident)
+    store.save_workflow(workflow)
+    return incident, workflow
+
+
+def test_a_blocked_workflow_of_a_recovered_incident_is_closed_on_the_tick() -> None:
+    store = build_store()
+    incident, _ = settled_incident_pair(store)
+    before = all_workflow_ids(store)
+
+    dispatcher(store).run_once()
+
+    closed = store.get_workflow(WORKFLOW)
+    assert closed.status is WorkflowStatus.SUPERSEDED, closed.status
+    assert SETTLED_CLOSE_MARKER in (closed.preemption_reason or "")
+    assert "23001" in (closed.preemption_reason or ""), "blocked_reasons must survive"
+    (event,) = reconcile_events(store)
+    assert event.actor == DISPATCHER_ACTOR
+    assert event.details["completed_operations"] == ["FREEZE_EVIDENCE"], event.details
+    assert all_workflow_ids(store) == before, "the sweep must never delete a record"
+    assert store.get_incident(INCIDENT) == incident, "the incident is not rewritten"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"execution_owner_id": "executor-a"}, {"remediation_budget_claims": ["budget-1"]}],
+    ids=["owned", "budget-claimed"],
+)
+def test_a_live_blocked_record_is_not_the_settled_shape(overrides) -> None:
+    store = build_store()
+    settled_incident_pair(store, **overrides)
+
+    dispatcher(store).run_once()
+
+    assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED, overrides
+
+
+def test_an_escalated_incidents_blocked_record_waits_for_the_operator() -> None:
+    """ESCALATED is not settled: the operator may still act on that record."""
+
+    store = build_store()
+    settled_incident_pair(store, incident_state=IncidentState.ESCALATED)
+
+    dispatcher(store).run_once()
+
+    assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED

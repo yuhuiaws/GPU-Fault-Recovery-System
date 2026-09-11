@@ -47,6 +47,7 @@ from gpu_fault.adapters.common import (
     QUARANTINE_TAINT,
     quarantine_taint_value,
 )
+from gpu_fault.compile_blocked import close_settled_incident_blocked_workflow
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
     FaultIncident,
@@ -357,7 +358,40 @@ class IncidentClosureService:
         LOGGER.info(
             "incident %s closed by operator %s: %s", incident_id, operator, reason
         )
+        self._settle_blocked_workflow(closed, operator=operator, reference=reference)
         return closed, True
+
+    def _settle_blocked_workflow(
+        self, incident: FaultIncident, *, operator: str, reference: str | None
+    ) -> None:
+        """End the BLOCKED workflow a closed incident leaves behind.
+
+        ``_open_workflow`` lets the close through past a BLOCKED row that holds
+        nothing on the node, so that row would outlive its incident as
+        paperwork -- and the release preflight counts BLOCKED destructive work.
+        The close must not fail on it: a refused or stale write is logged and
+        the dispatcher's sweep ends the record on its next tick.
+        """
+
+        if not incident.workflow_request_id:
+            return
+        try:
+            workflow = self.store.get_workflow(incident.workflow_request_id)
+            if workflow.status is not WorkflowStatus.BLOCKED:
+                return
+            close_settled_incident_blocked_workflow(
+                self.store,
+                workflow,
+                now=datetime.now(timezone.utc),
+                actor=operator,
+                reference=reference,
+            )
+        except Exception:  # noqa: BLE001 - the incident close already landed
+            LOGGER.exception(
+                "BLOCKED workflow %s of closed incident %s left for the sweep",
+                incident.workflow_request_id,
+                incident.incident_id,
+            )
 
     # ------------------------------------------------------- terminal hook
 

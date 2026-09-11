@@ -162,10 +162,49 @@ def main() -> None:
             for command in commands
         )
 
+    def settled_incident_blocked(workflow: Any) -> bool:
+        # A BLOCKED record whose incident is already RECOVERED: nothing waits
+        # on it (an operator close refuses while a workflow is open, so this is
+        # what a close leaves behind) and nothing on it is live -- no execution
+        # owner, no budget claim, no open remote command. The dispatcher sweep
+        # ends it (``gpu_fault.compile_blocked``, second shape); the gate sets
+        # it aside for the same reason as the compile-time shape: the record
+        # blocked the very release that carried its close. ESCALATED stays a
+        # blocker -- an operator may still act on that record.
+        if (
+            workflow.status is not WorkflowStatus.BLOCKED
+            or workflow.execution_owner_id
+            or workflow.remediation_budget_claims
+            or workflow.source_plan_id  # plan-driven: the restore reconcile's
+        ):
+            return False
+        try:
+            incident = store.get_incident(workflow.incident_id)
+        except Exception:
+            return False
+        if incident.state is not IncidentState.RECOVERED:
+            return False
+        try:
+            commands = store.list_remote_commands(
+                workflow_request_ids=[workflow.request_id]
+            )
+        except Exception:
+            return False
+        return not any(
+            command.status
+            in (
+                RemoteCommandStatus.PENDING,
+                RemoteCommandStatus.LEASED,
+                RemoteCommandStatus.WAITING,
+            )
+            for command in commands
+        )
+
     blockers: list[str] = []
     resolved: list[str] = []
     abandoned: list[str] = []
     compile_time: list[str] = []
+    settled: list[str] = []
     for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in workflow.official_steps
@@ -177,6 +216,8 @@ def main() -> None:
             abandoned.append(workflow.request_id)
         elif compile_blocked(workflow):
             compile_time.append(workflow.request_id)
+        elif settled_incident_blocked(workflow):
+            settled.append(workflow.request_id)
         else:
             blockers.append(workflow.request_id)
     print(
@@ -190,6 +231,8 @@ def main() -> None:
                 "abandoned_generation_count": len(abandoned),
                 "compile_blocked": compile_time[:100],
                 "compile_blocked_count": len(compile_time),
+                "settled_incident_blocked": settled[:100],
+                "settled_incident_blocked_count": len(settled),
             },
             sort_keys=True,
         )

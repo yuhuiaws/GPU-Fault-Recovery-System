@@ -26,6 +26,7 @@ import pytest
 
 from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.models import (
+    BlockedKind,
     IncidentState,
     WorkflowEventCode,
     WorkflowEventKind,
@@ -777,3 +778,38 @@ def test_a_succeeded_diagnostic_only_workflow_retires_its_recovered_incidents_ma
     service.on_terminal(diagnostic, incident, list(diagnostic.official_steps))
     (again,) = store.list_markers_for_incident("inc-identity")
     assert again.retired_at == stamp, "retirement is idempotent"
+
+
+def test_closing_an_incident_supersedes_the_blocked_workflow_it_leaves_behind(
+    store,
+) -> None:
+    """An Always-Fatal SXID's RESTART_BM workflow is BLOCKED SAFETY_SETTLED --
+    not open, so the close goes through -- and used to outlive its incident as
+    paperwork the release preflight counted. The close now ends it in the same
+    breath, attributed to the operator."""
+
+    incident, workflow = _quarantined(store)
+    blocked = copy_model(
+        workflow,
+        status=WorkflowStatus.BLOCKED,
+        blocked_kind=BlockedKind.SAFETY_SETTLED,
+        blocked_reasons=["NVIDIA Table 23 classifies SXID 23001 as Always Fatal"],
+    )
+    store.save_workflow(blocked, expected=workflow)
+    service = IncidentClosureService(store)
+
+    closed, changed = service.close_incident(
+        incident.incident_id,
+        reason="stale log line replayed after a reboot",
+        operator=OPERATOR,
+        reference="CHG-2",
+        evidence=[_clean()],
+    )
+
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    settled = store.get_workflow(workflow.request_id)
+    assert settled.status is WorkflowStatus.SUPERSEDED, settled.status
+    assert "closed BLOCKED workflow of a RECOVERED incident" in (
+        settled.preemption_reason or ""
+    )
+    assert f"{OPERATOR} reconciliation CHG-2" in (settled.preemption_reason or "")

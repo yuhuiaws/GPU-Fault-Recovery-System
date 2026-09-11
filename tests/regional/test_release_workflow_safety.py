@@ -217,3 +217,56 @@ def test_preflight_and_fleet_gate_require_verified_restore_evidence() -> None:
     assert "IncidentState.RECOVERED" in resolution
     assert "WorkflowStatus.SUCCEEDED" in resolution
     assert "WorkflowOperation.RESTORE_SCHEDULING" in resolution
+
+
+def test_workflow_safety_sets_aside_a_blocked_workflow_of_a_recovered_incident() -> (
+    None
+):
+    """An Always-Fatal SXID's RESTART_BM workflow stayed BLOCKED after an operator
+    closed its incident RECOVERED, and held the release carrying the fix for the
+    replayed log line that had opened it. Nothing waits on such a record; the
+    gate rolls past it and reports it, as it does for the compile-time shape."""
+
+    result = SAFETY.workflow_safety_snapshot(
+        release(
+            '{"blocker_count":0,"blockers":[],'
+            '"resolved_blocked_count":0,"resolved_blocked":[],'
+            '"abandoned_generation_count":0,"abandoned_generation":[],'
+            '"compile_blocked_count":0,"compile_blocked":[],'
+            '"settled_incident_blocked_count":1,'
+            '"settled_incident_blocked":["workflow-restart-bm"]}'
+        )
+    )
+
+    assert result["settled_incident_blocked_count"] == 1
+    assert result["settled_incident_blocked"] == ["workflow-restart-bm"]
+
+
+# The guards that make a BLOCKED record of a RECOVERED incident provably dead:
+# nothing live on it, and an incident nobody waits on. ESCALATED is deliberately
+# absent -- that incident still awaits an operator who may act on the record.
+SETTLED_INCIDENT_GUARDS = (
+    "IncidentState.RECOVERED",
+    "execution_owner_id",
+    "remediation_budget_claims",
+    "source_plan_id",
+    "RemoteCommandStatus.PENDING",
+    "RemoteCommandStatus.LEASED",
+    "RemoteCommandStatus.WAITING",
+)
+
+
+def test_the_probe_and_the_product_agree_on_what_makes_a_settled_incident_record() -> (
+    None
+):
+    preflight = PROBES.probe_source("workflow_safety")
+    product = COMPILE_BLOCKED.read_text(encoding="utf-8")
+
+    for source, label in ((preflight, "probe"), (product, "product")):
+        assert "settled_incident_blocked" in source, label
+        for guard in SETTLED_INCIDENT_GUARDS:
+            assert guard in source, f"{label} copy stopped reading {guard}"
+    assert "settled_incident_blocked_count" in preflight
+    assert "is not IncidentState.RECOVERED" in preflight, (
+        "the probe must set aside RECOVERED only, never ESCALATED"
+    )

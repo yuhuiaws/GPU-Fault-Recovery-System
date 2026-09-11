@@ -51,6 +51,15 @@ LOGGER = logging.getLogger(__name__)
 
 DISPATCHER_ACTOR = "dispatcher"
 CLOSE_MARKER = "closed compile-time BLOCKED workflow"
+#: The second shape the sweep closes: a BLOCKED record -- dispatched or not --
+#: whose incident an operator (or a validated restore) has since closed
+#: RECOVERED. Nothing waits on it any more (``close_incident`` refuses while a
+#: workflow is still open, so a BLOCKED row it left behind is settled paperwork)
+#: and nothing else ends it, yet the release preflight counted it as active
+#: destructive work: an Always-Fatal SXID's BLOCKED ``RESTART_BM`` blocked the
+#: release carrying the fix for the replayed log line that opened it
+#: (2026-09-11).
+SETTLED_CLOSE_MARKER = "closed BLOCKED workflow of a RECOVERED incident"
 SETTLED_INCIDENT_STATES = frozenset({IncidentState.RECOVERED, IncidentState.ESCALATED})
 OPEN_REMOTE_STATUSES = frozenset(
     {
@@ -231,27 +240,154 @@ def close_compile_blocked_workflow(
     return True
 
 
+def settled_incident_blocked_reasons(
+    workflow: WorkflowRequest,
+    incident: Any | None,
+    open_commands: Iterable[str],
+) -> list[str]:
+    """Why ``workflow`` is not a BLOCKED record of a RECOVERED incident.
+
+    Fewer guards than the compile-time shape on purpose: this record may have
+    run steps. What makes it safe to end is that its incident is closed --
+    RECOVERED, not ESCALATED, which still awaits an operator who may act on the
+    record -- and that nothing on it is live: no execution owner, no budget
+    claim, no open remote command.
+    """
+
+    reasons: list[str] = []
+    if workflow.status is not WorkflowStatus.BLOCKED:
+        reasons.append(f"workflow is {workflow.status.value}, not BLOCKED")
+    if workflow.execution_owner_id:
+        reasons.append("workflow still has an execution owner")
+    if workflow.remediation_budget_claims:
+        reasons.append("workflow holds remediation budget claims")
+    if workflow.source_plan_id:
+        # Plan-driven: the restore reconcile owns it and carries its audit.
+        reasons.append(
+            "workflow has a source recovery plan; the restore reconcile owns it"
+        )
+    commands = list(open_commands)
+    if commands:
+        reasons.append("workflow has open remote commands: " + ", ".join(commands))
+    if incident is None:
+        reasons.append("incident is missing")
+    elif incident.state is not IncidentState.RECOVERED:
+        reasons.append(f"incident is {incident.state.value}, not RECOVERED")
+    return reasons
+
+
+def closed_settled_incident_record(
+    workflow: WorkflowRequest,
+    *,
+    reconciled_at: datetime,
+    actor: str,
+    reference: str | None = None,
+) -> WorkflowRequest:
+    """The SUPERSEDED form of a BLOCKED record whose incident is RECOVERED."""
+
+    if workflow.status is not WorkflowStatus.BLOCKED:
+        raise ValueError(f"workflow is {workflow.status.value}, not BLOCKED")
+    attribution = f"{actor} reconciliation" + (f" {reference}" if reference else "")
+    closed: WorkflowRequest = workflow.model_copy(
+        update={
+            "status": WorkflowStatus.SUPERSEDED,
+            "preemption_reason": (
+                f"{attribution}: {SETTLED_CLOSE_MARKER}; blocked_reasons="
+                + json.dumps(list(workflow.blocked_reasons), sort_keys=True)
+            ),
+            "superseded_at": reconciled_at,
+            "updated_at": reconciled_at,
+        }
+    )
+    return record_operator_event(
+        closed,
+        WorkflowEventKind.OPERATOR_RECONCILED,
+        actor=actor,
+        reference=reference,
+        previous_status=workflow.status,
+        at=reconciled_at,
+        details={
+            "terminalization": SETTLED_CLOSE_MARKER,
+            "blocked_reasons": list(workflow.blocked_reasons),
+            "completed_operations": [
+                str(getattr(item, "value", item))
+                for item in workflow.completed_operations
+            ],
+        },
+    )
+
+
+def close_settled_incident_blocked_workflow(
+    store: Any,
+    workflow: WorkflowRequest,
+    *,
+    now: datetime,
+    actor: str = DISPATCHER_ACTOR,
+    reference: str | None = None,
+) -> bool:
+    """Close one BLOCKED record of a RECOVERED incident; ``False`` otherwise.
+
+    Same discipline as the compile-time close: incident and commands read
+    fresh, one compare-and-set write, the audit event in that write.
+    """
+
+    incident: Any | None
+    try:
+        incident = store.get_incident(workflow.incident_id)
+    except (KeyError, NotFoundError):
+        incident = None
+    open_commands = [
+        str(command.command_id)
+        for command in store.list_remote_commands(
+            workflow_request_ids=[workflow.request_id]
+        )
+        if command.status in OPEN_REMOTE_STATUSES
+    ]
+    if settled_incident_blocked_reasons(workflow, incident, open_commands):
+        return False
+    closed = closed_settled_incident_record(
+        workflow, reconciled_at=now, actor=actor, reference=reference
+    )
+    store.save_workflow(closed, expected=workflow)
+    LOGGER.warning(
+        "BLOCKED workflow of a RECOVERED incident closed by %s: workflow=%s "
+        "incident=%s blocked_reasons=%s",
+        actor,
+        workflow.request_id,
+        workflow.incident_id,
+        json.dumps(list(workflow.blocked_reasons), sort_keys=True),
+    )
+    return True
+
+
 def close_compile_blocked_workflows(
     store: Any,
     *,
     now: datetime,
     limit: int = SWEEP_LIMIT,
 ) -> list[str]:
-    """The dispatcher's sweep: close every compile-time BLOCKED no-op it can see.
+    """The dispatcher's sweep: close every BLOCKED record nothing waits on.
 
-    One isolated write per record; a failure on one is logged and leaves that
-    record for the next tick without stopping the others. Returns the ids
-    closed this tick. Nothing is deleted.
+    Two shapes: the compile-time no-op (never dispatched, incident settled) and
+    the BLOCKED record of an incident already RECOVERED. One isolated write per
+    record; a failure on one is logged and leaves that record for the next tick
+    without stopping the others. Returns the ids closed this tick. Nothing is
+    deleted.
     """
 
     closed_ids: list[str] = []
     for workflow in store.list_workflows(
         {WorkflowStatus.BLOCKED}, limit=limit, newest_first=True
     ):
-        if never_dispatched_reasons(workflow):
-            continue
         try:
-            closed = close_compile_blocked_workflow(store, workflow, now=now)
+            if never_dispatched_reasons(workflow):
+                closed = close_settled_incident_blocked_workflow(
+                    store, workflow, now=now
+                )
+            else:
+                closed = close_compile_blocked_workflow(
+                    store, workflow, now=now
+                ) or close_settled_incident_blocked_workflow(store, workflow, now=now)
         except Exception:  # noqa: BLE001 - keep sweeping, leave the record as read
             LOGGER.exception(
                 "compile-time BLOCKED close failed, workflow left as it was: %s",
