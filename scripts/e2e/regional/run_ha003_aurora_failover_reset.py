@@ -33,6 +33,7 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     reusable_focused_tests,
     run_standard_case,
 )
+from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     PROVIDER_MUTATIONS,
     RegionalFixtureError,
@@ -159,10 +160,17 @@ def rds_snapshot(settings: Settings) -> dict[str, Any]:
 
 
 def reset_command_status(state: dict[str, Any]) -> str | None:
+    """Status of the one remote command that carries RESET_GPU.
+
+    Since the round-trip batch that command usually heads with
+    QUIESCE_GPU_SERVICES and lists RESET_GPU among its batched steps; a
+    filter on ``step.operation`` alone saw no reset at all (attempt 1).
+    """
+
     commands = [
         item
         for item in state.get("commands") or []
-        if item.get("step", {}).get("operation") == "RESET_GPU"
+        if "RESET_GPU" in command_operations(item)
     ]
     if len(commands) != 1:
         return None
@@ -420,7 +428,7 @@ def wait_reset_claim(
         commands = [
             item
             for item in last.get("commands") or []
-            if item.get("step", {}).get("operation") == "RESET_GPU"
+            if "RESET_GPU" in command_operations(item)
         ]
         # The reset is in flight on the node from the first claim until the
         # Node Agent's result lands. The remote command is LEASED only for the
@@ -585,7 +593,7 @@ def evaluate_reset(
     reset_commands = [
         item
         for item in state.get("commands") or []
-        if item.get("step", {}).get("operation") == "RESET_GPU"
+        if "RESET_GPU" in command_operations(item)
     ]
     if len(reset_commands) != 1 or reset_commands[0].get("status") != "SUCCEEDED":
         errors.append("RESET_GPU remote command is not uniquely terminal")

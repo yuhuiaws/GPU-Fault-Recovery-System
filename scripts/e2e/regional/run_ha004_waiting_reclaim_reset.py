@@ -30,6 +30,7 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
 )
+from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -491,7 +492,7 @@ def command_timeline(
         commands = [
             item
             for item in state.get("commands") or []
-            if item.get("step", {}).get("operation") == "RESET_GPU"
+            if "RESET_GPU" in command_operations(item)
         ]
         command = commands[0] if len(commands) == 1 else {}
         sample = {
@@ -666,7 +667,7 @@ def evaluate_reclaim(
     commands = [
         item
         for item in state.get("commands") or []
-        if item.get("step", {}).get("operation") == "RESET_GPU"
+        if "RESET_GPU" in command_operations(item)
     ]
     if len(commands) != 1:
         errors.append("RESET_GPU remote command is not unique")
