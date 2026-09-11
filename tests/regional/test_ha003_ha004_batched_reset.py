@@ -54,3 +54,27 @@ def test_neither_runner_filters_on_the_head_step_alone() -> None:
         assert "command_operations(item)" in source, (
             f"{module.__name__} does not use command_operations"
         )
+
+
+def test_the_env_window_only_assigns_what_the_live_executor_does_not_already_carry() -> (
+    None
+):
+    """The shipped poll interval is 2 s, the case's own value; assigning it made
+    executor_env_window read the live env as an unrecorded open and refuse."""
+
+    live = {
+        ha004.LEASE_ENV: {"present": True, "value": "120"},
+        ha004.POLL_ENV: {"present": True, "value": "2"},
+    }
+    assert ha004.window_assignments(live) == {ha004.LEASE_ENV: "10"}, (
+        "poll=2 was re-assigned"
+    )
+    assert ha004.window_assignments({}) == {
+        ha004.LEASE_ENV: "10",
+        ha004.POLL_ENV: "2",
+    }, "absent variables must be assigned"
+    assert ha004.window_assignments(
+        {ha004.LEASE_ENV: {"present": True, "value": "10"}}
+    ) == {ha004.POLL_ENV: "2"}, (
+        "a lease already at the test value must be left to the window's own refusal"
+    )

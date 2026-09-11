@@ -219,6 +219,25 @@ def stop_process_group(process: subprocess.Popen[str] | None) -> dict[str, Any]:
     return {"armed": True, "fired": False, "disarmed": True}
 
 
+def window_assignments(live_variables: dict[str, Any]) -> dict[str, str]:
+    """The executor env values the case still has to change.
+
+    lease=10s/poll=2s is the shape the reclaim needs; a variable the live
+    Deployment already carries at that value is left out, because the env
+    window refuses to open when the live env "already carries a changed
+    value" -- its guard against an unrecorded window -- and the shipped poll
+    interval is now 2 s (attempt 1). What is not assigned is not restored
+    either, so the window only ever touches what it moved.
+    """
+
+    wanted = {LEASE_ENV: str(TEST_LEASE_SECONDS), POLL_ENV: str(TEST_POLL_SECONDS)}
+    return {
+        name: value
+        for name, value in wanted.items()
+        if (live_variables.get(name) or {}).get("value") != value
+    }
+
+
 class ExecutorTimingFixture:
     """Open the lease/poll env window on the executor and put it back.
 
@@ -303,11 +322,12 @@ class ExecutorTimingFixture:
 
     def apply(self) -> dict[str, Any]:
         self.start_watchdog()
+        survey = env_window.survey(self.regional)
         env_window.open_window(
             self.window,
             self.regional,
-            env_window.survey(self.regional),
-            {LEASE_ENV: str(TEST_LEASE_SECONDS), POLL_ENV: str(TEST_POLL_SECONDS)},
+            survey,
+            window_assignments(survey["deployment"].get("variables") or {}),
         )
         self.regional.kubectl(
             "gpu",
