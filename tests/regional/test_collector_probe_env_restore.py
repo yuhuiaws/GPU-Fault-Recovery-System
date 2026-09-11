@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import run_collector_destructive as runner
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.probes import collector_node_probe as probe
 
 ENV_TEXT = "GPU_FAULT_EXPECTED_GPU_COUNT=8\nGPU_FAULT_HOST_INTERVAL_SECONDS=15\n"
@@ -64,6 +66,9 @@ def test_override_arms_a_deadman_timer_and_a_boot_time_restore(
     )
     assert "WantedBy=multi-user.target" in service, (
         "the restore does not run at the next boot"
+    )
+    assert f"Before={probe.HOST_COLLECTOR_UNIT}" in service, (
+        "at boot the collector would read the override before the restore lands"
     )
     assert ["systemctl", "enable", f"{unit}.service"] in node["commands"], (
         "the boot-time restore was not enabled"
@@ -166,3 +171,42 @@ def test_probe_exposes_the_light_reads_the_runners_poll() -> None:
         "efa-inventory": probe.efa_inventory_command,
         "snapshot": probe.snapshot,
     }
+
+
+class _RebootingCollector:
+    """A probe whose node is down: every exec and every recreate fails."""
+
+    def __init__(self, recreate_recovers: bool) -> None:
+        self.recreate_recovers = recreate_recovers
+        self.calls: list[str] = []
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        self.calls.append("execute")
+        if self.recreate_recovers and "recreate" in self.calls:
+            return {"restored": True, "run_id": arguments[2]}
+        raise HostProbeError("kubectl failed (1): exec: pod is Failed")
+
+    def recreate(self) -> None:
+        self.calls.append("recreate")
+        if not self.recreate_recovers:
+            raise HostProbeError("kubectl failed (1): wait Ready timed out")
+
+
+def test_pre_reboot_restore_defers_instead_of_failing_the_case_when_the_node_is_down():
+    """Attempts 3 and 4 died here: the executor rebooted the node seconds after
+    planning RESTART_NODE, the restore's exec lost its Pod, and the recreate
+    waited 180 s for a Pod on a node that was down. The runner now records a
+    deferred restore and retries once the node is back."""
+
+    collector = _RebootingCollector(recreate_recovers=False)
+    outcome = runner.restore_collector_env(collector, "c004-5")
+    assert outcome["restored"] is False and outcome["deferred"] is True
+    assert "node reboots" in outcome["reason"]
+    assert collector.calls == ["execute", "recreate"]
+
+    recovered = _RebootingCollector(recreate_recovers=True)
+    assert runner.restore_collector_env(recovered, "c004-5") == {
+        "restored": True,
+        "run_id": "c004-5",
+    }
+    assert recovered.calls == ["execute", "recreate", "execute"]

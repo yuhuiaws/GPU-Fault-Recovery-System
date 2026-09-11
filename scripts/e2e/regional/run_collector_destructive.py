@@ -25,8 +25,10 @@ from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
     collector_setting,
     select_workflow,
 )
+from scripts.e2e.regional.collector_env_restore import (  # noqa: E402
+    restore_collector_env,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
-    HostProbeError,
     HostProbeFixture,
     HostProbeSettings,
 )
@@ -827,38 +829,6 @@ def workflow_planning(
     return None
 
 
-def restore_collector_env(collector: Any, run_id: str) -> dict[str, Any]:
-    """Undo the collector env override, through a fresh probe Pod if needed.
-
-    The first attempt goes through the Pod the case has been using; after a
-    real RESTART_NODE that Pod is Failed and `kubectl exec` refuses it, which
-    used to leave the override in place until the on-node deadman timer
-    expired. One recreate-and-retry is what the reboot costs.
-    """
-
-    try:
-        return cast(
-            dict[str, Any],
-            collector.execute(
-                "restore-collector-env",
-                "--run-id",
-                run_id,
-                timeout=300,
-            ),
-        )
-    except HostProbeError:
-        collector.recreate()
-        return cast(
-            dict[str, Any],
-            collector.execute(
-                "restore-collector-env",
-                "--run-id",
-                run_id,
-                timeout=300,
-            ),
-        )
-
-
 def restore_incident(
     regional: RegionalLiveFixture,
     settings: Settings,
@@ -1040,7 +1010,9 @@ def run_collect004(
         # fails and escalates, and the runner used to tolerate that.
         restore = restore_collector_env(collector, run_id)
         result["collector_restore"] = restore
-        if restore.get("restored") is not True:
+        if restore.get("deferred"):
+            result["collector_restore_before_reboot"] = restore
+        elif restore.get("restored") is not True:
             result["errors"].append(
                 f"collector env restore did not restore: {restore.get('reason')}"
             )

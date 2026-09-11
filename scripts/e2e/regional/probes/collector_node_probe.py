@@ -764,6 +764,15 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
             [
                 "[Unit]",
                 "Description=Restore gpu-fault collector env after acceptance",
+                # Ordered before the host collector: at the next boot the
+                # restore must land before the collector reads its env, or the
+                # collector's first sample after the reboot still carries the
+                # override, reports the mismatch again, and the RESTART_NODE
+                # workflow's VALIDATE_GPU fails on a node that is fine
+                # (COLLECT-004 attempt 4). The restart in ExecStart is then a
+                # start of a unit that has not started yet, which is harmless.
+                "After=local-fs.target",
+                f"Before={HOST_COLLECTOR_UNIT}",
                 "[Service]",
                 "Type=oneshot",
                 f"ExecStart=/bin/cp {backup} {COLLECTOR_ENV}",

@@ -27,7 +27,7 @@
     "scripts/e2e/regional/identity_acceptance_auth.py": 1786,
     "scripts/e2e/regional/regional_live_fixture.py": 1627,
     "scripts/e2e/regional/run_collector_acceptance.py": 1772,
-    "scripts/e2e/regional/run_collector_destructive.py": 1914,
+    "scripts/e2e/regional/run_collector_destructive.py": 1886,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1601,
     "scripts/e2e/regional/run_notification_acceptance.py": 1701,
     "scripts/e2e/regional/run_workload_acceptance.py": 2165,
