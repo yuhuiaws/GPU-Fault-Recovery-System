@@ -6284,7 +6284,13 @@ test_cases:
   - quiesce 期间的证据由宿主机侧采样器完整留存
   - 其余 RESET_GPU 码由 GF-LIVE-KMSG-* 家族与 COLLECT-007 的 XID 目录回放覆盖，本用例不重复做第二次 reset
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 25d046d60d29af5da867a5fab5c2de5ca722501f15de16259850ca9a6643fe17
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-013
   related_pytest: tests/node_agent/test_remediation.py::test_gpu_reset_is_idempotent_and_rechecks_clients
