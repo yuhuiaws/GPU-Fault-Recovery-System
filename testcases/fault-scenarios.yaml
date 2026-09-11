@@ -4749,7 +4749,13 @@ test_cases:
   - lane lease、remote command和notification均恰好一次完成
   - 第二次refresh为NOOP且不触发额外滚动
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e5aa7021bfce0015d049a8e3cbb65189121503546ccead9db9f72350269531a6
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-009
   related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_updates_the_secret_and_leaves_every_deployment_alone
