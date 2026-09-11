@@ -6250,7 +6250,13 @@ test_cases:
   - incident 收敛到 RECOVERED 且无 workflow；节点仍可调度、无 gpu-fault taint、boot_id 不变
   - 本用例只验采集层前半段与判定正确性，不验执行
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 9ad8ab7a747210c1a92dccede65a4098bdd80c60374e8042539f4abbad28fa62
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-012
   related_pytest: tests/orchestration/test_misc.py::test_restart_app_on_an_idle_node_does_not_open_a_workflow
