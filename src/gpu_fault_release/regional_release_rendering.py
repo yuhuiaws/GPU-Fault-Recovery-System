@@ -610,7 +610,12 @@ def render_gpu_rollout_manifests(
     replacements = {
         "gpu-fault-executor-wheel-0100": wheel_cm,
         "gpu_fault_cluster_executor-0.10.0-py3-none-any.whl": (
-            executor_wheel_filename or release.config.executor_wheel.name
+            # A rollback captures the wheel by its ConfigMap binaryData key,
+            # which is the xz-compressed storage name (`<wheel>.whl.xz`); the
+            # runtime spec and the Reconciler want the wheel filename itself.
+            (
+                executor_wheel_filename or release.config.executor_wheel.name
+            ).removesuffix(".xz")
         ),
         "namespace: gpu-fault-system": f"namespace: {config.namespace}",
         DEFAULT_RUNTIME_IMAGE: runtime_image or release.runtime_image,
@@ -685,7 +690,10 @@ def build_reconciler_environment(
         ),
         "GPU_FAULT_WHEEL_CONFIG_MAP": wheel_cm,
         "GPU_FAULT_EXECUTOR_WHEEL_FILENAME": (
-            executor_wheel_filename or config.executor_wheel.name
+            # A rollback hands the wheel's ConfigMap binaryData key, which is the
+            # xz-compressed storage name (`<wheel>.whl.xz`); the Reconciler wants
+            # the wheel filename and re-derives the `.xz` key itself.
+            (executor_wheel_filename or config.executor_wheel.name).removesuffix(".xz")
         ),
         "GPU_FAULT_RUNTIME_IMAGE": runtime_image or release.runtime_image,
         "GPU_FAULT_NODE_INSTALLER_IMAGE": (

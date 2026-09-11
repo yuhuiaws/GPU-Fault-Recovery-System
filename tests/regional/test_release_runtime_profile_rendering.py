@@ -153,3 +153,52 @@ def test_runtime_profile_override_restores_rollback_version(tmp_path: Path) -> N
         runtime_profile_version="hyperpod-v1",
     )
     assert environment["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"
+
+
+def test_rollback_wheel_storage_key_strips_xz_for_reconciler(tmp_path: Path) -> None:
+    """A rollback captures the wheel by its ConfigMap binaryData key.
+
+    That key is the xz-compressed storage name (``<wheel>.whl.xz``), but the
+    Reconciler validates ``GPU_FAULT_EXECUTOR_WHEEL_FILENAME`` against
+    ``^[A-Za-z0-9_.-]+\\.whl$`` and re-derives the ``.xz`` key itself, and the
+    rendered runtime spec substitutes the filename verbatim. The render layer
+    must hand the wheel filename, not the storage key.
+    """
+
+    import re
+
+    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
+
+    class RecordingRunner:
+        dry_run = True
+
+        def run(self, args, **kwargs):
+            return ""
+
+    release = MODULE.RegionalRelease(config, RecordingRunner())
+    target = config.clusters[0]
+
+    storage_key = "gpu_fault_cluster_executor-0.10.0-py3-none-any.whl.xz"
+    expected = "gpu_fault_cluster_executor-0.10.0-py3-none-any.whl"
+
+    environment = RENDERING_MODULE.build_reconciler_environment(
+        release,
+        target,
+        wheel_cm=release.wheel_cm,
+        bundle_cm=release.bundle_cm,
+        artifact_sha=release.wheel_sha,
+        config_digest=config.agent_config_digest,
+        executor_wheel_filename=storage_key,
+    )
+    assert environment["GPU_FAULT_EXECUTOR_WHEEL_FILENAME"] == expected
+    assert re.fullmatch(
+        r"[A-Za-z0-9_.-]+\.whl", environment["GPU_FAULT_EXECUTOR_WHEEL_FILENAME"]
+    ), "reconciler wheel filename must satisfy the reconciler script's regex"
+
+    rendered = "\n".join(
+        text
+        for _deployment, text in RENDERING_MODULE.render_gpu_rollout_manifests(
+            release, target, release.wheel_cm, executor_wheel_filename=storage_key
+        )
+    )
+    assert storage_key not in rendered, "rendered spec kept the .whl.xz storage key"
