@@ -24,11 +24,11 @@ from scripts.e2e.regional import run_destr016_preempting_reboot as destr016
 from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as destr017
 from scripts.e2e.regional import run_destr018_lifetime_deadline as destr018
 from scripts.e2e.regional import run_workload_acceptance as workload_acceptance
-from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.acceptance_scope import (
     EXECUTION_SCOPE_ENV,
     SELECTION_REFERENCE_ENV,
 )
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.managed_workload_fixture import (
     TRAINING_IMAGE,
     ImagePrewarmFixture,
