@@ -144,8 +144,13 @@ class FakeBackend:
             self.gpu_generations["cluster-a"][EXECUTOR] = 2
             if self.executor_rolls_watcher:
                 self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 2
-            if resume and self.resume_rolls_cpu:
-                self.cpu_generations = {"gpu-fault-api-ha": 3, "gpu-fault-worker": 3}
+            if resume:
+                # cpu-finalized is the one CPU roll every resume still owes;
+                # ``resume_rolls_cpu`` repeats the staged rollout on top of it.
+                step = 2 if self.resume_rolls_cpu else 1
+                self.cpu_generations = {
+                    name: value + step for name, value in self.cpu_generations.items()
+                }
         elif scenario == "agent":
             self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
             self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 3
@@ -184,7 +189,9 @@ def test_executor_stage_rejects_a_resume_that_rolls_the_cpu_again(
     backend = FakeBackend()
     backend.resume_rolls_cpu = True
 
-    with pytest.raises(boot020.AcceptanceCheckError, match="rolled the CPU"):
+    with pytest.raises(
+        boot020.AcceptanceCheckError, match="repeated the staged CPU rollout"
+    ):
         boot020.run_release_rolling(backend, _recorder(tmp_path))
 
 
