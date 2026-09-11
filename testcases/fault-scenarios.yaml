@@ -4338,7 +4338,13 @@ test_cases:
   - reboot 仍可独立启用 (ALLOW_HYPERPOD_REBOOT=true)（原 GF-REGIONAL-DESTR-011 的判定）
   - 报告记录所有 executor 副本数与 ALLOW_HYPERPOD_REPLACE=false（原 GF-REGIONAL-DESTR-011 的判定）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: a712e53ec5b9cf674b3854c1d8511ed0eb39e910339c9e5b9470f3ad31d96c3e
+      components:
+        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
+        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
+        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-013
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr013_manifest_audit_keeps_provider_replace_disabled
