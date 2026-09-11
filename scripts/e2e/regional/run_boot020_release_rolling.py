@@ -558,11 +558,20 @@ def _stage_executor(
     _assert_executor_pins(executor_resumed, phase="finalized")
     executor_after = chain.after(backend, recorder, "executor")
     # The interrupted attempt already staged the CPU side; the resume finishes
-    # the data plane and finalizes pins without rolling the CPU again.
+    # the data plane and then finalizes the pins, which is the one further CPU
+    # rollout every release makes (``cpu-finalized``). What it must not do is
+    # repeat the staged rollout: each CPU Deployment advances by at most one
+    # generation between the interruption and the end of the stage (live
+    # 2026-09-11: 505 -> 506, 563 -> 564, 455 -> 456).
+    repeated = {
+        name: (executor_interrupted["cpu_generations"].get(name), generation)
+        for name, generation in executor_after["cpu_generations"].items()
+        if generation - int(executor_interrupted["cpu_generations"].get(name) or 0) > 1
+    }
     _require(
-        executor_interrupted["cpu_generations"] == executor_after["cpu_generations"],
-        "resume rolled the CPU Deployments a second time",
-        (executor_interrupted["cpu_generations"], executor_after["cpu_generations"]),
+        not repeated,
+        "resume repeated the staged CPU rollout (more than the finalize roll)",
+        repeated,
     )
     _assert_data_plane_changed(executor_before, executor_after, scenario="executor")
     _assert_next_noop(backend, recorder, "executor")

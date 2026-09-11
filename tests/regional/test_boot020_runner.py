@@ -153,9 +153,14 @@ class FakeReleaseRollingBackend:
             self.cpu_generations = {"gpu-fault-api-ha": 2, "gpu-fault-worker": 2}
         elif scenario == "executor":
             # The interrupted attempt already staged the CPU side; the resume
-            # rolls only the executor Deployment.
+            # rolls the executor Deployment and then finalizes the pins, which
+            # is the one further CPU rollout (cpu-finalized) every release makes.
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
             self.gpu_generations["cluster-a"][EXECUTOR_DEPLOYMENT] = 2
+            if resume:
+                self.cpu_generations = {
+                    name: value + 1 for name, value in self.cpu_generations.items()
+                }
         elif scenario == "agent":
             self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
             self.live["clusters"]["cluster-a"]["bundle"] = "bundle-v2"
@@ -226,10 +231,11 @@ def test_boot020_runner_covers_diff_resume_and_rollback(tmp_path: Path) -> None:
         "candidate": CANDIDATE_EXECUTOR_PIN,
         "previous_required": PREVIOUS_EXECUTOR_PIN,
     }
-    assert (
-        stages["executor_interrupted_snapshot"]["cpu_generations"]
-        == stages["executor_after"]["cpu_generations"]
-    )
+    interrupted = stages["executor_interrupted_snapshot"]["cpu_generations"]
+    after = stages["executor_after"]["cpu_generations"]
+    assert {name: after[name] - interrupted[name] for name in after} == {
+        name: 1 for name in after
+    }, "the resume finalizes the pins (one CPU roll) and never repeats the stage"
     # Mid-transaction the two planes run different runtime images and the
     # engine's previous-release capture refuses the mixed fleet (live
     # 2026-09-11), so the interrupted snapshot must be the light form.
