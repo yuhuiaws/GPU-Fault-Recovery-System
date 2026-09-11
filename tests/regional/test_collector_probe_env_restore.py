@@ -4,7 +4,9 @@ COLLECT-004 restores ``collector.env`` through this probe. ``restore-collector-e
 used to answer ``restored: True`` unconditionally -- with the backup gone the
 override stayed on the node and the runner recorded a clean restore. The deadman
 timer was ``Persistent=true`` on a monotonic ``OnActiveSec`` timer, which systemd
-ignores, so a reboot never re-armed the restore either.
+ignores, so a reboot never re-armed the restore either; the ``OnBootSec=1`` that
+replaced it fired at once on a node long past boot. The boot-time restore is now
+an enabled oneshot service.
 """
 
 from __future__ import annotations
@@ -43,16 +45,28 @@ def _override(run_id: str = "c004-1") -> None:
     )
 
 
-def test_override_arms_a_timer_that_also_fires_after_a_reboot(
+def test_override_arms_a_deadman_timer_and_a_boot_time_restore(
     node: dict[str, Any],
 ) -> None:
+    """The timer restores after the deadline; the enabled oneshot restores at
+    the next boot. ``OnBootSec=1`` on a timer enabled long after boot is
+    already elapsed and fired the restore a second after the override
+    (attempt 1), so the timer carries only the monotonic deadline."""
+
     _override()
 
     backup, unit = probe.collector_restore_paths("c004-1")
     timer = (node["units"] / f"{unit}.timer").read_text(encoding="utf-8")
+    service = (node["units"] / f"{unit}.service").read_text(encoding="utf-8")
     assert "OnActiveSec=600s" in timer
-    assert "OnBootSec=1" in timer, (
-        "a monotonic timer needs OnBootSec to survive a reboot"
+    assert "OnBootSec" not in timer and "Persistent" not in timer, (
+        "an already-elapsed boot offset fires the restore immediately"
+    )
+    assert "WantedBy=multi-user.target" in service, (
+        "the restore does not run at the next boot"
+    )
+    assert ["systemctl", "enable", f"{unit}.service"] in node["commands"], (
+        "the boot-time restore was not enabled"
     )
     assert "GPU_FAULT_EXPECTED_GPU_COUNT=9" in node["env"].read_text(encoding="utf-8")
     assert backup.read_text(encoding="utf-8") == ENV_TEXT
@@ -73,6 +87,9 @@ def test_restore_puts_the_original_bytes_back_and_says_so(node: dict[str, Any]) 
     assert node["env"].read_text(encoding="utf-8") == ENV_TEXT
     backup, unit = probe.collector_restore_paths("c004-1")
     assert not backup.exists() and not probe.collector_override_record(backup).exists()
+    assert ["systemctl", "disable", f"{unit}.service"] in node["commands"], (
+        "the boot-time restore stayed enabled after the restore"
+    )
     assert not (node["units"] / f"{unit}.timer").exists(), (
         "the restore timer unit is removed once it fired"
     )

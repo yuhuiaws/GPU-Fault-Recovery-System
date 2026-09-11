@@ -768,6 +768,15 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
                 "Type=oneshot",
                 f"ExecStart=/bin/cp {backup} {COLLECTOR_ENV}",
                 f"ExecStart=/bin/systemctl restart {HOST_COLLECTOR_UNIT}",
+                # Enabled (not started) below: a oneshot wanted by
+                # multi-user.target runs once at the next boot, so the
+                # RESTART_NODE this case provokes comes back with the
+                # original env. `Persistent=` cannot do this on a monotonic
+                # timer, and `OnBootSec=1` on a timer enabled hours after boot
+                # is already elapsed, so it fired the restore within a second
+                # of the override (COLLECT-004 attempt 1, 2026-09-11).
+                "[Install]",
+                "WantedBy=multi-user.target",
             ]
         )
         + "\n",
@@ -780,13 +789,6 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
                 "Description=Timed gpu-fault collector env restore",
                 "[Timer]",
                 f"OnActiveSec={arguments.restore_seconds}s",
-                # `Persistent=` only replays *calendar* timers; on a monotonic
-                # OnActiveSec timer it is inert, and the RESTART_NODE this case
-                # provokes would otherwise boot a node whose env still carried
-                # the override. OnBootSec=1 makes the enabled timer fire right
-                # after the reboot instead.
-                "OnBootSec=1",
-                "Persistent=true",
                 f"Unit={unit}.service",
                 "[Install]",
                 "WantedBy=timers.target",
@@ -807,6 +809,7 @@ def override_expected_gpu_count(arguments: argparse.Namespace) -> None:
     temporary.write_text(updated, encoding="utf-8")
     os.replace(temporary, COLLECTOR_ENV)
     run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", f"{unit}.service"])
     run(["systemctl", "enable", "--now", f"{unit}.timer"])
     run(["systemctl", "restart", HOST_COLLECTOR_UNIT])
     emit(
@@ -844,6 +847,7 @@ def restore_collector_env(arguments: argparse.Namespace) -> None:
         COLLECTOR_ENV.write_bytes(backup.read_bytes())
         run(["systemctl", "restart", HOST_COLLECTOR_UNIT])
     run(["systemctl", "disable", "--now", f"{unit}.timer"], check=False)
+    run(["systemctl", "disable", f"{unit}.service"], check=False)
     for suffix in (".timer", ".service"):
         (SYSTEMD_UNIT_DIR / (unit + suffix)).unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"])
