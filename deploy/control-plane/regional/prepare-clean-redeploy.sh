@@ -1369,9 +1369,8 @@ for context in "${CLUSTER_CONTEXTS[@]}"; do
         scale_gpu_deployment_zero "${context}" "${deployment}"
     done
 done
-if [[ "${MODE}" == reset && "${EXECUTE}" == true && -n "${DATABASE_POD}" ]]; then
-    fail_orphaned_remote_commands "${DATABASE_POD}"
-fi
+# No second orphan pass here: the consumers are already stopped, so no pod
+# can reach the store, and nothing dispatches new commands any more.
 if [[ "${NODE_MODE}" != skip ]]; then
     for index in "${!CLUSTER_IDS[@]}"; do
         run_node_cleanup "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
