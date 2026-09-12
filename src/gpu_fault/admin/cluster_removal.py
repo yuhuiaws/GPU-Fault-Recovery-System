@@ -110,6 +110,9 @@ def resolve_cluster_id(
     ]
     if len(matches) == 1:
         return str(matches[0]["cluster_id"])
+    pending = _pending_removal_for(site, eks_arn=eks_arn, hyperpod_name=hyperpod_name)
+    if pending is not None:
+        return pending
     managed = ", ".join(
         str(item.get("eks_cluster_arn") or item.get("cluster_id")) for item in clusters
     )
@@ -117,6 +120,42 @@ def resolve_cluster_id(
         f"no managed GPU cluster matches {gpu_cluster_arn}; "
         f"managed clusters: {managed or 'none'}"
     )
+
+
+def _pending_removal_for(
+    site: RenderedSite,
+    *,
+    eks_arn: str,
+    hyperpod_name: str,
+) -> str | None:
+    """The cluster id of an unfinished removal that already dropped the ARN.
+
+    ``SITE_UPDATED`` removes the cluster from ``site.yaml``; a failure in the
+    steps after it (release-state sync, verification) leaves a state file the
+    documented "rerun with the same arguments" must still reach, although the
+    site no longer knows the ARN (live 2026-09-12: "no managed GPU cluster
+    matches ...; managed clusters: none"). The removal's own DISCOVERED
+    evidence recorded the target, so the ARN resolves through it.
+    """
+
+    root = site.source.parent / "remove-cluster"
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob("*/state.json")):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if state.get("phase") == "COMPLETED":
+            continue
+        target = ((state.get("evidence") or {}).get("DISCOVERED") or {}).get("target")
+        if not isinstance(target, dict):
+            continue
+        if target.get("eks_cluster_arn") == eks_arn or (
+            hyperpod_name and target.get("hyperpod_cluster_name") == hyperpod_name
+        ):
+            return str(state.get("cluster_id") or target.get("cluster_id") or "")
+    return None
 
 
 def _state(

@@ -737,3 +737,45 @@ def test_workload_namespace_rbac_prune_selects_by_the_engine_label_only(
         "--wait=true",
     ], "selection is by the engine's label across every namespace, nothing else"
     assert len(deleted) == 2
+
+
+def test_resolve_cluster_id_reaches_an_unfinished_removal_the_site_already_dropped(
+    tmp_path,
+) -> None:
+    """SITE_UPDATED removes the cluster from site.yaml; a rerun after a later
+    step failed (live 2026-09-12: sync-state) must still resolve the ARN
+    through the removal's DISCOVERED evidence, or "rerun with the same
+    arguments" is a promise the last steps cannot keep."""
+
+    site = _site_with_clusters(tmp_path)
+    arn = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+    site.release_config["clusters"] = []
+    state_dir = site.source.parent / "remove-cluster" / "gpu-a"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "cluster_id": "gpu-a",
+                "phase": "SITE_UPDATED",
+                "evidence": {
+                    "DISCOVERED": {
+                        "target": {
+                            "cluster_id": "gpu-a",
+                            "eks_cluster_arn": arn,
+                            "hyperpod_cluster_name": "hp-gpu-a",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert admin_cluster_removal.resolve_cluster_id(site, arn) == "gpu-a"
+
+    (state_dir / "state.json").write_text(
+        json.dumps({"cluster_id": "gpu-a", "phase": "COMPLETED", "evidence": {}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(BootstrapError, match="managed clusters: none"):
+        admin_cluster_removal.resolve_cluster_id(site, arn)
