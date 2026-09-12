@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, cast
 
-from gpu_fault.admin.aws_cleanup_helpers import ordered_aurora_instances
+from gpu_fault.admin.aws_cleanup_helpers import (
+    aurora_instance_deleting_or_absent,
+    ordered_aurora_instances,
+)
 from gpu_fault.admin.aws_commands import (
     FinalSnapshotPolicy,
 )
@@ -1453,6 +1456,31 @@ class ClusterDeletion(ResourceDeletion):
                     f"is not available: {retained}"
                 )
             return retained
+        # Deletion protection first, while the cluster is still available.
+        if database.get("DeletionProtection"):
+            _checked(
+                self._aws(
+                    "rds",
+                    "modify-db-cluster",
+                    "--db-cluster-identifier",
+                    cluster.resource_id,
+                    "--no-deletion-protection",
+                    "--apply-immediately",
+                ),
+                not_found=("DBClusterNotFoundFault",),
+            )
+            _wait_until(
+                lambda: (
+                    (current := self._aurora_cluster(cluster.resource_id)) is None
+                    or not current.get("DeletionProtection")
+                ),
+                description=(
+                    f"Aurora cluster {cluster.resource_id} "
+                    "deletion protection disablement"
+                ),
+                timeout_seconds=900,
+                interval_seconds=10,
+            )
         document = _json(
             self._aws(
                 "rds",
@@ -1461,6 +1489,10 @@ class ClusterDeletion(ResourceDeletion):
                 f"Name=db-cluster-id,Values={cluster.resource_id}",
             )
         )
+        # Readers first, writer last (AWS: a writer deleted under a live reader
+        # fails over to it). Each instance only has to *enter* ``deleting``: the
+        # cluster delete is accepted then, and one wait on the cluster covers
+        # them all (waiting for each to disappear cost 18 min live, 2026-09-12).
         for instance in ordered_aurora_instances(
             database,
             cast(
@@ -1481,50 +1513,14 @@ class ClusterDeletion(ResourceDeletion):
                     ),
                     not_found=("DBInstanceNotFound",),
                 )
-
-            def instance_absent() -> bool:
-                return not self._exists_command(
-                    self._aws(
-                        "rds",
-                        "describe-db-instances",
-                        "--db-instance-identifier",
-                        instance_id,
-                    ),
-                    not_found=("DBInstanceNotFound",),
-                )
-
             _wait_until(
-                instance_absent,
-                description=f"Aurora instance {instance_id} deletion",
-                timeout_seconds=3600,
-                interval_seconds=15,
+                lambda: aurora_instance_deleting_or_absent(self, instance_id),
+                description=f"Aurora instance {instance_id} entering deletion",
+                timeout_seconds=600,
+                interval_seconds=5,
             )
         database = self._aurora_cluster(cluster.resource_id)
         if database is not None and database.get("Status") != "deleting":
-            if database.get("DeletionProtection"):
-                _checked(
-                    self._aws(
-                        "rds",
-                        "modify-db-cluster",
-                        "--db-cluster-identifier",
-                        cluster.resource_id,
-                        "--no-deletion-protection",
-                        "--apply-immediately",
-                    ),
-                    not_found=("DBClusterNotFoundFault",),
-                )
-                _wait_until(
-                    lambda: (
-                        (current := self._aurora_cluster(cluster.resource_id)) is None
-                        or not current.get("DeletionProtection")
-                    ),
-                    description=(
-                        f"Aurora cluster {cluster.resource_id} "
-                        "deletion protection disablement"
-                    ),
-                    timeout_seconds=900,
-                    interval_seconds=10,
-                )
             arguments = self._aws(
                 "rds",
                 "delete-db-cluster",

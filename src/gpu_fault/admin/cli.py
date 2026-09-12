@@ -714,8 +714,8 @@ def parser() -> argparse.ArgumentParser:
         choices=("retain", "skip"),
         default="retain",
         help=(
-            "retain a final Aurora cluster snapshot for audit, or skip it; "
-            "skip is only valid with --cpu-cluster delete"
+            "retain a final Aurora cluster snapshot for audit, or skip it "
+            "(skip needs --cpu-cluster delete or --reset-database)"
         ),
     )
     return result

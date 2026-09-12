@@ -710,3 +710,139 @@ def test_a_failed_kubernetes_cleanup_record_is_archived_before_the_rerun(
     assert json.loads(archive.read_text(encoding="utf-8"))["status"] == "FAILED", (
         "the failed record must be kept as evidence"
     )
+
+
+def test_a_reset_reinstall_may_skip_the_final_aurora_snapshot(tmp_path) -> None:
+    """``keep`` alone keeps Aurora, so a skipped snapshot is meaningless and
+    refused; ``keep --reset-database`` deletes it like a retirement does and
+    may skip the audit snapshot (the live uninstall of 2026-09-12 spent most
+    of its Aurora phase on snapshots nobody asked for)."""
+
+    site = load_site(site_file(tmp_path))
+    with pytest.raises(BootstrapError, match="only valid with --cpu-cluster delete"):
+        admin_uninstall.UninstallRequest(
+            site=site,
+            cpu_disposition="keep",
+            confirmation="UNINSTALL_GPU_FAULT",
+            final_snapshot_policy="skip",
+        )
+    request = admin_uninstall.UninstallRequest(
+        site=site,
+        cpu_disposition="keep",
+        confirmation="UNINSTALL_GPU_FAULT",
+        final_snapshot_policy="skip",
+        reset_database=True,
+    )
+    assert request.final_snapshot_policy == "skip"
+
+
+def test_aurora_deletion_orders_readers_then_writer_and_does_not_wait_for_each(
+    tmp_path, monkeypatch
+) -> None:
+    """AWS: delete readers first, then the writer (a writer deleted under a
+    live reader fails over to it), and the cluster delete is accepted as soon
+    as no instance is in a non-deleting state. Waiting for each instance to
+    disappear before the next delete serialised two full deletions (live
+    2026-09-12: 18 of 24 min). Deletion protection goes first, while the
+    cluster is still available."""
+
+    site = load_site(site_file(tmp_path))
+    calls: list[str] = []
+    state = {"protected": True, "cluster": True, "deleting": set()}
+
+    def fake_run(arguments, **_kwargs):
+        line = " ".join(arguments)
+        calls.append(line)
+        if "modify-db-cluster" in line:
+            state["protected"] = False
+            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+        if "describe-db-clusters" in line:
+            if not state["cluster"]:
+                return subprocess.CompletedProcess(
+                    arguments, 254, stdout="", stderr="DBClusterNotFoundFault"
+                )
+            body = {
+                "DBClusters": [
+                    {
+                        "DBClusterIdentifier": "test-aurora",
+                        "Status": "available",
+                        "DeletionProtection": state["protected"],
+                        "DBClusterMembers": [
+                            {"DBInstanceIdentifier": "writer", "IsClusterWriter": True},
+                            {
+                                "DBInstanceIdentifier": "reader",
+                                "IsClusterWriter": False,
+                            },
+                        ],
+                    }
+                ]
+            }
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "describe-db-instances" in line and "--filters" in line:
+            body = {
+                "DBInstances": [
+                    {"DBInstanceIdentifier": "writer", "DBInstanceStatus": "available"},
+                    {"DBInstanceIdentifier": "reader", "DBInstanceStatus": "available"},
+                ]
+            }
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "describe-db-instances" in line:
+            name = arguments[arguments.index("--db-instance-identifier") + 1]
+            status = "deleting" if name in state["deleting"] else "available"
+            body = {
+                "DBInstances": [
+                    {"DBInstanceIdentifier": name, "DBInstanceStatus": status}
+                ]
+            }
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "delete-db-instance" in line:
+            state["deleting"].add(
+                arguments[arguments.index("--db-instance-identifier") + 1]
+            )
+            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+        if "delete-db-cluster" in line:
+            assert state["deleting"] == {"writer", "reader"}, (
+                "the cluster delete must wait until every instance is deleting"
+            )
+            state["cluster"] = False
+            return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+        if "describe-db-cluster-snapshots" in line:
+            body = {"DBClusterSnapshots": [{"Status": "available"}]}
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+
+    retained = cleaner.delete_aurora(
+        _resource("aws/aurora/cluster", "aurora_cluster", "test-aurora"),
+        final_snapshot_policy="retain",
+        final_snapshot_identifier="test-final",
+    )
+
+    assert retained == "test-final"
+
+    def first(*fragments: str) -> int:
+        return next(i for i, c in enumerate(calls) if all(f in c for f in fragments))
+
+    order = [
+        first("modify-db-cluster"),
+        first("delete-db-instance", "reader"),
+        first("delete-db-instance", "writer"),
+        first("delete-db-cluster"),
+    ]
+    assert order == sorted(order), (
+        "protection off, reader, writer, cluster -- in that order"
+    )
+    assert "--final-db-snapshot-identifier test-final" in next(
+        c for c in calls if "delete-db-cluster" in c
+    )

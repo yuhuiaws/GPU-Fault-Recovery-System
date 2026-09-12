@@ -93,10 +93,18 @@ class UninstallRequest:
     reset_database: bool = False
 
     def __post_init__(self) -> None:
-        if self.cpu_disposition == "keep" and self.final_snapshot_policy == "skip":
+        if (
+            self.cpu_disposition == "keep"
+            and self.final_snapshot_policy == "skip"
+            and not self.reset_database
+        ):
+            # A plain reinstall keeps the Aurora cluster, so there is nothing
+            # to snapshot; a reinstall that resets the database deletes it and
+            # may skip the audit snapshot like a retirement does.
             raise BootstrapError(
                 "--aurora-final-snapshot skip is only valid with --cpu-cluster "
-                "delete; a reinstall keeps the Aurora cluster"
+                "delete or with --reset-database; a reinstall keeps the Aurora "
+                "cluster"
             )
         if self.cpu_disposition == "delete" and self.reset_database:
             raise BootstrapError(
