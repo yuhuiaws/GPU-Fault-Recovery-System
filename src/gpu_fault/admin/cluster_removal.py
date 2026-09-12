@@ -14,7 +14,6 @@ from typing import Any, Callable, cast
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
-from gpu_fault.admin.cluster_join_state import complete_step
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
 from gpu_fault.admin.bootstrap_common import (
     Arn,
@@ -22,6 +21,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     safe_name,
 )
+from gpu_fault.admin.cluster_join_state import complete_step
 from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
@@ -159,6 +159,13 @@ def _pending_removal_for(
     return None
 
 
+def _site_manages(site: RenderedSite, cluster_id: str) -> bool:
+    return any(
+        item.get("cluster_id") == cluster_id
+        for item in site.release_config.get("clusters") or []
+    )
+
+
 def _state(
     request: RemoveClusterRequest,
 ) -> tuple[Path, Path, dict[str, Any]]:
@@ -176,7 +183,15 @@ def _state(
         for key, item in expected.items():
             if value.get(key) != item:
                 raise BootstrapError(f"remove-cluster state conflicts on {key}")
-        return state_dir, path, value
+        if value.get("phase") != "COMPLETED" or not _site_manages(
+            request.site, request.cluster_id
+        ):
+            return state_dir, path, value
+        # A cluster removed and joined again: the finished record is history,
+        # not a resume (live 2026-09-12: the second removal returned COMPLETED
+        # in one second and touched nothing). Keep it, start a fresh removal.
+        stamp = str(value.get("updated_at") or "").replace(":", "").replace("-", "")
+        write_json_atomic(state_dir / f"state.completed-{stamp[:15]}.json", dict(value))
     value = {
         "schema_version": 1,
         "site_id": request.site.release_config["site_name"],

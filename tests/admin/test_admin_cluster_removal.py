@@ -312,10 +312,8 @@ def test_route53_disassociation_waits_for_change_insync(monkeypatch) -> None:
     assert waits == ["/change/C123"]
 
 
-def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) -> None:
-    path = site_file(tmp_path)
-    site = load_site(path)
-    calls = []
+def _install_removal_harness(monkeypatch, calls: list) -> None:
+    """Every side effect of a removal, recorded in ``calls``."""
 
     def export_registry(current_site, state_dir):
         calls.append("registry")
@@ -420,6 +418,13 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
             f"failure-domain-map:{len(site.release_config['clusters'])}"
         ),
     )
+
+
+def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) -> None:
+    path = site_file(tmp_path)
+    site = load_site(path)
+    calls = []
+    _install_removal_harness(monkeypatch, calls)
 
     request = RemoveClusterRequest(
         site=site, cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
@@ -779,3 +784,41 @@ def test_resolve_cluster_id_reaches_an_unfinished_removal_the_site_already_dropp
     )
     with pytest.raises(BootstrapError, match="managed clusters: none"):
         admin_cluster_removal.resolve_cluster_id(site, arn)
+
+
+def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
+    tmp_path, monkeypatch
+) -> None:
+    """Live 2026-09-12: the cluster removed in the morning was joined again,
+    and the second remove-cluster found the morning's COMPLETED record, said
+    COMPLETED in one second and touched nothing. A finished removal of a
+    cluster the site manages again is history; the removal starts over."""
+
+    path = site_file(tmp_path)
+    original = path.read_bytes()
+    calls = []
+    _install_removal_harness(monkeypatch, calls)
+
+    first = remove_cluster(
+        RemoveClusterRequest(
+            site=load_site(path), cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+        )
+    )
+    assert first["phase"] == "COMPLETED"
+    path.write_bytes(original)  # the cluster joined again
+
+    second = remove_cluster(
+        RemoveClusterRequest(
+            site=load_site(path), cluster_id="gpu-a", confirmation="REMOVE_GPU_CLUSTER"
+        )
+    )
+
+    assert second["phase"] == "COMPLETED"
+    assert calls.count("registry") == 2, "the second removal must run, not resume"
+    assert load_site(path).release_config["clusters"] == [], (
+        "the second removal must drop the cluster from the site again"
+    )
+    archived = list(
+        (tmp_path / "remove-cluster" / "gpu-a").glob("state.completed-*.json")
+    )
+    assert len(archived) == 1, "the morning's record must be kept as history"
