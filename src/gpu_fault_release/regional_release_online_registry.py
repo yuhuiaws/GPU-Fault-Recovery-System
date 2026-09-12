@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -201,22 +202,49 @@ def activate_join_registry(release: Any, cluster_id: str) -> None:
     )
 
 
+def _transition_or_warn(
+    release: Any, cluster_id: str, lifecycle_state: str, *, reason: str
+) -> None:
+    """A failed join's terminal transitions are best effort.
+
+    The entry may be absent (the release failed before PENDING) or carry an
+    earlier attempt's token digest, which the API refuses on identity; the
+    purge that follows settles the registry either way.
+    """
+
+    try:
+        transition_join_registry(release, cluster_id, lifecycle_state, reason=reason)
+    except ReleaseError as exc:
+        print(
+            f"{cluster_id}: registry {lifecycle_state} transition skipped: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def fail_join_registry(release: Any, cluster_id: str) -> None:
-    transition_join_registry(
-        release,
-        cluster_id,
-        "FAILED",
-        reason=f"join {cluster_id} failed",
+    _transition_or_warn(
+        release, cluster_id, "FAILED", reason=f"join {cluster_id} failed"
     )
 
 
 def rollback_join_registry(release: Any, cluster_id: str) -> None:
-    transition_join_registry(
-        release,
-        cluster_id,
-        "ROLLED_BACK",
-        reason=f"join {cluster_id} rolled back",
+    _transition_or_warn(
+        release, cluster_id, "ROLLED_BACK", reason=f"join {cluster_id} rolled back"
     )
+
+
+def purge_failed_join(release: Any, target: Any) -> None:
+    """Leave nothing of a rolled-back join a later attempt could collide with.
+
+    Live 2026-09-12: a PENDING entry from an earlier attempt (its own token
+    digest) made every retry's PENDING transition fail on identity. The Secret
+    entry goes, and the published revision follows the Secret.
+    """
+
+    rollback_join_registry(release, target.cluster_id)
+    release._update_registry(target, remove=True)
+    purge_registry_cluster(release, target.cluster_id)
 
 
 def drain_registry_cluster(release: Any, cluster_id: str) -> None:

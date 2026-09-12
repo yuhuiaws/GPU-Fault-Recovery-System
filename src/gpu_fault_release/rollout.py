@@ -138,9 +138,9 @@ from gpu_fault_release.regional_release_online_registry import (
     prepare_join_registry,
     publish_restored_registry,
     publish_staged_registry,
+    purge_failed_join,
     purge_registry_cluster,
     revoke_registry_cluster,
-    rollback_join_registry,
 )
 from gpu_fault_release.regional_release_orchestration import (
     bootstrap_gpu_clusters,
@@ -1255,8 +1255,7 @@ class RegionalRelease:
         fail_join_registry(self, cluster_id)
 
     def rollback_cluster(self, cluster_id: str) -> None:
-        self._target(cluster_id)
-        rollback_join_registry(self, cluster_id)
+        purge_failed_join(self, self._target(cluster_id))
 
     def _target(self, cluster_id: str) -> ClusterTarget:
         for target in self.config.clusters:

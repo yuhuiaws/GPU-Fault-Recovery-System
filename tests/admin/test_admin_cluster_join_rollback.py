@@ -106,6 +106,7 @@ class Attempt:
         self.membership: list[bool] = []
         self.cleared: list[list[str]] = []
         self.joined = True
+        self.released = False
 
     def _write_candidate(self) -> Path:
         target = _target()
@@ -176,6 +177,7 @@ class Attempt:
                 "LOCAL_INPUTS_READY",
                 "PREREQUISITES_READY",
                 "CANDIDATE_READY",
+                *(["RELEASE_STARTED"] if self.released or self.joined else []),
                 *(["JOINED"] if self.joined else []),
             ]
             state["evidence"] = self.evidence()
@@ -642,3 +644,26 @@ def test_drift_still_blocks_an_attempt_that_is_in_flight(
             ),
             runner=SimpleNamespace(dry_run=False),
         )
+
+
+def test_a_release_that_started_but_never_joined_still_undoes_its_registry_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine registers the cluster (Secret + PENDING revision) at the very
+    start of ``join-cluster``; a failure before JOINED left both in place, and
+    the next attempt's PENDING transition failed on identity (live,
+    2026-09-12). Any started release is undone like a joined one."""
+
+    attempt = Attempt(tmp_path)
+    attempt.joined = False
+    attempt.released = True
+
+    attempt.run(monkeypatch, error="cluster deploy failed")
+
+    assert attempt.rollouts == [("fail-cluster", "hp-gpu-b")], (
+        "a started release must fail its registry entry"
+    )
+    assert attempt.membership == [True], (
+        "the membership undo must run rollback-cluster to purge the entry"
+    )
+    assert attempt.state()["phase"] == "ROLLED_BACK", "the rollback must complete"

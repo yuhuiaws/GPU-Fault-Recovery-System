@@ -816,13 +816,16 @@ def _rollback(
         str((evidence.get("CANDIDATE_READY") or {}).get("site_file") or "")
     )
     candidate: RenderedSite | None = None
+    # A release that started may have registered the cluster before it failed;
+    # its registry entry is undone exactly like a joined cluster's.
+    released = _done(state, "JOINED") or _done(state, "RELEASE_STARTED")
     if cluster_id and candidate_path.is_file():
         try:
             candidate = load_site(
                 candidate_path,
                 repository_root=request.site.repository_root,
             )
-            if _done(state, "JOINED"):
+            if released:
                 _run_rollout(candidate, "fail-cluster", cluster_id=cluster_id)
             _cleanup_candidate(
                 candidate,
@@ -916,7 +919,7 @@ def _rollback(
             rollback_membership(
                 request,
                 execution=execution,
-                joined=_done(state, "JOINED"),
+                joined=released,
             )
         except Exception as exc:
             errors.append(f"membership rollback: {exc}")
@@ -1201,6 +1204,7 @@ def _deploy_cluster(
 ) -> None:
     cluster_id = execution.cluster_id
     if not _done(state, "JOINED"):
+        _complete(state_path, state, "RELEASE_STARTED")
         _run_rollout(execution.candidate, "join-cluster", cluster_id=cluster_id)
         _complete(state_path, state, "JOINED")
     if not _done(state, "COLLECTORS_READY"):
