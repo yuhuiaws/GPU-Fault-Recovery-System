@@ -715,3 +715,38 @@ def test_deploy_leaves_an_uncommitted_bootstrap_for_verify_and_commit() -> None:
     assert calls == [], (
         "an uncommitted bootstrap must not be re-applied or committed by deploy"
     )
+
+
+@pytest.mark.parametrize(
+    ("recorded_release", "expected_pins"),
+    [("candidate-release", ["plan-digest"]), ("older-release", [])],
+)
+def test_a_resumed_bootstrap_pins_the_plan_only_for_the_same_candidate(
+    recorded_release: str, expected_pins: list[str]
+) -> None:
+    """Live 2026-09-12: a bootstrap interrupted on tree A was rerun with the
+    fixed tree B; the pin from A refused B's manifests, and that refusal tore
+    the partial site down. Only the same candidate resumes under the pin; a new
+    candidate re-plans, since a bootstrap has no baseline to protect."""
+
+    module = _admin_module()
+    pins: list[str] = []
+    calls: list[str] = []
+    release = SimpleNamespace(
+        release_id="candidate-release",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: {
+            "phase": "bootstrap-started",
+            "release_id": recorded_release,
+            "approved_manifest_sha256": "plan-digest",
+        },
+        pin_approved_manifest_plan=lambda digest: pins.append(digest),
+        bootstrap=lambda: calls.append("bootstrap"),
+    )
+
+    module.run_deploy(release)
+
+    assert pins == expected_pins, "the plan pin belongs to the candidate that made it"
+    assert calls == ["bootstrap"], "the bootstrap itself always runs"

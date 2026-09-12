@@ -508,8 +508,13 @@ def run_deploy(release: Any) -> None:
         # Resuming a partial bootstrap (state exists and its phase is a bootstrap
         # phase): pin the digest that bootstrap was first planned against so the
         # resumed apply refuses a working tree that drifted since it started
-        # (M-23). A fresh bootstrap (no prior state) leaves the pin unset.
-        if state is not None:
+        # (M-23). A fresh bootstrap (no prior state) leaves the pin unset, and so
+        # does a different candidate over a failed or interrupted attempt: that
+        # is the fixed tree the operator reruns with, there is no baseline to
+        # protect, and bootstrap re-plans and re-applies everything (live
+        # 2026-09-12: the pin refused the fix and the refusal tore the partial
+        # site down).
+        if state is not None and not _foreign_candidate(release, state):
             release.pin_approved_manifest_plan(state.get("approved_manifest_sha256"))
         release.bootstrap()
         return
