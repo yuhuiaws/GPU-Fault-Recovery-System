@@ -374,3 +374,28 @@ def test_counters_are_exposed_as_a_snapshot_and_in_the_claim_breadcrumb(
     with open(claim_state_outside_shared_tmp, encoding="utf-8") as handle:
         breadcrumb = json.load(handle)
     assert breadcrumb["counters"]["claimed_total"] == 1
+
+
+def test_the_breadcrumb_advertises_owners_before_the_first_claim(
+    claim_state_outside_shared_tmp: str,
+) -> None:
+    """A cluster still PENDING in the registry refuses every claim with 423,
+    so a breadcrumb written only by a successful claim left the readiness
+    probe advertising no owners and the join's executor rollout never became
+    Ready (live, 2026-09-12). Owners are configuration; the loop writes them
+    before it claims anything, with no claim timestamp yet."""
+
+    client = FakeExecutorClient([])
+    executor = build_executor(client, [RecordingAdapter()])
+    executor.request_stop("test: advertise only")
+
+    executor.run()
+
+    with open(claim_state_outside_shared_tmp, encoding="utf-8") as handle:
+        breadcrumb = json.load(handle)
+    assert breadcrumb["execution_owners"] == executor.execution_owners, (
+        "the pre-claim breadcrumb must advertise the configured owners"
+    )
+    assert breadcrumb["last_successful_claim_at"] is None, (
+        "no claim has happened, so the breadcrumb must not fake one"
+    )

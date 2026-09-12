@@ -472,6 +472,23 @@ class ClusterActionExecutor:
         }
 
     def _record_successful_claim(self, claimed_at: datetime) -> None:
+        self._record_claim_state(claimed_at)
+
+    def advertise_execution_owners(self) -> None:
+        """Write the readiness breadcrumb before the first claim.
+
+        The readiness probe reads ``execution_owners`` from this file, and
+        the control plane calls an executor that advertises none not ready.
+        Owners are configuration, not the result of a claim: a cluster still
+        PENDING in the registry (a join before activation) has every claim
+        refused with 423, so a breadcrumb written only by a successful claim
+        kept the executor Deployment from ever becoming Ready (live,
+        2026-09-12). ``last_successful_claim_at`` stays null until a claim.
+        """
+
+        self._record_claim_state(None)
+
+    def _record_claim_state(self, claimed_at: datetime | None) -> None:
         try:
             path = self.claim_state_path
             temporary = f"{path}.tmp"
@@ -480,7 +497,9 @@ class ClusterActionExecutor:
                     {
                         "executor_id": self.executor_id,
                         "execution_owners": self.execution_owners,
-                        "last_successful_claim_at": (claimed_at.isoformat()),
+                        "last_successful_claim_at": (
+                            claimed_at.isoformat() if claimed_at is not None else None
+                        ),
                         "counters": self.metrics_snapshot(),
                     },
                     handle,
@@ -634,6 +653,7 @@ class ClusterActionExecutor:
 
     def run(self) -> None:
         consecutive_failures = 0
+        self.advertise_execution_owners()
         while not self._stop_requested:
             try:
                 count = self.run_once()
