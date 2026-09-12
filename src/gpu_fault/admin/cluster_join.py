@@ -36,6 +36,7 @@ from gpu_fault.admin.bootstrap_services import (
     ensure_executor_role,
     provision_node_action_keys,
 )
+from gpu_fault.admin.cluster_join_rollback import restore_current_context
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
@@ -928,6 +929,8 @@ def _rollback(
         message = (result.stdout or "") + "\n" + (result.stderr or "")
         if result.returncode and "not found" not in message.lower():
             errors.append("kube context rollback: " + result.stderr.strip())
+        else:
+            restore_current_context(kubeconfig, deleted=context, errors=errors)
     if not errors and candidate is not None:
         try:
             from gpu_fault.admin.cluster_join_commit import rollback_membership

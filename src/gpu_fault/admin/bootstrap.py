@@ -274,9 +274,7 @@ def discover_cluster(
     vpc = eks.get("resourcesVpcConfig") or {}
     subnet_ids = tuple(vpc.get("subnetIds") or ())
     subnet_cidrs = discover_subnet_cidrs(
-        runner,
-        region=eks_parsed.region,
-        subnet_ids=subnet_ids,
+        runner, region=eks_parsed.region, subnet_ids=subnet_ids, hyperpod=hyperpod
     )
     node_recovery = str(hyperpod.get("NodeRecovery") or "")
     if role == "gpu" and node_recovery != "None":

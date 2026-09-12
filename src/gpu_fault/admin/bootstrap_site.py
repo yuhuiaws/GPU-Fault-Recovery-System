@@ -545,12 +545,41 @@ def discover_bootstrap_scope(
     return existing, cpu, gpu_clusters
 
 
+def hyperpod_node_subnet_ids(hyperpod: Mapping[str, Any]) -> tuple[str, ...]:
+    """Subnets the HyperPod nodes live in: the cluster ``VpcConfig`` plus every
+    instance group's ``OverrideVpcConfig``.
+
+    The EKS cluster's own ``subnetIds`` only place its control-plane ENIs; a
+    HyperPod that puts its nodes in another subnet of the VPC would otherwise
+    get Agent endpoint CIDRs that cover no node, and the release preflight
+    refuses the site (live join, 2026-09-12).
+    """
+
+    configs: list[Any] = [hyperpod.get("VpcConfig")]
+    for group in hyperpod.get("InstanceGroups") or ():
+        if isinstance(group, Mapping):
+            configs.append(group.get("OverrideVpcConfig"))
+    subnet_ids: list[str] = []
+    for config in configs:
+        if isinstance(config, Mapping):
+            subnet_ids.extend(str(item) for item in config.get("Subnets") or () if item)
+    return tuple(dict.fromkeys(subnet_ids))
+
+
 def discover_subnet_cidrs(
     runner: CommandRunner,
     *,
     region: str,
     subnet_ids: tuple[str, ...],
+    hyperpod: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
+    """CIDRs of the EKS subnets and, when ``hyperpod`` is given, its node subnets."""
+
+    subnet_ids = tuple(
+        dict.fromkeys(
+            (*subnet_ids, *(hyperpod_node_subnet_ids(hyperpod) if hyperpod else ()))
+        )
+    )
     if not subnet_ids:
         return ()
     return tuple(

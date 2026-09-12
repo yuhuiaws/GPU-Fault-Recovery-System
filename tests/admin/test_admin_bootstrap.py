@@ -141,6 +141,70 @@ def test_hyperpod_discovery_uses_the_complete_input_arn(monkeypatch) -> None:
     )
 
 
+def test_agent_cidrs_come_from_the_hyperpod_node_subnets_too(monkeypatch) -> None:
+    """The EKS subnets only hold control-plane ENIs; nodes may live elsewhere.
+
+    The live site's HyperPod places its instance groups in a subnet the EKS
+    cluster never lists, so CIDRs derived from ``resourcesVpcConfig`` alone
+    covered no node and the release preflight refused the join. The cluster's
+    ``VpcConfig`` and every instance group's ``OverrideVpcConfig`` join the
+    lookup; ``subnet_ids`` (Aurora, NLB placement) stays the EKS set.
+    """
+
+    hyperpod_arn = "arn:aws:sagemaker:us-east-1:123456789012:cluster/internal-id"
+    hyperpod = {
+        "ClusterArn": hyperpod_arn,
+        "ClusterName": "gpu-a",
+        "NodeRecovery": "None",
+        "Orchestrator": {
+            "Eks": {"ClusterArn": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"}
+        },
+        "VpcConfig": {"Subnets": ["subnet-nodes"]},
+        "InstanceGroups": [
+            {"InstanceGroupName": "default"},
+            {
+                "InstanceGroupName": "spot",
+                "OverrideVpcConfig": {"Subnets": ["subnet-override", "subnet-nodes"]},
+            },
+        ],
+    }
+    described: list[tuple[str, ...]] = []
+
+    class Runner:
+        def aws_json(self, region, service, operation, *arguments, **_kwargs):
+            if service == "sagemaker":
+                return hyperpod
+            if service == "ec2":
+                described.append(arguments)
+                return {
+                    "Subnets": [
+                        {"SubnetId": "subnet-a", "CidrBlock": "10.0.0.0/24"},
+                        {"SubnetId": "subnet-nodes", "CidrBlock": "10.1.0.0/16"},
+                        {"SubnetId": "subnet-override", "CidrBlock": "10.2.0.0/24"},
+                    ]
+                }
+            return {
+                "cluster": {
+                    "status": "ACTIVE",
+                    "resourcesVpcConfig": {"vpcId": "vpc-a", "subnetIds": ["subnet-a"]},
+                }
+            }
+
+    discovered = admin_bootstrap.discover_cluster(
+        Runner(), cluster_arn=hyperpod_arn, role="gpu", context="gpu-a"
+    )
+
+    assert described == [
+        ("--subnet-ids", "subnet-a", "subnet-nodes", "subnet-override")
+    ], "the node subnets were not looked up alongside the EKS subnets"
+    assert discovered.subnet_ids == ("subnet-a",), (
+        "subnet_ids must stay the EKS set that places Aurora and the NLB"
+    )
+    assert discovered.subnet_cidrs == ("10.0.0.0/24", "10.1.0.0/16", "10.2.0.0/24"), (
+        "Agent endpoint CIDRs must cover the HyperPod node subnets"
+    )
+
+
 def test_eks_hyperpod_inventory_is_loaded_once_per_runner(monkeypatch) -> None:
     calls: list[tuple[str, str, tuple[str, ...]]] = []
     eks_arns = {

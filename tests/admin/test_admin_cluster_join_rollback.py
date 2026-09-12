@@ -55,8 +55,14 @@ class Commands:
     a test can fail exactly one undo and leave the rest working.
     """
 
-    def __init__(self, *, failures: Sequence[tuple[str, int, str]] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        failures: Sequence[tuple[str, int, str]] = (),
+        outputs: Sequence[tuple[str, str]] = (),
+    ) -> None:
         self.failures = tuple(failures)
+        self.outputs = tuple(outputs)
         self.calls: list[list[str]] = []
 
     def __call__(self, arguments: Sequence[Any], **_keywords: Any) -> SimpleNamespace:
@@ -66,6 +72,9 @@ class Commands:
         for fragment, returncode, stderr in self.failures:
             if fragment in line:
                 return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+        for fragment, stdout in self.outputs:
+            if fragment in line:
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def matching(self, fragment: str) -> list[list[str]]:
@@ -258,6 +267,59 @@ def test_a_failure_before_activation_undoes_everything_the_attempt_created(
         "the fleet master secret was left on disk"
     )
     assert len(load_site(attempt.path).release_config["clusters"]) == 1
+
+
+def test_a_rollback_repoints_the_current_context_it_left_dangling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``update-kubeconfig --alias`` made the candidate current; undo that too.
+
+    Deleting only the context left ``current-context`` naming a context that no
+    longer exists, so every ``kubectl --kubeconfig gpu.kubeconfig`` call without
+    ``--context`` failed after a rolled-back join (live, 2026-09-12). The first
+    surviving context takes over.
+    """
+
+    attempt = Attempt(tmp_path)
+    attempt.commands = Commands(
+        outputs=(
+            ("config current-context", "gpu-fault-gpu-2-gpu-b\n"),
+            (
+                "config get-contexts -o name",
+                "gpu-fault-gpu-2-gpu-b\ngpu-fault-gpu-1-gpu-a\n",
+            ),
+        )
+    )
+
+    attempt.run(monkeypatch, error="cluster deploy failed")
+
+    assert attempt.commands.matching("delete-context gpu-fault-gpu-2-gpu-b"), (
+        "the candidate context was not deleted"
+    )
+    assert attempt.commands.matching("use-context gpu-fault-gpu-1-gpu-a"), (
+        "current-context was left pointing at the deleted context"
+    )
+
+
+def test_a_rollback_unsets_the_current_context_when_no_context_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = Attempt(tmp_path)
+    attempt.commands = Commands(
+        outputs=(
+            ("config current-context", "gpu-fault-gpu-2-gpu-b\n"),
+            ("config get-contexts -o name", "gpu-fault-gpu-2-gpu-b\n"),
+        )
+    )
+
+    attempt.run(monkeypatch, error="cluster deploy failed")
+
+    assert attempt.commands.matching("unset current-context"), (
+        "a dangling current-context with no other context must be unset"
+    )
+    assert not attempt.commands.matching("use-context"), (
+        "there was no surviving context to make current"
+    )
 
 
 def test_a_rollback_that_completes_clears_the_attempt_evidence(
