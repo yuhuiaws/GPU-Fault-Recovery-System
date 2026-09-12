@@ -412,7 +412,10 @@ def test_the_background_poll_collects_new_ids_and_records_its_errors(
     )
 
     def receipts(ids: list[str]) -> dict:
-        answer = next(answers)
+        # The poll thread may run once more between the receipt landing and
+        # stop(); an exhausted iterator would record "StopIteration" as the
+        # last error and flake the assertion below (deploy #63, 2026-09-12).
+        answer = next(answers, {"requests": [], "missing": []})
         if isinstance(answer, Exception):
             raise answer
         return answer
