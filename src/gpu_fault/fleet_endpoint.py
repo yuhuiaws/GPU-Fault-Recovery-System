@@ -56,6 +56,17 @@ class ClusterEndpointNetworks(dict[str, EndpointNetworks]):
         super().__init__(initial or {})
         self.resolver = resolver
 
+    def __getitem__(self, cluster_id: str) -> EndpointNetworks:
+        # The registry the runtime serves is the truth; the start-up copy is
+        # only a fallback for a cluster the runtime cannot answer for. A
+        # cluster removed and re-joined while this process ran would
+        # otherwise keep its old allow-list (live 2026-09-12: EKS subnets
+        # only) and every re-installed agent's heartbeat would be refused.
+        networks = self.resolver(cluster_id)
+        if networks is not None:
+            return networks
+        return super().__getitem__(cluster_id)
+
     def __missing__(self, cluster_id: str) -> EndpointNetworks:
         networks = self.resolver(cluster_id)
         if networks is None:

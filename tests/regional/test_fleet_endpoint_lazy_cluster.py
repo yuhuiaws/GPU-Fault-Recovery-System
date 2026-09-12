@@ -121,3 +121,33 @@ def test_registry_backed_networks_never_fall_back_to_the_global_list() -> None:
         endpoint_networks_for_cluster(
             "ghost", networks, (ipaddress.ip_network("10.0.0.0/8"),)
         )
+
+
+def test_the_registry_runtime_wins_over_the_start_up_copy() -> None:
+    """A cluster removed and re-joined while the process ran gets new CIDRs
+    in the registry; the dict built at start-up still holds the old ones.
+    Heartbeats must be judged against the registry (live, 2026-09-12)."""
+
+    networks = ClusterEndpointNetworks(
+        {"cluster-a": (ipaddress.ip_network("10.1.0.0/16"),)},
+        resolver=lambda cluster_id: (
+            (ipaddress.ip_network("10.2.0.0/16"),)
+            if cluster_id == "cluster-a"
+            else None
+        ),
+    )
+
+    assert networks["cluster-a"] == (ipaddress.ip_network("10.2.0.0/16"),), (
+        "the start-up copy shadowed the registry's current allow-list"
+    )
+
+
+def test_the_start_up_copy_still_answers_when_the_runtime_cannot() -> None:
+    networks = ClusterEndpointNetworks(
+        {"cluster-a": (ipaddress.ip_network("10.1.0.0/16"),)},
+        resolver=lambda _cluster_id: None,
+    )
+
+    assert networks["cluster-a"] == (ipaddress.ip_network("10.1.0.0/16"),), (
+        "a cluster the runtime cannot resolve keeps its start-up allow-list"
+    )

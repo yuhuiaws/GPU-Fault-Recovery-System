@@ -13,6 +13,7 @@ import yaml
 from gpu_fault_release import regional_release_agent_convergence as CONVERGENCE_MODULE
 from gpu_fault_release import regional_release_diff as DIFF_MODULE
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_MODULE
+from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
 from tests.regional._release_orchestrator_support import (
     DNS_MODULE,
@@ -1242,11 +1243,34 @@ def test_join_requires_gpu_dns_and_tls_before_the_executor(
         # join re-renders the expected-collector rules after the gate; not a
         # gate step, so it only has to be present here.
         _apply_observability=lambda **_kwargs: None,
+        state={},
     )
 
     MODULE.RegionalRelease.join_cluster(release, "gpu-a")
 
     assert tuple(calls) == ROLLOUT_GATE
+
+
+def test_each_join_attempt_opens_its_own_fleet_rollout_transaction() -> None:
+    """A join attempt that failed mid-rollout leaves a FAILED fleet record under
+    its deployment id; the next attempt must derive a fresh id, not resume it
+    (live 2026-09-12: the join path never set the per-transaction nonce the
+    upgrade path folds into ``fleet_deployment_id``)."""
+
+    release = SimpleNamespace(
+        state={},
+        _target=lambda _cluster_id: ROLLOUT_TARGET,
+        _remote_commands_are_idle=lambda: True,
+    )
+
+    GPU_ROLLOUT.join_target(release, "gpu-a")
+    first = release.state.get("fleet_rollout_transaction")
+    GPU_ROLLOUT.join_target(release, "gpu-a")
+
+    assert first, "the join must open a fleet rollout transaction"
+    assert release.state["fleet_rollout_transaction"] != first, (
+        "every join attempt must fold a fresh transaction into its deployment id"
+    )
 
 
 def test_gpu_endpoint_probe_checks_dns_ca_tls_and_health(tmp_path: Path) -> None:

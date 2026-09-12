@@ -8,6 +8,7 @@ from threading import Event, RLock
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from gpu_fault.channel_registry import COLLECTOR_EVENT_PREFIX
 from gpu_fault.regional import (
     RegionalClusterLifecycle,
     RegionalClusterRegistration,
@@ -419,10 +420,12 @@ def regional_cluster_request_allowed(
     }
     if path in bootstrap_paths:
         return True
-    if state in {
-        RegionalClusterLifecycle.PENDING,
-        RegionalClusterLifecycle.FAILED,
-    }:
+    if state is RegionalClusterLifecycle.PENDING:
+        # A join verifies collector readiness before it activates the
+        # cluster, and readiness is built from these events; claims stay
+        # refused, so telemetry admitted here cannot start a node action.
+        return path.startswith(COLLECTOR_EVENT_PREFIX)
+    if state is RegionalClusterLifecycle.FAILED:
         return False
     return path == "/v1/regional/executors/hyperpod-submissions/outcome" or (
         path.startswith("/v1/regional/executors/")

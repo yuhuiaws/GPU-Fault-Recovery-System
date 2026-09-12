@@ -183,6 +183,20 @@ def test_revision_barrier_requires_every_named_member_at_same_digest() -> None:
             "POST",
             False,
         ),
+        # A join waits for collector readiness before activation; the events
+        # that readiness is built from must get through while PENDING.
+        (
+            RegionalClusterLifecycle.PENDING,
+            "/v1/collector-events/nvidia-kernel",
+            "POST",
+            True,
+        ),
+        (
+            RegionalClusterLifecycle.FAILED,
+            "/v1/collector-events/nvidia-kernel",
+            "POST",
+            False,
+        ),
         (
             RegionalClusterLifecycle.DRAINING,
             "/v1/regional/executors/command-a/result",

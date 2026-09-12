@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -961,4 +962,10 @@ def join_target(release: Any, cluster_id: str) -> ClusterTarget:
     target = release._target(cluster_id)
     if not release._remote_commands_are_idle():
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
+    # Folded into the fleet deployment id: a join attempt that failed
+    # mid-rollout leaves a FAILED record, and the next attempt must not resume
+    # it (the upgrade path opens the same nonce per transaction).
+    state = getattr(release, "state", None)
+    if isinstance(state, dict):
+        state["fleet_rollout_transaction"] = uuid.uuid4().hex[:12]
     return target
