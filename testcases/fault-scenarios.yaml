@@ -4589,7 +4589,13 @@ test_cases:
   - rollback state记录每组件、每集群及每Fleet wave的safety、Reconciler和Agent收敛耗时
   - FULL回滚后再次应用同一候选时必须删除并重建旧completed Installer Job，Agent heartbeat须真实收敛，不能只把节点annotation标成Succeeded
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ccb58b7684d1710769ddbf8aa671187ec2bb088b2b1be668fbde38273303bf57
+      components:
+        control_plane: d5a9a25ddba05fce8087a88b52a5a4787835ecdf6906f176de4fae8453301386
+        executor: 03df710b2726108b05bede25d8934bfcd4808e3fed5323675bd0ccbbd88ac131
+        node_runtime: 8ad9b09149d4229bf4db31fa722c4fdd1256aced813cc1182011fc982d603a34
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-020
   related_pytest: tests/regional/test_boot020_runner.py::test_boot020_runner_covers_diff_resume_and_rollback
