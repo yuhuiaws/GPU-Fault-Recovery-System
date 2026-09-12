@@ -29,7 +29,13 @@ class JoinStateRequest(Protocol):
     def state_dir(self) -> Path | None: ...
 
 
-FINISHED_ATTEMPT_PHASES = frozenset({"ROLLED_BACK", "ROLLBACK_FAILED"})
+# Attempts that are over: the drift guard protects an attempt still being
+# built against the site it started from. A rolled-back one starts fresh, a
+# failed rollback is undone against the site as it is now, and a COMPLETED one
+# either still describes a managed cluster (ALREADY_MANAGED) or a cluster the
+# site has since dropped (fresh attempt) -- the site moving on is expected
+# in every case (live 2026-09-12: remove-cluster + two deploys after a join).
+FINISHED_ATTEMPT_PHASES = frozenset({"ROLLED_BACK", "ROLLBACK_FAILED", "COMPLETED"})
 
 
 def load_join_state(

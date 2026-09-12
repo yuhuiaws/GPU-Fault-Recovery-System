@@ -667,3 +667,61 @@ def test_a_release_that_started_but_never_joined_still_undoes_its_registry_entry
         "the membership undo must run rollback-cluster to purge the entry"
     )
     assert attempt.state()["phase"] == "ROLLED_BACK", "the rollback must complete"
+
+
+def test_a_completed_join_of_a_cluster_the_site_dropped_starts_over_despite_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-09-12: after remove-cluster, ``deploy --gpu-cluster-arn`` found
+    the morning's COMPLETED join record and refused on non-membership drift
+    (remove-cluster and two deploys had moved the site). A finished attempt is
+    never in flight; the caller resets it because the cluster is gone."""
+
+    attempt = Attempt(tmp_path)
+    state_path = attempt.state_dir / "state.json"
+    attempt.state_dir.mkdir(exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "site_id": attempt.site.release_config["site_name"],
+                "gpu_cluster_arn": GPU_B_ARN,
+                "requested_cluster_id": "",
+                "allowed_namespaces": ["gpu-fault-system", "training"],
+                "attempt": 1,
+                "source_site_sha256": "1" * 64,
+                "source_site_non_membership_sha256": "0" * 64,
+                "phase": "COMPLETED",
+                "completed_steps": ["DISCOVERED", "JOINED"],
+                "evidence": {
+                    "DISCOVERED": {
+                        "cluster_id": "hp-gpu-b",
+                        "target": {"eks_arn": GPU_B_ARN},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen: list[dict[str, Any]] = []
+
+    def prepare(_request: Any, **keywords: Any) -> Any:
+        seen.append(json.loads(json.dumps(keywords["state"])))
+        raise BootstrapError("stop after reset")
+
+    monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
+    monkeypatch.setattr(admin_cluster_join, "_rollback", lambda *_a, **_k: None)
+    with pytest.raises(BootstrapError, match="stop after reset"):
+        join_cluster(
+            JoinClusterRequest(
+                site=attempt.site,
+                gpu_cluster_arn=GPU_B_ARN,
+                state_dir=attempt.state_dir,
+            ),
+            runner=SimpleNamespace(dry_run=False),
+        )
+
+    assert seen and seen[0]["attempt"] == 2, (
+        "the dropped cluster must get a new attempt"
+    )
+    assert seen[0]["completed_steps"] == [], "nothing of the old attempt may resume"
