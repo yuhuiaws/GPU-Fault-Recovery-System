@@ -285,8 +285,11 @@ def test_node_components_stop_only_after_the_executors_and_the_drain() -> None:
         text.index("fail_orphaned_remote_commands", first_assert - 400) < first_assert
     ), "a resumed reset must fail orphaned leases before the safety assertion"
     assert orphan_before_assert < first_assert
-    assert "payload->>%(status)s = %(leased)s" in text, (
+    assert "payload->>'\\''status'\\'' = '\\''LEASED'\\''" in text, (
         "orphan handling must target LEASED commands only"
+    )
+    assert "(payload->>'\\''lease_expires_at'\\'')::timestamptz <" in text, (
+        "orphan handling must require a lapsed lease"
     )
     assert "clean-redeploy-orphan" in text, (
         "orphaned commands must carry an audit source"

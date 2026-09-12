@@ -927,24 +927,21 @@ with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], connect_timeout=10) as c
         statement = """
             UPDATE gpu_fault_objects
                SET payload = payload || jsonb_build_object(
-                       %(status)s, %(failed)s,
-                       %(source)s, %(origin)s,
-                       %(error)s, %(reason)s,
-                       %(updated)s, %(now)s)
-             WHERE kind = %(kind)s
-               AND payload->>%(status)s = %(leased)s
-               AND (payload->>%(expires)s)::timestamptz < %(now)s::timestamptz
+                       '\''status'\'', '\''FAILED'\'',
+                       '\''status_source'\'', '\''clean-redeploy-orphan'\'',
+                       '\''error'\'', %(reason)s::text,
+                       '\''updated_at'\'', %(now)s::text)
+             WHERE kind = '\''remote_command'\''
+               AND payload->>'\''status'\'' = '\''LEASED'\''
+               AND (payload->>'\''lease_expires_at'\'')::timestamptz < %(now)s::timestamptz
         """
         params = {
-            "status": "status", "failed": "FAILED",
-            "source": "status_source", "origin": "clean-redeploy-orphan",
-            "error": "error", "reason": "orphaned by clean-redeploy: no executor remains to complete the lease",
-            "updated": "updated_at", "now": now.isoformat(),
-            "kind": "remote_command", "leased": "LEASED", "expires": "lease_expires_at",
+            "reason": "orphaned by clean-redeploy: no executor remains to complete the lease",
+            "now": now.isoformat(),
         }
         if cluster_ids:
-            statement += " AND payload->>%(cluster)s = ANY(%(clusters)s)"
-            params.update({"cluster": "cluster_id", "clusters": cluster_ids})
+            statement += " AND payload->>'\''cluster_id'\'' = ANY(%(clusters)s::text[])"
+            params["clusters"] = cluster_ids
         try:
             cursor.execute(statement, params)
         except psycopg.errors.UndefinedTable:
