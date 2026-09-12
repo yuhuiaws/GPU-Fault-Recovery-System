@@ -107,12 +107,18 @@ def deploy_consent_is_never_ambient(monkeypatch) -> None:
     that chain: a `deploy --supersede-failed-transaction` on 2026-09-11 handed
     every test `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION=1`, and six
     resume tests took the supersede branch and failed the gate. Consent is an
-    input a test sets on purpose, never something it inherits."""
+    input a test sets on purpose, never something it inherits.
+
+    The signing password rides the same chain: on 2026-09-12 the gate's
+    ambient ``COSIGN_PASSWORD`` made ``ensure_signing_material`` skip its
+    generation branch, failed three tests, and the assertion diff printed the
+    live password into the deploy log."""
 
     for name in (
         "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION",
         "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE",
         "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256",
+        "COSIGN_PASSWORD",
     ):
         monkeypatch.delenv(name, raising=False)
 
