@@ -939,3 +939,50 @@ def test_release_renders_one_runtime_image_across_gpu_roles(
     assert reconciler_call["env"]["GPU_FAULT_RUNTIME_PROFILE"] == "hyperpod-v1"
     assert reconciler_call["env"]["GPU_FAULT_CLUSTER_ID"] == "gpu-a"
     assert reconciler_call["env"]["GPU_FAULT_HYPERPOD_CLUSTER"] == "hp-gpu-a"
+
+
+def test_previous_node_installer_image_survives_an_empty_cluster_set() -> None:
+    """Removing the last GPU cluster leaves no reconciler to read the Node
+    Installer image from; the snapshot keeps the recorded image instead of
+    judging the empty mapping inconsistent (remove-cluster's final sync-state
+    failed there on 2026-09-12). With clusters the live reading still rules."""
+
+    from gpu_fault_release import regional_release_state as state_module
+
+    assert (
+        state_module.previous_node_installer_image(
+            capture_gpu=True,
+            images={},
+            recorded="repo@sha256:" + "a" * 64,
+            configured="x",
+        )
+        == "repo@sha256:" + "a" * 64
+    )
+    assert (
+        state_module.previous_node_installer_image(
+            capture_gpu=True,
+            images={},
+            recorded="",
+            configured="repo@sha256:" + "b" * 64,
+        )
+        == "repo@sha256:" + "b" * 64
+    )
+    assert (
+        state_module.previous_node_installer_image(
+            capture_gpu=True,
+            images={"gpu-a": "repo@sha256:" + "c" * 64},
+            recorded="repo@sha256:" + "a" * 64,
+            configured="x",
+        )
+        == "repo@sha256:" + "c" * 64
+    )
+    with pytest.raises(state_module.ReleaseError, match="inconsistent"):
+        state_module.previous_node_installer_image(
+            capture_gpu=True,
+            images={
+                "gpu-a": "repo@sha256:" + "c" * 64,
+                "gpu-b": "repo@sha256:" + "d" * 64,
+            },
+            recorded="",
+            configured="",
+        )

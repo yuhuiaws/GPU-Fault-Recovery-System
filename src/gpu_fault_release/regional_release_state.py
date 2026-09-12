@@ -34,6 +34,10 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseExecutionPlan,
 )
 from gpu_fault_release.regional_release_history import record_release_history
+from gpu_fault_release.regional_release_images import (
+    previous_node_installer_image,
+    require_consistent_images,
+)
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
 from gpu_fault_release.regional_release_probes import probe_source
@@ -436,24 +440,6 @@ def require_digest_pinned_image(description: str, image: str | None) -> str:
             f"(expected ...@sha256:<64 hex chars>): {text or '<empty>'}"
         )
     return text
-
-
-def require_consistent_images(
-    description: str,
-    images: dict[str, str | None],
-) -> str:
-    missing = sorted(name for name, image in images.items() if not image)
-    if missing:
-        raise ReleaseError(
-            f"cannot capture previous {description} image from: " + ", ".join(missing)
-        )
-    distinct = {str(image) for image in images.values()}
-    if len(distinct) != 1:
-        raise ReleaseError(
-            f"previous {description} images are inconsistent across: "
-            + ", ".join(sorted(images))
-        )
-    return distinct.pop()
 
 
 def config_map_binary_key(
@@ -1054,10 +1040,11 @@ def _capture_previous(
                 "legacy release-state adoption has no immutable rollback runtime image"
             )
         runtime_image = rollback_runtime_image
-    node_installer_image = (
-        require_consistent_images("Node Installer", node_installer_images)
-        if capture_gpu
-        else str(live_state.get("node_installer_image") or release.node_installer_image)
+    node_installer_image = previous_node_installer_image(
+        capture_gpu=capture_gpu,
+        images=node_installer_images,
+        recorded=str(live_state.get("node_installer_image") or ""),
+        configured=str(getattr(release, "node_installer_image", "") or ""),
     )
     adot_image = (
         deployment_image(
