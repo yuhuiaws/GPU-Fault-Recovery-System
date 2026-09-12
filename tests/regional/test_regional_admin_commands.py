@@ -682,3 +682,36 @@ def test_next_deploy_names_the_live_release_a_different_candidate_will_commit(
     assert seen[0]["transaction_committed"] is True, (
         "the diff is classified against the release as it will be once committed"
     )
+
+
+def test_deploy_leaves_an_uncommitted_bootstrap_for_verify_and_commit() -> None:
+    """Live 2026-09-12 trace: a first bootstrap whose verify or stability failed
+    sits at complete/uncommitted with no previous release. Resuming it as an
+    upgrade refuses ("resume release diff does not match"), because bootstrap
+    records no diff or plan; there is nothing to re-apply, so deploy returns and
+    the driver verifies and commits it."""
+
+    module = _admin_module()
+    calls: list[str] = []
+    release = SimpleNamespace(
+        release_id="release-a",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=()),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=lambda _args: True),
+        _load_state=lambda: {
+            "phase": "complete",
+            "release_id": "release-a",
+            "transaction_committed": False,
+            "previous": None,
+        },
+        upgrade=lambda **_kwargs: calls.append("upgrade"),
+        noop=lambda _diff: calls.append("noop"),
+        commit_release=lambda: calls.append("commit"),
+        pin_approved_manifest_plan=lambda _digest: calls.append("pin"),
+    )
+
+    module.run_deploy(release)
+
+    assert calls == [], (
+        "an uncommitted bootstrap must not be re-applied or committed by deploy"
+    )

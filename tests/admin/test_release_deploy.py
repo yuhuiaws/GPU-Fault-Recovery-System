@@ -1243,6 +1243,40 @@ def test_a_stability_failure_still_records_the_verification_report(
     )
 
 
+def test_recovery_skips_the_rollback_of_a_bootstrap_without_a_baseline(
+    tmp_path: Path,
+) -> None:
+    """A first bootstrap has no previous release: the engine's rollback would
+    only fail with "previous release state is unavailable" and record a second
+    failure over a complete data plane. The rerun verifies and commits it."""
+
+    prepared = SimpleNamespace(release_id="release-a", state_dir=tmp_path)
+    modes: list[str] = []
+
+    result = release_failure_recovery.recover_release_failure(
+        prepared,
+        site_file=tmp_path / "site.yaml",
+        root=tmp_path,
+        environment={},
+        failure_error="RuntimeError: verify failed",
+        failed_at="2026-09-12T14:00:00+00:00",
+        deployment_succeeded=True,
+        commit_started=False,
+        automatic_rollback=True,
+        run_release_mode=lambda *_args, **kwargs: modes.append(kwargs.get("mode")),
+        read_live_state=lambda _site: {
+            "phase": "complete",
+            "transaction_committed": False,
+            "previous": None,
+        },
+        update_phase=lambda *_args, **_kwargs: None,
+    )
+
+    assert result is not None
+    assert result["status"] == "SKIPPED_NO_BASELINE"
+    assert modes == [], "no rollback may be attempted without a baseline"
+
+
 def test_recovery_names_the_accepted_schema_change_instead_of_the_site_policy(
     tmp_path: Path,
 ) -> None:

@@ -51,7 +51,8 @@ def test_live_agent_node_names_accepts_a_cluster_with_no_agents(
 
 
 @pytest.mark.parametrize(
-    ("phase", "expected"), [("join", ("node-b",)), ("upgrade", NODES)]
+    ("phase", "expected"),
+    [("join", ("node-b",)), ("bootstrap", ("node-b",)), ("upgrade", NODES)],
 )
 def test_the_wave_safety_node_set_depends_on_the_phase(
     tmp_path, monkeypatch: pytest.MonkeyPatch, phase: str, expected: tuple[str, ...]

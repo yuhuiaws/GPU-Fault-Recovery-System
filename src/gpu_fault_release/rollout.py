@@ -142,6 +142,7 @@ from gpu_fault_release.regional_release_online_registry import (
     purge_registry_cluster,
     revoke_registry_cluster,
 )
+from gpu_fault_release.regional_release_progress import bootstrap_completion_state
 from gpu_fault_release.regional_release_orchestration import (
     bootstrap_gpu_clusters,
     rollback_release,
@@ -1069,7 +1070,7 @@ class RegionalRelease:
             self._save_state(
                 "complete",
                 previous=None,
-                completed_cluster_ids=sorted(completed_cluster_ids),
+                **bootstrap_completion_state(completed_cluster_ids),
             )
         except Exception:
             self._save_state(

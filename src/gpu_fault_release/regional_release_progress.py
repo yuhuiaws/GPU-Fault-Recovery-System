@@ -22,6 +22,34 @@ CLUSTER_ATTEMPT_STATES = frozenset(
 )
 
 
+def bootstrap_completion_state(
+    cluster_ids: Iterable[str], *, now: float | None = None
+) -> dict[str, Any]:
+    """The cluster fields a completed bootstrap writes into its ``complete`` state.
+
+    An upgrade records ``converged_at_epoch`` per cluster when its data plane
+    converges, and the stability window's restart grace reads the newest of
+    them to forgive collector alerts raised while agents were being
+    (re)installed. A bootstrap installs every agent from nothing and raises the
+    same alerts; without this record the grace never applied to it and those
+    alerts read as non-settleable.
+    """
+
+    epoch = time.time() if now is None else now
+    return {
+        "completed_cluster_ids": sorted(cluster_ids),
+        "cluster_attempts": {
+            cluster_id: {
+                "state": "CONVERGED",
+                "attempt_generation": 1,
+                "converged_at_epoch": epoch,
+                "updated_at_epoch": epoch,
+            }
+            for cluster_id in sorted(cluster_ids)
+        },
+    }
+
+
 def cluster_attempts_with(
     state: dict[str, Any],
     cluster_id: str,

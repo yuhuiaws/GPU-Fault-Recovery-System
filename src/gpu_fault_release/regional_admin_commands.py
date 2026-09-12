@@ -168,6 +168,23 @@ def _foreign_candidate(release: Any, state: dict[str, Any]) -> bool:
     return str(state.get("release_id") or "") != str(release.release_id)
 
 
+def _uncommitted_bootstrap(release: Any, state: dict[str, Any]) -> bool:
+    """A first bootstrap's ``complete`` state whose commit never happened.
+
+    Only bootstrap writes ``previous: null``; every upgrade records the release
+    it replaced. The same candidate cannot resume it as an upgrade (no diff or
+    plan was recorded), and a foreign candidate takes the commit-live-release
+    path instead.
+    """
+
+    return (
+        _commit_pending(state)
+        and "previous" in state
+        and state.get("previous") is None
+        and not _foreign_candidate(release, state)
+    )
+
+
 def _refuse_foreign_candidate_resume(release: Any, state: dict[str, Any]) -> None:
     """A failed fail-forward transaction only resumes the release that failed.
 
@@ -282,6 +299,12 @@ def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
         return {
             **retry_release_diff(release, state).as_dict(),
             "resume": True,
+            "action": "commit",
+        }
+    if _uncommitted_bootstrap(release, state):
+        return {
+            **retry_release_diff(release, state).as_dict(),
+            "resume": False,
             "action": "commit",
         }
     if _commit_pending(state) and _foreign_candidate(release, state):
@@ -500,6 +523,20 @@ def run_deploy(release: Any) -> None:
         )
     if _commit_cleanup_pending(state):
         release.commit_release()
+        return
+    if _uncommitted_bootstrap(release, state):
+        # The first bootstrap rolled out completely but its deploy stopped
+        # before the commit (verify or stability failed, no baseline to roll
+        # back to). There is no previous release to resume an upgrade against
+        # -- bootstrap records neither a release diff nor an execution plan, so
+        # `upgrade(resume=True)` would refuse -- and nothing left to apply: the
+        # driver runs verify and commit again over this state.
+        narrate_step(
+            "bootstrap-complete",
+            release_id=str(state.get("release_id") or ""),
+            reason="complete but uncommitted with no previous release; nothing "
+            "to re-apply, awaiting verify and commit",
+        )
         return
     if _commit_pending(state) and _foreign_candidate(release, state):
         # The live release rolled out completely but its deploy stopped before

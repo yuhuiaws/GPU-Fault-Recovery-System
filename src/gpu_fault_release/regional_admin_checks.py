@@ -980,8 +980,6 @@ def check_aurora_refresh(
             f"targets={sorted(targets)}, allowed={sorted(allowed_targets)}"
         )
     last_successful = cronjob.get("status", {}).get("lastSuccessfulTime")
-    if require_success and not last_successful:
-        raise ReleaseError("Aurora credential refresh has never completed successfully")
     jobs = (
         release._get_json(
             release._cpu(
@@ -1025,6 +1023,8 @@ def check_aurora_refresh(
             + f": {status['error'] or status['status']}"
         )
     if require_success:
+        # Not lastSuccessfulTime: the controller records only its own scheduled
+        # runs (a fresh site's first is an hour away); the Jobs write this status.
         if status is None:
             raise ReleaseError(
                 "Aurora credential refresh has never recorded a status in the "

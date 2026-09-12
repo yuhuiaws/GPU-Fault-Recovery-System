@@ -267,6 +267,34 @@ def rollback_after_failure(
     }
 
 
+def _no_rollback_baseline(
+    failure_state: dict[str, Any] | None,
+    *,
+    site_file: Path,
+    read_live_state: ReadLiveState,
+) -> bool:
+    """Whether the live release is a first bootstrap with nothing to roll back to.
+
+    Only the ``complete`` state a bootstrap writes carries ``previous: null``;
+    every upgrade records the release it replaced. Read on demand: the other
+    branches above deliberately do not read the live state after a successful
+    deploy, and an unreadable state must keep the rollback decision as it was.
+    """
+
+    state = failure_state
+    if state is None:
+        try:
+            state = read_live_state(site_file)
+        except Exception:
+            return False
+    return (
+        isinstance(state, dict)
+        and state.get("phase") == "complete"
+        and "previous" in state
+        and state.get("previous") is None
+    )
+
+
 def recover_release_failure(
     prepared: PreparedRelease,
     *,
@@ -349,6 +377,23 @@ def recover_release_failure(
         return {
             "status": "SKIPPED_COMMITTED",
             "reason": "release is committed; only post-commit cleanup may retry",
+        }
+    if (
+        deployment_succeeded
+        and automatic_rollback
+        and _no_rollback_baseline(
+            failure_state, site_file=site_file, read_live_state=read_live_state
+        )
+    ):
+        # A first bootstrap that failed its verify or stability window: there is
+        # no previous release to roll back to, and the engine's rollback would
+        # only record a second failure ("previous release state is
+        # unavailable") over a complete data plane. Leave it uncommitted for the
+        # rerun, which verifies and commits it.
+        return {
+            "status": "SKIPPED_NO_BASELINE",
+            "reason": "first bootstrap has no previous release to roll back to; "
+            "rerun deploy to verify and commit it",
         }
     if (
         deployment_succeeded
