@@ -29,6 +29,7 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target,
     bootstrap_gpu_scope,
+    discover_bootstrap_scope,
     existing_gpu_context,
     preserve_existing_site_contract,
     recover_verified_site_contract,
@@ -784,3 +785,29 @@ def test_initial_deploy_target_accepts_monotonic_membership_subset(
 
     with pytest.raises(BootstrapError, match="persisted checkpoint"):
         bind_initial_deploy_target(reloaded, site, cpu, [gpu_a])
+
+
+def test_a_site_without_gpu_clusters_still_discovers_its_control_plane(
+    tmp_path: Path,
+) -> None:
+    """After remove-cluster the site deploys with ``clusters: []``; the GPU
+    discovery fan-out then has nothing to run, and a zero-worker pool is a
+    ValueError (deploy #61, 2026-09-12: "max_workers must be greater than 0")."""
+
+    cpu = _cluster()
+
+    existing, discovered_cpu, gpu_clusters = discover_bootstrap_scope(
+        request=BootstrapRequest(
+            cpu_cluster_arn=cpu.input_arn,
+            gpu_cluster_arns=(),
+            repository_root=tmp_path / "repo",
+            state_dir=tmp_path / "state",
+        ),
+        runner=object(),
+        discover=lambda _runner, **_keywords: cpu,
+        alias=lambda _arn, role, index: f"{role}-{index}",
+    )
+
+    assert existing is None, "a fresh state dir has no site to recover"
+    assert discovered_cpu.role == "cpu"
+    assert gpu_clusters == [], "no GPU ARN means no GPU cluster, not an error"

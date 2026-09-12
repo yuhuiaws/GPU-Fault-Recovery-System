@@ -518,7 +518,10 @@ def discover_bootstrap_scope(
         context=alias(request.cpu_cluster_arn, "cpu", 0),
     )
     cpu = replace(cpu, context=alias(cpu.eks_arn, "cpu", 0))
-    with ThreadPoolExecutor(max_workers=min(8, len(request.gpu_cluster_arns))) as pool:
+    # A site with no GPU cluster (after remove-cluster) still deploys its
+    # control plane; a zero-worker pool is a ValueError, not an empty fan-out.
+    workers = max(1, min(8, len(request.gpu_cluster_arns)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
             pool.submit(
                 discover,
