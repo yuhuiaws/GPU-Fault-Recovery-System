@@ -13,15 +13,9 @@ import yaml
 from gpu_fault.admin import cluster_batch_join as admin_cluster_batch_join
 from gpu_fault.admin import cluster_join as admin_cluster_join
 from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
-from gpu_fault.admin import cluster_readiness as admin_cluster_readiness
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_batch_join import join_clusters
-from gpu_fault.admin.cluster_join import (
-    JoinClusterRequest,
-    JoinExecution,
-    join_cluster,
-    wait_collector_readiness,
-)
+from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution, join_cluster
 from gpu_fault.admin.cluster_join_evidence import JoinVerificationExpired
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
@@ -31,6 +25,39 @@ from gpu_fault.installation_resources import (
     InstallationResourceSnapshot,
 )
 from tests.admin.test_admin_site import site_file
+
+JOINED_KEYS = {
+    "cluster/hp-gpu-b/eks",
+    "cluster/hp-gpu-b/hyperpod",
+    "aws/iam/executor/hp-gpu-b/role",
+    "aws/iam/adot-writer/hp-gpu-b/role",
+    "aws/iam/executor/hp-gpu-b/oidc-provider",
+    "aws/route53/vpc-association/hp-gpu-b",
+}
+
+
+def _readiness_evidence(nodes: int = 4) -> dict:
+    """What the COLLECTORS_READY gate records: fast kinds waited, slow deferred."""
+
+    return {
+        "ready": True,
+        "node_count": nodes,
+        "nodes": [f"node-{index}" for index in range(nodes)],
+        "waited_kinds": ["GPU_INVENTORY", "HOST_TELEMETRY"],
+        "deferred_kinds": {"GPU_METRICS": {"verified_as": "scheduled"}},
+        "fleet_ready": True,
+    }
+
+
+def _verify_report() -> dict:
+    return {
+        "mode": "verify",
+        "healthy": True,
+        "summary": {"PASS": 8, "WARN": 0, "FAIL": 0, "SKIP": 0},
+        "checks": [{"name": "control_api", "status": "PASS"}],
+        "scope": {"skipped_checks": {"monitoring": "..."}},
+    }
+
 
 GPU_B_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
 ADOT_WRITER_B = (
@@ -159,6 +186,25 @@ def _assert_adot_writer_committed(snapshot: InstallationResourceSnapshot, site) 
     )
 
 
+def _assert_commit_evidence_is_scoped(state: dict, state_dir: Path) -> None:
+    """Each commit step records the scope it worked at, for the operator."""
+
+    evidence = state["evidence"]
+    assert evidence["COLLECTORS_READY"]["deferred_kinds"] == {
+        "GPU_METRICS": {"verified_as": "scheduled"}
+    }, "the operator cannot see which collector kinds the gate deferred"
+    assert evidence["REGISTRY_UPDATED"]["mode"] == "delta"
+    assert set(evidence["REGISTRY_UPDATED"]["delta_keys"]) == JOINED_KEYS
+    assert evidence["RELEASE_STATE_UPDATED"]["capture_scope"] == "cluster:hp-gpu-b"
+    assert evidence["VERIFIED"]["verify"]["skipped_checks"] == ["monitoring"]
+    after = admin_cluster_join.load_installation_resource_snapshot(
+        state_dir / "installation-resources-after-001.json"
+    )
+    assert {item.resource_key for item in after.resources} == JOINED_KEYS | {
+        "aws/nlb"
+    }, "the after snapshot is the before snapshot plus the delta"
+
+
 def test_join_cluster_is_atomic_resumable_and_registers_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,10 +274,19 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     )
     monkeypatch.setattr(
         admin_cluster_join,
-        "_sync_release_state",
-        lambda current: release_state_syncs.append(
+        "sync_cluster_release_state",
+        lambda current, *, cluster_id: release_state_syncs.append(
             [item["cluster_id"] for item in current.release_config["clusters"]]
-        ),
+        )
+        or {"capture_scope": f"cluster:{cluster_id}"},
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_verify_candidate",
+        lambda _candidate, readiness: rollout_calls.append(
+            ("verify", ",".join(sorted(readiness)))
+        )
+        or _verify_report(),
     )
     failure_domain_renders: list[list[str]] = []
     monkeypatch.setattr(
@@ -246,10 +301,14 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
             ]
         ),
     )
+    readiness_waits: list[list[str] | None] = []
     monkeypatch.setattr(
         admin_cluster_join,
-        "wait_collector_readiness",
-        lambda *_args, **_kwargs: {"ready": True, "nodes": [{}, {}, {}, {}]},
+        "wait_join_collector_readiness",
+        lambda _site, _cluster_id, *, expected_nodes: readiness_waits.append(
+            expected_nodes
+        )
+        or _readiness_evidence(),
     )
     monkeypatch.setattr(
         admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
@@ -310,20 +369,20 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "gpu-a",
         "hp-gpu-b",
     ]
-    assert {
-        "cluster/hp-gpu-b/eks",
-        "cluster/hp-gpu-b/hyperpod",
-        "aws/iam/executor/hp-gpu-b/role",
-        "aws/iam/adot-writer/hp-gpu-b/role",
-        "aws/route53/vpc-association/hp-gpu-b",
-    }.issubset(keys), "Aurora registry omitted joined cluster resources"
+    assert keys == JOINED_KEYS, (
+        "the registry write must be exactly the join's delta, not the whole site"
+    )
+    assert len(synced) == 1, "a resumed COMPLETED join re-sent the registry delta"
     _assert_adot_writer_committed(synced[-1], updated)
     assert rollout_calls == [
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),
-        ("verify", None),
+        ("verify", "hp-gpu-b"),
         ("activate-cluster", "hp-gpu-b"),
     ], "the join ran a baseline verify the candidate verify already answers"
+    assert readiness_waits == [["node-b"]], (
+        "the readiness gate must be asked about the cluster's HyperPod nodes"
+    )
     assert release_state_syncs == [["gpu-a", "hp-gpu-b"]]
     assert failure_domain_renders == [["gpu-a", "hp-gpu-b"]], (
         "the failure-domain map is re-rendered once, from the committed site"
@@ -337,6 +396,7 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert token_file.is_file(), "the cluster token file was not written"
     assert state["evidence"]["FINAL_VERIFIED"]["registry_generation"] == 3
     assert state["evidence"]["FINAL_VERIFIED"]["live_release_state_sha256"] == "a" * 64
+    _assert_commit_evidence_is_scoped(state, state_dir)
     assert yaml.safe_load(path.read_text())["spec"]["gpuKubeconfig"] == str(
         gpu_kubeconfig
     )
@@ -563,26 +623,6 @@ def test_join_cluster_failure_after_site_commit_restores_original_site(
     assert len(load_site(path).release_config["clusters"]) == 1
 
 
-def test_join_waits_for_collector_freshness(monkeypatch: pytest.MonkeyPatch) -> None:
-    reports = iter(
-        [
-            {"ready": False, "nodes": [{"ready": False}]},
-            {"ready": True, "nodes": [{"ready": True}]},
-        ]
-    )
-    monkeypatch.setattr(
-        admin_cluster_readiness,
-        "_collector_readiness_report",
-        lambda *_args: next(reports),
-    )
-
-    result = wait_collector_readiness(
-        object(), "gpu-b", timeout_seconds=1, interval_seconds=0
-    )
-
-    assert result["ready"] is True
-
-
 def test_completed_join_state_starts_a_new_attempt_after_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -753,11 +793,21 @@ def _site_allowing_parallel_clusters(tmp_path: Path, count: int):
     return load_site(path)
 
 
-def _patch_batch_discovery(monkeypatch: pytest.MonkeyPatch, executions) -> None:
+def _patch_batch_discovery(
+    monkeypatch: pytest.MonkeyPatch, executions, verified: list[str] | None = None
+) -> None:
     monkeypatch.setattr(
         admin_cluster_join,
         "_prepare_execution",
         lambda request, **_kwargs: executions[request.gpu_cluster_arn],
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_verify_candidate",
+        lambda _candidate, _readiness: (
+            verified.append("verify") if verified is not None else None
+        )
+        or _verify_report(),
     )
     monkeypatch.setattr(
         admin_cluster_join,
@@ -813,7 +863,7 @@ def test_batch_join_rolls_as_many_clusters_as_the_release_allows(
         "_run_rollout",
         lambda _site, mode, **_kwargs: rollout_modes.append(mode),
     )
-    _patch_batch_discovery(monkeypatch, executions)
+    _patch_batch_discovery(monkeypatch, executions, rollout_modes)
 
     def deploy(*, execution, **_kwargs) -> None:
         nonlocal active, maximum
@@ -986,7 +1036,7 @@ def test_batch_join_re_verifies_expired_evidence_instead_of_rolling_back(
         "_run_rollout",
         lambda _site, mode, **_kwargs: rollout_modes.append(mode),
     )
-    _patch_batch_discovery(monkeypatch, executions)
+    _patch_batch_discovery(monkeypatch, executions, rollout_modes)
     monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", lambda **_kwargs: None)
     monkeypatch.setattr(
         admin_cluster_join,
@@ -1059,8 +1109,9 @@ def test_join_re_verifies_expired_evidence_instead_of_rolling_back(
     monkeypatch.setattr(admin_cluster_join, "_deploy_cluster", lambda **_kwargs: None)
     monkeypatch.setattr(
         admin_cluster_join,
-        "_run_rollout",
-        lambda _site, mode, **_kwargs: rollout_modes.append(mode),
+        "_verify_candidate",
+        lambda _candidate, _readiness: rollout_modes.append("verify")
+        or _verify_report(),
     )
     monkeypatch.setattr(
         admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
@@ -1089,3 +1140,140 @@ def test_join_re_verifies_expired_evidence_instead_of_rolling_back(
     assert rollout_modes == ["verify", "verify"]
     state = json.loads((state_dir / "state.json").read_text())
     assert "VERIFIED" in state["completed_steps"]
+
+
+def test_join_resumes_after_a_crash_between_commit_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process dies after the registry delta is written and before the
+    cluster is activated; the resumed attempt neither redoes the finished
+    steps nor re-sends the delta, and finishes from where it stopped."""
+
+    path = site_file(tmp_path)
+    site = load_site(path)
+    state_dir = tmp_path / "join-state"
+    gpu_kubeconfig = tmp_path / "secure/gpu.kubeconfig"
+    synced: list[InstallationResourceSnapshot] = []
+    verifies: list[str] = []
+    release_state_syncs: list[str] = []
+    activations: list[str] = []
+
+    def rollout(_site, mode, *, cluster_id=None):
+        if mode == "activate-cluster":
+            activations.append(mode)
+            if len(activations) == 1:
+                raise KeyboardInterrupt  # the operator's terminal died here
+
+    monkeypatch.setattr(admin_cluster_join, "_run_rollout", rollout)
+    monkeypatch.setattr(
+        admin_cluster_join, "discover_cluster", lambda *_args, **_kwargs: _target()
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_gpu_kubeconfig", lambda _site: gpu_kubeconfig
+    )
+    monkeypatch.setattr(admin_cluster_join, "ensure_namespace", lambda *_a, **_k: None)
+
+    def base_secrets(_runner, *, secure_dir, **_kwargs):
+        secret = secure_dir / "fleet-master"
+        secret.write_text("f" * 64, encoding="utf-8")
+        secret.chmod(0o600)
+        return secret
+
+    monkeypatch.setattr(admin_cluster_join, "_ensure_base_secrets", base_secrets)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_shared_ca_file",
+        lambda current: Path(current.release_config["clusters"][0]["ca_file"]),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_list_nodes", lambda *_args, **_kwargs: ["node-b"]
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "clear_stale_installer_annotations", lambda *_a: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_existing_cluster_networks", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_parallel_prerequisites",
+        lambda *_args, **_kwargs: _joined_prerequisites(),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "_update_bootstrap_state", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "sync_cluster_release_state",
+        lambda _current, *, cluster_id: release_state_syncs.append(cluster_id) or {},
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "refresh_failure_domain_map", lambda _current: None
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "wait_join_collector_readiness",
+        lambda *_args, **_kwargs: _readiness_evidence(1),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_verify_candidate",
+        lambda _candidate, readiness: verifies.append(",".join(readiness))
+        or _verify_report(),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join, "membership_runtime_snapshot", _membership_snapshot
+    )
+    monkeypatch.setattr(
+        admin_cluster_join_commit,
+        "validate_verified_membership",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        admin_cluster_join_commit,
+        "final_membership_identity",
+        lambda _site, **kwargs: {**kwargs, "registry_lifecycle": "ACTIVE"},
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "sync_installation_resource_snapshot",
+        lambda _site, snapshot: synced.append(snapshot),
+    )
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "fetch_installation_resource_registry",
+        lambda _site, output=None: synced[-1],
+    )
+    before = state_dir / "installation-resources-before-001.json"
+    before.parent.mkdir(parents=True, exist_ok=True)
+    admin_cluster_join.write_installation_resource_snapshot(
+        site, _snapshot(), path=before
+    )
+    request = JoinClusterRequest(
+        site=site, gpu_cluster_arn=GPU_B_ARN, state_dir=state_dir
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        join_cluster(request, runner=Runner())
+
+    crashed = json.loads((state_dir / "state.json").read_text())
+    assert "REGISTRY_UPDATED" in crashed["completed_steps"]
+    assert "ACTIVATION_STARTED" in crashed["completed_steps"]
+    assert "ACTIVATED" not in crashed["completed_steps"]
+    assert crashed["phase"] != "ROLLED_BACK", "a crash is not a failure to undo"
+
+    result = join_cluster(
+        JoinClusterRequest(
+            site=load_site(path), gpu_cluster_arn=GPU_B_ARN, state_dir=state_dir
+        ),
+        runner=Runner(),
+    )
+
+    assert result["phase"] == "COMPLETED"
+    assert activations == ["activate-cluster", "activate-cluster"]
+    assert len(synced) == 1, "the resumed attempt re-sent the registry delta"
+    assert release_state_syncs == ["hp-gpu-b"], "sync-state ran again on resume"
+    assert verifies == ["hp-gpu-b"], "fresh VERIFIED evidence was verified again"
+    state = json.loads((state_dir / "state.json").read_text())
+    assert "FINAL_VERIFIED" in state["completed_steps"]
+    assert state["evidence"]["FINAL_VERIFIED"]["registry_lifecycle"] == "ACTIVE"

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timezone
 
 import pytest
 
 from gpu_fault.admin import resource_registry as admin_resource_registry
+from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.cluster_join_commit import registry_delta
 from gpu_fault.admin.resource_registry import (
     LegacyInstallationRegistryMissing,
     build_installation_snapshot,
@@ -16,8 +19,10 @@ from gpu_fault.admin.resource_registry import (
 )
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
+    InstallationResource,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
+    InstallationResourceSnapshot,
 )
 from tests.admin.test_admin_site import site_file
 
@@ -463,3 +468,73 @@ def test_registry_sync_falls_back_to_direct_aurora_upsert(
 
     assert len(attempts) == 4
     assert direct == [snapshot]
+
+
+def _row(key: str, resource_id: str, *, arn: str | None = None) -> InstallationResource:
+    now = datetime.now(timezone.utc)
+    return InstallationResource(
+        site_id="test-site",
+        resource_key=key,
+        resource_type="gpu_eks" if key.endswith("/eks") else "iam_role",
+        resource_id=resource_id,
+        resource_arn=arn,
+        region="us-east-1",
+        account_id="123456789012",
+        ownership=InstallationResourceOwnership.EXTERNAL,
+        delete_policy=InstallationResourceDeletePolicy.PRESERVE,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _before(*rows: InstallationResource) -> InstallationResourceSnapshot:
+    snapshot = InstallationResourceSnapshot(site_id="test-site", resources=list(rows))
+    return snapshot.model_copy(update={"source_sha256": snapshot.digest()})
+
+
+def test_join_registry_delta_is_exactly_the_joined_resources() -> None:
+    """The write that reaches Aurora is the join's own rows; the after snapshot
+    is the DISCOVERED snapshot with those rows applied."""
+
+    before = _before(_row("aws/nlb", "gpu-fault-nlb"), _row("cluster/gpu-a/eks", "a"))
+    joined = [
+        _row("cluster/gpu-b/eks", "gpu-b", arn="arn:aws:eks:::cluster/gpu-b"),
+        _row("aws/iam/executor/gpu-b/role", "gpu-b-executor"),
+    ]
+
+    delta, merged = registry_delta(before, joined, site_id="test-site")
+
+    assert [item.resource_key for item in delta.resources] == sorted(
+        item.resource_key for item in joined
+    )
+    assert delta.resources == sorted(joined, key=lambda item: item.resource_key)
+    assert [item.resource_key for item in merged.resources] == [
+        "aws/iam/executor/gpu-b/role",
+        "aws/nlb",
+        "cluster/gpu-a/eks",
+        "cluster/gpu-b/eks",
+    ]
+    assert delta.source_sha256 == delta.digest(), "the delta snapshot is unsealed"
+    assert merged.source_sha256 == merged.digest(), "the merged snapshot is unsealed"
+
+
+def test_join_registry_delta_is_idempotent_over_its_own_rows() -> None:
+    """A resumed attempt whose before snapshot already carries the same rows
+    (an earlier life of the same cluster) is not a conflict."""
+
+    row = _row("cluster/gpu-b/eks", "gpu-b", arn="arn:aws:eks:::cluster/gpu-b")
+    delta, merged = registry_delta(_before(row), [row], site_id="test-site")
+
+    assert delta.resources == [row]
+    assert merged.resources == [row]
+
+
+def test_join_registry_delta_refuses_a_key_naming_another_resource() -> None:
+    before = _before(_row("cluster/gpu-b/eks", "gpu-b-old"))
+
+    with pytest.raises(BootstrapError, match="cluster/gpu-b/eks"):
+        registry_delta(
+            before, [_row("cluster/gpu-b/eks", "gpu-b")], site_id="test-site"
+        )
+    with pytest.raises(BootstrapError, match="belongs to site"):
+        registry_delta(before, [], site_id="other-site")

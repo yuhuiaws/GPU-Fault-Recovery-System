@@ -21,6 +21,7 @@ from gpu_fault.admin.cluster_join import (
     JoinClusterRequest,
     JoinExecution,
 )
+from gpu_fault.admin.cluster_join_engine import verify_report_summary
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
@@ -424,12 +425,21 @@ def _verify_deployed(
     )
     before = membership_runtime_snapshot(candidate)
     try:
-        join._run_rollout(candidate, "verify")
+        report = join._verify_candidate(
+            candidate,
+            {
+                _execution(attempt).cluster_id: join._collectors_ready_evidence(
+                    attempt.state
+                )
+                for attempt in attempts
+            },
+        )
     except Exception as exc:
         for attempt in attempts:
             _record_failure(context, attempt, attempt.execution, exc)
         return []
     after = membership_runtime_snapshot(candidate)
+    verify_summary = verify_report_summary(report)
     verified_at = datetime.now(timezone.utc)
     candidate_cluster_ids = [
         str(item["cluster_id"]) for item in candidate.release_config["clusters"]
@@ -440,24 +450,21 @@ def _verify_deployed(
             candidate=candidate,
         )
         if not step_done(attempt.state, "VERIFIED"):
-            complete_step(
-                attempt.state_path,
-                attempt.state,
-                "VERIFIED",
-                build_verified_membership_evidence(
-                    before,
-                    after,
-                    candidate_site_sha256=candidate.source_sha256,
-                    source_site_sha256=str(attempt.state["source_site_sha256"]),
-                    source_site_non_membership_sha256=str(
-                        attempt.state["source_site_non_membership_sha256"]
-                    ),
-                    candidate_cluster_ids=candidate_cluster_ids,
-                    cluster_id=_execution(attempt).cluster_id,
-                    batch_id=context.batch_id,
-                    verified_at=verified_at,
+            evidence = build_verified_membership_evidence(
+                before,
+                after,
+                candidate_site_sha256=candidate.source_sha256,
+                source_site_sha256=str(attempt.state["source_site_sha256"]),
+                source_site_non_membership_sha256=str(
+                    attempt.state["source_site_non_membership_sha256"]
                 ),
+                candidate_cluster_ids=candidate_cluster_ids,
+                cluster_id=_execution(attempt).cluster_id,
+                batch_id=context.batch_id,
+                verified_at=verified_at,
             )
+            evidence["verify"] = verify_summary
+            complete_step(attempt.state_path, attempt.state, "VERIFIED", evidence)
     return attempts
 
 

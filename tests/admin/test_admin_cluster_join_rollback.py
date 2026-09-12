@@ -20,6 +20,7 @@ import yaml
 
 from gpu_fault.admin import cluster_join as admin_cluster_join
 from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
+from gpu_fault.admin import cluster_join_network as admin_cluster_join_network
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_join import JoinClusterRequest, join_cluster
 from gpu_fault.admin.site import load_site
@@ -202,7 +203,9 @@ class Attempt:
             lambda *_args, **_keywords: None,
         )
         monkeypatch.setattr(
-            admin_cluster_join, "_wait_vpc_association_absent", lambda **_keywords: None
+            admin_cluster_join_network,
+            "_wait_vpc_association_absent",
+            lambda **_keywords: None,
         )
         monkeypatch.setattr(
             admin_cluster_join_commit,

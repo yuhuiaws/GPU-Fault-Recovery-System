@@ -63,7 +63,10 @@ def test_join_activation_is_the_irreversible_commit_boundary(
     monkeypatch.setattr(
         COMMIT,
         "_sync_registry",
-        lambda *_args, **_kwargs: SimpleNamespace(source_sha256="s" * 64),
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(source_sha256="d" * 64, resources=[]),
+            SimpleNamespace(source_sha256="s" * 64, resources=[]),
+        ),
     )
     monkeypatch.setattr(COMMIT, "_joined_resources", lambda *_a, **_k: [])
     monkeypatch.setattr(COMMIT, "load_site", lambda *_args, **_kwargs: site)

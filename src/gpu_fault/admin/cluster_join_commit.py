@@ -184,38 +184,90 @@ def _joined_resources(
     return resources
 
 
+def _sealed(
+    site_id: str,
+    resources: list[InstallationResource],
+) -> InstallationResourceSnapshot:
+    snapshot = InstallationResourceSnapshot(
+        site_id=site_id,
+        resources=sorted(resources, key=lambda item: item.resource_key),
+    )
+    return cast(
+        InstallationResourceSnapshot,
+        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
+    )
+
+
+def registry_delta(
+    before: InstallationResourceSnapshot,
+    resources: list[InstallationResource],
+    *,
+    site_id: str,
+) -> tuple[InstallationResourceSnapshot, InstallationResourceSnapshot]:
+    """``(delta, merged)``: what this join adds, and the before snapshot with it.
+
+    The delta is exactly ``_joined_resources``; it is what reaches Aurora, so
+    the registry API upserts the joined cluster's rows instead of re-saving
+    every row of the site (89 s on 2026-09-12). The consistency check against
+    the ``DISCOVERED`` snapshot is cheap and local: same site, and a key the
+    snapshot already holds must name the same resource, or the registry is
+    describing another cluster's life under this cluster's keys.
+    """
+
+    if before.site_id != site_id:
+        raise BootstrapError(
+            f"registry before-snapshot belongs to site {before.site_id!r}, "
+            f"not {site_id!r}"
+        )
+    existing = {item.resource_key: item for item in before.resources}
+    conflicts = sorted(
+        item.resource_key
+        for item in resources
+        if (previous := existing.get(item.resource_key)) is not None
+        and (previous.resource_type, previous.resource_id, previous.resource_arn)
+        != (item.resource_type, item.resource_id, item.resource_arn)
+    )
+    if conflicts:
+        raise BootstrapError(
+            "registry before-snapshot already holds a different resource under: "
+            + ", ".join(conflicts)
+        )
+    merged = {**existing, **{item.resource_key: item for item in resources}}
+    return _sealed(site_id, list(resources)), _sealed(site_id, list(merged.values()))
+
+
 def _sync_registry(
     site: RenderedSite,
     *,
     before_path: Path,
     state_dir: Path,
     resources: list[InstallationResource],
-) -> InstallationResourceSnapshot:
-    try:
-        before = join._fetch_installation_registry(site)
-    except LegacyInstallationRegistryMissing:
-        before = join._load_installation_snapshot(before_path)
-    merged = {item.resource_key: item for item in before.resources}
-    merged.update({item.resource_key: item for item in resources})
-    snapshot = InstallationResourceSnapshot(
-        site_id=before.site_id,
-        resources=sorted(merged.values(), key=lambda item: item.resource_key),
+) -> tuple[InstallationResourceSnapshot, InstallationResourceSnapshot]:
+    """Write the join's delta to Aurora; return ``(delta, merged)``.
+
+    Idempotent: a resumed attempt re-sends the same rows (an upsert) and
+    rewrites the same ``installation-resources-after`` file. The live registry
+    is read once, by ``FINAL_VERIFIED``, which is where the joined rows are
+    proven ACTIVE and the site's ``installation-resources.json`` is refreshed.
+    """
+
+    before = join._load_installation_snapshot(before_path)
+    delta, merged = registry_delta(
+        before,
+        resources,
+        site_id=str(site.release_config["site_name"]),
     )
-    snapshot = cast(
-        InstallationResourceSnapshot,
-        snapshot.model_copy(update={"source_sha256": snapshot.digest()}),
-    )
-    join._sync_installation_snapshot(site, snapshot)
+    join._sync_installation_snapshot(site, delta)
     join._write_installation_snapshot(
         site,
-        snapshot,
+        merged,
         path=state_dir
         / before_path.name.replace(
             "installation-resources-before",
             "installation-resources-after",
         ),
     )
-    return snapshot
+    return delta, merged
 
 
 def _commit_site(
@@ -374,7 +426,7 @@ def activate_and_commit(
         repository_root=request.site.repository_root,
     )
     if not step_done(state, "RELEASE_STATE_UPDATED"):
-        join._sync_join_release_state(updated_site)
+        synced = join._sync_join_release_state(updated_site, cluster_id=cluster_id)
         complete_step(
             state_path,
             state,
@@ -383,11 +435,12 @@ def activate_and_commit(
                 "cluster_ids": [
                     item["cluster_id"]
                     for item in updated_site.release_config["clusters"]
-                ]
+                ],
+                **(synced or {}),
             },
         )
     if not step_done(state, "REGISTRY_UPDATED"):
-        snapshot = _sync_registry(
+        delta, merged = _sync_registry(
             updated_site,
             before_path=Path(execution.discovery["registry_snapshot"]),
             state_dir=state_dir,
@@ -397,7 +450,12 @@ def activate_and_commit(
             state_path,
             state,
             "REGISTRY_UPDATED",
-            {"snapshot_digest": snapshot.source_sha256},
+            {
+                "snapshot_digest": merged.source_sha256,
+                "delta_digest": delta.source_sha256,
+                "delta_keys": [item.resource_key for item in delta.resources],
+                "mode": "delta",
+            },
         )
     if not activation_started:
         validate_verified_membership(

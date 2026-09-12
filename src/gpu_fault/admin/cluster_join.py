@@ -6,7 +6,6 @@ import os
 import secrets
 import subprocess
 import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -36,6 +35,11 @@ from gpu_fault.admin.bootstrap_services import (
     ensure_executor_role,
     provision_node_action_keys,
 )
+from gpu_fault.admin.cluster_join_engine import (
+    sync_cluster_release_state,
+    verify_joined_clusters,
+    verify_report_summary,
+)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
@@ -44,13 +48,17 @@ from gpu_fault.admin.cluster_join_evidence import (
     membership_runtime_snapshot,
     verification_is_stale,
 )
+from gpu_fault.admin.cluster_join_network import (
+    ensure_nlb_ingress,
+    rollback_network,
+    wait_zone_association,
+)
 from gpu_fault.admin.cluster_join_readonly import cached_network_baseline
 from gpu_fault.admin.cluster_join_rollback import (
     clear_stale_installer_annotations,
     ensure_kube_context,
     nothing_installed,
     restore_current_context,
-    rollback_command,
     rollback_iam_role,
 )
 from gpu_fault.admin.cluster_join_state import (
@@ -68,13 +76,12 @@ from gpu_fault.admin.cluster_join_state import (
 from gpu_fault.admin.cluster_join_state import (
     step_done as _done,
 )
-from gpu_fault.admin.cluster_readiness import wait_collector_readiness
+from gpu_fault.admin.cluster_join_readiness import wait_join_collector_readiness
 from gpu_fault.admin.cluster_removal import (
     _clear_installer_annotations,
     _cluster_network,
     _remove_node_action_keys,
     _sync_release_state,
-    _wait_vpc_association_absent,
 )
 from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
 from gpu_fault.admin.membership_lock import (
@@ -158,8 +165,36 @@ def _write_installation_snapshot(
     return write_installation_resource_snapshot(site, snapshot, path=path)
 
 
-def _sync_join_release_state(site: RenderedSite) -> None:
-    _sync_release_state(site)
+def _sync_join_release_state(
+    site: RenderedSite,
+    *,
+    cluster_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Refresh the release state after membership changed.
+
+    With a ``cluster_id`` (the join commit) only that cluster is captured and
+    merged into the committed state; without one (rollback, repair of an old
+    record) the engine's full ``sync-state`` runs.
+    """
+
+    if cluster_id is None:
+        _sync_release_state(site)
+        return None
+    return sync_cluster_release_state(site, cluster_id=cluster_id)
+
+
+def _verify_candidate(
+    candidate: RenderedSite,
+    readiness: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """The join-scoped verify; ``readiness`` is COLLECTORS_READY evidence per cluster."""
+
+    return verify_joined_clusters(candidate, readiness=readiness)
+
+
+def _collectors_ready_evidence(state: dict[str, Any]) -> dict[str, Any]:
+    value = (state.get("evidence") or {}).get("COLLECTORS_READY")
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _run_rollout(
@@ -326,66 +361,6 @@ def _export_registry(site: RenderedSite, path: Path) -> None:
         fetch_installation_resource_registry(site, output=path)
 
 
-def _ensure_nlb_ingress(
-    *,
-    region: str,
-    security_group: str,
-    eips: list[str],
-) -> list[str]:
-    created = []
-    for eip in eips:
-        result = subprocess.run(
-            [
-                "aws",
-                "ec2",
-                "authorize-security-group-ingress",
-                "--region",
-                region,
-                "--group-id",
-                security_group,
-                "--protocol",
-                "tcp",
-                "--port",
-                "443",
-                "--cidr",
-                f"{eip}/32",
-            ],
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            created.append(eip)
-        elif "InvalidPermission.Duplicate" not in result.stderr:
-            raise BootstrapError(
-                f"cannot authorize NLB ingress for {eip}: {result.stderr.strip()}"
-            )
-    return created
-
-
-def _wait_zone_association(
-    runner: CommandRunner,
-    *,
-    region: str,
-    hosted_zone_id: str,
-    vpc_id: str,
-) -> None:
-    for _ in range(60):
-        document = runner.aws_json(
-            region,
-            "route53",
-            "get-hosted-zone",
-            "--id",
-            hosted_zone_id,
-        )
-        if any(
-            item.get("VPCRegion") == region and item.get("VPCId") == vpc_id
-            for item in document.get("VPCs", [])
-        ):
-            return
-        time.sleep(5)
-    raise BootstrapError("Route53 VPC association did not become visible")
-
-
 def _existing_cluster_networks(
     runner: CommandRunner,
     site: RenderedSite,
@@ -433,7 +408,7 @@ def _ensure_network(
         value for network in baseline for value in network.get("nat_eips", [])
     }
     eips = list(_gpu_nat_eips(runner, target))
-    created_eips = _ensure_nlb_ingress(
+    created_eips = ensure_nlb_ingress(
         region=region,
         security_group=str(site.release_config["nlb"]["security_group"]),
         eips=eips,
@@ -472,7 +447,7 @@ def _ensure_network(
             capture=False,
         )
         association_created = True
-        _wait_zone_association(
+        wait_zone_association(
             runner,
             region=region,
             hosted_zone_id=hosted_zone_id,
@@ -748,47 +723,6 @@ def _cleanup_candidate(
         raise BootstrapError("; ".join(errors))
 
 
-def _rollback_network(network: dict[str, Any], site: RenderedSite) -> None:
-    region = str(site.release_config["aws_region"])
-    for eip in network.get("created_ingress_eips", []):
-        rollback_command(
-            [
-                "aws",
-                "ec2",
-                "revoke-security-group-ingress",
-                "--region",
-                region,
-                "--group-id",
-                str(site.release_config["nlb"]["security_group"]),
-                "--protocol",
-                "tcp",
-                "--port",
-                "443",
-                "--cidr",
-                f"{eip}/32",
-            ],
-            not_found=("InvalidPermission.NotFound",),
-        )
-    if network.get("association_created"):
-        rollback_command(
-            [
-                "aws",
-                "route53",
-                "disassociate-vpc-from-hosted-zone",
-                "--hosted-zone-id",
-                str(network["hosted_zone_id"]),
-                "--vpc",
-                f"VPCRegion={region},VPCId={network['vpc_id']}",
-            ],
-            not_found=("VPCAssociationNotFound",),
-        )
-        _wait_vpc_association_absent(
-            hosted_zone_id=str(network["hosted_zone_id"]),
-            region=region,
-            vpc_id=str(network["vpc_id"]),
-        )
-
-
 def _rollback(
     request: JoinClusterRequest,
     *,
@@ -869,7 +803,7 @@ def _rollback(
     network = prerequisites.get("network")
     if isinstance(network, dict):
         try:
-            _rollback_network(network, request.site)
+            rollback_network(network, request.site)
         except Exception as exc:
             errors.append(f"network rollback: {exc}")
     for prerequisite, label in (
@@ -1212,16 +1146,15 @@ def _deploy_cluster(
         _run_rollout(execution.candidate, "join-cluster", cluster_id=cluster_id)
         _complete(state_path, state, "JOINED")
     if not _done(state, "COLLECTORS_READY"):
-        readiness = wait_collector_readiness(execution.candidate, cluster_id)
-        _complete(
-            state_path,
-            state,
-            "COLLECTORS_READY",
-            {
-                "nodes": len(readiness.get("nodes") or []),
-                "ready": readiness.get("ready"),
-            },
+        # Fast kinds reported, slow kinds scheduled; the evidence names both so
+        # the operator can see what the gate waited for and what it deferred.
+        nodes = [str(item) for item in execution.local.get("nodes") or []]
+        readiness = wait_join_collector_readiness(
+            execution.candidate,
+            cluster_id,
+            expected_nodes=nodes or None,
         )
+        _complete(state_path, state, "COLLECTORS_READY", readiness)
 
 
 def _verify_join_candidate(
@@ -1239,27 +1172,27 @@ def _verify_join_candidate(
         clear_verified_step(state_path, state)
     if not _done(state, "VERIFIED"):
         before = membership_runtime_snapshot(execution.candidate)
-        _run_rollout(execution.candidate, "verify")
-        after = membership_runtime_snapshot(execution.candidate)
-        _complete(
-            state_path,
-            state,
-            "VERIFIED",
-            build_verified_membership_evidence(
-                before,
-                after,
-                candidate_site_sha256=execution.candidate.source_sha256,
-                source_site_sha256=str(state["source_site_sha256"]),
-                source_site_non_membership_sha256=str(
-                    state["source_site_non_membership_sha256"]
-                ),
-                candidate_cluster_ids=[
-                    str(item["cluster_id"])
-                    for item in execution.candidate.release_config["clusters"]
-                ],
-                cluster_id=execution.cluster_id,
-            ),
+        report = _verify_candidate(
+            execution.candidate,
+            {execution.cluster_id: _collectors_ready_evidence(state)},
         )
+        after = membership_runtime_snapshot(execution.candidate)
+        evidence = build_verified_membership_evidence(
+            before,
+            after,
+            candidate_site_sha256=execution.candidate.source_sha256,
+            source_site_sha256=str(state["source_site_sha256"]),
+            source_site_non_membership_sha256=str(
+                state["source_site_non_membership_sha256"]
+            ),
+            candidate_cluster_ids=[
+                str(item["cluster_id"])
+                for item in execution.candidate.release_config["clusters"]
+            ],
+            cluster_id=execution.cluster_id,
+        )
+        evidence["verify"] = verify_report_summary(report)
+        _complete(state_path, state, "VERIFIED", evidence)
 
 
 def _activate_and_commit(
