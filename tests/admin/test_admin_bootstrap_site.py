@@ -842,3 +842,43 @@ def test_a_site_left_without_gpu_clusters_still_renders(tmp_path: Path) -> None:
     assert document["spec"]["runtimeProfile"]["registrationClusterId"], (
         "the placeholder registration id must be non-empty so the site loads"
     )
+
+
+def test_existing_site_keeps_its_profile_but_takes_the_current_template_path() -> None:
+    """Live 2026-09-12: eight resumes moved repositoryRoot to new snapshots while
+    runtimeProfile.templateSource kept naming the first run's snapshot; once the
+    pruning removed that tree, `status` refused with "template_source must be an
+    existing file". The template is code and follows the tree being deployed."""
+
+    generated = {
+        "spec": {
+            "repositoryRoot": "/snapshots/new",
+            "runtimeProfile": {
+                "source": "/snapshots/new/config/profile.yaml",
+                "templateSource": "/snapshots/new/config/profile.yaml",
+                "version": "hyperpod-v1",
+                "registrationClusterId": "gpu-a",
+            },
+        }
+    }
+    existing = {
+        "spec": {
+            "repositoryRoot": "/snapshots/old",
+            "runtimeProfile": {
+                "source": "/secure/profiles/hyperpod-v1.yaml",
+                "templateSource": "/snapshots/old/config/profile.yaml",
+                "version": "hyperpod-v1",
+                "registrationClusterId": "gpu-a",
+            },
+        }
+    }
+
+    result = preserve_existing_site_contract(generated, existing)
+
+    profile = result["spec"]["runtimeProfile"]
+    assert profile["source"] == "/secure/profiles/hyperpod-v1.yaml", (
+        "the operator's rendered profile is preserved"
+    )
+    assert profile["templateSource"] == "/snapshots/new/config/profile.yaml", (
+        "the template path follows the tree being deployed"
+    )

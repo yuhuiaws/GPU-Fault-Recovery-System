@@ -389,10 +389,23 @@ def preserve_existing_site_contract(
         return generated
     # ``retention`` is operator-declared (archive-first deletion); regenerating
     # the site must not silently switch it back off.
+    generated_template = (generated_spec.get("runtimeProfile") or {}).get(
+        "templateSource"
+    )
     for key in ("release", "runtimeProfile", "retention"):
         value = existing_spec.get(key)
         if isinstance(value, dict):
             generated_spec[key] = deepcopy(value)
+    # ``runtimeProfile.source`` and ``version`` are the operator's declaration;
+    # ``templateSource`` is code -- the template file inside the source tree
+    # this deploy runs from. Kept verbatim it went on naming the first run's
+    # snapshot after later runs moved ``repositoryRoot`` and the snapshot
+    # pruning removed that tree (live 2026-09-12: `status` refused with
+    # "template_source must be an existing file").
+    if isinstance(generated_template, str) and isinstance(
+        generated_spec.get("runtimeProfile"), dict
+    ):
+        generated_spec["runtimeProfile"]["templateSource"] = generated_template
     # ``failureDomainLabels`` is the operator's declaration of which node labels
     # name a failure domain (EC2 topology fleets); a regenerated site must not
     # fall back to the default priority and silently re-render the map.

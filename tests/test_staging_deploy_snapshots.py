@@ -262,3 +262,35 @@ def test_prune_source_snapshots_unregisters_git_worktrees(
     assert not stale.repository_root.exists(), "the stale snapshot must be pruned"
     assert current.repository_root.is_dir(), "the current snapshot must survive pruning"
     assert str(stale.repository_root) not in _git(repository, "worktree", "list")
+
+
+def test_prune_source_snapshots_keeps_the_trees_the_site_document_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-09-12: after eight resumes the site's templateSource still named
+    the first run's snapshot; the pruning removed it and `status` refused with
+    "template_source must be an existing file". What the site points at stays."""
+
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
+    monkeypatch.setenv("GPU_FAULT_SOURCE_SNAPSHOT_RETAINED", "1")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    state = tmp_path / "state"
+    snapshots = state / "source-snapshots"
+    trees = [_snapshot_tree(snapshots, index) for index in range(5)]
+    (state / "site.yaml").write_text(
+        "spec:\n"
+        f"  repositoryRoot: {trees[1]}\n"
+        "  runtimeProfile:\n"
+        f"    templateSource: {trees[3] / 'config' / 'profile.yaml'}\n",
+        encoding="utf-8",
+    )
+
+    removed = staging_deploy.prune_source_snapshots(
+        state, source_repository_root=repository, current=trees[0]
+    )
+
+    # trees[4] is the newest and survives by retention; trees[0] is running now.
+    assert set(removed) == {trees[2].parent}, "only the tree nothing names is pruned"
+    assert trees[1].is_dir(), "the site's repositoryRoot survives"
+    assert trees[3].is_dir(), "the site's templateSource tree survives"

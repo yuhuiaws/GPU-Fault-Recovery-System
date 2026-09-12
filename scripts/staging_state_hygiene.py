@@ -25,6 +25,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml  # type: ignore[import-untyped,unused-ignore]
+
 if __package__:
     from scripts.deploy_host_bundle import bundle_platform_id
 else:
@@ -187,7 +189,40 @@ def _referenced_snapshot_roots(state_dir: Path) -> tuple[Path, ...]:
         )
         if isinstance(prepared, str) and prepared.strip():
             referenced.append(Path(prepared))
+    referenced.extend(_site_referenced_paths(state_dir))
     return tuple(referenced)
+
+
+def _site_referenced_paths(state_dir: Path) -> list[Path]:
+    """The trees the site document itself still names.
+
+    ``spec.repositoryRoot`` and ``spec.runtimeProfile.templateSource`` are read by
+    every later command (`status`, `verify`, the release engine); a snapshot they
+    point into is in use whatever the deploy records say (live 2026-09-12: the
+    template path still named the first run's snapshot when the pruning removed
+    it, and `status` refused). An unreadable site is not protected: the caller
+    only ever adds to what is kept, and a missing site names nothing.
+    """
+
+    site = state_dir / "site.yaml"
+    if not site.is_file():
+        return []
+    try:
+        document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    spec = document.get("spec") if isinstance(document, dict) else None
+    if not isinstance(spec, dict):
+        return []
+    paths: list[Path] = []
+    root = spec.get("repositoryRoot")
+    if isinstance(root, str) and root.strip():
+        paths.append(Path(root))
+    profile = spec.get("runtimeProfile")
+    template = profile.get("templateSource") if isinstance(profile, dict) else None
+    if isinstance(template, str) and template.strip():
+        paths.append(Path(template))
+    return paths
 
 
 def _remove_snapshot_tree(directory: Path, *, source_repository_root: Path) -> None:
