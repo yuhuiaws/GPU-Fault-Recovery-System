@@ -258,10 +258,12 @@ rules:
     regional_cases:
       - GF-REGIONAL-BOOT-016
       - GF-REGIONAL-BOOT-019
+      - GF-REGIONAL-BOOT-024..028
       - GF-REGIONAL-ISO-001..006
       - GF-REGIONAL-E2E-002
     approval_cases:
       - GF-REGIONAL-BOOT-019
+      - GF-REGIONAL-BOOT-024..028
       - GF-REGIONAL-ISO-006
       - GF-REGIONAL-E2E-002
     checks:

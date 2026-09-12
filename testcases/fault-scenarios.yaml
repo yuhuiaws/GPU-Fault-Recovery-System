@@ -2448,6 +2448,100 @@ test_cases:
   automation: manual
   gate: scripts/check-manual-command-order.py
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-017
+- id: GF-REGIONAL-BOOT-024
+  title: remove-cluster 注销站点唯一 GPU 集群：状态机全程、label 归属 RBAC 清理、注解二次清除与 CPU-only 稳态
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: remove-cluster 的首次真机执行连续暴露 fail-closed 清理拒绝 label 归属 RBAC、SITE_UPDATED 之后 ARN 无法解析、零集群 previous 快照不可渲染、终止中的 Reconciler 重写节点注解四类缺口，单测各自覆盖，但区域验收没有用真实命令跑过整条状态机。
+  injection: 在只纳管一个 GPU 集群的隔离站点上执行 gpu-fault-admin remove-cluster，在 SITE_UPDATED 之后注入一次 SIGINT 并原参数重跑，再对零集群站点执行 deploy --state-dir。
+  expected:
+  - completed_steps 依次记录 DISCOVERED、CONTROL_REGISTRY_DRAINING、KUBERNETES_QUIESCED、CONTROL_REGISTRY_REMOVED、AWS_DETACHED、KUBERNETES_REMOVED、AURORA_UPDATED、SITE_UPDATED、RELEASE_STATE_UPDATED、VERIFIED，phase 终态 COMPLETED
+  - SITE_UPDATED 之后中断的原参数重跑通过注销自身的 DISCOVERED 证据解析 ARN 并续跑，不报 no managed GPU cluster matches
+  - label gpu-fault.io/workload-namespace-rbac=true 的 Role/RoleBinding 全部删除，无 label 的手工 Role 保留，fail-closed 清理不以 unregistered live gpu-fault resources 拒绝
+  - namespace 消失后节点 Node Installer 注解为空且没有节点被重写成 Retrying
+  - CPU registry 为显式 []、每个 CPU Pod secret_drift=false、三个 CPU Deployment 的 Pod UID 与 restartCount 不变、status --full 全 PASS 且无 regional registry drift
+  - 零集群站点的 deploy --state-dir 分类 NOOP 且成功；底层 CPU/GPU EKS 与 HyperPod 保留
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-024
+  related_pytest: tests/admin/test_admin_cluster_removal.py::test_workload_namespace_rbac_prune_selects_by_the_engine_label_only
+- id: GF-REGIONAL-BOOT-025
+  title: join-cluster 注销后重接：节点子网 CIDR、DNS 门禁重试、PENDING 期采集事件、executor 先于首个 claim 就绪、wave 安全只看活体 Agent、强制失败后的回滚与重试重新发现
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: 注销后再接入的首次真机执行连续暴露 Agent endpoint CIDR 只取 EKS 控制面子网、DNS 门禁一次 NXDOMAIN 即失败、PENDING 集群拒绝采集事件、executor readiness 读不到 execution owners、wave 安全被过期 agent 行卡住、回滚残留 PENDING 条目与悬空 kube context、重试沿用旧发现等缺口，单测各自覆盖，但区域验收只有 runner 进程内注入的 join 负向。
+  injection: 在 BOOT-024 注销后的隔离站点上，先把 GPU 集群 CoreDNS 缩到 0 执行 gpu-fault-admin join-cluster 逼出 DNS 门禁失败与自动回滚，恢复 CoreDNS 后用同一命令重试到 COMPLETED。
+  expected:
+  - 强制失败发生在 RELEASE_STARTED 之后，state.json phase=ROLLED_BACK 且无 rollback_errors；registry 无该集群 PENDING 条目、status 无 regional registry drift、kube context 已删且 current-context 不悬空、secure 目录无该集群 token
+  - 重试把旧 attempt 归档为 state.attempt-001.json、attempt 加一并重新发现，一次跑到 COMPLETED
+  - DISCOVERED 的 subnet_cidrs 与 registry 条目的 agentEndpointAllowedCidrs 包含 HyperPod VpcConfig 与 OverrideVpcConfig 子网的 CIDR
+  - PENDING 期 /v1/collector-events 被接受而 claim 为 423，COLLECTORS_READY 早于 ACTIVATION_STARTED；executor Pod 在首个成功 claim 之前就 Ready
+  - DNS 门禁在 NXDOMAIN 后重试直到解析成功；fleet wave 安全不因过期 agent 行阻塞；attempt 间 fleet_rollout_transaction 不同
+  - 三个 CPU Deployment 的 Pod UID 与 restartCount 不变、secret_drift=false、site.yaml/registry/release state 的 cluster ID 集合一致、status --full 全 PASS
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-025
+  related_pytest: tests/admin/test_admin_cluster_join_rollback.py::test_a_rollback_repoints_the_current_context_it_left_dangling
+- id: GF-REGIONAL-BOOT-026
+  title: 二次 remove-cluster 归档旧记录并从头执行；deploy --gpu-cluster-arn 作为第二个 join 入口批量重接
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: 同一集群注销、接入、再注销、再接入的第二轮才会暴露两条缺口：remove-cluster 读到上一轮 COMPLETED 记录直接返回不做事；deploy --gpu-cluster-arn 的批量 join 被上一轮 COMPLETED join 记录触发 site 非成员字段漂移守卫拒绝。
+  injection: 在 BOOT-025 重接后的隔离站点上再次执行 remove-cluster，然后用 gpu-fault-admin deploy --state-dir --gpu-cluster-arn 重接，并把同一 deploy 与 join-cluster 各重复执行一次。
+  expected:
+  - 二次注销把旧 COMPLETED 记录归档为 state.completed-<stamp>.json，新 state.json 从 STARTED 走完十步到 COMPLETED，GPU 侧与 CPU 侧终态与首次注销相同
+  - deploy 的源码 hop 为 NOOP（source-deploy-success.json 的 mode 不是 APPLICATION_RELEASE）后直接批量 join，不先跑整轮 rollout
+  - 上一轮 COMPLETED 的 join 记录归档为 state.attempt-NNN.json、attempt 加一并重新发现，既不判 ALREADY_MANAGED 也不被非成员字段漂移守卫拒绝；批量结果 phase=COMPLETED 且 joined 含该集群
+  - 重复执行同一 deploy 与 join-cluster 都判 ALREADY_MANAGED，不滚动任何 Deployment
+  - BOOT-025 的接入中与接入后判定逐项成立
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-026
+  related_pytest: tests/admin/test_admin_cluster_removal.py::test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again
+- id: GF-REGIONAL-BOOT-027
+  title: uninstall --cpu-cluster keep --reset-database：节点组件在 drain 之后才停、孤儿 lease 被判失败、Aurora 先 reader 后 writer 只留一份最终快照、中断后在已停止的控制面上续跑
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: 整体卸载的首次真机执行暴露节点 Agent 在 drain 前被卸掉留下无人完成的 LEASED command、reset 的孤儿 lease 判失败 SQL 参数无类型、失败后重跑被状态文件拒绝、控制面已停后 reset 找不到 Pod、Aurora 逐实例等待五类缺口，单测各自覆盖，但没有区域验收用例用真实命令跑过。
+  injection: 在 BOOT-026 之后的隔离站点上执行 gpu-fault-admin uninstall --cpu-cluster keep --reset-database --confirm UNINSTALL_GPU_FAULT，在 CONTROL_CONSUMERS_STOPPED 之后注入一次 SIGINT 并原参数重跑；可选地先制造一条孤儿 LEASED command。
+  expected:
+  - kubernetes-cleanup.json 的 phase 按 PREFLIGHT、GPU_DATA_PLANE_SOURCES_STOPPED、INGRESS_STOPPED、QUEUES_DRAINED、CONTROL_CONSUMERS_STOPPED、GPU_EXECUTORS_STOPPED、CPU_AUXILIARIES_STOPPED、APPLICATION_OBJECTS_DELETED、NAMESPACES_DELETED、CLEANUP_COMPLETED 前进，节点组件在 GPU_EXECUTORS_STOPPED 内停止，QUEUES_DRAINED 不超时且没有新建 drain-after 工作流
+  - 孤儿 LEASED command 被判 FAILED 且 status_source=clean-redeploy-orphan，该步不因 psycopg 参数类型错误失败
+  - 中断后的原参数重跑把旧 cleanup 状态归档为 kubernetes-cleanup.failed-<stamp>.json、复用上一轮 fleet 快照、在已停止的控制面上续跑到 COMPLETED
+  - state.json 依次 STARTED、REGISTRY_EXPORTED、KUBERNETES_VERIFIED、NON_AURORA_DELETE_IN_PROGRESS、READY_TO_DELETE_AURORA、COMPLETED
+  - Aurora reader 先于 writer 进入 deleting，集群删除在实例仍 deleting 时被接受，只留下 final_snapshot_identifier 指向的一份 available 最终快照
+  - 输出 database_reset=true、aurora_deleted_last=true、delete_policy_residuals=0；状态目录与底层 CPU/GPU 集群保留
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-027
+  related_pytest: tests/regional/test_clean_redeploy_script.py::test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_snapshot
+- id: GF-REGIONAL-BOOT-028
+  title: 空集群全新 deploy 引导与中断后 deploy --state-dir 续跑
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: BOOT-016 证明首次部署先写 registry 与重跑 NOOP，但没有覆盖在没有任何已安装控制面的集群上前置检查、SNS 邮件确认与 runtime 镜像冷构建是否走通，也没有覆盖中断后仅凭 --state-dir 续跑是否复用检查点而不创建第二套资源。
+  injection: 在 BOOT-027 清空后的集群上用新的空 state-dir 执行 gpu-fault-admin deploy --cpu-cluster-arn --gpu-cluster-arn --state-dir --admin-email，在 bootstrap-state.json 到达 aws-infrastructure-ready 时注入一次 SIGINT，再以 deploy --state-dir 续跑到完成并重跑一次。
+  expected:
+  - 没有已安装控制面时前置检查通过，bootstrap-state.json 的 phase 走完 new、discovered、aws-infrastructure-ready、platform-prerequisites-ready、site-ready
+  - deploy --state-dir 续跑从状态目录恢复 ARN 与邮箱，已完成任务复用检查点，AWS 资源清单不出现第二套
+  - SNS 上 admin 邮箱恰好一个确认订阅、没有重复待确认请求
+  - runtime 镜像从空仓库冷构建并通过 cosign 验签，后续重跑描述符为复用
+  - release-deploy state 从 bootstrap-started 到 complete 且 COMPLETED，registry Secret 早于 CPU Deployment 与任何 GPU 工作负载创建，两侧全部 Ready
+  - status --full 全 PASS，site.yaml、registry 与 release state 的 cluster ID 集合一致；重跑 deploy 严格 NOOP
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-028
+  related_pytest: tests/admin/test_admin_bootstrap.py::test_admin_release_reuses_signed_release_for_same_commit
 - id: GF-REGIONAL-AUTH-001
   title: 缺少集群 header 返回 401
   category: regional-authentication

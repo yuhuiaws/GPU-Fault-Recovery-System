@@ -42,6 +42,11 @@ def test_deploy_host_component_change_stays_in_lifecycle_domain() -> None:
     assert plan.domains == ("lifecycle-registry",)
     assert "tests/test_deploy_host_setup.py" in plan.pytest_targets
     assert plan.postgres is False
+    # The admin lifecycle chain runs on a live site, so it is approval-only.
+    for number in range(24, 29):
+        case_id = f"GF-REGIONAL-BOOT-{number:03d}"
+        assert case_id in plan.approval_cases, case_id
+        assert case_id not in plan.safe_cases, case_id
 
 
 def test_remote_command_change_does_not_select_boot_or_collect() -> None:

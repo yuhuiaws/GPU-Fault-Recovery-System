@@ -106,6 +106,12 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
     # notes have said so in prose for every one of them.
     assert contract.explicit_predecessors() == {
         "GF-REGIONAL-BOOT-023": "GF-REGIONAL-BOOT-020",
+        # The admin lifecycle chain: each verb runs on the site the previous
+        # one left behind (BOOT-024's predecessor is positional: BOOT-023).
+        "GF-REGIONAL-BOOT-025": "GF-REGIONAL-BOOT-024",
+        "GF-REGIONAL-BOOT-026": "GF-REGIONAL-BOOT-025",
+        "GF-REGIONAL-BOOT-027": "GF-REGIONAL-BOOT-026",
+        "GF-REGIONAL-BOOT-028": "GF-REGIONAL-BOOT-027",
         "GF-REGIONAL-HA-010": "GF-REGIONAL-HA-001",
         "GF-REGIONAL-DESTR-016": "GF-REGIONAL-DESTR-002",
         "GF-REGIONAL-DESTR-017": "GF-REGIONAL-DESTR-002",
