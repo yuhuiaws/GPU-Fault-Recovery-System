@@ -119,6 +119,47 @@ def test_node_rollout_preflight_is_read_only_and_server_validated() -> None:
     assert "host has less than" in preflight
 
 
+def test_reconciler_product_reuse_is_gated_and_reports_no_key_material() -> None:
+    """The hints an earlier run of the release leaves are advisory: the live
+    node set must still hash to the recorded digest, the reused template must
+    still carry the content its name promises, the preflight never reuses, and
+    the product report names digests and objects only. The behaviour itself is
+    exercised end to end in ``test_release_installer_product_reuse``."""
+
+    deploy = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
+
+    assert (
+        'REUSE_NODE_SET_SHA256="${GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256:-}"'
+        in deploy
+    )
+    assert "invalid GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256" in deploy
+    assert "invalid GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP" in deploy
+    assert (
+        '"${PREFLIGHT_ONLY}" != "true" && -n "${REUSE_NODE_SET_SHA256}" &&\n'
+        '    "${REUSE_NODE_SET_SHA256}" == "${NODE_SET_SHA256}"'
+    ) in deploy, "reuse needs the live node set and never applies to a preflight"
+    assert '"gpu-fault-node-installer-template-${reused_sha256:0:12}"' in deploy, (
+        "a reused template must still hash to its content-addressed name"
+    )
+    report = deploy.split('if [[ -n "${PRODUCTS_FILE}" ]]; then', 1)[1]
+    report = report.split("\nfi\n", 1)[0]
+    for field in (
+        "node_set_sha256",
+        "node_action_keys_provisioned",
+        "template_config_map",
+        "template_content_sha256",
+        "template_rendered",
+    ):
+        assert f'"{field}"' in report
+    assert "MASTER" not in report and "key_dir" not in report, (
+        "the product report carries no key material"
+    )
+    preflight_section = deploy.split('if [[ "${PREFLIGHT_ONLY}" == "true" ]]', 1)[1]
+    assert "PRODUCTS_FILE" not in preflight_section.split("exit 0", 1)[0], (
+        "a preflight reports no products"
+    )
+
+
 def test_installer_job_wait_is_event_driven_but_the_read_still_judges() -> None:
     """The 2s between Job reads is a bounded `kubectl wait`, not a timer.
 

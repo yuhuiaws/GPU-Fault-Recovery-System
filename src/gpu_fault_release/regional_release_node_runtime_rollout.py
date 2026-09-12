@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from math import ceil
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_fleet_rollout import (
+    MAX_UPGRADE_UNAVAILABLE,
     FleetWaveContext,
     NodeRolloutPolicy,
     ensure_rollout_wave_safe,
@@ -17,6 +19,7 @@ from gpu_fault_release.regional_release_fleet_rollout import (
 )
 from gpu_fault_release.regional_release_gpu_rollout import node_inventory_scope
 from gpu_fault_release.regional_release_legacy import apply_fleet_request_identity
+from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_node_preflight import (
     NodeMutationPreflight,
     ensure_node_candidate_preflight,
@@ -25,6 +28,87 @@ from gpu_fault_release.regional_release_node_preflight import (
 from gpu_fault_release.regional_release_rollout_cleanup import (
     terminalize_stranded_cluster_rollouts,
 )
+
+FLEET_WAVE_PLANS_STATE_KEY = "fleet_wave_plans"
+JOIN_SINGLE_WAVE_REASON = "no-live-agents"
+
+
+def join_single_wave_policy(node_count: int) -> NodeRolloutPolicy:
+    """Every node in one wave, for a join whose cluster holds no live agent.
+
+    The wave policy exists to bound how much *serving* capacity a wave takes
+    away: the one-node canary, the per-domain spread and the size cap all
+    ration nodes that are doing work for the control plane. In a join the
+    safety gate protects only the nodes that hold a live agent
+    (``live_agent_node_names``), and when there is none -- a fresh join, or a
+    re-join after remove-cluster left only expired records -- there is no
+    capacity to ration: no wave can make the cluster less available than it
+    already is, and N waves are exactly as safe as one, at N times the fixed
+    cost (measured 2026-09-12: ~20s of safety polling and hand-off per wave
+    on top of the install itself).
+
+    ``MAX_UPGRADE_UNAVAILABLE`` still caps the wave: it is the ceiling on how
+    many installer Jobs the Reconciler runs at once, a limit on the installer
+    and the API rather than on availability, and it holds here for the same
+    reason it holds for an upgrade.
+    """
+
+    width = max(1, min(node_count, MAX_UPGRADE_UNAVAILABLE))
+    return NodeRolloutPolicy(
+        max_unavailable=width,
+        first_wave_max_unavailable=width,
+        max_unavailable_per_failure_domain=width,
+    )
+
+
+def record_join_wave_plan(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    phase: str = "join",
+    node_count: int,
+    policy: NodeRolloutPolicy,
+) -> dict[str, Any]:
+    """Say, and keep, why this join (or first bootstrap) rolls no canary wave.
+
+    The narration is for the operator watching the release; the state entry
+    is for whoever reads the rollout record afterwards and wonders why a join
+    installed four nodes at once when an upgrade would have taken two waves.
+    Plans of other releases are dropped: the record explains this release.
+    """
+
+    waves = ceil(node_count / max(1, policy.max_unavailable))
+    plan = {
+        "release_id": release.release_id,
+        "phase": phase,
+        "reason": JOIN_SINGLE_WAVE_REASON,
+        "node_count": node_count,
+        "waves": waves,
+        "max_unavailable": policy.max_unavailable,
+        "first_wave_max_unavailable": policy.first_wave_max_unavailable,
+    }
+    narrate_step(
+        "fleet-wave-plan",
+        cluster=target.cluster_id,
+        phase=phase,
+        waves=waves,
+        nodes=node_count,
+        max_unavailable=policy.max_unavailable,
+        reason=JOIN_SINGLE_WAVE_REASON,
+    )
+    state = getattr(release, "state", None)
+    if isinstance(state, dict):
+        existing = state.get(FLEET_WAVE_PLANS_STATE_KEY)
+        kept = {
+            cluster_id: item
+            for cluster_id, item in (
+                existing.items() if isinstance(existing, dict) else ()
+            )
+            if isinstance(item, dict) and item.get("release_id") == release.release_id
+        }
+        kept[target.cluster_id] = plan
+        state[FLEET_WAVE_PLANS_STATE_KEY] = kept
+    return plan
 
 
 def _ensure_runtime_safe(*args: Any, **kwargs: Any) -> None:
@@ -358,6 +442,24 @@ def roll_node_runtime(
         candidate,
         ensure_runtime_safe=_ensure_runtime_safe,
     )
+    safety_node_names = node_names
+    if phase in {"join", "bootstrap"}:
+        # The wave safety gate protects the capacity outside the wave, and a
+        # joining cluster's nodes hold no live agent yet -- or only records a
+        # removed cluster left behind (live 2026-09-12: leases expired for
+        # hours, every retry blocked on "lease-margin"). Neither is capacity a
+        # wave can take away; only nodes with a live agent are. A first
+        # bootstrap is the same picture with an empty store: every node is
+        # "missing" to the probe, so a canary wave could never converge.
+        safety_node_names = live_agent_node_names(release, target, node_names)
+        if not safety_node_names:
+            # And with nothing to protect there is nothing to ration either:
+            # one wave for the whole fleet, read before the paused Reconciler
+            # is deployed so its concurrency and the fleet record agree.
+            policy = join_single_wave_policy(len(node_names))
+            record_join_wave_plan(
+                release, target, phase=phase, node_count=len(node_names), policy=policy
+            )
     if mutation_started is not None:
         mutation_started()
     paused_identity = release._deploy_reconciler(
@@ -411,17 +513,6 @@ def roll_node_runtime(
         agent_identity=agent_identity,
     )
     desired_bundle, desired_template = paused_identity
-    safety_node_names = node_names
-    if phase in {"join", "bootstrap"}:
-        # The wave safety gate protects the capacity outside the wave, and a
-        # joining cluster's nodes hold no live agent yet -- or only records a
-        # removed cluster left behind (live 2026-09-12: leases expired for
-        # hours, every retry blocked on "lease-margin"). Neither is capacity a
-        # wave can take away; only nodes with a live agent are. A first
-        # bootstrap is the same picture with an empty store: every node is
-        # "missing" to the probe, so the 1-node canary wave of any cluster
-        # larger than one node could never converge.
-        safety_node_names = live_agent_node_names(release, target, node_names)
     run_fleet_waves(
         release,
         target,

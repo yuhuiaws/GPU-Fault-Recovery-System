@@ -716,3 +716,134 @@ def build_reconciler_environment(
     if template_config_map:
         environment["GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP"] = template_config_map
     return environment
+
+
+# The reconciler deploy script's expensive, idempotent products -- the node
+# action key Secret (derived from the fleet master and mirrored to the control
+# plane) and the rendered template ConfigMap -- are made once per release and
+# handed to its later runs as hints through these variables. The script owns
+# the check that the hints are still true (live node set, live ConfigMap
+# content); this side owns the scope: same release, same render inputs.
+INSTALLER_PRODUCTS_STATE_KEY = "node_installer_products"
+INSTALLER_REUSE_NODE_SET_ENV = "GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256"
+INSTALLER_REUSE_TEMPLATE_ENV = "GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP"
+INSTALLER_PRODUCTS_FILE_ENV = "GPU_FAULT_RECONCILER_PRODUCTS_FILE"
+# Every input the script feeds into the two products, and nothing else: no
+# credential is among them, so the digest of their values can sit in the
+# release state ConfigMap. The master file appears as a path, not as content.
+INSTALLER_PRODUCT_INPUT_ENV = (
+    "GPU_FAULT_KUBECTL_CONTEXT",
+    "GPU_FAULT_NAMESPACE",
+    "GPU_FAULT_CLUSTER_ID",
+    "GPU_FAULT_HYPERPOD_CLUSTER",
+    "GPU_FAULT_VERSION",
+    "GPU_FAULT_RUNTIME_PROFILE",
+    "GPU_FAULT_INSTALLER_CONFIG_MAP",
+    "GPU_FAULT_INSTALLER_CONFIG_DIGEST",
+    "GPU_FAULT_INSTALLER_ARTIFACT_SHA256",
+    "GPU_FAULT_INSTALLER_BUNDLE_SHA256",
+    "GPU_FAULT_INSTALLER_TEMPLATE_SHA256",
+    # An explicit override decides which template is used, so a run that names
+    # one (a rollback's steady template) shares no products with a run that
+    # renders; the rollback pays the full path, the join and upgrade do not.
+    "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP",
+    "GPU_FAULT_INSTALLER_ACTIVE_DEADLINE_SECONDS",
+    "GPU_FAULT_NODE_COMPATIBILITY_DIGEST",
+    "GPU_FAULT_NODE_INSTALLER_IMAGE",
+    "GPU_FAULT_NODE_ACTION_KEYS_SECRET",
+    "GPU_FAULT_DCGM_METRICS_URL",
+    "GPU_FAULT_REQUIRE_ROLLBACK_SLOT",
+    "GPU_FAULT_FLEET_MASTER_FILE",
+)
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+CONFIG_MAP_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+
+
+def installer_product_inputs_digest(environment: dict[str, str]) -> str:
+    """Digest of the render inputs the reusable products are a function of."""
+
+    inputs = {key: environment.get(key, "") for key in INSTALLER_PRODUCT_INPUT_ENV}
+    return hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def recorded_installer_products(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    inputs_digest: str,
+) -> dict[str, Any] | None:
+    """What an earlier run of *this* release produced for *these* inputs.
+
+    A record from another release, or from the same release with different
+    inputs (a rollback's steady template, a changed image), is not a hint.
+    """
+
+    state = getattr(release, "state", None)
+    if not isinstance(state, dict):
+        return None
+    record = (state.get(INSTALLER_PRODUCTS_STATE_KEY) or {}).get(target.cluster_id)
+    if not isinstance(record, dict):
+        return None
+    if record.get("release_id") != release.release_id:
+        return None
+    if record.get("inputs_sha256") != inputs_digest:
+        return None
+    if not SHA256_HEX.fullmatch(str(record.get("node_set_sha256") or "")):
+        return None
+    return record
+
+
+def record_installer_products(
+    release: Any,
+    target: ClusterTarget,
+    *,
+    inputs_digest: str,
+    products_path: str,
+) -> dict[str, Any] | None:
+    """Keep the script's product report for the next run of this release.
+
+    The report is advisory, so a missing or malformed one (a fake runner, a
+    script that stopped before writing it) records nothing and raises nothing;
+    the next run simply pays the full path. Records of other releases are
+    dropped: they can never be hints again, and the state is bounded.
+    """
+
+    state = getattr(release, "state", None)
+    if not isinstance(state, dict):
+        return None
+    try:
+        with open(products_path, encoding="utf-8") as handle:
+            products = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(products, dict):
+        return None
+    node_set = str(products.get("node_set_sha256") or "")
+    template = str(products.get("template_config_map") or "")
+    content = str(products.get("template_content_sha256") or "")
+    if not SHA256_HEX.fullmatch(node_set) or not SHA256_HEX.fullmatch(content):
+        return None
+    if not CONFIG_MAP_NAME.fullmatch(template):
+        return None
+    record = {
+        "release_id": release.release_id,
+        "inputs_sha256": inputs_digest,
+        "node_set_sha256": node_set,
+        "template_config_map": template,
+        "template_content_sha256": content,
+        "node_action_keys_provisioned": bool(
+            products.get("node_action_keys_provisioned")
+        ),
+        "template_rendered": bool(products.get("template_rendered")),
+    }
+    existing = state.get(INSTALLER_PRODUCTS_STATE_KEY)
+    kept = {
+        cluster_id: item
+        for cluster_id, item in (existing.items() if isinstance(existing, dict) else ())
+        if isinstance(item, dict) and item.get("release_id") == release.release_id
+    }
+    kept[target.cluster_id] = record
+    state[INSTALLER_PRODUCTS_STATE_KEY] = kept
+    return record

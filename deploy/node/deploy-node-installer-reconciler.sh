@@ -39,6 +39,16 @@ RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:-${DEFAULT_RUNTIME_IMAGE}}"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-}"
 PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
+# Products an earlier run of the same release left behind, as advisory hints:
+# the node set (by digest) whose action keys it provisioned, and the template
+# ConfigMap it rendered. Both are honoured only after this run's own checks --
+# the live node list must still hash to the recorded digest, and the ConfigMap
+# must still carry the content its name promises -- so a stale hint costs one
+# read and falls back to the full path. PRODUCTS_FILE is where this run reports
+# its own products (names and digests only, never key material) for the next.
+REUSE_NODE_SET_SHA256="${GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256:-}"
+REUSE_TEMPLATE_CONFIG_MAP="${GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP:-}"
+PRODUCTS_FILE="${GPU_FAULT_RECONCILER_PRODUCTS_FILE:-}"
 
 for command in awk kubectl python3 sed sha256sum; do
     command -v "${command}" >/dev/null || {
@@ -112,6 +122,16 @@ done
     printf 'ERROR: invalid GPU_FAULT_NODE_COMPATIBILITY_DIGEST\n' >&2
     exit 2
 }
+[[ -z "${REUSE_NODE_SET_SHA256}" ||
+    "${REUSE_NODE_SET_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256\n' >&2
+    exit 2
+}
+[[ -z "${REUSE_TEMPLATE_CONFIG_MAP}" ||
+    "${REUSE_TEMPLATE_CONFIG_MAP}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || {
+    printf 'ERROR: invalid GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP\n' >&2
+    exit 2
+}
 [[ -n "${RUNTIME_IMAGE}" &&
     "${RUNTIME_IMAGE}" != *[[:space:]#]* ]] || {
     printf 'ERROR: invalid GPU_FAULT_RUNTIME_IMAGE\n' >&2
@@ -142,15 +162,37 @@ mapfile -t NODES < <(
         "${HYPERPOD_CLUSTER}" >&2
     exit 1
 }
+# The identity of the fleet this run acts on. A hint from an earlier run is
+# only honoured when the live fleet still hashes to what that run provisioned
+# for; a node added or removed since produces a different digest and the full
+# path runs again. The preflight never reuses: it is the run that has to prove
+# the inputs from scratch.
+NODE_SET_SHA256="$(printf '%s\n' "${NODES[@]}" | sort | sha256sum | awk '{print $1}')"
+REUSE_PRODUCTS="false"
+if [[ "${PREFLIGHT_ONLY}" != "true" && -n "${REUSE_NODE_SET_SHA256}" &&
+    "${REUSE_NODE_SET_SHA256}" == "${NODE_SET_SHA256}" ]]; then
+    REUSE_PRODUCTS="true"
+fi
 
+NODE_ACTION_KEYS_PROVISIONED="false"
 if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" ]]; then
-    GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
-    GPU_FAULT_NAMESPACE="${NAMESPACE}" \
-    GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
-    GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
-    GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
-    GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
-        "${SCRIPT_DIR}/provision-node-action-keys.sh"
+    if [[ "${REUSE_PRODUCTS}" == "true" ]]; then
+        # Provisioning derives one key per node from the fleet master and
+        # mirrors the Secret to the control plane; both are functions of the
+        # node set alone, which has not changed since this release did them.
+        # The node-scoped key verification below still runs on the live Secret.
+        printf 'reusing node action keys in %s/%s provisioned earlier in this release\n' \
+            "${NAMESPACE}" "${NODE_ACTION_KEYS_SECRET}"
+    else
+        GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
+        GPU_FAULT_NAMESPACE="${NAMESPACE}" \
+        GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
+        GPU_FAULT_HYPERPOD_CLUSTER="${HYPERPOD_CLUSTER}" \
+        GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
+        GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
+            "${SCRIPT_DIR}/provision-node-action-keys.sh"
+        NODE_ACTION_KEYS_PROVISIONED="true"
+    fi
 else
     kubectl_context -n "${NAMESPACE}" get secret \
         "${NODE_ACTION_KEYS_SECRET}" >/dev/null || {
@@ -293,17 +335,11 @@ render_installer_job() {
         --node "${node}" "$@"
 }
 
-# TEMPLATE_CONTENT_SHA256 pins the exact job.yaml bytes the reconciler will
-# load, so a later edit to the template ConfigMap cannot become a privileged
-# Pod on every node. In the render path it is the digest of the file we put in
-# the ConfigMap; with an override it is the digest of what that ConfigMap
-# holds right now, computed from the object rather than assumed.
-if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
-    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
-    TEMPLATE_CONTENT_SHA256="$(
-        kubectl_context -n "${NAMESPACE}" get configmap \
-            "${TEMPLATE_CONFIG_MAP}" -o json |
-            python3 -c '
+# The digest of the job.yaml a template ConfigMap holds right now, computed
+# from the object rather than assumed.
+template_config_map_content_sha256() {
+    kubectl_context -n "${NAMESPACE}" get configmap "$1" -o json |
+        python3 -c '
 import hashlib
 import json
 import sys
@@ -313,8 +349,39 @@ if not text.strip():
     raise SystemExit("template ConfigMap has no job.yaml")
 print(hashlib.sha256(text.encode()).hexdigest())
 '
+}
+
+# TEMPLATE_CONTENT_SHA256 pins the exact job.yaml bytes the reconciler will
+# load, so a later edit to the template ConfigMap cannot become a privileged
+# Pod on every node. In the render path it is the digest of the file we put in
+# the ConfigMap; with an override it is the digest of what that ConfigMap
+# holds right now, computed from the object rather than assumed.
+TEMPLATE_RENDERED="false"
+TEMPLATE_CONFIG_MAP=""
+if [[ -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
+    TEMPLATE_CONFIG_MAP="${TEMPLATE_CONFIG_MAP_OVERRIDE}"
+    TEMPLATE_CONTENT_SHA256="$(
+        template_config_map_content_sha256 "${TEMPLATE_CONFIG_MAP}"
     )"
-else
+elif [[ "${REUSE_PRODUCTS}" == "true" && -n "${REUSE_TEMPLATE_CONFIG_MAP}" ]]; then
+    # A template rendered earlier in this release for the same inputs and the
+    # same node set. The render path names the ConfigMap after its content, so
+    # a name whose suffix no longer matches the live digest means the object
+    # was edited or replaced: it is not reused, and the render below recreates
+    # it from the inputs.
+    if reused_sha256="$(
+        template_config_map_content_sha256 "${REUSE_TEMPLATE_CONFIG_MAP}" \
+            2>/dev/null
+    )" && [[ "${REUSE_TEMPLATE_CONFIG_MAP}" == \
+        "gpu-fault-node-installer-template-${reused_sha256:0:12}" ]]; then
+        TEMPLATE_CONFIG_MAP="${REUSE_TEMPLATE_CONFIG_MAP}"
+        TEMPLATE_CONTENT_SHA256="${reused_sha256}"
+        printf 'reusing template ConfigMap %s rendered earlier in this release\n' \
+            "${TEMPLATE_CONFIG_MAP}"
+    fi
+fi
+if [[ -z "${TEMPLATE_CONFIG_MAP}" ]]; then
+    TEMPLATE_RENDERED="true"
     render_installer_job "${NODE}" --render-only >"${MANIFEST}"
     TEMPLATE_SHA256="$(sha256sum "${MANIFEST}" | awk '{print $1}')"
     TEMPLATE_CONTENT_SHA256="${TEMPLATE_SHA256}"
@@ -401,6 +468,16 @@ if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
 fi
 
 kubectl_context apply -f "${RECONCILER_MANIFEST}"
+
+# What the next run of this release may reuse. Names and digests only: the
+# node set by digest, the template ConfigMap by name and content digest, and
+# whether this run actually provisioned keys or rendered -- never key material.
+if [[ -n "${PRODUCTS_FILE}" ]]; then
+    printf '{"node_set_sha256":"%s","node_action_keys_provisioned":%s,"template_config_map":"%s","template_content_sha256":"%s","template_rendered":%s}\n' \
+        "${NODE_SET_SHA256}" "${NODE_ACTION_KEYS_PROVISIONED}" \
+        "${TEMPLATE_CONFIG_MAP}" "${TEMPLATE_CONTENT_SHA256}" \
+        "${TEMPLATE_RENDERED}" >"${PRODUCTS_FILE}"
+fi
 
 if [[ "${WAIT_FOR_ROLLOUT}" == "true" ]]; then
     kubectl_context -n "${NAMESPACE}" rollout status \

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from math import ceil
@@ -33,7 +36,15 @@ from gpu_fault_release.regional_release_config import (
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
-from gpu_fault_release.regional_release_rendering import build_reconciler_environment
+from gpu_fault_release.regional_release_rendering import (
+    INSTALLER_PRODUCTS_FILE_ENV,
+    INSTALLER_REUSE_NODE_SET_ENV,
+    INSTALLER_REUSE_TEMPLATE_ENV,
+    build_reconciler_environment,
+    installer_product_inputs_digest,
+    record_installer_products,
+    recorded_installer_products,
+)
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
@@ -1331,12 +1342,48 @@ def deploy_reconciler(
         node_installer_image=node_installer_image,
     )
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
-    release.runner.run(
-        [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
-        env=environment,
-        sensitive=bool(target.fleet_master_file),
-        timeout_seconds=660,
-    )
+    # The paused-state deploy, every compatibility-path wave and the finalize
+    # deploy run this same script inside one release, and each one provisioned
+    # the node action keys and rendered the template again (measured 2026-09-12:
+    # the two later runs re-did the first one's work). The first mutating run
+    # records what it produced; the later ones hand it back as hints, and the
+    # script re-checks them against the live cluster before trusting them.
+    products_dir: str | None = None
+    inputs_digest = ""
+    if not release.runner.dry_run:
+        inputs_digest = installer_product_inputs_digest(environment)
+        recorded = recorded_installer_products(
+            release, target, inputs_digest=inputs_digest
+        )
+        if recorded is not None:
+            environment[INSTALLER_REUSE_NODE_SET_ENV] = str(recorded["node_set_sha256"])
+            # An explicit template override (a rollback's steady template) is
+            # the caller's decision and outranks anything this release rendered.
+            if not template_config_map and recorded.get("template_config_map"):
+                environment[INSTALLER_REUSE_TEMPLATE_ENV] = str(
+                    recorded["template_config_map"]
+                )
+        products_dir = tempfile.mkdtemp(prefix="gpu-fault-reconciler-products-")
+        environment[INSTALLER_PRODUCTS_FILE_ENV] = os.path.join(
+            products_dir, "products.json"
+        )
+    try:
+        release.runner.run(
+            [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
+            env=environment,
+            sensitive=bool(target.fleet_master_file),
+            timeout_seconds=660,
+        )
+        if products_dir is not None:
+            record_installer_products(
+                release,
+                target,
+                inputs_digest=inputs_digest,
+                products_path=environment[INSTALLER_PRODUCTS_FILE_ENV],
+            )
+    finally:
+        if products_dir is not None:
+            shutil.rmtree(products_dir, ignore_errors=True)
     wait_deployment_rollout(
         release,
         target,
