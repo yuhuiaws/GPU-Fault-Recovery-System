@@ -750,3 +750,88 @@ def test_a_resumed_bootstrap_pins_the_plan_only_for_the_same_candidate(
 
     assert pins == expected_pins, "the plan pin belongs to the candidate that made it"
     assert calls == ["bootstrap"], "the bootstrap itself always runs"
+
+
+def _deployment_probe(installed: bool):
+    def probe(args):
+        if "deployment" in args:
+            return installed
+        return True
+
+    return probe
+
+
+def test_a_complete_state_over_an_uninstalled_control_plane_bootstraps(
+    monkeypatch,
+) -> None:
+    """Live 2026-09-12: a cleaned-up bootstrap attempt left digests equal to the
+    candidate's; release-diff said NOOP and stage-noop wrote `complete` over a
+    control plane that was never installed. Deploy must bootstrap, release-diff
+    must never call that NOOP, and stage-noop must refuse it."""
+
+    module = _admin_module()
+    calls: list[str] = []
+    state = {
+        "phase": "complete",
+        "release_id": "older-release",
+        "transaction_committed": False,
+        "previous": None,
+        "completed_cluster_ids": [],
+    }
+    release = SimpleNamespace(
+        release_id="candidate-release",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=_deployment_probe(installed=False)),
+        _load_state=lambda: dict(state),
+        pin_approved_manifest_plan=lambda _digest: calls.append("pin"),
+        bootstrap=lambda: calls.append("bootstrap"),
+        upgrade=lambda **_kwargs: calls.append("upgrade"),
+    )
+    classified: list[dict] = []
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, seen: classified.append(seen)
+        or module.diff_from_changed({"control_plane_wheel"}),
+    )
+
+    module.run_deploy(release)
+    assert calls == ["bootstrap"], "an empty control plane is bootstrapped, unpinned"
+
+    plan = module.next_deploy(release, dict(state))
+    assert plan["action"] == "bootstrap" and plan["resume"] is False
+    assert classified[-1] == {}, "the diff is against nothing installed"
+
+    with pytest.raises(module.ReleaseError, match="stage-noop refused"):
+        module.stage_noop_release(release)
+
+
+def test_a_complete_state_over_an_installed_control_plane_is_not_a_bootstrap(
+    monkeypatch,
+) -> None:
+    module = _admin_module()
+    monkeypatch.setattr(
+        module,
+        "classify_release",
+        lambda _release, _state: module.diff_from_changed(()),
+    )
+    release = SimpleNamespace(
+        release_id="candidate-release",
+        config=SimpleNamespace(namespace="gpu-fault-system", clusters=("gpu-a",)),
+        _cpu=lambda *args: ["kubectl", *args],
+        runner=SimpleNamespace(probe=_deployment_probe(installed=True)),
+    )
+    state = {
+        "phase": "complete",
+        "release_id": "candidate-release",
+        "transaction_committed": False,
+        "previous": None,
+    }
+
+    plan = module.next_deploy(release, state)
+
+    assert plan["action"] == "commit", (
+        "with the control plane installed this is the uncommitted bootstrap, "
+        "awaiting verify and commit, not a new bootstrap"
+    )

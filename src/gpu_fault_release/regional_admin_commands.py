@@ -164,6 +164,44 @@ def _terminal_failed_transaction(state: dict[str, Any]) -> bool:
     return str(state.get("phase") or "") in SUPERSEDABLE_PHASES
 
 
+def _control_plane_installed(release: Any) -> bool:
+    return bool(
+        release.runner.probe(
+            release._cpu(
+                "-n",
+                release.config.namespace,
+                "get",
+                "deployment",
+                inventory.CPU_INGRESS_DEPLOYMENT,
+            )
+        )
+    )
+
+
+def _bootstrap_required(release: Any, state: dict[str, Any] | None) -> bool:
+    """Whether this deploy is the site's bootstrap rather than an upgrade.
+
+    No state, or a state still in a bootstrap phase, is the plain case. The
+    third one is live 2026-09-12: a cleaned-up bootstrap attempt left a state
+    whose component digests matched the candidate, the release diff called
+    that NOOP, and stage-noop wrote ``complete`` over a control plane that had
+    never been installed. A ``complete`` state with no previous release and no
+    ingress Deployment is that -- nothing to upgrade, everything to install.
+    """
+
+    if state is None:
+        return True
+    if str(state.get("phase") or "") in BOOTSTRAP_PHASES:
+        return True
+    # Only bootstrap and stage-noop write ``previous: null`` explicitly; an
+    # upgrade records the release it replaced.
+    return (
+        "previous" in state
+        and state.get("previous") is None
+        and not _control_plane_installed(release)
+    )
+
+
 def _foreign_candidate(release: Any, state: dict[str, Any]) -> bool:
     return str(state.get("release_id") or "") != str(release.release_id)
 
@@ -278,6 +316,14 @@ def supersede_release_diff(release: Any, state: dict[str, Any]) -> ReleaseDiff:
 
 
 def next_deploy(release: Any, state: dict[str, Any]) -> dict[str, Any]:
+    if _bootstrap_required(release, state):
+        # Everything is to be installed, whatever digests the leftover state
+        # carries; never NOOP, so the driver cannot stage-noop an empty site.
+        return {
+            **classify_release(release, {}).as_dict(),
+            "resume": False,
+            "action": "bootstrap",
+        }
     if (
         supersede_requested()
         and _terminal_failed_transaction(state)
@@ -496,10 +542,7 @@ def run_deploy(release: Any) -> None:
         # The flag is consent to one specific thing; anywhere else it is refused
         # with the reason rather than ignored, so it cannot become a habit.
         _require_supersede_target(release, state)
-    bootstrap_required = not state_exists or (
-        state is not None and state.get("phase") in BOOTSTRAP_PHASES
-    )
-    if bootstrap_required:
+    if _bootstrap_required(release, state):
         if not release.config.clusters:
             raise ReleaseError(
                 "initial regional bootstrap requires at least one GPU cluster; "
@@ -603,6 +646,10 @@ def build_release_diff(release: Any) -> dict[str, Any]:
 def stage_noop_release(release: Any) -> None:
     state = release._load_state()
     _require_expected_state(state)
+    if _bootstrap_required(release, state):
+        raise ReleaseError(
+            "stage-noop refused: the control plane is not installed; deploy bootstraps it"
+        )
     diff = classify_release(release, state)
     if diff.kind is not ReleaseChangeKind.NOOP:
         raise ReleaseError(
