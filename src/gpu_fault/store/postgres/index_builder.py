@@ -156,6 +156,7 @@ def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
     statements = declared_index_statements()
     built: list[str] = []
     dropped: list[str] = []
+    awaiting_table: list[str] = []
     with connection.cursor() as cursor:
         for row in index_health(connection):
             name = row["name"]
@@ -164,6 +165,12 @@ def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
             if row["present"] and not row["valid"]:
                 cursor.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
                 dropped.append(name)
+            elif not _index_table_exists(cursor, statements[name]):
+                # A fresh database (first bootstrap, or a reset): the ensure
+                # Job's DDL creates the table and its indexes together, and an
+                # empty table has no writers to protect from a plain CREATE INDEX.
+                awaiting_table.append(name)
+                continue
             statement = statements[name].replace(
                 "INDEX IF NOT EXISTS", "INDEX CONCURRENTLY IF NOT EXISTS", 1
             )
@@ -173,12 +180,26 @@ def build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
     return {
         "built": built,
         "dropped_invalid": dropped,
+        "awaiting_table": awaiting_table,
         "present": [row["name"] for row in after if row["present"]],
         "invalid_after": [
             row["name"] for row in after if row["present"] and not row["valid"]
         ],
-        "missing_after": [row["name"] for row in after if not row["present"]],
+        "missing_after": [
+            row["name"]
+            for row in after
+            if not row["present"] and row["name"] not in awaiting_table
+        ],
     }
+
+
+def _index_table_exists(cursor: Any, statement: str) -> bool:
+    match = _INDEX_TABLE.search(statement)
+    if match is None:  # pragma: no cover - declared statements always name a table
+        return True
+    cursor.execute("SELECT to_regclass(%s)", (match.group(1),))
+    row = cursor.fetchone()
+    return bool(row and row[0] is not None)
 
 
 def schema_preflight(connection: Any) -> dict[str, Any]:

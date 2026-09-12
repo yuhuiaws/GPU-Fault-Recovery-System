@@ -28,6 +28,42 @@ RUNTIME_IMAGE="${GPU_FAULT_RUNTIME_IMAGE:?required}"
     exit 2
 }
 
+timeout_seconds() {
+    # "60m" / "90s" / "300" -> seconds.
+    local value="$1"
+    case "${value}" in
+        *m) printf '%d' "$(( ${value%m} * 60 ))" ;;
+        *s) printf '%d' "${value%s}" ;;
+        *) printf '%d' "${value}" ;;
+    esac
+}
+
+wait_for_postgres_job() {
+    # `kubectl wait --for=condition=complete` sits out the whole timeout on a
+    # Job that has already failed (live 2026-09-12: an hour on a two-pod
+    # backoff). Poll both terminal conditions instead.
+    local name="$1" timeout="$2" deadline conditions
+    deadline=$(( SECONDS + $(timeout_seconds "${timeout}") ))
+    while :; do
+        conditions="$(kubectl --kubeconfig "${KUBECONFIG}" -n "${NAMESPACE}" \
+          get "job/${name}" \
+          -o 'jsonpath={range .status.conditions[*]}{.type}={.status} {end}' \
+          2>/dev/null || true)"
+        case " ${conditions}" in
+            *" Complete=True"*) return 0 ;;
+            *" Failed=True"*)
+                printf 'ERROR: postgres job %s failed\n' "${name}" >&2
+                return 1 ;;
+        esac
+        if (( SECONDS >= deadline )); then
+            printf 'ERROR: postgres job %s did not complete within %s\n' \
+              "${name}" "${timeout}" >&2
+            return 1
+        fi
+        sleep "${GPU_FAULT_JOB_POLL_SECONDS:-5}"
+    done
+}
+
 run_postgres_job() {
     # Delete first: a completed Job's pod template is immutable and a new
     # release must run the new wheel. Wait, then print the log; a failure
@@ -41,8 +77,7 @@ run_postgres_job() {
       -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
       "${ROOT}/${manifest}" |
       kubectl --kubeconfig "${KUBECONFIG}" apply -f -
-    if ! kubectl --kubeconfig "${KUBECONFIG}" -n "${NAMESPACE}" \
-      wait --for=condition=complete "job/${name}" --timeout="${timeout}"; then
+    if ! wait_for_postgres_job "${name}" "${timeout}"; then
         printf 'ERROR: postgres job %s did not complete; its log follows\n' "${name}" >&2
         kubectl --kubeconfig "${KUBECONFIG}" -n "${NAMESPACE}" \
           logs "job/${name}" --all-containers=true >&2 || true
