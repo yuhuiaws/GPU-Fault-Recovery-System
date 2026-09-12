@@ -904,6 +904,63 @@ scale_gpu_deployment_zero() {
     fi
 }
 
+fail_orphaned_remote_commands() {
+    # LEASED commands whose lease has lapsed after every executor was scaled
+    # to zero have no claimant left to complete, renew or acknowledge a
+    # cancellation; the drain would wait on them forever. Reset is a wipe, so
+    # they are failed here with an audit source, and the consumers then fail
+    # their workflow steps in the ordinary way.
+    local pod=$1
+    local failed
+    failed="$(
+        cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- python -c '
+import os
+import sys
+from datetime import datetime, timezone
+
+import psycopg
+
+cluster_ids = sys.argv[1:]
+now = datetime.now(timezone.utc)
+with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], connect_timeout=10) as connection:
+    with connection.cursor() as cursor:
+        statement = """
+            UPDATE gpu_fault_objects
+               SET payload = payload || jsonb_build_object(
+                       %(status)s, %(failed)s,
+                       %(source)s, %(origin)s,
+                       %(error)s, %(reason)s,
+                       %(updated)s, %(now)s)
+             WHERE kind = %(kind)s
+               AND payload->>%(status)s = %(leased)s
+               AND (payload->>%(expires)s)::timestamptz < %(now)s::timestamptz
+        """
+        params = {
+            "status": "status", "failed": "FAILED",
+            "source": "status_source", "origin": "clean-redeploy-orphan",
+            "error": "error", "reason": "orphaned by clean-redeploy: no executor remains to complete the lease",
+            "updated": "updated_at", "now": now.isoformat(),
+            "kind": "remote_command", "leased": "LEASED", "expires": "lease_expires_at",
+        }
+        if cluster_ids:
+            statement += " AND payload->>%(cluster)s = ANY(%(clusters)s)"
+            params.update({"cluster": "cluster_id", "clusters": cluster_ids})
+        try:
+            cursor.execute(statement, params)
+        except psycopg.errors.UndefinedTable:
+            print(0)
+            raise SystemExit(0)
+        print(cursor.rowcount)
+    connection.commit()
+' "${CLUSTER_IDS[@]}"
+    )"
+    [[ "${failed}" =~ ^[0-9]+$ ]] ||
+        die "could not fail orphaned remote commands: ${failed}"
+    if ((failed > 0)); then
+        log "failed ${failed} orphaned LEASED remote command(s) with no executor left to complete them"
+    fi
+}
+
 run_node_cleanup() {
     local cluster_id=$1
     local context=$2
@@ -1047,9 +1104,12 @@ stop_gpu_producers() {
         gpu_kubectl "${context}" -n "${NAMESPACE}" delete daemonset \
             "${name}" --ignore-not-found
     done
-    if [[ "${NODE_MODE}" != skip ]]; then
-        run_node_cleanup "${cluster_id}" "${context}"
-    fi
+    # Node components are stopped after the drain and after the executors
+    # (see GPU_EXECUTORS_STOPPED): uninstalling agents while the control
+    # plane could still turn their disappearance into incidents, and the
+    # executors could still claim the resulting commands, left commands
+    # LEASED with no claimant once ingress went down and the drain never
+    # finished (live uninstall, 2026-09-12).
 }
 
 clean_gpu_objects() {
@@ -1241,6 +1301,9 @@ elif [[ "${MODE}" == reset ]]; then
     die "reset requires a running control-plane pod to export fleet inventory"
 fi
 if [[ -n "${DATABASE_POD}" ]]; then
+    if [[ "${MODE}" == reset && "${EXECUTE}" == true ]]; then
+        fail_orphaned_remote_commands "${DATABASE_POD}"
+    fi
     assert_no_active_work "${DATABASE_POD}"
 elif [[ "${SCOPE}" == gpu || "${CPU_RUNTIME_PRESENT}" == true ]]; then
     die "no running CPU control-plane pod is available for the Aurora safety check"
@@ -1253,14 +1316,14 @@ transition_state \
 
 transition_state \
     GPU_DATA_PLANE_SOURCES_STOPPED IN_PROGRESS \
-    "stopping GPU producers and node components"
+    "stopping GPU producers"
 for index in "${!CLUSTER_IDS[@]}"; do
     stop_gpu_producers \
         "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
 done
 transition_state \
     GPU_DATA_PLANE_SOURCES_STOPPED COMPLETED \
-    "GPU producers and node components stopped"
+    "GPU producers stopped"
 
 if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
     transition_state \
@@ -1303,15 +1366,23 @@ fi
 
 transition_state \
     GPU_EXECUTORS_STOPPED IN_PROGRESS \
-    "stopping GPU executors"
+    "stopping GPU executors and node components"
 for context in "${CLUSTER_CONTEXTS[@]}"; do
     for deployment in "${GPU_EXECUTOR_DEPLOYMENTS[@]}"; do
         scale_gpu_deployment_zero "${context}" "${deployment}"
     done
 done
+if [[ "${MODE}" == reset && "${EXECUTE}" == true && -n "${DATABASE_POD}" ]]; then
+    fail_orphaned_remote_commands "${DATABASE_POD}"
+fi
+if [[ "${NODE_MODE}" != skip ]]; then
+    for index in "${!CLUSTER_IDS[@]}"; do
+        run_node_cleanup "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"
+    done
+fi
 transition_state \
     GPU_EXECUTORS_STOPPED COMPLETED \
-    "GPU executors stopped"
+    "GPU executors and node components stopped"
 
 if [[ "${SCOPE}" == all ]]; then
     transition_state \

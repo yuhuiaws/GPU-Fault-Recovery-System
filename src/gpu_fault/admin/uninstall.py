@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Literal, Mapping, cast
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_cleanup import (
@@ -109,6 +109,25 @@ def _required_confirmation(disposition: CpuDisposition) -> str:
     return (
         "DELETE_CPU_CONTROL_PLANE" if disposition == "delete" else "UNINSTALL_GPU_FAULT"
     )
+
+
+def archive_unfinished_cleanup_state(path: Path, document: Mapping[str, Any]) -> Path:
+    """Move a Kubernetes cleanup record that never reached CLEANUP_COMPLETED aside.
+
+    ``prepare-clean-redeploy.sh`` refuses an existing state file and its state
+    tool refuses a phase moving backwards, so a rerun after a failed sweep
+    (live 2026-09-12: the drain timed out at QUEUES_DRAINED) could never start
+    over the same file. The failed record stays beside the new one as evidence.
+    """
+
+    stamp = (
+        str(document.get("updated_at") or datetime.now(timezone.utc).isoformat())
+        .replace("-", "")
+        .replace(":", "")[:15]
+    )
+    archive = path.with_name(f"{path.stem}.failed-{stamp}{path.suffix}")
+    path.replace(archive)
+    return archive
 
 
 def _run_cleanup(
@@ -709,6 +728,8 @@ def _uninstall_locked(
             previous_cleanup.get("phase") == "CLEANUP_COMPLETED"
             and previous_cleanup.get("status") == "COMPLETED"
         )
+        if not cleanup_complete:
+            archive_unfinished_cleanup_state(cleanup_state, previous_cleanup)
     if not cleanup_complete:
         _run_cleanup(request, active_runner, cleanup_state)
     cleanup_document = json.loads(cleanup_state.read_text(encoding="utf-8"))

@@ -682,3 +682,31 @@ def test_uninstall_request_refuses_contradictory_flags(
         UninstallRequest(
             site=site, cpu_disposition=disposition, confirmation="x", **overrides
         )
+
+
+def test_a_failed_kubernetes_cleanup_record_is_archived_before_the_rerun(
+    tmp_path,
+) -> None:
+    """The cleanup script refuses an existing state file and its state tool
+    refuses a phase moving backwards, so the live uninstall of 2026-09-12 (drain
+    timed out at QUEUES_DRAINED) could never have resumed over its own record.
+    A record short of CLEANUP_COMPLETED is moved aside; a complete one is
+    left alone by the caller."""
+
+    path = tmp_path / "kubernetes-cleanup.json"
+    document = {
+        "phase": "QUEUES_DRAINED",
+        "status": "FAILED",
+        "updated_at": "2026-09-12T11:56:17.123456+00:00",
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    archive = admin_uninstall.archive_unfinished_cleanup_state(path, document)
+
+    assert not path.exists(), "the rerun must start from a fresh state file"
+    assert archive.name == "kubernetes-cleanup.failed-20260912T115617.json", (
+        archive.name
+    )
+    assert json.loads(archive.read_text(encoding="utf-8"))["status"] == "FAILED", (
+        "the failed record must be kept as evidence"
+    )

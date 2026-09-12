@@ -251,3 +251,43 @@ raise SystemExit(0)
     worker = calls.index("scale deployment/gpu-fault-control-worker --replicas=0")
     executor = calls.index("scale deployment/gpu-fault-cluster-executor --replicas=0")
     assert producer < ingress < worker < executor, calls
+
+
+def test_node_components_stop_only_after_the_executors_and_the_drain() -> None:
+    """Live uninstall, 2026-09-12: the node cleanup ran inside
+    ``stop_gpu_producers``, before ingress went down and while the executors
+    were still claiming. Uninstalling the agents produced incidents, the
+    executors leased their commands, ingress was then stopped, and the drain
+    waited on three LEASED commands nobody could ever complete. Node
+    components now stop after the drain and after the executors, and a reset
+    fails the orphaned leases before the safety assertion and before the
+    node cleanup."""
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    producers_start = text.index("stop_gpu_producers() {")
+    producers_end = text.index("\n}\n", producers_start)
+    assert "run_node_cleanup" not in text[producers_start:producers_end], (
+        "node cleanup must not run while the control plane can still react"
+    )
+    executors_stopped = text.index("GPU_EXECUTORS_STOPPED IN_PROGRESS")
+    executors_done = text.index("GPU_EXECUTORS_STOPPED COMPLETED")
+    node_cleanup_call = text.index('run_node_cleanup "${CLUSTER_IDS[index]}"')
+    assert executors_stopped < node_cleanup_call < executors_done, (
+        "node cleanup must run inside the executor stop phase, after the scale"
+    )
+    scale = text.index(
+        'scale_gpu_deployment_zero "${context}" "${deployment}"', executors_stopped
+    )
+    assert scale < node_cleanup_call
+    orphan_before_assert = text.index("fail_orphaned_remote_commands")
+    first_assert = text.index('assert_no_active_work "${DATABASE_POD}"')
+    assert (
+        text.index("fail_orphaned_remote_commands", first_assert - 400) < first_assert
+    ), "a resumed reset must fail orphaned leases before the safety assertion"
+    assert orphan_before_assert < first_assert
+    assert "payload->>%(status)s = %(leased)s" in text, (
+        "orphan handling must target LEASED commands only"
+    )
+    assert "clean-redeploy-orphan" in text, (
+        "orphaned commands must carry an audit source"
+    )
