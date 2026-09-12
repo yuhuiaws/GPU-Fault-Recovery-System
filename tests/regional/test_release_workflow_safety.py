@@ -15,16 +15,29 @@ WORKFLOW_RESOLUTION = ROOT / "src/gpu_fault/workflow_resolution.py"
 class Runner:
     dry_run = False
 
-    def __init__(self, result: str) -> None:
+    def __init__(self, result: str, *, installed: bool = True) -> None:
         self.result = result
+        self.installed = installed
+        self.runs: list[list[str]] = []
 
     def run(self, args, **_kwargs):
+        self.runs.append(list(args))
         return "cpu-pod" if "get" in args and "pod" in args else self.result
 
+    def probe_output(self, args, **_kwargs):
+        assert "deployment" in args
+        if self.installed:
+            return 0, "deployment.apps/gpu-fault-api-ha", ""
+        return (
+            1,
+            "",
+            'Error from server (NotFound): deployments.apps "gpu-fault-api-ha" not found',
+        )
 
-def release(result: str):
+
+def release(result: str, *, installed: bool = True):
     return SimpleNamespace(
-        runner=Runner(result),
+        runner=Runner(result, installed=installed),
         config=SimpleNamespace(namespace="gpu-fault-system"),
         _cpu=lambda *args: ["kubectl", *args],
     )
@@ -270,3 +283,29 @@ def test_the_probe_and_the_product_agree_on_what_makes_a_settled_incident_record
     assert "is not IncidentState.RECOVERED" in preflight, (
         "the probe must set aside RECOVERED only, never ESCALATED"
     )
+
+
+def test_workflow_safety_passes_on_a_first_bootstrap_without_a_control_plane() -> None:
+    # The first regional preflight runs before gpu-fault-api-ha exists, so the
+    # in-Pod probe cannot run; with no control plane nothing destructive can be
+    # active, and the check must not fail the bootstrap.
+    target = release("unused", installed=False)
+
+    snapshot = SAFETY.workflow_safety_snapshot(target)
+
+    assert snapshot["blocker_count"] == 0
+    assert snapshot["control_plane"] == "not installed"
+    assert target.runner.runs == []
+
+
+def test_workflow_safety_still_fails_when_the_deployment_is_unreadable() -> None:
+    target = release("unused")
+    target.runner.probe_output = lambda *_args, **_kwargs: (
+        1,
+        "",
+        "Unable to connect to the server: dial tcp: i/o timeout",
+    )
+
+    with pytest.raises(SAFETY.ReleaseError, match="CPU ingress Deployment"):
+        SAFETY.workflow_safety_snapshot(target)
+    assert target.runner.runs == []

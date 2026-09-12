@@ -84,6 +84,38 @@ def cpu_ingress_pod_if_running(release: Any) -> str:
     return pod
 
 
+def cpu_ingress_deployment_installed(release: Any) -> bool:
+    """Whether the CPU ingress Deployment exists at all.
+
+    A first bootstrap runs its preflight before the control plane is
+    installed: the namespace holds only the bootstrap's Secrets and Jobs, so
+    "no Running ingress Pod" means "nothing installed", not "outage". Callers
+    that need a Pod to answer a question use this to tell the two apart: with
+    the Deployment absent the answer is decided by the absence; with it present
+    but no Running Pod the resolvers above still raise.
+    """
+
+    returncode, _stdout, stderr = release.runner.probe_output(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "deployment",
+            inventory.CPU_INGRESS_DEPLOYMENT,
+            "-o",
+            "name",
+        )
+    )
+    if returncode == 0:
+        return True
+    if "NotFound" in str(stderr):
+        return False
+    raise ReleaseError(
+        "could not read the CPU ingress Deployment: "
+        + (str(stderr).strip() or f"kubectl exited {returncode}")
+    )
+
+
 def forget_cpu_ingress_pod(release: Any) -> None:
     setattr(release, CPU_INGRESS_POD_ATTRIBUTE, "")
 
