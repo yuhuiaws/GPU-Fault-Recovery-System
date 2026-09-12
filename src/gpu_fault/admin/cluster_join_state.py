@@ -29,6 +29,9 @@ class JoinStateRequest(Protocol):
     def state_dir(self) -> Path | None: ...
 
 
+FINISHED_ATTEMPT_PHASES = frozenset({"ROLLED_BACK", "ROLLBACK_FAILED"})
+
+
 def load_join_state(
     request: JoinStateRequest,
 ) -> tuple[Path, Path, dict[str, Any]]:
@@ -60,10 +63,11 @@ def load_join_state(
         if (
             recorded_non_membership
             and recorded_non_membership != current_non_membership
-            and value.get("phase") != "ROLLED_BACK"
+            and value.get("phase") not in FINISHED_ATTEMPT_PHASES
         ):
             # An attempt still in flight was built against the old site; a
-            # rolled-back one is over and the caller starts a fresh attempt.
+            # rolled-back one is over (the caller starts a fresh attempt) and a
+            # failed rollback is undone against the site as it is now.
             raise BootstrapError(
                 "join-cluster source site non-membership fields drifted"
             )

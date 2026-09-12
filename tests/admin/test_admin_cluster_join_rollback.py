@@ -544,6 +544,13 @@ def test_a_retry_after_a_failed_rollback_finishes_the_undo_first(
     attempt.run(monkeypatch, error="cleanup refused")
     assert attempt.state()["phase"] == "ROLLBACK_FAILED", "the first undo must fail"
     assert attempt.membership == [], "membership must stay until the undo is clean"
+    # The deploy that ships a fix moves the site's repositoryRoot between the
+    # attempts (live, 2026-09-12); a finished attempt is not in flight, so that
+    # drift must not block the undo.
+    state_path = attempt.state_dir / "state.json"
+    recorded = attempt.state()
+    recorded["source_site_non_membership_sha256"] = "0" * 64
+    state_path.write_text(json.dumps(recorded), encoding="utf-8")
 
     attempt.commands = Commands()
     attempt.install(monkeypatch)
@@ -599,3 +606,25 @@ def test_a_retry_whose_undo_still_fails_stops_there(
 
     assert attempt.state()["phase"] == "ROLLBACK_FAILED", "the evidence must be kept"
     assert attempt.membership == [], "membership must not be undone over leftovers"
+
+
+def test_drift_still_blocks_an_attempt_that_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = Attempt(tmp_path)
+    attempt.run(monkeypatch, error="cluster deploy failed")
+    state_path = attempt.state_dir / "state.json"
+    recorded = attempt.state()
+    recorded["phase"] = "CANDIDATE_READY"
+    recorded["source_site_non_membership_sha256"] = "0" * 64
+    state_path.write_text(json.dumps(recorded), encoding="utf-8")
+
+    with pytest.raises(BootstrapError, match="non-membership fields drifted"):
+        join_cluster(
+            JoinClusterRequest(
+                site=attempt.site,
+                gpu_cluster_arn=GPU_B_ARN,
+                state_dir=attempt.state_dir,
+            ),
+            runner=SimpleNamespace(dry_run=False),
+        )
