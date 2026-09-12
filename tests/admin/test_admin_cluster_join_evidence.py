@@ -13,6 +13,8 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import load_site
 from tests.admin.test_admin_site import site_file
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _candidate_sites(tmp_path: Path):
     source_path = site_file(tmp_path)
@@ -222,3 +224,20 @@ def test_a_malformed_joined_cluster_id_is_rejected(cluster_id: str) -> None:
             candidate_cluster_ids=["gpu-a", "gpu-b"],
             cluster_id=cluster_id,
         )
+
+
+def test_membership_evidence_reads_the_registry_through_the_deployed_ingress() -> None:
+    """The verification snapshot execs into the control-plane ingress Pod by
+    label. A literal that named a Deployment the manifests never rendered made
+    every live join fail at verification with "no Running CPU ingress Pod"
+    (2026-09-12); the label must be the one the NLB Service selects."""
+
+    manifest = yaml.safe_load(
+        (
+            REPO_ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert evidence.CPU_INGRESS_APP == manifest["spec"]["selector"]["app"], (
+        "the membership snapshot looks for a Pod label the control plane never has"
+    )

@@ -17,9 +17,14 @@ from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
     hydrate_previous_snapshot,
 )
+from gpu_fault_release.regional_deployment_inventory import CPU_INGRESS_DEPLOYMENT
 
 REGIONAL_RELEASE_STATE_CONFIG_MAP = "gpu-fault-regional-release-state"
-CPU_INGRESS_APP = "gpu-fault-control-plane-ingress"
+# The Pod the registry status is read through: the same Deployment the release
+# engine execs into. A private literal here named a Deployment that never
+# existed, and every live join failed at verification with "no Running CPU
+# ingress Pod" (2026-09-12).
+CPU_INGRESS_APP = CPU_INGRESS_DEPLOYMENT
 VERIFICATION_MAX_AGE_SECONDS = 900
 
 
