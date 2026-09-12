@@ -46,6 +46,10 @@ from gpu_fault.installation_resources import (
 )
 from gpu_fault.node_installer_reconciler import INSTALLER_NODE_ANNOTATIONS
 
+# The label the release engine puts on the namespaced Role/RoleBinding pairs it
+# renders into every allowed workload namespace (`regional_release_gpu_rollout`).
+WORKLOAD_NAMESPACE_RBAC_LABEL = "gpu-fault.io/workload-namespace-rbac"
+
 CONFIRMATION = "REMOVE_GPU_CLUSTER"
 #: The reconciler's own list, not a copy: a hand-kept five-entry copy left
 #: ``installer-attempts`` (and five others) on the nodes of a removed cluster.
@@ -338,10 +342,56 @@ def _run_kubernetes_cleanup(
             check=False,
         )
     if completed.returncode:
+        if path.is_file():
+            raise BootstrapError(
+                f"GPU Kubernetes cleanup failed; evidence retained in {path}"
+            )
+        # The script refused before it wrote its state file (an unregistered
+        # live resource, an invalid config); the reason is in the command log.
         raise BootstrapError(
-            f"GPU Kubernetes cleanup failed; evidence retained in {path}"
+            f"GPU Kubernetes cleanup refused before writing {path.name}; the "
+            "refusal is in the command log above"
         )
     return path
+
+
+def prune_workload_namespace_rbac(
+    site: RenderedSite,
+    target: dict[str, Any],
+) -> list[str]:
+    """Delete the engine's per-namespace Role/RoleBinding pairs on the target.
+
+    The release engine renders a Role + RoleBinding for the executor and the
+    watcher into every allowed workload namespace -- including the system
+    namespace itself and kube-system for the device plugin -- and owns them by
+    label, not by the installed-resource registry. The fail-closed cleanup
+    therefore met them as "unregistered live gpu-fault resources" in the
+    system namespace and refused (live 2026-09-12), while the copies in the
+    workload namespaces would have outlived the removal. Selection is by the
+    engine's label only, so hand-made RBAC in those namespaces is untouched.
+    Returns the ``kind/name`` lines kubectl reported deleted.
+    """
+
+    result = subprocess.run(
+        [
+            *_gpu_kubectl(site, target),
+            "delete",
+            "roles,rolebindings",
+            "--all-namespaces",
+            "-l",
+            f"{WORKLOAD_NAMESPACE_RBAC_LABEL}=true",
+            "--ignore-not-found",
+            "--wait=true",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise BootstrapError(
+            "failed to delete the workload-namespace RBAC of the target cluster: "
+            + result.stderr.strip()
+        )
+    return [line for line in result.stdout.splitlines() if line.strip()]
 
 
 def _clear_installer_annotations(
@@ -1149,6 +1199,7 @@ def _remove_cluster_locked(
     if not _done(state, "KUBERNETES_QUIESCED") and not _done(
         state, "KUBERNETES_REMOVED"
     ):
+        pruned_rbac = prune_workload_namespace_rbac(request.site, target)
         cleanup_path = _run_kubernetes_cleanup(request, target, state_dir)
         _clear_installer_annotations(request.site, target, nodes)
         _request_target_namespace_deletion(request.site, target)
@@ -1156,7 +1207,11 @@ def _remove_cluster_locked(
             state_path,
             state,
             "KUBERNETES_QUIESCED",
-            {"cleanup_state": str(cleanup_path), "nodes": nodes},
+            {
+                "cleanup_state": str(cleanup_path),
+                "nodes": nodes,
+                "workload_namespace_rbac_deleted": pruned_rbac,
+            },
         )
 
     def remove_control_registry() -> dict[str, Any]:

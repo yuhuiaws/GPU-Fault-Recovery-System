@@ -20,6 +20,10 @@ NAMESPACED_DISCOVERY_KINDS = (
     "serviceaccount,service"
 )
 CLUSTER_DISCOVERY_KINDS = "clusterrole,clusterrolebinding"
+# The release engine renders a Role/RoleBinding pair per allowed workload
+# namespace and owns them by this label (`regional_release_gpu_rollout`);
+# they are not registry entries and `remove-cluster` deletes them by label.
+WORKLOAD_NAMESPACE_RBAC_LABEL = "gpu-fault.io/workload-namespace-rbac"
 
 
 def _identity(resource: dict[str, Any]) -> tuple[str, str]:
@@ -56,6 +60,12 @@ def discover_unregistered(
         ):
             continue
         if (kind, name) in registered:
+            continue
+        labels = metadata.get("labels") or {}
+        if (
+            kind in ("role", "rolebinding")
+            and str(labels.get(WORKLOAD_NAMESPACE_RBAC_LABEL, "")).lower() == "true"
+        ):
             continue
         found.append(
             {

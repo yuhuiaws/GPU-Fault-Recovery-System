@@ -82,6 +82,31 @@ class DiscoveryKubectl:
                         "name": "gpu-fault-customer-workload",
                     },
                 },
+                # The engine's per-namespace RBAC, owned by label: not a
+                # registry entry, not an unregistered legacy resource either.
+                {
+                    "kind": "Role",
+                    "metadata": {
+                        "namespace": "gpu-fault-system",
+                        "name": "gpu-fault-cluster-executor",
+                        "labels": {"gpu-fault.io/workload-namespace-rbac": "true"},
+                    },
+                },
+                {
+                    "kind": "RoleBinding",
+                    "metadata": {
+                        "namespace": "gpu-fault-system",
+                        "name": "gpu-fault-completion-watcher",
+                        "labels": {"gpu-fault.io/workload-namespace-rbac": "true"},
+                    },
+                },
+                {
+                    "kind": "Role",
+                    "metadata": {
+                        "namespace": "gpu-fault-system",
+                        "name": "gpu-fault-hand-made-role",
+                    },
+                },
             ]
         elif "clusterrole" in arguments[1]:
             items = [
@@ -400,4 +425,5 @@ def test_cleanup_discovery_fails_closed_on_legacy_resources() -> None:
         ("deployment", "gpu-fault-legacy-executor"),
         ("clusterrole", "gpu-fault-legacy-role"),
         ("namespace", "gf-regional-old"),
-    }
+        ("role", "gpu-fault-hand-made-role"),
+    }, "label-owned workload RBAC is the engine's; an unlabelled Role is not"

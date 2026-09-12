@@ -341,8 +341,16 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     )
     monkeypatch.setattr(
         admin_cluster_removal,
-        "_run_kubernetes_cleanup",
-        lambda _request, _target, state_dir: state_dir / "cleanup.json",
+        "prune_workload_namespace_rbac",
+        lambda *_args: (calls.append("workload-rbac"), ["role/gpu-fault-x"])[1],
+    )
+
+    def kubernetes_cleanup(_request, _target, state_dir):
+        calls.append("kubernetes-cleanup")
+        return state_dir / "cleanup.json"
+
+    monkeypatch.setattr(
+        admin_cluster_removal, "_run_kubernetes_cleanup", kubernetes_cleanup
     )
     monkeypatch.setattr(
         admin_cluster_removal,
@@ -429,6 +437,17 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     assert load_site(path).release_config["clusters"] == []
     assert calls.count("registry") == 1
     assert calls.count("release-state") == 1
+    # The engine's label-owned workload RBAC goes before the fail-closed
+    # cleanup, which would otherwise meet it as unregistered and refuse
+    # (live 2026-09-12); the evidence records what was deleted.
+    assert calls.count("workload-rbac") == 1
+    assert calls.index("workload-rbac") < calls.index("kubernetes-cleanup")
+    state = json.loads(
+        (tmp_path / "remove-cluster" / "gpu-a" / "state.json").read_text("utf-8")
+    )
+    assert state["evidence"]["KUBERNETES_QUIESCED"][
+        "workload_namespace_rbac_deleted"
+    ] == ["role/gpu-fault-x"]
     assert calls.count("site-verified") == 1
     # The failure-domain map is re-rendered once, for the remaining (empty)
     # cluster set, before the release state moves on.
@@ -677,3 +696,44 @@ def test_resolve_cluster_id_refuses_unknown_and_non_cluster_arns(tmp_path) -> No
         admin_cluster_removal.resolve_cluster_id(
             site, "arn:aws:sagemaker:us-east-1:123456789012:cluster/abc123def456"
         )
+
+
+def test_workload_namespace_rbac_prune_selects_by_the_engine_label_only(
+    tmp_path, monkeypatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+    site.release_config["gpu_kubeconfig"] = str(tmp_path / "gpu.kubeconfig")
+    seen: list[list[str]] = []
+
+    def run(arguments, **_kwargs):
+        seen.append(list(arguments))
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            'role.rbac.authorization.k8s.io "gpu-fault-cluster-executor" deleted\n'
+            'rolebinding.rbac.authorization.k8s.io "gpu-fault-cluster-executor" deleted\n',
+            "",
+        )
+
+    monkeypatch.setattr(admin_cluster_removal.subprocess, "run", run)
+    target = next(
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == "gpu-a"
+    )
+
+    deleted = admin_cluster_removal.prune_workload_namespace_rbac(site, target)
+
+    [command] = seen
+    assert command[:3] == ["kubectl", "--kubeconfig", str(tmp_path / "gpu.kubeconfig")]
+    assert command[3:5] == ["--context", target["context"]]
+    assert command[5:] == [
+        "delete",
+        "roles,rolebindings",
+        "--all-namespaces",
+        "-l",
+        "gpu-fault.io/workload-namespace-rbac=true",
+        "--ignore-not-found",
+        "--wait=true",
+    ], "selection is by the engine's label across every namespace, nothing else"
+    assert len(deleted) == 2
