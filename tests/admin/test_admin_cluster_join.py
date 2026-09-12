@@ -211,6 +211,9 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         admin_cluster_join, "_list_nodes", lambda *_args, **_kwargs: ["node-b"]
     )
     monkeypatch.setattr(
+        admin_cluster_join, "clear_stale_installer_annotations", lambda *_a: None
+    )
+    monkeypatch.setattr(
         admin_cluster_join,
         "_existing_cluster_networks",
         lambda *_args, **_kwargs: [{"vpc_id": "vpc-gpu-a", "nat_eips": ["192.0.2.10"]}],

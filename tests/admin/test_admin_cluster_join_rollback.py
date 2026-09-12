@@ -725,3 +725,49 @@ def test_a_completed_join_of_a_cluster_the_site_dropped_starts_over_despite_drif
         "the dropped cluster must get a new attempt"
     )
     assert seen[0]["completed_steps"] == [], "nothing of the old attempt may resume"
+
+
+def test_stale_installer_annotations_are_cleared_only_without_a_reconciler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-09-12: remove-cluster cleared the installer annotations while
+    its Reconciler was still terminating; the Reconciler's last pass wrote
+    "Retrying" back, and the next join's node barrier refused every node as
+    installer-active. A joining cluster has no Reconciler, so its leftovers
+    go; a cluster with a Reconciler keeps its live annotations."""
+
+    attempt = Attempt(tmp_path)
+    from gpu_fault.admin import cluster_join_rollback
+
+    absent = Commands(
+        failures=[
+            ("get deployment gpu-fault-node-installer-reconciler", 1, "not found")
+        ]
+    )
+    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", absent)
+    cluster_join_rollback.clear_stale_installer_annotations(
+        attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
+    )
+    assert absent.matching("annotate node node-b"), (
+        "leftover installer annotations must go when no Reconciler owns them"
+    )
+
+    present = Commands()
+    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", present)
+    cluster_join_rollback.clear_stale_installer_annotations(
+        attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
+    )
+    assert not present.matching("annotate"), (
+        "a live Reconciler's annotations must not be touched"
+    )
+
+    broken = Commands(
+        failures=[
+            ("get deployment gpu-fault-node-installer-reconciler", 1, "Unauthorized")
+        ]
+    )
+    monkeypatch.setattr(cluster_join_rollback.subprocess, "run", broken)
+    with pytest.raises(BootstrapError, match="cannot tell whether"):
+        cluster_join_rollback.clear_stale_installer_annotations(
+            attempt.site, {"context": "gpu-fault-gpu-2-gpu-b"}, ["node-b"]
+        )

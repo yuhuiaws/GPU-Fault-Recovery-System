@@ -1305,6 +1305,11 @@ def _remove_cluster_locked(
 
     if not _done(state, "KUBERNETES_REMOVED"):
         _wait_target_namespace_absent(request.site, target)
+        # The Reconciler scaled to zero above may still have been terminating
+        # when the annotations were first cleared, and its last pass rewrites
+        # unannotated nodes as "Retrying" (live 2026-09-12). Now the namespace
+        # is gone nothing can write them; clear once more.
+        _clear_installer_annotations(request.site, target, nodes)
         _complete(
             state_path,
             state,

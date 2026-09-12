@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.cluster_removal import _clear_installer_annotations, _gpu_kubectl
 from gpu_fault.admin.site import RenderedSite, effective_environment
+from gpu_fault_release.regional_deployment_inventory import GPU_RECONCILER_DEPLOYMENT
 
 
 def restore_current_context(
@@ -169,3 +171,42 @@ def ensure_kube_context(kubeconfig: Path, target: Mapping[str, Any]) -> None:
     )
     if kubeconfig.exists():
         kubeconfig.chmod(0o600)
+
+
+def clear_stale_installer_annotations(
+    site: RenderedSite, target: Mapping[str, Any], nodes: list[str]
+) -> None:
+    """Drop the installer annotations on ``nodes`` when no Reconciler owns them.
+
+    A cluster being joined has no node-installer Reconciler yet, so whatever
+    installer-state its nodes carry is a leftover: remove-cluster clears the
+    annotations, but a Reconciler still terminating rewrites unannotated nodes
+    as "Retrying" (live 2026-09-12), and the node barrier then refuses every
+    node as "installer-active". With a Reconciler present the annotations are
+    live state and stay.
+    """
+
+    if not nodes:
+        return
+    probe = subprocess.run(
+        [
+            *_gpu_kubectl(site, dict(target)),
+            "-n",
+            str(site.release_config["namespace"]),
+            "get",
+            "deployment",
+            GPU_RECONCILER_DEPLOYMENT,
+            "-o",
+            "name",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode == 0:
+        return
+    if "not found" not in (probe.stderr or "").lower():
+        raise BootstrapError(
+            "cannot tell whether a node-installer Reconciler owns the installer "
+            "annotations: " + (probe.stderr or "").strip()
+        )
+    _clear_installer_annotations(site, dict(target), nodes)

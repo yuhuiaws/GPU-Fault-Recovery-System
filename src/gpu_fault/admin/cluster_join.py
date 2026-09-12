@@ -36,13 +36,6 @@ from gpu_fault.admin.bootstrap_services import (
     ensure_executor_role,
     provision_node_action_keys,
 )
-from gpu_fault.admin.cluster_join_rollback import (
-    ensure_kube_context,
-    nothing_installed,
-    restore_current_context,
-    rollback_command,
-    rollback_iam_role,
-)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
@@ -52,6 +45,14 @@ from gpu_fault.admin.cluster_join_evidence import (
     verification_is_stale,
 )
 from gpu_fault.admin.cluster_join_readonly import cached_network_baseline
+from gpu_fault.admin.cluster_join_rollback import (
+    clear_stale_installer_annotations,
+    ensure_kube_context,
+    nothing_installed,
+    restore_current_context,
+    rollback_command,
+    rollback_iam_role,
+)
 from gpu_fault.admin.cluster_join_state import (
     complete_step as _complete,
 )
@@ -1060,6 +1061,9 @@ def _prepare_execution(
             runner,
             kubeconfig=gpu_kubeconfig,
             target=target,
+        )
+        clear_stale_installer_annotations(
+            request.site, {"context": target.context}, nodes
         )
         _complete(
             state_path,

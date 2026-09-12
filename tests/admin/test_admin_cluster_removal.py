@@ -442,6 +442,12 @@ def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) ->
     assert load_site(path).release_config["clusters"] == []
     assert calls.count("registry") == 1
     assert calls.count("release-state") == 1
+    # Once before the namespace goes and once after it is gone: a Reconciler
+    # still terminating rewrote cleared nodes as "Retrying" (live 2026-09-12).
+    assert calls.count("annotations") == 2
+    assert calls.index("namespace-wait") < len(calls) - 1 - calls[::-1].index(
+        "annotations"
+    )
     # The engine's label-owned workload RBAC goes before the fail-closed
     # cleanup, which would otherwise meet it as unregistered and refuse
     # (live 2026-09-12); the evidence records what was deleted.
