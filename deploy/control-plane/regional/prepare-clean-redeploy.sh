@@ -1164,6 +1164,31 @@ print(
         die "${cluster_id}: ${count} node(s) retain gpu-fault.io/quarantined; resolve their health and restore scheduling before reset"
 }
 
+release_parked_spares() {
+    # A declared warm spare is the spare label plus a cordon this deployment
+    # placed. Stripping the label alone leaves an anonymous cordon behind, and
+    # the next bootstrap's node barrier refuses the node as operator-cordoned
+    # (live 2026-09-12). Restore the recorded baseline: uncordon unless the
+    # node was already unschedulable before the declaration.
+    local context=$1
+    local node
+    while IFS= read -r node; do
+        [[ -n "${node}" ]] || continue
+        log "releasing warm spare cordon on ${node}"
+        gpu_kubectl "${context}" uncordon "${node}"
+    done < <(
+        gpu_kubectl "${context}" get nodes -l gpu-fault.io/spare=true -o json |
+            python3 -c '
+import json, sys
+for item in json.load(sys.stdin).get("items", []):
+    meta = item.get("metadata", {})
+    before = (meta.get("annotations") or {}).get("gpu-fault.io/previous-unschedulable")
+    if item.get("spec", {}).get("unschedulable") and str(before).lower() != "true":
+        print(meta.get("name", ""))
+'
+    )
+}
+
 clear_node_metadata() {
     local context=$1
     local annotation
@@ -1196,6 +1221,7 @@ for item in document.get("items", []):
 '
     )
     ((${#nodes[@]})) || return 0
+    release_parked_spares "${context}"
     for annotation in "${GPU_NODE_ANNOTATIONS[@]}"; do
         arguments+=("${annotation}-")
     done

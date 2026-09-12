@@ -573,3 +573,24 @@ def test_namespace_and_wave_deletes_are_issued_before_their_waits(
     assert ingress_delete < ingress_poll < consumer_delete, (
         "the CPU ingress wave is gone before the consumer wave starts"
     )
+
+
+def test_node_cleanup_uncordons_declared_spares_before_stripping_their_label() -> None:
+    """Live 2026-09-12: the uninstall stripped gpu-fault.io/spare from the parked
+    warm spare and left its cordon; the next fresh bootstrap's node barrier then
+    refused the node as operator-cordoned. The baseline is restored first."""
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    release = text.index("release_parked_spares() {")
+    clear = text.index("clear_node_metadata() {")
+    call = text.index('release_parked_spares "${context}"', clear)
+    strip = text.index('label nodes "${nodes[@]}" --overwrite', clear)
+    assert release < clear < call < strip, (
+        "the spare cordon is released inside clear_node_metadata before the label strip"
+    )
+    body = text[release:clear]
+    assert "-l gpu-fault.io/spare=true" in body, "only declared spares are touched"
+    assert "gpu-fault.io/previous-unschedulable" in body, (
+        "a node cordoned before its declaration stays cordoned"
+    )
+    assert "uncordon" in body, "the release is an uncordon"
