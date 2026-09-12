@@ -36,7 +36,11 @@ from gpu_fault.admin.bootstrap_services import (
     ensure_executor_role,
     provision_node_action_keys,
 )
-from gpu_fault.admin.cluster_join_rollback import restore_current_context
+from gpu_fault.admin.cluster_join_rollback import (
+    restore_current_context,
+    rollback_command,
+    rollback_iam_role,
+)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     build_verified_membership_evidence,
@@ -736,59 +740,10 @@ def _cleanup_candidate(
         raise BootstrapError("; ".join(errors))
 
 
-def _rollback_command(
-    arguments: list[str],
-    *,
-    not_found: tuple[str, ...],
-) -> None:
-    result = subprocess.run(arguments, text=True, capture_output=True)
-    if result.returncode == 0:
-        return
-    message = (result.stdout or "") + "\n" + (result.stderr or "")
-    if any(value in message for value in not_found):
-        return
-    raise BootstrapError(
-        f"rollback command failed ({result.returncode}): "
-        f"{' '.join(arguments[:3])}: {result.stderr.strip()}"
-    )
-
-
-def _rollback_iam_role(role: object, *, label: str, errors: list[str]) -> None:
-    """Delete a role a failed join created (inline policy first); absent is fine."""
-
-    if not isinstance(role, dict) or not role.get("role_arn"):
-        return
-    role_name = str(role["role_arn"]).rsplit("/", 1)[-1]
-    policy = str(role.get("inline_policy_name") or "")
-    if policy:
-        try:
-            _rollback_command(
-                [
-                    "aws",
-                    "iam",
-                    "delete-role-policy",
-                    "--role-name",
-                    role_name,
-                    "--policy-name",
-                    policy,
-                ],
-                not_found=("NoSuchEntity",),
-            )
-        except BootstrapError as exc:
-            errors.append(f"{label} policy rollback: {exc}")
-    try:
-        _rollback_command(
-            ["aws", "iam", "delete-role", "--role-name", role_name],
-            not_found=("NoSuchEntity",),
-        )
-    except BootstrapError as exc:
-        errors.append(f"{label} role rollback: {exc}")
-
-
 def _rollback_network(network: dict[str, Any], site: RenderedSite) -> None:
     region = str(site.release_config["aws_region"])
     for eip in network.get("created_ingress_eips", []):
-        _rollback_command(
+        rollback_command(
             [
                 "aws",
                 "ec2",
@@ -807,7 +762,7 @@ def _rollback_network(network: dict[str, Any], site: RenderedSite) -> None:
             not_found=("InvalidPermission.NotFound",),
         )
     if network.get("association_created"):
-        _rollback_command(
+        rollback_command(
             [
                 "aws",
                 "route53",
@@ -902,7 +857,7 @@ def _rollback(
         ("executor_role", "Executor"),
         ("adot_writer_role", "ADOT writer"),
     ):
-        _rollback_iam_role(prerequisites.get(prerequisite), label=label, errors=errors)
+        rollback_iam_role(prerequisites.get(prerequisite), label=label, errors=errors)
     token_file = Path(str(local.get("token_file") or ""))
     secure = state_dir / "secure"
     for path in {
@@ -1429,6 +1384,11 @@ def _join_cluster_locked(
 ) -> dict[str, Any]:
     state_dir, state_path, state = _state(request)
     attempt = JoinAttempt(request, state_dir, state_path, state)
+    if state.get("phase") == "ROLLED_BACK":
+        # Its recorded discovery describes the world that made it fail.
+        _reset_completed_state(
+            request, state_dir=state_dir, state_path=state_path, state=state
+        )
     if state.get("phase") == "COMPLETED":
         if _completed_state_is_current(request, state):
             if not _done(state, "RELEASE_STATE_UPDATED"):

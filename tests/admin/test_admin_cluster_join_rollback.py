@@ -437,3 +437,50 @@ def test_an_undo_that_really_failed_is_reported_and_keeps_the_evidence(
     assert attempt.membership == [], (
         "membership rollback ran on top of a failed resource rollback"
     )
+
+
+def test_a_retry_after_rollback_starts_a_fresh_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read-only steps of a rolled-back attempt are not worth resuming.
+
+    Live, 2026-09-12: the first join rolled back because discovery had derived
+    Agent CIDRs that covered no node. The fix changed discovery, yet a retry
+    would have replayed the recorded ``DISCOVERED`` target, and the deploy that
+    shipped the fix had moved the site's ``repositoryRoot``, which the drift
+    guard treated as a conflict. A rolled-back attempt is over: the retry
+    archives it and rediscovers from scratch.
+    """
+
+    attempt = Attempt(tmp_path)
+    attempt.run(monkeypatch, error="cluster deploy failed")
+    assert attempt.state()["phase"] == "ROLLED_BACK", "the first attempt must roll back"
+    state_path = attempt.state_dir / "state.json"
+    recorded = attempt.state()
+    recorded["source_site_non_membership_sha256"] = "0" * 64
+    state_path.write_text(json.dumps(recorded), encoding="utf-8")
+
+    seen: list[dict[str, Any]] = []
+
+    def prepare(_request: Any, **keywords: Any) -> Any:
+        seen.append(json.loads(json.dumps(keywords["state"])))
+        raise BootstrapError("stop after reset")
+
+    monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
+    with pytest.raises(BootstrapError, match="stop after reset"):
+        join_cluster(
+            JoinClusterRequest(
+                site=attempt.site,
+                gpu_cluster_arn=GPU_B_ARN,
+                state_dir=attempt.state_dir,
+            ),
+            runner=SimpleNamespace(dry_run=False),
+        )
+
+    assert seen and seen[0]["attempt"] == 2, "the retry must open a new attempt"
+    assert seen[0]["completed_steps"] == [], (
+        "the retry must not resume the rolled-back attempt's discovery"
+    )
+    assert (attempt.state_dir / "state.attempt-001.json").exists(), (
+        "the rolled-back attempt must be archived, not overwritten"
+    )

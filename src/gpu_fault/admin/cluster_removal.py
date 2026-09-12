@@ -14,6 +14,7 @@ from typing import Any, Callable, cast
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
+from gpu_fault.admin.cluster_join_state import complete_step
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
 from gpu_fault.admin.bootstrap_common import (
     Arn,
@@ -195,14 +196,9 @@ def _complete(
     step: str,
     evidence: dict[str, Any] | None = None,
 ) -> None:
-    completed = set(state.get("completed_steps") or [])
-    completed.add(step)
-    state["completed_steps"] = sorted(completed)
-    state["phase"] = step
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    if evidence is not None:
-        state.setdefault("evidence", {})[step] = evidence
-    write_json_atomic(path, state)
+    """Same record shape as a join step, timestamps included."""
+
+    complete_step(path, state, step, evidence)
 
 
 def _done(state: dict[str, Any], step: str) -> bool:

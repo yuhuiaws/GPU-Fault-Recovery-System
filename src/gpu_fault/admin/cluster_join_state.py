@@ -60,7 +60,10 @@ def load_join_state(
         if (
             recorded_non_membership
             and recorded_non_membership != current_non_membership
+            and value.get("phase") != "ROLLED_BACK"
         ):
+            # An attempt still in flight was built against the old site; a
+            # rolled-back one is over and the caller starts a fresh attempt.
             raise BootstrapError(
                 "join-cluster source site non-membership fields drifted"
             )
@@ -146,7 +149,10 @@ def complete_step(
     completed.add(step)
     state["completed_steps"] = sorted(completed)
     state["phase"] = step
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    state["updated_at"] = now
+    # One timestamp per step so an operator can read where a join spent its time.
+    state.setdefault("step_completed_at", {})[step] = now
     if evidence is not None:
         state.setdefault("evidence", {})[step] = evidence
     write_json_atomic(path, state)

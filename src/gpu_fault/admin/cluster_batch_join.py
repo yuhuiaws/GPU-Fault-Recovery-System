@@ -101,6 +101,13 @@ def _initialize_context(
     for request in requests:
         attempt_state_dir, state_path, state = load_join_state(request)
         attempt = JoinAttempt(request, attempt_state_dir, state_path, state)
+        if state.get("phase") == "ROLLED_BACK":
+            reset_completed_state(
+                request,
+                state_dir=attempt_state_dir,
+                state_path=state_path,
+                state=state,
+            )
         if state.get("phase") == "COMPLETED":
             if completed_state_is_current(request, state):
                 context.results.append(
