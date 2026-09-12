@@ -9,6 +9,7 @@ from gpu_fault_release.regional_release_fleet_rollout import (
     NodeRolloutPolicy,
     ensure_rollout_wave_safe,
     finish_legacy_node_runtime_rollback,
+    live_agent_node_names,
     node_rollout_policy,
     rollback_node_rollout_policy,
     run_fleet_waves,
@@ -410,13 +411,21 @@ def roll_node_runtime(
         agent_identity=agent_identity,
     )
     desired_bundle, desired_template = paused_identity
+    safety_node_names = node_names
+    if phase == "join":
+        # The wave safety gate protects the capacity outside the wave, and a
+        # joining cluster's nodes hold no live agent yet -- or only records a
+        # removed cluster left behind (live 2026-09-12: leases expired for
+        # hours, every retry blocked on "lease-margin"). Neither is capacity a
+        # wave can take away; only nodes with a live agent are.
+        safety_node_names = live_agent_node_names(release, target, node_names)
     run_fleet_waves(
         release,
         target,
         FleetWaveContext(
             phase=phase,
             deployment_id=deployment_id,
-            node_names=node_names,
+            node_names=safety_node_names,
             paused_identity=paused_identity,
             wheel_cm=wheel_cm,
             bundle_cm=bundle_cm,

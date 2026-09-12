@@ -758,9 +758,7 @@ def wait_candidate_cpu_agent_heartbeats(
         raise ReleaseError(prefix + json.dumps(diagnostics, sort_keys=True))
 
 
-def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
-    if release.runner.dry_run:
-        return {}
+def _read_active_agent_node_sets(release: Any) -> dict[str, Any]:
     raw = exec_cpu_ingress_probe(
         release,
         script=probe_source("active_agent_node_sets"),
@@ -774,6 +772,33 @@ def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
         raise ReleaseError("active Agent node inventory is invalid") from exc
     if not isinstance(value, dict):
         raise ReleaseError("active Agent node inventory is not an object")
+    return value
+
+
+def live_agent_node_names(
+    release: Any,
+    target: ClusterTarget,
+    node_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    """The nodes of ``target`` whose agent is ACTIVE with an unexpired lease.
+
+    A cluster with none is a valid answer here (a join installs the first
+    agents), unlike ``capture_active_agent_node_sets`` which reads the whole
+    managed fleet and treats an empty cluster as a failure.
+    """
+
+    if release.runner.dry_run:
+        return ()
+    value = _read_active_agent_node_sets(release)
+    listed = value.get(target.cluster_id)
+    live = {str(node_id) for node_id in listed} if isinstance(listed, list) else set()
+    return tuple(name for name in node_names if name in live)
+
+
+def capture_active_agent_node_sets(release: Any) -> dict[str, dict[str, Any]]:
+    if release.runner.dry_run:
+        return {}
+    value = _read_active_agent_node_sets(release)
     expected = {target.cluster_id for target in release.config.clusters}
     result = {
         str(cluster_id): {
