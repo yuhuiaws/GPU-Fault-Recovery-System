@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.site import RenderedSite, effective_environment
 
 
 def restore_current_context(
@@ -89,3 +91,39 @@ def rollback_iam_role(role: object, *, label: str, errors: list[str]) -> None:
         )
     except BootstrapError as exc:
         errors.append(f"{label} role rollback: {exc}")
+
+
+def nothing_installed(candidate: RenderedSite, config: Path) -> bool:
+    """Whether the installed-resource registry lists no GPU-plane resource.
+
+    Unreadable output counts as "something may be installed": the cleanup
+    script then validates the inventory itself, fail-closed as before.
+    """
+
+    result = subprocess.run(
+        [
+            "python3",
+            str(
+                candidate.repository_root
+                / "deploy/control-plane/tools/collect_installed_resource_registry.py"
+            ),
+            "--config",
+            str(config),
+        ],
+        cwd=candidate.repository_root,
+        env=effective_environment(candidate),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        return False
+    try:
+        registry = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(registry, dict):
+        return False
+    gpu = registry.get("gpu")
+    resources = gpu.get("resources") if isinstance(gpu, dict) else None
+    return not resources and not registry.get("unregistered_resources")

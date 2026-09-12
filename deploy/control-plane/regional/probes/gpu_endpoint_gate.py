@@ -24,6 +24,7 @@ import os
 import pathlib
 import socket
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,9 +34,27 @@ expected_hostname = os.environ["EXPECTED_HOSTNAME"]
 parsed = urllib.parse.urlsplit(base_url)
 if parsed.scheme != "https" or parsed.hostname != expected_hostname:
     raise RuntimeError("control-plane URL does not use the expected HTTPS hostname")
-addresses = sorted(
-    {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
+# A join associates the GPU VPC with the private hosted zone moments before
+# this Pod starts, and the VPC resolver keeps answering NXDOMAIN for a while
+# (live 2026-09-12: still unresolved 50 s after the association). Keep asking
+# until the name resolves or the wait runs out; the caller's Pod deadline is
+# longer than this.
+dns_deadline = time.monotonic() + float(
+    os.environ.get("DNS_RESOLVE_WAIT_SECONDS", "180")
 )
+while True:
+    try:
+        addresses = sorted(
+            {
+                item[4][0]
+                for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+            }
+        )
+        break
+    except socket.gaierror:
+        if time.monotonic() >= dns_deadline:
+            raise
+        time.sleep(5)
 if not addresses:
     raise RuntimeError("control-plane DNS returned no addresses")
 context = ssl.create_default_context(cafile="/tls/ca.crt")

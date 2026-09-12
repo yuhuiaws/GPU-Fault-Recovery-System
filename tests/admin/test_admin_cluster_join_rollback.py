@@ -484,3 +484,118 @@ def test_a_retry_after_rollback_starts_a_fresh_attempt(
     assert (attempt.state_dir / "state.attempt-001.json").exists(), (
         "the rolled-back attempt must be archived, not overwritten"
     )
+
+
+EMPTY_REGISTRY = json.dumps(
+    {
+        "schema_version": 1,
+        "cpu": {"resources": [{"kind": "deployment", "name": "gpu-fault-api"}]},
+        "gpu": {"resources": []},
+        "unregistered_resources": [],
+    }
+)
+
+
+def test_a_release_that_installed_nothing_needs_no_gpu_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup script refuses an empty inventory; do not ask it to clean one.
+
+    Live, 2026-09-12: the release failed at the endpoint gate, before any GPU
+    resource existed, and the rollback then failed on "cleanup resource
+    inventory gpu.resources is empty" -- leaving the attempt ROLLBACK_FAILED
+    and the membership undo skipped. When the installed-resource registry
+    shows nothing on the GPU plane, the rollback skips the script.
+    """
+
+    attempt = Attempt(tmp_path)
+    attempt.commands = Commands(
+        outputs=(("collect_installed_resource_registry.py", EMPTY_REGISTRY),)
+    )
+
+    attempt.run(monkeypatch, error="cluster deploy failed")
+
+    assert attempt.state()["phase"] == "ROLLED_BACK", "the rollback must complete"
+    assert attempt.commands.matching("collect_installed_resource_registry.py"), (
+        "the registry was not consulted"
+    )
+    assert not attempt.commands.matching("prepare-clean-redeploy.sh"), (
+        "the cleanup script was run against an empty inventory"
+    )
+    assert attempt.membership == [True], "the membership undo must still run"
+
+
+def test_a_retry_after_a_failed_rollback_finishes_the_undo_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ROLLBACK_FAILED`` keeps its evidence so the retry can finish the undo.
+
+    The retry must not resume the attempt (its IAM roles and zone association
+    are already gone) and must not open a new one on top of the leftovers
+    (live, 2026-09-12: the control plane still listed the cluster as a
+    member). It re-runs the rollback; once that is clean the attempt is
+    archived and discovery starts over.
+    """
+
+    attempt = Attempt(tmp_path)
+    attempt.commands = Commands(
+        failures=[("prepare-clean-redeploy.sh", 1, "cleanup refused")]
+    )
+    attempt.run(monkeypatch, error="cleanup refused")
+    assert attempt.state()["phase"] == "ROLLBACK_FAILED", "the first undo must fail"
+    assert attempt.membership == [], "membership must stay until the undo is clean"
+
+    attempt.commands = Commands()
+    attempt.install(monkeypatch)
+    seen: list[dict[str, Any]] = []
+
+    def prepare(_request: Any, **keywords: Any) -> Any:
+        seen.append(json.loads(json.dumps(keywords["state"])))
+        raise BootstrapError("stop after reset")
+
+    monkeypatch.setattr(admin_cluster_join, "_prepare_execution", prepare)
+    with pytest.raises(BootstrapError, match="stop after reset"):
+        join_cluster(
+            JoinClusterRequest(
+                site=attempt.site,
+                gpu_cluster_arn=GPU_B_ARN,
+                state_dir=attempt.state_dir,
+            ),
+            runner=SimpleNamespace(dry_run=False),
+        )
+
+    assert attempt.commands.matching("prepare-clean-redeploy.sh"), (
+        "the retry did not re-run the failed undo"
+    )
+    assert attempt.membership == [True], "the retry must finish the membership undo"
+    assert seen and seen[0]["attempt"] == 2, "a clean undo must open a fresh attempt"
+    assert seen[0]["completed_steps"] == [], "the fresh attempt must rediscover"
+
+
+def test_a_retry_whose_undo_still_fails_stops_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = Attempt(tmp_path)
+    attempt.commands = Commands(
+        failures=[("prepare-clean-redeploy.sh", 1, "cleanup refused")]
+    )
+    attempt.run(monkeypatch, error="cleanup refused")
+
+    attempt.install(monkeypatch)
+    monkeypatch.setattr(
+        admin_cluster_join,
+        "_prepare_execution",
+        lambda *_args, **_keywords: pytest.fail("the join must not proceed"),
+    )
+    with pytest.raises(BootstrapError, match="cleanup refused"):
+        join_cluster(
+            JoinClusterRequest(
+                site=attempt.site,
+                gpu_cluster_arn=GPU_B_ARN,
+                state_dir=attempt.state_dir,
+            ),
+            runner=SimpleNamespace(dry_run=False),
+        )
+
+    assert attempt.state()["phase"] == "ROLLBACK_FAILED", "the evidence must be kept"
+    assert attempt.membership == [], "membership must not be undone over leftovers"

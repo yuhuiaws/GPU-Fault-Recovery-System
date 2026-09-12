@@ -37,6 +37,7 @@ from gpu_fault.admin.bootstrap_services import (
     provision_node_action_keys,
 )
 from gpu_fault.admin.cluster_join_rollback import (
+    nothing_installed,
     restore_current_context,
     rollback_command,
     rollback_iam_role,
@@ -708,6 +709,11 @@ def _cleanup_candidate(
 ) -> None:
     errors = []
     with materialized_release_config(candidate) as config:
+        if nothing_installed(candidate, config):
+            # The release failed before it installed anything (live
+            # 2026-09-12: at the endpoint gate); the cleanup script refuses an
+            # empty inventory, and there is nothing for it to undo.
+            return
         result = subprocess.run(
             [
                 str(
@@ -1384,6 +1390,9 @@ def _join_cluster_locked(
 ) -> dict[str, Any]:
     state_dir, state_path, state = _state(request)
     attempt = JoinAttempt(request, state_dir, state_path, state)
+    if state.get("phase") == "ROLLBACK_FAILED":
+        # Finish the undo the last run could not; it raises if it still cannot.
+        _rollback(request, state_dir=state_dir, state_path=state_path, state=state)
     if state.get("phase") == "ROLLED_BACK":
         # Its recorded discovery describes the world that made it fail.
         _reset_completed_state(

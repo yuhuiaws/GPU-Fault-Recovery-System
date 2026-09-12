@@ -101,6 +101,17 @@ def _initialize_context(
     for request in requests:
         attempt_state_dir, state_path, state = load_join_state(request)
         attempt = JoinAttempt(request, attempt_state_dir, state_path, state)
+        if state.get("phase") == "ROLLBACK_FAILED":
+            try:
+                join._rollback(
+                    request,
+                    state_dir=attempt_state_dir,
+                    state_path=state_path,
+                    state=state,
+                )
+            except BootstrapError as exc:
+                _record_failure(context, attempt, None, exc)
+                continue
         if state.get("phase") == "ROLLED_BACK":
             reset_completed_state(
                 request,
