@@ -37,6 +37,7 @@ from gpu_fault_release.regional_release_diff import (
     build_execution_plan,
     control_plane_role_targets,
 )
+from gpu_fault_release.regional_release_gpu_stage import stage_gpu_prerequisites
 from gpu_fault_release.regional_release_legacy import (
     rollback_controller_config,
     validate_rollback_agent_identity,
@@ -606,9 +607,8 @@ def bootstrap_gpu_target(self: Any, target: ClusterTarget) -> None:
     self._ensure_gpu_namespace(target)
     self._ensure_connection_secret(target)
     self._quiesce_gpu_executor(target)
-    self._verify_gpu_control_plane_endpoint(target)
-    self._apply_gpu_dcgm_exporter(target)
-    self._apply_gpu_adot_collector(target)
+    # Gate, DCGM and collector together; Deployments only after the gate passed.
+    stage_gpu_prerequisites(self, target)
     self._apply_gpu_deployments(target, self.executor_wheel_cm)
     self._roll_node_runtime(
         target,

@@ -101,14 +101,21 @@ def test_rollout_wait_rejects_deterministic_unschedulable_pod() -> None:
         )
 
 
-def test_gpu_deployments_apply_dependency_waves_and_wait_in_parallel(
+def test_gpu_deployments_apply_once_and_wait_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """One wave: every manifest is applied, then all three rollouts are waited
+    at once. The Deployments have no dependency on one another -- each talks to
+    the control plane, none to another -- and the endpoint gate they share has
+    already passed by the time this runs (``regional_release_gpu_stage``), so
+    waiting for the Executor before applying the other two only stacked a
+    second rollout wait on the first (live 2026-09-12)."""
+
     sequence: list[str] = []
     active = 0
     maximum = 0
     lock = threading.Lock()
-    two_started = threading.Event()
+    all_started = threading.Event()
     manifests = [
         ("watcher", "watcher-yaml"),
         ("executor", "executor-yaml"),
@@ -149,15 +156,13 @@ def test_gpu_deployments_apply_dependency_waves_and_wait_in_parallel(
 
     def wait(_release, _target, deployment):
         nonlocal active, maximum
-        sequence.append(f"wait:{deployment}")
-        if deployment == "executor":
-            return {}
         with lock:
+            sequence.append(f"wait:{deployment}")
             active += 1
             maximum = max(maximum, active)
-            if active == 2:
-                two_started.set()
-        assert two_started.wait(timeout=2), "secondary Deployment waits did not overlap"
+            if active == 3:
+                all_started.set()
+        assert all_started.wait(timeout=2), "the Deployment waits did not overlap"
         time.sleep(0.01)
         with lock:
             active -= 1
@@ -177,9 +182,13 @@ def test_gpu_deployments_apply_dependency_waves_and_wait_in_parallel(
         "dry-run:executor-yaml",
         "dry-run:collector-yaml",
     }
-    assert sequence[3:5] == ["apply:executor-yaml", "wait:executor"]
-    assert set(sequence[5:7]) == {"apply:watcher-yaml", "apply:collector-yaml"}
-    assert maximum == 2
+    assert sequence[3:6] == [
+        "apply:executor-yaml",
+        "apply:watcher-yaml",
+        "apply:collector-yaml",
+    ], "every Deployment is applied, in a fixed order, before any wait starts"
+    assert set(sequence[6:]) == {"wait:executor", "wait:watcher", "wait:collector"}
+    assert maximum == 3, "all three rollouts must be waited together"
 
 
 def test_reconciler_deploy_uses_progress_aware_wait(

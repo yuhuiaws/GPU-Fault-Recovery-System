@@ -761,7 +761,9 @@ def test_bootstrap_gates_each_gpu_step_on_its_dependency() -> None:
     The connection Secret and a verified control-plane endpoint must exist before
     the Executor is allowed to reach the region, and DCGM has to be exporting
     before the node Installer rolls, or the first nodes come up without the
-    metrics every policy decision reads.
+    metrics every policy decision reads. The gate, DCGM and the collector do not
+    depend on one another and run as one stage (``regional_release_gpu_stage``),
+    so only their membership is fixed, not their order among themselves.
     """
 
     release, calls = bootstrap_recorder()
@@ -770,16 +772,9 @@ def test_bootstrap_gates_each_gpu_step_on_its_dependency() -> None:
         release, SimpleNamespace(cluster_id="gpu-a")
     )
 
-    assert calls == [
-        "namespace",
-        "secret",
-        "quiesce",
-        "endpoint",
-        "dcgm",
-        "adot",
-        "executor",
-        "node-runtime",
-    ]
+    assert calls[:3] == ["namespace", "secret", "quiesce"], calls
+    assert set(calls[3:6]) == {"endpoint", "dcgm", "adot"}, calls
+    assert calls[6:] == ["executor", "node-runtime"], calls
 
 
 def test_dcgm_exporter_is_ready_before_node_installer(tmp_path: Path) -> None:
@@ -1112,6 +1107,18 @@ ROLLOUT_TARGET = SimpleNamespace(cluster_id="gpu-a")
 ROLLOUT_GATE = ("endpoint", "dcgm", "deployments")
 
 
+def assert_gate_precedes_deployments(calls: list[str]) -> None:
+    """The gate and DCGM run as one stage; the Deployments follow both.
+
+    Their order among themselves is not fixed (``regional_release_gpu_stage``
+    runs them together); that nothing reaching the control plane is applied
+    before the gate has passed is what every Executor rollout path has to keep.
+    """
+
+    assert set(calls[:2]) == {"endpoint", "dcgm"}, calls
+    assert calls[2:] == ["deployments"], calls
+
+
 def rollout_gate_recorder(calls: list[str]) -> dict:
     """The three steps every Executor rollout path has to order identically."""
 
@@ -1151,11 +1158,15 @@ def test_upgrade_requires_gpu_dns_and_tls_before_the_executor() -> None:
         ),
     )
 
-    assert tuple(calls) == ROLLOUT_GATE
+    assert_gate_precedes_deployments(calls)
 
 
 def test_rollback_requires_gpu_dns_and_tls_before_the_executor() -> None:
-    """A rollback re-checks the endpoint after restoring the previous Secret."""
+    """A rollback re-checks the endpoint after restoring the previous Secret.
+
+    The rollback path stays strictly serial -- it is the conservative path and
+    is not staged -- so its order is pinned exactly.
+    """
 
     calls: list[str] = []
     release = SimpleNamespace(
@@ -1248,7 +1259,7 @@ def test_join_requires_gpu_dns_and_tls_before_the_executor(
 
     MODULE.RegionalRelease.join_cluster(release, "gpu-a")
 
-    assert tuple(calls) == ROLLOUT_GATE
+    assert_gate_precedes_deployments(calls)
 
 
 def test_each_join_attempt_opens_its_own_fleet_rollout_transaction() -> None:

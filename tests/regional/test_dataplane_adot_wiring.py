@@ -115,6 +115,14 @@ def _gpu_recorder(calls: list[str]) -> dict[str, Any]:
     }
 
 
+def _assert_collector_is_staged_with_dcgm_before_the_executor(calls: list[str]) -> None:
+    # The gate, DCGM and the collector run as one stage
+    # (``regional_release_gpu_stage``); only their membership is fixed.
+    assert calls[:3] == ["namespace", "secret", "quiesce"], calls
+    assert set(calls[3:6]) == {"endpoint", "dcgm", "adot"}, calls
+    assert calls[6:8] == ["executor", "node-runtime"], calls
+
+
 def test_bootstrap_applies_the_collector_right_after_dcgm() -> None:
     """A bootstrapping cluster gets its scrape path before the Executor rolls.
 
@@ -126,16 +134,8 @@ def test_bootstrap_applies_the_collector_right_after_dcgm() -> None:
 
     ORCHESTRATION.bootstrap_gpu_target(SimpleNamespace(**_gpu_recorder(calls)), TARGET)
 
-    assert calls == [
-        "namespace",
-        "secret",
-        "quiesce",
-        "endpoint",
-        "dcgm",
-        "adot",
-        "executor",
-        "node-runtime",
-    ]
+    _assert_collector_is_staged_with_dcgm_before_the_executor(calls)
+    assert len(calls) == 8, calls
 
 
 def test_join_applies_the_collector_right_after_dcgm(
@@ -163,19 +163,10 @@ def test_join_applies_the_collector_right_after_dcgm(
 
     MODULE.RegionalRelease.join_cluster(release, "gpu-a")
 
-    assert calls == [
-        "namespace",
-        "secret",
-        "quiesce",
-        "endpoint",
-        "dcgm",
-        "adot",
-        "executor",
-        "node-runtime",
-        # Fix round 2 (LOW-3): the joined cluster's absence rule is rendered
-        # once it is up, not on the next deploy.
-        "observability",
-    ]
+    _assert_collector_is_staged_with_dcgm_before_the_executor(calls)
+    # Fix round 2 (LOW-3): the joined cluster's absence rule is rendered
+    # once it is up, not on the next deploy.
+    assert calls[8:] == ["observability"], calls
 
 
 def test_upgrade_applies_the_collector_on_the_observability_node() -> None:
@@ -197,11 +188,13 @@ def test_upgrade_applies_the_collector_on_the_observability_node() -> None:
         ),
     )
 
-    assert calls == ["dcgm", "adot"]
-    assert progress[-2:] == [
-        ((Component.OBSERVABILITY,), "STARTED"),
-        ((Component.OBSERVABILITY,), "COMPLETED"),
+    assert set(calls) == {"dcgm", "adot"}, calls
+    observability = [
+        status
+        for components, status in progress
+        if components == (Component.OBSERVABILITY,)
     ]
+    assert observability == ["STARTED", "COMPLETED"], progress
 
 
 def test_upgrade_without_the_observability_node_leaves_the_collector_alone() -> None:

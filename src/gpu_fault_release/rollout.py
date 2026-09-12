@@ -117,6 +117,9 @@ from gpu_fault_release.regional_release_gpu_rollout import (
 from gpu_fault_release.regional_release_gpu_rollout import (
     require_executor_pin as require_executor_pin,
 )
+from gpu_fault_release.regional_release_gpu_stage import (
+    stage_join_gpu_prerequisites,
+)
 from gpu_fault_release.regional_release_iam import (
     validate_executor_iam_documents as validate_executor_iam_documents,
 )
@@ -1192,24 +1195,11 @@ class RegionalRelease:
         self._ensure_gpu_namespace(target)
         self._ensure_connection_secret(target)
         self._quiesce_gpu_executor(target)
-        self._verify_gpu_control_plane_endpoint(target)
-        self._apply_gpu_dcgm_exporter(target)
-        self._apply_gpu_adot_collector(target)
-        self._upload_config_map(
-            self._gpu(target),
-            self.executor_wheel_cm,
-            self.config.executor_wheel.name,
-            self.config.executor_wheel,
-            self.executor_wheel_sha,
-            compress=True,
-        )
-        self._upload_config_map(
-            self._gpu(target),
-            self.bundle_cm,
-            self.config.bundle.name,
-            self.config.bundle,
-            self.bundle_sha,
-        )
+        # The DNS/TLS gate beside DCGM, the ADOT collector and the two artifact
+        # ConfigMaps -- none of those reach the control plane -- and the
+        # Executor, watcher and collector Deployments only once the gate has
+        # passed (regional_release_gpu_stage).
+        stage_join_gpu_prerequisites(self, target)
         metadata = self._config_map_data("gpu-fault-release-metadata")
         required = metadata.get("required-agent-artifact-sha256")
         required_executor = metadata.get("required-regional-executor-artifact-sha256")

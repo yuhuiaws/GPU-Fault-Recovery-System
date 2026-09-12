@@ -24,6 +24,7 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseExecutionPlan,
     build_execution_plan,
 )
+from gpu_fault_release.regional_release_gpu_stage import GpuStageStep, run_gpu_stage
 from gpu_fault_release.regional_release_rendering import render_gpu_rollout_manifests
 from gpu_fault_release.regional_release_rollout_wait import wait_deployment_rollout
 
@@ -789,52 +790,52 @@ def apply_gpu_deployments(
         executor_compatibility_digest=executor_compatibility_digest,
         require_live_pin=True,
     )
-    waves = []
-    if inventory.GPU_EXECUTOR_DEPLOYMENT in manifests:
-        waves.append((inventory.GPU_EXECUTOR_DEPLOYMENT,))
-    secondary = tuple(
+    # One wave. The three Deployments each talk to the control plane and none
+    # of them to another, and the endpoint gate they all depend on has already
+    # passed by the time this runs (regional_release_gpu_stage), so waiting for
+    # the Executor before applying the watcher and the collector only stacked a
+    # second ~40 s rollout wait on top of the first (live 2026-09-12). Every
+    # manifest is applied in this fixed order, then all rollouts are waited
+    # together; each wait keeps its own deadline and no-progress budget, so the
+    # whole wave is bounded by one Deployment's timeout instead of two.
+    ordered = [
         deployment
         for deployment in (
+            inventory.GPU_EXECUTOR_DEPLOYMENT,
             inventory.GPU_WATCHER_DEPLOYMENT,
             inventory.GPU_COLLECTOR_DEPLOYMENT,
         )
         if deployment in manifests
-    )
-    if secondary:
-        waves.append(secondary)
-    known = {deployment for wave in waves for deployment in wave}
-    waves.extend((deployment,) for deployment in sorted(set(manifests) - known))
+    ]
+    ordered.extend(sorted(set(manifests) - set(ordered)))
     for manifest in manifests.values():
         release.runner.run(
             release._gpu(target, "apply", "--dry-run=server", "-f", "-"),
             input_text=manifest,
         )
-    for wave in waves:
-        for deployment in wave:
-            manifest = manifests[deployment]
-            release.runner.run(
-                release._gpu(target, "apply", "-f", "-"),
-                input_text=manifest,
-            )
-        with ThreadPoolExecutor(max_workers=len(wave)) as executor:
-            futures = {
-                executor.submit(
-                    wait_deployment_rollout,
-                    release,
-                    target,
-                    deployment,
-                ): deployment
-                for deployment in wave
-            }
-            for future in as_completed(futures):
-                deployment = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    raise ReleaseError(
-                        f"{target.cluster_id} Deployment {deployment} rollout "
-                        f"failed: {exc}"
-                    ) from exc
+    for deployment in ordered:
+        release.runner.run(
+            release._gpu(target, "apply", "-f", "-"),
+            input_text=manifests[deployment],
+        )
+    with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as executor:
+        futures = {
+            executor.submit(
+                wait_deployment_rollout,
+                release,
+                target,
+                deployment,
+            ): deployment
+            for deployment in ordered
+        }
+        for future in as_completed(futures):
+            deployment = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                raise ReleaseError(
+                    f"{target.cluster_id} Deployment {deployment} rollout failed: {exc}"
+                ) from exc
     if inventory.GPU_EXECUTOR_DEPLOYMENT in manifests:
         prune_workload_namespace_rbac(release, target)
 
@@ -865,26 +866,46 @@ def upgrade_gpu_target(
         if progress is not None:
             progress(components, "COMPLETED", None)
 
+    # The endpoint gate, DCGM and the ADOT collector are independent of one
+    # another and run as one stage; each keeps its own progress record, so the
+    # release state names the component that failed, not the stage. The
+    # Deployments below are applied only after every step has returned, which
+    # is the ordering the gate exists for (regional_release_gpu_stage).
+    stage: list[GpuStageStep] = []
     if active_plan.has(ReleaseComponent.ENDPOINT):
-        run_component(
-            (ReleaseComponent.ENDPOINT,),
-            lambda: (
-                release._ensure_connection_secret(target),
-                release._verify_gpu_control_plane_endpoint(target),
-            ),
+        stage.append(
+            GpuStageStep(
+                "GPU DNS/TLS gate",
+                lambda: run_component(
+                    (ReleaseComponent.ENDPOINT,),
+                    lambda: (
+                        release._ensure_connection_secret(target),
+                        release._verify_gpu_control_plane_endpoint(target),
+                    ),
+                ),
+            )
         )
     if active_plan.has(ReleaseComponent.DCGM):
-        run_component(
-            (ReleaseComponent.DCGM,),
-            lambda: release._apply_gpu_dcgm_exporter(
-                target,
-            ),
+        stage.append(
+            GpuStageStep(
+                "DCGM exporter",
+                lambda: run_component(
+                    (ReleaseComponent.DCGM,),
+                    lambda: release._apply_gpu_dcgm_exporter(target),
+                ),
+            )
         )
     if active_plan.has(ReleaseComponent.OBSERVABILITY):
-        run_component(
-            (ReleaseComponent.OBSERVABILITY,),
-            lambda: release._apply_gpu_adot_collector(target),
+        stage.append(
+            GpuStageStep(
+                "data-plane ADOT collector",
+                lambda: run_component(
+                    (ReleaseComponent.OBSERVABILITY,),
+                    lambda: release._apply_gpu_adot_collector(target),
+                ),
+            )
         )
+    run_gpu_stage(release, target.cluster_id, stage)
     deployment_components = tuple(
         (component, deployment)
         for component, deployment in (

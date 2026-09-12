@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -82,6 +83,58 @@ def _registration(
     return matches[0]
 
 
+def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> None:
+    """Name the control-plane members that held a publish past its window.
+
+    Convergence is over the control plane's own processes, nothing else: the
+    member rows ``active_registry_member_ids`` counted at publish time (every
+    process that heartbeated within ``GPU_FAULT_REGISTRY_STALE_SECONDS``) must
+    each re-read the new head and heartbeat it before ``converged`` turns true
+    (``regional_registry_runtime.registry_revision_converged``). A GPU cluster
+    has no row -- its executor and agents are not registry members -- so a
+    cluster being joined, purged or rolled back never widens the set, and a
+    publish with no active member at all converges on the probe's first poll.
+
+    So when a publish still runs its whole window out, some control-plane
+    process did not ack, and the probe's own exit line names only the
+    generation. This reads the status once more and prints the members that
+    are missing, with the readiness and error each reports, so the next live
+    occurrence is attributable to a process instead of to "the fleet". It is
+    best effort and never masks the failure that brought the caller here.
+    """
+
+    try:
+        status = _request(release, "GET", "/v1/regional/registry/status")
+    except ReleaseError as exc:
+        print(
+            "regional registry status is unavailable after the publish ran out "
+            f"its {timeout_seconds:.0f}s convergence window: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    members = {
+        str(item.get("member_id")): item
+        for item in status.get("members") or []
+        if isinstance(item, dict)
+    }
+    lines = [
+        f"regional registry generation {status.get('generation')} did not "
+        f"converge within {timeout_seconds:.0f}s: "
+        f"required={status.get('required_member_ids')} "
+        f"acked={status.get('acked_member_ids')} "
+        f"active={status.get('active_member_ids')}"
+    ]
+    for member_id in status.get("missing_member_ids") or []:
+        member = members.get(str(member_id)) or {}
+        lines.append(
+            f"  missing {member_id}: role={member.get('service_role')} "
+            f"ready={member.get('ready')} generation={member.get('generation')} "
+            f"last_seen_at={member.get('last_seen_at')} error={member.get('error')}"
+        )
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
 def publish_registry_revision(
     release: Any,
     *,
@@ -90,22 +143,32 @@ def publish_registry_revision(
     use_current_generation: bool,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    output = exec_cpu_ingress_command(
-        release,
-        arguments=("python3", "-c", probe_source("registry_publish_converge")),
-        failure="a registry revision publish",
-        input_text=json.dumps(
-            {
-                "path": path,
-                "payload": payload,
-                "use_current_generation": use_current_generation,
-                "timeout_seconds": timeout_seconds,
-            },
-            separators=(",", ":"),
-        ),
-        sensitive=True,
-        timeout_seconds=timeout_seconds + 60,
-    )
+    started = time.monotonic()
+    try:
+        output = exec_cpu_ingress_command(
+            release,
+            arguments=("python3", "-c", probe_source("registry_publish_converge")),
+            failure="a registry revision publish",
+            input_text=json.dumps(
+                {
+                    "path": path,
+                    "payload": payload,
+                    "use_current_generation": use_current_generation,
+                    "timeout_seconds": timeout_seconds,
+                },
+                separators=(",", ":"),
+            ),
+            sensitive=True,
+            timeout_seconds=timeout_seconds + 60,
+        )
+    except ReleaseError:
+        # The probe is sensitive, so its last words are not forwarded; a
+        # failure that took the whole convergence window is the probe giving
+        # up on a member, and that member is worth a second, read-only exec.
+        # A refusal (identity, generation) fails in seconds and gets none.
+        if time.monotonic() - started >= timeout_seconds:
+            describe_unconverged_publish(release, timeout_seconds=timeout_seconds)
+        raise
     value = json.loads(output)
     if not isinstance(value, dict):
         raise ReleaseError("regional registry client returned a non-object")
