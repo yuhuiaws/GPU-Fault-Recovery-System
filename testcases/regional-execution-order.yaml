@@ -24,12 +24,17 @@ phases:
         predecessor: GF-REGIONAL-BOOT-026
       - case: GF-REGIONAL-BOOT-028
         predecessor: GF-REGIONAL-BOOT-027
+      - case: GF-REGIONAL-BOOT-029
+        predecessor: GF-REGIONAL-BOOT-028
     notes:
       - BOOT-023 以 BOOT-020 PASS 为证据前置；BOOT-021/022 之间没有它要读的发布历史。
-      - BOOT-024..028 是管理员生命周期链，按 remove-cluster → join-cluster 重接 → 二次 remove 与
+      - BOOT-024..029 是管理员生命周期链，按 remove-cluster → join-cluster 重接 → 二次 remove 与
         deploy 批量 join → uninstall keep + reset-database → 空集群全新 deploy 与续跑的顺序，
         每条以前一条 PASS 为证据前置（BOOT-024 读 BOOT-023）；只在隔离站点执行——该站点唯一的
         GPU 集群会被注销、重接并整体卸载，在共享验收站点上记 BLOCKED_PREREQUISITE。
+      - BOOT-029 把冷构建首次 deploy → remove-cluster → join-cluster → uninstall keep +
+        reset-database → 再次冷构建首次 deploy 作为一条序列由驱动一次跑完；它以 BOOT-028 PASS
+        为证据前置，并要求先把 BOOT-028 装出的站点卸载成一对空集群。
   - sequence: 1
     name: 启动配置守卫
     maintenance_window: 否

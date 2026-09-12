@@ -112,6 +112,9 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         "GF-REGIONAL-BOOT-026": "GF-REGIONAL-BOOT-025",
         "GF-REGIONAL-BOOT-027": "GF-REGIONAL-BOOT-026",
         "GF-REGIONAL-BOOT-028": "GF-REGIONAL-BOOT-027",
+        # The whole-lifecycle sequence starts from the empty clusters the
+        # uninstalled BOOT-028 site leaves behind.
+        "GF-REGIONAL-BOOT-029": "GF-REGIONAL-BOOT-028",
         "GF-REGIONAL-HA-010": "GF-REGIONAL-HA-001",
         "GF-REGIONAL-DESTR-016": "GF-REGIONAL-DESTR-002",
         "GF-REGIONAL-DESTR-017": "GF-REGIONAL-DESTR-002",

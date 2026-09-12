@@ -2542,6 +2542,25 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-028
   related_pytest: tests/admin/test_admin_bootstrap.py::test_admin_release_reuses_signed_release_for_same_commit
+- id: GF-REGIONAL-BOOT-029
+  title: 管理员部署生命周期序列：冷构建首次 deploy → remove-cluster → join-cluster → uninstall keep + reset-database → 再次冷构建首次 deploy
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: BOOT-024..028 各自只证一个管理员动词并允许单独执行，没有用例把首次部署、注销、重接、卸载与重建作为管理员真实经历的一条不可拆分顺序跑完；也没有用例证明两次首次部署都是没有 BuildKit 缓存、本地镜像与 ECR buildcache 的冷构建，以及卸载后的站点能从零重建出与第一轮相同的结果。
+  injection: 在一对空集群上用 scripts/acceptance/admin-lifecycle-sequence.sh 顺序执行五个阶段：清空 BuildKit 缓存、本地 gpu-fault-runtime 镜像与站点 ECR 标签后 gpu-fault-admin deploy 首次部署，remove-cluster 注销唯一 GPU 集群，join-cluster 重接，uninstall --cpu-cluster keep --reset-database，再次清空缓存后向第二个空 state-dir 首次部署；每条命令等到退出，第一处失败即停止并按阶段号续跑。
+  expected:
+  - 五个阶段按 1→2→3→4→5 各执行一次，驱动在第一处失败停止并给出可用 --stage 续跑的阶段号
+  - 阶段 1 与阶段 5 的部署日志出现六个 Dockerfile 步骤行、没有任何 CACHED 行且 FROM 步骤有 extracting 拉取行，release 描述符为构建而非 registry 复用；部署前本地缓存与镜像已清空，站点 ECR 标签不存在
+  - 阶段 1 与阶段 5 的 bootstrap-state.json 走完 new、discovered、aws-infrastructure-ready、platform-prerequisites-ready、site-ready，BOOT-028 步骤 3-7 的核对成立
+  - 阶段 2 的 remove-cluster state.json 终态 COMPLETED 且 BOOT-024 步骤 2、4、5 成立；阶段 3 的 join-cluster state.json 终态 COMPLETED 且 BOOT-025 步骤 2、3、4 成立；阶段 4 的 uninstall state.json 终态 COMPLETED 且 BOOT-027 步骤 3、5、6、7 成立，站点 ECR 仓库已删除
+  - 阶段 5 与阶段 1 的 site_id、completed_tasks 集合、AWS 资源条数与 status --full PASS 计数一致，重跑 deploy --state-dir 严格 NOOP
+  - 驱动的 admin-lifecycle-sequence.json 记录每阶段 PASS/FAIL、日志 sha256 与冷构建计数，ARN、邮箱与路径只以 sha256 出现
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-029
+  related_pytest: tests/regional/test_admin_lifecycle_sequence_script.py::test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy
 - id: GF-REGIONAL-AUTH-001
   title: 缺少集群 header 返回 401
   category: regional-authentication

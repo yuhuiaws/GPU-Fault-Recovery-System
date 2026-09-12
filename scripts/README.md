@@ -54,6 +54,11 @@ generic fault-case runner.
 - `run_static_gates.py`: bounded static DAG for Ruff, mypy, compileall,
   architecture, contracts, safety, deployment/config, docs, YAML and Shell.
   The same runner backs local `make check` and the production fallback.
+- `scripts/acceptance/`: administrator-run acceptance drivers that call only
+  the public `gpu-fault-admin` verbs plus `docker`/`aws`
+  (`admin-lifecycle-sequence.sh` runs GF-REGIONAL-BOOT-029: cold first deploy,
+  remove-cluster, join-cluster, uninstall keep + reset-database, cold first
+  deploy again, stopping at the first failing stage).
 - `scripts/e2e/regional/`: regional acceptance drivers, probes, boot guards,
   recovery helpers and test-only Kubernetes inputs.
 - `scripts/e2e/hyperpod/`: focused HyperPod scenario runners.
