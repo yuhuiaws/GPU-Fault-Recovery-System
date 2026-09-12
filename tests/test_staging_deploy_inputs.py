@@ -124,6 +124,30 @@ def test_first_deploy_requires_all_three_inputs(tmp_path: Path) -> None:
         )
 
 
+def test_a_managed_site_with_no_gpu_cluster_left_still_deploys(tmp_path: Path) -> None:
+    """remove-cluster of the last GPU cluster leaves ``clusters: []`` and a
+    control plane on an explicit empty registry; a deploy of that site is a
+    CPU-only upgrade, not a first deploy (live 2026-09-12: refused as "no
+    cluster identity"). Only the CPU cluster identity is required."""
+
+    state = tmp_path / "state"
+    _write_site(state)
+    document = yaml.safe_load((state / "site.yaml").read_text(encoding="utf-8"))
+    document["spec"]["clusters"] = []
+    (state / "site.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    arguments = _arguments(state)
+    resolved = staging_deploy.resolve_deploy_inputs(arguments, state_dir=state)
+
+    assert resolved == (CPU_ARN, (), EMAIL)
+    assert arguments.gpu_cluster_arn == []
+
+    document["spec"]["cpu"] = {}
+    (state / "site.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(staging_deploy.StagingDeployError, match="CPU cluster identity"):
+        staging_deploy.resolve_deploy_inputs(_arguments(state), state_dir=state)
+
+
 def test_rerun_command_is_one_parameter_on_a_managed_site(tmp_path: Path) -> None:
     upgrade = staging_deploy.deploy_rerun_command(
         state_dir=tmp_path,

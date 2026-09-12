@@ -104,12 +104,19 @@ def resolve_deploy_inputs(
         cpu_arn = cpu_arn or str(site["cpu_cluster_arn"] or "")
         gpu_arns = gpu_arns or cast(tuple[str, ...], site["gpu_cluster_arns"])
         admin_email = admin_email or str(site["admin_email"] or "")
-    if not cpu_arn or not gpu_arns:
+    if site is None and (not cpu_arn or not gpu_arns):
         raise StagingDeployError(
             "first deploy requires --cpu-cluster-arn and at least one --gpu-cluster-arn"
-            if site is None
-            else "managed site records no cluster identity; pass --cpu-cluster-arn "
-            "and --gpu-cluster-arn"
+        )
+    if not cpu_arn:
+        # A managed site always records its CPU cluster; its GPU set may be
+        # empty -- remove-cluster of the last GPU cluster leaves the control
+        # plane running on an explicit empty registry, and a deploy of that
+        # site is a CPU-only upgrade (the inner CLI treats "no GPU ARN given"
+        # as "the managed set", which is then empty). Live 2026-09-12 this was
+        # refused as "no cluster identity".
+        raise StagingDeployError(
+            "managed site records no CPU cluster identity; pass --cpu-cluster-arn"
         )
     if not admin_email:
         raise StagingDeployError(
