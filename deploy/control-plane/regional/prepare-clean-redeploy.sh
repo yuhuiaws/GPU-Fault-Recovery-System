@@ -684,6 +684,30 @@ find_database_pod() {
     return 1
 }
 
+reuse_previous_fleet_inventory() {
+    # An earlier run of this reset already stopped the control plane, so no
+    # Pod can export the fleet inventory again -- but that run attached the
+    # export to its state file, which the caller moves aside as
+    # <state>.failed-<stamp>.json before retrying (live uninstall,
+    # 2026-09-12). Reuse the newest such snapshot instead of refusing.
+    local candidate
+    local snapshot
+    [[ -n "${STATE_FILE}" ]] || return 1
+    candidate="$(
+        find "$(dirname "${STATE_FILE}")" -maxdepth 1 -type f \
+            -name "$(basename "${STATE_FILE%.json}").failed-*.json" \
+            -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | head -n 1 | cut -d' ' -f2- || true
+    )"
+    [[ -n "${candidate}" ]] || return 1
+    snapshot="$(
+        PYTHONDONTWRITEBYTECODE=1 python3 "${CLEANUP_STATE_TOOL}" reuse-fleet \
+            --path "${STATE_FILE}" --from "${candidate}" 2>/dev/null | head -n 1
+    )"
+    [[ "${snapshot}" =~ ^[0-9]+$ ]] || return 1
+    log "control plane already stopped by an earlier run; reused its fleet inventory (${snapshot} agent record(s)) from ${candidate}"
+}
+
 capture_fleet_inventory() {
     local pod=$1
     local missing
@@ -1283,29 +1307,39 @@ done
 log "captured pre-clean state in ${STATE_FILE}"
 
 DATABASE_POD="$(find_database_pod || true)"
+# PRESENT: the Deployments exist (a previous run may have scaled them to
+# zero). RUNNING: at least one still has replicas, so a Pod can exist and
+# work can still be created.
 CPU_RUNTIME_PRESENT=false
+CPU_RUNTIME_RUNNING=false
 for deployment in \
     "${CPU_INGRESS_DEPLOYMENTS[@]}" \
     "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
-    if [[ -n "$(deployment_replicas_cpu "${deployment}")" ]]; then
+    replicas="$(deployment_replicas_cpu "${deployment}")"
+    if [[ -n "${replicas}" ]]; then
         CPU_RUNTIME_PRESENT=true
-        break
+        if ((replicas > 0)); then
+            CPU_RUNTIME_RUNNING=true
+        fi
     fi
 done
 if [[ -n "${DATABASE_POD}" ]]; then
     capture_fleet_inventory "${DATABASE_POD}"
 elif [[ "${MODE}" == reset ]]; then
-    die "reset requires a running control-plane pod to export fleet inventory"
+    if [[ "${CPU_RUNTIME_RUNNING}" == true ]] ||
+        ! reuse_previous_fleet_inventory; then
+        die "reset requires a running control-plane pod to export fleet inventory (or an earlier run's ${STATE_FILE%.json}.failed-*.json to reuse)"
+    fi
 fi
 if [[ -n "${DATABASE_POD}" ]]; then
     if [[ "${MODE}" == reset && "${EXECUTE}" == true ]]; then
         fail_orphaned_remote_commands "${DATABASE_POD}"
     fi
     assert_no_active_work "${DATABASE_POD}"
-elif [[ "${SCOPE}" == gpu || "${CPU_RUNTIME_PRESENT}" == true ]]; then
+elif [[ "${SCOPE}" == gpu || "${CPU_RUNTIME_RUNNING}" == true ]]; then
     die "no running CPU control-plane pod is available for the Aurora safety check"
 else
-    log "CPU runtime is already absent; Aurora runtime checks are not available"
+    log "CPU runtime is already stopped; nothing can enqueue work, Aurora runtime checks are skipped"
 fi
 transition_state \
     PREFLIGHT COMPLETED \
@@ -1332,16 +1366,22 @@ if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
     transition_state \
         INGRESS_STOPPED COMPLETED \
         "CPU ingress stopped"
-    DATABASE_POD="$(find_database_pod || true)"
-    [[ -n "${DATABASE_POD}" ]] ||
-        die "no worker pod remains to verify the Aurora drain"
-    transition_state \
-        QUEUES_DRAINED IN_PROGRESS \
-        "waiting for processor, spool, workflow, and remote command drain"
-    wait_for_shared_queues "${DATABASE_POD}"
-    transition_state \
-        QUEUES_DRAINED COMPLETED \
-        "processor, spool, workflow, and remote command state drained"
+    if [[ "${CPU_RUNTIME_RUNNING}" == true ]]; then
+        DATABASE_POD="$(find_database_pod || true)"
+        [[ -n "${DATABASE_POD}" ]] ||
+            die "no worker pod remains to verify the Aurora drain"
+        transition_state \
+            QUEUES_DRAINED IN_PROGRESS \
+            "waiting for processor, spool, workflow, and remote command drain"
+        wait_for_shared_queues "${DATABASE_POD}"
+        transition_state \
+            QUEUES_DRAINED COMPLETED \
+            "processor, spool, workflow, and remote command state drained"
+    else
+        transition_state \
+            QUEUES_DRAINED COMPLETED \
+            "control plane already stopped by an earlier run; nothing can enqueue work"
+    fi
     transition_state \
         CONTROL_CONSUMERS_STOPPED IN_PROGRESS \
         "stopping CPU consumers"

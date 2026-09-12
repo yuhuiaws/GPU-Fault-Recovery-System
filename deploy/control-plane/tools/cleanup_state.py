@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-
 PHASES = (
     "PREFLIGHT",
     "GPU_DATA_PLANE_SOURCES_STOPPED",
@@ -297,6 +296,13 @@ def main() -> int:
         required=True,
     )
 
+    # A reset resumed over a control plane an earlier run already stopped has
+    # no Pod left to export the fleet inventory; the earlier run's record,
+    # moved aside as <state>.failed-<stamp>.json, still carries the export.
+    reuse = subparsers.add_parser("reuse-fleet")
+    reuse.add_argument("--path", type=Path, required=True)
+    reuse.add_argument("--from", dest="source", type=Path, required=True)
+
     update = subparsers.add_parser("transition")
     update.add_argument("--path", type=Path, required=True)
     update.add_argument(
@@ -342,6 +348,18 @@ def main() -> int:
                 raise CleanupStateError("fleet snapshot must be a JSON list")
             attach_fleet_snapshot(document, snapshot)
             atomic_write(args.path, document)
+        elif args.command == "reuse-fleet":
+            previous = json.loads(args.source.read_text(encoding="utf-8"))
+            snapshot = (
+                previous.get("fleet_snapshot") if isinstance(previous, dict) else None
+            )
+            if not isinstance(snapshot, list):
+                raise CleanupStateError(
+                    f"earlier cleanup record {args.source} carries no fleet snapshot"
+                )
+            attach_fleet_snapshot(document, snapshot)
+            atomic_write(args.path, document)
+            print(len(snapshot))
         elif args.command == "transition":
             transition(
                 document,

@@ -294,3 +294,156 @@ def test_node_components_stop_only_after_the_executors_and_the_drain() -> None:
     assert "clean-redeploy-orphan" in text, (
         "orphaned commands must carry an audit source"
     )
+
+
+FAKE_KUBECTL_STOPPED_PLANE = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_KUBECTL_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(" ".join(args) + "\\n")
+if "exec" in args:
+    raise SystemExit("no Pod is running: exec must not be attempted")
+if "get" in args and "--raw=/readyz" in args:
+    print("ok")
+    raise SystemExit(0)
+if "get" in args and "pod" in args:
+    print("", end="")
+    raise SystemExit(0)
+if (
+    "get" in args
+    and "configmap" in args
+    and "gpu-fault-installed-resources" in args
+):
+    print("Error from server (NotFound): configmap not found", file=sys.stderr)
+    raise SystemExit(1)
+if (
+    "get" in args
+    and "daemonset" in args
+    and "-o" in args
+    and "jsonpath" in " ".join(args)
+):
+    print("1", end="")
+    raise SystemExit(0)
+if (
+    "get" in args
+    and "-o" in args
+    and "json" in args
+    and (
+        args.index("-o") == args.index("get") + 2
+        or any("," in argument for argument in args)
+        or "namespace" in args
+    )
+):
+    items = []
+    kind = args[args.index("get") + 1]
+    if "," not in kind and kind == "deployment":
+        items = [
+            {"metadata": {"name": name}}
+            for name in (
+                "gpu-fault-api-ha",
+                "gpu-fault-control-worker",
+                "gpu-fault-cluster-executor",
+                "gpu-fault-completion-watcher",
+                "gpu-fault-kubernetes-node-resource-collector",
+                "gpu-fault-node-installer-reconciler",
+            )
+        ]
+    print(json.dumps({"items": items}))
+    raise SystemExit(0)
+if "get" in args and "deployment" in args:
+    print("0", end="")
+    raise SystemExit(0)
+if "get" in args and "nodes" in args:
+    print("fake-node Ready")
+    raise SystemExit(0)
+if "get" in args and ("daemonset" in args or "cronjob" in args):
+    print("Error from server (NotFound): resource not found", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(0)
+"""
+
+
+def test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Live uninstall, 2026-09-12: the first reset stopped ingress and the
+    consumers, then failed; the rerun died with "reset requires a running
+    control-plane pod to export fleet inventory" because no Pod was left to
+    export it, and it would have died again waiting for a drain no Pod can
+    report. The failed record the caller moved aside still carries the
+    export: a reset over a stopped control plane reuses it, skips the
+    Aurora checks nothing can invalidate, and completes."""
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "kubectl.log"
+    fake_kubectl = fake_bin / "kubectl"
+    fake_kubectl.write_text(FAKE_KUBECTL_STOPPED_PLANE, encoding="utf-8")
+    fake_kubectl.chmod(0o755)
+    kubeconfig = tmp_path / "cpu.kubeconfig"
+    kubeconfig.write_text("test", encoding="utf-8")
+    config = tmp_path / "regional-release.json"
+    config.write_text(
+        json.dumps(
+            {
+                "cpu_kubeconfig": str(kubeconfig),
+                "namespace": "gpu-fault-system",
+                "clusters": [{"cluster_id": "gpu-a", "context": "gpu-a-context"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    fleet = [
+        {
+            "cluster_id": "gpu-a",
+            "node_id": "node-a",
+            "lifecycle_state": "ACTIVE",
+            "installed_unit_inventory": {"units": ["gpu-fault-node-agent.service"]},
+        }
+    ]
+    (state_dir / "clean.failed-20260912T115617.json").write_text(
+        json.dumps(
+            {"phase": "QUEUES_DRAINED", "status": "FAILED", "fleet_snapshot": fleet}
+        ),
+        encoding="utf-8",
+    )
+    state = state_dir / "clean.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_KUBECTL_LOG": str(log),
+    }
+
+    result = run_script(
+        "--config",
+        str(config),
+        "--mode",
+        "reset",
+        "--node-mode",
+        "uninstall",
+        "--state-file",
+        str(state),
+        "--confirm-reset",
+        "RESET_GPU_FAULT_INSTALLATION",
+        "--execute",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "reused its fleet inventory (1 agent record(s))"
+        in result.stderr + result.stdout
+    )
+    document = json.loads(state.read_text(encoding="utf-8"))
+    assert document["phase"] == "CLEANUP_COMPLETED", document["phase"]
+    assert document["fleet_snapshot"] == fleet, (
+        "the earlier export must be carried over"
+    )
+    calls = log.read_text(encoding="utf-8")
+    assert " exec " not in f" {calls} ", "no drain probe may be attempted without a Pod"
+    assert "delete namespace gpu-fault-system" in calls
