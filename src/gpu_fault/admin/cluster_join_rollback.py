@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite, effective_environment
@@ -127,3 +128,44 @@ def nothing_installed(candidate: RenderedSite, config: Path) -> bool:
     gpu = registry.get("gpu")
     resources = gpu.get("resources") if isinstance(gpu, dict) else None
     return not resources and not registry.get("unregistered_resources")
+
+
+def ensure_kube_context(kubeconfig: Path, target: Mapping[str, Any]) -> None:
+    """Recreate the GPU cluster's kubeconfig context if it is gone.
+
+    A rollback deletes the context as its last Kubernetes step; when it fails
+    partway and is retried (live, 2026-09-12), the annotation, namespace and
+    cleanup undos would all fail on the missing context. ``update-kubeconfig``
+    is the same call the join made and is idempotent.
+    """
+
+    context = str(target.get("context") or "")
+    if not context:
+        return
+    probe = subprocess.run(
+        ["kubectl", "--kubeconfig", str(kubeconfig), "config", "get-contexts", context],
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode == 0:
+        return
+    subprocess.run(
+        [
+            "aws",
+            "eks",
+            "update-kubeconfig",
+            "--region",
+            str(target.get("region") or ""),
+            "--name",
+            str(target.get("eks_name") or ""),
+            "--kubeconfig",
+            str(kubeconfig),
+            "--alias",
+            context,
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    if kubeconfig.exists():
+        kubeconfig.chmod(0o600)

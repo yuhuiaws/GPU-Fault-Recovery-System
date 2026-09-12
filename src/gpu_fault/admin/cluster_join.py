@@ -37,6 +37,7 @@ from gpu_fault.admin.bootstrap_services import (
     provision_node_action_keys,
 )
 from gpu_fault.admin.cluster_join_rollback import (
+    ensure_kube_context,
     nothing_installed,
     restore_current_context,
     rollback_command,
@@ -798,6 +799,19 @@ def _rollback(
     discovery = evidence.get("DISCOVERED") or {}
     cluster_id = str(discovery.get("cluster_id") or "")
     errors = []
+    local = evidence.get("LOCAL_INPUTS_READY") or {}
+    nodes = list(local.get("nodes") or [])
+    target = discovery.get("target") or {}
+    context = str(target.get("context") or "")
+    kubeconfig = Path(str(local.get("gpu_kubeconfig") or _gpu_kubeconfig(request.site)))
+    if context:
+        # A retried rollback finds the context its first run deleted; every
+        # Kubernetes-side undo below needs it back.
+        try:
+            with _KUBECONFIG_THREAD_LOCK:
+                ensure_kube_context(kubeconfig, target)
+        except Exception as exc:
+            errors.append(f"kube context restore: {exc}")
     candidate_path = Path(
         str((evidence.get("CANDIDATE_READY") or {}).get("site_file") or "")
     )
@@ -818,9 +832,6 @@ def _rollback(
             )
         except Exception as exc:
             errors.append(f"kubernetes/control rollback: {exc}")
-    local = evidence.get("LOCAL_INPUTS_READY") or {}
-    nodes = list(local.get("nodes") or [])
-    target = discovery.get("target") or {}
     try:
         _clear_installer_annotations(request.site, dict(target), nodes)
     except Exception as exc:
@@ -829,8 +840,6 @@ def _rollback(
         _remove_node_action_keys(request.site, nodes)
     except Exception as exc:
         errors.append(f"node key rollback: {exc}")
-    context = str(target.get("context") or "")
-    kubeconfig = Path(str(local.get("gpu_kubeconfig") or _gpu_kubeconfig(request.site)))
     if context:
         namespace = str(request.site.release_config["namespace"])
         result = subprocess.run(

@@ -552,7 +552,17 @@ def test_a_retry_after_a_failed_rollback_finishes_the_undo_first(
     recorded["source_site_non_membership_sha256"] = "0" * 64
     state_path.write_text(json.dumps(recorded), encoding="utf-8")
 
-    attempt.commands = Commands()
+    # The first rollback already deleted the kubeconfig context; the retry
+    # must put it back before it can undo anything on the cluster.
+    attempt.commands = Commands(
+        failures=[
+            (
+                "config get-contexts gpu-fault-gpu-2-gpu-b",
+                1,
+                'error: context "gpu-fault-gpu-2-gpu-b" not found',
+            )
+        ]
+    )
     attempt.install(monkeypatch)
     seen: list[dict[str, Any]] = []
 
@@ -571,6 +581,10 @@ def test_a_retry_after_a_failed_rollback_finishes_the_undo_first(
             runner=SimpleNamespace(dry_run=False),
         )
 
+    restored = attempt.commands.matching("update-kubeconfig")
+    assert restored and "gpu-fault-gpu-2-gpu-b" in restored[0], (
+        "the retry did not recreate the context the first rollback deleted"
+    )
     assert attempt.commands.matching("prepare-clean-redeploy.sh"), (
         "the retry did not re-run the failed undo"
     )
