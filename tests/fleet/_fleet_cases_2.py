@@ -615,3 +615,57 @@ def test_collector_readiness_accepts_reported_service_state() -> None:
         assert collectors["NVIDIA_KERNEL"]["unit_enabled"] == "unknown"
 
     asyncio.run(scenario())
+
+
+def test_collector_readiness_waits_out_the_first_report_window_of_a_new_agent() -> None:
+    """Live 2026-09-12: the first verify after a fresh bootstrap ran one minute
+    after the agents came up and failed on the 5-minute health-summary kinds
+    that had not reported yet. A kind that has never reported is silent only
+    once its threshold has elapsed since the Agent first appeared."""
+
+    store = build_store()
+    # The readiness route reads the wall clock, so the registry must too.
+    context = ApplicationContext(
+        store=store,
+        execution_token="e" * 32,
+        fleet_registry=registry(store, now=lambda: datetime.now(timezone.utc)),
+        barrier_coordinator=BarrierCoordinator(store),
+    )
+    token = {"X-GPU-Fault-Execution-Token": "e" * 32}
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            registered = await client.post(
+                "/v1/fleet/agents/heartbeat",
+                json=signed(
+                    heartbeat("node-a", observed_at=datetime.now(timezone.utc))
+                ).model_dump(mode="json"),
+            )
+            assert registered.status_code == 200, registered.text
+
+            fresh = (
+                await client.get("/v1/collector-readiness/cluster-a", headers=token)
+            ).json()
+            assert fresh["ready"] is True, "nothing is due yet on a brand-new Agent"
+            assert all(
+                item["pending_first_report"] is True and item["last_success_at"] is None
+                for item in fresh["nodes"][0]["collectors"].values()
+            ), "every kind is waiting for its first report, none has reported"
+
+            (agent,) = store.list_agents("cluster-a")
+            store.save_agent(
+                agent.model_copy(
+                    update={"first_seen_at": agent.first_seen_at - timedelta(hours=1)}
+                )
+            )
+            stale = (
+                await client.get("/v1/collector-readiness/cluster-a", headers=token)
+            ).json()
+
+        assert stale["ready"] is False, "an hour of silence is silence"
+        assert not any(
+            item["pending_first_report"]
+            for item in stale["nodes"][0]["collectors"].values()
+        ), "past its threshold a never-reported kind is not pending any more"
+
+    asyncio.run(scenario())

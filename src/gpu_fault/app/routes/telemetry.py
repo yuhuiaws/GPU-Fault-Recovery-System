@@ -97,17 +97,25 @@ async def collector_readiness(
                     if service_state is not None
                     else "unknown"
                 )
-                ready = (
-                    age is not None
-                    and age <= thresholds[kind]
-                    and unit_state in {"active", "unknown"}
+                unit_running = unit_state in {"active", "unknown"}
+                # A kind that has never reported is silent only once its
+                # threshold has elapsed since the Agent first appeared; before
+                # that its first report is simply not due yet (a fresh install's
+                # health summaries post every 5 min, the verify runs after 1).
+                agent_age = (now - agent.first_seen_at).total_seconds()
+                pending_first_report = (
+                    last is None and unit_running and agent_age <= thresholds[kind]
                 )
+                ready = (
+                    age is not None and age <= thresholds[kind] and unit_running
+                ) or pending_first_report
                 collectors[kind.value] = {
                     "unit": unit,
                     "unit_state": unit_state,
                     "unit_enabled": unit_enabled,
                     "last_success_at": (last.isoformat() if last else None),
                     "age_seconds": age,
+                    "pending_first_report": pending_first_report,
                     "ready": ready,
                 }
             nodes.append(

@@ -42,6 +42,7 @@ from ._fleet_cases_2 import (
     test_agent_heartbeat_reporter_signs_payload,
     test_barrier_id_cannot_be_reused_for_another_contract,
     test_collector_readiness_accepts_reported_service_state,
+    test_collector_readiness_waits_out_the_first_report_window_of_a_new_agent,
     test_commit_client_conflict_retries_only_failed_node,
     test_fleet_api_registers_and_reports_readiness,
     test_prepare_failure_aborts_without_any_reset,
