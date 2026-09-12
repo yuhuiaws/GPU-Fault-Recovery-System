@@ -58,7 +58,9 @@ def test_indexes_of_absent_tables_are_left_to_the_ensure_job() -> None:
     assert report["built"] == []
     assert report["missing_after"] == [], "nothing the ensure Job cannot create"
     assert sorted(report["awaiting_table"]) == sorted(MODULE.declared_index_names())
-    assert not any("CREATE INDEX" in s for s in cursor.statements)
+    assert not any("CREATE INDEX" in s for s in cursor.statements), (
+        "no index may be built before its table exists"
+    )
 
 
 def test_indexes_of_existing_tables_are_still_built_online() -> None:
@@ -74,4 +76,4 @@ def test_indexes_of_existing_tables_are_still_built_online() -> None:
     assert any(
         s.startswith("CREATE") and "CONCURRENTLY" in s and f" {name} " in s
         for s in cursor.statements
-    )
+    ), "an index whose table exists is still built online"
