@@ -103,6 +103,11 @@ class EvidenceRecorder:
 
     def complete(self) -> dict[str, Any]:
         self.document["status"] = "COMPLETED"
+        # A run resumed after a failure carried that failure's ``error`` in the
+        # document; a completed run has none (BOOT-020 on 2026-09-11 finished
+        # with every stage passed and the previous attempt's assertion text
+        # still at the top level).
+        self.document.pop("error", None)
         self.document["completed_at"] = utc_now()
         self.document["updated_at"] = utc_now()
         write_json_atomic(self.path, self.document)

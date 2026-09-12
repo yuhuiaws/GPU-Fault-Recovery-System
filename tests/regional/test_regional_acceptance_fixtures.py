@@ -845,3 +845,25 @@ def test_runners_with_their_own_plan_builder_record_the_site_profile() -> None:
         if '"site_profile": applied_site_profile()' not in source:
             offenders.append(path.name)
     assert not offenders, f"plan builders without site_profile: {offenders}"
+
+
+def test_a_completed_recorder_drops_the_error_of_the_attempt_it_resumed(
+    tmp_path,
+) -> None:
+    """``fail`` writes ``error``; a later ``--resume`` that finishes must not
+    leave it at the top level beside ``status: COMPLETED`` (BOOT-020,
+    2026-09-11: every stage passed, the previous assertion text still there)."""
+
+    from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
+
+    path = tmp_path / "GF-REGIONAL-BOOT-020.json"
+    first = EvidenceRecorder(path, case_id="GF-REGIONAL-BOOT-020", inputs={"a": 1})
+    first.fail(RuntimeError("stage assertion"))
+    assert "error" in first.document and first.document["status"] == "FAILED"
+
+    resumed = EvidenceRecorder(path, case_id="GF-REGIONAL-BOOT-020", inputs={"a": 1})
+    document = resumed.complete()
+
+    assert document["status"] == "COMPLETED"
+    assert "error" not in document
+    assert "error" not in resumed.document
