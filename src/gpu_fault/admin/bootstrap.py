@@ -53,9 +53,7 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.bootstrap_common import (
     kubectl_apply as _kubectl_apply,
 )
-from gpu_fault.admin.bootstrap_common import (
-    safe_name as _safe_name,
-)
+from gpu_fault.admin.bootstrap_common import safe_name as _safe_name
 from gpu_fault.admin.bootstrap_common import (
     write_secret as _write_secret,
 )
@@ -63,9 +61,7 @@ from gpu_fault.admin.bootstrap_common import (
     write_yaml as _write_yaml,
 )
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
-from gpu_fault.admin.bootstrap_network import (
-    RouteTableIndex,
-)
+from gpu_fault.admin.bootstrap_network import RouteTableIndex
 from gpu_fault.admin.bootstrap_network import (
     describe_subnets as _describe_subnets,
 )
@@ -75,9 +71,7 @@ from gpu_fault.admin.bootstrap_network import (
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
 )
-from gpu_fault.admin.bootstrap_site import (
-    cluster_alias as _cluster_alias,
-)
+from gpu_fault.admin.bootstrap_site import cluster_alias as _cluster_alias
 from gpu_fault.admin.bootstrap_site import (
     cluster_irsa_role_entries,
     discover_bootstrap_scope,
@@ -1707,7 +1701,10 @@ def _site_document(
                 "fleetMasterFile": str(fleet_master_file),
             }
         )
-    first_cluster = cluster_documents[0]["clusterId"]
+    # No GPU cluster left (remove-cluster): a managed site keeps its own profile.
+    first_cluster = _safe_name(cpu.hyperpod_name)
+    if cluster_documents:
+        first_cluster = cluster_documents[0]["clusterId"]
     profile_source = str(request.repository_root / REGIONAL_PROFILE_SOURCE)
     return {
         "apiVersion": "gpu-fault.aws/v1alpha1",

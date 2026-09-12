@@ -13,6 +13,7 @@ import json
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,6 +25,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     BootstrapRequest,
     BootstrapState,
+    ClusterIdentity,
     CommandRunner,
 )
 from gpu_fault.admin.bootstrap_site import (
@@ -447,26 +449,25 @@ def test_existing_site_preserves_release_profile_and_cluster_context() -> None:
     ]
 
 
-def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -> None:
-    """A fresh site with a workspace gets the data-plane collector with no hand step.
+def _render_site(
+    tmp_path: Path,
+    *,
+    gpu_clusters: list[ClusterIdentity],
+    roles: dict[str, dict[str, str]],
+    token_files: dict[str, Path],
+) -> dict[str, Any]:
+    """The one call site for the private site renderer the tests below share."""
 
-    The role the ``adot_writer_role:<cluster>`` task created lands on the
-    cluster entry as ``adotIrsaRoleArn``; a cluster the task produced no role
-    for keeps the key absent, which is the release's "skip the collector" signal.
-    """
-
-    gpu_a = replace(_cluster(), role="gpu", hyperpod_name="gpu-a", eks_name="gpu-a")
-    gpu_b = replace(_cluster(), role="gpu", hyperpod_name="gpu-b", eks_name="gpu-b")
-    document = admin_bootstrap._site_document(
+    return admin_bootstrap._site_document(
         request=BootstrapRequest(
             cpu_cluster_arn=_cluster().input_arn,
-            gpu_cluster_arns=(gpu_a.input_arn, gpu_b.input_arn),
+            gpu_cluster_arns=tuple(cluster.input_arn for cluster in gpu_clusters),
             repository_root=tmp_path / "repo",
             state_dir=tmp_path / "state",
         ),
         site_id="site-a",
         cpu=_cluster(),
-        gpu_clusters=[gpu_a, gpu_b],
+        gpu_clusters=gpu_clusters,
         cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
         gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
         release={
@@ -488,6 +489,33 @@ def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -
         },
         aurora={"cluster_id": "aurora"},
         monitoring={"workspace_id": "ws-1", "sns_topic_arn": "arn:aws:sns:x"},
+        roles=roles,
+        token_files=token_files,
+        fleet_master_file=tmp_path / "fleet-master",
+        adot_image="adot:1",
+        admin_email="admin@example.com",
+        routing=NotificationRouting(
+            sender="admin@example.com",
+            recipients=("admin@example.com",),
+            subject_prefix="[gpu-fault]",
+        ),
+        grafana_health={},
+    )
+
+
+def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -> None:
+    """A fresh site with a workspace gets the data-plane collector with no hand step.
+
+    The role the ``adot_writer_role:<cluster>`` task created lands on the
+    cluster entry as ``adotIrsaRoleArn``; a cluster the task produced no role
+    for keeps the key absent, which is the release's "skip the collector" signal.
+    """
+
+    gpu_a = replace(_cluster(), role="gpu", hyperpod_name="gpu-a", eks_name="gpu-a")
+    gpu_b = replace(_cluster(), role="gpu", hyperpod_name="gpu-b", eks_name="gpu-b")
+    document = _render_site(
+        tmp_path,
+        gpu_clusters=[gpu_a, gpu_b],
         roles={
             "executor_role:gpu-a": {
                 "role_arn": "arn:aws:iam::123456789012:role/gpu-a-executor"
@@ -501,17 +529,7 @@ def test_the_generated_site_names_the_created_adot_writer_role(tmp_path: Path) -
             "aurora": {"cluster_id": "aurora"},
         },
         token_files={"gpu-a": tmp_path / "a.token", "gpu-b": tmp_path / "b.token"},
-        fleet_master_file=tmp_path / "fleet-master",
-        adot_image="adot:1",
-        admin_email="admin@example.com",
-        routing=NotificationRouting(
-            sender="admin@example.com",
-            recipients=("admin@example.com",),
-            subject_prefix="[gpu-fault]",
-        ),
-        grafana_health={},
     )
-
     clusters = {item["clusterId"]: item for item in document["spec"]["clusters"]}
     assert clusters["gpu-a"]["adotIrsaRoleArn"] == (
         "arn:aws:iam::123456789012:role/gpu-a-adot-writer"
@@ -811,3 +829,16 @@ def test_a_site_without_gpu_clusters_still_discovers_its_control_plane(
     assert existing is None, "a fresh state dir has no site to recover"
     assert discovered_cpu.role == "cpu"
     assert gpu_clusters == [], "no GPU ARN means no GPU cluster, not an error"
+
+
+def test_a_site_left_without_gpu_clusters_still_renders(tmp_path: Path) -> None:
+    """Deploy #62 (2026-09-12) died on ``cluster_documents[0]`` for the site
+    remove-cluster had left with ``clusters: []``. The managed site keeps its
+    own runtimeProfile through ``preserve_existing_site_contract``; the
+    generated placeholder only has to exist."""
+
+    document = _render_site(tmp_path, gpu_clusters=[], roles={}, token_files={})
+    assert document["spec"]["clusters"] == [], "no GPU cluster means no entry"
+    assert document["spec"]["runtimeProfile"]["registrationClusterId"], (
+        "the placeholder registration id must be non-empty so the site loads"
+    )
