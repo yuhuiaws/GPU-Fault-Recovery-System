@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -630,127 +631,170 @@ def _verify_gpu_clusters(
     return len(resources)
 
 
-def _delete_aurora_last(
+class AuroraDeletion:
+    """The Aurora phase of one uninstall, run beside the non-Aurora deletes.
+
+    The cluster deletion depends only on the Kubernetes cleanup (no Pod may
+    still hold a connection), not on Route53, the NLB, IAM or ECR, and its
+    wait dominated the live uninstall (18 of 24 min, 2026-09-12). ``start``
+    therefore issues it on a worker thread as soon as the cleanup is verified;
+    the non-Aurora deletes run meanwhile; ``finish`` joins the thread, then
+    deletes what the cluster stood on (managed secret, subnet group, security
+    group, parameter group) -- RDS refuses those while a cluster uses them.
+
+    A rerun after a crash needs nothing from this object: ``delete_aurora``
+    finds the cluster and its instances already ``deleting`` (or gone) and
+    only waits. The thread is a daemon so a Ctrl-C does not hang on the wait;
+    the state file is written by the caller's thread only.
+    """
+
+    def __init__(
+        self,
+        cleaner: ResourceCleaner,
+        snapshot: InstallationResourceSnapshot,
+        request: UninstallRequest,
+        state: Mapping[str, Any],
+    ) -> None:
+        self._cleaner = cleaner
+        self._request = request
+        self._final_snapshot_identifier = str(state["final_snapshot_identifier"])
+        self.resources = [
+            resource for resource in snapshot.resources if is_aurora_resource(resource)
+        ]
+        cluster = next(
+            (
+                resource
+                for resource in self.resources
+                if resource.resource_type == "aurora_cluster"
+            ),
+            None,
+        )
+        if cluster is None:
+            raise BootstrapError(
+                "installation registry does not contain the Aurora cluster"
+            )
+        self.cluster = cluster
+        self.policy = _effective_policy(
+            cluster,
+            cpu_disposition=request.cpu_disposition,
+            reset_database=request.reset_database,
+        )
+        self._thread: threading.Thread | None = None
+        self._retained: str | None = None
+        self._failure: BaseException | None = None
+
+    def _child_policy(
+        self, resource: InstallationResource
+    ) -> InstallationResourceDeletePolicy:
+        return _effective_policy(
+            resource,
+            cpu_disposition=self._request.cpu_disposition,
+            reset_database=self._request.reset_database,
+            aurora_cluster_policy=self.policy,
+        )
+
+    def _run(self) -> None:
+        try:
+            self._retained = self._cleaner.delete_aurora(
+                self.cluster,
+                final_snapshot_policy=self._request.final_snapshot_policy,
+                final_snapshot_identifier=self._final_snapshot_identifier,
+            )
+        except BaseException as exc:  # handed to the caller by ``wait``/``join``
+            self._failure = exc
+
+    def start(self) -> None:
+        """Issue the cluster deletion (protection off, readers, writer, cluster)."""
+
+        if self.policy is InstallationResourceDeletePolicy.PRESERVE:
+            inconsistent = [
+                resource.resource_key
+                for resource in self.resources
+                if self._child_policy(resource)
+                is not InstallationResourceDeletePolicy.PRESERVE
+            ]
+            if inconsistent:
+                raise BootstrapError(
+                    "preserved Aurora cluster has deletable child resources: "
+                    + ", ".join(inconsistent)
+                )
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="aurora-delete", daemon=True
+        )
+        self._thread.start()
+
+    def wait(self) -> BaseException | None:
+        """Block until the cluster deletion ended; return its failure, if any."""
+
+        if self._thread is not None:
+            self._thread.join()
+        return self._failure
+
+    def join(self) -> str | None:
+        """Block until the cluster is gone; return the retained snapshot id."""
+
+        failure = self.wait()
+        if failure is not None:
+            raise failure
+        return self._retained
+
+    def finish(self) -> InstallationResource | None:
+        """Join, delete the cluster's dependents, describe the final snapshot."""
+
+        retained = self.join()
+        if self.policy is InstallationResourceDeletePolicy.PRESERVE:
+            return None
+        for resource in self.resources:
+            if resource.resource_type in {
+                "aurora_cluster",
+                "aurora_instance",
+                "rds_managed_secret",
+            }:
+                self._cleaner.wait_absent(resource, timeout_seconds=3600)
+                continue
+            if (
+                self._child_policy(resource)
+                is InstallationResourceDeletePolicy.PRESERVE
+            ):
+                continue
+            self._cleaner.delete(resource)
+        if not retained:
+            return None
+        now = datetime.now(timezone.utc)
+        return InstallationResource(
+            site_id=self.cluster.site_id,
+            resource_key="aws/aurora/final-snapshot",
+            resource_type="rds_snapshot",
+            resource_id=retained,
+            region=self.cluster.region,
+            account_id=self.cluster.account_id,
+            ownership=InstallationResourceOwnership.CREATED,
+            delete_policy=InstallationResourceDeletePolicy.PRESERVE,
+            status=InstallationResourceStatus.PRESERVED,
+            created_at=now,
+            updated_at=now,
+        )
+
+
+def _delete_non_aurora_phase(
     cleaner: ResourceCleaner,
     snapshot: InstallationResourceSnapshot,
     request: UninstallRequest,
-    state: dict[str, Any],
-) -> InstallationResource | None:
-    aurora = [
-        resource for resource in snapshot.resources if is_aurora_resource(resource)
-    ]
-    cluster = next(
-        (resource for resource in aurora if resource.resource_type == "aurora_cluster"),
-        None,
-    )
-    if cluster is None:
-        raise BootstrapError(
-            "installation registry does not contain the Aurora cluster"
-        )
-    cluster_policy = _effective_policy(
-        cluster,
-        cpu_disposition=request.cpu_disposition,
-        reset_database=request.reset_database,
-    )
-    if cluster_policy is InstallationResourceDeletePolicy.PRESERVE:
-        inconsistent = [
-            resource.resource_key
-            for resource in aurora
-            if _effective_policy(
-                resource,
-                cpu_disposition=request.cpu_disposition,
-                reset_database=request.reset_database,
-                aurora_cluster_policy=cluster_policy,
-            )
-            is not InstallationResourceDeletePolicy.PRESERVE
-        ]
-        if inconsistent:
-            raise BootstrapError(
-                "preserved Aurora cluster has deletable child resources: "
-                + ", ".join(inconsistent)
-            )
-        return None
-    retained = cleaner.delete_aurora(
-        cluster,
-        final_snapshot_policy=request.final_snapshot_policy,
-        final_snapshot_identifier=state["final_snapshot_identifier"],
-    )
-    for resource in aurora:
-        if resource.resource_type in {
-            "aurora_cluster",
-            "aurora_instance",
-            "rds_managed_secret",
-        }:
-            cleaner.wait_absent(resource, timeout_seconds=3600)
-            continue
-        policy = _effective_policy(
-            resource,
-            cpu_disposition=request.cpu_disposition,
-            reset_database=request.reset_database,
-            aurora_cluster_policy=cluster_policy,
-        )
-        if policy is InstallationResourceDeletePolicy.PRESERVE:
-            continue
-        cleaner.delete(resource)
-    if not retained:
-        return None
-    now = datetime.now(timezone.utc)
-    return InstallationResource(
-        site_id=snapshot.site_id,
-        resource_key="aws/aurora/final-snapshot",
-        resource_type="rds_snapshot",
-        resource_id=retained,
-        region=cluster.region,
-        account_id=cluster.account_id,
-        ownership=InstallationResourceOwnership.CREATED,
-        delete_policy=InstallationResourceDeletePolicy.PRESERVE,
-        status=InstallationResourceStatus.PRESERVED,
-        created_at=now,
-        updated_at=now,
-    )
-
-
-def _uninstall_locked(
-    request: UninstallRequest,
     *,
-    runner: CommandRunner | None = None,
-) -> dict[str, Any]:
-    required = _required_confirmation(request.cpu_disposition)
-    if request.confirmation != required:
-        raise BootstrapError(f"uninstall requires --confirm {required}")
-    active_runner = runner or CommandRunner()
-    state_dir = request.site.source.parent / "uninstall"
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    state_path = state_dir / "state.json"
-    state = _uninstall_state(request, state_path)
-    snapshot = _load_or_export_registry(request, state_dir)
-    cleaner = ResourceCleaner(request.site)
-    cleaner.validate_supported(snapshot.resources)
-    _transition(state_path, state, "REGISTRY_EXPORTED")
+    state_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> int:
+    """Delete and verify everything but Aurora; return the GPU cluster count.
 
-    cleanup_state = state_dir / "kubernetes-cleanup.json"
-    cleanup_complete = False
-    if cleanup_state.exists():
-        previous_cleanup = json.loads(cleanup_state.read_text(encoding="utf-8"))
-        cleanup_complete = (
-            previous_cleanup.get("phase") == "CLEANUP_COMPLETED"
-            and previous_cleanup.get("status") == "COMPLETED"
-        )
-        if not cleanup_complete:
-            archive_unfinished_cleanup_state(cleanup_state, previous_cleanup)
-    if not cleanup_complete:
-        _run_cleanup(request, active_runner, cleanup_state)
-    cleanup_document = json.loads(cleanup_state.read_text(encoding="utf-8"))
-    if (
-        cleanup_document.get("phase") != "CLEANUP_COMPLETED"
-        or cleanup_document.get("status") != "COMPLETED"
-    ):
-        raise BootstrapError("Kubernetes cleanup did not reach CLEANUP_COMPLETED")
-    kubernetes_result = verify_installed_registry_cleanup(
-        request.site,
-        cleanup_document,
-    )
-    _transition(state_path, state, "KUBERNETES_VERIFIED")
+    Runs while ``AuroraDeletion`` waits on the cluster. Nothing here reads the
+    cluster: the PKI secret is the solution's own, the IAM policy that read the
+    managed master secret only has to be detached from roles no Pod uses any
+    more, and the resources the cluster stands on (subnet group, its security
+    group, parameter group) are keyed ``aws/aurora/`` and so belong to the
+    Aurora phase, after the join.
+    """
 
     _delete_non_aurora_resources(
         cleaner,
@@ -803,23 +847,73 @@ def _uninstall_locked(
         path=state_dir / "installation-resources-pre-aurora-delete.json",
     )
     _transition(state_path, state, "READY_TO_DELETE_AURORA")
+    return gpu_records
 
-    final_snapshot = _delete_aurora_last(
-        cleaner,
-        snapshot,
-        request,
-        state,
+
+def _uninstall_locked(
+    request: UninstallRequest,
+    *,
+    runner: CommandRunner | None = None,
+) -> dict[str, Any]:
+    required = _required_confirmation(request.cpu_disposition)
+    if request.confirmation != required:
+        raise BootstrapError(f"uninstall requires --confirm {required}")
+    active_runner = runner or CommandRunner()
+    state_dir = request.site.source.parent / "uninstall"
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_path = state_dir / "state.json"
+    state = _uninstall_state(request, state_path)
+    snapshot = _load_or_export_registry(request, state_dir)
+    cleaner = ResourceCleaner(request.site)
+    cleaner.validate_supported(snapshot.resources)
+    _transition(state_path, state, "REGISTRY_EXPORTED")
+
+    cleanup_state = state_dir / "kubernetes-cleanup.json"
+    cleanup_complete = False
+    if cleanup_state.exists():
+        previous_cleanup = json.loads(cleanup_state.read_text(encoding="utf-8"))
+        cleanup_complete = (
+            previous_cleanup.get("phase") == "CLEANUP_COMPLETED"
+            and previous_cleanup.get("status") == "COMPLETED"
+        )
+        if not cleanup_complete:
+            archive_unfinished_cleanup_state(cleanup_state, previous_cleanup)
+    if not cleanup_complete:
+        _run_cleanup(request, active_runner, cleanup_state)
+    cleanup_document = json.loads(cleanup_state.read_text(encoding="utf-8"))
+    if (
+        cleanup_document.get("phase") != "CLEANUP_COMPLETED"
+        or cleanup_document.get("status") != "COMPLETED"
+    ):
+        raise BootstrapError("Kubernetes cleanup did not reach CLEANUP_COMPLETED")
+    kubernetes_result = verify_installed_registry_cleanup(
+        request.site,
+        cleanup_document,
     )
-    aurora_cluster = next(
-        resource
-        for resource in snapshot.resources
-        if resource.resource_type == "aurora_cluster"
-    )
-    aurora_policy = _effective_policy(
-        aurora_cluster,
-        cpu_disposition=request.cpu_disposition,
-        reset_database=request.reset_database,
-    )
+    _transition(state_path, state, "KUBERNETES_VERIFIED")
+
+    aurora = AuroraDeletion(cleaner, snapshot, request, state)
+    aurora.start()
+    try:
+        gpu_records = _delete_non_aurora_phase(
+            cleaner,
+            snapshot,
+            request,
+            state_dir=state_dir,
+            state_path=state_path,
+            state=state,
+        )
+    except Exception as failure:
+        # Never orphan the Aurora thread: wait for it, then report the failure
+        # that stopped the uninstall (and the Aurora one, if it failed too).
+        aurora_failure = aurora.wait()
+        if aurora_failure is not None:
+            raise BootstrapError(
+                f"{failure}; the Aurora deletion also failed: {aurora_failure}"
+            ) from failure
+        raise
+    final_snapshot = aurora.finish()
+    aurora_policy = aurora.policy
     verified = _verify_resources(
         cleaner,
         snapshot.resources,

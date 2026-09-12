@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -14,13 +17,14 @@ from gpu_fault.admin.aws_cleanup import ordered_aurora_instances
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import load_site
 from gpu_fault.admin.uninstall import (
+    AuroraDeletion,
     UninstallRequest,
-    _delete_aurora_last,
     _delete_non_aurora_resources,
     _effective_policy,
     _kubectl_prefix,
     _load_or_export_registry,
     _terminal_resource,
+    _uninstall_locked,
 )
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -316,7 +320,9 @@ def test_aurora_cleanup_runs_after_non_aurora_resources(tmp_path) -> None:
         confirmation="UNINSTALL_GPU_FAULT",
         reset_database=True,
     )
-    _delete_aurora_last(cleaner, snapshot, request, state)
+    aurora = AuroraDeletion(cleaner, snapshot, request, state)
+    aurora.start()
+    aurora.finish()
 
     assert calls == ["aws/nlb", "aws/aurora/cluster", "aws/aurora/parameter-group"]
 
@@ -620,7 +626,9 @@ def test_keep_mode_never_calls_delete_db_cluster(tmp_path) -> None:
     )
     state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
 
-    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
+    aurora = AuroraDeletion(Cleaner(), snapshot, request, state)
+    aurora.start()
+    retained = aurora.finish()
 
     assert retained is None, "no final snapshot exists when nothing was deleted"
     assert calls == [], "a reinstall must not touch the Aurora stack"
@@ -654,7 +662,9 @@ def test_reset_database_runs_the_aurora_phase(tmp_path) -> None:
     )
     state = {"final_snapshot_identifier": "test-final", "phase": "STARTED"}
 
-    retained = _delete_aurora_last(Cleaner(), snapshot, request, state)
+    aurora = AuroraDeletion(Cleaner(), snapshot, request, state)
+    aurora.start()
+    retained = aurora.finish()
 
     assert retained is not None, "the retained final snapshot must be reported"
     assert retained.resource_id == "test-final", "snapshot id comes from the cleaner"
@@ -846,3 +856,308 @@ def test_aurora_deletion_orders_readers_then_writer_and_does_not_wait_for_each(
     assert "--final-db-snapshot-identifier test-final" in next(
         c for c in calls if "delete-db-cluster" in c
     )
+
+
+class _InMemoryAws:
+    """A cleaner over an in-memory AWS: ``present`` holds the keys that exist.
+
+    Non-Aurora deletes block until the Aurora deletion has been issued, so a
+    serial orchestration (Aurora after the other deletes) deadlocks into the
+    timeout instead of passing by luck. ``hold_seconds`` keeps the Aurora
+    thread busy so a join, or its absence, is observable.
+    """
+
+    def __init__(self) -> None:
+        self.present: set[str] = set()
+        self.events: list[str] = []
+        self.aurora_issued = threading.Event()
+        self.aurora_returned = False
+        self.aurora_failure: Exception | None = None
+        self.failing_key: str | None = None
+        self.hold_seconds = 0.0
+
+    def validate_supported(self, resources) -> None:
+        self.present.update(resource.resource_key for resource in resources)
+
+    def exists(self, resource) -> bool:
+        return (
+            resource.resource_type == "rds_snapshot"
+            or resource.resource_key in self.present
+        )
+
+    def delete(self, resource) -> None:
+        key = resource.resource_key
+        if key.startswith("aws/aurora/"):
+            if not self.aurora_returned:
+                raise AssertionError(f"{key} deleted while the cluster still used it")
+        elif not self.aurora_issued.wait(timeout=10):
+            raise AssertionError(f"{key} deleted before the Aurora deletion was issued")
+        if key == self.failing_key:
+            raise BootstrapError(f"{key} refused")
+        self.present.discard(key)
+        self.events.append(f"deleted:{key}")
+
+    def delete_aurora(
+        self, cluster, *, final_snapshot_policy, final_snapshot_identifier
+    ) -> str | None:
+        self.events.append("aurora:issued")
+        self.aurora_issued.set()
+        time.sleep(self.hold_seconds)
+        if self.aurora_failure is not None:
+            raise self.aurora_failure
+        for key in (
+            "aws/aurora/cluster",
+            "aws/aurora/instance/writer",
+            "aws/aurora/secret",
+        ):
+            self.present.discard(key)
+        self.aurora_returned = True
+        self.events.append("aurora:gone")
+        return final_snapshot_identifier if final_snapshot_policy == "retain" else None
+
+    def wait_absent(self, resource, *, timeout_seconds=900) -> None:
+        del resource, timeout_seconds
+
+    def delete_cpu_cluster(self, cpu_hyperpod, cpu_eks) -> None:
+        self.present.discard(cpu_hyperpod.resource_key)
+        self.present.discard(cpu_eks.resource_key)
+
+
+def _orchestration(tmp_path: Path, monkeypatch, aws: _InMemoryAws) -> UninstallRequest:
+    """Wire ``_uninstall_locked`` to ``aws``: registry, cleanup and kubectl faked."""
+
+    site = load_site(site_file(tmp_path))
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site",
+        resources=[
+            _resource("aws/nlb", "nlb", "test-nlb"),
+            _resource("aws/sns/topic", "sns_topic", "arn:aws:sns:us-east-1:1:t"),
+            _resource(
+                "aws/eks/cpu",
+                "cpu_eks",
+                "control",
+                policy=InstallationResourceDeletePolicy.PRESERVE,
+            ),
+            _resource(
+                "aws/hyperpod/cpu",
+                "cpu_hyperpod",
+                "control",
+                policy=InstallationResourceDeletePolicy.PRESERVE,
+            ),
+            _resource(
+                "aws/eks/gpu-a",
+                "gpu_eks",
+                "gpu-a",
+                policy=InstallationResourceDeletePolicy.PRESERVE,
+            ),
+            *_aurora_stack(),
+        ],
+    )
+
+    def cleanup(request, runner, state_file):
+        del request, runner
+        state_file.write_text(
+            json.dumps({"phase": "CLEANUP_COMPLETED", "status": "COMPLETED"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(admin_uninstall, "ResourceCleaner", lambda _site: aws)
+    monkeypatch.setattr(
+        admin_uninstall, "_load_or_export_registry", lambda _request, _dir: snapshot
+    )
+    monkeypatch.setattr(admin_uninstall, "_run_cleanup", cleanup)
+    monkeypatch.setattr(
+        admin_uninstall,
+        "verify_installed_registry_cleanup",
+        lambda _site, _document: {"registered_kubernetes_resources_verified_absent": 3},
+    )
+    monkeypatch.setattr(
+        admin_uninstall,
+        "write_installation_resource_snapshot",
+        lambda _site, _value, *, path=None: path,
+    )
+    return UninstallRequest(
+        site=site,
+        cpu_disposition="keep",
+        confirmation="UNINSTALL_GPU_FAULT",
+        reset_database=True,
+    )
+
+
+def _state(request: UninstallRequest) -> dict:
+    path = request.site.source.parent / "uninstall" / "state.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_the_aurora_deletion_is_issued_before_the_non_aurora_deletes_finish(
+    tmp_path, monkeypatch
+) -> None:
+    """Aurora only needs the Kubernetes cleanup (no Pod holding a connection),
+    not Route53, the NLB, IAM or ECR, and its wait took 18 of the 24 live
+    minutes (2026-09-12). The cluster deletion is issued first and the other
+    deletes run while it proceeds; what the cluster stood on is deleted only
+    after it is gone, and the report and state file are unchanged."""
+
+    aws = _InMemoryAws()
+    request = _orchestration(tmp_path, monkeypatch, aws)
+
+    report = _uninstall_locked(request)
+
+    assert aws.events[0] == "aurora:issued", aws.events
+    assert aws.events.index("aurora:gone") < aws.events.index(
+        "deleted:aws/aurora/parameter-group"
+    ), "the parameter group is deleted only once the cluster is gone"
+    assert {"deleted:aws/nlb", "deleted:aws/sns/topic"} <= set(aws.events)
+    assert report["aurora_cluster"] == "deleted"
+    assert (
+        report["aurora_final_snapshot"] == _state(request)["final_snapshot_identifier"]
+    )
+    assert report["registry_entries_deleted"] == 8, report
+    assert report["registry_entries_preserved"] == 4, report
+    assert report["delete_policy_residuals"] == 0
+    assert _state(request)["phase"] == "COMPLETED"
+
+
+def test_a_non_aurora_failure_joins_the_aurora_thread_before_it_is_reported(
+    tmp_path, monkeypatch
+) -> None:
+    aws = _InMemoryAws()
+    aws.failing_key = "aws/nlb"
+    aws.hold_seconds = 0.5
+    request = _orchestration(tmp_path, monkeypatch, aws)
+
+    with pytest.raises(BootstrapError, match="aws/nlb refused"):
+        _uninstall_locked(request)
+
+    assert aws.aurora_returned is True, (
+        "the uninstall reported the NLB failure without waiting for Aurora"
+    )
+    assert _state(request)["phase"] != "COMPLETED"
+
+
+def test_an_aurora_failure_fails_the_uninstall_after_the_other_deletes_succeeded(
+    tmp_path, monkeypatch
+) -> None:
+    aws = _InMemoryAws()
+    aws.aurora_failure = BootstrapError("delete-db-cluster refused")
+    request = _orchestration(tmp_path, monkeypatch, aws)
+
+    with pytest.raises(BootstrapError, match="delete-db-cluster refused"):
+        _uninstall_locked(request)
+
+    assert "deleted:aws/nlb" in aws.events, "the other deletes ran to completion"
+    assert _state(request)["phase"] == "READY_TO_DELETE_AURORA"
+    assert "deleted:aws/aurora/parameter-group" not in aws.events, (
+        "nothing the cluster stands on may be deleted after a failed cluster delete"
+    )
+
+
+def test_both_failures_are_reported_when_aurora_and_a_non_aurora_delete_fail(
+    tmp_path, monkeypatch
+) -> None:
+    aws = _InMemoryAws()
+    aws.failing_key = "aws/nlb"
+    aws.aurora_failure = BootstrapError("delete-db-cluster refused")
+    request = _orchestration(tmp_path, monkeypatch, aws)
+
+    with pytest.raises(
+        BootstrapError,
+        match="aws/nlb refused; the Aurora deletion also failed: delete-db-cluster",
+    ):
+        _uninstall_locked(request)
+
+
+def test_a_rerun_over_a_deleting_aurora_cluster_only_waits(
+    tmp_path, monkeypatch
+) -> None:
+    """If the process dies while the cluster is deleting, the rerun finds the
+    cluster and its instances in ``deleting``: it must issue no further
+    delete, only wait for the cluster and its final snapshot, then take down
+    the subnet group, security group and parameter group as usual."""
+
+    site = load_site(site_file(tmp_path))
+    describes = {"clusters": 0}
+
+    def fake_run(arguments, **_kwargs):
+        line = " ".join(arguments)
+        if "describe-db-clusters" in line:
+            describes["clusters"] += 1
+            if describes["clusters"] > 2:
+                return subprocess.CompletedProcess(
+                    arguments, 254, stdout="", stderr="DBClusterNotFoundFault"
+                )
+            body = {
+                "DBClusters": [
+                    {
+                        "DBClusterIdentifier": "test-aurora",
+                        "Status": "deleting",
+                        "DeletionProtection": False,
+                        "DBClusterMembers": [
+                            {"DBInstanceIdentifier": "writer", "IsClusterWriter": True}
+                        ],
+                    }
+                ]
+            }
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "describe-db-instances" in line and "--filters" in line:
+            body = {
+                "DBInstances": [
+                    {"DBInstanceIdentifier": "writer", "DBInstanceStatus": "deleting"}
+                ]
+            }
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "describe-db-cluster-snapshots" in line:
+            body = {"DBClusterSnapshots": [{"Status": "available"}]}
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(body), stderr=""
+            )
+        if "describe" in line:
+            return subprocess.CompletedProcess(
+                arguments,
+                254,
+                stdout="",
+                stderr=(
+                    "DBInstanceNotFound ResourceNotFoundException "
+                    "DBSubnetGroupNotFoundFault InvalidGroup.NotFound "
+                    "DBParameterGroupNotFound"
+                ),
+            )
+        if any(
+            verb in line
+            for verb in (
+                "delete-db-instance",
+                "delete-db-cluster ",
+                "modify-db-cluster",
+            )
+        ):
+            raise AssertionError(f"a deleting cluster was re-deleted: {line}")
+        return subprocess.CompletedProcess(arguments, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", fake_run)
+    monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
+    request = UninstallRequest(
+        site=site,
+        cpu_disposition="keep",
+        confirmation="UNINSTALL_GPU_FAULT",
+        reset_database=True,
+    )
+    snapshot = InstallationResourceSnapshot(
+        site_id="test-site", resources=_aurora_stack()
+    )
+    aurora = AuroraDeletion(
+        admin_aws_cleanup.ResourceCleaner(site),
+        snapshot,
+        request,
+        {"final_snapshot_identifier": "test-final", "phase": "KUBERNETES_VERIFIED"},
+    )
+
+    aurora.start()
+    retained = aurora.finish()
+
+    assert retained is not None, "the final snapshot must still be reported"
+    assert retained.resource_id == "test-final"
+    assert describes["clusters"] > 2, "the rerun must wait for the cluster to vanish"

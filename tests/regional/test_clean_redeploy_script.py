@@ -299,11 +299,50 @@ def test_node_components_stop_only_after_the_executors_and_the_drain() -> None:
 FAKE_KUBECTL_STOPPED_PLANE = """#!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_KUBECTL_LOG"], "a", encoding="utf-8") as stream:
     stream.write(" ".join(args) + "\\n")
+
+# A minimal API server memory: an object deleted here is NotFound afterwards
+# (silently absent under --ignore-not-found), so the script's own polls for
+# disappearance terminate the way they do against a real cluster.
+context = args[args.index("--context") + 1] if "--context" in args else "cpu"
+deleted_path = os.environ["FAKE_KUBECTL_LOG"] + ".deleted"
+deleted = set()
+if os.path.exists(deleted_path):
+    with open(deleted_path, encoding="utf-8") as stream:
+        deleted = set(stream.read().split())
+
+
+def object_key(verb):
+    rest = [item for item in args[args.index(verb) + 1 :] if not item.startswith("-")]
+    return f"{context}:{rest[0]}:{rest[1]}" if len(rest) >= 2 else None
+
+
+if "delete" in args:
+    key = object_key("delete")
+    if key is not None:
+        with open(deleted_path, "a", encoding="utf-8") as stream:
+            stream.write(key + "\\n")
+    raise SystemExit(0)
+if "apply" in args:
+    manifest = sys.stdin.read()
+    kind = re.search(r"^kind: (\\S+)", manifest, re.M)
+    name = re.search(r"^  name: (\\S+)", manifest, re.M)
+    if kind and name:
+        key = f"{context}:{kind.group(1).lower()}:{name.group(1)}"
+        deleted.discard(key)
+        with open(deleted_path, "w", encoding="utf-8") as stream:
+            stream.write("\\n".join(sorted(deleted)) + "\\n")
+    raise SystemExit(0)
+if "get" in args and object_key("get") in deleted:
+    if "--ignore-not-found" in args:
+        raise SystemExit(0)
+    print("Error from server (NotFound): object not found", file=sys.stderr)
+    raise SystemExit(1)
 if "exec" in args:
     raise SystemExit("no Pod is running: exec must not be attempted")
 if "get" in args and "--raw=/readyz" in args:
@@ -366,16 +405,14 @@ raise SystemExit(0)
 """
 
 
-def test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_snapshot(
+def _run_reset_over_stopped_plane(
     tmp_path: Path,
-) -> None:
-    """Live uninstall, 2026-09-12: the first reset stopped ingress and the
-    consumers, then failed; the rerun died with "reset requires a running
-    control-plane pod to export fleet inventory" because no Pod was left to
-    export it, and it would have died again waiting for a drain no Pod can
-    report. The failed record the caller moved aside still carries the
-    export: a reset over a stopped control plane reuses it, skips the
-    Aurora checks nothing can invalidate, and completes."""
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, list[dict[str, object]]]:
+    """Execute a reset against the stopped-plane fake with one GPU cluster.
+
+    Returns the process, the state file, the kubectl call log, and the fleet
+    snapshot the earlier (failed) record carried.
+    """
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -433,6 +470,21 @@ def test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_sna
         "--execute",
         env=env,
     )
+    return result, state, log, fleet
+
+
+def test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Live uninstall, 2026-09-12: the first reset stopped ingress and the
+    consumers, then failed; the rerun died with "reset requires a running
+    control-plane pod to export fleet inventory" because no Pod was left to
+    export it, and it would have died again waiting for a drain no Pod can
+    report. The failed record the caller moved aside still carries the
+    export: a reset over a stopped control plane reuses it, skips the
+    Aurora checks nothing can invalidate, and completes."""
+
+    result, state, log, fleet = _run_reset_over_stopped_plane(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert (
@@ -447,3 +499,77 @@ def test_a_reset_resumes_over_a_stopped_control_plane_with_the_earlier_fleet_sna
     calls = log.read_text(encoding="utf-8")
     assert " exec " not in f" {calls} ", "no drain probe may be attempted without a Pod"
     assert "delete namespace gpu-fault-system" in calls
+
+
+def test_namespace_and_wave_deletes_are_issued_before_their_waits(
+    tmp_path: Path,
+) -> None:
+    """Live uninstall, 2026-09-12: deleting the application objects one by one
+    with kubectl's own wait cost ~50 s, and the two namespaces ~49 s more. A
+    wave's deletes are all issued with --wait=false before the wave is polled
+    once, a later wave starts only after the earlier one is gone, and both
+    planes' namespace deletes go out before either namespace is waited on."""
+
+    result, _state, log, _fleet = _run_reset_over_stopped_plane(tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+
+    def first(*fragments: str) -> int:
+        return next(
+            index
+            for index, call in enumerate(calls)
+            if all(fragment in call for fragment in fragments)
+        )
+
+    namespace_deletes = [
+        index
+        for index, call in enumerate(calls)
+        if "delete namespace gpu-fault-system" in call
+    ]
+    assert len(namespace_deletes) == 2, "one namespace delete per plane"
+    assert all(
+        "--wait=false" in calls[index] and "--timeout" not in calls[index]
+        for index in namespace_deletes
+    ), "namespace deletes must not wait one at a time"
+    namespace_poll = first("get namespace gpu-fault-system", "--ignore-not-found")
+    assert max(namespace_deletes) < namespace_poll, (
+        "both planes' namespace deletes go out before either is waited on"
+    )
+
+    # The fake reports three GPU producer Deployments and one executor, so the
+    # producer wave has three members and the executor wave follows it.
+    producers = (
+        "gpu-fault-node-installer-reconciler",
+        "gpu-fault-completion-watcher",
+        "gpu-fault-kubernetes-node-resource-collector",
+    )
+    producer_deletes = [
+        first("--context gpu-a-context", f"delete deployment {name}", "--wait=false")
+        for name in producers
+    ]
+    producer_polls = [
+        first("--context gpu-a-context", f"get deployment {name}", "--ignore-not-found")
+        for name in producers
+    ]
+    assert max(producer_deletes) < min(producer_polls), (
+        "every delete of a wave is issued before the wave is polled once"
+    )
+    executor_delete = first(
+        "--context gpu-a-context",
+        "delete deployment gpu-fault-cluster-executor",
+        "--wait=false",
+    )
+    assert max(producer_polls) < executor_delete, (
+        "a later wave starts only after the earlier wave is gone"
+    )
+    ingress_delete = first("--kubeconfig", "delete deployment gpu-fault-api-ha")
+    ingress_poll = first(
+        "--kubeconfig", "get deployment gpu-fault-api-ha", "--ignore-not-found"
+    )
+    consumer_delete = first(
+        "--kubeconfig", "delete deployment gpu-fault-control-worker"
+    )
+    assert ingress_delete < ingress_poll < consumer_delete, (
+        "the CPU ingress wave is gone before the consumer wave starts"
+    )

@@ -68,6 +68,10 @@ log() {
     printf '[clean-redeploy] %s\n' "$*"
 }
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=prepare-clean-redeploy-delete.sh
+source "${SCRIPT_DIR}/prepare-clean-redeploy-delete.sh"
+
 while (($# > 0)); do
     case "$1" in
         --config)
@@ -435,7 +439,7 @@ while IFS=$'\t' read -r record first second third fourth fifth sixth; do
                     CPU_CRONJOBS+=("${third}")
                 fi
                 if [[ "${sixth}" == delete ]]; then
-                    CPU_DELETE_RESOURCES+=("${resource_record}")
+                    CPU_DELETE_RESOURCES+=("${resource_record}"$'\t'"${fifth}")
                 elif [[ "${fifth}" == nlb ]]; then
                     CPU_NLB_SERVICES+=("${third}")
                 fi
@@ -452,7 +456,7 @@ while IFS=$'\t' read -r record first second third fourth fifth sixth; do
                     GPU_DAEMONSETS+=("${third}")
                 fi
                 if [[ "${sixth}" == delete ]]; then
-                    GPU_DELETE_RESOURCES+=("${resource_record}")
+                    GPU_DELETE_RESOURCES+=("${resource_record}"$'\t'"${fifth}")
                 fi
             fi
             ;;
@@ -1133,40 +1137,6 @@ stop_gpu_producers() {
     # finished (live uninstall, 2026-09-12).
 }
 
-clean_gpu_objects() {
-    local context=$1
-    local entry
-    local kind
-    local name
-    local resource_scope
-    for entry in "${GPU_DELETE_RESOURCES[@]}"; do
-        IFS=$'\t' read -r kind name resource_scope <<<"${entry}"
-        if [[ "${resource_scope}" == cluster ]]; then
-            gpu_kubectl "${context}" delete "${kind}" "${name}" \
-                --ignore-not-found
-        else
-            gpu_kubectl "${context}" -n "${NAMESPACE}" \
-                delete "${kind}" "${name}" --ignore-not-found
-        fi
-    done
-}
-
-clean_cpu_objects() {
-    local entry
-    local kind
-    local name
-    local resource_scope
-    for entry in "${CPU_DELETE_RESOURCES[@]}"; do
-        IFS=$'\t' read -r kind name resource_scope <<<"${entry}"
-        if [[ "${resource_scope}" == cluster ]]; then
-            cpu_kubectl delete "${kind}" "${name}" --ignore-not-found
-        else
-            cpu_kubectl -n "${NAMESPACE}" \
-                delete "${kind}" "${name}" --ignore-not-found
-        fi
-    done
-}
-
 assert_no_quarantined_nodes() {
     local cluster_id=$1
     local context=$2
@@ -1249,18 +1219,6 @@ delete_control_plane_nlb_service() {
                 --timeout="${TIMEOUT_SECONDS}s"
         fi
     done
-}
-
-delete_solution_namespaces() {
-    local context
-    for context in "${CLUSTER_CONTEXTS[@]}"; do
-        gpu_kubectl "${context}" delete namespace "${NAMESPACE}" \
-            --ignore-not-found --wait=true \
-            --timeout="${TIMEOUT_SECONDS}s"
-    done
-    cpu_kubectl delete namespace "${NAMESPACE}" \
-        --ignore-not-found --wait=true \
-        --timeout="${TIMEOUT_SECONDS}s"
 }
 
 verify_gpu_stopped() {
@@ -1449,10 +1407,10 @@ if [[ "${MODE}" == clean || "${MODE}" == reset ]]; then
         APPLICATION_OBJECTS_DELETED IN_PROGRESS \
         "deleting registered application objects"
     for context in "${CLUSTER_CONTEXTS[@]}"; do
-        clean_gpu_objects "${context}"
+        clean_plane_objects "${context}" GPU_DELETE_RESOURCES
     done
     if [[ "${SCOPE}" == all ]]; then
-        clean_cpu_objects
+        clean_plane_objects "" CPU_DELETE_RESOURCES
     fi
     transition_state \
         APPLICATION_OBJECTS_DELETED COMPLETED \
