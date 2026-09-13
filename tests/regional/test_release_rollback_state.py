@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_observability_rollback as OBSERVABILITY
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
@@ -94,6 +95,7 @@ def test_rollback_cleanup_is_scoped_to_agent_components() -> None:
     calls = []
     release = SimpleNamespace(
         config=SimpleNamespace(
+            admin_config=default_admin_config(),
             clusters=(target,),
             agent_config_digest="c" * 64,
             runtime_profile_version="profile-v2",
@@ -281,7 +283,10 @@ def test_previous_release_snapshot_reads_live_images() -> None:
     previous_dcgm = "registry.example/dcgm:previous"
     target = SimpleNamespace(cluster_id="gpu-a")
     config = SimpleNamespace(
-        namespace="gpu-fault-system", clusters=(target,), bundle=Path("bundle.tar.gz")
+        admin_config=default_admin_config(),
+        namespace="gpu-fault-system",
+        clusters=(target,),
+        bundle=Path("bundle.tar.gz"),
     )
 
     def get_json(arguments: list[str]) -> dict:
@@ -413,7 +418,11 @@ def test_deployment_snapshot_primes_list_reads_and_returns_independent_values() 
     class SnapshotRelease:
         _deployment_snapshot_enabled = True
         runner = Runner()
-        config = SimpleNamespace(namespace="gpu-fault-system", clusters=(target,))
+        config = SimpleNamespace(
+            admin_config=default_admin_config(),
+            namespace="gpu-fault-system",
+            clusters=(target,),
+        )
         _cpu = staticmethod(cpu_command)
         _gpu = staticmethod(gpu_command)
 
@@ -513,7 +522,9 @@ def test_release_state_externalizes_and_hydrates_previous_snapshot() -> None:
     }
     loaded_release = SimpleNamespace(
         state={},
-        config=SimpleNamespace(namespace="gpu-fault-system"),
+        config=SimpleNamespace(
+            admin_config=default_admin_config(), namespace="gpu-fault-system"
+        ),
         _cpu=lambda *args: list(args),
         _get_json=lambda arguments: (
             {"data": {"state.json": json.dumps(persisted)}}
@@ -568,7 +579,9 @@ def test_previous_snapshot_configmaps_are_immutable_and_content_addressed(
     runner.probe = exists
     release = SimpleNamespace(
         runner=runner,
-        config=SimpleNamespace(namespace="gpu-fault-system"),
+        config=SimpleNamespace(
+            admin_config=default_admin_config(), namespace="gpu-fault-system"
+        ),
         release_id="release-a",
         _cpu=lambda *args: list(args),
         _get_json=lambda arguments: documents[arguments[-1]],
@@ -607,7 +620,9 @@ def test_snapshot_cleanup_preserves_current_reference_and_newest_retained() -> N
             dry_run=False,
             run=lambda arguments, **_kwargs: calls.append(arguments) or "",
         ),
-        config=SimpleNamespace(namespace="gpu-fault-system"),
+        config=SimpleNamespace(
+            admin_config=default_admin_config(), namespace="gpu-fault-system"
+        ),
         _cpu=lambda *args: list(args),
         _get_json=lambda _arguments: {
             "items": [
@@ -642,6 +657,7 @@ def test_observability_snapshot_restores_amp_rules_and_alertmanager() -> None:
     calls = []
     release = SimpleNamespace(
         config=SimpleNamespace(
+            admin_config=default_admin_config(),
             namespace="gpu-fault-system",
             aws_region="us-west-2",
             health=SimpleNamespace(amp_workspace_id="ws-test"),
@@ -783,6 +799,7 @@ def test_agent_identity_snapshot_captures_the_exact_legacy_contract() -> None:
     release = SimpleNamespace(
         runner=Runner(),
         config=SimpleNamespace(
+            admin_config=default_admin_config(),
             namespace="gpu-fault-system",
             clusters=(SimpleNamespace(cluster_id="gpu-a"),),
         ),
@@ -1046,9 +1063,10 @@ def rollback_release_fake(
         runtime_image="candidate-runtime",
         node_installer_image="registry.example/installer:candidate",
         config=SimpleNamespace(
+            admin_config=default_admin_config(),
             clusters=tuple(
                 SimpleNamespace(cluster_id=cluster_id) for cluster_id in cluster_ids
-            )
+            ),
         ),
         _refresh_aurora_credentials=lambda: None,
         _require_no_inflight_installs=lambda **_kwargs: None,
@@ -1108,7 +1126,9 @@ def test_rollback_verifier_receives_previous_runtime_image(
         ),
         runtime_image="candidate-runtime",
         config=SimpleNamespace(
-            namespace="gpu-fault-system", cpu_kubeconfig="/nonexistent/cpu.kubeconfig"
+            admin_config=default_admin_config(),
+            namespace="gpu-fault-system",
+            cpu_kubeconfig="/nonexistent/cpu.kubeconfig",
         ),
         _config_map_data=lambda name: (
             {"GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "profile-v1"}
@@ -1200,7 +1220,10 @@ def _snapshot_release(
     state: dict,
 ) -> SimpleNamespace:
     config = SimpleNamespace(
-        namespace="gpu-fault-system", clusters=(target,), bundle=Path("bundle.tar.gz")
+        admin_config=default_admin_config(),
+        namespace="gpu-fault-system",
+        clusters=(target,),
+        bundle=Path("bundle.tar.gz"),
     )
 
     def get_json(arguments: list[str]) -> dict:
