@@ -351,12 +351,38 @@ def run_prepared_deploy(
     return 0
 
 
+def refuse_deploy_during_uninstall(state_dir: Path) -> None:
+    """A site half-way through an uninstall is not a site to deploy to.
+
+    Live 2026-09-13: an uninstall had deleted the namespaces and Aurora and
+    stopped at a certificate; a `deploy --state-dir` started meanwhile (meant
+    as a deploy-host refresh) re-created the SNS topic and re-subscribed the
+    administrator before it stopped for the confirmation link. The uninstall
+    record says what the site is; until it reads COMPLETED, deploy refuses.
+    """
+
+    record = state_dir / "uninstall" / "state.json"
+    if not record.is_file():
+        return
+    try:
+        phase = str(json.loads(record.read_text(encoding="utf-8")).get("phase") or "")
+    except (OSError, ValueError):
+        phase = "unreadable"
+    if phase != "COMPLETED":
+        raise SiteConfigError(
+            f"an uninstall of this site is in progress (phase {phase}); finish it "
+            "with `gpu-fault-admin uninstall --state-dir ...` (it resumes where it "
+            "stopped) before deploying again"
+        )
+
+
 def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     """Dispatch the one deploy command to its action."""
 
     if arguments.state_dir is None:
         raise SiteConfigError("deploy requires --state-dir")
     state_dir = arguments.state_dir.expanduser().resolve()
+    refuse_deploy_during_uninstall(state_dir)
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)
