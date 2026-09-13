@@ -215,6 +215,59 @@ def test_aurora_fixture_sets_124_128_before_capacity_check(
     assert result["min_acu"] == 124.0
 
 
+def test_aurora_fixture_keeps_a_window_at_or_above_the_formal_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """128/128 (the 50-* preset floor) satisfies 124/128; it is not lowered.
+
+    Lowering it behind ``gpu-fault-admin config`` left the desired and live
+    windows apart and the next preset apply refused the drift (2026-09-13).
+    """
+
+    def fake_aws_json(*arguments: str, **_kwargs):
+        assert arguments[1] != "modify-db-cluster", (
+            "a window above the floor was lowered"
+        )
+        if arguments[1] == "describe-db-clusters":
+            return {
+                "DBClusters": [
+                    {
+                        "Status": "available",
+                        "ServerlessV2ScalingConfiguration": {
+                            "MinCapacity": 128.0,
+                            "MaxCapacity": 128.0,
+                        },
+                        "DBClusterMembers": [
+                            {"DBInstanceIdentifier": "w", "IsClusterWriter": True},
+                            {"DBInstanceIdentifier": "r", "IsClusterWriter": False},
+                        ],
+                    }
+                ]
+            }
+        if arguments[1] == "describe-db-instances":
+            return {
+                "DBInstances": [
+                    {
+                        "DBInstanceStatus": "available",
+                        "DBInstanceClass": "db.serverless",
+                    }
+                ]
+            }
+        return {
+            "Datapoints": [
+                {"Timestamp": datetime.now(UTC).isoformat(), "Maximum": 128.0}
+            ]
+        }
+
+    monkeypatch.setattr(suite, "aws_json", fake_aws_json)
+
+    result = suite.ensure_aurora_capacity("aurora-a", timeout_seconds=5, configure=True)
+
+    assert result["scaling_modified"] is False
+    assert result["initial_scaling"] == {"min_acu": 128.0, "max_acu": 128.0}
+    assert result["min_acu"] == 128.0
+
+
 def test_aurora_fixture_refuses_to_resize_without_authorization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

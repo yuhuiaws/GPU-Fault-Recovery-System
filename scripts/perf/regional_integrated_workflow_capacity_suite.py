@@ -291,8 +291,8 @@ def aurora_capacity_preflight(
         }
         if (
             last["cluster_status"] == "available"
-            and float(last["min_acu"] or 0) == FORMAL_AURORA_MIN_ACU
-            and float(last["max_acu"] or 0) == FORMAL_AURORA_MAX_ACU
+            and float(last["min_acu"] or 0) >= FORMAL_AURORA_MIN_ACU
+            and float(last["max_acu"] or 0) >= FORMAL_AURORA_MAX_ACU
             and len(instances) == 2
             and all(
                 item["status"] == "available"
@@ -323,13 +323,19 @@ def ensure_aurora_capacity(
     timeout_seconds: int,
     configure: bool,
 ) -> dict:
-    """Hold the formal 124/128 window through the one writer of the ACU window.
+    """Hold at least the formal 124/128 window through the one writer of it.
 
     ``aurora_capacity.reconcile_aurora_capacity`` issues the modify (when
     authorized) and waits for RDS to really settle -- the same settle rule
     ``config apply`` uses, so the harness cannot start against a cluster that
     is about to flip to ``modifying``. The harness's own preflight then reads
     the window and per-instance ACU into the report shape the suite expects.
+
+    124/128 is a floor, not an exact window: the ``50-*`` capacity presets pin
+    Aurora at 128/128 (their node count fixes that Min), and lowering it to
+    124 behind ``gpu-fault-admin config`` left the site's desired window and
+    the live one apart -- the next preset apply refused the drift (live
+    2026-09-13). A window at or above the floor is kept as it is.
     """
 
     initial_state = observe_aurora_capacity(
@@ -342,21 +348,21 @@ def ensure_aurora_capacity(
         "min_acu": initial_state["min_acu"],
         "max_acu": initial_state["max_acu"],
     }
-    modified = (
-        float(initial["min_acu"] or 0) != FORMAL_AURORA_MIN_ACU
-        or float(initial["max_acu"] or 0) != FORMAL_AURORA_MAX_ACU
-    )
+    live_min = float(initial["min_acu"] or 0)
+    live_max = float(initial["max_acu"] or 0)
+    modified = live_min < FORMAL_AURORA_MIN_ACU or live_max < FORMAL_AURORA_MAX_ACU
     if modified:
         if not configure:
             raise RuntimeError(
-                "Aurora is not at 124/128 and automatic capacity configuration "
+                "Aurora is below 124/128 and automatic capacity configuration "
                 "was not authorized"
             )
         reconcile_aurora_capacity(
             aws_region=AWS_REGION,
             cluster_id=cluster_id,
             desired=AuroraCapacityConfig(
-                min_acu=FORMAL_AURORA_MIN_ACU, max_acu=FORMAL_AURORA_MAX_ACU
+                min_acu=max(live_min, FORMAL_AURORA_MIN_ACU),
+                max_acu=max(live_max, FORMAL_AURORA_MAX_ACU),
             ),
             timeout_seconds=timeout_seconds,
             poll_seconds=0 if timeout_seconds < 60 else 10.0,
