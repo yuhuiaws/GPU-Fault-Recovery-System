@@ -62,6 +62,9 @@ __all__ = [
 ]
 
 CONTROL_WORKER_DEPLOYMENT = "gpu-fault-control-worker"
+# Six replicas rolling one at a time with readiness at 5 s intervals settle well
+# inside this; a worker that cannot become Ready is a failed command, not a hang.
+CONTROL_WORKER_ROLLOUT_TIMEOUT_SECONDS = 600
 # The HyperPod cluster label the release engine filters its node inventory on
 # (``regional_release_gpu_rollout.gpu_node_command``); the admin-side render
 # selects on it too so both produce one document, one digest, for one fleet.
@@ -274,6 +277,21 @@ def apply_failure_domain_map(
                 "--type=merge",
                 "-p",
                 json.dumps(patch),
+            ],
+        )
+        # A changed stamp starts a rolling restart; the command that applied it
+        # (join-cluster, remove-cluster) reports COMPLETED only once the worker
+        # has settled. Live 2026-09-13: join returned mid-roll and the uninstall
+        # that followed exec'd into a worker Pod that was already terminating.
+        # An unchanged stamp returns at once.
+        _run(
+            run,
+            [
+                *kubectl,
+                "rollout",
+                "status",
+                f"deployment/{CONTROL_WORKER_DEPLOYMENT}",
+                f"--timeout={CONTROL_WORKER_ROLLOUT_TIMEOUT_SECONDS}s",
             ],
         )
     return result

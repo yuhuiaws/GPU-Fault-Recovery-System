@@ -671,14 +671,18 @@ deployment_replicas_cpu() {
 }
 
 find_database_pod() {
+    # Ready and not terminating: a Running Pod already being deleted (a roll
+    # the previous command started) completes before the exec reaches it.
     local name
     local pod
     for name in "${CPU_DATABASE_POD_PREFERENCE[@]}"; do
         pod="$(
-            cpu_kubectl -n "${NAMESPACE}" get pod \
-                -l "app=${name}" \
-                --field-selector=status.phase=Running \
-                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+            cpu_kubectl -n "${NAMESPACE}" get pod -l "app=${name}" \
+                --field-selector=status.phase=Running -o json 2>/dev/null |
+                python3 -c 'import json,sys
+for i in json.load(sys.stdin).get("items", []):
+    if not i["metadata"].get("deletionTimestamp") and all(c.get("ready") for c in i.get("status", {}).get("containerStatuses", [])):
+        print(i["metadata"]["name"]); break' 2>/dev/null || true
         )"
         if [[ -n "${pod}" ]]; then
             printf '%s\n' "${pod}"
@@ -686,6 +690,16 @@ find_database_pod() {
         fi
     done
     return 1
+}
+
+wait_for_cpu_rollouts() { # a role still rolling would hand us terminating Pods
+    local deployment
+    for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}" "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
+        [[ "$(deployment_replicas_cpu "${deployment}")" =~ ^[1-9] ]] || continue
+        cpu_kubectl -n "${NAMESPACE}" rollout status "deployment/${deployment}" \
+            --timeout="${TIMEOUT_SECONDS}s" >/dev/null ||
+            die "control-plane deployment ${deployment} did not settle before cleanup"
+    done
 }
 
 reuse_previous_fleet_inventory() {
@@ -1290,6 +1304,7 @@ for index in "${!CLUSTER_IDS[@]}"; do
 done
 log "captured pre-clean state in ${STATE_FILE}"
 
+if [[ "${SCOPE}" == all ]]; then wait_for_cpu_rollouts; fi
 DATABASE_POD="$(find_database_pod || true)"
 # PRESENT: the Deployments exist (a previous run may have scaled them to
 # zero). RUNNING: at least one still has replicas, so a Pod can exist and

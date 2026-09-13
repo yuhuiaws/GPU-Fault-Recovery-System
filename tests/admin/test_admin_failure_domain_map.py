@@ -103,6 +103,8 @@ class FakeKubectl:
                 verbs.append("apply")
             elif "patch" in args:
                 verbs.append("patch")
+            elif "rollout" in args:
+                verbs.append("rollout status")
             elif "nodes" in args:
                 verbs.append("get nodes")
             elif "deployment" in args:
@@ -191,7 +193,13 @@ def test_apply_ships_the_map_and_stamps_the_worker_pod_template() -> None:
         "apply",
         "get deployment",
         "patch",
-    ]
+        "rollout status",
+    ], "the stamp starts a worker roll; the apply must wait for it to settle"
+    rollout_args, _ = next(c for c in kubectl.calls if "rollout" in c[0])
+    assert rollout_args[-2:] == [
+        f"deployment/{module.CONTROL_WORKER_DEPLOYMENT}",
+        f"--timeout={module.CONTROL_WORKER_ROLLOUT_TIMEOUT_SECONDS}s",
+    ], rollout_args
     apply_args, apply_kwargs = next(c for c in kubectl.calls if "apply" in c[0])
     assert apply_args[:5] == [
         "kubectl",
