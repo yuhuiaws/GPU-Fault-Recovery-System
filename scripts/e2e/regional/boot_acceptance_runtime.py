@@ -966,7 +966,9 @@ import urllib.request
 
 cluster_id = sys.argv[1]
 started = time.perf_counter()
-text = urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode()
+# The remote-command gauges are computed by the control-worker role (port
+# 8081) since the role split; the ingress on 8080 no longer serves them.
+text = urllib.request.urlopen("http://127.0.0.1:8081/metrics", timeout=5).read().decode()
 elapsed = time.perf_counter() - started
 pending = 0.0
 oldest = None
@@ -1262,9 +1264,13 @@ def run_boot015(
                     ),
                 }
             )
-        first = fixture.regional.cpu_python(METRIC_PROBE, fixture.cluster_id)
+        first = fixture.regional.pod_python(
+            "cpu", "gpu-fault-control-worker", METRIC_PROBE, fixture.cluster_id
+        )
         time.sleep(METRIC_SAMPLE_GAP_SECONDS)
-        second = fixture.regional.cpu_python(METRIC_PROBE, fixture.cluster_id)
+        second = fixture.regional.pod_python(
+            "cpu", "gpu-fault-control-worker", METRIC_PROBE, fixture.cluster_id
+        )
         logs = [
             fixture.regional.kubectl(
                 "gpu",
