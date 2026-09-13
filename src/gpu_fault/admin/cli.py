@@ -77,8 +77,10 @@ from gpu_fault.admin.collector_outbox import (
 )
 from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.release_child import (
+    run_automatic_release as _run_automatic_release,
+)
 from gpu_fault.admin.notification_precheck import WAIT_FLAG
-from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
     approve_profile_plan_inline,
@@ -721,42 +723,6 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _run_automatic_release(
-    *,
-    repository_root: Path,
-    site_file: Path,
-    state_dir: Path,
-    staging_only_release: bool,
-) -> int:
-    command = [
-        sys.executable,
-        str(repository_root / "scripts/release_deploy.py"),
-        "--site",
-        str(site_file),
-        "--prebuilt-attestation",
-        str(repository_root / "dist/current-attestation.json"),
-        "--prebuilt-bundle",
-        str(repository_root / "dist/current-attestation.bundle.json"),
-        "--cosign-key",
-        str(state_dir / "release-signing/cosign.pub"),
-    ]
-    if staging_only_release:
-        command.append("--allow-staging-release")
-    completed = subprocess.run(
-        command,
-        cwd=repository_root,
-        env={
-            **os.environ,
-            "PYTHONPATH": str(repository_root / "src"),
-        },
-        check=False,
-        pass_fds=inherited_lock_pass_fds(),
-    )
-    if completed.returncode:
-        return completed.returncode
-    return 0
-
-
 def _run_join_cluster(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="join-cluster")
     assert site_file is not None
@@ -1309,6 +1275,7 @@ def _roll_admin_config(
     *,
     release_id: str,
     staging_only: bool,
+    lock_fd: int | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     """Aurora modify, role rollout, then the scale-up wait; undone on failure.
 
@@ -1334,6 +1301,7 @@ def _roll_admin_config(
             site_file=site_file,
             state_dir=arguments.state_dir,
             staging_only_release=staging_only,
+            lock_fd=lock_fd,
         )
         rolled = returncode == 0
         if rolled and aurora is not None:
@@ -1378,6 +1346,8 @@ def _apply_admin_config(
     arguments: argparse.Namespace,
     site: RenderedSite,
     site_file: Path,
+    *,
+    lock_fd: int | None = None,
 ) -> int:
     """The locked apply: verify, record, roll, complete, then normalise the YAML."""
 
@@ -1432,6 +1402,7 @@ def _apply_admin_config(
         apply,
         release_id=release_id,
         staging_only=staging_only,
+        lock_fd=lock_fd,
     )
     if returncode:
         return returncode
@@ -1476,8 +1447,8 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
         plan = admin_config_change_plan(current, desired, source=source)
         print(json.dumps({"status": "DRY_RUN", **plan}, indent=2, sort_keys=True))
         return 0
-    with administrator_operation_lock(arguments.state_dir):
-        return _apply_admin_config(arguments, site, site_file)
+    with administrator_operation_lock(arguments.state_dir) as lock_fd:
+        return _apply_admin_config(arguments, site, site_file, lock_fd=lock_fd)
 
 
 def _run_deploy(arguments: argparse.Namespace) -> int:

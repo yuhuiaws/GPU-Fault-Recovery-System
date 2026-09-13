@@ -593,3 +593,45 @@ def test_existing_site_rejects_direct_config_change_on_deploy(tmp_path: Path) ->
 
     with pytest.raises(AdminConfigError, match="gpu-fault-admin config --state-dir"):
         admin_cli.run(arguments)
+
+
+def test_config_hands_its_site_lock_to_release_deploy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Live 2026-09-13: `config` held the site lock and spawned release-deploy,
+    which takes the same lock and -- without the inherited descriptor -- refused
+    its own parent as "another administrator mutation". The release is now given
+    the held descriptor, which must be the site lock file itself."""
+
+    import os
+
+    from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK
+
+    site_file(tmp_path)
+    mock_live_release(monkeypatch)
+    initialize_desired_admin_config(tmp_path)
+    Stubs(monkeypatch)
+    handed: list[object] = []
+
+    def release(**kwargs):
+        lock_fd = kwargs.get("lock_fd")
+        handed.append(lock_fd)
+        if isinstance(lock_fd, int):
+            held = os.fstat(lock_fd)
+            expected = os.stat(tmp_path / SITE_OPERATION_LOCK)
+            handed.append(
+                (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino)
+            )
+        return 0
+
+    monkeypatch.setattr(admin_cli, "_run_automatic_release", release)
+    config = _yaml(
+        tmp_path / "c.yaml", {"capacity": {"remediation": {"maxActiveRegion": 40}}}
+    )
+
+    assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
+
+    assert len(handed) == 2 and isinstance(handed[0], int), (
+        "the release is handed an open descriptor"
+    )
+    assert handed[1] is True, "the descriptor is the site operation lock"

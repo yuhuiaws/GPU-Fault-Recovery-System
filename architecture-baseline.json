@@ -32,7 +32,7 @@
     "scripts/e2e/regional/run_workload_acceptance.py": 2165,
     "src/gpu_fault/admin/aws_cleanup.py": 1562,
     "src/gpu_fault/admin/bootstrap.py": 1994,
-    "src/gpu_fault/admin/cli.py": 1651,
+    "src/gpu_fault/admin/cli.py": 1622,
     "src/gpu_fault/admin/resource_registry.py": 1501,
     "src/gpu_fault/execution/dispatcher.py": 1692,
     "src/gpu_fault/execution/executor.py": 2808,
