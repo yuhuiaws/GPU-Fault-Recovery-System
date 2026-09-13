@@ -50,42 +50,49 @@ def test_a_completed_uninstall_does_not_block_the_next_bootstrap(tmp_path) -> No
     deploy_command.refuse_deploy_during_uninstall(tmp_path)
 
 
-def test_a_completed_uninstall_archives_the_bootstrap_checkpoints_once(
-    tmp_path,
-) -> None:
-    """The deploy after an uninstall must create every resource again.
+def test_a_completed_uninstall_retires_the_site_records_once(tmp_path) -> None:
+    """The deploy after an uninstall must start as a new site.
 
     Live 2026-09-13: bootstrap-state.json still trusted aurora, the IAM roles
-    and the AMP workspace after the uninstall had deleted them, so the deploy
-    skipped their creation and failed its preflight on the missing resources.
+    and the AMP workspace after the uninstall had deleted them, and site.yaml
+    plus the signed success record made the source deploy classify the
+    directory as an installed site; the deploy skipped every creation task and
+    failed its preflight on the missing resources.
     """
 
     (tmp_path / "uninstall").mkdir()
     (tmp_path / "uninstall" / "state.json").write_text(
         json.dumps({"phase": "COMPLETED"}), encoding="utf-8"
     )
-    (tmp_path / "bootstrap-state.json").write_text(
-        json.dumps({"completed_tasks": ["aurora"]}), encoding="utf-8"
-    )
+    for name in deploy_command.RETIRED_AFTER_UNINSTALL:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    (tmp_path / "admin-config").mkdir()
+    (tmp_path / "admin-config" / "desired.json").write_text("{}", encoding="utf-8")
 
-    deploy_command.retire_bootstrap_checkpoints_after_uninstall(tmp_path)
+    archive = deploy_command.retire_site_after_uninstall(tmp_path)
 
-    assert not (tmp_path / "bootstrap-state.json").exists(), (
-        "the checkpoints must not be trusted after an uninstall"
+    assert archive is not None and archive.is_dir(), "the records are retired, not lost"
+    for name in deploy_command.RETIRED_AFTER_UNINSTALL:
+        assert not (tmp_path / name).exists(), (
+            f"{name} must not describe the site any more"
+        )
+        assert (archive / name).is_file(), f"{name} is kept for the audit trail"
+    assert (tmp_path / "admin-config" / "desired.json").is_file(), (
+        "the administrator's desired config survives a keep-uninstall"
     )
-    archived = list(tmp_path.glob("bootstrap-state.uninstalled-*.json"))
-    assert len(archived) == 1, "the checkpoints are archived, not lost"
     assert not (tmp_path / "uninstall" / "state.json").exists(), (
-        "the uninstall record is consumed so the next deploy keeps its checkpoints"
+        "the uninstall record is consumed so the next deploy keeps the fresh records"
     )
     assert list((tmp_path / "uninstall").glob("state.consumed-*.json")), (
         "the consumed record is kept for the audit trail"
     )
-    # A second deploy finds no record and leaves the fresh checkpoints alone.
-    (tmp_path / "bootstrap-state.json").write_text("{}", encoding="utf-8")
-    deploy_command.retire_bootstrap_checkpoints_after_uninstall(tmp_path)
-    assert (tmp_path / "bootstrap-state.json").exists(), (
-        "only the first deploy after the uninstall archives"
+    # A second deploy finds no record and leaves the fresh site alone.
+    (tmp_path / "site.yaml").write_text("fresh", encoding="utf-8")
+    assert deploy_command.retire_site_after_uninstall(tmp_path) is None, (
+        "only the first deploy after the uninstall retires"
+    )
+    assert (tmp_path / "site.yaml").read_text(encoding="utf-8") == "fresh", (
+        "the fresh site document is untouched"
     )
 
 
@@ -96,8 +103,9 @@ def test_an_unfinished_uninstall_keeps_the_checkpoints(tmp_path) -> None:
     )
     (tmp_path / "bootstrap-state.json").write_text("{}", encoding="utf-8")
 
-    deploy_command.retire_bootstrap_checkpoints_after_uninstall(tmp_path)
-
+    assert deploy_command.retire_site_after_uninstall(tmp_path) is None, (
+        "an uninstall that has not finished decides nothing"
+    )
     assert (tmp_path / "bootstrap-state.json").exists(), (
         "an uninstall that has not finished decides nothing about the checkpoints"
     )
