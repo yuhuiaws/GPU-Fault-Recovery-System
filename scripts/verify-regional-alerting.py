@@ -345,10 +345,23 @@ def _live_rule_defects(path: Path) -> tuple[list[str], set[str]]:
     return defects, groups
 
 
+DRILL_CLUSTER_PREFIX = "perf-cap-"
+
+
+def _matches_drill_clusters(route: dict[str, Any]) -> bool:
+    matchers = [str(item) for item in route.get("matchers") or []]
+    return any(
+        matcher.replace(" ", "").startswith("cluster_id=~")
+        and DRILL_CLUSTER_PREFIX in matcher
+        for matcher in matchers
+    )
+
+
 def _route_defects(
     route: Any,
     receivers: list[str],
     *,
+    sinks: frozenset[str] = frozenset(),
     location: str = "root route",
     require_receiver: bool = True,
 ) -> list[str]:
@@ -365,7 +378,15 @@ def _route_defects(
         return [f"Alertmanager {location} is not a mapping"]
     defects: list[str] = []
     receiver = str(route.get("receiver", ""))
-    if receiver and receiver not in receivers:
+    if receiver in sinks:
+        # A sink drops what it receives; only the capacity drill clusters may
+        # be routed there, and only by an explicit cluster_id matcher.
+        if not _matches_drill_clusters(route):
+            defects.append(
+                f"Alertmanager {location} drops alerts into sink {receiver} "
+                "without a perf-cap- cluster_id matcher"
+            )
+    elif receiver and receiver not in receivers:
         defects.append(
             f"Alertmanager {location} selects an unknown receiver: {receiver}"
         )
@@ -378,6 +399,7 @@ def _route_defects(
             _route_defects(
                 child,
                 receivers,
+                sinks=sinks,
                 location=f"{location} > routes[{index}]",
                 require_receiver=False,
             )
@@ -392,9 +414,14 @@ def alertmanager_defects(path: Path) -> tuple[list[str], list[str]]:
         config = yaml.safe_load(config) or {}
 
     receivers: list[str] = []
+    sinks: set[str] = set()
     defects: list[str] = []
     for receiver in config.get("receivers", []):
         sns_configs = receiver.get("sns_configs") or []
+        if not any(str(key).endswith("_configs") for key in receiver):
+            # No delivery at all: the capacity drill sink (see _route_defects).
+            sinks.add(str(receiver.get("name", "<unnamed>")))
+            continue
         for sns in sns_configs:
             topic = str(sns.get("topic_arn", ""))
             if (
@@ -410,7 +437,9 @@ def alertmanager_defects(path: Path) -> tuple[list[str], list[str]]:
             receivers.append(str(receiver.get("name", "<unnamed>")))
     if not receivers:
         defects.append("live Alertmanager has no valid SNS receiver")
-    defects.extend(_route_defects(config.get("route") or {}, receivers))
+    defects.extend(
+        _route_defects(config.get("route") or {}, receivers, sinks=frozenset(sinks))
+    )
     return defects, receivers
 
 

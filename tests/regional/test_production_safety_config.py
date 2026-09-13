@@ -1322,3 +1322,56 @@ def test_manual_command_order_gate_is_not_constant_green(tmp_path: Path) -> None
         )
         assert result.returncode == 1
         assert expected in result.stdout
+
+
+def test_perf_capacity_alerts_are_routed_to_a_sink_that_delivers_nothing() -> None:
+    """Live 2026-09-13: capacity rounds fired GpuFaultCollectorSilent and
+    GpuFaultStaleAttemptObservation for 32 synthetic `perf-cap-` clusters and
+    Alertmanager mailed the administrator ~580 times -- the Store's drill label
+    never sees an AMP alert. The first child route now sinks them."""
+
+    document = yaml.safe_load(
+        (ROOT / "deploy/observability/amp-alertmanager.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    config = yaml.safe_load(document["alertmanager_config"])
+    first = config["route"]["routes"][0]
+    receivers = {item["name"]: item for item in config["receivers"]}
+
+    assert first["matchers"] == ['cluster_id=~"perf-cap-.*"'], (
+        "drill clusters are matched first, on cluster_id alone"
+    )
+    assert first.get("continue") is not True, "a drill alert must not fall through"
+    sink = receivers[first["receiver"]]
+    assert not any(str(key).endswith("_configs") for key in sink), (
+        "the drill sink must have no delivery configuration"
+    )
+    assert "sns_configs" in receivers["gpu-fault-sns"], "real alerts still page"
+
+
+def test_rendered_alertmanager_passes_the_live_verifier_with_the_drill_sink(
+    tmp_path: Path,
+) -> None:
+    from tests._script_loader import lazy_script_module
+
+    verifier = lazy_script_module(ROOT / "scripts/verify-regional-alerting.py")
+    rendered = (
+        (ROOT / "deploy/observability/amp-alertmanager.yaml")
+        .read_text(encoding="utf-8")
+        .replace("REPLACE_WITH_SNS_TOPIC_ARN", "arn:aws:sns:us-west-2:123456789012:t")
+        .replace("REPLACE_WITH_AWS_REGION", "us-west-2")
+    )
+    path = tmp_path / "alertmanager.yaml"
+    path.write_text(rendered, encoding="utf-8")
+
+    defects, receivers = verifier.alertmanager_defects(path)
+
+    assert defects == [], f"the drill sink must not read as a defect: {defects}"
+    assert receivers == ["gpu-fault-sns"], "only the SNS receiver counts as delivery"
+
+    # A sink reached without the drill matcher is still a defect.
+    leaky = rendered.replace('cluster_id=~"perf-cap-.*"', 'severity="critical"')
+    path.write_text(leaky, encoding="utf-8")
+    defects, _receivers = verifier.alertmanager_defects(path)
+    assert any("drops alerts into sink" in item for item in defects), defects

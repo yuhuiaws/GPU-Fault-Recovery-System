@@ -221,6 +221,9 @@ def test_register_publishes_one_online_revision(tmp_path: Path, monkeypatch) -> 
     )
     monkeypatch.setattr(registry_module, "validate_notification_safety", lambda: None)
     monkeypatch.setattr(
+        registry_module, "validate_alertmanager_drill_route", lambda: {"stub": True}
+    )
+    monkeypatch.setattr(
         registry_module, "cleanup_registry_residuals", lambda **_kwargs: 0
     )
     monkeypatch.setattr(registry_module, "load_registry", lambda: list(baseline))
@@ -827,3 +830,70 @@ def test_connection_secret_mirror_is_a_no_op_when_already_current(monkeypatch) -
     monkeypatch.setattr(registry_module, "dataplane", dataplane)
 
     assert registry_module.sync_dataplane_connection_secret()["changed"] is False
+
+
+def _alertmanager_definition(alertmanager_config: str) -> str:
+    import base64
+    import subprocess as sp
+
+    del sp
+    outer = "alertmanager_config: |\n" + "".join(
+        "  " + line + "\n" for line in alertmanager_config.splitlines()
+    )
+    return json.dumps(
+        {
+            "alertManagerDefinition": {
+                "data": base64.b64encode(outer.encode()).decode(),
+                "status": {"statusCode": "ACTIVE"},
+            }
+        }
+    )
+
+
+_SINKING = """\
+route:
+  receiver: gpu-fault-sns
+  routes:
+    - receiver: gpu-fault-drill-sink
+      matchers:
+        - cluster_id=~"perf-cap-.*"
+receivers:
+  - name: gpu-fault-drill-sink
+  - name: gpu-fault-sns
+    sns_configs:
+      - topic_arn: arn:aws:sns:us-west-2:123456789012:t
+"""
+
+
+def test_capacity_run_requires_the_alertmanager_drill_sink(monkeypatch) -> None:
+    """Live 2026-09-13: the dispatcher suppressed every drill notification, but
+    Alertmanager mailed the synthetic clusters' AMP alerts straight to SNS. The
+    live definition must sink perf-cap- alerts before anything is registered."""
+
+    monkeypatch.setattr(registry_module, "AMP_WORKSPACE_ID", "ws-test")
+
+    def run(command, **_kwargs):
+        assert "describe-alert-manager-definition" in command, command
+        return SimpleNamespace(stdout=_alertmanager_definition(_SINKING).encode())
+
+    monkeypatch.setattr(registry_module, "run", run)
+
+    report = registry_module.validate_alertmanager_drill_route()
+
+    assert report["workspace_id"] == "ws-test"
+    assert report["drill_sink_routes"] == [
+        {"receiver": "gpu-fault-drill-sink", "matchers": ['cluster_id=~"perf-cap-.*"']}
+    ], "the sink route is the evidence"
+
+    mailing = _SINKING.replace("  - name: gpu-fault-drill-sink\n", "").replace(
+        "gpu-fault-drill-sink", "gpu-fault-sns"
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "run",
+        lambda command, **_k: SimpleNamespace(
+            stdout=_alertmanager_definition(mailing).encode()
+        ),
+    )
+    with pytest.raises(RuntimeError, match="must not mail drill alerts"):
+        registry_module.validate_alertmanager_drill_route()

@@ -12,6 +12,14 @@ alertmanager_config: |
     group_interval: 5m
     repeat_interval: 4h
     routes:
+      # Capacity drills register synthetic clusters under the reserved
+      # `perf-cap-` prefix; their collector-silence and stale-observation
+      # alerts describe faults that did not happen and must never reach the
+      # administrator (live 2026-09-13: ~580 mails from one afternoon). They
+      # still fire and stay queryable in AMP; this sink just does not deliver.
+      - receiver: gpu-fault-drill-sink
+        matchers:
+          - cluster_id=~"perf-cap-.*"
       - receiver: gpu-fault-sns
         matchers:
           - alertname="GpuFaultExclusiveNodeOwnershipInvariantViolation"
@@ -19,6 +27,7 @@ alertmanager_config: |
         group_interval: 1m
         repeat_interval: 4h
   receivers:
+    - name: gpu-fault-drill-sink
     - name: gpu-fault-sns
       sns_configs:
         - topic_arn: REPLACE_WITH_SNS_TOPIC_ARN

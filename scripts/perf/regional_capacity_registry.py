@@ -332,6 +332,106 @@ def validate_notification_safety() -> None:
             )
 
 
+AMP_WORKSPACE_ID = os.getenv("GPU_FAULT_PERF_AMP_WORKSPACE_ID", "")
+
+
+def _amp_workspace_id() -> str:
+    """The site's AMP workspace: the configured one, else the single tagged one."""
+
+    if AMP_WORKSPACE_ID:
+        return AMP_WORKSPACE_ID
+    result = run(
+        [
+            "aws",
+            "amp",
+            "list-workspaces",
+            "--region",
+            AWS_REGION,
+            "--output",
+            "json",
+        ],
+        check=True,
+    )
+    workspaces = [
+        item
+        for item in json.loads(result.stdout.decode()).get("workspaces", [])
+        if (item.get("status") or {}).get("statusCode") == "ACTIVE"
+        and "gpu-fault:site-id" in (item.get("tags") or {})
+    ]
+    if len(workspaces) != 1:
+        raise RuntimeError(
+            "cannot identify the site's AMP workspace: "
+            f"{len(workspaces)} ACTIVE workspaces carry gpu-fault:site-id; set "
+            "GPU_FAULT_PERF_AMP_WORKSPACE_ID"
+        )
+    return str(workspaces[0]["workspaceId"])
+
+
+def validate_alertmanager_drill_route() -> dict:
+    """Fail closed unless the live Alertmanager sinks perf-cap- alerts.
+
+    The Store marks every notification of a `perf-cap-` cluster as a drill and
+    the dispatcher suppresses it, but AMP alerts never pass through the Store:
+    Alertmanager delivers them to the SNS topic itself. Live 2026-09-13, one
+    afternoon of capacity rounds fired GpuFaultCollectorSilent and
+    GpuFaultStaleAttemptObservation for 32 synthetic clusters and mailed the
+    administrator ~580 times. The route that sends `cluster_id=~"perf-cap-.*"`
+    to a receiver with no delivery configuration is therefore a precondition.
+    """
+
+    import base64
+
+    import yaml
+
+    workspace_id = _amp_workspace_id()
+    result = run(
+        [
+            "aws",
+            "amp",
+            "describe-alert-manager-definition",
+            "--workspace-id",
+            workspace_id,
+            "--region",
+            AWS_REGION,
+            "--output",
+            "json",
+        ],
+        check=True,
+    )
+    definition = json.loads(result.stdout.decode())["alertManagerDefinition"]
+    outer = yaml.safe_load(base64.b64decode(definition["data"]).decode()) or {}
+    config = outer.get("alertmanager_config", outer)
+    if isinstance(config, str):
+        config = yaml.safe_load(config) or {}
+    receivers = {str(item.get("name")): item for item in config.get("receivers") or []}
+    sink_routes = []
+    for route in (config.get("route") or {}).get("routes") or []:
+        matchers = [str(m).replace(" ", "") for m in route.get("matchers") or []]
+        if not any(
+            m.startswith("cluster_id=~") and PERF_CLUSTER_PREFIX in m for m in matchers
+        ):
+            continue
+        receiver = receivers.get(str(route.get("receiver", "")))
+        if receiver is not None and not any(
+            str(key).endswith("_configs") for key in receiver
+        ):
+            sink_routes.append(
+                {"receiver": route.get("receiver"), "matchers": matchers}
+            )
+    if not sink_routes:
+        raise RuntimeError(
+            "capacity runs must not mail drill alerts: the live Alertmanager "
+            f"(workspace {workspace_id}) has no route sending "
+            f'cluster_id=~"{PERF_CLUSTER_PREFIX}.*" to a receiver without delivery; '
+            "deploy the release that carries the drill sink first"
+        )
+    return {
+        "workspace_id": workspace_id,
+        "definition_status": (definition.get("status") or {}).get("statusCode"),
+        "drill_sink_routes": sink_routes,
+    }
+
+
 def validate_registry_target(
     *,
     allow_live_registry: bool,
@@ -672,6 +772,7 @@ def register(
         confirmation=live_registry_confirmation,
     )
     validate_notification_safety()
+    validate_alertmanager_drill_route()
     cleanup_registry_residuals(
         scope=scope,
         artifacts=artifacts,

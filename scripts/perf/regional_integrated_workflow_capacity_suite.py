@@ -30,6 +30,7 @@ if __package__:
     )
     from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
+        validate_alertmanager_drill_route,
         sync_dataplane_connection_secret,
         STORE_DSN_SNIPPET,
         AWS_REGION,
@@ -75,6 +76,7 @@ else:
     )
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
+        validate_alertmanager_drill_route,
         sync_dataplane_connection_secret,
         STORE_DSN_SNIPPET,
         AWS_REGION,
@@ -1263,6 +1265,10 @@ def run(args: argparse.Namespace) -> int:
         connection_preflight = sync_dataplane_connection_secret()
         (artifacts / "connection-secret-preflight.json").write_text(
             json.dumps(connection_preflight, indent=2, sort_keys=True) + "\n"
+        )
+        notification_preflight = validate_alertmanager_drill_route()
+        (artifacts / "notification-safety-preflight.json").write_text(
+            json.dumps(notification_preflight, indent=2, sort_keys=True) + "\n"
         )
         ingress_process_preflight = ingress_process_model_preflight()
         (artifacts / "ingress-process-model-preflight.json").write_text(
