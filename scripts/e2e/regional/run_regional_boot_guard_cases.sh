@@ -128,12 +128,23 @@ apply_mutation() {
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" apply -f -
 }
 
-# The Pod name of the single probe replica, read only after the Deployment is
-# Available. `.items[0]` straight after `kubectl apply` races the ReplicaSet:
-# the list is empty, or still holds the previous round's terminating Pod.
+# The Pod name of the single probe replica, read only after the new rollout has
+# genuinely finished. `.items[0]` straight after `kubectl apply` races the
+# ReplicaSet: the list is empty, or still holds the previous round's terminating
+# Pod.
+#
+# `wait --for=condition=Available` is NOT enough here: deleting and re-applying
+# the Deployment under the same name races the controller, so `wait` matches a
+# stale `Available=True` from the prior generation and returns in ~1s -- before
+# the new Pod's app has bound :8080. The positive callers then `exec` straight
+# into a Pod whose uvicorn is still starting and get `Connection refused`
+# (BOOT-002's empty-registry `[]` check failed exactly this way on 2026-09-13).
+# `rollout status` gates on observedGeneration + availableReplicas, so it only
+# returns once a Pod is Ready (readiness is GET /healthz on :8080, i.e. the app
+# is actually serving).
 probe_pod_name() {
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    wait deployment "${PROBE}" --for=condition=Available --timeout=600s >/dev/null
+    rollout status deployment "${PROBE}" --timeout=600s >/dev/null
   local pods
   pods="$(
     kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
