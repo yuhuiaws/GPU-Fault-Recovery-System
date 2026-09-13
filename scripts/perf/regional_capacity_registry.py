@@ -175,6 +175,68 @@ def dataplane_identity(
     return result.stdout.decode()
 
 
+def sync_dataplane_connection_secret() -> dict:
+    """Copy the live connection Secret into the perf namespace; report the change.
+
+    The load generators and simulated executors read the control-plane URL,
+    CA and cluster token from ``CONNECTION_SECRET`` in the perf namespace. That
+    namespace outlives the site: on 2026-09-13 it still held the Secret of a
+    site uninstalled and rebuilt twelve days later, every load Pod failed TLS
+    verification against the old CA within a second and the round aborted with
+    no log to explain it. The identity namespace's Secret is the truth; it is
+    mirrored before anything is registered, and its absence fails closed.
+    """
+
+    raw = dataplane_identity(
+        "get", "secret", CONNECTION_SECRET, "-o", "json", check=False
+    ).strip()
+    if not raw:
+        raise RuntimeError(
+            f"connection Secret {CONNECTION_SECRET} is missing from the identity "
+            f"namespace {IDENTITY_NAMESPACE}; the data plane is not joined"
+        )
+    source = json.loads(raw)
+    data = dict(source.get("data") or {})
+    if not data:
+        raise RuntimeError(f"connection Secret {CONNECTION_SECRET} carries no data")
+    digest = hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    previous_raw = dataplane(
+        "get", "secret", CONNECTION_SECRET, "-o", "json", check=False
+    ).strip()
+    previous_digest = None
+    if previous_raw:
+        previous = json.loads(previous_raw).get("data") or {}
+        previous_digest = hashlib.sha256(
+            json.dumps(previous, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    if previous_digest != digest:
+        document = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": source.get("type", "Opaque"),
+            "metadata": {
+                "name": CONNECTION_SECRET,
+                "namespace": NAMESPACE,
+                "labels": {
+                    "gpu-fault.io/perf-synced-from": IDENTITY_NAMESPACE,
+                },
+            },
+            "data": data,
+        }
+        dataplane("apply", "-f", "-", stdin=json.dumps(document).encode())
+    return {
+        "secret": CONNECTION_SECRET,
+        "source_namespace": IDENTITY_NAMESPACE,
+        "target_namespace": NAMESPACE,
+        "keys": sorted(data),
+        "data_sha256": digest,
+        "previous_sha256": previous_digest,
+        "changed": previous_digest != digest,
+    }
+
+
 def load_registry() -> list[dict]:
     raw = control(
         "get",

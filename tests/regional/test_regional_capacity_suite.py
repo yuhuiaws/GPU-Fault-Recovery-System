@@ -745,3 +745,85 @@ def test_synchronized_burst_records_recovered_transport_retry(
     assert result[3] is None
     assert result[5] == "URLError:ConnectionResetError"
     assert attempts == 2
+
+
+def test_connection_secret_is_mirrored_from_the_identity_namespace(monkeypatch) -> None:
+    """Live 2026-09-13: the perf namespace still held the connection Secret of a
+    site uninstalled and rebuilt twelve days later; every load Pod failed TLS
+    verification against the old CA and the round aborted without a log. The
+    identity namespace's Secret is mirrored before anything is registered."""
+
+    live = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": "gpu-fault-regional-connection",
+            "namespace": "gpu-fault-system",
+            "uid": "abc",
+            "resourceVersion": "7",
+        },
+        "data": {
+            "ca.crt": "bmV3",
+            "cluster-token": "dG9rZW4=",
+            "control-plane-url": "aHR0cHM=",
+        },
+    }
+    stale = {
+        **live,
+        "data": {
+            "ca.crt": "b2xk",
+            "cluster-token": "b2xk",
+            "control-plane-url": "aHR0cHM=",
+        },
+    }
+    applied: list[dict] = []
+
+    monkeypatch.setattr(
+        registry_module, "dataplane_identity", lambda *a, **k: json.dumps(live)
+    )
+
+    def dataplane(*args, stdin=None, **_kwargs):
+        if args[:2] == ("get", "secret"):
+            return json.dumps(stale)
+        if args[:1] == ("apply",):
+            applied.append(json.loads(stdin))
+            return ""
+        raise AssertionError(f"unexpected kubectl: {args}")
+
+    monkeypatch.setattr(registry_module, "dataplane", dataplane)
+
+    report = registry_module.sync_dataplane_connection_secret()
+
+    assert report["changed"] is True, "a stale mirror is replaced"
+    assert applied and applied[0]["data"] == live["data"], "the live data is mirrored"
+    assert applied[0]["metadata"]["namespace"] == registry_module.NAMESPACE, (
+        "the mirror lands in the perf namespace"
+    )
+    assert "uid" not in applied[0]["metadata"], "source metadata is not copied"
+    assert report["keys"] == ["ca.crt", "cluster-token", "control-plane-url"]
+
+
+def test_connection_secret_mirror_fails_closed_without_a_joined_data_plane(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(registry_module, "dataplane_identity", lambda *a, **k: "")
+
+    with pytest.raises(RuntimeError, match="is missing from the identity namespace"):
+        registry_module.sync_dataplane_connection_secret()
+
+
+def test_connection_secret_mirror_is_a_no_op_when_already_current(monkeypatch) -> None:
+    live = {"data": {"ca.crt": "bmV3"}, "type": "Opaque"}
+    monkeypatch.setattr(
+        registry_module, "dataplane_identity", lambda *a, **k: json.dumps(live)
+    )
+
+    def dataplane(*args, **_kwargs):
+        if args[:2] == ("get", "secret"):
+            return json.dumps(live)
+        raise AssertionError(f"an unchanged mirror must not be re-applied: {args}")
+
+    monkeypatch.setattr(registry_module, "dataplane", dataplane)
+
+    assert registry_module.sync_dataplane_connection_secret()["changed"] is False

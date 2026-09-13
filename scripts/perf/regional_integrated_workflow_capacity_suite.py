@@ -30,6 +30,7 @@ if __package__:
     )
     from .regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from .regional_capacity_registry import (
+        sync_dataplane_connection_secret,
         STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
@@ -74,6 +75,7 @@ else:
     )
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_registry import (
+        sync_dataplane_connection_secret,
         STORE_DSN_SNIPPET,
         AWS_REGION,
         CONNECTION_SECRET,
@@ -1258,6 +1260,10 @@ def run(args: argparse.Namespace) -> int:
     failure: BaseException | None = None
     result = 1
     try:
+        connection_preflight = sync_dataplane_connection_secret()
+        (artifacts / "connection-secret-preflight.json").write_text(
+            json.dumps(connection_preflight, indent=2, sort_keys=True) + "\n"
+        )
         ingress_process_preflight = ingress_process_model_preflight()
         (artifacts / "ingress-process-model-preflight.json").write_text(
             json.dumps(ingress_process_preflight, indent=2, sort_keys=True) + "\n"
