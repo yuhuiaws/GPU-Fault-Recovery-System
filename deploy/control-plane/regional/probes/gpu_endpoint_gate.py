@@ -42,33 +42,54 @@ if parsed.scheme != "https" or parsed.hostname != expected_hostname:
 # until the name resolves or the wait runs out; the caller's Pod deadline is
 # longer than this.
 dns_deadline = time.monotonic() + float(
-    os.environ.get("DNS_RESOLVE_WAIT_SECONDS", "180")
+    os.environ.get("DNS_RESOLVE_WAIT_SECONDS", "240")
 )
 
 
-def _name_error(error: BaseException) -> bool:
-    # ``urlopen`` wraps the resolver failure in URLError(reason=gaierror).
-    if isinstance(error, socket.gaierror):
+# Failures that mean "the endpoint is not there yet", bare or wrapped in
+# URLError(reason=...): the name not resolving, the connection refused or
+# timing out, or the TLS handshake timing out because a brand-new NLB still
+# forwards to nothing (live 2026-09-13: "_ssl.c:981: The handshake operation
+# timed out" 35 s after the NLB went active). A certificate that fails to
+# verify is a real answer and is not in this set.
+_NOT_YET_REACHABLE = (
+    socket.gaierror,
+    socket.timeout,
+    TimeoutError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+
+
+def _not_yet_reachable(error: BaseException) -> bool:
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(error, _NOT_YET_REACHABLE):
         return True
     reason = getattr(error, "reason", None)
-    return isinstance(reason, socket.gaierror)
+    return isinstance(reason, _NOT_YET_REACHABLE) and not isinstance(
+        reason, ssl.SSLCertVerificationError
+    )
 
 
 def until_resolved(operation: Callable[[], Any]) -> Any:
-    """Run ``operation`` until it stops failing on name resolution.
+    """Run ``operation`` until the endpoint stops being "not there yet".
 
     The name resolves through whichever CoreDNS replica answers, and right after
     the zone association one replica can still serve the cached NXDOMAIN while
     another already resolves (live 2026-09-13: the resolve loop passed and the
-    very next request failed "Name or service not known"). Every request in this
-    probe therefore retries on a resolver failure, not only the first lookup.
+    very next request failed "Name or service not known"); a brand-new NLB
+    accepts connections before it forwards them. Every request in this probe
+    therefore retries on those failures until the wait runs out; anything else
+    -- a rejected certificate, an HTTP error -- is raised at once.
     """
 
     while True:
         try:
             return operation()
-        except (socket.gaierror, urllib.error.URLError) as error:
-            if not _name_error(error) or time.monotonic() >= dns_deadline:
+        except (OSError, urllib.error.URLError) as error:
+            if not _not_yet_reachable(error) or time.monotonic() >= dns_deadline:
                 raise
             time.sleep(5)
 

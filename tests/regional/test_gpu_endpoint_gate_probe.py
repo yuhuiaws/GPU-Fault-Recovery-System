@@ -32,7 +32,13 @@ class _Response:
         return None
 
 
-def _run_probe(monkeypatch, *, resolver_failures: int, request_failures: int) -> dict:
+def _run_probe(
+    monkeypatch,
+    *,
+    resolver_failures: int,
+    request_failures: int,
+    request_error: Exception | None = None,
+) -> dict:
     # Read the probe before Path.read_text is stubbed for the mounted files.
     source = compile(
         PROBES.probe_source("gpu_endpoint_gate"), "gpu_endpoint_gate", "exec"
@@ -50,7 +56,9 @@ def _run_probe(monkeypatch, *, resolver_failures: int, request_failures: int) ->
         requests[0] += 1
         if requests[0] <= request_failures:
             raise urllib.error.URLError(
-                socket.gaierror(-2, "Name or service not known")
+                request_error
+                if request_error is not None
+                else socket.gaierror(-2, "Name or service not known")
             )
         return _Response()
 
@@ -98,3 +106,30 @@ def test_a_name_that_never_resolves_still_fails_when_the_wait_runs_out(
     with pytest.raises(urllib.error.URLError):
         # 60 s wait, 5 s per retry: the lookup passes at once, healthz never resolves.
         _run_probe(monkeypatch, resolver_failures=0, request_failures=100)
+
+
+def test_a_handshake_that_times_out_on_a_brand_new_nlb_is_retried(monkeypatch) -> None:
+    """Live 2026-09-13 (fresh bootstrap, NLB created five minutes earlier): the
+    name resolved and the targets were healthy, but the TLS handshake through the
+    new NLB timed out -- the load balancer accepted the connection before it
+    forwarded anything. That is "not there yet", the same as an unresolved name."""
+
+    result = _run_probe(
+        monkeypatch,
+        resolver_failures=0,
+        request_failures=2,
+        request_error=TimeoutError("_ssl.c:981: The handshake operation timed out"),
+    )
+
+    assert result["output"]["cluster_token"] == "accepted", "the gate passed"
+    assert result["requests"] == 4, "two timeouts were retried before healthz answered"
+
+
+def test_a_rejected_certificate_is_never_retried(monkeypatch) -> None:
+    with pytest.raises(urllib.error.URLError, match="certificate verify failed"):
+        _run_probe(
+            monkeypatch,
+            resolver_failures=0,
+            request_failures=100,
+            request_error=ssl.SSLCertVerificationError("certificate verify failed"),
+        )

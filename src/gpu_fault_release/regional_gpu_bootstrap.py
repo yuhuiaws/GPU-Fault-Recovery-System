@@ -418,7 +418,9 @@ def verify_gpu_control_plane_endpoint(release: Any, target: ClusterTarget) -> No
         },
         "spec": {
             "restartPolicy": "Never",
-            "activeDeadlineSeconds": 300,
+            # The probe waits up to 240 s for a brand-new endpoint (DNS, then
+            # the NLB actually forwarding); the Pod outlives that wait.
+            "activeDeadlineSeconds": 420,
             "tolerations": [
                 {
                     "key": "gpu-fault.io/quarantined",
