@@ -469,6 +469,19 @@ def readiness_matrix_verdict(replicas: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# The markers with which the executor client refuses an empty CA file: the TLS
+# handshake failing verification (OpenSSL < 3.5) or the trust store refusing to
+# load an empty PEM at all (OpenSSL 3.5, live 2026-09-13 after a cold image build).
+EMPTY_CA_REJECTION_MARKERS = (
+    "CERTIFICATE_VERIFY_FAILED",
+    "NO_CERTIFICATE_OR_CRL_FOUND",
+)
+
+
+def empty_ca_rejection(output: str) -> bool:
+    return any(marker in output for marker in EMPTY_CA_REJECTION_MARKERS)
+
+
 def run_boot012(
     fixture: SiteFixture,
     *,
@@ -555,8 +568,13 @@ def run_boot012(
                 "authenticated_readiness": readiness.returncode == 0,
                 # A non-zero exit alone could be any failure; the negative probe
                 # has to fail *because* the empty CA cannot verify the server.
+                # OpenSSL < 3.5 loaded an empty PEM silently and the handshake
+                # then failed CERTIFICATE_VERIFY_FAILED; OpenSSL 3.5 refuses the
+                # empty file when the client builds its context
+                # (X509: NO_CERTIFICATE_OR_CRL_FOUND). Both are the rejection
+                # the case wants; what must not happen is a completed request.
                 "empty_ca_rejected": empty_ca.returncode != 0
-                and "CERTIFICATE_VERIFY_FAILED" in empty_ca_output,
+                and empty_ca_rejection(empty_ca_output),
                 "sts_public_trust": sts["caller_identity_available"],
                 "stale_claim_503": (
                     (stale_payload.get("stale_claim") or {}).get("status") == 503
@@ -569,9 +587,7 @@ def run_boot012(
                     _tail(readiness) if readiness.returncode != 0 else None
                 ),
                 "empty_ca_stderr_tail": (
-                    _tail(empty_ca)
-                    if "CERTIFICATE_VERIFY_FAILED" not in empty_ca_output
-                    else None
+                    _tail(empty_ca) if not empty_ca_rejection(empty_ca_output) else None
                 ),
                 "stale_probe_stderr_tail": (
                     _tail(stale) if stale.returncode != 0 else None

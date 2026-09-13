@@ -333,3 +333,22 @@ def test_boot015_metric_gap_is_short_and_windows_are_named() -> None:
     assert "time.sleep(30)" not in source
     assert '"pending_counted": second["pending"] >= 1' in source
     assert 'state["lease_owner"] is None' in source
+
+
+def test_empty_ca_rejection_accepts_both_openssl_refusals() -> None:
+    """An empty CA file may fail at handshake (OpenSSL < 3.5) or at load (3.5).
+
+    Live 2026-09-13: the cold image build pulled OpenSSL 3.5, the executor client
+    refused the empty PEM with X509: NO_CERTIFICATE_OR_CRL_FOUND before any TLS
+    handshake, and BOOT-012 read that stronger refusal as "not rejected".
+    """
+
+    assert runtime.empty_ca_rejection(
+        "ssl.SSLError: [X509: NO_CERTIFICATE_OR_CRL_FOUND]"
+    ), "the trust store refusing an empty PEM is a rejection"
+    assert runtime.empty_ca_rejection(
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+    ), "a handshake that fails verification is a rejection"
+    assert not runtime.empty_ca_rejection("Traceback ... ConnectionRefusedError"), (
+        "an unrelated failure must not pass for a CA rejection"
+    )
