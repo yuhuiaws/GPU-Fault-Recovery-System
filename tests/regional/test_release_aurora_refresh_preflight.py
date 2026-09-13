@@ -185,9 +185,11 @@ class _Reached(RuntimeError):
 
 
 def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
-    """After the CA bundle (the refresher mounts it), before the idle check and
-    before the previous release is captured: a stale password must stop the
-    transaction before it has anything to roll back."""
+    """After the CA bundle (the refresher mounts it) and before anything is
+    written: a stale password must stop the transaction before it has anything
+    to roll back. The refresh, the idle check and the read-only capture run as
+    concurrent lanes, so their mutual order is not fixed; what is fixed is that
+    all three sit behind the CA bundle and ahead of the Secret backups."""
 
     calls: list[str] = []
     release = SimpleNamespace(
@@ -201,7 +203,8 @@ def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
         _refresh_aurora_credentials=lambda: calls.append("aurora-refresh"),
         _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: (calls.append("idle"), True)[1],
-        _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(_Reached()),
+        _capture_previous=lambda **_kwargs: {"metadata": {}},
+        _backup_release_secrets=lambda: (_ for _ in ()).throw(_Reached()),
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
@@ -211,16 +214,19 @@ def test_upgrade_refreshes_credentials_before_touching_anything() -> None:
     with pytest.raises(_Reached):
         ORCHESTRATION.upgrade_release(release, diff=diff)
 
-    assert calls == [
-        "contexts",
-        "cpu-secrets",
-        "rds-ca-bundle",
-        "aurora-refresh",
-        "idle",
-    ]
+    assert calls[:3] == ["contexts", "cpu-secrets", "rds-ca-bundle"], (
+        "the CA bundle must be in place before the refresh Job mounts it"
+    )
+    assert sorted(calls[3:]) == ["aurora-refresh", "idle"], (
+        "the refresh and the idle check both ran before the Secret backups"
+    )
 
 
-def test_a_failed_refresh_stops_the_upgrade_before_the_idle_check() -> None:
+def test_a_failed_refresh_stops_the_upgrade_before_anything_is_written() -> None:
+    """The idle check and the capture may run beside the refresh, but a refresh
+    that fails still stops the transaction with its own error before the Secret
+    backups and before the first state write."""
+
     release = SimpleNamespace(
         config=SimpleNamespace(
             auto_rollback=True, schema_rollback_compatible=True, clusters=()
@@ -232,10 +238,15 @@ def test_a_failed_refresh_stops_the_upgrade_before_the_idle_check() -> None:
         _refresh_aurora_credentials=lambda: (_ for _ in ()).throw(
             MODULE.ReleaseError("Aurora credential refresh Job x did not complete")
         ),
-        _remote_commands_are_idle=lambda: pytest.fail(
-            "the transaction went on after the credential refresh failed"
+        _remote_commands_are_idle=lambda: True,
+        _require_no_inflight_installs=lambda **_kwargs: None,
+        _capture_previous=lambda **_kwargs: {"metadata": {}},
+        _backup_release_secrets=lambda: pytest.fail(
+            "the Secret backups were taken after the credential refresh failed"
         ),
-        _capture_previous=lambda **_kwargs: pytest.fail("previous was captured"),
+        _save_state=lambda *_args, **_kwargs: pytest.fail(
+            "state was written after the credential refresh failed"
+        ),
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,

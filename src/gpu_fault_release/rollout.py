@@ -213,6 +213,7 @@ from gpu_fault_release.regional_release_transaction import commit_release
 from gpu_fault_release.regional_release_validation import (
     critical_amp_alerts,
     ensure_profile_transition_safe,
+    stability_release_kind,
     stability_snapshot,
     store_io_rejection_series_ready,
     validate_release_components,
@@ -1433,7 +1434,9 @@ def _run_mode(arguments: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         exit_code = report_exit_code(report)
     elif arguments.mode == "stability":
-        report = release.validate_stability_window()
+        report = release.validate_stability_window(
+            release_kind=stability_release_kind(release)
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
     return exit_code
 

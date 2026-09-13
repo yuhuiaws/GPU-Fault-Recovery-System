@@ -355,6 +355,7 @@ def test_cluster_local_upgrade_failure_pauses_without_auto_rollback(
         _refresh_aurora_credentials=lambda: None,
         _require_no_inflight_installs=lambda **_kwargs: None,
         _remote_commands_are_idle=lambda: True,
+        _capture_previous=lambda **_kwargs: {"metadata": {}},
         rollback=lambda **_kwargs: pytest.fail(
             "cluster-local failure triggered automatic rollback"
         ),

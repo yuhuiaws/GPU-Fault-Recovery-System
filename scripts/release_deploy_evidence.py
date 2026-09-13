@@ -111,10 +111,24 @@ def validate_verification_report(report: dict[str, Any]) -> None:
         raise ReleaseDeployError("verification report has no check evidence")
 
 
+STABILITY_WINDOW_FLOOR_SECONDS = 120
+# A CONTROL_PLANE_ONLY release may close its window at 60 s once two clean
+# samples and converged control-plane Deployments were seen
+# (``regional_release_validation.CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS``);
+# the report says so with ``early_exit`` and names the kind it applied to.
+CONTROL_PLANE_ONLY_STABILITY_FLOOR_SECONDS = 60
+
+
 def validate_stability_report(report: dict[str, Any]) -> None:
     if report.get("mode") != "stability" or report.get("healthy") is not True:
         raise ReleaseDeployError("release stability report is not healthy")
-    if int(report.get("window_seconds") or 0) < 120:
+    floor = STABILITY_WINDOW_FLOOR_SECONDS
+    if (
+        report.get("early_exit") is True
+        and report.get("release_kind") == "CONTROL_PLANE_ONLY"
+    ):
+        floor = CONTROL_PLANE_ONLY_STABILITY_FLOOR_SECONDS
+    if int(report.get("window_seconds") or 0) < floor:
         raise ReleaseDeployError("release stability report has an invalid window")
 
 

@@ -190,6 +190,7 @@ def phase_release(
         "_apply_rds_ca_bundle": lambda: calls.append("rds-ca-bundle"),
         "_refresh_aurora_credentials": lambda: calls.append("aurora-refresh"),
         "_require_no_inflight_installs": lambda **_kwargs: None,
+        "_capture_previous": lambda **_kwargs: {"metadata": {}},
         "_ensure_schema": lambda: calls.append("schema"),
         "_stage_registry": stage_registry,
         "_publish_staged_registry": lambda: calls.append("publish-registry"),

@@ -944,12 +944,16 @@ def _upgrade_double(calls: list[str], **stubs: Any) -> SimpleNamespace:
         "_require_no_inflight_installs": lambda **kwargs: calls.append(
             f"inflight-installs:{kwargs['action']}"
         ),
+        "_capture_previous": lambda **_kwargs: {"metadata": {}},
     }
     fields.update(stubs)
     return SimpleNamespace(**fields)
 
 
-def test_upgrade_checks_for_in_flight_installs_before_capturing_previous() -> None:
+def test_upgrade_checks_for_in_flight_installs_after_the_idle_probe() -> None:
+    """The gate follows the idle probe on the same preflight lane; the read-only
+    capture of the previous release runs beside them and cannot reorder them."""
+
     calls: list[str] = []
     release = _upgrade_double(
         calls, _capture_previous=lambda **_kwargs: (_ for _ in ()).throw(_Reached())
@@ -966,13 +970,21 @@ def test_upgrade_checks_for_in_flight_installs_before_capturing_previous() -> No
 
 
 def test_a_refused_upgrade_writes_no_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The read-only capture may run beside the gate; the Secret backups and the
+    first checkpoint may not."""
+
     calls: list[str] = []
     release = _upgrade_double(
         calls,
         _require_no_inflight_installs=lambda **_kwargs: (_ for _ in ()).throw(
             GATE.InflightInstallsRefused("upgrade refused: workflow-7f3a")
         ),
-        _capture_previous=lambda **_kwargs: pytest.fail("previous was captured"),
+        _backup_release_secrets=lambda: pytest.fail(
+            "Secret backups were taken after the gate refused"
+        ),
+        _save_state=lambda *_args, **_kwargs: pytest.fail(
+            "state was written after the gate refused"
+        ),
     )
     diff = DIFF.ReleaseDiff(
         kind=DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY,
