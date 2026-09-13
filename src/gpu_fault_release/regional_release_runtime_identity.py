@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from gpu_fault.admin.command_log import FAILURE_EXIT_CODE_ATTRIBUTE
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ReleaseError
 
@@ -35,11 +37,72 @@ def _cpu_ingress_pod_command(release: Any) -> list[str]:
     )
 
 
+def _cpu_ingress_pods_command(release: Any) -> list[str]:
+    command: list[str] = release._cpu(
+        "-n",
+        release.config.namespace,
+        "get",
+        "pod",
+        "-l",
+        f"app={inventory.CPU_INGRESS_DEPLOYMENT}",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "json",
+    )
+    return command
+
+
+def _ingress_pod_ready_not_terminating(pod: dict[str, Any]) -> bool:
+    """Whether ``pod`` can safely carry a long-lived in-Pod probe.
+
+    A Pod the rollout is about to reap either already carries a
+    ``deletionTimestamp`` (it is Terminating, still ``status.phase=Running``)
+    or is not yet Ready. Handing the heartbeat barrier to either one is how a
+    forward FULL release earns an ``exec`` killed with exit 137 mid-window.
+    """
+
+    if (pod.get("metadata") or {}).get("deletionTimestamp"):
+        return False
+    conditions = (pod.get("status") or {}).get("conditions") or []
+    for condition in conditions:
+        if isinstance(condition, dict) and condition.get("type") == "Ready":
+            return str(condition.get("status")) == "True"
+    return False
+
+
 def resolve_cpu_ingress_pod(release: Any, *, failure: str) -> str:
-    pod = release.runner.run(_cpu_ingress_pod_command(release), capture=True)
-    if not pod:
-        raise ReleaseError(f"no running CPU ingress Pod for {failure}")
-    return str(pod)
+    """Return a CPU ingress Pod name that can carry an in-Pod probe.
+
+    The control plane rolls one replica at a time, so during a FULL release
+    the outgoing and incoming ReplicaSets both have Running Pods for a window.
+    Picking the first ``status.phase=Running`` Pod can hand a long barrier to
+    an outgoing Pod the rollout then kills (exit 137), which -- for the
+    ``retries=0`` barrier -- fails the whole release. Prefer a Pod that is
+    Ready and not already Terminating; only when none qualifies (a first
+    bootstrap window, or every Pod mid-restart) fall back to any Running Pod,
+    which preserves the previous behaviour and its "no Pod" failure.
+    """
+
+    raw = release.runner.run(_cpu_ingress_pods_command(release), capture=True)
+    pods: list[dict[str, Any]] = []
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if isinstance(items, list):
+            pods = [item for item in items if isinstance(item, dict)]
+    for candidate in pods:
+        if _ingress_pod_ready_not_terminating(candidate):
+            name = str((candidate.get("metadata") or {}).get("name") or "")
+            if name:
+                return name
+    for candidate in pods:
+        name = str((candidate.get("metadata") or {}).get("name") or "")
+        if name:
+            return name
+    raise ReleaseError(f"no running CPU ingress Pod for {failure}")
 
 
 def cpu_ingress_pod(
@@ -145,17 +208,20 @@ def exec_cpu_ingress(
     command again, which is only sound for a read-only probe. A failed attempt
     always drops the memoised name so the next caller re-resolves it.
 
-    A Pod that no longer exists is not a failed attempt, when ``retry_replaced``
-    allows it. The release rolls the CPU ingress Deployment itself, so a
-    memoised name can be replaced between two probes -- the barrier that runs
-    straight after CPU finalize hits exactly that. ``kubectl exec`` then reports
-    ``NotFound`` without the command ever starting, which is why a vanished Pod
-    always buys one more attempt against a freshly resolved Pod, even for the
-    callers that set ``retries=0`` because their in-Pod barrier already spends
-    its whole window: nothing was spent when the exec never ran. The check is
-    positive -- the Pod is looked up rather than the failure text matched -- so
-    it also holds for commands whose output is sensitive and must not be
-    inspected.
+    A Pod that no longer exists, or one the rollout killed mid-exec, is not a
+    failed attempt when ``retry_replaced`` allows it. The release rolls the CPU
+    ingress Deployment itself, so a memoised name can be replaced between two
+    probes -- the barrier that runs during a FULL release's CPU roll hits
+    exactly that. ``kubectl exec`` then either reports ``NotFound`` without the
+    command ever starting, or the running container is reaped and exits 137
+    (SIGKILL) / 143 (SIGTERM). Either way the Pod is going away, so it buys one
+    more attempt against a freshly resolved Pod -- one the new resolver prefers
+    to pick Ready and not Terminating -- even for the callers that set
+    ``retries=0`` because their in-Pod barrier already spends its whole window.
+    A vanished Pod is looked up rather than the failure text matched, so that
+    branch also holds for commands whose output is sensitive and must not be
+    inspected; the kill branch reads the child's own exit code, never its
+    output.
     """
 
     error: Exception | None = None
@@ -184,13 +250,25 @@ def exec_cpu_ingress(
             return str(output or "")
         except ReleaseError as exc:
             error = exc
-            replaced = replacement_attempts_left > 0 and not release.runner.probe(
-                release._cpu(
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "pod",
-                    pod,
+            # A container killed with SIGKILL/SIGTERM exits 137/143: the Pod is
+            # being reaped by the rollout even if its object still lingers as
+            # Terminating, so the `get pod` below would still find it. Treat
+            # the kill itself as the replacement signal, which also spares the
+            # extra round trip.
+            killed_in_flight = getattr(exc, FAILURE_EXIT_CODE_ATTRIBUTE, None) in (
+                137,
+                143,
+            )
+            replaced = replacement_attempts_left > 0 and (
+                killed_in_flight
+                or not release.runner.probe(
+                    release._cpu(
+                        "-n",
+                        release.config.namespace,
+                        "get",
+                        "pod",
+                        pod,
+                    )
                 )
             )
             forget_cpu_ingress_pod(release)

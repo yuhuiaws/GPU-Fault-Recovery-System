@@ -107,11 +107,19 @@ class ProbeRelease:
     which is the window this probe has to survive.
     """
 
-    def __init__(self, *, pod: str, live_pods: list[str], failures: int) -> None:
+    def __init__(
+        self,
+        *,
+        pod: str,
+        live_pods: list[str],
+        failures: int,
+        failure_exit_code: int = 1,
+    ) -> None:
         self.config = SimpleNamespace(namespace="gpu-fault-system")
         self.pod = pod
         self.live_pods = live_pods
         self.failures = failures
+        self.failure_exit_code = failure_exit_code
         self.execs: list[str] = []
         self.runner = SimpleNamespace(run=self._run, probe=self._probe, dry_run=False)
 
@@ -121,7 +129,22 @@ class ProbeRelease:
 
     def _run(self, arguments, **_kwargs):
         if "get" in arguments and "pod" in arguments and "-l" in arguments:
-            return self.pod
+            # The resolver now reads the Pod list as JSON and prefers a Ready,
+            # non-terminating Pod; a single Ready Pod answers as the resolution.
+            import json as _json
+
+            return _json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": self.pod},
+                            "status": {
+                                "conditions": [{"type": "Ready", "status": "True"}]
+                            },
+                        }
+                    ]
+                }
+            )
         if "exec" in arguments:
             # ``kubectl exec`` may carry flags such as ``-i`` between the verb
             # and the Pod, so the Pod is the last word before ``--``.
@@ -129,7 +152,13 @@ class ProbeRelease:
             self.execs.append(pod)
             if self.failures > 0:
                 self.failures -= 1
-                raise MODULE.ReleaseError("command failed (1): kubectl")
+                error = MODULE.ReleaseError(
+                    f"command failed ({self.failure_exit_code}): kubectl"
+                )
+                setattr(
+                    error, MODULE.FAILURE_EXIT_CODE_ATTRIBUTE, self.failure_exit_code
+                )
+                raise error
             return "probe-output"
         raise AssertionError(f"unexpected command: {arguments}")
 
@@ -166,6 +195,89 @@ def test_replaced_ingress_pod_buys_one_more_probe_even_without_retries() -> None
         == "probe-output"
     )
     assert release.execs == ["stale-pod", "fresh-pod"]
+
+
+def test_ingress_resolution_prefers_a_ready_non_terminating_pod() -> None:
+    # During a FULL release both ReplicaSets have Running Pods: the outgoing
+    # one is Terminating (a deletionTimestamp, still status.phase=Running) or
+    # not yet Ready, and handing it the barrier earns a mid-window kill. The
+    # resolver must skip it for a Ready, not-Terminating Pod.
+    listing = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "old-pod",
+                    "deletionTimestamp": "2026-09-13T21:00:00Z",
+                },
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            },
+            {
+                "metadata": {"name": "starting-pod"},
+                "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+            },
+            {
+                "metadata": {"name": "settled-pod"},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            },
+        ]
+    }
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system"),
+        _cpu=lambda *a: ["kubectl", *a],
+        runner=SimpleNamespace(run=lambda *_a, **_k: __import__("json").dumps(listing)),
+    )
+
+    assert (
+        MODULE.resolve_cpu_ingress_pod(release, failure="release safety checks")
+        == "settled-pod"
+    )
+
+
+def test_ingress_resolution_falls_back_to_any_running_pod() -> None:
+    # A first bootstrap window, or every replica mid-restart, has no Ready
+    # not-Terminating Pod. Rather than fail, fall back to any Running Pod so
+    # the previous behaviour and its "no Pod" failure are preserved.
+    listing = {
+        "items": [
+            {
+                "metadata": {"name": "restarting-pod"},
+                "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+            }
+        ]
+    }
+    release = SimpleNamespace(
+        config=SimpleNamespace(namespace="gpu-fault-system"),
+        _cpu=lambda *a: ["kubectl", *a],
+        runner=SimpleNamespace(run=lambda *_a, **_k: __import__("json").dumps(listing)),
+    )
+
+    assert (
+        MODULE.resolve_cpu_ingress_pod(release, failure="release safety checks")
+        == "restarting-pod"
+    )
+
+
+def test_a_probe_killed_mid_window_buys_one_more_probe_even_without_retries() -> None:
+    # A barrier whose Pod is reaped by the rollout mid-exec exits 137 while the
+    # Pod object still lingers as Terminating, so the "vanished Pod" check would
+    # still find it. The kill itself is the replacement signal: the release must
+    # re-resolve and run the barrier once more instead of failing.
+    release = ProbeRelease(
+        pod="doomed-pod",
+        live_pods=["doomed-pod", "fresh-pod"],
+        failures=1,
+        failure_exit_code=137,
+    )
+    release.prime()
+    release.pod = "fresh-pod"
+
+    assert (
+        MODULE.exec_cpu_ingress_probe(
+            release, script="print(1)", failure="release safety checks", retries=0
+        )
+        == "probe-output"
+    )
+    assert release.execs == ["doomed-pod", "fresh-pod"]
 
 
 def test_a_probe_that_ran_against_a_live_pod_is_not_retried_without_retries() -> None:
