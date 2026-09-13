@@ -1161,3 +1161,61 @@ def test_a_rerun_over_a_deleting_aurora_cluster_only_waits(
     assert retained is not None, "the final snapshot must still be reported"
     assert retained.resource_id == "test-final"
     assert describes["clusters"] > 2, "the rerun must wait for the cluster to vanish"
+
+
+def test_certificate_deletion_waits_for_acm_to_release_the_listener(
+    tmp_path, monkeypatch
+) -> None:
+    """Live 2026-09-13: the NLB was already gone, but ACM still answered
+    ResourceInUseException for its listener ten minutes later and the uninstall
+    stopped at the certificate. That one refusal is retried until it clears."""
+
+    site = load_site(site_file(tmp_path))
+    deletes: list[int] = [0]
+
+    def acm(arguments, **kwargs):
+        del kwargs
+        if "delete-certificate" in arguments:
+            deletes[0] += 1
+            if deletes[0] <= 2:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    254,
+                    stdout="",
+                    stderr="An error occurred (ResourceInUseException) ... is in use.",
+                )
+            return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        if "describe-certificate" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 254, stdout="", stderr="ResourceNotFoundException"
+            )
+        raise AssertionError(f"unexpected aws call: {arguments}")
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", acm)
+    monkeypatch.setattr(admin_aws_commands.time, "sleep", lambda _seconds: None)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+    certificate = _resource("aws/acm/certificate", "acm_certificate", "arn:acm/a")
+
+    cleaner.delete(certificate)
+
+    assert deletes[0] == 3, (
+        "two in-use refusals were retried, the third delete went through"
+    )
+
+
+def test_certificate_deletion_still_raises_on_any_other_failure(
+    tmp_path, monkeypatch
+) -> None:
+    site = load_site(site_file(tmp_path))
+
+    def acm(arguments, **kwargs):
+        del kwargs
+        return subprocess.CompletedProcess(
+            arguments, 254, stdout="", stderr="AccessDeniedException: no"
+        )
+
+    monkeypatch.setattr(admin_aws_commands.subprocess, "run", acm)
+    cleaner = admin_aws_cleanup.ResourceCleaner(site)
+
+    with pytest.raises(BootstrapError, match="AccessDeniedException"):
+        cleaner.delete(_resource("aws/acm/certificate", "acm_certificate", "arn:acm/a"))

@@ -5,6 +5,7 @@ from typing import Any, Iterable, cast
 
 from gpu_fault.admin.aws_cleanup_helpers import (
     aurora_instance_deleting_or_absent,
+    delete_certificate_once_released,
     ordered_aurora_instances,
 )
 from gpu_fault.admin.aws_commands import (
@@ -1034,15 +1035,7 @@ class ResourceDeletion(ResourceProbe):
                 ),
             )
         elif resource_type == "acm_certificate":
-            _checked(
-                self._aws(
-                    "acm",
-                    "delete-certificate",
-                    "--certificate-arn",
-                    arn,
-                ),
-                not_found=("ResourceNotFoundException",),
-            )
+            delete_certificate_once_released(self, resource, arn)
         elif resource_type == "secretsmanager_secret":
             _checked(
                 self._aws(
