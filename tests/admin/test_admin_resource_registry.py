@@ -23,6 +23,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
     InstallationResourceSnapshot,
+    InstallationResourceStatus,
 )
 from tests.admin.test_admin_site import site_file
 
@@ -538,3 +539,51 @@ def test_join_registry_delta_refuses_a_key_naming_another_resource() -> None:
         )
     with pytest.raises(BootstrapError, match="belongs to site"):
         registry_delta(before, [], site_id="other-site")
+
+
+def test_join_registry_delta_replaces_a_previous_life_left_in_a_terminal_status() -> (
+    None
+):
+    """Live 2026-09-13: remove-cluster leaves the cluster's rows DETACHED/DELETED
+    in the registry; the re-join's before snapshot therefore held
+    ``cluster/<id>/hyperpod`` with no ARN (the bootstrap never recorded one) and
+    the join, which records the ARN, was refused as "a different resource"."""
+
+    detached = _row("cluster/gpu-b/hyperpod", "gpu-b").model_copy(
+        update={"status": InstallationResourceStatus.DETACHED}
+    )
+    deleted = _row("aws/iam/executor/gpu-b/role", "gpu-b-old").model_copy(
+        update={"status": InstallationResourceStatus.DELETED}
+    )
+    joined = [
+        _row("cluster/gpu-b/hyperpod", "gpu-b", arn="arn:aws:sagemaker:::cluster/b"),
+        _row("aws/iam/executor/gpu-b/role", "gpu-b-new"),
+    ]
+
+    delta, merged = registry_delta(
+        _before(detached, deleted), joined, site_id="test-site"
+    )
+
+    assert delta.resources == sorted(joined, key=lambda item: item.resource_key)
+    assert {item.resource_key: item.resource_id for item in merged.resources} == {
+        "cluster/gpu-b/hyperpod": "gpu-b",
+        "aws/iam/executor/gpu-b/role": "gpu-b-new",
+    }, "the previous life is replaced, not kept beside the new rows"
+
+
+def test_join_registry_delta_accepts_a_live_row_that_recorded_no_arn() -> None:
+    before = _before(_row("cluster/gpu-b/hyperpod", "gpu-b"))
+
+    delta, _merged = registry_delta(
+        before,
+        [_row("cluster/gpu-b/hyperpod", "gpu-b", arn="arn:aws:sagemaker:::cluster/b")],
+        site_id="test-site",
+    )
+
+    assert delta.resources[0].resource_arn == "arn:aws:sagemaker:::cluster/b", (
+        "same type and id: the row with the ARN wins"
+    )
+    with pytest.raises(BootstrapError, match="cluster/gpu-b/hyperpod"):
+        registry_delta(
+            before, [_row("cluster/gpu-b/hyperpod", "gpu-c")], site_id="test-site"
+        )

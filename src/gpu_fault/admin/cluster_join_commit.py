@@ -18,6 +18,7 @@ from gpu_fault.admin.cluster_join_state import complete_step, step_done
 from gpu_fault.admin.resource_registry import LegacyInstallationRegistryMissing
 from gpu_fault.admin.site import RenderedSite, load_site
 from gpu_fault.installation_resources import (
+    TERMINAL_INSTALLATION_RESOURCE_STATUSES,
     InstallationResource,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
@@ -220,12 +221,24 @@ def registry_delta(
             f"not {site_id!r}"
         )
     existing = {item.resource_key: item for item in before.resources}
+    # A row remove-cluster left in a terminal status (DETACHED, DELETED,
+    # PRESERVED) is the cluster's previous life, not a claim on the key: a
+    # re-join replaces it. A live row must name the same resource; a bootstrap
+    # row that recorded no ARN (live 2026-09-13: the HyperPod row) is compared
+    # on type and id alone.
     conflicts = sorted(
         item.resource_key
         for item in resources
         if (previous := existing.get(item.resource_key)) is not None
-        and (previous.resource_type, previous.resource_id, previous.resource_arn)
-        != (item.resource_type, item.resource_id, item.resource_arn)
+        and previous.status not in TERMINAL_INSTALLATION_RESOURCE_STATUSES
+        and (
+            (previous.resource_type, previous.resource_id)
+            != (item.resource_type, item.resource_id)
+            or (
+                previous.resource_arn is not None
+                and previous.resource_arn != item.resource_arn
+            )
+        )
     )
     if conflicts:
         raise BootstrapError(
