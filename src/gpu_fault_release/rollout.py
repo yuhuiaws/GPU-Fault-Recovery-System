@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
@@ -50,6 +50,7 @@ from gpu_fault_release.regional_endpoint_rollback import (
     capture_endpoint_snapshot,
     restore_endpoint_snapshot,
 )
+from gpu_fault_release.regional_kubeconfig_cache import ReleaseKubeconfigCache
 from gpu_fault_release.regional_gpu_bootstrap import (
     apply_gpu_adot_collector,
     apply_gpu_dcgm_exporter,
@@ -69,6 +70,7 @@ from gpu_fault_release.regional_notifications import (
 from gpu_fault_release.regional_observability_rollback import (
     restore_observability_snapshot,
 )
+from gpu_fault_release.regional_release_arguments import parser as parser
 from gpu_fault_release.regional_release_artifacts import (
     require_cpu_secrets,
     upload_config_map,
@@ -239,8 +241,21 @@ SENSITIVE_CONFIG_MARKERS = (
 
 
 class Runner:
-    def __init__(self, *, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        dry_run: bool = False,
+        before_command: Callable[[], None] | None = None,
+    ) -> None:
         self.dry_run = dry_run
+        # Runs before every child process: the kubeconfig token cache uses it
+        # to re-fetch a token that is about to expire, so a child started late
+        # in a long release reads fresh credentials.
+        self._before_command = before_command
+
+    def _prepare(self) -> None:
+        if self._before_command is not None:
+            self._before_command()
 
     def _narrate_elapsed(self, label: str, started: float) -> None:
         """Name the command that ate the wall clock, when it ate enough of it.
@@ -283,6 +298,7 @@ class Runner:
         print("+ " + label, file=sys.stderr, flush=True)
         if self.dry_run and not capture:
             return ""
+        self._prepare()
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -347,6 +363,7 @@ class Runner:
         their answers are visible in what the release does next -- so a slow one
         is a wholly silent gap, which is why the elapsed line still applies.
         """
+        self._prepare()
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -374,6 +391,7 @@ class Runner:
         boolean :meth:`probe` returns. Like :meth:`probe`, this exists so the
         call sites do not reach ``subprocess`` behind the runner's back.
         """
+        self._prepare()
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -1286,64 +1304,6 @@ class RegionalRelease:
             )
 
 
-def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(
-        description="Regional GPU fault release orchestrator"
-    )
-    value.add_argument(
-        "mode",
-        choices=(
-            "plan",
-            "preflight",
-            "release-summary",
-            "release-diff",
-            "status",
-            "bootstrap",
-            "deploy",
-            "upgrade",
-            "resume",
-            "rollback",
-            "commit",
-            "stage-noop",
-            "join-cluster",
-            "activate-cluster",
-            "fail-cluster",
-            "rollback-cluster",
-            "drain-cluster",
-            "remove-cluster",
-            "sync-state",
-            "verify",
-            "stability",
-        ),
-    )
-    value.add_argument("--config", required=True, type=Path)
-    value.add_argument("--cluster-id")
-    value.add_argument(
-        "--plan-mode",
-        choices=(
-            "bootstrap",
-            "deploy",
-            "upgrade",
-            "rollback",
-            "join-cluster",
-            "remove-cluster",
-        ),
-        default="upgrade",
-    )
-    value.add_argument("--dry-run", action="store_true")
-    # Engine-internal: set by `recover_failed_upgrade` (in-process) and by
-    # `scripts/release_failure_recovery.py` on `rollback`, never typed by an
-    # operator, so hidden from --help; `parse_arguments` refuses it elsewhere.
-    # It lets the in-flight install check proceed (logging) when no
-    # control-plane Pod can answer the store read.
-    value.add_argument("--automatic", action="store_true", help=argparse.SUPPRESS)
-    # `status`: every health check instead of the cheap two. `preflight`: the
-    # passing checks' details instead of their names. GPU_FAULT_FULL_REPORT=1
-    # does the same for a wrapper that cannot add the flag.
-    value.add_argument("--full", action="store_true")
-    return value
-
-
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     value = parser()
     arguments = value.parse_args(argv)
@@ -1354,7 +1314,22 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _run_mode(arguments: argparse.Namespace) -> int:
     config = ReleaseConfig.load(arguments.config)
-    release = RegionalRelease(config, Runner(dry_run=arguments.dry_run))
+    # One exec-plugin run per kubeconfig instead of one per kubectl call; the
+    # cached copies live for this invocation only (see regional_kubeconfig_cache).
+    with ReleaseKubeconfigCache(
+        config.cpu_kubeconfig, dry_run=arguments.dry_run
+    ) as kubeconfigs:
+        release = RegionalRelease(
+            kubeconfigs.rewrite_config(config),
+            Runner(
+                dry_run=arguments.dry_run,
+                before_command=kubeconfigs.refresh_if_needed,
+            ),
+        )
+        return _dispatch_mode(release, arguments)
+
+
+def _dispatch_mode(release: RegionalRelease, arguments: argparse.Namespace) -> int:
     exit_code = 0
     if arguments.mode == "plan":
         print(

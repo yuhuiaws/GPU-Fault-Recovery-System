@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,7 +47,11 @@ def _rollout(monkeypatch: pytest.MonkeyPatch, capsys, *argv: str) -> tuple[int, 
 @pytest.fixture
 def engine(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     seen: dict[str, object] = {}
-    monkeypatch.setattr(ROLLOUT.ReleaseConfig, "load", staticmethod(lambda _p: "cfg"))
+    # The entry point rewrites the CPU kubeconfig through the token cache, so
+    # the stand-in config carries one; a path that does not exist is passed on
+    # unchanged, which keeps the release's view of the config equal to this.
+    config = SimpleNamespace(cpu_kubeconfig="release.kubeconfig")
+    monkeypatch.setattr(ROLLOUT.ReleaseConfig, "load", staticmethod(lambda _p: config))
 
     class Release:
         def __init__(self, config, runner):

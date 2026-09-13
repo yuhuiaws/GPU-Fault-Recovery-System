@@ -1387,7 +1387,12 @@ def test_the_rollback_mode_takes_an_automatic_marker(
     monkeypatch.setattr(
         MODULE, "parser", lambda: SimpleNamespace(parse_args=lambda argv=None: parsed)
     )
-    monkeypatch.setattr(MODULE.ReleaseConfig, "load", classmethod(lambda cls, _p: None))
+    # The entry point routes the config's CPU kubeconfig through the token
+    # cache; a path that does not exist passes through unchanged.
+    config = SimpleNamespace(cpu_kubeconfig="/tmp/site.kubeconfig")
+    monkeypatch.setattr(
+        MODULE.ReleaseConfig, "load", classmethod(lambda cls, _p: config)
+    )
     monkeypatch.setattr(MODULE, "RegionalRelease", lambda _config, _runner: release)
 
     assert MODULE.main() == 0
