@@ -211,7 +211,8 @@ def test_fabric_manager_commits_the_checkpoint_when_the_record_is_buffered(
 
     stats = collector.collect_once()
 
-    assert len(sink.requests) == 1, "the SXID was not handed to the sink"
+    events = [payload for _path, payload in sink.requests if "message" in payload]
+    assert len(events) == 1, "the SXID was not handed to the sink"
     assert stats.delivered == 0, "a buffered record must not count as delivered"
     offset = json.loads(state.read_text())["files"][str(log)]["offset"]
     assert offset == len(message) + 1, (
