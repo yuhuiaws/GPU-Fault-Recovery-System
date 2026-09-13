@@ -14,6 +14,7 @@ from gpu_fault.regional_registry_runtime import (
 )
 from gpu_fault_release import regional_release_online_registry as REGISTRY
 from gpu_fault_release.regional_release_config import ReleaseError
+from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,6 +26,8 @@ def test_join_transition_uses_one_cpu_pod_client(monkeypatch) -> None:
         def run(self, arguments, **kwargs):
             calls.append((arguments, kwargs))
             if "get" in arguments and "pod" in arguments:
+                if "json" in arguments:
+                    return ingress_pod_list_json("ingress-0")
                 return "ingress-0"
             return json.dumps(
                 {"generation": 4, "content_sha256": "a" * 64, "converged": True}
@@ -57,7 +60,7 @@ def test_join_transition_uses_one_cpu_pod_client(monkeypatch) -> None:
 
     assert status["generation"] == 4
     assert len(calls) == 2
-    assert calls[0][0][-2:] == ["-o", "jsonpath={.items[0].metadata.name}"]
+    assert calls[0][0][-2:] == ["-o", "json"]
     transaction = json.loads(calls[1][1]["input_text"])
     assert transaction["path"].endswith("/gpu-a/transition"), (
         "registry client used the wrong cluster transition endpoint"
@@ -78,6 +81,8 @@ def _publish_release(
         def run(self, arguments, **kwargs):
             calls.append((list(arguments), kwargs))
             if "get" in arguments and "pod" in arguments:
+                if "json" in arguments:
+                    return ingress_pod_list_json("ingress-0")
                 return "ingress-0"
             transaction = json.loads(kwargs.get("input_text") or "{}")
             if "path" in transaction:
@@ -190,6 +195,8 @@ def test_status_read_failure_after_a_timeout_never_masks_the_publish_error(
         def run(self, arguments, **kwargs):
             calls.append(arguments)
             if "get" in arguments and "pod" in arguments:
+                if "json" in arguments:
+                    return ingress_pod_list_json("ingress-0")
                 return "ingress-0"
             raise ReleaseError("exec failed")
 

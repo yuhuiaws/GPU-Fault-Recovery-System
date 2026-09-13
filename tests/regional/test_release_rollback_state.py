@@ -21,6 +21,7 @@ from gpu_fault_release import regional_release_rollout_cleanup as ROLLOUT_CLEANU
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release import rollout as MODULE
+from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -802,7 +803,13 @@ def test_agent_identity_snapshot_captures_the_exact_legacy_contract() -> None:
     class Runner:
         @staticmethod
         def run(arguments, **_kwargs):
-            return "api-pod" if "get" in arguments else json.dumps(records)
+            if "get" in arguments:
+                return (
+                    ingress_pod_list_json("api-pod")
+                    if "json" in arguments
+                    else "api-pod"
+                )
+            return json.dumps(records)
 
     release = SimpleNamespace(
         runner=Runner(),

@@ -11,6 +11,7 @@ import pytest
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
 from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
 from gpu_fault_release import regional_release_rollout_wait as WAIT
+from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -326,6 +327,8 @@ def test_candidate_cpu_heartbeat_barrier_is_one_aggregated_exec() -> None:
         def run(self, args, **kwargs):
             self.calls.append((args, kwargs))
             if "get" in args and "pod" in args:
+                if "json" in args:
+                    return ingress_pod_list_json("cpu-pod")
                 return "cpu-pod"
             return '{"status":"PASSED","expected_count":2,"refreshed_count":2}'
 
@@ -359,6 +362,8 @@ class _BarrierRunner:
     def run(self, args, **kwargs):
         self.calls.append((args, kwargs))
         if "get" in args and "pod" in args:
+            if "json" in args:
+                return ingress_pod_list_json("cpu-pod")
             return "cpu-pod"
         return self.result
 
@@ -466,6 +471,8 @@ def test_active_agent_node_sets_are_captured_before_cpu_rollout() -> None:
         @staticmethod
         def run(args, **_kwargs):
             if "get" in args and "pod" in args:
+                if "json" in args:
+                    return ingress_pod_list_json("cpu-pod")
                 return "cpu-pod"
             return '{"gpu-a":["node-b","node-a"],"gpu-b":["node-c"]}'
 

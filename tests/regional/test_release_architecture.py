@@ -15,7 +15,10 @@ from gpu_fault_release import regional_release_node_preflight as NODE_PREFLIGHT_
 from gpu_fault_release import regional_release_node_runtime_rollout as RUNTIME_MODULE
 from gpu_fault_release import regional_release_validation as VALIDATION_MODULE
 from gpu_fault_release import rollout as MODULE
-from tests.regional._release_orchestrator_support import config_file
+from tests.regional._release_orchestrator_support import (
+    config_file,
+    ingress_pod_list_json,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -599,7 +602,10 @@ def test_profile_finalize_rejects_old_profile_activity(
     )
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     responses = iter(
-        ("cpu-pod", json.dumps({"workflow_count": 1, "workload_count": 0}))
+        (
+            ingress_pod_list_json("cpu-pod"),
+            json.dumps({"workflow_count": 1, "workload_count": 0}),
+        )
     )
     monkeypatch.setattr(
         release.runner, "run", lambda *_args, **_kwargs: next(responses)
@@ -652,7 +658,10 @@ def test_profile_finalize_allows_drained_old_profile(
     )
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=False))
     responses = iter(
-        ("cpu-pod", json.dumps({"workflow_count": 0, "workload_count": 0}))
+        (
+            ingress_pod_list_json("cpu-pod"),
+            json.dumps({"workflow_count": 0, "workload_count": 0}),
+        )
     )
     monkeypatch.setattr(
         release.runner, "run", lambda *_args, **_kwargs: next(responses)
@@ -930,7 +939,7 @@ def test_stability_snapshot_normalizes_decimal_store_stats(
     calls = []
     responses = iter(
         (
-            "api-pod",
+            ingress_pod_list_json("api-pod"),
             json.dumps(
                 {
                     "queue": {"depth": 0, "oldest_age_seconds": 0.5},

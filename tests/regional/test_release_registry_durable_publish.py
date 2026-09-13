@@ -27,7 +27,10 @@ from gpu_fault.store import InMemoryStore
 from gpu_fault_release import regional_release_online_registry as ONLINE_REGISTRY
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from tests.regional._regional_support import TOKEN_A, TOKEN_B, registration
-from tests.regional._release_orchestrator_support import phase_release
+from tests.regional._release_orchestrator_support import (
+    ingress_pod_list_json,
+    phase_release,
+)
 
 NOW = datetime(2026, 9, 7, tzinfo=timezone.utc)
 
@@ -191,6 +194,8 @@ def _online_release(calls: list) -> SimpleNamespace:
         def run(self, arguments, **kwargs):
             calls.append((list(arguments), kwargs))
             if "get" in arguments and "pod" in arguments:
+                if "json" in arguments:
+                    return ingress_pod_list_json("ingress-0")
                 return "ingress-0"
             return json.dumps(
                 {"generation": 7, "content_sha256": "b" * 64, "converged": True}

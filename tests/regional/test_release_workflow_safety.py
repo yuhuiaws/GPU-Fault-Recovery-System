@@ -7,6 +7,7 @@ import pytest
 
 from gpu_fault_release import regional_release_probes as PROBES
 from gpu_fault_release import regional_release_workflow_safety as SAFETY
+from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_RESOLUTION = ROOT / "src/gpu_fault/workflow_resolution.py"
@@ -22,7 +23,9 @@ class Runner:
 
     def run(self, args, **_kwargs):
         self.runs.append(list(args))
-        return "cpu-pod" if "get" in args and "pod" in args else self.result
+        if "get" in args and "pod" in args:
+            return ingress_pod_list_json("cpu-pod") if "json" in args else "cpu-pod"
+        return self.result
 
     def probe_output(self, args, **_kwargs):
         assert "deployment" in args

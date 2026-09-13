@@ -14,6 +14,7 @@ from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MO
 from gpu_fault_release import regional_release_registry as REGISTRY_MODULE
 from gpu_fault_release import regional_release_state as STATE_MODULE
 from gpu_fault_release import rollout as ROLLOUT_MODULE
+from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -243,6 +244,8 @@ class IdleProbe:
             if isinstance(result, Exception):
                 raise result
             return result
+        if "json" in arguments:
+            return ingress_pod_list_json(self.pod)
         return self.pod
 
     def probe(self, _arguments) -> bool:

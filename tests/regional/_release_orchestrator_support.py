@@ -21,9 +21,35 @@ __all__ = [
     "RELEASE_MODULE",
     "RUNTIME_PROFILE_MODULE",
     "config_file",
+    "ingress_pod_list_json",
     "manifest_config_file",
     "phase_release",
 ]
+
+
+def ingress_pod_list_json(name: str = "ingress-0") -> str:
+    """The ``kubectl get pod ... -o json`` listing the ingress resolver reads.
+
+    ``resolve_cpu_ingress_pod`` now lists the CPU ingress Pods as JSON and
+    prefers a Ready, not-Terminating one, so a fake runner that used to answer
+    the old jsonpath command with a bare Pod name must answer this command with
+    a listing whose single Pod is ``name`` and is Ready. The old jsonpath
+    command (still used by ``cpu_ingress_pod_if_running``) keeps returning the
+    bare name, so a fake tells the two apart by ``"json"`` in the argv.
+    """
+
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {"name": name},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }
+            ]
+        }
+    )
+
+
 REGION = "us-east-1"
 SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:gpu-fault"
 CPU_EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-fault-control-plane"
@@ -137,7 +163,9 @@ class RuntimeProfileRunner:
     def run(self, args, **kwargs):
         command = " ".join(args)
         if "get pod" in command:
-            return "api-pod"
+            return (
+                ingress_pod_list_json("api-pod") if "-o json" in command else "api-pod"
+            )
         if "compile_runtime_profile" in command:
             desired = self._desired(kwargs["input_text"])
             return json.dumps({"desired": desired, "existing": self.existing})
