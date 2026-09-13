@@ -456,13 +456,9 @@ class NodeLogCollector:
         self.health_summary_seconds = int(
             os.getenv("GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS", "300")
         )
-        self._next_health_summary = next_stable_phase(
-            self.now(),
-            cluster_id=self.context.cluster_id,
-            node_id=self.node_id,
-            channel="NODE_LOGS",
-            interval_seconds=self.health_summary_seconds,
-        )
+        # First summary on the first collection (see kernel.py); later ones
+        # keep their stable phase.
+        self._next_health_summary = self.now()
 
     def collect_once(self) -> NodeLogBatch:
         collected_at = self.now()

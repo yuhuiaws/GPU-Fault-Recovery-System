@@ -164,7 +164,9 @@ def test_kernel_collector_starts_at_live_tail(monkeypatch) -> None:
         collector.run()
 
     assert stream.sought_to_end is True
-    assert sink.requests == []
+    assert [p for _path, p in sink.requests if "summary_id" not in p] == [], (
+        "only the start-up summary may be posted; the backlog is not replayed"
+    )
 
 
 def test_kernel_collector_reopens_after_stream_error(monkeypatch) -> None:
@@ -198,8 +200,9 @@ def test_kernel_collector_reopens_after_stream_error(monkeypatch) -> None:
     with pytest.raises(KeyboardInterrupt):
         collector.run()
 
-    assert len(sink.requests) == 1
-    assert sink.requests[0][1]["record_id"] == "kmsg-boot-123-42"
+    events = [payload for _path, payload in sink.requests if "record_id" in payload]
+    assert len(events) == 1, f"one record besides the start-up summary: {sink.requests}"
+    assert events[0]["record_id"] == "kmsg-boot-123-42"
 
 
 def test_kernel_collector_health_summary_uses_routine_path() -> None:
@@ -402,9 +405,11 @@ def test_fabric_manager_file_collector_persists_offsets(tmp_path) -> None:
     assert initial_offset == initial_size
     assert resumed.observed == 1
     assert resumed.delivered == 1
-    assert len(sink.requests) == 1
-    assert sink.requests[0][1]["source"] == "file"
-    assert sink.requests[0][1]["fields"]["path"] == str(log)
+    # Each collector start posts one health summary; the events are the point.
+    events = [payload for _path, payload in sink.requests if "source" in payload]
+    assert len(events) == 1, f"exactly one event was delivered: {sink.requests}"
+    assert events[0]["source"] == "file"
+    assert events[0]["fields"]["path"] == str(log)
 
 
 def test_fabric_manager_file_cursor_rolls_back_on_delivery_failure(tmp_path) -> None:
@@ -553,8 +558,10 @@ def test_fabric_manager_initial_file_baselines_at_eof(tmp_path) -> None:
     assert json.loads(state.read_text())["files"][str(log)]["offset"] > initial_size
     assert delivered.observed == 1
     assert delivered.delivered == 1
-    assert len(sink.requests) == 1
-    assert sink.requests[0][1]["message"].endswith("fresh event")
+    # Each collector start posts one health summary; the events are the point.
+    events = [payload for _path, payload in sink.requests if "message" in payload]
+    assert len(events) == 1, f"exactly one event was delivered: {sink.requests}"
+    assert events[0]["message"].endswith("fresh event")
 
 
 def test_fabric_manager_corrupt_state_does_not_replay_existing_file(tmp_path) -> None:
@@ -580,7 +587,9 @@ def test_fabric_manager_corrupt_state_does_not_replay_existing_file(tmp_path) ->
 
     assert stats.observed == 0
     assert stats.delivered == 0
-    assert sink.requests == []
+    assert [p for _path, p in sink.requests if "summary_id" not in p] == [], (
+        "only the start-up summary may be posted; nothing was replayed"
+    )
     assert json.loads(state.read_text())["files"][str(log)]["offset"] == (
         log.stat().st_size
     )
@@ -631,8 +640,9 @@ def test_fabric_manager_commits_each_successful_record(tmp_path) -> None:
     ).collect_once()
 
     assert stats.delivered == 1
-    assert len(retry.requests) == 1
-    assert retry.requests[0][1]["message"] == messages[1]
+    events = [payload for _path, payload in retry.requests if "message" in payload]
+    assert len(events) == 1, "one record was retried; the start-up summary is not one"
+    assert events[0]["message"] == messages[1]
 
 
 def test_fabric_manager_state_fsyncs_file_and_directory(
@@ -996,7 +1006,8 @@ def test_fabric_manager_skips_a_file_that_vanishes_between_glob_and_stat(
     stats = collector.collect_once()
 
     assert stats.delivered == 1, "a vanished sibling file stopped the whole round"
-    assert len(sink.requests) == 1, "the surviving file's SXID was not delivered"
+    events = [payload for _path, payload in sink.requests if "message" in payload]
+    assert len(events) == 1, "the surviving file's SXID was not delivered"
 
 
 def test_fabric_manager_bounds_the_tracked_file_table(tmp_path, caplog) -> None:
@@ -1204,7 +1215,8 @@ def test_fabric_manager_reads_the_tail_of_a_renamed_log(tmp_path) -> None:
     assert stats.delivered == 1, (
         "the tail written between the last poll and the rotation was lost"
     )
-    assert sink.requests[0][1]["message"].endswith("written before the rotation"), (
+    events = [payload for _path, payload in sink.requests if "message" in payload]
+    assert events[0]["message"].endswith("written before the rotation"), (
         f"the wrong line was delivered: {sink.requests}"
     )
     assert (
@@ -1385,7 +1397,8 @@ def test_fabric_manager_keeps_its_offset_at_a_line_the_daemon_is_still_writing(
     assert second_round.delivered == 1, (
         f"the fatal SXID after the completed line was lost: {sink.requests}"
     )
-    assert "12020" in sink.requests[0][1]["message"], (
+    events = [payload for _path, payload in sink.requests if "message" in payload]
+    assert "12020" in events[0]["message"], (
         f"the delivered record is not the fatal SXID: {sink.requests}"
     )
     assert caplog.text.count("line boundary") == 1, (

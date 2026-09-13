@@ -77,10 +77,11 @@ def test_a_rejected_event_does_not_reopen_the_kmsg_stream(monkeypatch) -> None:
         collector.run()
 
     assert opens == 1, "a delivery failure reopened the stream"
-    assert [item[1]["record_id"] for item in sink.requests] == [
-        "kmsg-boot-123-42",
-        "kmsg-boot-123-43",
-    ], "the record after the rejected one was lost"
+    assert [
+        item[1]["record_id"] for item in sink.requests if "record_id" in item[1]
+    ] == ["kmsg-boot-123-42", "kmsg-boot-123-43"], (
+        "the record after the rejected one was lost"
+    )
     assert collector.health_counters["delivery_failures"] == 1, (
         "the rejected delivery was not counted"
     )
@@ -120,10 +121,11 @@ def test_kmsg_overflow_continues_on_the_same_stream_and_is_counted(
         collector._collect_live_stream(stream)
 
     assert stream.reads == 4, "the stream was abandoned after the overflow"
-    assert [item[1]["record_id"] for item in sink.requests] == [
-        "kmsg-boot-123-42",
-        "kmsg-boot-123-43",
-    ], "records after the overflow were not read"
+    assert [
+        item[1]["record_id"] for item in sink.requests if "record_id" in item[1]
+    ] == ["kmsg-boot-123-42", "kmsg-boot-123-43"], (
+        "records after the overflow were not read"
+    )
     assert collector.health_counters["kmsg_overflow"] == 1, "overflow not counted"
     assert "overflow" in caplog.text.lower(), "overflow was not logged"
 
@@ -243,11 +245,11 @@ def test_the_kmsg_reader_does_not_wait_for_the_sink() -> None:
         sink.released.set()
         collector.stop_delivery()
 
-    assert [item[1]["record_id"] for item in sink.requests] == [
-        "kmsg-boot-123-42",
-        "kmsg-boot-123-43",
-        "kmsg-boot-123-44",
-    ], f"queued records were lost instead of draining on shutdown: {sink.requests}"
+    assert [
+        item[1]["record_id"] for item in sink.requests if "record_id" in item[1]
+    ] == ["kmsg-boot-123-42", "kmsg-boot-123-43", "kmsg-boot-123-44"], (
+        f"queued records were lost instead of draining on shutdown: {sink.requests}"
+    )
 
 
 def test_the_delivery_queue_drops_the_oldest_record_and_counts_it(caplog) -> None:
@@ -278,11 +280,11 @@ def test_the_delivery_queue_drops_the_oldest_record_and_counts_it(caplog) -> Non
         "the records dropped by the bounded queue were not counted: "
         f"{collector.health_counters}"
     )
-    assert [item[1]["record_id"] for item in sink.requests] == [
-        "kmsg-boot-123-42",
-        "kmsg-boot-123-45",
-        "kmsg-boot-123-46",
-    ], f"the queue dropped the newest records instead of the oldest: {sink.requests}"
+    assert [
+        item[1]["record_id"] for item in sink.requests if "record_id" in item[1]
+    ] == ["kmsg-boot-123-42", "kmsg-boot-123-45", "kmsg-boot-123-46"], (
+        f"the queue dropped the newest records instead of the oldest: {sink.requests}"
+    )
     assert "delivery queue" in caplog.text.lower(), (
         "a dropped kernel record was not logged"
     )
@@ -342,10 +344,11 @@ def test_an_unexpected_delivery_error_does_not_reopen_the_kmsg_stream(
         collector.run()
 
     assert opens == 1, "an unexpected delivery error reopened the stream"
-    assert [item[1]["record_id"] for item in sink.requests] == [
-        "kmsg-boot-123-42",
-        "kmsg-boot-123-43",
-    ], f"the record after the failed one was lost: {sink.requests}"
+    assert [
+        item[1]["record_id"] for item in sink.requests if "record_id" in item[1]
+    ] == ["kmsg-boot-123-42", "kmsg-boot-123-43"], (
+        f"the record after the failed one was lost: {sink.requests}"
+    )
     assert collector.health_counters["delivery_failures"] == 1, (
         f"the failure was not counted: {collector.health_counters}"
     )
@@ -473,8 +476,8 @@ def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
 
     collector.run()
 
-    posted = [payload["record_id"] for _path, payload in sink.requests]
-    buffered = [payload["record_id"] for _path, payload in sink.buffered]
+    posted = [p["record_id"] for _path, p in sink.requests if "record_id" in p]
+    buffered = [p["record_id"] for _path, p in sink.buffered if "record_id" in p]
     assert sorted(posted + buffered) == [
         "kmsg-boot-123-42",
         "kmsg-boot-123-43",
@@ -485,8 +488,9 @@ def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
     assert len(buffered) >= 2, (
         f"the stop signal did not hand the queue to the outbox: {buffered}"
     )
+    # The start-up health summary is handed to the outbox like any record.
     assert collector.health_counters["delivery_buffered_at_shutdown"] == len(
-        buffered
+        sink.buffered
     ), f"the records handed to the outbox were not counted: {collector.health_counters}"
     assert signal.getsignal(signal.SIGTERM) is before, (
         "the collector kept the process's SIGTERM handler after run() returned"
@@ -1067,7 +1071,8 @@ def test_a_dropped_health_summary_is_not_counted_as_a_lost_record(
     with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.logs.kernel"):
         collector.run()
 
-    assert collector.health_counters["health_summary_queue_drops"] == 1, (
+    # Two summaries yield: the start-up one and the periodic one.
+    assert collector.health_counters["health_summary_queue_drops"] == 2, (
         f"the dropped health summary was not counted anywhere: "
         f"{collector.health_counters}"
     )
@@ -1218,7 +1223,8 @@ def test_a_health_summary_never_evicts_a_queued_xid(monkeypatch, caplog) -> None
     assert collector.health_counters["delivery_queue_drops"] == 0, (
         f"a health summary evicted a queued XID record: {collector.health_counters}"
     )
-    assert collector.health_counters["health_summary_queue_drops"] == 1, (
+    # Two summaries yield: the start-up one and the periodic one.
+    assert collector.health_counters["health_summary_queue_drops"] == 2, (
         f"the summary that yielded to the XID was not counted: "
         f"{collector.health_counters}"
     )

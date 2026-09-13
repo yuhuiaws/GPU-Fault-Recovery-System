@@ -224,13 +224,12 @@ class KernelLogCollector:
         self.health_summary_seconds = int(
             os.getenv("GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS", "300")
         )
-        self._next_health_summary = next_stable_phase(
-            self.now(),
-            cluster_id=self.context.cluster_id,
-            node_id=self.node_id,
-            channel=CollectorKind.NVIDIA_KERNEL.value,
-            interval_seconds=self.health_summary_seconds,
-        )
+        # The first summary goes out on the first collection: a freshly
+        # installed (or restarted) collector proves itself alive within
+        # seconds instead of one period later (live 2026-09-12: a bootstrap's
+        # first verify ran before the 300 s summary and read the node as
+        # silent). Later summaries keep their stable phase.
+        self._next_health_summary = self.now()
         self._last_read_at: datetime | None = None
         self.delivery_queue_size = delivery_queue_size
         # (record_id, path, payload): the health summary goes to its own

@@ -127,13 +127,9 @@ class FabricManagerLogCollector:
                 "300",
             )
         )
-        self._next_health_summary = next_stable_phase(
-            self.now(),
-            cluster_id=self.context.cluster_id,
-            node_id=self.node_id,
-            channel=CollectorKind.FABRIC_MANAGER_LOG.value,
-            interval_seconds=self.health_summary_seconds,
-        )
+        # First summary on the first collection (see kernel.py); later ones
+        # keep their stable phase.
+        self._next_health_summary = self.now()
         self._load_state()
 
     def collect_once(self) -> CollectorStats:
