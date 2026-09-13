@@ -188,6 +188,13 @@ def aws_json(
     return cached_read(cache, release._json_read_cache_lock, tuple(command), fetch)
 
 
+# `kubectl get <kind> <name>...` answers several names in one round trip. The
+# flag makes a missing name an omission from the returned `List` rather than an
+# exit-1 with the found items still on stdout, so absence is read from the set
+# difference and any non-zero exit is a real read failure.
+IGNORE_NOT_FOUND = "--ignore-not-found"
+
+
 def get_json(release: Any, args: list[str]) -> dict[str, Any]:
     def fetch() -> dict[str, Any]:
         raw = release.runner.run(args + ["-o", "json"], capture=True)
@@ -213,11 +220,22 @@ def _cache_list_items(
     value: dict[str, Any],
     lock: threading.Lock,
 ) -> None:
+    """Serve later per-name reads from a list or a named batch already read.
+
+    A bare `get <kind>` and a `get <kind> <a> <b> ... --ignore-not-found`
+    both return the very documents `get <kind> <name>` would, so each item is
+    filed under the per-name key too. A selector or any other flag is left
+    alone: the cache only ever answers a question with that question's answer.
+    """
+
     try:
         get_index = args.index("get")
     except ValueError:
         return
-    if len(args) != get_index + 2 or not isinstance(value.get("items"), list):
+    trailing = args[get_index + 2 :]
+    if any(word.startswith("-") and word != IGNORE_NOT_FOUND for word in trailing):
+        return
+    if not isinstance(value.get("items"), list):
         return
     prefix = args[: get_index + 2]
     with lock:
@@ -327,6 +345,57 @@ def config_map_data(release: Any, name: str) -> dict[str, str]:
         )
     )
     return dict(value.get("data") or {})
+
+
+def documents_by_name(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index a `kubectl get -o json` answer by `metadata.name`.
+
+    Several names come back as a `List`; one name comes back as the object
+    itself; no found name at all (under `--ignore-not-found`) as empty output,
+    which `get_json` has already turned into `{}`.
+    """
+
+    items = value.get("items") if value.get("kind") == "List" else None
+    if items is None:
+        items = [value] if value else []
+    documents: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str((item.get("metadata") or {}).get("name") or "")
+        if name:
+            documents[name] = item
+    return documents
+
+
+def config_maps_data(release: Any, names: Sequence[str]) -> dict[str, dict[str, str]]:
+    """The `data` of several ConfigMaps from ONE kubectl call, keyed by name.
+
+    Every kubectl call from the deploy host costs about 1.2 s of exec-plugin
+    auth and API round trip, so the 18 role ConfigMaps of a capture cost 22 s
+    one at a time and about 1 s together. A missing ConfigMap fails the read
+    like the per-name reader does -- the capture must not describe a control
+    plane that does not exist -- but names every missing one at once.
+    """
+
+    requested = sorted(set(names))
+    if not requested:
+        return {}
+    value = release._get_json(
+        release._cpu(
+            "-n",
+            release.config.namespace,
+            "get",
+            "configmap",
+            *requested,
+            IGNORE_NOT_FOUND,
+        )
+    )
+    found = documents_by_name(value)
+    missing = [name for name in requested if name not in found]
+    if missing:
+        raise ReleaseError("ConfigMap(s) not found: " + ", ".join(missing))
+    return {name: dict(found[name].get("data") or {}) for name in requested}
 
 
 def deployment_wheel(
@@ -563,8 +632,8 @@ def cpu_role_config_maps(
                     names.add(name)
 
     snapshots: dict[str, dict[str, str]] = {}
-    for name in sorted(names):
-        data = release._config_map_data(name)
+    # One kubectl round trip for all 18 role ConfigMaps, not one each.
+    for name, data in release._config_maps_data(sorted(names)).items():
         sensitive = sorted(key for key in data if SENSITIVE_CONFIG_KEY.search(key))
         if sensitive:
             raise ReleaseError(

@@ -160,8 +160,24 @@ def _drop_env(deployment: dict[str, Any], name: str) -> None:
     container["env"] = [item for item in container["env"] if item["name"] != name]
 
 
+def _requested_names(command: list[str]) -> list[str]:
+    """The resource names of a ``kubectl get <kind> <name>... [flags]`` argv."""
+
+    names: list[str] = []
+    for word in command[5:]:
+        if word.startswith("-"):
+            break
+        names.append(word)
+    return names
+
+
 class _Kubectl:
-    """Answers ``kubectl -n <ns> get deployment|configmap <name> -o json``."""
+    """Answers ``kubectl -n <ns> get deployment|configmap <name>... -o json``.
+
+    Batched like the verifier asks: every name in one call, ``--ignore-not-found``
+    semantics (a missing Deployment is simply absent from the ``List``, exit 0).
+    A ConfigMap not in ``config_maps`` is present with empty ``data``.
+    """
 
     def __init__(
         self,
@@ -176,25 +192,26 @@ class _Kubectl:
         self, command: list[str], **_kwargs: Any
     ) -> subprocess.CompletedProcess:
         assert command[:2] == ["kubectl", "-n"], command
-        kind, name = command[4], command[5]
+        assert command[3] == "get", command
+        assert "--ignore-not-found" in command, command
+        kind = command[4]
+        names = _requested_names(command)
         self.calls.append(command)
         if kind == "configmap":
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout=json.dumps({"data": self.config_maps.get(name, {})}),
-                stderr="",
-            )
-        assert kind == "deployment", command
-        if name not in self.deployments:
-            return subprocess.CompletedProcess(
-                command,
-                1,
-                stdout="",
-                stderr=f'Error from server (NotFound): deployments "{name}" not found\n',
-            )
+            items: list[dict[str, Any]] = [
+                {"metadata": {"name": name}, "data": self.config_maps.get(name, {})}
+                for name in names
+            ]
+        else:
+            assert kind == "deployment", command
+            items = [
+                self.deployments[name] for name in names if name in self.deployments
+            ]
         return subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps(self.deployments[name]), stderr=""
+            command,
+            0,
+            stdout=json.dumps({"kind": "List", "apiVersion": "v1", "items": items}),
+            stderr="",
         )
 
 
@@ -271,8 +288,9 @@ def test_snapshot_mode_skips_the_current_contract_and_passes_on_a_match(
     assert "contract assertions are skipped" in lines[0]
     assert lines[1].startswith("role-split check passed (snapshot mode)"), lines
     assert "gpu-fault-control-worker 1 replicas ready" in lines[1]
-    # Snapshot mode never resolves ConfigMaps: it compares references, not values.
-    assert all(call[4] == "deployment" for call in kubectl.calls), kubectl.calls
+    # Snapshot mode compares references, not values; the only ConfigMap read it
+    # may make is the one batched warm-up for the spool exemption lookup.
+    assert sum(call[4] == "configmap" for call in kubectl.calls) <= 1, kubectl.calls
 
 
 def test_snapshot_mode_ignores_env_order(monkeypatch, verifier, tmp_path):

@@ -41,6 +41,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -86,15 +87,30 @@ PROCESSOR_POOL_ENV = (
 )
 
 
-def deployment(name: str) -> dict | None:
+def kubectl_get(
+    kind: str, names: Sequence[str]
+) -> tuple[dict[str, dict[str, Any]] | None, str]:
+    """One ``kubectl get <kind> <name>... -o json`` for every name at once.
+
+    Each kubectl call from the deploy host costs about 1.2 s (exec-plugin auth
+    plus the API round trip), and this verifier runs after every role apply;
+    per-object gets made it a 28 s step. ``--ignore-not-found`` turns a
+    missing name into an omission from the returned ``List`` instead of an
+    exit-1 with the found items still on stdout, so absence is the set
+    difference and a non-zero exit is a real read failure: the result is
+    ``(found-by-name, "")`` or ``(None, stderr)``. One name comes back as the
+    object itself, several as a ``List``, none as empty output.
+    """
+
     result = subprocess.run(
         [
             "kubectl",
             "-n",
             NAMESPACE,
             "get",
-            "deployment",
-            name,
+            kind,
+            *names,
+            "--ignore-not-found",
             "-o",
             "json",
         ],
@@ -103,8 +119,19 @@ def deployment(name: str) -> dict | None:
         check=False,
     )
     if result.returncode != 0:
-        return None
-    return json.loads(result.stdout)
+        return None, (result.stderr or "").strip() or (
+            f"kubectl exited {result.returncode}"
+        )
+    text = (result.stdout or "").strip()
+    if not text:
+        return {}, ""
+    document = json.loads(text)
+    items = document.get("items") if document.get("kind") == "List" else [document]
+    return {
+        str(item["metadata"]["name"]): item
+        for item in items or []
+        if isinstance(item, dict) and (item.get("metadata") or {}).get("name")
+    }, ""
 
 
 def container(item: dict, name: str) -> dict:
@@ -113,6 +140,46 @@ def container(item: dict, name: str) -> dict:
         if candidate["name"] == name:
             return candidate
     raise SystemExit(f"{item['metadata']['name']} has no {name} container")
+
+
+def load_config_maps(names: Iterable[str]) -> None:
+    """Read every not-yet-cached name in one kubectl call.
+
+    NotFound is cached as ``None`` (see ``config_map_data``); any other kubectl
+    failure is fatal for the whole batch, because kubelet tolerates a
+    ConfigMap that does not exist, not one it could not read.
+    """
+
+    wanted = [name for name in dict.fromkeys(names) if name not in _CONFIG_MAP_CACHE]
+    if not wanted:
+        return
+    found, error = kubectl_get("configmap", wanted)
+    if found is None:
+        raise SystemExit(f"ConfigMap {', '.join(wanted)} could not be read: {error}")
+    for name in wanted:
+        item = found.get(name)
+        _CONFIG_MAP_CACHE[name] = None if item is None else (item.get("data") or {})
+
+
+def referenced_config_maps(items: Iterable[dict[str, Any]]) -> list[str]:
+    """Every ConfigMap the Deployments' containers draw environment from."""
+
+    names: dict[str, None] = {}
+    for item in items:
+        pod_spec = item.get("spec", {}).get("template", {}).get("spec", {})
+        for member in [
+            *pod_spec.get("initContainers", []),
+            *pod_spec.get("containers", []),
+        ]:
+            for source in member.get("envFrom") or []:
+                reference = source.get("configMapRef") or {}
+                if reference.get("name"):
+                    names[reference["name"]] = None
+            for entry in member.get("env") or []:
+                reference = (entry.get("valueFrom") or {}).get("configMapKeyRef") or {}
+                if reference.get("name"):
+                    names[reference["name"]] = None
+    return list(names)
 
 
 def config_map_data(name: str, *, optional: bool = False) -> dict[str, str] | None:
@@ -127,36 +194,12 @@ def config_map_data(name: str, *, optional: bool = False) -> dict[str, str] | No
     kubelet tolerates a ConfigMap that does not exist, not one it could
     not read, and reading "unreachable" as "absent" would silently unset
     variables the template meant to carry.
+
+    ``role_deployments`` warms the cache for every referenced ConfigMap in one
+    kubectl call; a name asked for outside that set costs one call of its own.
     """
 
-    if name not in _CONFIG_MAP_CACHE:
-        result = subprocess.run(
-            [
-                "kubectl",
-                "-n",
-                NAMESPACE,
-                "get",
-                "configmap",
-                name,
-                "-o",
-                "json",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            _CONFIG_MAP_CACHE[name] = json.loads(result.stdout).get("data") or {}
-        elif "NotFound" in (result.stderr or ""):
-            _CONFIG_MAP_CACHE[name] = None
-        else:
-            raise SystemExit(
-                f"ConfigMap {name} could not be read: "
-                + (
-                    (result.stderr or "").strip()
-                    or f"kubectl exited {result.returncode}"
-                )
-            )
+    load_config_maps([name])
     data = _CONFIG_MAP_CACHE[name]
     if data is None and not optional:
         raise SystemExit(f"ConfigMap {name} is missing")
@@ -333,14 +376,20 @@ def report(problems: list[str]) -> int:
 def role_deployments() -> tuple[dict[str, dict[str, Any]], list[str]]:
     """The three role Deployments by name, and a problem for each missing one."""
 
+    live, _error = kubectl_get("deployment", ROLE_DEPLOYMENTS)
     found: dict[str, dict[str, Any]] = {}
     problems: list[str] = []
     for name in ROLE_DEPLOYMENTS:
-        item = deployment(name)
+        # A failed read reports every role missing, as the per-name reads did.
+        item = (live or {}).get(name)
         if item is None:
             problems.append(f"{name} is missing{MISSING_ROLE_CONSEQUENCE[name]}")
         else:
             found[name] = item
+    if not problems:
+        # Warm the ConfigMap cache with one call for every reference the three
+        # Deployments carry, so env resolution below never pays per name.
+        load_config_maps(referenced_config_maps(found.values()))
     return found, problems
 
 

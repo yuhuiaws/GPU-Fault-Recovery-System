@@ -581,6 +581,36 @@ def test_generated_role_split_manifests_are_current(tmp_path: Path) -> None:
     ).read_text()
 
 
+def _kubectl_stub(tmp_path: Path, *items: dict) -> Path:
+    """A ``kubectl`` answering ``get deployment <name>... --ignore-not-found -o json``.
+
+    The verifier asks for the three role Deployments in one call, so the stub
+    answers with a ``List`` of the objects it was given for the names asked;
+    a name without an object is simply absent, as kubectl does under
+    ``--ignore-not-found``. No object here references a ConfigMap, so the
+    verifier's batched ConfigMap read never happens.
+    """
+
+    documents = {item["metadata"]["name"]: item for item in items}
+    stub = tmp_path / "kubectl"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"DOCUMENTS = json.loads({json.dumps(json.dumps(documents))})\n"
+        "args = sys.argv[1:]\n"
+        "names = []\n"
+        "for word in args[args.index('get') + 2 :]:\n"
+        "    if word.startswith('-'):\n"
+        "        break\n"
+        "    names.append(word)\n"
+        "found = [DOCUMENTS[name] for name in names if name in DOCUMENTS]\n"
+        "print(json.dumps({'kind': 'List', 'apiVersion': 'v1', 'items': found}))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
 def test_role_split_verifier_rejects_a_missing_worker_tier(tmp_path) -> None:
     """The self-check has to fail on the split that looks healthy.
 
@@ -589,41 +619,31 @@ def test_role_split_verifier_rejects_a_missing_worker_tier(tmp_path) -> None:
     only thing in the deploy that notices.
     """
 
-    stub = tmp_path / "kubectl"
-    stub.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        "*gpu-fault-control-worker*) exit 1 ;;\n"
-        "esac\n"
-        "cat <<'JSON'\n"
-        + json.dumps(
-            {
-                "metadata": {"name": "gpu-fault-api-ha"},
-                "spec": {
-                    "replicas": 3,
-                    "template": {
-                        "spec": {
-                            "containers": [
-                                {
-                                    "name": "api",
-                                    "args": ["--port 8080 --workers 4"],
-                                    "env": [
-                                        {
-                                            "name": "GPU_FAULT_SERVICE_ROLE",
-                                            "value": "ingress",
-                                        }
-                                    ],
-                                }
-                            ]
-                        }
-                    },
+    _kubectl_stub(
+        tmp_path,
+        {
+            "metadata": {"name": "gpu-fault-api-ha"},
+            "spec": {
+                "replicas": 3,
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "api",
+                                "args": ["--port 8080 --workers 4"],
+                                "env": [
+                                    {
+                                        "name": "GPU_FAULT_SERVICE_ROLE",
+                                        "value": "ingress",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
                 },
-            }
-        )
-        + "\nJSON\n",
-        encoding="utf-8",
+            },
+        },
     )
-    stub.chmod(0o755)
     result = subprocess.run(
         [
             sys.executable,
@@ -718,23 +738,7 @@ def test_role_split_verifier_rejects_pool_env_on_ingress(tmp_path) -> None:
     }
     for item in (ingress, worker, spool):
         _mount_aurora_credentials(item)
-    stub = tmp_path / "kubectl"
-    stub.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        "*gpu-fault-telemetry-spool-worker*)\n"
-        "cat <<'SPOOL'\n" + json.dumps(spool) + "\nSPOOL\n"
-        ";;\n"
-        "*gpu-fault-control-worker*)\n"
-        "cat <<'WORKER'\n" + json.dumps(worker) + "\nWORKER\n"
-        ";;\n"
-        "*)\n"
-        "cat <<'INGRESS'\n" + json.dumps(ingress) + "\nINGRESS\n"
-        ";;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    stub.chmod(0o755)
+    _kubectl_stub(tmp_path, ingress, worker, spool)
     result = subprocess.run(
         [
             sys.executable,
@@ -903,24 +907,7 @@ def _verifier_stub(tmp_path, *, ingress_workers: int, worker_workers: int) -> Pa
         _mount_aurora_secret(item)
     for item in (ingress, worker, spool):
         _mount_aurora_credentials(item)
-    stub = tmp_path / "kubectl"
-    stub.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        "*gpu-fault-telemetry-spool-worker*)\n"
-        "cat <<'SPOOL'\n" + json.dumps(spool) + "\nSPOOL\n"
-        ";;\n"
-        "*gpu-fault-control-worker*)\n"
-        "cat <<'WORKER'\n" + json.dumps(worker) + "\nWORKER\n"
-        ";;\n"
-        "*)\n"
-        "cat <<'INGRESS'\n" + json.dumps(ingress) + "\nINGRESS\n"
-        ";;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    stub.chmod(0o755)
-    return stub
+    return _kubectl_stub(tmp_path, ingress, worker, spool)
 
 
 def _run_verifier(tmp_path) -> subprocess.CompletedProcess:

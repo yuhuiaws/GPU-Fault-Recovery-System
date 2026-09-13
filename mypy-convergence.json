@@ -15,7 +15,7 @@
     "why": "route handlers and ingest: no-any-return on request bodies is the boundary that swallows bad payloads"
   },
   "deploy": {
-    "ceiling": 46,
+    "ceiling": 44,
     "priority": 5,
     "why": "release orchestrator and rollback path: only typed since the mypy target was widened"
   },
