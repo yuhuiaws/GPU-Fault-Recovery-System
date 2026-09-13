@@ -17,8 +17,9 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import (
     AdminConfig,
-    AdminConfigError,
-    default_admin_config,
+)
+from gpu_fault_release.regional_release_admin_capture import (
+    captured_admin_config,
 )
 from gpu_fault.release_state_snapshot import (
     ReleaseStateSnapshotError,
@@ -574,217 +575,6 @@ def cpu_role_config_maps(
     return snapshots
 
 
-def _captured_node_counts(worker_core: dict[str, str]) -> dict[str, int]:
-    """Node counts exactly as the live worker ConfigMap declares them.
-
-    Absent keys stay absent: this config is what a rollback restores, and a
-    default filled in here would be invented capacity, not captured state
-    (the Aurora 0.5/8 fabrication had exactly that shape). The parser then
-    reads the legacy topology from the captured depth.
-    """
-
-    captured: dict[str, int] = {}
-    for name, key in (
-        ("GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT", "largest_cluster_node_count"),
-        ("GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT", "managed_node_count"),
-    ):
-        if name in worker_core:
-            captured[key] = int(worker_core[name])
-    return captured
-
-
-def captured_admin_config(
-    release: Any,
-    snapshots: dict[str, dict[str, str]],
-) -> AdminConfig:
-    try:
-        defaults = default_admin_config()
-        capacity_defaults = defaults.capacity
-        worker = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
-                "gpu-fault-control-worker",
-            )
-        )
-        spool = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
-                "gpu-fault-telemetry-spool-worker",
-            )
-        )
-        ingress_telemetry = snapshots.get(
-            "gpu-fault-api-ha-config-telemetry",
-            {},
-        )
-        worker_core = snapshots.get("gpu-fault-control-worker-config-core", {})
-        ingress_processor = snapshots.get(
-            "gpu-fault-api-ha-config-processor",
-            {},
-        )
-        ingress_recovery = snapshots.get(
-            "gpu-fault-api-ha-config-recovery",
-            {},
-        )
-        ingress_notification = snapshots.get(
-            "gpu-fault-api-ha-config-notification",
-            {},
-        )
-        spool_enabled = ingress_telemetry.get(
-            "GPU_FAULT_TELEMETRY_SPOOL",
-            str(capacity_defaults.telemetry_spool.enabled).lower(),
-        )
-        if spool_enabled not in {"true", "false"}:
-            raise AdminConfigError("live ingress telemetry spool value is invalid")
-        worker_replicas = (worker.get("spec") or {}).get("replicas")
-        spool_replicas = (spool.get("spec") or {}).get("replicas")
-        remediation = capacity_defaults.remediation
-        processor = defaults.processor
-        workflow = defaults.workflow
-        notification = defaults.notification_delivery
-        evidence = defaults.evidence
-        return AdminConfig.from_mapping(
-            {
-                "schema_version": 1,
-                "capacity": {
-                    "control_worker_replicas": int(
-                        capacity_defaults.control_worker_replicas
-                        if worker_replicas is None
-                        else worker_replicas
-                    ),
-                    "telemetry_spool": {
-                        "enabled": spool_enabled == "true",
-                        "replicas": int(
-                            capacity_defaults.telemetry_spool.replicas
-                            if spool_replicas is None
-                            else spool_replicas
-                        ),
-                    },
-                    "remediation": {
-                        "max_active_region": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
-                                remediation.max_active_region,
-                            )
-                        ),
-                        "max_active_per_cluster": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
-                                remediation.max_active_per_cluster,
-                            )
-                        ),
-                        "max_active_per_node": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
-                                remediation.max_active_per_node,
-                            )
-                        ),
-                        "max_active_per_failure_domain": int(
-                            worker_core.get(
-                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
-                                remediation.max_active_per_failure_domain,
-                            )
-                        ),
-                        "max_active_per_resource_class": int(
-                            worker_core.get(
-                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
-                                remediation.max_active_per_resource_class,
-                            )
-                        ),
-                    },
-                    **_captured_node_counts(worker_core),
-                },
-                "processor": {
-                    "max_queue_depth": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
-                            processor.max_queue_depth,
-                        )
-                    ),
-                    "max_cluster_queue_depth": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
-                            processor.max_cluster_queue_depth,
-                        )
-                    ),
-                    "retry_after_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
-                            processor.retry_after_seconds,
-                        )
-                    ),
-                    "retry_backoff_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
-                            processor.retry_backoff_seconds,
-                        )
-                    ),
-                    "retry_backoff_max_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
-                            processor.retry_backoff_max_seconds,
-                        )
-                    ),
-                    "completed_retention_seconds": int(
-                        ingress_processor.get(
-                            ("GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS"),
-                            processor.completed_retention_seconds,
-                        )
-                    ),
-                },
-                "workflow": {
-                    "poll_interval_seconds": float(
-                        ingress_recovery.get(
-                            "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
-                            workflow.poll_interval_seconds,
-                        )
-                    ),
-                    "dispatcher_workers": int(
-                        ingress_recovery.get(
-                            "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
-                            workflow.dispatcher_workers,
-                        )
-                    ),
-                },
-                "notification_delivery": {
-                    "batch_size": int(
-                        ingress_notification.get(
-                            "GPU_FAULT_NOTIFICATION_BATCH_SIZE",
-                            notification.batch_size,
-                        )
-                    ),
-                    "max_attempts": int(
-                        ingress_notification.get(
-                            "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS",
-                            notification.max_attempts,
-                        )
-                    ),
-                },
-                "evidence": {
-                    "retention_hours": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_EVIDENCE_RETENTION_HOURS",
-                            evidence.retention_hours,
-                        )
-                    ),
-                    "max_records_per_node": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE",
-                            evidence.max_records_per_node,
-                        )
-                    ),
-                },
-            }
-        )
-    except (AdminConfigError, KeyError, TypeError, ValueError) as exc:
-        raise ReleaseError("cannot capture a valid live administrator config") from exc
-
-
 def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
     raw = exec_cpu_ingress_probe(
         release,
@@ -1087,7 +877,9 @@ def _capture_previous(
         cpu_role_container_env(release, role_deployments) if capture_cpu else {}
     )
     admin_config = (
-        captured_admin_config(release, role_config_maps)
+        captured_admin_config(
+            release, role_config_maps, recorded=live_state.get("admin_config")
+        )
         if capture_cpu
         else AdminConfig.from_mapping(live_state.get("admin_config") or {})
     )

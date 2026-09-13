@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.admin.config import AuroraCapacityConfig, default_admin_config
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MODULE
 from gpu_fault_release import regional_release_registry as REGISTRY_MODULE
 from gpu_fault_release import regional_release_state as STATE_MODULE
@@ -204,7 +206,9 @@ def test_registry_update_retries_resource_version_conflict_without_lost_update(
     runner = Runner()
 
     class Release:
-        config = SimpleNamespace(namespace="gpu-fault-system")
+        config = SimpleNamespace(
+            namespace="gpu-fault-system", admin_config=default_admin_config()
+        )
 
         @staticmethod
         def _cpu(*arguments):
@@ -379,7 +383,9 @@ def test_unchanged_registry_does_not_force_a_cpu_restart() -> None:
 
 def test_cpu_role_config_snapshot_rejects_sensitive_keys() -> None:
     class SnapshotRelease:
-        config = SimpleNamespace(namespace="gpu-fault-system")
+        config = SimpleNamespace(
+            namespace="gpu-fault-system", admin_config=default_admin_config()
+        )
 
         @staticmethod
         def _cpu(*args):
@@ -421,7 +427,9 @@ def test_cpu_role_config_snapshot_rejects_sensitive_keys() -> None:
 
 def test_previous_state_captures_the_live_administrator_config() -> None:
     class SnapshotRelease:
-        config = SimpleNamespace(namespace="gpu-fault-system")
+        config = SimpleNamespace(
+            namespace="gpu-fault-system", admin_config=default_admin_config()
+        )
 
         @staticmethod
         def _cpu(*args):
@@ -460,7 +468,9 @@ def test_previous_state_captures_node_counts_only_from_the_live_environment() ->
     # the live ConfigMaps must not be invented from the release defaults (the
     # Aurora 0.5/8 fabrication had exactly that shape).
     class SnapshotRelease:
-        config = SimpleNamespace(namespace="gpu-fault-system")
+        config = SimpleNamespace(
+            namespace="gpu-fault-system", admin_config=default_admin_config()
+        )
 
         @staticmethod
         def _cpu(*args):
@@ -502,3 +512,66 @@ def test_previous_state_captures_node_counts_only_from_the_live_environment() ->
     assert legacy.processor.max_cluster_queue_depth == 1024
     assert legacy.capacity.largest_cluster_node_count == 256
     assert legacy.capacity.managed_node_count == 256
+
+
+def _aurora_snapshot_release(admin_config=None):
+    class SnapshotRelease:
+        config = SimpleNamespace(
+            namespace="gpu-fault-system", admin_config=admin_config
+        )
+
+        @staticmethod
+        def _cpu(*args):
+            return ["kubectl", *args]
+
+        @staticmethod
+        def _get_json(arguments):
+            name = arguments[arguments.index("deployment") + 1]
+            return {
+                "spec": {
+                    "replicas": (0 if name == "gpu-fault-telemetry-spool-worker" else 6)
+                }
+            }
+
+    return SnapshotRelease()
+
+
+def test_previous_state_takes_aurora_from_the_recorded_release_state() -> None:
+    """No ConfigMap carries the Aurora window; the parser default is not it.
+
+    Live 2026-09-13: the capture fed a mapping without ``aurora`` to
+    ``AdminConfig.from_mapping``, which filled the 0.5/8 legacy default; the
+    rollback restored it over 82/128 and the next deploy scaled the production
+    database down to it. The window the live release state recorded wins.
+    """
+
+    recorded = {"aurora": {"min_acu": 82.0, "max_acu": 128.0}}
+    candidate = replace(
+        default_admin_config(),
+        aurora=AuroraCapacityConfig(min_acu=124.0, max_acu=128.0),
+    )
+
+    config = STATE_MODULE.captured_admin_config(
+        _aurora_snapshot_release(candidate), {}, recorded=recorded
+    )
+
+    assert (config.aurora.min_acu, config.aurora.max_acu) == (82.0, 128.0)
+
+
+def test_previous_state_falls_back_to_the_candidate_aurora_window() -> None:
+    """Without a recorded window the candidate's desired one is what the cluster runs."""
+
+    candidate = replace(
+        default_admin_config(), aurora=AuroraCapacityConfig(min_acu=82.0, max_acu=128.0)
+    )
+
+    config = STATE_MODULE.captured_admin_config(
+        _aurora_snapshot_release(candidate), {}, recorded={"capacity": {}}
+    )
+
+    assert (config.aurora.min_acu, config.aurora.max_acu) == (82.0, 128.0)
+
+
+def test_previous_state_refuses_to_invent_an_aurora_window() -> None:
+    with pytest.raises(STATE_MODULE.ReleaseError, match="valid live administrator"):
+        STATE_MODULE.captured_admin_config(_aurora_snapshot_release(None), {})

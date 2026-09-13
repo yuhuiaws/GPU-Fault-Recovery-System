@@ -406,27 +406,40 @@ def test_rollback_keeps_capacity_the_snapshot_never_recorded(tmp_path: Path) -> 
     )
 
 
-def test_rollback_still_restores_capacity_the_snapshot_does_record(
+def test_rollback_never_moves_aurora_but_still_restores_recorded_capacity(
     tmp_path: Path,
 ) -> None:
-    """Keeping unrecorded fields must not turn the rollback into a no-op."""
+    """A recorded ``aurora`` is not a rollback target; the recorded capacity is.
+
+    A release never changes Aurora capacity: the ``config`` command settles the
+    window before its release starts and restores its own ``before`` when that
+    release fails. Live 2026-09-13 a snapshot carried a parser-default 0.5/8
+    (the previous-state capture had no source for the block), the rollback
+    restored it over the desired 82/128, and the next deploy scaled the
+    production database down. Keeping the desired window must not turn the
+    rollback into a no-op for the fields the snapshot really recorded.
+    """
 
     site, _manifest, live_state, admin_config = _fixture(tmp_path)
-    persist_desired_admin_config(
-        tmp_path,
-        config=replace(
-            admin_config, aurora=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
-        ),
-        source="approved:test",
+    desired = replace(
+        admin_config, aurora=AuroraCapacityConfig(min_acu=8.0, max_acu=32.0)
     )
+    persist_desired_admin_config(tmp_path, config=desired, source="approved:test")
     recorded = replace(
-        admin_config, aurora=AuroraCapacityConfig(min_acu=16.0, max_acu=64.0)
+        admin_config,
+        aurora=AuroraCapacityConfig(min_acu=0.5, max_acu=8.0),
+        capacity=replace(admin_config.capacity, control_worker_replicas=4),
     )
     live_state["previous"]["admin_config"] = recorded.as_dict()
 
     _document, restored, _root = rollback_management_document(site, live_state)
 
-    assert restored.aurora == recorded.aurora
+    assert restored.aurora == desired.aurora, (
+        "a rollback restored an Aurora window a release never moved"
+    )
+    assert restored.capacity.control_worker_replicas == 4, (
+        "the rollback stopped restoring the capacity the snapshot does record"
+    )
 
 
 @pytest.mark.parametrize(

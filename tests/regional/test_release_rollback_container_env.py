@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
@@ -207,6 +208,8 @@ def test_capture_previous_records_the_container_env_beside_the_config_maps() -> 
         "runtime_image": PREVIOUS_RUNTIME,
         "node_installer_image": "registry.example/installer@sha256:" + "f" * 64,
         "adot_image": "registry.example/adot@sha256:" + "a" * 64,
+        # The Aurora window comes from the recorded state, never a parser default.
+        "admin_config": default_admin_config().as_dict(),
     }
     release = _reader(
         documents,

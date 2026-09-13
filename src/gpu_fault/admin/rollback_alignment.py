@@ -302,7 +302,14 @@ def _restored_admin_config(state_dir: Path, snapshot: object) -> AdminConfig:
     rollback can only move the fields it actually recorded.
     """
 
-    recorded = snapshot if isinstance(snapshot, Mapping) else {}
+    recorded = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+    # A release never moves Aurora capacity, so a rollback has nothing to restore
+    # there: the ``config`` command settles the window before its release starts
+    # and restores its own ``before`` when that release fails. A snapshot's
+    # ``aurora`` is at best a copy of what the site desired at the time and at
+    # worst a parser default (live 2026-09-13: 0.5/8 restored over 82/128, and
+    # the next deploy scaled the production database down to it).
+    recorded.pop("aurora", None)
     current = load_desired_admin_config(state_dir).as_dict()
     return AdminConfig.from_mapping(_overlay(current, recorded))
 
