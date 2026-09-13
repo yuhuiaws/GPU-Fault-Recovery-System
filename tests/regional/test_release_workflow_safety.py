@@ -26,8 +26,10 @@ class Runner:
 
     def probe_output(self, args, **_kwargs):
         assert "deployment" in args
+        if self.installed == "scaled-to-zero":
+            return 0, "0", ""
         if self.installed:
-            return 0, "deployment.apps/gpu-fault-api-ha", ""
+            return 0, "3", ""
         return (
             1,
             "",
@@ -308,4 +310,18 @@ def test_workflow_safety_still_fails_when_the_deployment_is_unreadable() -> None
 
     with pytest.raises(SAFETY.ReleaseError, match="CPU ingress Deployment"):
         SAFETY.workflow_safety_snapshot(target)
+    assert target.runner.runs == []
+
+
+def test_workflow_safety_passes_over_a_control_plane_a_cleanup_scaled_to_zero() -> None:
+    """Live 2026-09-13: a failed bootstrap's cleanup leaves the Deployments in
+    place at zero replicas; the retry's preflight must not ask a Pod that cannot
+    exist. Scaled to zero is "nothing running", like not installed."""
+
+    target = release("unused", installed="scaled-to-zero")
+
+    snapshot = SAFETY.workflow_safety_snapshot(target)
+
+    assert snapshot["blocker_count"] == 0
+    assert snapshot["control_plane"] == "not installed"
     assert target.runner.runs == []

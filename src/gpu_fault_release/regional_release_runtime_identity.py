@@ -85,17 +85,20 @@ def cpu_ingress_pod_if_running(release: Any) -> str:
 
 
 def cpu_ingress_deployment_installed(release: Any) -> bool:
-    """Whether the CPU ingress Deployment exists at all.
+    """Whether the CPU ingress Deployment exists and is meant to run.
 
     A first bootstrap runs its preflight before the control plane is
     installed: the namespace holds only the bootstrap's Secrets and Jobs, so
-    "no Running ingress Pod" means "nothing installed", not "outage". Callers
-    that need a Pod to answer a question use this to tell the two apart: with
-    the Deployment absent the answer is decided by the absence; with it present
-    but no Running Pod the resolvers above still raise.
+    "no Running ingress Pod" means "nothing installed", not "outage". A failed
+    bootstrap's cleanup leaves the same picture with the Deployments present
+    but scaled to zero (live 2026-09-13: the retry's preflight then asked a
+    Pod that could not exist). Callers that need a Pod to answer a question
+    use this to tell the two apart: absent or scaled to zero, the answer is
+    decided by the absence; present with replicas but no Running Pod, the
+    resolvers above still raise.
     """
 
-    returncode, _stdout, stderr = release.runner.probe_output(
+    returncode, stdout, stderr = release.runner.probe_output(
         release._cpu(
             "-n",
             release.config.namespace,
@@ -103,11 +106,11 @@ def cpu_ingress_deployment_installed(release: Any) -> bool:
             "deployment",
             inventory.CPU_INGRESS_DEPLOYMENT,
             "-o",
-            "name",
+            "jsonpath={.spec.replicas}",
         )
     )
     if returncode == 0:
-        return True
+        return str(stdout).strip() not in {"", "0"}
     if "NotFound" in str(stderr):
         return False
     raise ReleaseError(
