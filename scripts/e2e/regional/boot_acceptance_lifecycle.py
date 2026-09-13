@@ -629,10 +629,17 @@ def runtime_identity_matches_release(
     node_wheel = component("node_runtime", "wheel_sha256")
     node_digest = component("node_runtime", "module_digest")
 
+    # ``status --full`` wraps the health report: its checks live under
+    # ``health.checks`` beside ``live_release`` and ``release_metadata``; the
+    # bare health report keeps them at the top level.
+    health = report.get("health")
+    checks = report.get("checks") or (
+        health.get("checks") if isinstance(health, dict) else None
+    )
     check = next(
         (
             item
-            for item in report.get("checks") or []
+            for item in checks or []
             if isinstance(item, dict) and item.get("name") == RUNTIME_IDENTITY_CHECK
         ),
         None,
@@ -700,12 +707,10 @@ def runtime_identity_matches_release(
 
 
 def _live_release_identity(state_dir: Path) -> dict[str, Any]:
-    """The manifest, release metadata and ACTIVE Agents of the isolated site."""
+    """The release metadata and ACTIVE Agents of the site (the manifest is the build's)."""
 
     site_file = state_dir / "site.yaml"
     site = load_site(site_file, repository_root=ROOT)
-    manifest_path = Path(str(site.release_config["release"]["manifest"]))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     clusters = [str(item["cluster_id"]) for item in site.release_config["clusters"]]
     if not clusters:
         raise BootAcceptanceError("BOOT-018 site contains no GPU clusters")
@@ -722,7 +727,6 @@ def _live_release_identity(state_dir: Path) -> dict[str, Any]:
     )
     agents = fixture.regional.cpu_python(ACTIVE_AGENT_PROBE)
     return {
-        "manifest": manifest,
         "metadata": dict(configmap.get("data") or {}),
         "agents": list(agents.get("agents") or []),
         "identity": dict(fixture.regional.evidence_identity()),
@@ -800,9 +804,13 @@ def boot018_body(state_dir: Path, case_dir: Path) -> dict[str, Any]:
     )
     write_log(case_dir / "live-status-full.log", status)
     live = _live_release_identity(state_dir)
+    # The expected identity is what THIS source produced a moment ago -- the
+    # reproducible build's manifest -- not whatever dist/current-release.json
+    # the checkout happens to hold (a candidate build written there by another
+    # procedure made the comparison meaningless, live 2026-09-13).
     identity = runtime_identity_matches_release(
         parse_status_report(status.stdout),
-        manifest=live["manifest"],
+        manifest=right,
         metadata=live["metadata"],
         agents=live["agents"],
     )

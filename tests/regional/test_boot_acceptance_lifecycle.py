@@ -452,3 +452,20 @@ def test_boot018_builds_the_two_umask_checkouts_concurrently(
 
     assert sorted(started) == ["002", "077"]
     assert not barrier.broken, "both builds reached the barrier before it timed out"
+
+
+def test_runtime_identity_reads_the_checks_status_full_nests_under_health() -> None:
+    """`status --full` wraps the health report; its checks sit under health.checks.
+
+    Live 2026-09-13: BOOT-018 read the wrapped report at the top level, found no
+    runtime_component_identity check and failed a site whose report carried it
+    as PASS.
+    """
+
+    wrapped = {"live_release": {"release_id": "x"}, "health": _report(CPU, EXEC)}
+
+    result = lifecycle.runtime_identity_matches_release(
+        wrapped, manifest=MANIFEST, metadata=METADATA, agents=AGENTS
+    )
+
+    assert result["passed"] is True, result["reasons"]
