@@ -327,8 +327,21 @@ def test_boot015_writes_details_and_cleans_up_when_a_probe_raises(
 
 
 def test_boot015_metric_gap_is_short_and_windows_are_named() -> None:
-    assert runtime.METRIC_SAMPLE_GAP_SECONDS == 5
-    assert runtime.AMP_FIRING_WINDOW_SECONDS == 300
+    """The gap outlives the worker's metric scan cache; the windows stay named.
+
+    The remote-command gauges come from a scan cache shared for 60 s per
+    process, so two scrapes 5 s apart could read one snapshot (live 2026-09-13:
+    first scrape 0 pending, second 1 pending 622 s old). The samples are polled
+    against a bounded deadline instead of taken blind.
+    """
+
+    assert runtime.METRIC_SAMPLE_GAP_SECONDS > runtime.METRIC_SCAN_TTL_SECONDS, (
+        "the second sample must land after the scan cache expired"
+    )
+    assert (
+        runtime.METRIC_SAMPLE_DEADLINE_SECONDS >= 2 * runtime.METRIC_SCAN_TTL_SECONDS
+    ), "polling must outlive at least two cache lifetimes"
+    assert runtime.AMP_FIRING_WINDOW_SECONDS == 300, "the alert window is unchanged"
     source = Path(runtime.__file__).read_text(encoding="utf-8")
     assert "time.sleep(30)" not in source
     assert '"pending_counted": second["pending"] >= 1' in source

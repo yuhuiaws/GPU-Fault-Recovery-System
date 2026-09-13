@@ -1103,9 +1103,37 @@ else:
 
 AMP_FIRING_WINDOW_SECONDS = 300
 AMP_RESOLVE_WINDOW_SECONDS = 180
-# Two samples of an age metric are monotonic whatever the gap; 5 s is enough
-# to see it move and does not stretch the alert window.
-METRIC_SAMPLE_GAP_SECONDS = 5
+# The remote-command gauges are served from the control-worker's metric scan
+# cache: one store scan shared for GPU_FAULT_METRICS_SCAN_TTL_SECONDS (60 s by
+# default) per uvicorn process. A scrape right after the injection can still
+# answer from a snapshot taken before it, and two scrapes inside one TTL (or on
+# two processes) can answer from the same snapshot. The first sample therefore
+# waits until a scrape shows the injected command, and the second waits until a
+# scrape shows the age advanced -- both bounded, both recorded.
+METRIC_SCAN_TTL_SECONDS = 60
+METRIC_SAMPLE_GAP_SECONDS = METRIC_SCAN_TTL_SECONDS + 5
+METRIC_SAMPLE_DEADLINE_SECONDS = 4 * METRIC_SCAN_TTL_SECONDS
+METRIC_SAMPLE_POLL_SECONDS = 5
+
+
+def sample_remote_command_metrics(
+    fixture: SiteFixture,
+    accept: Callable[[dict[str, Any]], bool],
+    *,
+    deadline_seconds: int = METRIC_SAMPLE_DEADLINE_SECONDS,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Scrape the worker until ``accept`` holds; return that sample and all seen."""
+
+    seen: list[dict[str, Any]] = []
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        sample = fixture.regional.pod_python(
+            "cpu", "gpu-fault-control-worker", METRIC_PROBE, fixture.cluster_id
+        )
+        seen.append(sample)
+        if accept(sample) or time.monotonic() >= deadline:
+            return sample, seen
+        time.sleep(METRIC_SAMPLE_POLL_SECONDS)
 
 
 def _cleanup_step(
@@ -1264,13 +1292,20 @@ def run_boot015(
                     ),
                 }
             )
-        first = fixture.regional.pod_python(
-            "cpu", "gpu-fault-control-worker", METRIC_PROBE, fixture.cluster_id
+        first, first_seen = sample_remote_command_metrics(
+            fixture,
+            lambda sample: sample["pending"] >= 1
+            and sample["oldest_unclaimed_seconds"] is not None,
         )
         time.sleep(METRIC_SAMPLE_GAP_SECONDS)
-        second = fixture.regional.pod_python(
-            "cpu", "gpu-fault-control-worker", METRIC_PROBE, fixture.cluster_id
+        first_age = first["oldest_unclaimed_seconds"]
+        second, second_seen = sample_remote_command_metrics(
+            fixture,
+            lambda sample: first_age is not None
+            and sample["oldest_unclaimed_seconds"] is not None
+            and sample["oldest_unclaimed_seconds"] > first_age,
         )
+        metric_samples = [*first_seen, *second_seen]
         logs = [
             fixture.regional.kubectl(
                 "gpu",
@@ -1326,7 +1361,7 @@ def run_boot015(
                 "owner_sets": owner_sets,
                 "profile": profile,
                 "readiness": readiness,
-                "metric_samples": [first, second],
+                "metric_samples": metric_samples,
                 "pre_delete_state": state,
                 "amp_firing": firing,
             }
