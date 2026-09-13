@@ -28,6 +28,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from typing import Any
 
 base_url = os.environ["CONTROL_PLANE_URL"].rstrip("/")
 expected_hostname = os.environ["EXPECTED_HOSTNAME"]
@@ -42,26 +44,51 @@ if parsed.scheme != "https" or parsed.hostname != expected_hostname:
 dns_deadline = time.monotonic() + float(
     os.environ.get("DNS_RESOLVE_WAIT_SECONDS", "180")
 )
-while True:
-    try:
-        addresses = sorted(
-            {
-                item[4][0]
-                for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)
-            }
-        )
-        break
-    except socket.gaierror:
-        if time.monotonic() >= dns_deadline:
-            raise
-        time.sleep(5)
+
+
+def _name_error(error: BaseException) -> bool:
+    # ``urlopen`` wraps the resolver failure in URLError(reason=gaierror).
+    if isinstance(error, socket.gaierror):
+        return True
+    reason = getattr(error, "reason", None)
+    return isinstance(reason, socket.gaierror)
+
+
+def until_resolved(operation: Callable[[], Any]) -> Any:
+    """Run ``operation`` until it stops failing on name resolution.
+
+    The name resolves through whichever CoreDNS replica answers, and right after
+    the zone association one replica can still serve the cached NXDOMAIN while
+    another already resolves (live 2026-09-13: the resolve loop passed and the
+    very next request failed "Name or service not known"). Every request in this
+    probe therefore retries on a resolver failure, not only the first lookup.
+    """
+
+    while True:
+        try:
+            return operation()
+        except (socket.gaierror, urllib.error.URLError) as error:
+            if not _name_error(error) or time.monotonic() >= dns_deadline:
+                raise
+            time.sleep(5)
+
+
+addresses = until_resolved(
+    lambda: sorted(
+        {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
+    )
+)
 if not addresses:
     raise RuntimeError("control-plane DNS returned no addresses")
 context = ssl.create_default_context(cafile="/tls/ca.crt")
-with urllib.request.urlopen(
-    base_url + "/healthz", context=context, timeout=15
-) as response:
-    status = response.status
+
+
+def _status(target: Any) -> int:
+    with urllib.request.urlopen(target, context=context, timeout=15) as response:
+        return int(response.status)
+
+
+status = until_resolved(lambda: _status(base_url + "/healthz"))
 if status != 200:
     raise RuntimeError(f"healthz returned HTTP {status}")
 
@@ -82,8 +109,7 @@ probe = urllib.request.Request(
     },
 )
 try:
-    with urllib.request.urlopen(probe, context=context, timeout=15) as response:
-        authenticated = response.status
+    authenticated = until_resolved(lambda: _status(probe))
 except urllib.error.HTTPError as error:
     if error.code in (401, 403):
         raise RuntimeError(
