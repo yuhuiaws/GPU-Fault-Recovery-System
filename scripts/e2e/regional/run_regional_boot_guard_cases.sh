@@ -188,9 +188,18 @@ printf 'baseline=%s\n' "${baseline}" |
   tee "${CASE_DIR}/GF-REGIONAL-BOOT-001-010-baseline.txt"
 
 api_pod="$(latest_ready_api_pod)"
+# 必须清空 GPU_FAULT_STORE_URL_FILE 再跑这段初始化：CP-3 起 StoreCredentials
+# 会在每次连接时优先读挂载的 DSN 文件（api Pod 里指向线上 gpu_fault 库），
+# 覆盖我们显式传给 PostgresStore 的 guardprobe URL。若不清空，下面
+# initialize_schema=True 实际会去初始化**线上 gpu_fault**（幂等、无新表），
+# 而 gpu_fault_guardprobe 始终保持空 schema——探针 App（derive.sh 已把它
+# 隔离到 guardprobe）随后校验 schema 失败并崩溃，BOOT-002 的空注册表 []
+# 正向用例会因探针一直不 Ready、rollout 超过 progressDeadline 而假失败。
+# CREATE DATABASE 走 psycopg.connect(admin) 直连 URL、不经 StoreCredentials，
+# 清空该变量对它无影响。
 database_output="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    exec -i "${api_pod}" -- python - <<'PY'
+    exec -i "${api_pod}" -- env GPU_FAULT_STORE_URL_FILE= python - <<'PY'
 import os
 import urllib.parse
 
@@ -219,6 +228,20 @@ store = PostgresStore(
     hot_state_mode="legacy",
 )
 store.close()
+# 防御性核验：确认 schema 真的落在 guardprobe 库。initialize_schema 在已初始化
+# 的库上是幂等的，一旦 DSN 被挂载文件覆盖到线上库，这段会“成功”却不建任何表，
+# 探针随后才在启动时暴露出来。这里当场失败，把根因固定在初始化步骤。
+with psycopg.connect(probe, autocommit=True) as verify:
+    if (
+        verify.execute(
+            "SELECT to_regclass('gpu_fault_schema_version')"
+        ).fetchone()[0]
+        is None
+    ):
+        raise SystemExit(
+            "guardprobe schema init no-op: gpu_fault_schema_version 缺失，"
+            "疑似 GPU_FAULT_STORE_URL_FILE 把 DSN 指回了线上库"
+        )
 print("guardprobe schema initialized")
 PY
 )"
