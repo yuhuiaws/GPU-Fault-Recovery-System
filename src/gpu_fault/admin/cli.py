@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 
@@ -914,7 +914,8 @@ def _run_readonly_managed_command(
             None if arguments.command == "status" else arguments.repo_root
         ),
     )
-    context: AbstractContextManager[Path] = nullcontext(site_file)
+    stack = ExitStack()
+    effective_site_file = site_file
     if arguments.command == "status":
         try:
             live_state = _live_release_state(current_site)
@@ -927,12 +928,27 @@ def _run_readonly_managed_command(
                 and isinstance(rollback_result, dict)
                 and rollback_result.get("status") == "PASSED"
             ):
-                context = materialized_rollback_status_site(
-                    site_file,
-                    live_state,
-                    management_repository_root=arguments.repo_root,
-                )
-    with context as effective_site_file:
+                try:
+                    effective_site_file = stack.enter_context(
+                        materialized_rollback_status_site(
+                            site_file,
+                            live_state,
+                            management_repository_root=arguments.repo_root,
+                        )
+                    )
+                except SiteConfigError as exc:
+                    # The rolled-back baseline only sharpens this read-only
+                    # report and its manifest is not always on disk (a candidate
+                    # built out of tree matches no source-snapshot). A deploy
+                    # over a failed transaction reads this report to supersede,
+                    # so `status` falls back to the recorded site rather than
+                    # crashing; the `rollback` verb keeps the strict lookup.
+                    print(
+                        "gpu-fault-admin: reporting against the recorded site; "
+                        f"could not materialise the rolled-back baseline: {exc}",
+                        file=sys.stderr,
+                    )
+    with stack:
         site = load_site(effective_site_file)
         print(
             json.dumps(

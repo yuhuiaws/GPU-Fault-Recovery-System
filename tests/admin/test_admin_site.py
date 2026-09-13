@@ -502,6 +502,56 @@ def test_status_uses_previous_management_baseline_after_verified_rollback(
     assert used == [(path, "rolled-back")]
 
 
+def test_status_reports_when_previous_rollback_baseline_is_unlocatable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    # A rolled-back-to release built out of tree leaves the source-snapshots
+    # scan with nothing to match, so materialising the baseline raises. A deploy
+    # over a failed transaction reads this report to classify and supersede, so
+    # status must still print a report and exit cleanly against the recorded
+    # site rather than crashing (which the deploy's evidence step treats as
+    # fatal and which wedged the live recovery on 2026-09-13).
+    site = site_file(tmp_path)
+
+    monkeypatch.setattr(
+        admin_cli,
+        "_live_release_state",
+        lambda _site: {
+            "phase": "rolled-back",
+            "rollback_result": {"status": "PASSED"},
+            "previous": {"release_delivery_sha256": "a" * 64},
+        },
+    )
+
+    @contextmanager
+    def materialized(_site, _state, **_kwargs):
+        raise SiteConfigError(
+            "cannot locate the immutable previous release after rollback"
+        )
+        yield site  # pragma: no cover
+
+    monkeypatch.setattr(admin_cli, "materialized_rollback_status_site", materialized)
+    seen: list = []
+    monkeypatch.setattr(
+        admin_cli.subprocess,
+        "run",
+        lambda arguments, **_kwargs: (
+            seen.append(arguments) or subprocess.CompletedProcess(arguments, 0)
+        ),
+    )
+    arguments = argparse.Namespace(
+        command="status",
+        file=None,
+        state_dir=tmp_path,
+        repo_root=None,
+        show_effective_config=False,
+    )
+
+    assert admin_cli.run(arguments) == 0
+    assert seen, "status did not run the engine after the baseline fell back"
+    assert "could not materialise the rolled-back baseline" in capsys.readouterr().err
+
+
 def test_console_script_is_published() -> None:
     project = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
