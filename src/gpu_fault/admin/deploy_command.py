@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -376,6 +377,43 @@ def refuse_deploy_during_uninstall(state_dir: Path) -> None:
         )
 
 
+def retire_bootstrap_checkpoints_after_uninstall(state_dir: Path) -> None:
+    """A completed uninstall invalidates every bootstrap checkpoint of the site.
+
+    ``bootstrap-state.json`` trusts a completed task and never runs it again;
+    an uninstall deletes the very resources those tasks created (Aurora, IAM
+    roles, the AMP workspace, ECR repositories, the certificate). Live
+    2026-09-13: the deploy after an uninstall skipped every creation task and
+    its preflight failed on the cluster, roles and workspace that were gone.
+    The first deploy after a COMPLETED uninstall archives the checkpoints (the
+    file is kept beside them for the audit trail) and consumes the uninstall
+    record, so the bootstrap starts from a new site and a later deploy does not
+    archive the fresh checkpoints again.
+    """
+
+    record = state_dir / "uninstall" / "state.json"
+    if not record.is_file():
+        return
+    try:
+        phase = str(json.loads(record.read_text(encoding="utf-8")).get("phase") or "")
+    except (OSError, ValueError):
+        return
+    if phase != "COMPLETED":
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    checkpoints = state_dir / "bootstrap-state.json"
+    if checkpoints.is_file():
+        archived = state_dir / f"bootstrap-state.uninstalled-{stamp}.json"
+        checkpoints.replace(archived)
+        print(
+            f"gpu-fault-admin: the site was uninstalled; bootstrap checkpoints archived "
+            f"as {archived.name}, every resource will be created again",
+            file=sys.stderr,
+            flush=True,
+        )
+    record.replace(record.with_name(f"state.consumed-{stamp}.json"))
+
+
 def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     """Dispatch the one deploy command to its action."""
 
@@ -383,6 +421,7 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
         raise SiteConfigError("deploy requires --state-dir")
     state_dir = arguments.state_dir.expanduser().resolve()
     refuse_deploy_during_uninstall(state_dir)
+    retire_bootstrap_checkpoints_after_uninstall(state_dir)
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)
