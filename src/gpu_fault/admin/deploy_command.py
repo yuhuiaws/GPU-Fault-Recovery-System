@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -376,6 +377,72 @@ def refuse_deploy_during_uninstall(state_dir: Path) -> None:
         )
 
 
+# What a completed uninstall leaves behind that would make the next deploy treat
+# the directory as an installed site: the site document, the bootstrap
+# checkpoints, the source-deploy records and their signature, the installed-
+# resource registry and the last quick verdicts. Kept: admin-config/, the
+# release-signing keys, the deployer venv, kubeconfigs and logs.
+RETIRED_AFTER_UNINSTALL = (
+    "site.yaml",
+    "bootstrap-state.json",
+    "source-deploy.json",
+    "source-deploy-success.json",
+    "source-deploy-success.sigstore.json",
+    "installation-resources.json",
+    "installation-resources.json.sha256",
+    "quick-validation.json",
+    "public-release-verdict.json",
+)
+
+
+def retire_site_after_uninstall(state_dir: Path) -> Path | None:
+    """A completed uninstall turns the directory back into a new site.
+
+    ``bootstrap-state.json`` trusts a completed task and never runs it again,
+    and the source deploy classifies a directory with ``site.yaml`` and a
+    signed success record as an installed site to upgrade -- yet the uninstall
+    deleted Aurora, the IAM roles, the AMP workspace, the ECR repositories and
+    the certificate those records describe. Live 2026-09-13: the deploy after
+    an uninstall skipped every creation task, ran the upgrade preflight and
+    failed on each missing resource. The first deploy after a COMPLETED
+    uninstall moves those records into ``retired-<stamp>/`` (kept for the
+    audit trail) and consumes the uninstall record, so the bootstrap starts as
+    a new site and a later deploy leaves the fresh records alone. Returns the
+    archive directory, or None when there was nothing to retire.
+    """
+
+    record = state_dir / "uninstall" / "state.json"
+    if not record.is_file():
+        return None
+    try:
+        phase = str(json.loads(record.read_text(encoding="utf-8")).get("phase") or "")
+    except (OSError, ValueError):
+        return None
+    if phase != "COMPLETED":
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    archive = state_dir / f"retired-{stamp}"
+    archive.mkdir(mode=0o700)
+    moved = []
+    for name in RETIRED_AFTER_UNINSTALL:
+        path = state_dir / name
+        if path.is_file():
+            path.replace(archive / name)
+            moved.append(name)
+    record.replace(record.with_name(f"state.consumed-{stamp}.json"))
+    print(
+        f"gpu-fault-admin: the site was uninstalled; {len(moved)} site record(s) "
+        f"retired into {archive.name}, every resource will be created again",
+        file=sys.stderr,
+        flush=True,
+    )
+    return archive
+
+
+# Earlier name of the same step, kept for its callers.
+retire_bootstrap_checkpoints_after_uninstall = retire_site_after_uninstall
+
+
 def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     """Dispatch the one deploy command to its action."""
 
@@ -383,6 +450,7 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
         raise SiteConfigError("deploy requires --state-dir")
     state_dir = arguments.state_dir.expanduser().resolve()
     refuse_deploy_during_uninstall(state_dir)
+    retire_site_after_uninstall(state_dir)
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)
