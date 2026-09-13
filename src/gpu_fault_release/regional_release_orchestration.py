@@ -42,6 +42,10 @@ from gpu_fault_release.regional_release_legacy import (
     rollback_controller_config,
     validate_rollback_agent_identity,
 )
+from gpu_fault_release.regional_release_preflight_concurrency import (
+    run_rollback_preflight,
+    run_upgrade_preflight,
+)
 from gpu_fault_release.regional_release_mutation_preflight import (
     preflight_upgrade_mutations,
 )
@@ -328,6 +332,7 @@ def _upgrade_context(
     diff: ReleaseDiff,
     plan: ReleaseExecutionPlan,
     supersede: dict[str, Any] | None = None,
+    captured_previous: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], set[str], set[str], bool]:
     loaded = self._load_state() if resume else {}
     if resume:
@@ -346,7 +351,12 @@ def _upgrade_context(
         if supersede is not None:
             previous = inherit_superseded_previous(self, supersede)
         else:
-            previous = self._capture_previous(plan=plan)
+            # The backup is a mutation: after every preflight check passed.
+            previous = (
+                captured_previous
+                if captured_previous is not None
+                else self._capture_previous(plan=plan)
+            )
             previous["secret_backups"] = self._backup_release_secrets()
         completed_phases = set()
         completed_clusters = set()
@@ -1086,23 +1096,22 @@ def upgrade_release(
     # control-plane roles (or a schema-ensure Job) that mount it verify-full;
     # on the first upgrade after this change an existing cluster has no bundle
     # yet, so an un-wired apply would wedge in CreateContainerConfigError.
+    # The Aurora refresh Job mounts it too: ahead of the preflight lanes.
     self._apply_rds_ca_bundle()
-    # Copy the current Aurora password into the Secret before anything restarts
-    # a Pod against it; fail closed. A rotation that the refresh CronJob has not
-    # caught up with yet makes every new control-plane Pod die on password
-    # authentication failed, and a rollout that hits that window fails for a
-    # reason that looks like a broken release (2026-09-07, rollback-failed).
-    # After the CA bundle because the refresh Job mounts it.
-    self._refresh_aurora_credentials()
-    if not self._remote_commands_are_idle():
-        raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
-    # One store read; refuses by name while a driver/firmware/EFA install is
-    # PENDING or WAITING (``regional_release_store_preflight``).
-    verdict = self._require_no_inflight_installs(action="upgrade")
     active_diff = diff or _default_release_diff()
     plan = build_execution_plan(active_diff)
-    acceptance = _validate_upgrade_transaction(
-        self, active_diff, plan, resume=resume, supersede=supersede
+    # Refresh, store probes and validate-then-capture run at once; the first
+    # failure in that order is raised (``regional_release_preflight_concurrency``).
+    preflight = run_upgrade_preflight(
+        self,
+        validate=lambda: _validate_upgrade_transaction(
+            self, active_diff, plan, resume=resume, supersede=supersede
+        ),
+        capture=(
+            (lambda: self._capture_previous(plan=plan))
+            if not resume and supersede is None
+            else None
+        ),
     )
     (
         previous,
@@ -1115,14 +1124,15 @@ def upgrade_release(
         diff=active_diff,
         plan=plan,
         supersede=supersede,
+        captured_previous=preflight.previous,
     )
     if not resume:
         # A new transaction must not inherit rollback checkpoints or failure
         # fields from the currently deployed release.
         self.state = {}
-    if isinstance(verdict, dict):
+    if isinstance(preflight.verdict, dict):
         # The gate's verdict, persisted by the first checkpoint like the rollback's.
-        self.state["inflight_installs"] = verdict
+        self.state["inflight_installs"] = preflight.verdict
     if not resume:
         self._save_state(
             "preflight",
@@ -1144,8 +1154,8 @@ def upgrade_release(
             transaction_committed=False,
             release_lifecycle="PREPARING",
             **(
-                {SCHEMA_CHANGE_ACCEPTANCE_KEY: acceptance}
-                if acceptance is not None
+                {SCHEMA_CHANGE_ACCEPTANCE_KEY: preflight.acceptance}
+                if preflight.acceptance is not None
                 else {}
             ),
             cluster_attempts={
@@ -1835,28 +1845,17 @@ def rollback_release(
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return
-    # The compensating restore restarts the control-plane roles; on 2026-09-07
-    # it restarted them into a password RDS had rotated mid-transaction and the
-    # release landed in rollback-failed. Fresh credentials first, fail closed,
-    # before any restore is even planned.
-    self._refresh_aurora_credentials()
-    # Before any restore is planned: the previous release's control plane would
-    # re-submit an install that is PENDING or WAITING right now. Skipped once
-    # the control plane is already restored (a cleanup re-entry). An automatic
-    # rollback proceeds only when no Running control-plane Pod with a ready
-    # container could run the probe (StoreUnreachable); a kubectl-level failure
-    # on a ready Pod and a manual rollback refuse. The verdict rides in the
-    # state so ``rollback-started`` persists whether and on what this was
-    # checked (``render_persisted_state`` writes the state whole).
-    if "rollback-cpu-restored" not in set(
-        loaded.get("rollback_completed_phases") or []
-    ):
-        verdict = self._require_no_inflight_installs(
-            action="rollback",
-            unreadable="proceed" if automatic else "refuse",
-        )
-        if isinstance(verdict, dict):
-            self.state["inflight_installs"] = verdict
+    # Fresh Aurora credentials beside the in-flight install gate, before any
+    # restore is planned (``regional_release_preflight_concurrency``); the
+    # verdict rides in the state so ``rollback-started`` persists the check.
+    verdict = run_rollback_preflight(
+        self,
+        check_installs="rollback-cpu-restored"
+        not in set(loaded.get("rollback_completed_phases") or []),
+        automatic=automatic,
+    )
+    if isinstance(verdict, dict):
+        self.state["inflight_installs"] = verdict
     compensation = build_rollback_compensation_plan(
         loaded,
         (target.cluster_id for target in self.config.clusters),

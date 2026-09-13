@@ -11,6 +11,7 @@ from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
+    ReleaseChangeKind,
     ReleaseComponent,
     ReleaseExecutionPlan,
 )
@@ -32,6 +33,18 @@ TRANSIENT_CRITICAL_ALERTS = frozenset({"GpuFaultStoreIoRejected"})
 CRITICAL_CLEAR_TIMEOUT_SECONDS = 420
 CRITICAL_CLEAR_SAMPLE_SECONDS = 15
 DATA_CONVERGED_GRACE_SECONDS = 600
+# The configured window (120..300 s) exists for what a data-plane restart sets
+# in motion: every node Agent reconnects and re-posts its first inventory, the
+# collector takes a scrape or two to report again, and a CrashLooping executor
+# needs a couple of back-off cycles to show as a restart. A CONTROL_PLANE_ONLY
+# release rolls only the control-plane role ConfigMaps/replicas -- no data-plane
+# Pod restarts, no Agent reconnect grace to wait out -- so its window may close
+# at this floor instead. 60 s is two 30 s samples after the baseline: the least
+# that still shows a control-plane Pod restart loop (a CrashLoop recurs within
+# 10-20 s) and gives the queue-growth verdict its three depths. It is a floor,
+# never the configured value: any non-clean observation keeps the full window.
+CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS = 60
+CONTROL_PLANE_ONLY_MINIMUM_CLEAN_SAMPLES = 2
 STORE_IO_REJECTION_METRIC = "gpu_fault_store_io_rejections_total"
 CPU_METRIC_PORTS = {
     "gpu-fault-api-ha": 8080,
@@ -710,6 +723,142 @@ def _queue_growth_verdict(
     }
 
 
+def stability_release_kind(release: Any) -> str | None:
+    """The ``release_diff.kind`` of the live release state, or None.
+
+    Read for the stability window so a CONTROL_PLANE_ONLY release can close its
+    window early (``validate_stability_window``). Anything short of a persisted
+    kind -- no state, an unreadable one, a state without a diff -- is None, which
+    the window treats as the full-length case.
+    """
+
+    try:
+        state = release._load_state()
+    except (ReleaseError, ValueError, OSError):
+        return None
+    diff = state.get("release_diff") if isinstance(state, dict) else None
+    kind = diff.get("kind") if isinstance(diff, dict) else None
+    return str(kind) if kind else None
+
+
+def _deployment_converged(document: dict[str, Any]) -> str | None:
+    """Why the Deployment has not converged, or None when it has."""
+
+    metadata = document.get("metadata") or {}
+    spec = document.get("spec") or {}
+    status = document.get("status") or {}
+    name = str(metadata.get("name") or "<unnamed>")
+    generation = int(metadata.get("generation") or 0)
+    observed = int(status.get("observedGeneration") or 0)
+    if observed != generation:
+        return f"{name} observedGeneration {observed} != generation {generation}"
+    want = int(spec.get("replicas", 1) or 0)
+    counts = {
+        field: int(status.get(field) or 0)
+        for field in ("replicas", "updatedReplicas", "readyReplicas")
+    }
+    if any(count != want for count in counts.values()):
+        return f"{name} replicas {counts} != spec.replicas {want}"
+    return None
+
+
+def control_plane_deployments_converged(release: Any) -> str | None:
+    """Why the control-plane Deployments are not all converged, or None.
+
+    One ``get deployment`` listing; every Deployment the control-plane
+    inventory names must be present and report ``observedGeneration ==
+    generation`` with ``replicas == updatedReplicas == readyReplicas ==
+    spec.replicas`` -- no surge Pod still terminating, no old ReplicaSet Pod
+    lingering, nothing the rollout has not yet observed.
+    """
+
+    listing = release._get_json(
+        release._cpu("-n", release.config.namespace, "get", "deployment")
+    )
+    by_name = {
+        str((item.get("metadata") or {}).get("name") or ""): item
+        for item in listing.get("items") or []
+        if isinstance(item, dict)
+    }
+    for name in inventory.CPU_DEPLOYMENTS:
+        document = by_name.get(name)
+        if document is None:
+            return f"deployment/{name} is absent"
+        reason = _deployment_converged(document)
+        if reason is not None:
+            return reason
+    return None
+
+
+class _ControlPlaneOnlyWindow:
+    """May this window close at the floor instead of the configured length?
+
+    Only for a CONTROL_PLANE_ONLY release, and only while every observation so
+    far has been clean: the baseline needed no critical-clear wait, no sample
+    carried a critical alert at all (graced ones included: an alert the grace
+    excuses is still an alert firing), and each sample passed the checks that
+    otherwise fail the window. Once the floor is reached with enough clean
+    samples, the control-plane Deployments have to report converged as well;
+    until they do, the window keeps sampling and asks again.
+    """
+
+    def __init__(
+        self,
+        release: Any,
+        release_kind: str | None,
+        *,
+        configured: int,
+        baseline: dict[str, Any],
+        critical_clear: dict[str, Any],
+    ) -> None:
+        self._release = release
+        control_plane_only = release_kind == ReleaseChangeKind.CONTROL_PLANE_ONLY.value
+        self.enabled = (
+            control_plane_only
+            and configured > CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS
+        )
+        self.closed = False
+        if not control_plane_only:
+            self.reason = "full window: release kind is not CONTROL_PLANE_ONLY"
+        elif not self.enabled:
+            self.reason = "full window: configured window is already at the floor"
+        else:
+            self.reason = "eligible for the CONTROL_PLANE_ONLY floor"
+        if self.enabled and (
+            int(critical_clear.get("wait_seconds") or 0)
+            or int((baseline.get("critical_alerts") or {}).get("count", 0))
+        ):
+            self._unclean("baseline had critical alerts")
+
+    def _unclean(self, reason: str) -> None:
+        self.enabled = False
+        self.reason = f"full window kept: {reason}"
+
+    def observe(self, sample: dict[str, Any]) -> None:
+        """A sample that passed the failing checks; is it also clean?"""
+
+        if self.enabled and int((sample.get("critical_alerts") or {}).get("count", 0)):
+            self._unclean("a sample had critical alerts")
+
+    def may_close(self, *, elapsed: float, clean_samples: int) -> bool:
+        if (
+            not self.enabled
+            or elapsed < CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS
+            or clean_samples < CONTROL_PLANE_ONLY_MINIMUM_CLEAN_SAMPLES
+        ):
+            return False
+        reason = control_plane_deployments_converged(self._release)
+        if reason is not None:
+            self.reason = f"waiting for control-plane Deployments: {reason}"
+            return False
+        self.closed = True
+        self.reason = (
+            f"CONTROL_PLANE_ONLY release: {clean_samples} clean samples over "
+            f"{elapsed:.0f}s and every control-plane Deployment converged"
+        )
+        return True
+
+
 def validate_stability_window(
     release: Any,
     *,
@@ -717,7 +866,17 @@ def validate_stability_window(
     sample_seconds: int = 30,
     critical_clear_timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
     critical_clear_sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
+    release_kind: str | None = None,
 ) -> dict[str, Any]:
+    """Hold the release for the stability window; return the report.
+
+    ``release_kind`` is the persisted ``release_diff.kind``
+    (``stability_release_kind``); a CONTROL_PLANE_ONLY release may close the
+    window at ``CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS`` when every
+    observation was clean and the control-plane Deployments converged. Every
+    other kind, and every window that saw anything, runs the configured length.
+    """
+
     configured = (
         window_seconds
         if window_seconds is not None
@@ -742,8 +901,21 @@ def validate_stability_window(
         grace=grace,
     )
     samples = [baseline]
+    early = _ControlPlaneOnlyWindow(
+        release,
+        release_kind,
+        configured=configured,
+        baseline=baseline,
+        critical_clear=critical_clear,
+    )
     deadline = time.monotonic() + configured
-    while time.monotonic() < deadline:
+    started = deadline - configured
+    while True:
+        now = time.monotonic()
+        if now >= deadline or early.may_close(
+            elapsed=now - started, clean_samples=len(samples) - 1
+        ):
+            break
         time.sleep(min(sample_seconds, max(0, deadline - time.monotonic())))
         sample = release._stability_snapshot()
         if sample["not_ready"]:
@@ -773,6 +945,7 @@ def validate_stability_window(
                 "release stability window has non-terminal remote commands"
             )
         samples.append(sample)
+        early.observe(sample)
     queue_growth = _queue_growth_verdict(
         [item["queue"] for item in samples],
         sample_seconds=sample_seconds,
@@ -783,7 +956,14 @@ def validate_stability_window(
     return {
         "mode": "stability",
         "healthy": True,
-        "window_seconds": configured,
+        # The window that applied: the floor on an early close, else configured.
+        "window_seconds": (
+            CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS if early.closed else configured
+        ),
+        "configured_window_seconds": configured,
+        "release_kind": release_kind,
+        "early_exit": early.closed,
+        "early_exit_reason": early.reason,
         "sample_count": len(samples),
         "baseline_queue": baseline["queue"],
         "final_queue": samples[-1]["queue"],
