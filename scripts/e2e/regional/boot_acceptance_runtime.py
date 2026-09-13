@@ -655,20 +655,55 @@ import subprocess
 import sys
 
 from botocore.exceptions import ParamValidationError
-from gpu_fault.notifications import SesEmailNotifier, SesNotificationConfig
+from gpu_fault.env import env_bool
 
-config = SesNotificationConfig.from_environment()
-client = SesEmailNotifier._create_client(config)
+# The live channel decides which client the case inspects. Both clients take
+# their region from the environment, never from the Pod's SDK defaults; the SNS
+# client additionally pins it to the topic ARN's region when the variables are
+# absent, so its negative branch proves that pin instead of NoRegionError.
+channel = (os.getenv("GPU_FAULT_NOTIFICATION_CHANNEL") or "ses").strip().lower()
+if channel == "sns":
+    from gpu_fault.notifications.sns import SnsNotificationConfig, SnsNotifier
+
+    config = SnsNotificationConfig.from_environment()
+    client = SnsNotifier._create_client(config)
+    allow_default = True
+
+    def zero_network_call():
+        client.publish(TopicArn=config.topic_arn, Message=1)
+
+    negative_source = (
+        "from gpu_fault.notifications.sns import SnsNotificationConfig, SnsNotifier;"
+        "c=SnsNotificationConfig.from_environment();"
+        "print('REGION=' + str(SnsNotifier._create_client(c).meta.region_name))"
+    )
+else:
+    from gpu_fault.notifications import SesEmailNotifier, SesNotificationConfig
+
+    config = SesNotificationConfig.from_environment()
+    client = SesEmailNotifier._create_client(config)
+    allow_default = False
+
+    def zero_network_call():
+        client.send_email(
+            FromEmailAddress=config.sender,
+            Destination={"ToAddresses": [1]},
+            Content={"Simple": {
+                "Subject": {"Data": "boot013"},
+                "Body": {"Text": {"Data": "boot013"}},
+            }},
+        )
+
+    negative_source = (
+        "from gpu_fault.notifications import "
+        "SesEmailNotifier,SesNotificationConfig;"
+        "SesEmailNotifier._create_client("
+        "SesNotificationConfig.from_environment())"
+    )
+
 local_validation = False
 try:
-    client.send_email(
-        FromEmailAddress=config.sender,
-        Destination={"ToAddresses": [1]},
-        Content={"Simple": {
-            "Subject": {"Data": "boot013"},
-            "Body": {"Text": {"Data": "boot013"}},
-        }},
-    )
+    zero_network_call()
 except ParamValidationError:
     local_validation = True
 
@@ -677,29 +712,28 @@ child.pop("AWS_REGION", None)
 child.pop("AWS_DEFAULT_REGION", None)
 child["AWS_CONFIG_FILE"] = "/dev/null"
 negative = subprocess.run(
-    [
-        sys.executable,
-        "-c",
-        (
-            "from gpu_fault.notifications import "
-            "SesEmailNotifier,SesNotificationConfig;"
-            "SesEmailNotifier._create_client("
-            "SesNotificationConfig.from_environment())"
-        ),
-    ],
+    [sys.executable, "-c", negative_source],
     env=child,
     text=True,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
 )
+if channel == "sns":
+    topic_region = config.topic_arn.split(":")[3]
+    no_region_error = (
+        negative.returncode == 0 and f"REGION={topic_region}" in negative.stdout
+    )
+else:
+    no_region_error = "NoRegionError" in negative.stderr
 print(json.dumps({
+    "channel": channel,
     "region_present": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
     "config_region": config.region_name,
     "client_region": client.meta.region_name,
     "execution_enabled": config.execution_enabled,
-    "allow_email": os.getenv("GPU_FAULT_ALLOW_EMAIL", "").lower() == "true",
+    "allow_email": env_bool("GPU_FAULT_ALLOW_EMAIL", allow_default),
     "local_param_validation": local_validation,
-    "no_region_error": "NoRegionError" in negative.stderr,
+    "no_region_error": no_region_error,
 }, sort_keys=True))
 """
 
@@ -729,7 +763,9 @@ def run_boot013(fixture: SiteFixture) -> dict[str, Any]:
         "replicas": results,
         "limitations": [
             "The mandatory path performs only botocore local parameter "
-            "validation and does not send an acceptance email."
+            "validation and does not send an acceptance email.",
+            "On the sns channel the negative branch proves the client region is "
+            "pinned to the topic ARN without AWS_REGION, not NoRegionError.",
         ],
     }
 
