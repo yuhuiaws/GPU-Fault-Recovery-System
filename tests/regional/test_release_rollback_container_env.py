@@ -136,6 +136,10 @@ def _reader(
         _cpu=lambda *args: ["cpu", *args],
         _get_json=get_json,
         _config_map_data=lambda name: {"GPU_FAULT_PROCESSOR_WORKERS": "24"},
+        # The role ConfigMaps are read in one batch, keyed by name.
+        _config_maps_data=lambda names: {
+            name: {"GPU_FAULT_PROCESSOR_WORKERS": "24"} for name in names
+        },
     )
     return SimpleNamespace(**{**defaults, **stubs})
 

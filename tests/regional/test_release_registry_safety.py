@@ -418,8 +418,8 @@ def test_cpu_role_config_snapshot_rejects_sensitive_keys() -> None:
             return {}
 
         @staticmethod
-        def _config_map_data(_name):
-            return {"GPU_FAULT_DATABASE_PASSWORD": "unsafe"}
+        def _config_maps_data(names):
+            return {name: {"GPU_FAULT_DATABASE_PASSWORD": "unsafe"} for name in names}
 
     with pytest.raises(STATE_MODULE.ReleaseError, match="sensitive-looking keys"):
         STATE_MODULE.cpu_role_config_maps(SnapshotRelease())

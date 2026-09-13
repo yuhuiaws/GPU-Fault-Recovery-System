@@ -195,6 +195,7 @@ from gpu_fault_release.regional_release_state import (
     cleanup_previous_snapshots,
     config_map_binary_key,
     config_map_data,
+    config_maps_data,
     deployment_template_name,
     deployment_wheel,
     get_json,
@@ -535,6 +536,7 @@ class RegionalRelease:
     _restore_endpoint_snapshot = restore_endpoint_snapshot
     _config_map_binary_key = config_map_binary_key
     _config_map_data = config_map_data
+    _config_maps_data = config_maps_data
     _deployment_template_name = deployment_template_name
     _deployment_wheel = deployment_wheel
     _ensure_connection_secret = ensure_connection_secret

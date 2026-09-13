@@ -356,6 +356,14 @@ def test_previous_release_snapshot_reads_live_images() -> None:
             if name == "gpu-fault-api-ha-config-core"
             else {}
         ),
+        _config_maps_data=lambda names: {
+            name: (
+                {"GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "profile-v1"}
+                if name == "gpu-fault-api-ha-config-core"
+                else {}
+            )
+            for name in names
+        },
         _deployment_template_name=lambda _target: "installer-template",
         _deployment_wheel=lambda _args, name: f"{name}-wheel",
         _template_bundle=lambda _target, _template: "node-bundle",
@@ -1285,6 +1293,14 @@ def _snapshot_release(
             if name == "gpu-fault-api-ha-config-core"
             else {}
         ),
+        _config_maps_data=lambda names: {
+            name: (
+                {"GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "profile-v1"}
+                if name == "gpu-fault-api-ha-config-core"
+                else {}
+            )
+            for name in names
+        },
         _deployment_template_name=lambda _target: "installer-template",
         _deployment_wheel=lambda _args, name: f"{name}-wheel",
         _template_bundle=lambda _target, _template: "node-bundle",

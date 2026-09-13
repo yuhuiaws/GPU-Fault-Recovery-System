@@ -59,8 +59,24 @@ def _load_verifier() -> ModuleType:
     return module
 
 
+def _requested_names(command: list[str]) -> list[str]:
+    """The resource names of a ``kubectl get <kind> <name>... [flags]`` argv."""
+
+    names: list[str] = []
+    for word in command[5:]:
+        if word.startswith("-"):
+            break
+        names.append(word)
+    return names
+
+
 class _Kubectl:
-    """Answers ``kubectl get configmap <name> -o json`` from a dict."""
+    """Answers ``kubectl get configmap <name>... --ignore-not-found -o json``.
+
+    Like kubectl under that flag: the found ConfigMaps come back as a ``List``
+    and a missing one is simply absent from it, exit 0. ``names`` records every
+    name asked for, in order, one entry per name per call.
+    """
 
     def __init__(
         self, config_maps: dict[str, dict[str, str]], *, unreachable: bool = False
@@ -68,12 +84,15 @@ class _Kubectl:
         self.config_maps = config_maps
         self.unreachable = unreachable
         self.names: list[str] = []
+        self.calls = 0
 
     def __call__(self, command, **_kwargs) -> subprocess.CompletedProcess:
         assert command[:2] == ["kubectl", "-n"], command
         assert command[3:5] == ["get", "configmap"], command
-        name = command[5]
-        self.names.append(name)
+        assert "--ignore-not-found" in command, command
+        names = _requested_names(command)
+        self.names.extend(names)
+        self.calls += 1
         if self.unreachable:
             return subprocess.CompletedProcess(
                 command,
@@ -84,15 +103,16 @@ class _Kubectl:
                     "- did you specify the right host or port?\n"
                 ),
             )
-        if name not in self.config_maps:
-            return subprocess.CompletedProcess(
-                command,
-                1,
-                stdout="",
-                stderr=f'Error from server (NotFound): configmaps "{name}" not found\n',
-            )
+        items = [
+            {"metadata": {"name": name}, "data": self.config_maps[name]}
+            for name in names
+            if name in self.config_maps
+        ]
         return subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps({"data": self.config_maps[name]}), stderr=""
+            command,
+            0,
+            stdout=json.dumps({"kind": "List", "apiVersion": "v1", "items": items}),
+            stderr="",
         )
 
 
