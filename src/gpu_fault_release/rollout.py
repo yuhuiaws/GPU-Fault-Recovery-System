@@ -16,6 +16,9 @@ from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault.admin.command_log import child_failure, last_output_line, report_failure
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
+from gpu_fault_release.regional_release_runtime_identity import (
+    forget_cpu_ingress_pod,
+)
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
     build_preflight_report,
@@ -447,6 +450,12 @@ def render_and_apply_cpu_roles(
             ],
             env=environment,
         )
+    # The apply rolled the CPU ingress Deployment: a Pod name memoised by the
+    # preflight probes may now be gone, and the mutating fleet execs after
+    # this point never re-resolve on their own (live 2026-09-13: the rollback
+    # after a failed apply exec'd into a replaced Pod and stopped at
+    # rollback-failed).
+    forget_cpu_ingress_pod(release)
 
 
 def bootstrap_resume_context(

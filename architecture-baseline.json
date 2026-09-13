@@ -42,7 +42,7 @@
     "src/gpu_fault/processor/coordinator.py": 1828,
     "src/gpu_fault/store/postgres/ddl.py": 1753,
     "src/gpu_fault_release/regional_admin_checks.py": 1727,
-    "src/gpu_fault_release/regional_release_orchestration.py": 2031,
+    "src/gpu_fault_release/regional_release_orchestration.py": 2005,
     "src/gpu_fault_release/regional_release_state.py": 1608,
     "tests/processor/test_telemetry_spool.py": 1658,
     "tests/regional/test_regional_admin_checks.py": 1614

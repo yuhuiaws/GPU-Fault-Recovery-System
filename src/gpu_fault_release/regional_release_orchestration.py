@@ -56,7 +56,11 @@ from gpu_fault_release.regional_release_progress import (
     update_component_progress,
     update_components_progress,
 )
+from gpu_fault_release.regional_release_runtime_identity import (
+    forget_cpu_ingress_pod,
+)
 from gpu_fault_release.regional_release_rollback_context import (
+    apply_rollback_cpu_environment,
     # Re-exported: `rollout_regional_release` and the command tests reach this
     # through the orchestration module, which is the entry point that owns the
     # rollback flow even though the environment assembly now lives beside the
@@ -128,42 +132,8 @@ SUPERSEDABLE_PHASES = frozenset({"failed", "partial-convergence"})
 SUPERSEDED_TRANSACTION_KEY = "superseded_transaction"
 
 
-def _apply_rollback_cpu_environment(
-    self: Any,
-    environment: dict[str, str],
-) -> None:
-    with tempfile.TemporaryDirectory(
-        prefix="gpu-fault-rollback-role-split-"
-    ) as directory:
-        generated = Path(directory)
-        render_environment = {
-            **environment,
-            "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(generated),
-        }
-        self.runner.run(
-            [
-                "bash",
-                str(
-                    ROOT / "deploy/control-plane/tools/"
-                    "render-control-plane-role-split.sh"
-                ),
-            ],
-            env=render_environment,
-        )
-        apply_environment = {
-            **environment,
-            "GPU_FAULT_ROLE_SPLIT_GENERATED_DIR": str(generated),
-        }
-        self.runner.run(
-            [
-                "bash",
-                str(
-                    ROOT / "deploy/control-plane/tools/"
-                    "apply-control-plane-role-split.sh"
-                ),
-            ],
-            env=apply_environment,
-        )
+# Kept under its old private name: the rollback container-env tests patch it here.
+_apply_rollback_cpu_environment = apply_rollback_cpu_environment
 
 
 def _default_release_diff() -> ReleaseDiff:
@@ -1858,6 +1828,10 @@ def rollback_release(
     state: dict[str, Any] | None = None,
     automatic: bool = False,
 ) -> None:
+    # A rollback follows an arbitrary failure, including one inside the CPU
+    # role apply that replaced every ingress Pod. Whatever Pod name the upgrade
+    # memoised is suspect here; the first exec re-resolves it.
+    forget_cpu_ingress_pod(self)
     loaded, previous = _rollback_context(self, state)
     if not previous:
         return

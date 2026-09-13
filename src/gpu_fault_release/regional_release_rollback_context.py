@@ -3,10 +3,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
 from gpu_fault_release.regional_release_diff import ReleaseComponent
@@ -18,6 +20,53 @@ from gpu_fault_release.regional_release_state import (
     SENSITIVE_CONFIG_KEY,
     require_digest_pinned_image,
 )
+from gpu_fault_release.regional_release_runtime_identity import (
+    forget_cpu_ingress_pod,
+)
+
+ROOT = repository_root()
+
+
+def apply_rollback_cpu_environment(
+    self: Any,
+    environment: dict[str, str],
+) -> None:
+    """Render and apply the previous release's CPU roles, then drop the Pod memo."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-fault-rollback-role-split-"
+    ) as directory:
+        generated = Path(directory)
+        render_environment = {
+            **environment,
+            "GPU_FAULT_ROLE_SPLIT_OUT_DIR": str(generated),
+        }
+        self.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT / "deploy/control-plane/tools/"
+                    "render-control-plane-role-split.sh"
+                ),
+            ],
+            env=render_environment,
+        )
+        apply_environment = {
+            **environment,
+            "GPU_FAULT_ROLE_SPLIT_GENERATED_DIR": str(generated),
+        }
+        self.runner.run(
+            [
+                "bash",
+                str(
+                    ROOT / "deploy/control-plane/tools/"
+                    "apply-control-plane-role-split.sh"
+                ),
+            ],
+            env=apply_environment,
+        )
+    # The restore rolled the CPU ingress Deployment; see render_and_apply_cpu_roles.
+    forget_cpu_ingress_pod(self)
 
 
 def rollback_target_arguments(

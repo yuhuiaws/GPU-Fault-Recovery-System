@@ -792,6 +792,10 @@ wait_for_rollout() {
         "deployment/${deployment}" --timeout=1s
 }
 
+# Fallback when the Pod spec carries no named http port; matches the
+# spool-worker manifest's uvicorn --port.
+SPOOL_WORKER_METRICS_PORT="${GPU_FAULT_SPOOL_WORKER_METRICS_PORT:-8082}"
+
 wait_for_spool_drain() {
     # E-1: this runs after ingress has already rolled to spool=false, and an
     # ingress with spool admission off reports depth/leased as 0 whatever the
@@ -818,11 +822,27 @@ wait_for_spool_drain() {
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
         )"
         if [[ -n "${pod}" ]]; then
-            metrics="$(
+            # The spool-worker serves on its own port (8082 today; api-ha is
+            # 8080), read from the Pod rather than assumed: the first live
+            # enabled->disabled transition failed on a hard-coded 8080. A Pod
+            # that is Running but not answering yet (rolling, restarting) is a
+            # poll to repeat inside the drain window, not a failed drain.
+            port="$(
+                kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get pod "${pod}" \
+                    -o jsonpath='{.spec.containers[0].ports[?(@.name=="http")].containerPort}' \
+                    2>/dev/null || true
+            )"
+            [[ "${port}" =~ ^[0-9]+$ ]] || port="${SPOOL_WORKER_METRICS_PORT}"
+            if ! metrics="$(
                 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" exec "${pod}" -- \
                     /opt/gpu-fault/control-plane/bin/python -c \
-                    'from urllib.request import urlopen; print(urlopen("http://127.0.0.1:8080/metrics", timeout=5).read().decode())'
-            )"
+                    "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:${port}/metrics', timeout=5).read().decode())" \
+                    2>/dev/null
+            )"; then
+                echo "spool-worker ${pod} is not answering on port ${port} yet; polling again" >&2
+                sleep 5
+                continue
+            fi
             depth="$(
                 awk '$1=="gpu_fault_telemetry_spool_depth"{print int($2)}' \
                     <<<"${metrics}" |
