@@ -809,12 +809,17 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
             # command; the first WAITING record is just a pointer to a PENDING
             # node action, so keep polling until the reason is on record.
             errors = waiting_boundary_errors(workflow) + barrier_reason_errors(
-                last.get("commands") or []
+                last.get("commands") or [], workflow
             )
             if not errors:
                 write_json_atomic(run.case_dir / "barrier-state.json", last)
                 return last
-            if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED"}:
+            if workflow.get("status") in {
+                "SUCCEEDED",
+                "FAILED",
+                "BLOCKED",
+                "SUPERSEDED",
+            }:
                 break
         time.sleep(5)
     write_json_atomic(run.case_dir / "barrier-state.json", last)
@@ -912,7 +917,9 @@ def _escalate(
     errors.extend(successor_step_graph_errors(adopted))
     errors.extend(superseded_predecessor_errors(predecessor))
     errors.extend(
-        cancelled_command_errors(commands, successor_request_id=run.successor_id)
+        cancelled_command_errors(
+            commands, successor_request_id=run.successor_id, workflow=predecessor
+        )
     )
     return errors, adopted
 

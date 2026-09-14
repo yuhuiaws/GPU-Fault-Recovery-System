@@ -487,10 +487,16 @@ def remote_command_errors(
     """Every in-flight command must end FAILED with a cancellation source."""
 
     errors: list[str] = []
+    # Since 6e0248c the agent steps of a reset run as one compound command
+    # labelled by its first step (QUIESCE_GPU_SERVICES), and the
+    # VERIFY_NO_GPU_CLIENTS hold lives in that command's result details as
+    # ``gpu_client_quiesce_attempt``; a per-step operation match alone found
+    # no waiting command on 2026-09-14 (DESTR-016, same shape).
     waiting = [
         command
         for command in commands
         if (command.get("step") or {}).get("operation") == WAITING_STEP
+        or "gpu_client_quiesce_attempt" in (command.get("result_details") or {})
     ]
     if not waiting:
         errors.append(f"no remote command was issued for {WAITING_STEP}")

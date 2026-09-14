@@ -1437,3 +1437,27 @@ def test_the_preflight_refuses_a_node_carrying_an_open_lifetime_incident(
     assert not any("open incident" in e for e in _preflight_errors(tmp_path)), (
         "a node without open incidents must not be refused for one"
     )
+
+
+def test_the_waiting_hold_is_found_on_the_compound_agent_command() -> None:
+    """Since 6e0248c the reset's agent steps run as one compound command
+    labelled QUIESCE_GPU_SERVICES; the VERIFY_NO_GPU_CLIENTS hold lives in its
+    result details, so the cancelled compound command is the waiting one."""
+    commands = happy_commands()
+    commands[1] = _command(
+        "QUIESCE_GPU_SERVICES",
+        status="FAILED",
+        status_source=verdicts.CANCELLED_BY_TIMEOUT,
+        updated_at=T_CANCEL,
+        result_details={
+            "gpu_client_quiesce_attempt": 16,
+            "batched_step_index": 3,
+            "reason": "RuntimeError: GPU device clients are still active: GPU-1:1:holder",
+        },
+        command_id=f"{WORKFLOW_ID}/2/QUIESCE_GPU_SERVICES/compound",
+    )
+    assert verdicts.remote_command_errors(commands, t_cancel=T_CANCEL) == []
+
+    del commands[1]
+    errors = verdicts.remote_command_errors(commands, t_cancel=T_CANCEL)
+    assert f"no remote command was issued for {verdicts.WAITING_STEP}" in _text(errors)

@@ -251,7 +251,39 @@ def waiting_boundary_errors(workflow: dict[str, Any]) -> list[str]:
     return errors
 
 
-def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
+def barrier_commands(
+    commands: list[dict[str, Any]], workflow: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """The remote command that carries the client-verification barrier.
+
+    Since 6e0248c the executor runs the agent steps of a reset as one compound
+    command labelled by its first step (QUIESCE_GPU_SERVICES, step_index 2),
+    and the VERIFY_NO_GPU_CLIENTS hold lives in that command's
+    ``result_details`` (``gpu_client_quiesce_attempt``, the reason). Selecting
+    by operation therefore found nothing on 2026-09-14 while the barrier stood
+    for four minutes. The barrier step execution names the command it waits on
+    (``details.remote_command_id``); that id wins, then a command whose hold
+    details record the verification attempt, then the pre-batching per-step
+    operation match.
+    """
+
+    matches: list[dict[str, Any]] = []
+    remote_command_id = None
+    for execution in executions_of(workflow or {}, BARRIER_OPERATION):
+        remote_command_id = (execution.get("details") or {}).get("remote_command_id")
+    for item in commands:
+        operation = (item.get("step") or {}).get("operation") or item.get("operation")
+        details = item.get("result_details") or {}
+        if remote_command_id and item.get("command_id") == remote_command_id:
+            return [item]
+        if operation == BARRIER_OPERATION or "gpu_client_quiesce_attempt" in details:
+            matches.append(item)
+    return matches
+
+
+def barrier_reason_errors(
+    commands: list[dict[str, Any]], workflow: dict[str, Any] | None = None
+) -> list[str]:
     """The WAITING command must say *why* it waits, and it must be the holder.
 
     Recorded from ``result_details`` rather than inferred: an empty reason
@@ -259,12 +291,7 @@ def barrier_reason_errors(commands: list[dict[str, Any]]) -> list[str]:
     proving a boundary it did not create.
     """
 
-    barrier = [
-        item
-        for item in commands
-        if (item.get("step") or {}).get("operation") == BARRIER_OPERATION
-        or item.get("operation") == BARRIER_OPERATION
-    ]
+    barrier = barrier_commands(commands, workflow)
     if len(barrier) != 1:
         return [f"there is not exactly one barrier remote command: {len(barrier)}"]
     details = barrier[0].get("result_details") or {}
@@ -518,6 +545,7 @@ def cancelled_command_errors(
     commands: list[dict[str, Any]],
     *,
     successor_request_id: str,
+    workflow: dict[str, Any] | None = None,
 ) -> list[str]:
     """The predecessor's WAITING remote command must be cancelled, once, by
     the preemption -- and no reset command may have been issued at all."""
@@ -527,11 +555,7 @@ def cancelled_command_errors(
         operation = (item.get("step") or {}).get("operation")
         if operation in FORBIDDEN_LEDGER_OPERATIONS:
             errors.append(f"the superseded reset issued a {operation} command")
-    barrier = [
-        item
-        for item in commands
-        if (item.get("step") or {}).get("operation") == BARRIER_OPERATION
-    ]
+    barrier = barrier_commands(commands, workflow)
     if len(barrier) != 1:
         return errors + [
             f"there is not exactly one barrier remote command: {len(barrier)}"

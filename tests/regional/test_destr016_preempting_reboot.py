@@ -1490,3 +1490,70 @@ def test_plan_details_declare_the_destructive_risk_and_the_stop_conditions() -> 
     ):
         assert expected in joined, expected
     assert "BatchRebootClusterNodes" in details["mutation"]
+
+
+def _compound_hold(status: str = "WAITING") -> dict[str, Any]:
+    """The post-6e0248c shape: one compound agent command labelled by its first
+    step carries the VERIFY_NO_GPU_CLIENTS hold in its result details."""
+    command = {
+        "command_id": "remote-compound",
+        "step_index": 2,
+        "step": {"operation": "QUIESCE_GPU_SERVICES"},
+        "status": status,
+        "result_details": {
+            "reason": (
+                "RuntimeError: GPU device clients are still active: "
+                "GPU-08cc989d:153561:destr016-holder"
+            ),
+            "gpu_client_quiesce_attempt": 16,
+            "batched_step_index": 3,
+            "waiting_node": NODE,
+        },
+    }
+    if status == "FAILED":
+        command["status_source"] = "workflow-preempted"
+        command["error"] = f"remote command cancelled by stronger workflow {REBOOT_ID}"
+    return command
+
+
+def test_the_barrier_is_found_on_the_compound_agent_command() -> None:
+    """Since 6e0248c the reset's agent steps run as one compound command
+    labelled QUIESCE_GPU_SERVICES; the barrier hold lives in its result details
+    and the barrier step names it by remote_command_id."""
+    commands = [
+        {
+            "command_id": "remote-isolate",
+            "step": {"operation": "MARK_UNSCHEDULABLE"},
+            "status": "SUCCEEDED",
+        },
+        _compound_hold(),
+    ]
+    workflow = parked_reset_workflow()
+    for execution in workflow["step_executions"]:
+        if execution["operation"] == "VERIFY_NO_GPU_CLIENTS":
+            execution["details"]["remote_command_id"] = "remote-compound"
+
+    assert verdicts.barrier_commands(commands, workflow) == [commands[1]]
+    assert verdicts.barrier_reason_errors(commands, workflow) == []
+    # Without the workflow the hold is still recognised by its attempt record.
+    assert verdicts.barrier_reason_errors(commands) == []
+    assert (
+        verdicts.cancelled_command_errors(
+            [commands[0], _compound_hold("FAILED")], successor_request_id=REBOOT_ID
+        )
+        == []
+    )
+
+
+def test_a_compound_command_without_a_hold_is_not_a_barrier() -> None:
+    commands = [
+        {
+            "command_id": "remote-quiesce",
+            "step": {"operation": "QUIESCE_GPU_SERVICES"},
+            "status": "SUCCEEDED",
+            "result_details": {"node_results": {}},
+        }
+    ]
+    assert verdicts.barrier_reason_errors(commands) == [
+        "there is not exactly one barrier remote command: 0"
+    ]
