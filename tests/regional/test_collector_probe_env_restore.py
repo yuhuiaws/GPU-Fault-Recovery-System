@@ -166,6 +166,23 @@ def test_fabric_manager_cursor_reads_the_persisted_offsets(
     assert broken is not None and "error" in broken
 
 
+def test_fabric_manager_cursor_candidates_include_the_deployed_state_path() -> None:
+    """The probe must look where the collector actually writes its cursor.
+
+    The src default (``FabricManagerLogCollector`` state_path) and the value
+    ``deploy/node/install-gpu-fault-collector.sh`` stamps into
+    ``GPU_FAULT_FABRIC_MANAGER_STATE_PATH`` both resolve to
+    ``/var/lib/gpu-fault/fabric-manager-collector-state.json``. When that path
+    was missing from ``FM_STATE_CANDIDATES`` the cursor read None on every real
+    node and COLLECT-005 failed its EOF claim against a healthy collector.
+    """
+
+    assert (
+        Path("/var/lib/gpu-fault/fabric-manager-collector-state.json")
+        in probe.FM_STATE_CANDIDATES
+    )
+
+
 def test_probe_exposes_the_light_reads_the_runners_poll() -> None:
     parser = probe.parser()
     handlers = {

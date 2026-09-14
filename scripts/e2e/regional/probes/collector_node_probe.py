@@ -18,6 +18,13 @@ from typing import Any
 COLLECTOR_ENV = Path("/etc/gpu-fault/collector.env")
 FM_LOG = Path("/var/log/fabricmanager.log")
 FM_STATE_CANDIDATES = (
+    # The path the collector actually writes: the src default and the value
+    # deploy/node/install-gpu-fault-collector.sh stamps into
+    # GPU_FAULT_FABRIC_MANAGER_STATE_PATH both resolve here. It was missing
+    # from this list, so fabric_manager_cursor() always read None on a real
+    # node and COLLECT-005 failed its "cursor caught up to EOF" claim even
+    # though the collector had checkpointed the log at its EOF.
+    Path("/var/lib/gpu-fault/fabric-manager-collector-state.json"),
     Path("/var/lib/gpu-fault/fabric-manager-offsets.json"),
     Path("/var/lib/gpu-fault/fabric-manager-state.json"),
 )
