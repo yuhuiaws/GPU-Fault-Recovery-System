@@ -48,7 +48,11 @@ OPERATION = "FREEZE_EVIDENCE"
 NODE_IDS = ["net003-synthetic-node"]
 DROP_ROLLBACK_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 30
-LEASE_SECONDS = 60
+# 90s (renews every 30s), not 60s (every 20s): the probe holds the command
+# leased at the action gate until the runner snapshots it and arms
+# /state/block, so the renewal budget must cover that handshake as well as the
+# result exchange, or a renewal would 409 against the terminal command.
+LEASE_SECONDS = 90
 ACTION_SECONDS = 5
 RESPONSE_QUIET_SECONDS = 2.0
 REPLAY_DELAY_SECONDS = 5.0
@@ -100,18 +104,21 @@ def timing_errors(
     replay delay -- has to finish before the executor's first lease renewal,
     because a renewal sent against the now-terminal command is refused with
     409 and would count as a renewal failure the case has no business
-    producing. That is why the lease is not shortened to 20s here: a 20s
-    lease renews every 6.7s and cannot fit the exchange.
+    producing. The probe also holds the command leased at the action gate
+    until the runner has snapshotted it and armed the block, so the renewal
+    budget must cover that handshake on top of the exchange; the margin below
+    reserves for it. That is why the lease is 90s (renews every 30s), not 60s
+    (every 20s) and not 20s (every 6.7s, too tight for the exchange alone).
     """
 
     errors: list[str] = []
     interval = renewal_interval_seconds(lease_seconds)
     exchange = ACTION_SECONDS + quiet_seconds + replay_delay_seconds
-    if exchange + 5 >= interval:
+    if exchange + 10 >= interval:
         errors.append(
-            f"result exchange takes {exchange:.1f}s (+5s margin), not inside the "
-            f"{interval:.1f}s renewal interval of a {lease_seconds}s lease; a "
-            "renewal against the terminal command would be refused"
+            f"result exchange takes {exchange:.1f}s (+10s gate/skew margin), not "
+            f"inside the {interval:.1f}s renewal interval of a {lease_seconds}s "
+            "lease; a renewal against the terminal command would be refused"
         )
     if quiet_seconds + replay_delay_seconds >= http_timeout_seconds:
         errors.append(
@@ -502,6 +509,14 @@ def _run_net003_case(
     write_json(case_dir / "leased-command.json", leased)
     if leased.get("status") != "LEASED" or not leased.get("lease_expires_at"):
         raise CaseError(f"command was not actively leased before injection: {leased}")
+    # The probe held the command leased at the action gate for the snapshot
+    # above; arm the block so it proceeds into the action and the lost-response
+    # exchange. The block only releases the action here -- it is never removed,
+    # because unlike NET-002 this case does not force the lease to expire.
+    fixture.touch(probe, "/state/block")
+    fixture.wait_file(probe, "/state/action-gate-observed.json", 30)
+    action_gate_observed = fixture.read_state(probe, "/state/action-gate-observed.json")
+    write_json(case_dir / "action-gate-observed.json", action_gate_observed)
     fixture.wait_file(probe, "/state/result-submit-started.json", 30)
     result_submit_started = fixture.read_state(
         probe, "/state/result-submit-started.json"

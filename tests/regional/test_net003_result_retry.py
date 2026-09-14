@@ -33,7 +33,9 @@ def _evidence(**overrides: Any) -> dict[str, Any]:
         "ready": _ready(),
         "leased": {
             "status": "LEASED",
-            "lease_expires_at": (T0 + timedelta(seconds=60)).isoformat(),
+            "lease_expires_at": (
+                T0 + timedelta(seconds=net003.LEASE_SECONDS)
+            ).isoformat(),
         },
         "committed": {"status": "SUCCEEDED", "lease_expires_at": None},
         "final": {
@@ -203,7 +205,7 @@ def test_timing_keeps_the_exchange_inside_the_first_renewal_interval() -> None:
         + net003.RESPONSE_QUIET_SECONDS
         + net003.REPLAY_DELAY_SECONDS
     )
-    assert exchange + 5 < net003.renewal_interval_seconds(net003.LEASE_SECONDS)
+    assert exchange + 10 < net003.renewal_interval_seconds(net003.LEASE_SECONDS)
 
 
 def test_a_twenty_second_lease_cannot_fit_the_exchange() -> None:
@@ -238,3 +240,36 @@ def test_the_private_seed_leases_the_workflow_to_the_probe(monkeypatch) -> None:
     assert calls[-1][-1] == str(seeded.SEED_LEASE_SECONDS)
     assert 'execution_owner_id=f"{owner}-seed"' in net003._SEED_COMMAND
     assert "execution_lease_expires_at=" in net003._SEED_COMMAND
+
+
+def test_the_probe_holds_its_action_behind_the_network_gate() -> None:
+    """The probe must not run its action until the runner has armed
+    /state/block, so the runner's leased snapshot cannot race the action that
+    commits the result; it records action-gate-observed once it proceeds."""
+    from pathlib import Path
+
+    source = (
+        Path(net003.__file__).resolve().parent / "probes" / "net003_executor.py"
+    ).read_text(encoding="utf-8")
+    assert 'BLOCK = STATE / "block"' in source
+    assert 'ACTION_GATE_OBSERVED = STATE / "action-gate-observed.json"' in source
+    gate = source.index("while not BLOCK.exists()")
+    observed = source.index("ACTION_GATE_OBSERVED.write_text")
+    action = source.index("time.sleep(5)")
+    assert gate < observed < action
+
+
+def test_the_runner_arms_the_gate_after_snapshotting_the_leased_command() -> None:
+    """The runner snapshots the leased command first, then arms /state/block
+    and waits for the probe to observe it. The block is never removed: unlike
+    NET-002 this case does not force the lease to expire."""
+    from pathlib import Path
+
+    source = Path(net003.__file__).read_text(encoding="utf-8")
+    snapshot = source.index('write_json(case_dir / "leased-command.json"')
+    lease_check = source.index("command was not actively leased before injection")
+    arm = source.index('fixture.touch(probe, "/state/block")')
+    observed = source.index('"/state/action-gate-observed.json"')
+    submit = source.index('"/state/result-submit-started.json"')
+    assert snapshot < lease_check < arm < observed < submit
+    assert 'fixture.remove(probe, "/state/block")' not in source

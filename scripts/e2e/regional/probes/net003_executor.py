@@ -37,6 +37,8 @@ STATE = Path("/state")
 DROP_NEXT = STATE / "drop-next"
 DROP_OBSERVED = STATE / "drop-observed.json"
 ACTION_STARTED = STATE / "action-started"
+BLOCK = STATE / "block"
+ACTION_GATE_OBSERVED = STATE / "action-gate-observed.json"
 LEDGER = STATE / "ledger.json"
 READY = STATE / "ready.json"
 EXECUTOR_STATE = STATE / "executor-state.json"
@@ -83,6 +85,30 @@ class LedgerAdapter:
             )
             cached = context.idempotency_key in document["keys"]
         if not cached:
+            # Hold the command LEASED at the action gate until the runner has
+            # armed the block, so its leased snapshot cannot race the action
+            # that commits the result: an ungated 5s action outran the runner's
+            # exec+DB round-trip and the command could commit SUCCEEDED before
+            # the runner observed LEASED. Unlike NET-002 the block only gates
+            # the action here (never a forced lease expiry), so the runner arms
+            # it once and never removes it.
+            deadline = time.monotonic() + 30
+            while not BLOCK.exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "network block was not armed before the simulated action"
+                    )
+                time.sleep(0.05)
+            ACTION_GATE_OBSERVED.write_text(
+                json.dumps(
+                    {
+                        "idempotency_key": context.idempotency_key,
+                        "observed_at_epoch": time.time(),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
             time.sleep(5)
         with self._lock:
             document = (
