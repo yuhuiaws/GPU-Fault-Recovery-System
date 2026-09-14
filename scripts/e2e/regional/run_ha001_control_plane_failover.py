@@ -21,6 +21,7 @@ if __package__:
     from .live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
+        details_sha256,
         install_site_profile,
     )
     from .live_driver_guard import authorize_execution as guard_authorize_execution
@@ -34,6 +35,7 @@ else:
     from live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
+        details_sha256,
         install_site_profile,
     )
     from live_driver_guard import authorize_execution as guard_authorize_execution
@@ -494,14 +496,35 @@ def build_plan(run_dir: Path, attempt: int) -> dict:
         for app in (INGRESS_APP, WORKER_APP)
     }
     scope = current_acceptance_scope()
+    details = {
+        "risk": "live-control-plane-pod-deletion",
+        "mutation": (
+            "delete one ingress and two control-worker Pods in three staged "
+            "phases; Pod deletion only, with no Deployment spec or node "
+            "change, and the ReplicaSets recreate the deleted Pods"
+        ),
+        "targets": [
+            {"phase": "ingress-1", "app": INGRESS_APP, **ingress[0]},
+            {"phase": "worker-1", "app": WORKER_APP, **workers[0]},
+            {"phase": "worker-2", "app": WORKER_APP, **workers[1]},
+        ],
+        "node_mutation": None,
+        "minimum_ready": minimum_ready,
+        "failure_window_limits": {
+            app: item["limit_seconds"] for app, item in limits.items()
+        },
+        "maintenance_window_required_at_execute": True,
+    }
     plan = {
-        "schema_version": 3,
+        "schema_version": 2,
         "case_id": CASE_ID,
         "attempt": attempt,
         "confirmation": CONFIRMATION,
         "environment": environment_values(),
         "site_profile": applied_site_profile(),
         **scope.plan_fields(),
+        "details": details,
+        "details_sha256": details_sha256(details),
         "mutation_performed": False,
         "region": AWS_REGION,
         "cpu_kubeconfig": str(CPU_KUBECONFIG),

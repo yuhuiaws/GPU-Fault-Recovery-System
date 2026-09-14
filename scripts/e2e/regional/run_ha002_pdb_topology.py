@@ -18,6 +18,7 @@ if __package__:
     from .live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
+        details_sha256,
         install_site_profile,
     )
     from .live_driver_guard import (
@@ -34,6 +35,7 @@ else:
     from live_driver_guard import (
         add_live_arguments,
         applied_site_profile,
+        details_sha256,
         install_site_profile,
     )
     from live_driver_guard import (
@@ -398,14 +400,35 @@ def build_plan(run_dir: Path, attempt: int) -> dict[str, Any]:
         for app in (COMMON.INGRESS_APP, COMMON.WORKER_APP)
     }
     scope = current_acceptance_scope()
+    details = {
+        "risk": "live-control-plane-pdb-eviction",
+        "mutation": (
+            "cordon one CPU node and issue Eviction API calls against its "
+            "same-role Pods to prove the PodDisruptionBudget rejects the "
+            "second same-role disruption; no Deployment spec change; the "
+            "node is uncordoned in a finally block"
+        ),
+        "target_node": selected["node"]["name"],
+        "target_pods": {
+            "ingress": [selected["ingress"][0]["name"]],
+            "workers": [item["name"] for item in selected["workers"][:2]],
+            "spool_worker": [item["name"] for item in selected["spool_workers"][:1]],
+        },
+        "failure_window_limits": {
+            app: item["limit_seconds"] for app, item in limits.items()
+        },
+        "maintenance_window_required_at_execute": True,
+    }
     plan = {
-        "schema_version": 3,
+        "schema_version": 2,
         "case_id": CASE_ID,
         "attempt": attempt,
         "confirmation": CONFIRMATION,
         "environment": COMMON.environment_values(),
         "site_profile": applied_site_profile(),
         **scope.plan_fields(),
+        "details": details,
+        "details_sha256": details_sha256(details),
         "mutation_performed": False,
         "region": COMMON.AWS_REGION,
         "maintenance_window_required_at_execute": True,
