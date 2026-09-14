@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import net_command_fixture as fixture  # noqa: E402
+from scripts.e2e.regional import seeded_command_fixture as seeded  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
 )
@@ -210,10 +211,17 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner, notification_id, deduplication_key, raw_node_ids = (
-    sys.argv[1:]
-)
+(
+    run_id,
+    cluster_id,
+    owner,
+    notification_id,
+    deduplication_key,
+    raw_node_ids,
+    raw_lease_seconds,
+) = sys.argv[1:]
 node_ids = [item for item in raw_node_ids.split(",") if item]
+lease_seconds = int(raw_lease_seconds)
 incident_id = f"incident-{run_id}"
 workflow_id = f"workflow-actionperf-{run_id}"
 command_id = f"remote-{run_id}"
@@ -235,6 +243,11 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Leased to the probe's seed identity exactly like the shared seed
+# (seeded_command_fixture, commit 87c2697): the deployed dispatcher wakes on
+# the workflow save and claims an unleased PENDING row within the second,
+# drives its step against a node no cluster carries, fails it, and the orphan
+# sweep then cancels the command before the probe can claim it.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
@@ -242,6 +255,9 @@ workflow = WorkflowRequest(
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 notification = AdvisoryNotification(
     notification_id=notification_id,
@@ -296,6 +312,7 @@ def seed_command(run_id: str) -> dict[str, Any]:
         f"notification-{run_id}",
         f"{run_id}/result-retry",
         ",".join(NODE_IDS),
+        str(seeded.SEED_LEASE_SECONDS),
     )
 
 

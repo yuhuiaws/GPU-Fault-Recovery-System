@@ -221,3 +221,20 @@ def test_plan_details_carry_the_predecessor_and_the_loss_mode() -> None:
     assert details["predecessor"] is predecessor
     assert details["response_loss_mode"] == "forward-then-reset"
     assert details["terminal_result_replays"] == 1
+
+
+def test_the_private_seed_leases_the_workflow_to_the_probe(monkeypatch) -> None:
+    """NET-003 seeds its own workflow (a notification rides along too); it must
+    carry the same probe-owned execution lease as the shared seed, or the
+    deployed dispatcher claims and fails it on the save-triggered wakeup within
+    the second, then the orphan sweep cancels the command."""
+    from scripts.e2e.regional import seeded_command_fixture as seeded
+
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        net003.fixture, "cpu_python", lambda script, *args: calls.append(args) or {}
+    )
+    net003.seed_command("run")
+    assert calls[-1][-1] == str(seeded.SEED_LEASE_SECONDS)
+    assert 'execution_owner_id=f"{owner}-seed"' in net003._SEED_COMMAND
+    assert "execution_lease_expires_at=" in net003._SEED_COMMAND
