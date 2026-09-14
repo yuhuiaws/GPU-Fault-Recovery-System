@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from scripts.e2e.regional import run_net003_result_retry as net003
 
@@ -246,8 +251,6 @@ def test_the_probe_holds_its_action_behind_the_network_gate() -> None:
     """The probe must not run its action until the runner has armed
     /state/block, so the runner's leased snapshot cannot race the action that
     commits the result; it records action-gate-observed once it proceeds."""
-    from pathlib import Path
-
     source = (
         Path(net003.__file__).resolve().parent / "probes" / "net003_executor.py"
     ).read_text(encoding="utf-8")
@@ -263,8 +266,6 @@ def test_the_runner_arms_the_gate_after_snapshotting_the_leased_command() -> Non
     """The runner snapshots the leased command first, then arms /state/block
     and waits for the probe to observe it. The block is never removed: unlike
     NET-002 this case does not force the lease to expire."""
-    from pathlib import Path
-
     source = Path(net003.__file__).read_text(encoding="utf-8")
     snapshot = source.index('write_json(case_dir / "leased-command.json"')
     lease_check = source.index("command was not actively leased before injection")
@@ -273,3 +274,94 @@ def test_the_runner_arms_the_gate_after_snapshotting_the_leased_command() -> Non
     submit = source.index('"/state/result-submit-started.json"')
     assert snapshot < lease_check < arm < observed < submit
     assert 'fixture.remove(probe, "/state/block")' not in source
+
+
+def _fake_replay(command_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        command_id=command_id,
+        status=SimpleNamespace(value="SUCCEEDED"),
+        status_source="control-plane",
+        updated_at=T0 + timedelta(seconds=7),
+    )
+
+
+def _interrupting_client(tmp_path, monkeypatch):
+    """A probe client with its /state writes redirected into a temp dir and its
+    replay backoff neutralised, so complete()'s classification can be exercised
+    without a live control plane."""
+    from scripts.e2e.regional.probes import net003_executor as probe
+
+    for attr in (
+        "RESULT_SUBMIT_STARTED",
+        "RESULT_INTERRUPTED",
+        "RESULT_REPLAYS",
+        "DROP_NEXT",
+    ):
+        monkeypatch.setattr(probe, attr, tmp_path / attr.lower())
+    monkeypatch.setattr(probe.time, "sleep", lambda *_a, **_k: None)
+    client = probe.InterruptingRegionalExecutorClient.__new__(
+        probe.InterruptingRegionalExecutorClient
+    )
+    client._drop_injected = False
+    return probe, client
+
+
+def test_a_reset_with_no_status_code_is_a_lost_response_and_is_replayed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reset this case injects reaches the client as a ClusterExecutorError
+    with status_code None -- no verdict was received -- so the probe records an
+    interrupted first post and replays the same terminal result exactly once."""
+    probe, client = _interrupting_client(tmp_path, monkeypatch)
+    calls: list[int] = []
+
+    def fake_complete(self, command, result):
+        calls.append(1)
+        if len(calls) == 1:
+            raise probe.ClusterExecutorError(
+                "regional control plane request failed: connection reset",
+                status_code=None,
+            )
+        return _fake_replay(command.command_id)
+
+    monkeypatch.setattr(probe.RegionalExecutorClient, "complete", fake_complete)
+    command = SimpleNamespace(command_id="cmd-net003")
+
+    returned = client.complete(command, {"status": "SUCCEEDED"})
+
+    assert len(calls) == 2  # first post lost its response, then one replay
+    interrupted = json.loads(probe.RESULT_INTERRUPTED.read_text(encoding="utf-8"))
+    assert interrupted["first_post_succeeded"] is False
+    assert interrupted["exception"] == "ClusterExecutorError"
+    replays = json.loads(probe.RESULT_REPLAYS.read_text(encoding="utf-8"))
+    assert replays["count"] == 1
+    assert replays["responses"][0]["status"] == "SUCCEEDED"
+    assert returned.status.value == "SUCCEEDED"
+
+
+def test_an_http_rejection_surfaces_and_is_never_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ClusterExecutorError carrying a real HTTP status is an answer the
+    client received; it must surface as the rejection it is and never be
+    mistaken for the lost-response window, so no interrupted record is written
+    and no replay is sent."""
+    probe, client = _interrupting_client(tmp_path, monkeypatch)
+    calls: list[int] = []
+
+    def fake_complete(self, command, result):
+        calls.append(1)
+        raise probe.ClusterExecutorError(
+            "regional control plane rejected the command", status_code=409
+        )
+
+    monkeypatch.setattr(probe.RegionalExecutorClient, "complete", fake_complete)
+    command = SimpleNamespace(command_id="cmd-net003")
+
+    with pytest.raises(probe.ClusterExecutorError) as caught:
+        client.complete(command, {"status": "SUCCEEDED"})
+
+    assert caught.value.status_code == 409
+    assert len(calls) == 1  # rejected, not replayed
+    assert not probe.RESULT_INTERRUPTED.exists()
+    assert not probe.RESULT_REPLAYS.exists()

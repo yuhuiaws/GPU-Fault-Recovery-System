@@ -166,11 +166,17 @@ class InterruptingRegionalExecutorClient(RegionalExecutorClient):
         DROP_NEXT.touch()
         try:
             first = super().complete(command, result)
-        except ClusterExecutorError:
-            # A 4xx/5xx is an answer the client did receive; that is not the
-            # lost-response window and must surface as the rejection it is.
-            raise
         except Exception as exc:  # noqa: BLE001 - the transport error under test
+            # The regional client wraps BOTH a real HTTP rejection and a
+            # transport failure into ClusterExecutorError; status_code tells
+            # them apart (regional_client._send: a None status is "no answer,
+            # safe to retry"). A verdict the client DID receive (non-None
+            # status) is not the lost-response window and surfaces as the
+            # rejection it is; a None status -- or any other transport
+            # exception -- is the connection reset this case injects, which the
+            # client must treat as a lost response and replay once.
+            if isinstance(exc, ClusterExecutorError) and exc.status_code is not None:
+                raise
             interrupted = {
                 "command_id": command.command_id,
                 "exception": type(exc).__name__,
