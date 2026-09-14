@@ -271,7 +271,7 @@ def test_observe_phase_reports_cap_reached_when_never_settled(monkeypatch) -> No
 def _closure(statuses: list[str], owners: list[str | None], cached: list[bool]) -> dict:
     return {
         "workflow_id": "workflow-x",
-        "workflow_status_observed": "BLOCKED",
+        "workflow_status_observed": "PENDING",
         "commands": [
             {
                 "command_id": f"remote-x-{index}",
@@ -313,8 +313,10 @@ def test_closure_is_judged_from_control_plane_records_not_a_runner_write() -> No
 
     assert summary["succeeded_by_step_index"] == {"0": 1, "1": 1, "2": 1}
     assert summary["physical_executions"] == 3
-    assert summary["workflow_status_observed"] == "BLOCKED", (
-        "the runner records the workflow as the control plane left it"
+    assert summary["workflow_status_observed"] == "PENDING", (
+        "the runner records the workflow as the control plane left it; the seed\n"
+        "is PENDING under its own lease, never BLOCKED, or the orphan sweep\n"
+        "would cancel the open commands"
     )
     assert ha001.closure_errors(SEED, summary, executor_id=executor) == []
     assert not hasattr(ha001, "finalize_closure"), (

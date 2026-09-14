@@ -51,6 +51,10 @@ CASE_ID = "GF-REGIONAL-HA-001"
 CONFIGMAP = "gpu-fault-ha001-probe"
 PROBE_POD = "gpu-fault-ha001-probe"
 OWNER = "gpu-fault-ha-test"
+# Lease held by the seeded workflow's seed identity; the closure completes
+# within seconds of the seed and cleanup deletes the rows, so this only has to
+# outlive the case (see seed_closure).
+SEED_LEASE_SECONDS = 30 * 60
 CONFIRMATION = "HA001_DELETE_CONTROL_PODS"
 INGRESS_APP = "gpu-fault-api-ha"
 WORKER_APP = "gpu-fault-control-worker"
@@ -988,6 +992,7 @@ def seed_closure(run_id: str, cluster_id: str) -> dict:
     script = r"""
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     FaultIncident,
@@ -999,7 +1004,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner = sys.argv[1:]
+run_id, cluster_id, owner, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 incident_id = f"incident-{run_id}"
 event_id = f"event-{run_id}"
 workflow_id = f"workflow-{run_id}"
@@ -1025,14 +1031,23 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Leased to a seed identity, never BLOCKED. The dispatcher's orphan sweep
+# cancels every open command of a terminal workflow (BLOCKED included), and
+# because the completion route wakes the dispatcher it did so 50 ms after the
+# probe completed step 0 of HA-001 (attempt 3, 2026-09-14), failing the
+# remaining PENDING commands before the probe could claim them. A PENDING
+# workflow under an unexpired foreign lease is live work only its lease holder
+# may drive; the probe alone claims the commands, and cleanup deletes the rows.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
-    status=WorkflowStatus.BLOCKED,
+    status=WorkflowStatus.PENDING,
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=steps,
-    blocked_reasons=["synthetic HA-001 executor-only closure"],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 store = ApplicationContext.from_environment().store
 store.save_incident(incident)
@@ -1061,7 +1076,9 @@ print(json.dumps({
     "operations": [item.value for item in operations],
 }, sort_keys=True))
 """
-    return cpu_python(script, run_id, cluster_id, OWNER, attempts=1)
+    return cpu_python(
+        script, run_id, cluster_id, OWNER, str(SEED_LEASE_SECONDS), attempts=1
+    )
 
 
 def closure_status(seed: dict) -> dict:

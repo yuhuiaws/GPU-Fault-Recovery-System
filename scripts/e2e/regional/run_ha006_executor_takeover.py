@@ -50,6 +50,9 @@ CONFIGMAP = "gpu-fault-ha006-executor"
 PODS = ("gpu-fault-ha006-a", "gpu-fault-ha006-b")
 CASE_ID = "GF-REGIONAL-HA-006"
 OWNER = "gpu-fault-ha006-test"
+# Lease held by the seeded workflow's seed identity; must outlive the case
+# (see seed_command), cleanup deletes the rows.
+SEED_LEASE_SECONDS = 30 * 60
 LEASE_SECONDS = 30
 WINNER_SLEEP_SECONDS = 60
 # The fixture executors poll every second but back off up to this after idle
@@ -240,6 +243,7 @@ def seed_command(run_id: str) -> dict:
     script = r"""
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
     FaultIncident,
@@ -251,7 +255,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id, owner = sys.argv[1:]
+run_id, cluster_id, owner, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 incident_id = f"incident-{run_id}"
 event_id = f"event-{run_id}"
 workflow_id = f"workflow-actionperf-{run_id}"
@@ -273,14 +278,23 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Leased to a seed identity, never BLOCKED. The dispatcher's orphan sweep
+# cancels every open command of a terminal workflow (BLOCKED included), and
+# because the completion route wakes the dispatcher it did so 50 ms after the
+# probe completed step 0 of HA-001 (attempt 3, 2026-09-14), failing the
+# remaining PENDING commands before the probe could claim them. A PENDING
+# workflow under an unexpired foreign lease is live work only its lease holder
+# may drive; the probe alone claims the commands, and cleanup deletes the rows.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
-    status=WorkflowStatus.BLOCKED,
+    status=WorkflowStatus.PENDING,
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step],
-    blocked_reasons=["synthetic HA-006 executor takeover"],
+    execution_owner_id=f"{owner}-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 command = RemoteActionCommand(
     command_id=command_id,
@@ -306,7 +320,7 @@ print(json.dumps({
     "deduplication_key": f"{run_id}/shared-action-ledger",
 }, sort_keys=True))
 """
-    return cpu_python(script, run_id, "perf-cap-000", OWNER)
+    return cpu_python(script, run_id, "perf-cap-000", OWNER, str(SEED_LEASE_SECONDS))
 
 
 def command_snapshot(command_id: str) -> dict:

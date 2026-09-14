@@ -85,6 +85,10 @@ POOL_METRIC_NAMES = (
     "gpu_fault_aurora_credential_refresh_last_success_age_seconds",
 )
 BUDGET_MARGIN_SECONDS = 600
+# Lease held by the seeded workflow's seed identity for the whole case: the
+# seeded rows are read until the last phase, and an expired lease would let
+# the dispatcher claim and drive the workflow (see seed_runtime_records).
+SEED_LEASE_SECONDS = sum(PHASE_BUDGETS.values()) + BUDGET_MARGIN_SECONDS
 # If the runner dies after rotate-secret and before the refresh Job ran, every
 # new Pod fails Aurora auth until someone refreshes the Secret. The watchdog
 # creates the Job itself once the runner's own rotation-plus-refresh budget has
@@ -658,7 +662,8 @@ from gpu_fault.models import (
 )
 from gpu_fault.regional import RemoteActionCommand
 
-run_id, cluster_id = sys.argv[1:]
+run_id, cluster_id, raw_lease_seconds = sys.argv[1:]
+lease_seconds = int(raw_lease_seconds)
 incident_id = f"incident-{run_id}"
 event_id = f"event-{run_id}"
 workflow_id = f"workflow-actionperf-{run_id}"
@@ -682,14 +687,23 @@ incident = FaultIncident(
     fencing_token=1,
     drill_id=run_id,
 )
+# Leased to a seed identity, never BLOCKED. The dispatcher's orphan sweep
+# cancels every open command of a terminal workflow (BLOCKED included), and
+# because the completion route wakes the dispatcher it did so 50 ms after the
+# probe completed step 0 of HA-001 (attempt 3, 2026-09-14), failing the
+# remaining PENDING commands before the probe could claim them. A PENDING
+# workflow under an unexpired foreign lease is live work only its lease holder
+# may drive; the probe alone claims the commands, and cleanup deletes the rows.
 workflow = WorkflowRequest(
     request_id=workflow_id,
     incident_id=incident_id,
-    status=WorkflowStatus.BLOCKED,
+    status=WorkflowStatus.PENDING,
     official_action="NO_ACTION",
     fencing_token=1,
     official_steps=[step],
-    blocked_reasons=["synthetic HA-009 credential-rotation check"],
+    execution_owner_id="gpu-fault-ha009-seed",
+    execution_epoch=1,
+    execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=lease_seconds),
 )
 command = RemoteActionCommand(
     command_id=command_id,
@@ -729,7 +743,7 @@ print(json.dumps({
     "deduplication_key": dedup_key,
 }, sort_keys=True))
 """
-    return BASE.cpu_python(script, run_id, "perf-cap-000")
+    return BASE.cpu_python(script, run_id, "perf-cap-000", str(SEED_LEASE_SECONDS))
 
 
 def runtime_snapshot(seed: dict) -> dict:
