@@ -210,6 +210,81 @@ def predecessor_identity_errors(
     return errors
 
 
+def _read_predecessor_evidence(
+    path: Path,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    """The parsed evidence, or (None, MISSING|INVALID, why)."""
+
+    if not path.is_file():
+        return None, "MISSING", "predecessor evidence does not exist"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, "INVALID", f"cannot read predecessor evidence: {exc}"
+    if not isinstance(value, dict):
+        return None, "INVALID", "predecessor evidence is not a JSON object"
+    return value, "", None
+
+
+def predecessor_evidence_facts(
+    path: Path,
+    expected_case_id: str,
+    *,
+    release_id: str | None = None,
+    cluster_id: str | None = None,
+) -> dict[str, Any]:
+    """What the predecessor's evidence file says, independent of the scope gate.
+
+    ``evidence_valid`` is true only for a PASS of the expected case whose
+    top-level ``release_id``/``cluster_id`` equal the identity asked for; the
+    reason it is not is ``evidence_error``. A successor that *reuses* the
+    predecessor's recorded facts (DESTR-012 group A reads DESTR-009's compiled
+    steps) needs this answer whether or not the operator waived the sequence.
+    """
+
+    value, _code, read_error = _read_predecessor_evidence(path)
+    facts: dict[str, Any] = {
+        "evidence_valid": False,
+        "evidence_case_id": None,
+        "evidence_verdict": None,
+        "evidence_execution_scope": None,
+        "evidence_release_id": None,
+        "evidence_cluster_id": None,
+        "expected_release_id": release_id,
+        "expected_cluster_id": cluster_id,
+        "evidence_error": read_error,
+    }
+    if value is None:
+        return facts
+    actual_case_id = str(value.get("case_id") or "")
+    verdict = str(value.get("verdict") or "")
+    identity_errors = predecessor_identity_errors(
+        value,
+        release_id=release_id,
+        cluster_id=cluster_id,
+    )
+    if actual_case_id != expected_case_id or verdict != "PASS":
+        error: str | None = "predecessor case must have verdict PASS"
+    elif identity_errors:
+        error = "; ".join(identity_errors)
+    else:
+        error = None
+    facts.update(
+        {
+            "evidence_valid": error is None,
+            "evidence_case_id": actual_case_id,
+            "evidence_verdict": verdict,
+            "evidence_execution_scope": str(
+                value.get("execution_scope") or FORMAL_SCOPE
+            ),
+            "evidence_release_id": value.get("release_id"),
+            "evidence_cluster_id": value.get("cluster_id"),
+            "evidence_error": error,
+        }
+    )
+    return facts
+
+
 def predecessor_evidence(
     path: Path,
     expected_case_id: str,
@@ -223,9 +298,24 @@ def predecessor_evidence(
     top-level fields of the same name; the successor obtains both from
     ``RegionalLiveFixture.evidence_identity``. Left as ``None`` the identity is
     not checked, which is the pre-binding behaviour.
+
+    Selective scope waives the *sequence gate* -- the record says
+    ``SKIPPED_BY_OPERATOR`` and execution is allowed -- but not the facts:
+    ``evidence_valid`` and the ``evidence_*`` fields still describe the file,
+    so a successor that reuses the predecessor's recorded facts can tell a
+    bound PASS from a missing or foreign one. The old early return reported
+    ``evidence_valid`` false without looking, and on 2026-09-14 failed
+    DESTR-012 group A against a DESTR-009 PASS recorded minutes earlier on the
+    same release and cluster.
     """
 
     scope = current_acceptance_scope()
+    facts = predecessor_evidence_facts(
+        path,
+        expected_case_id,
+        release_id=release_id,
+        cluster_id=cluster_id,
+    )
     if scope.selective:
         return {
             "path": str(path),
@@ -235,89 +325,49 @@ def predecessor_evidence(
             "status": "SKIPPED_BY_OPERATOR",
             "valid": True,
             "execution_allowed": True,
-            "evidence_valid": False,
+            **facts,
             **scope.result_fields(),
             "error": None,
         }
-    if not path.is_file():
+    value, code, read_error = _read_predecessor_evidence(path)
+    if value is None:
         return {
             "path": str(path),
             "case_id": expected_case_id,
-            "verdict": "MISSING",
+            "verdict": code,
             "valid": False,
             "execution_allowed": False,
-            "evidence_valid": False,
+            **facts,
             **scope.plan_fields(),
             "formal_sequence_satisfied": False,
-            "error": "predecessor evidence does not exist",
+            "error": read_error,
         }
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {
-            "path": str(path),
-            "case_id": expected_case_id,
-            "verdict": "INVALID",
-            "valid": False,
-            "execution_allowed": False,
-            "evidence_valid": False,
-            **scope.plan_fields(),
-            "formal_sequence_satisfied": False,
-            "error": f"cannot read predecessor evidence: {exc}",
-        }
-    if not isinstance(value, dict):
-        return {
-            "path": str(path),
-            "case_id": expected_case_id,
-            "verdict": "INVALID",
-            "valid": False,
-            "execution_allowed": False,
-            "evidence_valid": False,
-            **scope.plan_fields(),
-            "formal_sequence_satisfied": False,
-            "error": "predecessor evidence is not a JSON object",
-        }
-    actual_case_id = str(value.get("case_id") or "")
-    verdict = str(value.get("verdict") or "")
-    evidence_scope = str(value.get("execution_scope") or FORMAL_SCOPE)
+    evidence_scope = str(facts["evidence_execution_scope"])
     formal_sequence_satisfied = bool(
         value.get(
             "formal_sequence_satisfied",
             evidence_scope == FORMAL_SCOPE,
         )
     )
-    identity_errors = predecessor_identity_errors(
-        value,
-        release_id=release_id,
-        cluster_id=cluster_id,
+    valid = bool(
+        facts["evidence_valid"]
+        and evidence_scope == FORMAL_SCOPE
+        and formal_sequence_satisfied
     )
-    evidence_valid = (
-        actual_case_id == expected_case_id and verdict == "PASS" and not identity_errors
-    )
-    valid = (
-        evidence_valid and evidence_scope == FORMAL_SCOPE and formal_sequence_satisfied
-    )
-    if actual_case_id != expected_case_id or verdict != "PASS":
-        error = "predecessor case must have verdict PASS"
-    elif identity_errors:
-        error = "; ".join(identity_errors)
+    if facts["evidence_error"]:
+        error = facts["evidence_error"]
     elif evidence_scope != FORMAL_SCOPE or not formal_sequence_satisfied:
         error = "selective evidence cannot satisfy a formal predecessor"
     else:
         error = None
     return {
         "path": str(path),
-        "case_id": actual_case_id,
+        "case_id": facts["evidence_case_id"],
         "expected_case_id": expected_case_id,
-        "verdict": verdict,
+        "verdict": facts["evidence_verdict"],
         "valid": valid,
         "execution_allowed": valid,
-        "evidence_valid": evidence_valid,
-        "evidence_execution_scope": evidence_scope,
-        "evidence_release_id": value.get("release_id"),
-        "evidence_cluster_id": value.get("cluster_id"),
-        "expected_release_id": release_id,
-        "expected_cluster_id": cluster_id,
+        **facts,
         **scope.plan_fields(),
         "formal_sequence_satisfied": valid,
         "error": error,

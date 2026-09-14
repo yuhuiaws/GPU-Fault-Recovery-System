@@ -24,7 +24,7 @@
     "deploy/node/install-gpu-fault-collector.sh": 1937,
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1706,
     "scripts/e2e/regional/identity_acceptance_auth.py": 1786,
-    "scripts/e2e/regional/regional_live_fixture.py": 1655,
+    "scripts/e2e/regional/regional_live_fixture.py": 1705,
     "scripts/e2e/regional/run_collector_acceptance.py": 1772,
     "scripts/e2e/regional/run_collector_destructive.py": 1886,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1663,
@@ -45,6 +45,7 @@
     "src/gpu_fault_release/regional_admin_checks.py": 1727,
     "src/gpu_fault_release/regional_release_orchestration.py": 2004,
     "tests/processor/test_telemetry_spool.py": 1673,
+    "tests/regional/test_destructive_acceptance_fixtures.py": 1534,
     "tests/regional/test_regional_admin_checks.py": 1614
   },
   "functions": {

@@ -142,10 +142,53 @@ def test_selective_predecessor_is_explicitly_skipped(
     assert result["valid"] is True, result
     assert result["execution_allowed"] is True, result
     assert result["evidence_valid"] is False, result
+    assert result["evidence_error"] == "predecessor evidence does not exist", result
     assert result["verdict"] == "SKIPPED_BY_OPERATOR", result
     assert result["execution_scope"] == "selective", result
     assert result["formal_sequence_satisfied"] is False, result
     assert result["selection_reference"] == "CHG-DESTR001-SELECTIVE", result
+
+
+def test_selective_predecessor_still_reports_the_evidence_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's selection waives the sequence gate, not the facts: a
+    successor that reuses the predecessor's recorded evidence (DESTR-012 group A
+    reads DESTR-009's steps) must still learn whether the file is a PASS bound
+    to this release and cluster."""
+    monkeypatch.setenv(EXECUTION_SCOPE_ENV, "selective")
+    monkeypatch.setenv(SELECTION_REFERENCE_ENV, "CHG-DESTR012-SELECTIVE")
+    path = tmp_path / "predecessor.json"
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": "GF-REGIONAL-DESTR-009",
+                "verdict": "PASS",
+                "execution_scope": "selective",
+                "release_id": "release-a",
+                "cluster_id": "cluster-a",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bound = predecessor_evidence(
+        path, "GF-REGIONAL-DESTR-009", release_id="release-a", cluster_id="cluster-a"
+    )
+    assert bound["verdict"] == "SKIPPED_BY_OPERATOR", bound
+    assert bound["valid"] is True and bound["execution_allowed"] is True, bound
+    assert bound["evidence_valid"] is True, bound
+    assert bound["evidence_verdict"] == "PASS", bound
+    assert bound["evidence_error"] is None, bound
+    assert bound["formal_sequence_satisfied"] is False, bound
+
+    foreign = predecessor_evidence(
+        path, "GF-REGIONAL-DESTR-009", release_id="release-b", cluster_id="cluster-a"
+    )
+    assert foreign["verdict"] == "SKIPPED_BY_OPERATOR", foreign
+    assert foreign["valid"] is True, foreign
+    assert foreign["evidence_valid"] is False, foreign
+    assert foreign["evidence_error"] == "release_id mismatch", foreign
 
 
 def test_formal_predecessor_rejects_selective_pass(tmp_path: Path) -> None:

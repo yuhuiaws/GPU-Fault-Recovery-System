@@ -548,7 +548,13 @@ def group_a_from_evidence(
     if not predecessor.get("evidence_valid"):
         result["error"] = (
             "DESTR-009 evidence is not a PASS bound to this release/cluster "
-            f"({predecessor.get('error') or predecessor.get('verdict')}); {remedy}"
+            "("
+            + str(
+                predecessor.get("evidence_error")
+                or predecessor.get("error")
+                or predecessor.get("verdict")
+            )
+            + f"); {remedy}"
         )
         return result
     try:
