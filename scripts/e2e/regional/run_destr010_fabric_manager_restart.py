@@ -415,7 +415,10 @@ outcome = adapter.execute(
         incident=command.incident,
         step=command.step,
         step_index=command.step_index,
-        request=executor._execution_request(command),
+        # The request builder lives on the executor's dispatch layer since the
+        # 2026-09-09 layer split (130be28); the private executor method it
+        # replaced is gone from the deployed image (DESTR-010, 2026-09-14).
+        request=executor.dispatch.execution_request(command),
         idempotency_key=command.idempotency_key,
     )
 )
