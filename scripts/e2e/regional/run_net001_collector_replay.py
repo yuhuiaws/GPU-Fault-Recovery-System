@@ -28,6 +28,7 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     predecessor_path,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
+    business_workload_items,
     predecessor_evidence,
 )
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
@@ -348,19 +349,13 @@ class Runner:
                 "json",
             ).stdout
         )
-        allowed_namespaces = {
-            "aws-hyperpod",
-            self.settings.namespace,
-            "kube-system",
-        }
-        return [
-            {
-                "namespace": str(item["metadata"].get("namespace", "")),
-                "name": str(item["metadata"].get("name", "")),
-            }
-            for item in payload.get("items", [])
-            if item["metadata"].get("namespace") not in allowed_namespaces
-        ]
+        # One definition for the whole runner family: infrastructure
+        # namespaces never count, the solution's namespace counts only for
+        # GPU-holding Pods (live 2026-09-14: a private allowlist refused the
+        # target node for hosting cert-manager and the inference router).
+        return business_workload_items(
+            payload.get("items", []), namespace=self.settings.namespace
+        )
 
     def select_worker(self) -> str:
         if self.worker_pod:

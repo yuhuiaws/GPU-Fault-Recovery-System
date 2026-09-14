@@ -787,6 +787,67 @@ print(json.dumps({
 """
 
 
+# Cluster infrastructure a GPU node hosts without it being anyone's training
+# job. Every runner that asks "does this node run a business workload" must
+# share this list: NET-001 kept its own shorter copy and refused a node for
+# hosting cert-manager and the inference router.
+SYSTEM_NAMESPACES = frozenset(
+    {
+        "aws-hyperpod",
+        "cert-manager",
+        "hyperpod-inference-system",
+        "kube-system",
+        "kubeflow",
+    }
+)
+
+
+def pod_gpu_count(item: dict[str, Any]) -> int:
+    """The largest ``nvidia.com/gpu`` request or limit across containers."""
+
+    gpu_count = 0
+    for container in item.get("spec", {}).get("containers", []):
+        resources = container.get("resources", {})
+        for values in (
+            resources.get("requests", {}),
+            resources.get("limits", {}),
+        ):
+            try:
+                gpu_count = max(
+                    gpu_count,
+                    int(values.get("nvidia.com/gpu", 0)),
+                )
+            except (TypeError, ValueError):
+                pass
+    return gpu_count
+
+
+def business_workload_items(
+    items: list[dict[str, Any]], *, namespace: str
+) -> list[dict[str, str]]:
+    """The Pods among ``items`` that count as somebody's business workload.
+
+    Infrastructure namespaces never count; the solution's own namespace counts
+    only for Pods that hold a GPU (the acceptance training jobs), so the
+    executor and agents on a node do not read as a workload.
+    """
+
+    result = []
+    for item in items:
+        pod_namespace = str(item["metadata"].get("namespace", ""))
+        if pod_namespace in SYSTEM_NAMESPACES:
+            continue
+        if pod_namespace == namespace and pod_gpu_count(item) <= 0:
+            continue
+        result.append(
+            {
+                "namespace": pod_namespace,
+                "name": str(item["metadata"].get("name", "")),
+            }
+        )
+    return result
+
+
 class RegionalLiveFixture:
     def __init__(self, settings: RegionalLiveSettings) -> None:
         self.settings = settings
@@ -1317,21 +1378,7 @@ class RegionalLiveFixture:
     def pod_gpu_count(item: dict[str, Any]) -> int:
         """The largest ``nvidia.com/gpu`` request or limit across containers."""
 
-        gpu_count = 0
-        for container in item.get("spec", {}).get("containers", []):
-            resources = container.get("resources", {})
-            for values in (
-                resources.get("requests", {}),
-                resources.get("limits", {}),
-            ):
-                try:
-                    gpu_count = max(
-                        gpu_count,
-                        int(values.get("nvidia.com/gpu", 0)),
-                    )
-                except (TypeError, ValueError):
-                    pass
-        return gpu_count
+        return pod_gpu_count(item)
 
     def gpu_workloads(self) -> list[dict[str, Any]]:
         value = json.loads(
@@ -1382,28 +1429,9 @@ class RegionalLiveFixture:
                 all_namespaces=True,
             )
         )
-        system_namespaces = {
-            "aws-hyperpod",
-            "cert-manager",
-            "hyperpod-inference-system",
-            "kube-system",
-            "kubeflow",
-        }
-        result = []
-        for item in value.get("items", []):
-            namespace = str(item["metadata"].get("namespace", ""))
-            gpu_count = self.pod_gpu_count(item)
-            if namespace in system_namespaces:
-                continue
-            if namespace == self.settings.namespace and gpu_count <= 0:
-                continue
-            result.append(
-                {
-                    "namespace": namespace,
-                    "name": str(item["metadata"].get("name", "")),
-                }
-            )
-        return result
+        return business_workload_items(
+            value.get("items", []), namespace=self.settings.namespace
+        )
 
     def cpu_blast_snapshot(self) -> dict[str, Any]:
         nodes = json.loads(

@@ -270,3 +270,47 @@ def test_resource_cleanup_failure_is_recorded_not_raised(
         (runner.case_dir / f"{net001.CASE_ID}.json").read_text(encoding="utf-8")
     )
     assert "resource cleanup failed" in document["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Business workload preflight
+# --------------------------------------------------------------------------- #
+
+
+def _pod(namespace: str, name: str, gpus: int = 0) -> dict[str, Any]:
+    requests = {"nvidia.com/gpu": str(gpus)} if gpus else {}
+    return {
+        "metadata": {"namespace": namespace, "name": name},
+        "spec": {"containers": [{"resources": {"requests": requests}}]},
+    }
+
+
+def test_business_workloads_share_the_fleet_wide_definition(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Cluster infrastructure and the solution's own GPU-less Pods are not a
+    # business workload; a training Pod and a GPU job in the solution's
+    # namespace are. NET-001 used to keep a shorter private allowlist.
+    runner = _runner(tmp_path)
+    pods = [
+        _pod("kube-system", "coredns"),
+        _pod("cert-manager", "cainjector"),
+        _pod("hyperpod-inference-system", "router"),
+        _pod("kubeflow", "training-operator"),
+        _pod("aws-hyperpod", "controller"),
+        _pod("gpu-fault-system", "executor"),
+        _pod("gpu-fault-system", "notify005-worker-0", gpus=8),
+        _pod("training", "megatron-worker-0", gpus=8),
+    ]
+    monkeypatch.setattr(
+        runner,
+        "gpu",
+        lambda *args: subprocess.CompletedProcess(
+            args, 0, json.dumps({"items": pods}), ""
+        ),
+    )
+
+    assert runner.active_business_workloads() == [
+        {"namespace": "gpu-fault-system", "name": "notify005-worker-0"},
+        {"namespace": "training", "name": "megatron-worker-0"},
+    ]
