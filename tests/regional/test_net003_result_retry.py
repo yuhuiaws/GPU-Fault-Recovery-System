@@ -247,19 +247,68 @@ def test_the_private_seed_leases_the_workflow_to_the_probe(monkeypatch) -> None:
     assert "execution_lease_expires_at=" in net003._SEED_COMMAND
 
 
-def test_the_probe_holds_its_action_behind_the_network_gate() -> None:
-    """The probe must not run its action until the runner has armed
-    /state/block, so the runner's leased snapshot cannot race the action that
-    commits the result; it records action-gate-observed once it proceeds."""
-    source = (
-        Path(net003.__file__).resolve().parent / "probes" / "net003_executor.py"
-    ).read_text(encoding="utf-8")
-    assert 'BLOCK = STATE / "block"' in source
-    assert 'ACTION_GATE_OBSERVED = STATE / "action-gate-observed.json"' in source
-    gate = source.index("while not BLOCK.exists()")
-    observed = source.index("ACTION_GATE_OBSERVED.write_text")
-    action = source.index("time.sleep(5)")
-    assert gate < observed < action
+def _gated_adapter(tmp_path, monkeypatch):
+    """A LedgerAdapter with its /state files redirected into a temp dir and
+    its sleeps replaced by a spy that records what was on disk when the
+    simulated action ran."""
+    from scripts.e2e.regional.probes import net003_executor as probe
+
+    for attr in ("BLOCK", "ACTION_STARTED", "ACTION_GATE_OBSERVED", "LEDGER"):
+        monkeypatch.setattr(probe, attr, tmp_path / attr.lower())
+    at_action: list[dict[str, bool]] = []
+
+    def spy_sleep(seconds):
+        if seconds == 5:
+            at_action.append(
+                {
+                    "gate_observed": probe.ACTION_GATE_OBSERVED.exists(),
+                    "ledger_written": probe.LEDGER.exists(),
+                }
+            )
+
+    monkeypatch.setattr(probe.time, "sleep", spy_sleep)
+    return probe, probe.LedgerAdapter(NOTIFICATION_ID), at_action
+
+
+def test_the_probe_holds_its_action_until_the_network_gate_is_armed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With /state/block never armed the adapter must give up without running
+    the action, so the runner's leased snapshot can never race a commit."""
+    probe, adapter, at_action = _gated_adapter(tmp_path, monkeypatch)
+    clock = iter([0.0, 31.0, 31.0])
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(RuntimeError, match="network block was not armed"):
+        adapter.execute(SimpleNamespace(idempotency_key="key-1"))
+
+    assert at_action == [], "the action ran although the gate was never armed"
+    assert not probe.ACTION_GATE_OBSERVED.exists(), "gate-observed written early"
+    assert not probe.LEDGER.exists(), "the ledger committed an ungated action"
+
+
+def test_the_probe_records_the_gate_then_acts_then_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once /state/block is armed the adapter records action-gate-observed,
+    runs the action, and only then commits the ledger; a replay of the same
+    key is served from the ledger without a second action."""
+    probe, adapter, at_action = _gated_adapter(tmp_path, monkeypatch)
+    probe.BLOCK.touch()
+
+    first = adapter.execute(SimpleNamespace(idempotency_key="key-1"))
+
+    observed = json.loads(probe.ACTION_GATE_OBSERVED.read_text(encoding="utf-8"))
+    assert observed["idempotency_key"] == "key-1"
+    assert at_action == [{"gate_observed": True, "ledger_written": False}]
+    assert first.details["cached"] is False
+    assert first.details["physical_count"] == 1
+
+    replay = adapter.execute(SimpleNamespace(idempotency_key="key-1"))
+
+    assert len(at_action) == 1, "a cached key must not run the action again"
+    assert replay.details["cached"] is True
+    assert replay.details["physical_count"] == 1
 
 
 def test_the_runner_arms_the_gate_after_snapshotting_the_leased_command() -> None:
@@ -363,5 +412,5 @@ def test_an_http_rejection_surfaces_and_is_never_replayed(
 
     assert caught.value.status_code == 409
     assert len(calls) == 1  # rejected, not replayed
-    assert not probe.RESULT_INTERRUPTED.exists()
-    assert not probe.RESULT_REPLAYS.exists()
+    assert not probe.RESULT_INTERRUPTED.exists(), "a 409 is not a lost response"
+    assert not probe.RESULT_REPLAYS.exists(), "a rejected result must not replay"

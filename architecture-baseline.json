@@ -1,9 +1,9 @@
 {
   "classes": {
-    "scripts/e2e/regional/audit_regional_command_protocol_live.py:LiveProtocolAudit": 1179,
+    "scripts/e2e/regional/audit_regional_command_protocol_live.py:LiveProtocolAudit": 1202,
     "scripts/e2e/regional/capacity_acceptance_cases.py:CapacityAcceptanceCases": 817,
-    "scripts/e2e/regional/regional_live_fixture.py:RegionalLiveFixture": 838,
-    "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 861,
+    "scripts/e2e/regional/regional_live_fixture.py:RegionalLiveFixture": 805,
+    "scripts/e2e/regional/run_net001_collector_replay.py:Runner": 855,
     "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 865,
     "src/gpu_fault/execution/dispatcher.py:WorkflowDispatcher": 1607,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 2614,
@@ -22,14 +22,14 @@
   "files": {
     "deploy/hyperpod/deploy.sh": 3345,
     "deploy/node/install-gpu-fault-collector.sh": 1937,
-    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1680,
+    "scripts/e2e/regional/audit_regional_command_protocol_live.py": 1706,
     "scripts/e2e/regional/identity_acceptance_auth.py": 1786,
-    "scripts/e2e/regional/regional_live_fixture.py": 1627,
+    "scripts/e2e/regional/regional_live_fixture.py": 1655,
     "scripts/e2e/regional/run_collector_acceptance.py": 1772,
     "scripts/e2e/regional/run_collector_destructive.py": 1886,
-    "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1601,
+    "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1646,
     "scripts/e2e/regional/run_notification_acceptance.py": 1701,
-    "scripts/e2e/regional/run_workload_acceptance.py": 2165,
+    "scripts/e2e/regional/run_workload_acceptance.py": 2171,
     "src/gpu_fault/admin/aws_cleanup.py": 1562,
     "src/gpu_fault/admin/bootstrap.py": 1994,
     "src/gpu_fault/admin/cli.py": 1638,
@@ -43,7 +43,7 @@
     "src/gpu_fault/store/postgres/ddl.py": 1753,
     "src/gpu_fault_release/regional_admin_checks.py": 1727,
     "src/gpu_fault_release/regional_release_orchestration.py": 2004,
-    "tests/processor/test_telemetry_spool.py": 1658,
+    "tests/processor/test_telemetry_spool.py": 1673,
     "tests/regional/test_regional_admin_checks.py": 1614
   },
   "functions": {

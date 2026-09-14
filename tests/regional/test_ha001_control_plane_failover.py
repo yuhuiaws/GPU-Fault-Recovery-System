@@ -76,14 +76,14 @@ def test_replica_counts_come_from_spec_replicas() -> None:
         ha001.declared_replicas({"deployments": {ha001.INGRESS_APP: {"replicas": 3}}})
 
 
-def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() -> None:
+def test_validate_roles_uses_declared_replicas_and_requires_leaderless_epoch() -> None:
     replicas = {ha001.INGRESS_APP: 1, ha001.WORKER_APP: 2, ha001.SPOOL_APP: 0}
     ingress = {
         "name": "api-a",
         "health": {
             "service_role": "ingress",
             "processor_role": "inactive",
-            "leadership": None,
+            "processor_epoch": "",
         },
         "processor_active_consumer": 0.0,
     }
@@ -92,9 +92,11 @@ def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() ->
         "health": {
             "service_role": "worker",
             "processor_role": "active-consumer",
-            "leadership": None,
+            "processor_epoch": "",
         },
-        "processor_active_consumer": 1.0,
+        # --workers 4 sums the active-consumer gauge across the four uvicorn
+        # processes, so a healthy worker Pod reports 4, not 1.
+        "processor_active_consumer": 4.0,
     }
     clean = {
         ha001.INGRESS_APP: [ingress],
@@ -102,30 +104,55 @@ def test_validate_roles_uses_declared_replicas_and_requires_null_leadership() ->
     }
     assert ha001.validate_roles(clean, replicas) == []
 
+    # A single live consuming process (metric == 1) is still valid; the
+    # invariant is ">= 1 consumer", not an exact replica or worker count.
+    one_process = {**worker, "name": "worker-one", "processor_active_consumer": 1.0}
+    assert (
+        ha001.validate_roles(
+            {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, one_process]},
+            replicas,
+        )
+        == []
+    )
+
+    # A worker consuming on zero processes is a real fault.
+    idle = {**worker, "name": "worker-idle", "processor_active_consumer": 0.0}
+    assert ha001.validate_roles(
+        {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, idle]}, replicas
+    ) == [
+        "worker-idle active-consumer metric is 0.0, "
+        "expected >= 1 (one per uvicorn worker process)"
+    ]
+
+    # A non-empty processor_epoch means the replica holds a leadership lease,
+    # which the leaderless active-active catalog rules out.
     leader = {
         **worker,
         "name": "worker-c",
-        "health": {**worker["health"], "leadership": {"owner": "worker-c"}},
+        "health": {**worker["health"], "processor_epoch": "7"},
     }
     errors = ha001.validate_roles(
         {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, leader]}, replicas
     )
-    assert errors == ["worker-c reports leadership; expected null"], errors
+    assert errors == [
+        "worker-c holds processor leadership epoch '7'; "
+        "expected none (leaderless active-active)"
+    ], errors
 
-    missing_leadership_key = {
+    # The release always emits processor_epoch, so a healthz that omits it is
+    # not proof of leaderless-ness and must fail closed.
+    missing_epoch = {
         **worker,
-        "health": {k: v for k, v in worker["health"].items() if k != "leadership"},
+        "name": "worker-missing",
+        "health": {k: v for k, v in worker["health"].items() if k != "processor_epoch"},
     }
     assert any(
-        "leadership" in item
+        "processor_epoch" in item
         for item in ha001.validate_roles(
-            {
-                ha001.INGRESS_APP: [ingress],
-                ha001.WORKER_APP: [worker, missing_leadership_key],
-            },
+            {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker, missing_epoch]},
             replicas,
         )
-    ), "a healthz without the leadership field is not proof of null leadership"
+    ), "a healthz without processor_epoch is not proof of leaderless active-active"
 
     short = ha001.validate_roles(
         {ha001.INGRESS_APP: [ingress], ha001.WORKER_APP: [worker]}, replicas

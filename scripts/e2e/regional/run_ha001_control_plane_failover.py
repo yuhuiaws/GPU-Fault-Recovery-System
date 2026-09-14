@@ -1275,13 +1275,35 @@ def validate_roles(snapshot: dict, replicas: dict[str, int]) -> list[str]:
             errors.append(f"{item['name']} is not worker")
         if health.get("processor_role") != "active-consumer":
             errors.append(f"{item['name']} processor is not active-consumer")
-        if item.get("processor_active_consumer") != 1.0:
-            errors.append(f"{item['name']} active-consumer metric is not one")
+        consumer = item.get("processor_active_consumer")
+        # control-worker runs uvicorn --workers 4 and the active-consumer
+        # gauge is summed across the four processes (/dev/shm aggregation),
+        # so a healthy worker Pod reports 4, not 1. The invariant is ">= 1
+        # consuming process", never an exact replica or worker count.
+        if consumer is None or consumer < 1.0:
+            errors.append(
+                f"{item['name']} active-consumer metric is {consumer!r}, "
+                "expected >= 1 (one per uvicorn worker process)"
+            )
     for item in [*ingress, *workers]:
-        # active-active has no leader; a non-null leadership record means a
+        # Active-active is leaderless. /healthz reports processor_epoch as the
+        # str() of the held leadership epoch, or "" when this replica holds no
+        # lease (src/gpu_fault/app/routes/admin.py); a non-empty epoch means a
         # replica is running the leader/standby mode the catalog rules out.
-        if item.get("health", {}).get("leadership", "missing") is not None:
-            errors.append(f"{item['name']} reports leadership; expected null")
+        # The release always emits the key, so its ABSENCE is not proof of
+        # leaderless-ness -- fail closed on a healthz that no longer speaks
+        # this contract, preserving the original intent.
+        epoch = item.get("health", {}).get("processor_epoch", None)
+        if epoch is None:
+            errors.append(
+                f"{item['name']} healthz omits processor_epoch; "
+                "cannot prove leaderless active-active"
+            )
+        elif epoch != "":
+            errors.append(
+                f"{item['name']} holds processor leadership epoch {epoch!r}; "
+                "expected none (leaderless active-active)"
+            )
     return errors
 
 
