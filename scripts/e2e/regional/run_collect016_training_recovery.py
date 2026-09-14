@@ -515,6 +515,85 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
 
 
+A_WORKLOAD_DRAIN_TIMEOUT_SECONDS = 300
+
+
+def wait_a_workload_drained(
+    regional: RegionalLiveFixture,
+    *,
+    job_id: str,
+    case_dir: Path,
+    timeout_seconds: int = A_WORKLOAD_DRAIN_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Wait until the A/B-phase workload can no longer be node-correlated.
+
+    A and B run on their own 24-GPU PyTorchJob that ``execute_case`` deletes
+    before the reset section. ``delete`` force-removes the Pods and the
+    PyTorchJob, but the attempt observation the collector last wrote lags: for
+    up to the node-correlation window (``host_health._active_attempt`` --
+    ``observed_at`` within [-30s, +120s], phase PENDING/RUNNING, a
+    non-terminated container on the node) the store still reports the A
+    workload as live on the reset node. A D-phase XID 109 fired inside that
+    window correlates BOTH the D workload and the just-deleted A workload into
+    one incident: STOP_WORKLOADS tolerates the absent A source
+    (``already_absent_workloads``) but RESTART_WORKLOAD fails it closed
+    (``RESTART_SOURCE_WORKLOAD_NOT_FOUND``, intentional hardening -- 41900a1,
+    141a021), so the whole reset workflow FAILs and the node QUARANTINEs.
+    Draining the A workload first scopes the reset incident to the D workload
+    alone, which is what the case intends.
+
+    "Drained" here is the negation of the product's correlation predicate: no
+    observation for ``job_id`` is both non-terminal (PENDING/RUNNING) and still
+    holding a non-terminated container. Once the latest observation of every
+    attempt is terminal (or all its containers are terminated, or no
+    observation is left), the [-30s, +120s] window can never match again, so
+    the drain is durable rather than merely aged out.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    entries: list[dict[str, Any]] = []
+    last: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        state = regional.store_snapshot(job_id=job_id, queue_attempts=1)
+        last = state.get("observations") or []
+        live = [
+            {
+                "attempt_id": observation.get("attempt_id"),
+                "workload_phase": observation.get("workload_phase"),
+                "live_nodes": sorted(
+                    {
+                        str(container.get("node_id"))
+                        for container in observation.get("containers") or []
+                        if not container.get("terminated")
+                    }
+                ),
+            }
+            for observation in last
+            if observation.get("workload_phase") in {"PENDING", "RUNNING"}
+            and any(
+                not container.get("terminated")
+                for container in observation.get("containers") or []
+            )
+        ]
+        entries.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "observation_count": len(last),
+                "live": live,
+            }
+        )
+        write_json_atomic(
+            case_dir / "a-drain.json",
+            {"job_id": job_id, "drained": not live, "entries": entries},
+        )
+        if not live:
+            return {"job_id": job_id, "drained": True, "entries": entries}
+        time.sleep(5)
+    raise RegionalFixtureError(
+        f"A-phase workload {job_id} did not drain from node correlation: {last}"
+    )
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -560,6 +639,16 @@ def execute_case(
         result["errors"].extend(ab["errors"])
         result.update({"a": ab["a"], "b": ab["b"]})
         workloads[0].delete()
+        # Drain the just-deleted A workload from the store before the
+        # reset section injects XID 109: otherwise its lagging attempt
+        # observation is still node-correlatable and the reset incident
+        # binds it as a restart source it can never satisfy (see
+        # wait_a_workload_drained).
+        result["a_drain"] = wait_a_workload_drained(
+            regional,
+            job_id=f"c016-a-{suffix}",
+            case_dir=case_dir,
+        )
         d = run_reset_section(
             settings,
             regional,
