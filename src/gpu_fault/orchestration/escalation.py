@@ -676,6 +676,26 @@ class HardwareEscalationService:
                         gpu_uuids_by_node.setdefault(node_id, []).extend(
                             str(value) for value in values
                         )
+        # A job DAG scopes each branch's steps to one node and that node's GPUs
+        # without a gpu_uuids_by_node parameter (the map is written by the
+        # multi-node SXID compiler only). Read the per-node scope off those
+        # single-node steps too, or the fallback below hands an exhausted node
+        # every GPU the workflow ever named: live 2026-09-14 (DESTR-014) the
+        # support-after incident for the one exhausted node carried the
+        # sibling's GPU as well, and its validated restore waited on a GPU the
+        # node does not have until the step cap failed it.
+        derived_by_node: dict[str, list[str]] = {}
+        for step in workflow.official_steps:
+            if len(step.node_ids) != 1 or not step.gpu_uuids:
+                continue
+            derived_by_node.setdefault(step.node_ids[0], []).extend(
+                str(value) for value in step.gpu_uuids
+            )
+        for node_id in ordered_failed_nodes:
+            if not gpu_uuids_by_node.get(node_id) and derived_by_node.get(node_id):
+                gpu_uuids_by_node[node_id] = list(
+                    dict.fromkeys(derived_by_node[node_id])
+                )
         gpu_uuids = list(
             dict.fromkeys(
                 gpu_uuid

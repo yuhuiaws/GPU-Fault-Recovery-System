@@ -680,3 +680,42 @@ def test_a_multi_node_replacement_keeps_the_per_node_gpu_mapping():
         if step.operation is WorkflowOperation.QUARANTINE
     )
     assert "gpu_uuids_by_node" not in quarantine.parameters
+
+
+def test_the_scope_of_one_exhausted_branch_carries_only_that_nodes_gpus():
+    """A job DAG scopes each branch's steps to one node and its GPUs without a
+    gpu_uuids_by_node parameter. The support-after incident for the exhausted
+    node must carry that node's GPUs alone; on 2026-09-14 (DESTR-014) it also
+    inherited the sibling's GPU and the validated restore waited on it."""
+    store = build_store()
+    steps = [
+        workflow_step(REBOOT, node_ids=["node-a"], gpu_uuids=["GPU-a"]),
+        workflow_step(RESET, node_ids=["node-b"], gpu_uuids=["GPU-b"]),
+        workflow_step(
+            WorkflowOperation.REPLACE_NODE, node_ids=["node-a"], gpu_uuids=["GPU-a"]
+        ),
+    ]
+    incident, workflow = _failed(
+        store,
+        steps,
+        [
+            workflow_step_execution(
+                0, REBOOT, WorkflowStepStatus.FAILED, error="timed out"
+            ),
+            workflow_step_execution(
+                2,
+                WorkflowOperation.REPLACE_NODE,
+                WorkflowStepStatus.FAILED,
+                error="no spare",
+            ),
+        ],
+        completed=[],
+    )
+
+    scope = HardwareEscalationService.collect_scope(
+        workflow, incident, [workflow.step_executions[0], workflow.step_executions[1]]
+    )
+
+    assert scope["ordered_failed_nodes"] == ["node-a"]
+    assert scope["gpu_uuids"] == ["GPU-a"], scope["gpu_uuids"]
+    assert scope["gpu_uuids_by_node"] == {"node-a": ["GPU-a"]}

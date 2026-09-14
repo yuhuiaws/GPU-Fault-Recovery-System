@@ -139,3 +139,40 @@ def test_the_fixture_script_uses_the_product_builder() -> None:
     for key in ('"workflow_request_id"', '"incident_id"', '"node_id"'):
         assert key in script, f"the printed contract keeps {key}"
     compile(script, "<create-restore-workflow>", "exec")
+
+
+def test_incident_gpus_the_node_does_not_carry_leave_the_validation_scope() -> None:
+    """An exhaustion escalation can hand a one-node incident a sibling's GPU
+    (DESTR-014, 2026-09-14); a validation waiting on it can only hit the step
+    cap. With the node's inventory known the scope keeps only what the node
+    carries, goes node-wide when nothing is left, and is kept when unknown."""
+    incident = _quarantined()
+
+    _, kept = module.build_validated_restore_workflow(
+        incident,
+        operator=OPERATOR,
+        reference=None,
+        now=NOW,
+        node_gpu_uuids={"node-a": ["GPU-1", "GPU-9"]},
+    )
+    assert all(step.gpu_uuids == ["GPU-1"] for step in kept.official_steps), (
+        "only the GPU the node carries stays in scope"
+    )
+
+    _, node_wide = module.build_validated_restore_workflow(
+        incident,
+        operator=OPERATOR,
+        reference=None,
+        now=NOW,
+        node_gpu_uuids={"node-a": ["GPU-9"]},
+    )
+    assert all(step.gpu_uuids == [] for step in node_wide.official_steps), (
+        "with none of the incident GPUs on the node the validation goes node-wide"
+    )
+
+    _, unknown = module.build_validated_restore_workflow(
+        incident, operator=OPERATOR, reference=None, now=NOW, node_gpu_uuids={}
+    )
+    assert all(
+        step.gpu_uuids == ["GPU-1", "GPU-2"] for step in unknown.official_steps
+    ), "an unknown inventory keeps the incident scope"

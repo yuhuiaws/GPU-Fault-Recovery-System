@@ -12,6 +12,7 @@
     "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 876,
     "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1051,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1870,
+    "src/gpu_fault/orchestration/escalation.py:HardwareEscalationService": 819,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1412,
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1759,
     "src/gpu_fault/store/memory/workflows.py:MemoryWorkflowMixin": 920,

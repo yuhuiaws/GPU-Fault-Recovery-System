@@ -201,12 +201,18 @@ elif payload["mode"] == "restore":
             + ", ".join(f"{item.request_id} ({item.status.value})" for item in still_open)
         )
     else:
+        from gpu_fault.execution.node_rebinding import inventory_gpu_uuids
+
         updated, created = build_validated_restore_workflow(
             incident,
             operator=payload["operator"],
             reference=payload.get("reference"),
             now=datetime.now(timezone.utc),
             runtime_profile_version=payload.get("runtime_profile_version"),
+            node_gpu_uuids={
+                node_id: inventory_gpu_uuids(store, incident.cluster_id, node_id)
+                for node_id in incident.node_ids
+            },
         )
         store.save_incident_and_workflow(updated, created)
         context.dispatcher.wake()

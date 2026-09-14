@@ -21,6 +21,8 @@ ownership -- because those need the store and the cluster; the admin verb
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from datetime import datetime
 from typing import Sequence
 from uuid import uuid4
@@ -90,6 +92,7 @@ def build_validated_restore_workflow(
     node_ids: Sequence[str] | None = None,
     runtime_profile_version: str | None = None,
     reason: str | None = None,
+    node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[FaultIncident, WorkflowRequest]:
     """The ``(incident, workflow)`` pair of a validated restore of ``incident``.
 
@@ -100,8 +103,15 @@ def build_validated_restore_workflow(
     incident's nodes). The incident's GPU scope goes on the steps only when
     the steps cover exactly the incident's nodes: a restore of some other node
     (the fixture restoring a spare) must not name GPUs that node does not have
-    (DESTR-003, 2026-09-08). The incident moves to ACTION_PENDING, points at
-    the workflow, and records ``reason`` (default ``restore_reason``).
+    (DESTR-003, 2026-09-08). ``node_gpu_uuids`` is what the step nodes
+    currently enumerate, when the caller can read it: GPUs the incident names
+    but no step node carries are dropped from the validation scope, because
+    a per-GPU validation waiting on a GPU the node does not have can only run
+    into the step cap (an exhaustion escalation that inherited a sibling's
+    GPU, DESTR-014, 2026-09-14). With none of the incident's GPUs left the
+    validation goes node-wide; with no inventory known the scope is kept.
+    The incident moves to ACTION_PENDING, points at the workflow, and records
+    ``reason`` (default ``restore_reason``).
     """
 
     step_nodes = sorted(set(node_ids if node_ids is not None else incident.node_ids))
@@ -110,6 +120,14 @@ def build_validated_restore_workflow(
     gpu_uuids = (
         list(incident.gpu_uuids) if set(step_nodes) == set(incident.node_ids) else []
     )
+    if gpu_uuids and node_gpu_uuids is not None:
+        known = {
+            str(gpu_uuid)
+            for node_id in step_nodes
+            for gpu_uuid in node_gpu_uuids.get(node_id, ())
+        }
+        if known:
+            gpu_uuids = [gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid in known]
     workflow = WorkflowRequest(
         request_id=f"{RESTORE_WORKFLOW_PREFIX}{uuid4()}",
         incident_id=incident.incident_id,
