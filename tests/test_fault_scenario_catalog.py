@@ -1200,16 +1200,28 @@ def test_cap005_uses_the_postgres_stress_runner_consistently() -> None:
     runner_path = ROOT / command[1]
     runner_text = runner_path.read_text(encoding="utf-8")
     tree = ast.parse(runner_text)
-    literal_commands = [
-        [element.value for element in node.elts]
+    # The stress shard must run under the venv interpreter (sys.executable), never
+    # the system python3 that lacks pytest-xdist; the CAP-005 fix (commit 73e12d6)
+    # made the make PYTHON argument an f-string, so match the list structurally
+    # rather than as all-constants.
+    make_lists = [
+        node.elts
         for node in ast.walk(tree)
         if isinstance(node, ast.List)
-        and all(
-            isinstance(element, ast.Constant) and isinstance(element.value, str)
-            for element in node.elts
-        )
+        and len(node.elts) == 3
+        and isinstance(node.elts[0], ast.Constant)
+        and node.elts[0].value == "make"
+        and isinstance(node.elts[1], ast.Constant)
+        and node.elts[1].value == "test-postgres-stress"
     ]
-    assert ["make", "test-postgres-stress", "PYTHON=python3"] in literal_commands
+    assert make_lists, "CAP-005 runner must invoke make test-postgres-stress"
+    python_arg = make_lists[0][2]
+    assert isinstance(python_arg, ast.JoinedStr), (
+        'CAP-005 must pass PYTHON=<venv interpreter>, e.g. f"PYTHON={sys.executable}"'
+    )
+    unparsed = ast.unparse(python_arg)
+    assert "PYTHON=" in unparsed and "sys.executable" in unparsed
+    assert '"PYTHON=python3"' not in runner_text
     assert "GPU_FAULT_CAP005_WORKDIR" in runner_text
     assert '"/work"' not in runner_text
 
