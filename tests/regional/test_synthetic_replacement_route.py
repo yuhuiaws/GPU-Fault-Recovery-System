@@ -292,3 +292,37 @@ def test_helper_carries_no_site_topology() -> None:
     assert "/secure/gpu-fault-bootstrap" not in source
     assert "514385905925" not in source
     assert "hyperpod-i-" not in source
+
+
+def test_a_replica_removed_by_the_rolling_update_drops_out_of_the_gate_reading() -> (
+    None
+):
+    """A Pod listed as Ready can be deleted by the rolling update before the exec
+    reaches it; that is convergence in progress, not a failed gate, so the reading
+    keeps the survivors and any other exec failure still raises."""
+    from scripts.e2e.regional import synthetic_replacement_route as route
+    from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+
+    class Regional:
+        def ready_pods(self, _plane: str, _app: str) -> list[dict[str, str]]:
+            return [{"name": "api-gone"}, {"name": "api-alive"}]
+
+        def kubectl(self, _plane: str, *arguments: str, **_kwargs: object) -> str:
+            pod = arguments[1]
+            if pod == "api-gone":
+                raise RegionalFixtureError(
+                    "command failed (1): kubectl exec api-gone; stderr=Error from "
+                    'server (NotFound): pods "api-gone" not found'
+                )
+            return '{"enabled": null}'
+
+    assert route.pod_gates(Regional()) == [{"pod": "api-alive", "enabled": None}]  # type: ignore[arg-type]
+
+    class Broken(Regional):
+        def kubectl(self, _plane: str, *arguments: str, **_kwargs: object) -> str:
+            raise RegionalFixtureError(
+                "command failed (1): kubectl exec; stderr=connection refused"
+            )
+
+    with pytest.raises(RegionalFixtureError, match="connection refused"):
+        route.pod_gates(Broken())  # type: ignore[arg-type]

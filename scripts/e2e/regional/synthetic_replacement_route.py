@@ -126,16 +126,27 @@ def pod_gates(regional: RegionalLiveFixture) -> list[dict[str, str | None]]:
 
     result: list[dict[str, str | None]] = []
     for pod in regional.ready_pods("cpu", DEPLOYMENT):
-        output = regional.kubectl(
-            "cpu",
-            "exec",
-            str(pod["name"]),
-            "--",
-            "python3",
-            "-c",
-            f"import json,os; print(json.dumps({{'enabled':os.getenv({ROUTE_ENV!r})}}))",
-            timeout=60,
-        )
+        try:
+            output = regional.kubectl(
+                "cpu",
+                "exec",
+                str(pod["name"]),
+                "--",
+                "python3",
+                "-c",
+                f"import json,os; print(json.dumps({{'enabled':os.getenv({ROUTE_ENV!r})}}))",
+                timeout=60,
+            )
+        except RegionalFixtureError as exc:
+            # A replica of the old ReplicaSet was Ready when listed and gone by
+            # the time it was asked: that is the rolling update finishing, not a
+            # gate that failed to converge. It has left the graded set, so it
+            # drops out of this reading; the next one lists the survivors
+            # (close after DESTR-022, 2026-09-14: the close had applied and this
+            # race made the tool exit 1).
+            if "not found" in str(exc).lower():
+                continue
+            raise
         enabled = json.loads(output.splitlines()[-1]).get("enabled")
         result.append(
             {
