@@ -62,6 +62,15 @@ def test_net003_ledger_is_exactly_once(tmp_path: Path, monkeypatch) -> None:
     adapter = net003_executor.LedgerAdapter("notification-a")
     context = _context("workflow/0/FREEZE_EVIDENCE")
     monkeypatch.setattr(net003_executor.time, "sleep", lambda _seconds: None)
+    # The action gate waits up to 30s for the runner to arm BLOCK; with no live
+    # runner the unit test arms it itself, or execute() times out against the
+    # ambient /state/block that only happens to exist on a live host.
+    block = tmp_path / "block"
+    block.write_text("", encoding="utf-8")
+    monkeypatch.setattr(net003_executor, "BLOCK", block)
+    monkeypatch.setattr(
+        net003_executor, "ACTION_GATE_OBSERVED", tmp_path / "action-gate-observed.json"
+    )
 
     first = adapter.execute(context)
     second = adapter.execute(context)

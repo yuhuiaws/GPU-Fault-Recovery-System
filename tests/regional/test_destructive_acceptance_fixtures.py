@@ -47,6 +47,11 @@ from scripts.e2e.regional.warm_spare_fixture import (
     GpuHolderFixture,
     WarmSpareLiveFixture,
 )
+from tests.regional._destructive_acceptance_builders import (
+    _reset_state,
+    _restart_state,
+    _runtime_identity,
+)
 
 yaml = importlib.import_module("yaml")
 
@@ -490,59 +495,6 @@ def test_warm_spare_gpu_holder_is_node_pinned_and_bounded(tmp_path: Path) -> Non
     assert manifest["spec"]["tolerations"] == [{"operator": "Exists"}], manifest
 
 
-def _reset_state() -> dict[str, Any]:
-    waiting = []
-    for operation in (
-        "QUIESCE_GPU_SERVICES",
-        "VERIFY_NO_GPU_CLIENTS",
-        "RESET_GPU",
-        "RESTORE_GPU_SERVICES",
-    ):
-        waiting.append(
-            {
-                "operation": operation,
-                "status": "WAITING",
-                "details": {"mutation_submitted_by_control_plane": False},
-            }
-        )
-    return {
-        "event": {"xid": 46, "evidence_ref": "kmsg://node/boot/1"},
-        "decision": {"official_action": "RESET_GPU"},
-        "workflow": {
-            "status": "SUCCEEDED",
-            "official_steps": [
-                {"operation": operation} for operation in destr001.EXPECTED_STEPS
-            ],
-            "completed_operations": list(destr001.EXPECTED_STEPS),
-            "step_executions": [
-                {
-                    "operation": operation,
-                    "status": "SUCCEEDED",
-                    "adapter_operation_id": f"remote/{operation.lower()}",
-                }
-                for operation in (
-                    "QUIESCE_GPU_SERVICES",
-                    "VERIFY_NO_GPU_CLIENTS",
-                    "RESET_GPU",
-                    "RESTORE_GPU_SERVICES",
-                )
-            ],
-        },
-        "observed_waiting_step_executions": waiting,
-        "commands": [
-            {"status": "SUCCEEDED", "step": {"operation": operation}}
-            for operation in (
-                "MARK_UNSCHEDULABLE",
-                "QUIESCE_GPU_SERVICES",
-                "VERIFY_NO_GPU_CLIENTS",
-                "RESET_GPU",
-                "RESTORE_GPU_SERVICES",
-                "RESTORE_SCHEDULING",
-            )
-        ],
-    }
-
-
 def test_destr001_requires_the_exact_reset_contract() -> None:
     state = _reset_state()
 
@@ -886,64 +838,6 @@ def test_destr003_rejects_a_restart_that_reported_no_gpu_counts(tmp_path: Path) 
     assert not [item for item in errors if "count is not" in item], errors
 
 
-def _restart_state(gpu_count: int) -> dict[str, Any]:
-    waiting: list[dict[str, Any]] = []
-    executions: list[dict[str, Any]] = []
-    for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD"):
-        waiting.append(
-            {
-                "operation": operation,
-                "status": "WAITING",
-                "details": {"mutation_submitted_by_control_plane": False},
-            }
-        )
-        details: dict[str, Any] = {}
-        if operation == "RESTART_WORKLOAD":
-            details = {
-                "notification_context": {
-                    "source_gpu_count": gpu_count,
-                    "target_gpu_count": gpu_count,
-                    "restart_count": 1,
-                }
-            }
-        executions.append(
-            {
-                "operation": operation,
-                "status": "SUCCEEDED",
-                "adapter_operation_id": f"remote/{operation.lower()}",
-                "details": details,
-            }
-        )
-    return {
-        "event": {"xid": 11},
-        "decision": {"official_action": "RESTART_APP"},
-        "workflow": {
-            "status": "SUCCEEDED",
-            "official_steps": [
-                {
-                    "operation": "FREEZE_EVIDENCE",
-                    "execution_owner": "gpu-fault-control-plane",
-                },
-                {
-                    "operation": "STOP_WORKLOADS",
-                    "execution_owner": "gpu-fault-kubernetes-adapter",
-                },
-                {
-                    "operation": "RESTART_WORKLOAD",
-                    "execution_owner": "gpu-fault-kubernetes-adapter",
-                },
-            ],
-            "step_executions": executions,
-        },
-        "observed_waiting_step_executions": waiting,
-        "commands": [
-            {"status": "SUCCEEDED", "step": {"operation": operation}}
-            for operation in ("STOP_WORKLOADS", "RESTART_WORKLOAD")
-        ],
-        "restart_budget": {"budget": 1, "restart_count": 1},
-    }
-
-
 def test_destr009_workflow_contract_scales_to_expected_gpu_count() -> None:
     state = _restart_state(24)
 
@@ -1266,28 +1160,6 @@ def test_destr012_keeps_group_c_optional_and_isolated(
         details["preflight_identity"]["runtime_identity"]
         == preflight["runtime_identity"]
     )
-
-
-def _runtime_identity(*, phase: str = "complete") -> dict[str, Any]:
-    deployments = {}
-    for plane, names in live_fixture_module.RUNTIME_IDENTITY_DEPLOYMENTS.items():
-        deployments[plane] = {
-            name: {
-                "generation": 1,
-                "desired_replicas": 2,
-                "observed_generation": 1,
-                "updated_replicas": 2,
-                "ready_replicas": 2,
-                "available_replicas": 2,
-                "template_sha256": "a" * 64,
-                "images": ["registry.example/runtime@sha256:" + "b" * 64],
-            }
-            for name in names
-        }
-    return {
-        "release_state": {"release_id": "release-a", "phase": phase},
-        "deployments": deployments,
-    }
 
 
 def test_runtime_identity_rejects_active_release_rollback() -> None:

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.e2e.regional import ha009_verdicts as verdicts
 from scripts.e2e.regional import run_ha005_rollout_continuity as ha005
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
 
@@ -102,21 +103,23 @@ def test_deployments_rolled_requires_updated_replicas_and_new_uids() -> None:
         "gpu-fault-control-worker": _deployment(2, ["x1", "x2", "x3"]),
         "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
     }
-    assert ha009.deployments_rolled(before, rolled) is True, (
+    assert verdicts.deployments_rolled(before, rolled) is True, (
         "a replicas=0 role must not block completion"
     )
     half = {**rolled, "gpu-fault-control-worker": _deployment(2, ["x1", "x2", "w3"])}
-    assert ha009.deployments_rolled(before, half) is False, "an old UID still present"
+    assert verdicts.deployments_rolled(before, half) is False, (
+        "an old UID still present"
+    )
     not_updated = {
         **rolled,
         "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"], complete=False),
     }
-    assert ha009.deployments_rolled(before, not_updated) is False, (
+    assert verdicts.deployments_rolled(before, not_updated) is False, (
         "ready == replicas with updatedReplicas short is mid-rollout"
     )
     # deployments_rolled stays for the refresher's --restart-deployments
     # compatibility mode; the catalog status for path A is STEADY.
-    assert ha009.role_status(before) == {
+    assert verdicts.role_status(before) == {
         "gpu-fault-api-ha": "STEADY",
         "gpu-fault-control-worker": "STEADY",
         "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
@@ -129,27 +132,27 @@ def test_deployments_steady_requires_same_generation_uids_and_restarts() -> None
         "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w3"]),
         "gpu-fault-telemetry-spool-worker": _deployment(1, [], replicas=0),
     }
-    assert ha009.deployments_steady(before, before) == []
+    assert verdicts.deployments_steady(before, before) == []
 
     rolled = {**before, "gpu-fault-api-ha": _deployment(2, ["b1", "b2", "b3"])}
     assert any(
-        "generation" in item for item in ha009.deployments_steady(before, rolled)
+        "generation" in item for item in verdicts.deployments_steady(before, rolled)
     ), "a generation bump must be reported as a rollout"
 
     replaced = {
         **before,
         "gpu-fault-control-worker": _deployment(1, ["w1", "w2", "w9"]),
     }
-    assert any("Pod" in item for item in ha009.deployments_steady(before, replaced)), (
-        "a replaced Pod uid must be reported"
-    )
+    assert any(
+        "Pod" in item for item in verdicts.deployments_steady(before, replaced)
+    ), "a replaced Pod uid must be reported"
 
     restarted = {**before, "gpu-fault-api-ha": _deployment(1, ["a1", "a2", "a3"])}
     restarted["gpu-fault-api-ha"]["pods"][0][1]["restarts"] = 1
     assert any(
-        "restart" in item for item in ha009.deployments_steady(before, restarted)
+        "restart" in item for item in verdicts.deployments_steady(before, restarted)
     ), "a container restart must be reported"
-    assert ha009.role_status(before) == {
+    assert verdicts.role_status(before) == {
         "gpu-fault-api-ha": "STEADY",
         "gpu-fault-control-worker": "STEADY",
         "gpu-fault-telemetry-spool-worker": "SKIPPED_NOT_ENABLED",
@@ -254,10 +257,10 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         before_noop=after,
         after_noop=after,
     )
-    assert ha009.rotation_errors(final_probe=probe, **common) == []
+    assert verdicts.rotation_errors(final_probe=probe, **common) == []
 
     broken_probe = {**probe, "error_types": {"http-500": 1}}
-    errors = ha009.rotation_errors(final_probe=broken_probe, **common)
+    errors = verdicts.rotation_errors(final_probe=broken_probe, **common)
     assert errors == ha005.continuity_errors(
         broken_probe, receipts, accepted_ids=["r1"]
     ), "HA-009 must report exactly what HA-005's shared evaluation reports"
@@ -271,7 +274,7 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         },
         "first_job": {"logs": ["rotated=True restarted=True"]},
     }
-    errors = ha009.rotation_errors(final_probe=probe, **rolled)
+    errors = verdicts.rotation_errors(final_probe=probe, **rolled)
     assert any("generation" in item for item in errors), (
         "the api-ha rollout must surface as a generation error"
     )
@@ -288,18 +291,19 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
         },
     }
     assert any(
-        "p-w3" in item for item in ha009.rotation_errors(final_probe=probe, **stale)
+        "p-w3" in item for item in verdicts.rotation_errors(final_probe=probe, **stale)
     ), "the lagging Pod must be named in the propagation error"
 
     # H1-5: after max_idle every Pod still serves and no reconnect was refused.
     sick = {**common, "idle_observation": _observation(pods, healthz=503)}
     assert any(
-        "healthz" in item for item in ha009.rotation_errors(final_probe=probe, **sick)
+        "healthz" in item
+        for item in verdicts.rotation_errors(final_probe=probe, **sick)
     ), "a 503 healthz after max_idle must fail the case"
     refused = {**common, "idle_observation": _observation(pods, auth_failures=2)}
     assert any(
         "authentication" in item
-        for item in ha009.rotation_errors(final_probe=probe, **refused)
+        for item in verdicts.rotation_errors(final_probe=probe, **refused)
     ), "refused reconnects must fail the case"
     unrendered = {**common, "idle_observation": _observation(pods)}
     for samples in unrendered["idle_observation"]["samples"].values():
@@ -307,7 +311,7 @@ def test_rotation_errors_reuse_ha005_continuity_and_skip_disabled_roles() -> Non
             sample["metrics"].pop("gpu_fault_postgres_pool_connections_errors_total")
     assert any(
         "connections_errors_total" in item
-        for item in ha009.rotation_errors(final_probe=probe, **unrendered)
+        for item in verdicts.rotation_errors(final_probe=probe, **unrendered)
     ), "a missing pool error counter must fail the case"
 
 

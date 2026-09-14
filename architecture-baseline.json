@@ -29,7 +29,6 @@
     "scripts/e2e/regional/run_collector_acceptance.py": 1772,
     "scripts/e2e/regional/run_collector_destructive.py": 1886,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1663,
-    "scripts/e2e/regional/run_ha009_aurora_credential_rotation.py": 1508,
     "scripts/e2e/regional/run_notification_acceptance.py": 1701,
     "scripts/e2e/regional/run_workload_acceptance.py": 2171,
     "src/gpu_fault/admin/aws_cleanup.py": 1562,
@@ -46,8 +45,6 @@
     "src/gpu_fault_release/regional_admin_checks.py": 1727,
     "src/gpu_fault_release/regional_release_orchestration.py": 2004,
     "tests/processor/test_telemetry_spool.py": 1673,
-    "tests/regional/test_destr016_preempting_reboot.py": 1574,
-    "tests/regional/test_destructive_acceptance_fixtures.py": 1534,
     "tests/regional/test_regional_admin_checks.py": 1614
   },
   "functions": {

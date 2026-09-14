@@ -101,6 +101,20 @@ def block_cluster_binaries(request: pytest.FixtureRequest, monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def kubeconfig_is_never_ambient(monkeypatch) -> None:
+    """A test points the release engine at a kubeconfig it wrote, never one it
+    inherits. The deploy runs this suite as a release gate with ``KUBECONFIG``
+    set to the live site kubeconfig, whose exec credential is ``aws eks
+    get-token``; ``ReleaseKubeconfigCache`` pre-fetches a token for every entry
+    in ``KUBECONFIG`` on ``__enter__``. An ambient value made four
+    kubeconfig-cache and four rollout tests plus the rollback-marker test exec
+    real ``aws`` and trip ``block_cluster_binaries`` in the gate while passing on
+    a developer box that has no ``KUBECONFIG``. Clearing it here forces each
+    test to export ``KUBECONFIG`` on purpose."""
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def deploy_consent_is_never_ambient(monkeypatch) -> None:
     """The deploy carries operator consent down its process chain as
     environment variables, and it runs this suite as a release gate inside

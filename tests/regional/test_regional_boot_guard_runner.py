@@ -65,7 +65,11 @@ def test_no_silent_test_expressions_remain() -> None:
 def test_pod_names_are_read_after_the_deployment_is_available() -> None:
     runner = _runner()
 
-    assert 'wait deployment "${PROBE}" --for=condition=Available' in runner
+    # Since 5159f8e the runner waits on `rollout status`, not `--for=Available`:
+    # deleting and re-applying the Deployment under one name lets `wait` match a
+    # stale Available=True from the prior generation and return before the new
+    # Pod exists. `rollout status` waits for the current generation.
+    assert 'rollout status deployment "${PROBE}" --timeout=600s' in runner
     assert runner.count('probe_pod="$(probe_pod_name)"') == 3
     # BOOT-001 re-reads Ready one readiness period after the guard fired; that is
     # the single remaining .items[0] read and it happens after assert.sh matched.
