@@ -422,6 +422,14 @@ def _group_fakes(
 
     monkeypatch.setattr(destr012, "delete_after_quiescence", delete_after_quiescence)
     monkeypatch.setattr(destr012, "ManagedWorkloadFixture", lambda _r, _s: workload)
+
+    def wait_out_duplicate_window(_first_at: Any, **_kwargs: Any) -> float:
+        log.entries.append("wait_out_duplicate_window")
+        return 0.0
+
+    monkeypatch.setattr(
+        destr012, "wait_out_duplicate_window", wait_out_duplicate_window
+    )
     monkeypatch.setattr(
         destr009,
         "wait_observation",
@@ -620,3 +628,28 @@ def test_group_d_fails_on_inconclusive_executor_logs(
         (tmp_path / "case" / "group-d-executor-logs.json").read_text(encoding="utf-8")
     )
     assert written["verdict"] == "INCONCLUSIVE"
+
+
+def test_the_retry_waits_out_the_coordinator_duplicate_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second XID 11 within same_source_window (30 s) of the first is folded
+    into the first incident as a duplicate and plans nothing; group D's retry
+    must wait the window plus a margin out, measured from the first injection."""
+    slept: list[float] = []
+    monkeypatch.setattr(destr012.time, "sleep", lambda seconds: slept.append(seconds))
+    first_at = datetime(2026, 9, 14, 12, 43, 1, tzinfo=timezone.utc)
+
+    waited = destr012.wait_out_duplicate_window(
+        first_at, now=first_at + timedelta(seconds=10)
+    )
+
+    assert destr012.SAME_SOURCE_DUPLICATE_WINDOW_SECONDS == 30, (
+        "mirror gpu_fault.orchestration.coordinator's same_source_window default"
+    )
+    assert waited == 35.0 and slept == [35.0], (waited, slept)
+
+    late = destr012.wait_out_duplicate_window(
+        first_at, now=first_at + timedelta(seconds=60)
+    )
+    assert late == 0.0 and slept == [35.0], (late, slept)

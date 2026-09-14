@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -63,6 +63,16 @@ MANAGED_WORKLOAD_OWNER = "gpu-fault-kubernetes-adapter"
 GROUP_A_OWNER_OPERATIONS = ("STOP_WORKLOADS", "RESTART_WORKLOAD")
 GROUP_A_EVIDENCE_SOURCE = f"{PREDECESSOR_CASE_ID} evidence"
 GROUP_A_WORKLOAD_SOURCE = "rerun 24-GPU workload restart"
+# The coordinator folds a same-source marker on the same node and GPU into an
+# existing active marker when the two lie at most ``same_source_window`` apart
+# (gpu_fault.orchestration.coordinator, default 30 s, which the release does
+# not override). Group D's second XID 11 must read as a NEW fault after the
+# annotation was fixed; on 2026-09-14 attempt 3 fired it 29.8 s after the
+# first, the coordinator folded it into the ESCALATED incident, no workflow
+# was planned and nothing restarted. Attempt 2 had cleared the window by a
+# fraction of a second. The retry now waits the window out plus a margin.
+SAME_SOURCE_DUPLICATE_WINDOW_SECONDS = 30
+DUPLICATE_WINDOW_MARGIN_SECONDS = 15
 
 
 PROFILE_REPLICA_PROBE = r"""
@@ -509,6 +519,24 @@ def delete_after_quiescence(
         result["verdict"] = "FAIL"
 
 
+def wait_out_duplicate_window(
+    first_at: datetime, *, now: datetime | None = None
+) -> float:
+    """Sleep until a second same-source event cannot be a duplicate of the first.
+
+    Returns the seconds slept; zero when the window had already passed.
+    """
+
+    ready_at = first_at + timedelta(
+        seconds=SAME_SOURCE_DUPLICATE_WINDOW_SECONDS + DUPLICATE_WINDOW_MARGIN_SECONDS
+    )
+    remaining = (ready_at - (now or datetime.now(timezone.utc))).total_seconds()
+    if remaining <= 0:
+        return 0.0
+    time.sleep(remaining)
+    return remaining
+
+
 def group_a_owner_errors(steps: list[dict[str, Any]]) -> list[str]:
     owners = {
         item.get("operation"): item.get("execution_owner")
@@ -824,6 +852,9 @@ def run_group_d(
             == "true"
         ):
             errors.append("group D auto-resume annotation was not removed")
+        result["duplicate_window_wait_seconds"] = round(
+            wait_out_duplicate_window(first_at), 3
+        )
         second_marker = f"destr012-d-retry-{int(time.time())}"
         second_at = datetime.now(timezone.utc)
         quiescence_marker, quiescence_after = second_marker, second_at
