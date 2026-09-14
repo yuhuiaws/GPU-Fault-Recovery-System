@@ -543,6 +543,7 @@ STORE_PROBE = r"""
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -657,13 +658,64 @@ matching_events = [
     )
 ]
 event = matching_events[-1] if matching_events else None
+# A correlation event is a sliding working set, not a log: the correlator
+# deletes a node's older rows whenever a newer one lands (xid_correlation.py,
+# retain_from = observed_at - companion_window * retained_windows), so a case
+# whose target node takes another XID after its injection -- DESTR-016 absorbs
+# one by design -- lost its event from list_xid_events mid-run and never saw
+# the barrier it had built (2026-09-14). The raw evidence keeps the injected
+# line for its retention and the marker keyed to the same kmsg record names
+# the event; both outlive the correlation row, so recover the event from them
+# before reporting that nothing happened.
+recovered_event = None
+if marker and event is None and node_id:
+    for record in store.list_raw_evidence(cluster_id, node_id=node_id, limit=500):
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        message = str(payload.get("message") or "")
+        if marker not in message:
+            continue
+        if observed_after is not None and record.observed_at < observed_after:
+            continue
+        evidence_ref = str(payload.get("evidence_ref") or "")
+        if not evidence_ref:
+            continue
+        matched = [
+            item
+            for item in store.list_recent_markers_for_nodes(
+                {node_id}, observed_after or record.observed_at
+            )
+            if str(item.raw_evidence_ref or "") == evidence_ref
+        ]
+        if not matched:
+            continue
+        xid_match = re.search(r"Xid \(PCI:([0-9a-fA-F:.]+)\): (\d+)", message)
+        recovered_event = {
+            "event_id": str(matched[0].marker_id).removeprefix("marker-"),
+            "cluster_id": cluster_id,
+            "node_id": node_id,
+            "observed_at": record.observed_at.isoformat(),
+            "collected_at": payload.get("collected_at"),
+            "event_source": matched[0].event_source or "KERNEL_LOG",
+            "source_boot_id": payload.get("source_boot_id"),
+            "xid": int(xid_match.group(2)) if xid_match else None,
+            "pci_bdf": xid_match.group(1) if xid_match else None,
+            "raw_message": message,
+            "evidence_ref": evidence_ref,
+            "recovered_from": "raw_evidence",
+        }
+        break
+event_id = (
+    recovered_event["event_id"]
+    if recovered_event is not None
+    else (event.event_id if event is not None else None)
+)
 decision = None
-if event is not None:
+if event_id is not None:
     try:
-        decision = store.get_xid_policy_decision(event.event_id)
+        decision = store.get_xid_policy_decision(event_id)
     except NotFoundError:
         pass
-incident = store.get_incident_by_event(event.event_id) if event is not None else None
+incident = store.get_incident_by_event(event_id) if event_id is not None else None
 workflow = (
     store.get_workflow(incident.workflow_request_id)
     if incident is not None and incident.workflow_request_id
@@ -753,7 +805,11 @@ if hyperpod_cluster and commands:
             pass
 print(json.dumps({
     "release_id": os.getenv("GPU_FAULT_RELEASE_ID"),
-    "event": event.model_dump(mode="json") if event is not None else None,
+    "event": (
+        recovered_event
+        if recovered_event is not None
+        else (event.model_dump(mode="json") if event is not None else None)
+    ),
     "decision": (
         decision.model_dump(mode="json") if decision is not None else None
     ),

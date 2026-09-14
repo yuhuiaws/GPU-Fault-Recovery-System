@@ -587,3 +587,98 @@ def test_waiting_projection_keeps_timestamps_only_when_the_record_has_them() -> 
     assert projected_bare["error"] is None
     assert projected_stamped["started_at"] == "2026-09-06T10:02:00+00:00"
     assert "updated_at" not in projected_stamped, projected_stamped
+
+
+class _DurableFakeStore(_FakeStore):
+    """The correlation row is gone; raw evidence and the marker still exist."""
+
+    def __init__(self, *, message: str) -> None:
+        super().__init__()
+        self.message = message
+        self.incident_lookups: list[str] = []
+
+    def list_xid_events(self, _cluster: str, _node: str, *, observed_after: Any):
+        return []
+
+    def list_raw_evidence(
+        self, _cluster: str, *, node_id: str | None = None, **_k: Any
+    ):
+        return [
+            _Record(
+                observed_at=datetime(2026, 9, 14, 13, 43, 43, tzinfo=timezone.utc),
+                payload={
+                    "message": self.message,
+                    "evidence_ref": "kmsg://node-a/boot-1/3783",
+                    "collected_at": "2026-09-14T13:43:44Z",
+                    "source_boot_id": "boot-1",
+                },
+            )
+        ]
+
+    def list_recent_markers_for_nodes(self, node_ids: set[str], _after: Any, **_k: Any):
+        return [
+            _Record(
+                marker_id="marker-event-durable",
+                raw_evidence_ref="kmsg://node-a/boot-1/3783",
+                event_source="KERNEL_LOG",
+            ),
+            _Record(
+                marker_id="marker-other",
+                raw_evidence_ref="kmsg://node-a/boot-1/9999",
+                event_source="KERNEL_LOG",
+            ),
+        ]
+
+    def get_incident_by_event(self, event_id: str):
+        self.incident_lookups.append(event_id)
+        return _Record(incident_id="incident-a", workflow_request_id="workflow-a")
+
+
+def test_store_probe_recovers_the_event_from_raw_evidence_when_the_correlation_row_is_gone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The correlator prunes a node's older correlation events whenever a newer
+    one lands, so a case that injects a second XID (DESTR-016's absorb) loses its
+    first event from list_xid_events mid-run. Raw evidence and the marker keyed
+    to the same kmsg record outlive that row and still name the workflow."""
+    from gpu_fault.app import ApplicationContext
+
+    store = _DurableFakeStore(
+        message=(
+            "gpu-fault GF-REGIONAL-DESTR-016 marker=marker-a drill_id=d "
+            "NVRM: Xid (PCI:0000:59:00): 46, GPU stopped processing"
+        )
+    )
+    monkeypatch.setattr(
+        ApplicationContext,
+        "from_environment",
+        classmethod(lambda _cls: SimpleNamespace(store=store)),
+    )
+    monkeypatch.setattr(sys, "argv", ["store-probe", *_EIGHT_ARGUMENTS])
+    exec(compile(STORE_PROBE, "<store-probe>", "exec"), {"__name__": "__probe__"})
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert payload["event"]["event_id"] == "event-durable", payload["event"]
+    assert payload["event"]["xid"] == 46 and payload["event"]["pci_bdf"] == "0000:59:00"
+    assert payload["event"]["recovered_from"] == "raw_evidence"
+    assert store.incident_lookups == ["event-durable"]
+    assert payload["workflow"]["request_id"] == "workflow-a"
+
+
+def test_store_probe_does_not_invent_an_event_from_foreign_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from gpu_fault.app import ApplicationContext
+
+    store = _DurableFakeStore(message="NVRM: Xid (PCI:0000:59:00): 46, another drill")
+    monkeypatch.setattr(
+        ApplicationContext,
+        "from_environment",
+        classmethod(lambda _cls: SimpleNamespace(store=store)),
+    )
+    monkeypatch.setattr(sys, "argv", ["store-probe", *_EIGHT_ARGUMENTS])
+    exec(compile(STORE_PROBE, "<store-probe>", "exec"), {"__name__": "__probe__"})
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert payload["event"] is None and payload["incident"] is None, payload
+    assert store.incident_lookups == []
