@@ -119,6 +119,50 @@ reset_probe() {
   "${FIXTURE_DIR}/reset.sh"
 }
 
+# BOOT-007/008 依赖各自的 env 注册表成为**运行时权威**，但产品的区域注册表运行时
+# 遵循 "durable head wins"：首个 bootstrap 的探针把 gen-1 从 list_regional_clusters()
+# 固化为 durable head，此后 env Secret 只写漂移日志、不再改写 store（见
+# regional_registry.py 的 sync：head 已存在就直接返回 durable revision；以及
+# regional_registry_runtime._bootstrap_once：head NotFound 才 publish gen-1）。
+# 整批共用一个 gpu_fault_guardprobe 库，于是 BOOT-002 的空注册表 [] 会把 durable
+# head 钉死为空；BOOT-007 的 32、BOOT-008 的 64 disabled 随后被忽略，BOOT-008 的
+# claim 打到未注册集群、返回 403 "regional cluster is not registered"（而非用例
+# 期望的 "authentication failed"），造成与用例顺序相关的假失败（完整跑失败、
+# START=7 因跳过 BOOT-002 而侥幸通过）。这是 runner/fixture 缺陷，非产品缺陷。
+# 每次换注册表起探针前清掉 guardprobe 的 durable registry 行，让本用例 env 重新
+# bootstrap 成 gen-1，用例判定即与顺序无关。reset_probe 已等到 0 个探针 Pod，
+# 删除时无探针连着该 head；api Pod 只连线上 /gpu_fault，不受影响。裸
+# psycopg.connect 自建 DSN、不经 StoreCredentials，但仍显式清空
+# GPU_FAULT_STORE_URL_FILE 与 baseline 初始化保持一致（防误读挂载文件）。
+reset_durable_registry() {
+  local pod
+  pod="$(latest_ready_api_pod)"
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    exec -i "${pod}" -- env GPU_FAULT_STORE_URL_FILE= python - <<'PY'
+import os
+import urllib.parse
+
+import psycopg
+
+parts = urllib.parse.urlsplit(os.environ["GPU_FAULT_STORE_URL"])
+assert parts.path == "/gpu_fault", parts.path
+probe = urllib.parse.urlunsplit(parts._replace(path="/gpu_fault_guardprobe"))
+with psycopg.connect(probe, autocommit=True) as connection:
+    deleted = connection.execute(
+        """
+        DELETE FROM gpu_fault_objects
+        WHERE kind IN (
+            'regional_cluster',
+            'regional_registry_head',
+            'regional_registry_revision',
+            'regional_registry_member'
+        )
+        """
+    ).rowcount
+print("guardprobe durable registry reset, rows deleted:", deleted)
+PY
+}
+
 assert_probe() {
   "${FIXTURE_DIR}/assert.sh" "$1" 180
 }
@@ -159,6 +203,9 @@ probe_pod_name() {
 
 probe_registry() {
   reset_probe
+  # 探针已全部消失，此刻清掉 guardprobe 的 durable registry，
+  # 让下面这套 env 注册表成为新探针 bootstrap 的 gen-1 权威。
+  reset_durable_registry
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     create secret generic gpu-fault-regional-clusters-probe \
     --from-literal=clusters.json="$(
@@ -500,6 +547,7 @@ disabled_output="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     exec -i "${probe_pod}" -- python - <<'PY'
 import json
+import sys
 import urllib.error
 import urllib.request
 
@@ -527,7 +575,14 @@ except urllib.error.HTTPError as exc:
     body = exc.read().decode()
     print("status", exc.code, body)
     if exc.code != 403 or "regional cluster authentication failed" not in body:
+        # 命中失败时，实际 code/body 只 print 到被 $(...) 捕获的 stdout，
+        # set -e 会在 tee 之前中止、变量永不回显（见 memory 记录的吞输出陷阱）。
+        # 额外写一份到 stderr，批次日志能捕获，失败时立刻看到真实响应。
+        print("status", exc.code, body, file=sys.stderr)
         raise SystemExit("disabled cluster was not refused with 403")
+except urllib.error.URLError as exc:
+    print("URLError", exc, file=sys.stderr)
+    raise SystemExit("disabled cluster claim connection failed")
 else:
     raise SystemExit("disabled cluster authenticated")
 PY
