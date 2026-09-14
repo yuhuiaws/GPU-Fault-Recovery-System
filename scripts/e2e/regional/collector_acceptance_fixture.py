@@ -30,7 +30,15 @@ from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
 
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "collector_node_probe.py"
-TERMINAL_WORKFLOW_STATUSES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED"})
+# A workflow in any of these will never run again on its own, so a wait
+# loop must treat it as settled. SUPERSEDED belongs here: a case whose
+# positive marker sweeps in a predecessor a later workflow superseded
+# (COLLECT-014, whose fail-closed workflow the restore supersedes 25s
+# before the positive injection, inside the KMSG_CLOCK_SKEW_SECONDS the
+# store read widens observed_after by) hangs to timeout without it. This
+# mirrors the control plane's own terminal set (models.py: everything
+# outside PENDING/SAFETY_PENDING/RUNNING).
+TERMINAL_WORKFLOW_STATUSES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"})
 # The control plane's own isolation taint. A node the validated restore left
 # with it is still quarantined whatever the annotations say.
 QUARANTINE_TAINT_PREFIX = "gpu-fault.io/"

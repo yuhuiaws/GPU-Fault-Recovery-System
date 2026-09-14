@@ -25,7 +25,7 @@ from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
     current_acceptance_scope,
 )
 
-TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED"}
+TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 PROVIDER_MUTATIONS = {
     "BatchDeleteClusterNodes",
     "BatchRebootClusterNodes",
