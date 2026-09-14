@@ -1052,7 +1052,12 @@ with psycopg.connect(store_dsn()) as c:
                         ),
                     }
                     for item in pods.get("items", [])
-                    if item.get("metadata", {}).get("labels", {}).get("app")
+                    # Probe Pods wear the worker's `app` label too; one left
+                    # behind by another run must not count as production, or
+                    # its removal mid-case reads as a baseline change.
+                    if "gpu-fault.io/capacity-probe"
+                    not in item.get("metadata", {}).get("labels", {})
+                    and item.get("metadata", {}).get("labels", {}).get("app")
                     in {
                         "gpu-fault-api-ha",
                         "gpu-fault-control-worker",

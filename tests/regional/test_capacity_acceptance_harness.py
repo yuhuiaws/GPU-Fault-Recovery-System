@@ -499,3 +499,42 @@ def test_probe_carries_nothing_when_the_release_mounts_no_ca_bundle() -> None:
         "scripts",
         "work",
     ]
+
+
+class _BaselineHarness(base.CapHarnessBase):
+    """A core harness whose kubectl reads are scripted."""
+
+    def __init__(  # noqa: D107 - bypasses CapCoreHarness.__init__ on purpose
+        self, pods: list[dict[str, Any]]
+    ) -> None:
+        self._pods = pods
+
+    def kubectl_json(self, *args: str) -> Any:
+        return {"items": self._pods if args[1] == "pods" else []}
+
+
+def _pod(name: str, labels: dict[str, str]) -> dict[str, Any]:
+    return {
+        "metadata": {"name": name, "uid": f"uid-{name}", "labels": labels},
+        "status": {"phase": "Running", "containerStatuses": [{"restartCount": 0}]},
+    }
+
+
+def test_baseline_ignores_capacity_probes_wearing_the_worker_label() -> None:
+    # A probe left behind by another run wears app=gpu-fault-control-worker;
+    # its later removal must not turn a passing case into "baseline changed".
+    harness = _BaselineHarness(
+        [
+            _pod("gpu-fault-control-worker-1", {"app": "gpu-fault-control-worker"}),
+            _pod(
+                "gpu-fault-cap000000-cap001-1",
+                {
+                    "app": "gpu-fault-control-worker",
+                    "gpu-fault.io/capacity-probe": "cap000000-cap001",
+                },
+            ),
+        ]
+    )
+    assert [p["name"] for p in harness.production_baseline()["pods"]] == [
+        "gpu-fault-control-worker-1"
+    ]
