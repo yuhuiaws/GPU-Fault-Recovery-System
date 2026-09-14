@@ -3073,15 +3073,15 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cmd-009
   related_pytest: tests/regional/test_regional_command_protocol_acceptance.py::test_cmd009_an_unknown_and_a_foreign_command_are_the_same_404
 - id: GF-REGIONAL-CMD-010
-  title: fencing token 陈旧的 command 既不可领取也不可完成
+  title: fencing token 陈旧的 command 领不到、结果被作废并判 FAILED
   category: regional-remote-command
   level: live
   risk: live-non-destructive
   problem: 旧一代 executor 若能在新一代恢复流程进行中写入结果，会造成恢复完成的错误结论。
   injection: 先 claim 一条 command 不提交结果，让 workflow 的 fencing token 前进后再提交并重新 claim。
   expected:
-  - 提交返回 409 且 detail 为 remote command fencing token is stale
-  - 重新 claim 领不到这条旧 command
+  - 提交返回 200 但结果不被采纳为成功；command 结算 FAILED、status_source 为 stale-fence，executor 上报仅存入 result_details.post_stale_fence_status 供审计，租约被释放
+  - 重新 claim 领不到这条旧 command（已 FAILED，且 claim 跳过与当前代不一致的 command）
   - 集群实际状态未被这条陈旧 command 改变
   evidence:
     verdict: NOT_RUN

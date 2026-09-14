@@ -54,7 +54,10 @@ from gpu_fault.store import NotFoundError
 
 try:
     ROOT: Path | None = Path(__file__).resolve().parents[3]
-except NameError:  # piped into the Pod as ``python3 -``; no checkout there
+except (
+    NameError,
+    IndexError,
+):  # piped in as ``python3 -``; __file__ may resolve shallow
     ROOT = None
 if ROOT is not None and str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -803,10 +806,20 @@ class LiveProtocolAudit:
         status, reclaimed = self.claim(executor_id="cmd010-reclaim", max_commands=25)
         reclaimed_ids = [item["command_id"] for item in reclaimed["commands"]]
         self.hand_back(list(reclaimed["commands"]))
-        expect(stale_status == 409, f"stale fencing result answered {stale_status}")
+        # A stale-fenced completion is *recorded* (HTTP 200) and settles the
+        # command FAILED under status_source "stale-fence": the old generation's
+        # reported outcome is preserved only under result_details
+        # ["post_stale_fence_*"] for audit and never becomes the command's
+        # effective status, so an old-generation executor still cannot drive a
+        # false "recovery complete" conclusion (the case's failure meaning). The
+        # earlier contract (409 + WorkflowLeaseError, row left LEASED) was
+        # abandoned because refusing the result left the row LEASED for ever; see
+        # complete_remote_command and tests/store/test_remote_command_stale_fence.py.
+        expect(stale_status == 200, f"stale fencing result answered {stale_status}")
         expect(
-            "fencing token is stale" in str(stale.get("detail")),
-            f"stale detail is {stale.get('detail')!r}",
+            isinstance(stale, dict) and stale.get("status_source") == "stale-fence",
+            f"the 200 result body did not settle under stale-fence: "
+            f"{stale.get('status_source') if isinstance(stale, dict) else stale!r}",
         )
         expect(
             command.command_id not in reclaimed_ids,
@@ -822,11 +835,19 @@ class LiveProtocolAudit:
             "the fenced workflow/incident changed under the stale result",
         )
         expect(
-            after_command.status.value == "LEASED"
-            and after_command.lease_owner == "cmd010"
+            after_command.status.value == "FAILED"
+            and after_command.status_source == "stale-fence"
+            and after_command.lease_owner is None
+            and after_command.last_lease_owner == "cmd010"
             and after_command.fencing_token == 1,
-            f"the fenced command moved: {after_command.status.value} "
+            f"the fenced command did not settle FAILED under stale-fence: "
+            f"{after_command.status.value} source={after_command.status_source!r} "
             f"owner={after_command.lease_owner!r}",
+        )
+        expect(
+            after_command.result_details.get("post_stale_fence_status") == "SUCCEEDED",
+            "the executor's reported outcome was not preserved for audit: "
+            f"{after_command.result_details.get('post_stale_fence_status')!r}",
         )
         node_absent_after = self._node_agent_record_absent()
         expect(
@@ -849,8 +870,13 @@ class LiveProtocolAudit:
             },
             command_after={
                 "status": after_command.status.value,
+                "status_source": after_command.status_source,
                 "lease_owner": after_command.lease_owner,
+                "last_lease_owner": after_command.last_lease_owner,
                 "fencing_token": after_command.fencing_token,
+                "post_stale_fence_status": after_command.result_details.get(
+                    "post_stale_fence_status"
+                ),
             },
             node_agent_record_absent={
                 "before": node_absent_before,
