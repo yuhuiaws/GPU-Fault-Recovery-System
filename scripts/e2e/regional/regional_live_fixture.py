@@ -24,6 +24,7 @@ from scripts.e2e.regional.acceptance_scope import (  # noqa: E402
     FORMAL_SCOPE,
     current_acceptance_scope,
 )
+from scripts.e2e.regional.kmsg_clock import marker_observed_after  # noqa: E402
 
 TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 PROVIDER_MUTATIONS = {
@@ -1171,11 +1172,17 @@ class RegionalLiveFixture:
         marker's own workflow's commands, as it always has.
         """
 
+        # A marker-tagged read identifies its line by the marker, so the time
+        # bound is only a scan limit; widen it by the kmsg clock skew (the
+        # kernel stamps the injected line a little before the runner's
+        # datetime.now()), exactly as the collector fixture does, or an exact
+        # cut drops the event and the loop waits its whole budget.
+        bound = marker_observed_after(marker, observed_after)
         arguments = [
             self.settings.cluster_id,
             node,
             marker,
-            observed_after.isoformat() if observed_after is not None else "",
+            bound.isoformat() if bound is not None else "",
             job_id,
             attempt_id,
             hyperpod_cluster,
