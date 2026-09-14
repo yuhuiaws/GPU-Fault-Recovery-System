@@ -393,6 +393,54 @@ def workload_write_lines(output: str, workload_name: str) -> list[str]:
     ]
 
 
+def silence_evidence(
+    regional: RegionalLiveFixture,
+    *,
+    plane: str,
+    pod: str,
+    since: datetime,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Prove that a Pod's empty window read means "nothing logged", or say why not.
+
+    The ingress tier runs with ``--no-access-log`` and logs only on events, so
+    an idle window legitimately yields zero lines (DESTR-009 attempt 1,
+    2026-09-14: all three api-ha Pods, INCONCLUSIVE). Zero lines is trusted only
+    when the container has been running since before the window (no restart
+    could have dropped lines) and its log stream has history (the read path
+    works); otherwise the Pod stays inconclusive with the reason recorded.
+    """
+
+    try:
+        described = json.loads(
+            regional.kubectl(plane, "get", "pod", pod, "-o", "json", timeout=60)
+        )
+    except (RegionalFixtureError, ValueError) as exc:
+        return None, f"pod could not be described: {exc}"[:300]
+    statuses = (described.get("status") or {}).get("containerStatuses") or []
+    if not statuses:
+        return None, "pod reports no container status"
+    running = ((statuses[0].get("state") or {}).get("running") or {}).get("startedAt")
+    if not running:
+        return None, "container is not running"
+    started_at = datetime.fromisoformat(str(running).replace("Z", "+00:00"))
+    if started_at > since:
+        return None, (
+            f"container started at {started_at.isoformat()} inside the window; "
+            "lines before the restart are gone"
+        )
+    try:
+        history = regional.kubectl(plane, "logs", pod, "--tail=1", timeout=60)
+    except RegionalFixtureError as exc:
+        return None, f"log stream could not be read: {exc}"[:300]
+    if not history.strip():
+        return None, "log stream has no history at all"
+    return {
+        "container_started_at": started_at.isoformat(),
+        "restart_count": statuses[0].get("restartCount"),
+        "history_tail_lines": len(history.splitlines()),
+    }, None
+
+
 def log_write_snapshot(
     regional: RegionalLiveFixture,
     *,
@@ -403,37 +451,62 @@ def log_write_snapshot(
 ) -> dict[str, Any]:
     """Grep the Pods of ``apps`` for a write against the workload.
 
-    A Pod that returned no log lines for the window has not been checked --
-    the window may predate its log retention, or the read may have failed --
-    so it is listed under ``inconclusive`` and the verdict is INCONCLUSIVE,
-    not CLEAN. The old shape counted an empty read as "no suspicious lines".
+    A Pod whose window read failed, or returned no lines without the proof in
+    ``silence_evidence``, has not been checked: it is listed under
+    ``inconclusive`` and the verdict is INCONCLUSIVE, not CLEAN. A Pod that
+    returned no lines *with* that proof is ``silent`` -- checked, and clean.
+    The old shape counted every empty read as "no suspicious lines".
     """
 
     entries: list[dict[str, Any]] = []
     suspicious: list[dict[str, Any]] = []
     inconclusive: list[str] = []
+    silent: list[str] = []
     for app in apps:
         for pod in regional.ready_pods(plane, app):
-            output = regional.kubectl(
-                plane,
-                "logs",
-                str(pod["name"]),
-                "--since-time",
-                since.isoformat(),
-                check=False,
-                timeout=120,
-            )
-            path_key = f"{app}/{pod['name']}"
-            line_count = len(output.splitlines())
-            entries.append(
-                {
-                    "pod": path_key,
-                    "line_count": line_count,
-                    "sha256": hashlib.sha256(output.encode()).hexdigest(),
-                }
-            )
-            if line_count == 0:
+            name = str(pod["name"])
+            path_key = f"{app}/{name}"
+            try:
+                output = regional.kubectl(
+                    plane,
+                    "logs",
+                    name,
+                    "--since-time",
+                    since.isoformat(),
+                    timeout=120,
+                )
+            except RegionalFixtureError as exc:
+                entries.append(
+                    {
+                        "pod": path_key,
+                        "line_count": 0,
+                        "sha256": None,
+                        "classification": "inconclusive",
+                        "reason": f"window read failed: {exc}"[:300],
+                    }
+                )
                 inconclusive.append(path_key)
+                continue
+            line_count = len(output.splitlines())
+            entry: dict[str, Any] = {
+                "pod": path_key,
+                "line_count": line_count,
+                "sha256": hashlib.sha256(output.encode()).hexdigest(),
+                "classification": "checked",
+            }
+            if line_count == 0:
+                evidence, reason = silence_evidence(
+                    regional, plane=plane, pod=name, since=since
+                )
+                if evidence is None:
+                    entry["classification"] = "inconclusive"
+                    entry["reason"] = reason
+                    inconclusive.append(path_key)
+                else:
+                    entry["classification"] = "silent"
+                    entry["silence_evidence"] = evidence
+                    silent.append(path_key)
+            entries.append(entry)
             suspicious.extend(
                 {"pod": path_key, "line": line}
                 for line in workload_write_lines(output, workload_name)
@@ -448,6 +521,7 @@ def log_write_snapshot(
         "entries": entries,
         "suspicious": suspicious,
         "inconclusive": inconclusive,
+        "silent": silent,
         "verdict": verdict,
     }
 

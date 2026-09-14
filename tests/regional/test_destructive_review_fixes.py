@@ -546,28 +546,124 @@ def test_destr009_wait_loops_take_the_single_queue_sample(tmp_path: Path) -> Non
     assert seen[-1]["workflow_request_ids"] == ["wf-a"]
 
 
-def test_log_write_snapshot_is_inconclusive_without_lines(tmp_path: Path) -> None:
+def _pod_json(started_at: str, *, restarts: int = 0) -> str:
+    return json.dumps(
+        {
+            "status": {
+                "containerStatuses": [
+                    {
+                        "restartCount": restarts,
+                        "state": {"running": {"startedAt": started_at}},
+                    }
+                ]
+            }
+        }
+    )
+
+
+class _LogRegional:
+    """kubectl fake for the log snapshot: window reads, pod describes, history."""
+
+    def __init__(
+        self, windows: dict[str, str], pods: dict[str, str], history: dict[str, str]
+    ):
+        self.windows, self.pods, self.history = windows, pods, history
+        self.calls: list[tuple[str, ...]] = []
+
+    def ready_pods(self, _plane: str, app: str) -> list[dict[str, Any]]:
+        return [{"name": name} for name in self.windows]
+
+    def kubectl(self, _plane: str, *arguments: str, **_kwargs: Any) -> str:
+        self.calls.append(arguments)
+        if arguments[0] == "get":
+            return self.pods[arguments[2]]
+        if "--tail=1" in arguments:
+            return self.history[arguments[1]]
+        return self.windows[arguments[1]]
+
+
+def test_log_write_snapshot_trusts_silence_only_with_proof(tmp_path: Path) -> None:
+    """The ingress tier logs nothing while idle (--no-access-log), so an empty
+    window is CLEAN when the container predates the window and its stream has
+    history; a Pod restarted inside the window, or one with no history at all,
+    stays INCONCLUSIVE."""
+    since = datetime.now(timezone.utc)
+    before = (since - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    during = (since + timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
     outputs = {"pod-a": "", "pod-b": "2026-09-07 INFO gpu_fault.api served /healthz"}
-
-    class Regional:
-        def ready_pods(self, _plane: str, app: str) -> list[dict[str, Any]]:
-            return [{"name": name} for name in outputs]
-
-        def kubectl(self, _plane: str, *arguments: str, **_kwargs: Any) -> str:
-            return outputs[arguments[1]]
+    regional = _LogRegional(
+        outputs,
+        pods={"pod-a": _pod_json(before), "pod-b": _pod_json(before)},
+        history={
+            "pod-a": "2026-09-14 INFO uvicorn Application startup complete",
+            "pod-b": "x",
+        },
+    )
 
     logs = destr009.log_write_snapshot(
-        cast(Any, Regional()),
+        cast(Any, regional),
         plane="cpu",
         apps=("gpu-fault-api-ha",),
-        since=datetime.now(timezone.utc),
+        since=since,
+        workload_name="training-a",
+    )
+
+    assert logs["verdict"] == "CLEAN", logs
+    assert logs["silent"] == ["gpu-fault-api-ha/pod-a"]
+    assert logs["inconclusive"] == []
+    silent_entry = next(
+        e for e in logs["entries"] if e["pod"] == "gpu-fault-api-ha/pod-a"
+    )
+    assert silent_entry["classification"] == "silent"
+    assert silent_entry["silence_evidence"]["history_tail_lines"] == 1
+    assert destr009.log_write_errors(logs, "control-plane") == []
+
+    restarted = _LogRegional(
+        outputs,
+        pods={"pod-a": _pod_json(during, restarts=1), "pod-b": _pod_json(before)},
+        history={"pod-a": "x", "pod-b": "x"},
+    )
+    logs = destr009.log_write_snapshot(
+        cast(Any, restarted),
+        plane="cpu",
+        apps=("gpu-fault-api-ha",),
+        since=since,
         workload_name="training-a",
     )
     assert logs["verdict"] == "INCONCLUSIVE"
     assert logs["inconclusive"] == ["gpu-fault-api-ha/pod-a"]
+    assert (
+        "inside the window"
+        in next(e for e in logs["entries"] if e["pod"] == "gpu-fault-api-ha/pod-a")[
+            "reason"
+        ]
+    )
     assert destr009.log_write_errors(logs, "control-plane") == [
         "control-plane logs are INCONCLUSIVE: no lines from gpu-fault-api-ha/pod-a"
     ]
+
+    no_history = _LogRegional(
+        outputs,
+        pods={"pod-a": _pod_json(before), "pod-b": _pod_json(before)},
+        history={"pod-a": "", "pod-b": "x"},
+    )
+    logs = destr009.log_write_snapshot(
+        cast(Any, no_history),
+        plane="cpu",
+        apps=("gpu-fault-api-ha",),
+        since=since,
+        workload_name="training-a",
+    )
+    assert logs["verdict"] == "INCONCLUSIVE"
+    assert logs["inconclusive"] == ["gpu-fault-api-ha/pod-a"]
+
+    class Regional(_LogRegional):
+        def __init__(self) -> None:
+            super().__init__(
+                outputs,
+                pods={"pod-a": _pod_json(before), "pod-b": _pod_json(before)},
+                history={"pod-a": "x", "pod-b": "x"},
+            )
 
     outputs["pod-a"] = '{"verb":"patch","resource":"pytorchjobs","name":"training-a"}'
     logs = destr009.log_write_snapshot(

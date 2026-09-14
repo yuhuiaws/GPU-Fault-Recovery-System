@@ -571,9 +571,13 @@ def test_executor_log_snapshot_is_inconclusive_without_lines(tmp_path: Path) -> 
         "gpu-fault-cluster-executor/gpu-fault-cluster-executor-pod-a"
     ]
     assert logs["suspicious"] == []
-    # Only the GPU-plane executor Pods are read, nothing on the CPU plane.
+    # Only the GPU-plane executor Pods are read, nothing on the CPU plane. An
+    # empty window read is followed by the silence proof (describe the Pod, then
+    # its log history); this fake answers the describe with nothing, so the Pod
+    # stays inconclusive and the history is never asked for.
     assert log.entries == [
-        "regional:kubectl:logs gpu-fault-cluster-executor-pod-a --since-time"
+        "regional:kubectl:logs gpu-fault-cluster-executor-pod-a --since-time",
+        "regional:kubectl:get pod gpu-fault-cluster-executor-pod-a",
     ]
 
 
