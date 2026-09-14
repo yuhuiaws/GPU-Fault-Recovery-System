@@ -285,7 +285,13 @@ observations = [
     for item in store.list_attempt_observations(cluster_id)
     if item.job_id == job_id and item.attempt_id == attempt_id
 ]
-decision = store.get_decision_by_attempt(cluster_id, attempt_id)
+try:
+    decision = store.get_decision_by_attempt(cluster_id, attempt_id)
+except NotFoundError:
+    # A clean-baseline attempt has no terminal event/decision yet; the
+    # product deliberately raises here (unit-tested), so a missing
+    # decision is None, exactly as get_restart_budget is handled below.
+    decision = None
 try:
     budget = store.get_restart_budget(cluster_id, job_id).model_dump(mode="json")
 except NotFoundError:
