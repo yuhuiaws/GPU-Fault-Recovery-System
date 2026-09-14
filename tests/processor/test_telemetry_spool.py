@@ -1507,6 +1507,21 @@ def spool_store(request):
     yield from postgres_store_instance()
 
 
+@pytest.fixture
+def postgres_spool_store():
+    """Only the Postgres store: the depth projection is Postgres-specific, and
+    a memory variant that skips would count against the CAP-005 zero-skip gate."""
+
+    from tests.store._postgres_processor_claim_support import (
+        POSTGRES_URL,
+        postgres_store_instance,
+    )
+
+    if not POSTGRES_URL:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is not configured")
+    yield from postgres_store_instance()
+
+
 def test_a_failed_replay_comes_back_and_then_gives_up_on_every_store(
     spool_store,
 ) -> None:
@@ -1635,10 +1650,10 @@ def test_the_depth_projection_query_never_touches_the_payload() -> None:
     assert PostgresTelemetrySpoolMixin._TELEMETRY_SPOOL_DEPTH_TTL_SECONDS >= 1.0
 
 
-def test_the_depth_counts_agree_with_the_full_stats_on_postgres(spool_store) -> None:
-    store = spool_store
-    if not hasattr(store, "telemetry_spool_depths"):
-        pytest.skip("the in-memory spool has no separate depth projection")
+def test_the_depth_counts_agree_with_the_full_stats_on_postgres(
+    postgres_spool_store,
+) -> None:
+    store = postgres_spool_store
     spool(
         store,
         [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -162,16 +163,19 @@ def run_suite(base_url: str, workdir: Path) -> dict[str, Any]:
         _create_database(base_url, database)
         created = True
         environment = {**os.environ, "GPU_FAULT_TEST_POSTGRES_URL": test_url}
+        # The interpreter running this script is the project venv, the one
+        # with pytest-xdist; a bare ``python3`` resolved to the system
+        # interpreter and the parallel Postgres shard died on ``-n``.
         exit_codes = {
             "postgres": _run_pytest(
-                ["make", "test-postgres-stress", "PYTHON=python3"],
+                ["make", "test-postgres-stress", f"PYTHON={sys.executable}"],
                 cwd=workdir,
                 env=environment,
                 junit=postgres_xml,
             ),
             "contract": _run_pytest(
                 [
-                    "python3",
+                    sys.executable,
                     "-m",
                     "pytest",
                     "-q",

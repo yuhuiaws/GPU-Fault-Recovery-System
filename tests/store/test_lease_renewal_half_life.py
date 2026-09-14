@@ -47,6 +47,19 @@ def store(request, tmp_path):
     _truncate()
 
 
+@pytest.fixture
+def postgres_store():
+    """Only the Postgres backend: the tuple-header assertion has no memory or
+    SQLite counterpart, and a parametrized skip would count against the CAP-005
+    zero-skip gate."""
+
+    if not POSTGRES_URL:
+        pytest.skip("GPU_FAULT_TEST_POSTGRES_URL is required")
+    for postgres in postgres_store_instance():
+        yield postgres
+    _truncate()
+
+
 def _claimed(store):
     incident = fault_incident(
         "inc-r",
@@ -141,9 +154,8 @@ def _xmin(request_id: str) -> str:
     return str(row[0])
 
 
-def test_postgres_early_renewal_leaves_the_tuple_untouched(store) -> None:
-    if type(store).__name__ != "PostgresStore":
-        pytest.skip("xmin is a PostgreSQL tuple header")
+def test_postgres_early_renewal_leaves_the_tuple_untouched(postgres_store) -> None:
+    store = postgres_store
     claimed = _claimed(store)
     before = _xmin("wf-r")
 
