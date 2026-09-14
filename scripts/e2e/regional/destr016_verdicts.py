@@ -239,7 +239,13 @@ def waiting_boundary_errors(workflow: dict[str, Any]) -> list[str]:
         errors.append(f"{BARRIER_OPERATION} is not WAITING: {barrier[0].get('status')}")
     else:
         details = barrier[0].get("details") or {}
-        if details.get("remote_status") != "WAITING":
+        # The compound agent command behind the barrier cycles: LEASED while
+        # the agent runs one more client-verification attempt, WAITING between
+        # attempts (the hold record). The step itself stays WAITING throughout,
+        # so a LEASED remote status is the barrier still standing, not a moved
+        # boundary (DESTR-016 attempt 3, 2026-09-14: absorb read LEASED at
+        # attempt 7 and failed a correct run).
+        if details.get("remote_status") not in {"WAITING", "LEASED"}:
             errors.append(
                 "the barrier step's remote command is not WAITING: "
                 f"{details.get('remote_status')}"

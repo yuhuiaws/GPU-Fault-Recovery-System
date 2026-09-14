@@ -1557,3 +1557,18 @@ def test_a_compound_command_without_a_hold_is_not_a_barrier() -> None:
     assert verdicts.barrier_reason_errors(commands) == [
         "there is not exactly one barrier remote command: 0"
     ]
+
+
+def test_a_leased_compound_command_keeps_the_barrier_standing() -> None:
+    """Between attempts the compound command is WAITING; during one it is
+    LEASED. Both leave the barrier step WAITING, so only a terminal or absent
+    remote status means the boundary moved."""
+    workflow = parked_reset_workflow()
+    workflow["step_executions"][3]["details"]["remote_status"] = "LEASED"
+    assert verdicts.waiting_boundary_errors(workflow) == []
+
+    workflow["step_executions"][3]["details"]["remote_status"] = "SUCCEEDED"
+    errors = verdicts.waiting_boundary_errors(workflow)
+    assert any("remote command is not WAITING: SUCCEEDED" in item for item in errors), (
+        errors
+    )

@@ -45,7 +45,7 @@
     "src/gpu_fault_release/regional_admin_checks.py": 1727,
     "src/gpu_fault_release/regional_release_orchestration.py": 2004,
     "tests/processor/test_telemetry_spool.py": 1673,
-    "tests/regional/test_destr016_preempting_reboot.py": 1559,
+    "tests/regional/test_destr016_preempting_reboot.py": 1574,
     "tests/regional/test_destructive_acceptance_fixtures.py": 1534,
     "tests/regional/test_regional_admin_checks.py": 1614
   },
