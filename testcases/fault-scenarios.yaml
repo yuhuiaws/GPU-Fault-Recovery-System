@@ -4506,18 +4506,18 @@ test_cases:
   related_pytest: tests/regional/test_destr014_branch_exhaustion.py::test_destr014_workflow_contract_requires_sibling_exhaustion_without_restart
 
 - id: GF-REGIONAL-NOTIFY-001
-  title: 关键动作各有一封 SENT 邮件且含非空 SES MessageId
+  title: 关键动作各有一封 SENT 通知且含非空 provider MessageId
   category: regional-notification
   level: live
   risk: live-non-destructive
-  problem: ALLOW_EMAIL=true 但 IAM 返回 AccessDenied 必须视为上线失败而不是告警渠道待接入。
-  injection: 复用本轮已批准的RESET_GPU与RESTART_WORKLOAD完成记录；若不存在，则在隔离控制面用通知drill生成对应completion，不为邮件测试重复执行破坏性动作。
+  problem: 配置的告警通知渠道被 IAM 拒绝（SES SendEmail 或 SNS Publish AccessDenied）必须视为上线失败而不是告警渠道待接入。
+  injection: 复用本轮已批准的RESET_GPU与RESTART_WORKLOAD完成记录；若不存在，则在隔离控制面用通知drill生成对应completion，不为通知测试重复执行破坏性动作。
   expected:
   - RESET_GPU 与 RESTART_WORKLOAD 各一封通知
   - 每条通知 status 为 SENT 且 provider_message_id 非空
-  - MessageId 可在 SES 侧核对到
-  - 人工确认收件箱真的收到邮件
-  - 对同一 RESET_GPU completion 四次重复提交 provider_message_id 不变、通知条数不变，SES 发送计数不增加（原 GF-REGIONAL-NOTIFY-002 的去重判定）
+  - MessageId 可在当前生效通知渠道侧核对到（SNS 默认渠道用 AWS/SNS 发布与投递指标，SES 用 SES/Send）
+  - 人工/带外确认订阅端真的收到通知（SNS→email 订阅即确认收件箱收到邮件）
+  - 对同一 RESET_GPU completion 四次重复提交 provider_message_id 不变、通知条数不变，通知渠道发送计数不增加（SNS 默认渠道为 topic 发布数不增加；原 GF-REGIONAL-NOTIFY-002 的去重判定）
   evidence:
     verdict: NOT_RUN
   automation: manual
