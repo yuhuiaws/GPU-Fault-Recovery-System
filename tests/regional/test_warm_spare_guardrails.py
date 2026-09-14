@@ -295,3 +295,94 @@ def test_the_negative_cluster_is_read_from_the_recorded_snapshot_not_described_t
         "status": None,
         "node_recovery": None,
     }
+
+
+def test_the_isolated_node_reader_carries_the_probes_past_the_isolation_fence() -> None:
+    """The deployed step adapter refuses any HyperPod mutation until it has read
+    the target Node and seen it isolated for the incident; the probes' read-only
+    Kubernetes stand-in must satisfy exactly that read, and nothing more, or the
+    guards the cases exist to prove are never reached."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from gpu_fault.adapters.hyperpod.lifecycle import HyperPodLifecycleStepAdapter
+    from gpu_fault.execution import WorkflowStepContext
+    from gpu_fault.models import (
+        FaultIncident,
+        IncidentState,
+        WorkflowExecutionRequest,
+        WorkflowOperation,
+        WorkflowRequest,
+        WorkflowStatus,
+        WorkflowStepSpec,
+    )
+
+    namespace: dict[str, Any] = {}
+    exec(warm_spare.ISOLATED_NODE_READER, namespace)  # noqa: S102 - the probe text is the artifact
+    kubernetes, reader = namespace["isolated_kubernetes_adapter"]("incident-probe", 1)
+    now = datetime.now(timezone.utc)
+    step = WorkflowStepSpec(
+        operation=WorkflowOperation.REPLACE_NODE,
+        execution_owner="gpu-fault-hyperpod-adapter",
+        node_ids=["audit-node"],
+        parameters={"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"},
+    )
+    incident = FaultIncident(
+        incident_id="incident-probe",
+        event_id="event-probe",
+        event_type="REGIONAL_ACCEPTANCE",
+        cluster_id="cluster",
+        node_ids=["audit-node"],
+        policy_version="probe/v1",
+        policy_source="ACCEPTANCE",
+        state=IncidentState.ACTION_PENDING,
+        workflow_request_id="workflow-probe",
+        fencing_token=1,
+        created_at=now,
+        updated_at=now,
+    )
+    workflow = WorkflowRequest(
+        request_id="workflow-probe",
+        incident_id="incident-probe",
+        status=WorkflowStatus.RUNNING,
+        official_action="REPLACE_NODE",
+        fencing_token=1,
+        official_steps=[step],
+        completed_operations=[WorkflowOperation.MARK_UNSCHEDULABLE],
+        created_at=now,
+        updated_at=now,
+    )
+    context = WorkflowStepContext(
+        workflow=workflow,
+        incident=incident,
+        step=step,
+        step_index=0,
+        request=WorkflowExecutionRequest(
+            expected_fencing_token=1,
+            confirm_cluster_name="cluster",
+            isolation_verified_nodes=["audit-node"],
+        ),
+        idempotency_key="workflow-probe/0/REPLACE_NODE",
+    )
+
+    def preflight(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            safe_to_submit=True, gate_failures=[], node_recovery="None"
+        )
+
+    without = HyperPodLifecycleStepAdapter(object())
+    without.dispatcher.preflight = preflight
+    refused = without.execute(context)
+    assert "observe node isolation" in str(refused.error), refused
+
+    carried = HyperPodLifecycleStepAdapter(object(), kubernetes_adapter=kubernetes)
+    carried.dispatcher.preflight = preflight
+    outcome = carried.execute(context)
+    assert outcome.error == (
+        "healthy warm-spare replacement is required but the "
+        "spare coordinator is disabled"
+    ), outcome
+    assert reader.reads == ["audit-node"]
+    assert not hasattr(kubernetes.core, "patch_node"), (
+        "the stand-in must stay read-only"
+    )

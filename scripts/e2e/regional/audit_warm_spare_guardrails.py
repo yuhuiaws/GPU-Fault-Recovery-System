@@ -584,6 +584,64 @@ def record_provider_snapshot(cluster_name: str) -> dict[str, Any]:
     }
 
 
+# Prepended to both deployed probes. Since the 2026-09-07 architecture review
+# (406ae39) the step adapter reads every target Node through its Kubernetes
+# adapter and refuses any HyperPod mutation until it has seen the node isolated
+# for the incident -- unschedulable, quarantine-tainted, incident-annotated.
+# The probes carried no Kubernetes adapter, so on 2026-09-14 both arms of the
+# DESTR-006 probe were refused at that fence, before the NodeRecovery guard the
+# case exists to prove, and the audit rightly reported FAIL. The reader below
+# answers that read with the probe's own target, already isolated for the
+# probe's synthetic incident. It implements ``read_node`` and nothing else, so
+# the probe still cannot cordon, taint or patch anything.
+ISOLATED_NODE_READER = r"""
+from types import SimpleNamespace
+
+from gpu_fault.adapters.common import (
+    ANNOTATION_FENCING,
+    ANNOTATION_INCIDENT,
+    QUARANTINE_TAINT,
+    quarantine_taint_value,
+)
+
+
+class IsolatedNodeReader:
+    # Read-only stand-in for the Kubernetes core API: every node it is asked
+    # for is the probe's target, isolated for the probe's incident.
+
+    def __init__(self, incident_id, fencing_token):
+        self.reads = []
+        self.node = {
+            "metadata": {
+                "resourceVersion": "deployed-probe",
+                "annotations": {
+                    ANNOTATION_INCIDENT: incident_id,
+                    ANNOTATION_FENCING: str(fencing_token),
+                },
+            },
+            "spec": {
+                "unschedulable": True,
+                "taints": [
+                    {
+                        "key": QUARANTINE_TAINT,
+                        "value": quarantine_taint_value(incident_id),
+                        "effect": "NoSchedule",
+                    }
+                ],
+            },
+        }
+
+    def read_node(self, name):
+        self.reads.append(str(name))
+        return self.node
+
+
+def isolated_kubernetes_adapter(incident_id, fencing_token):
+    reader = IsolatedNodeReader(incident_id, fencing_token)
+    return SimpleNamespace(core=reader, owner="gpu-fault-kubernetes-adapter"), reader
+"""
+
+
 def deployed_automatic_recovery_probe(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Fire DESTR-006's guard in the deployed executor, on a real Automatic cluster.
 
@@ -603,7 +661,10 @@ def deployed_automatic_recovery_probe(snapshot: dict[str, Any]) -> dict[str, Any
 
     Nothing here can mutate: the replayed client implements the three read
     calls and nothing else, no spare coordinator is attached, and the negative
-    cluster's `NodeRecovery` is never touched.
+    cluster's `NodeRecovery` is never touched. The Kubernetes side is the
+    read-only ``IsolatedNodeReader``: the deployed adapter first observes the
+    target's isolation through it, then reads `NodeRecovery` off the recorded
+    payloads; the nodes it read are recorded as ``isolation_reads``.
     """
 
     pods = _running_pods(
@@ -694,9 +755,10 @@ if target is None:
     raise SystemExit("the Automatic negative cluster has no Running node to preflight")
 
 now = datetime.now(timezone.utc)
+ISOLATION_READS = {}
 
 
-def guard_outcome(parameters):
+def guard_outcome(arm, parameters):
     step = WorkflowStepSpec(
         operation=WorkflowOperation.REPLACE_NODE,
         execution_owner="gpu-fault-hyperpod-adapter",
@@ -728,7 +790,12 @@ def guard_outcome(parameters):
         created_at=now,
         updated_at=now,
     )
-    outcome = HyperPodLifecycleStepAdapter(adapter).execute(
+    kubernetes, reader = isolated_kubernetes_adapter(
+        incident.incident_id, incident.fencing_token
+    )
+    outcome = HyperPodLifecycleStepAdapter(
+        adapter, kubernetes_adapter=kubernetes
+    ).execute(
         WorkflowStepContext(
             workflow=workflow,
             incident=incident,
@@ -742,6 +809,7 @@ def guard_outcome(parameters):
             idempotency_key="workflow-destr006-deployed-probe/0/REPLACE_NODE",
         )
     )
+    ISOLATION_READS[arm] = reader.reads
     return {"status": outcome.status.value, "error": outcome.error}
 
 
@@ -751,15 +819,20 @@ print(json.dumps({
     "probed_node_status": target.status,
     "probed_node_count": len(nodes),
     "warm_spare_guard": guard_outcome(
-        {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
+        "warm_spare_guard", {"replacement_strategy": "HEALTHY_WARM_SPARE_ONLY"}
     ),
-    "control_without_warm_spare_strategy": guard_outcome({}),
+    "control_without_warm_spare_strategy": guard_outcome(
+        "control_without_warm_spare_strategy", {}
+    ),
+    "isolation_reads": ISOLATION_READS,
 }, sort_keys=True))
 """
     header = (
         f"import json\nRECORDED = json.loads({json.dumps(snapshot['payloads'])!r})\n"
     )
-    probe = _pod_python(GPU_KUBECONFIG, GPU_CONTEXT, pods[0], header + script)
+    probe = _pod_python(
+        GPU_KUBECONFIG, GPU_CONTEXT, pods[0], header + ISOLATED_NODE_READER + script
+    )
     probe["payload_provenance"] = {
         key: snapshot[key] for key in ("recorded_at", "payload_digest", "recorded_by")
     }
@@ -825,7 +898,10 @@ workflow = WorkflowRequest(
     created_at=now,
     updated_at=now,
 )
-adapter = HyperPodLifecycleStepAdapter(object())
+kubernetes, reader = isolated_kubernetes_adapter(
+    incident.incident_id, incident.fencing_token
+)
+adapter = HyperPodLifecycleStepAdapter(object(), kubernetes_adapter=kubernetes)
 adapter.dispatcher.preflight = lambda *_args, **_kwargs: SimpleNamespace(
     safe_to_submit=True,
     gate_failures=[],
@@ -870,9 +946,12 @@ print(json.dumps({
         "error": outcome.error,
     },
     "startup_guard_error": startup_error,
+    "isolation_reads": reader.reads,
 }, sort_keys=True))
 """
-    return _pod_python(GPU_KUBECONFIG, GPU_CONTEXT, pods[0], script)
+    return _pod_python(
+        GPU_KUBECONFIG, GPU_CONTEXT, pods[0], ISOLATED_NODE_READER + script
+    )
 
 
 def run_pytest(case_dir: Path, nodeids: list[str]) -> bool:
