@@ -1299,7 +1299,7 @@ def outside_probe(
 HIGH_RISK_ROUTE_BUCKETS = {
     "/v1/runtime-profiles": "execution-token",
     "/v1/advisory-notifications/{notification_id}/send": "execution-token",
-    "/v1/fleet/agents": "cluster-token",
+    "/v1/fleet/agents": "dual-credential",
 }
 
 

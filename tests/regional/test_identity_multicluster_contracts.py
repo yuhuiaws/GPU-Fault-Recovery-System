@@ -304,7 +304,7 @@ def test_high_risk_routes_are_judged_by_bucket_not_counted() -> None:
             "path": "/v1/advisory-notifications/{notification_id}/send",
             "bucket": "public",
         },
-        {"path": "/v1/fleet/agents", "bucket": "cluster-token"},
+        {"path": "/v1/fleet/agents", "bucket": "dual-credential"},
     ]
     errors = auth.high_risk_route_errors(routes)
     assert errors == [
