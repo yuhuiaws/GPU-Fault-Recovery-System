@@ -204,6 +204,29 @@ def resources_for(statement: Mapping[str, Any]) -> list[str]:
     return [str(item) for item in as_list(statement.get("Resource"))]
 
 
+NOTIFICATION_CONFIGMAP = "gpu-fault-api-ha-config-notification"
+
+
+def notification_channel(config: Mapping[str, Any]) -> str:
+    """Which delivery channel the deployed control plane notifies through.
+
+    Mirrors ``notifications.channel.notification_channel_from_environment``
+    against the rendered control-plane config: the declared channel wins,
+    then a topic ARN implies ``sns``, then a sender implies ``ses``, else
+    ``disabled``. The release engine always renders the channel onto the
+    role, so ``sns`` (the admin-CLI default) is the usual answer.
+    """
+
+    declared = str(config.get("GPU_FAULT_NOTIFICATION_CHANNEL") or "").strip().lower()
+    if declared in ("sns", "ses", "disabled"):
+        return declared
+    if str(config.get("GPU_FAULT_SNS_TOPIC_ARN") or "").strip():
+        return "sns"
+    if str(config.get("GPU_FAULT_EMAIL_SENDER") or "").strip():
+        return "ses"
+    return "disabled"
+
+
 def policy_statement_summary(statement: Mapping[str, Any]) -> dict[str, Any]:
     resources = resources_for(statement)
     return {
@@ -304,6 +327,21 @@ class BlastRunnerBase:
             ),
             check=check,
         ).stdout
+
+    def notification_config(self) -> dict[str, str]:
+        """The control plane's rendered notification config (channel + topic)."""
+
+        document = self.cpu_json(
+            "-n",
+            self.namespace,
+            "get",
+            "configmap",
+            NOTIFICATION_CONFIGMAP,
+            "-o",
+            "json",
+        )
+        data = document.get("data") or {}
+        return {str(key): str(value) for key, value in data.items()}
 
     def evidence_identity(self) -> dict[str, str | None]:
         """The release (and, on a single-cluster site, the cluster) this audit reads.

@@ -13,6 +13,7 @@ from scripts.e2e.regional.blast_acceptance_base import (
     arn_parts,
     as_list,
     command,
+    notification_channel,
     parse_time,
     policy_statement_summary,
     resources_for,
@@ -520,24 +521,61 @@ class BlastCasesOne(BlastRunnerBase):
         )
         sagemaker_patterns = self.sagemaker_patterns(patterns)
         sagemaker_read_only = self.sagemaker_read_only(sagemaker_patterns)
+        # Notifications are least-privilege *per active channel*, not SES-only.
+        # control_plane_policy_document (bootstrap_services.py) renders exactly
+        # one send permission from spec.notifications.channel: sns:Publish scoped
+        # to the site topic ARN (channel "sns", the admin-CLI default), or
+        # ses:SendEmail scoped to the verified identity with a FromAddress
+        # condition (channel "ses"), or neither (channel "disabled"). So the
+        # audit reads the deployed channel and requires that one permission to be
+        # present and scoped and the other absent, instead of demanding SES on a
+        # topic-only site (which would fail the correct SNS posture).
+        channel = notification_channel(self.notification_config())
+        sns_topic_arn = str(
+            self.notification_config().get("GPU_FAULT_SNS_TOPIC_ARN") or ""
+        ).strip()
+        account_id = arn_parts(self.cpu_eks_arn)[1]
+        sns_send_statements = [
+            item for item in statements if allow_statement_matches(item, "sns:Publish")
+        ]
         ses_send_statements = [
             item
             for item in statements
             if allow_statement_matches(item, "ses:SendEmail")
         ]
+        sns_scoped = bool(sns_send_statements) and all(
+            resources_for(item)
+            and all(
+                resource != "*"
+                and (
+                    resource == sns_topic_arn
+                    if sns_topic_arn
+                    else resource.startswith(f"arn:aws:sns:{self.region}:{account_id}:")
+                )
+                for resource in resources_for(item)
+            )
+            for item in sns_send_statements
+        )
         ses_scoped = bool(ses_send_statements) and all(
             resources_for(item)
             and all(
                 resource != "*"
                 and resource.startswith(
-                    f"arn:aws:ses:{self.region}:{arn_parts(self.cpu_eks_arn)[1]}:"
-                    "identity/"
+                    f"arn:aws:ses:{self.region}:{account_id}:identity/"
                 )
                 for resource in resources_for(item)
             )
             and bool(item.get("Condition"))
             for item in ses_send_statements
         )
+        if channel == "sns":
+            notification_send_scoped = sns_scoped and not ses_send_statements
+        elif channel == "ses":
+            notification_send_scoped = ses_scoped and not sns_send_statements
+        else:  # "disabled": the control plane persists to the outbox only.
+            notification_send_scoped = (
+                not sns_send_statements and not ses_send_statements
+            )
         inventory.update(
             {
                 "allowed_action_patterns": patterns,
@@ -546,8 +584,12 @@ class BlastCasesOne(BlastRunnerBase):
                 "sagemaker_read_only_describe_list_only": sagemaker_read_only,
                 "sagemaker_action_pattern_count": len(sagemaker_patterns),
                 "sagemaker_action_patterns": sagemaker_patterns,
+                "active_notification_channel": channel,
+                "sns_publish_statement_count": len(sns_send_statements),
+                "sns_publish_scoped_to_site_topic": sns_scoped,
                 "ses_send_statement_count": len(ses_send_statements),
                 "ses_send_scoped_to_identity_with_condition": ses_scoped,
+                "notification_send_scoped_to_active_channel": notification_send_scoped,
             }
         )
         write_json(self.run_dir / "BLAST-002-iam.json", inventory)
@@ -558,7 +600,7 @@ class BlastCasesOne(BlastRunnerBase):
                 not forbidden,
                 not broad_not_action,
                 sagemaker_read_only,
-                ses_scoped,
+                notification_send_scoped,
                 "home_kube=absent" in filesystem_probe,
                 "kubeconfig_env=unset" in filesystem_probe,
             )
@@ -573,7 +615,8 @@ class BlastCasesOne(BlastRunnerBase):
                 "forbidden_hyperpod_mutations_present": forbidden,
                 "sagemaker_describe_list_only": sagemaker_read_only,
                 "sagemaker_action_pattern_count": len(sagemaker_patterns),
-                "ses_send_scoped": ses_scoped,
+                "active_notification_channel": channel,
+                "notification_send_scoped": notification_send_scoped,
             },
         )
         if not passed:

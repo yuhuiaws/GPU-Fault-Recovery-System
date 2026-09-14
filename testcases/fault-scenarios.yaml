@@ -3676,7 +3676,7 @@ test_cases:
   - 写类 verb 对 nodes、pods 和 jobs 全部为 no
   - IAM 中无 BatchReplaceClusterNodes、RebootClusterNodes 和 BatchDeleteClusterNodes
   - SageMaker 权限只有 Describe 和 List
-  - ses:SendEmail 被限定到已验证 sender identity
+  - 当前生效通知渠道的发送权限被资源限定（SNS 默认渠道为 sns:Publish 限定到站点 Topic ARN，SES 为 ses:SendEmail 限定到已验证 identity 并带 FromAddress 条件），非生效渠道的发送权限缺失
   evidence:
     verdict: NOT_RUN
   automation: manual
