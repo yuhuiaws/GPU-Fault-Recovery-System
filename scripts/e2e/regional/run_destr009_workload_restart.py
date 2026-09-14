@@ -75,8 +75,18 @@ FORBIDDEN_OPERATIONS = {
 CLEANUP_TERMINAL_WORKFLOW_STATUSES = {"SUCCEEDED", "FAILED"}
 CLEANUP_TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED"}
 CLEANUP_QUIET_SECONDS = 15
-CLEANUP_TIMEOUT_SECONDS = 300
 CLEANUP_POLL_SECONDS = 5
+# The completion watcher keeps republishing a vanished attempt as RUNNING for
+# GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS (default 300, not
+# overridden by the release) before it tombstones the attempt STOPPED, so the
+# quiescence gate's observation cannot turn terminal earlier than that after
+# STOP_WORKLOADS. DESTR-012 group D (2026-09-14) reached the gate 20 s after
+# the stop with a 300 s budget and missed the tombstone by seconds, deferring
+# the delete and leaving the restarted Job running. The budget must outlive
+# the grace plus the quiet window and the polling slack; the loop returns as
+# soon as the gate holds, so a large budget costs nothing when it does.
+ATTEMPT_MISSING_GRACE_SECONDS = 300
+CLEANUP_TIMEOUT_SECONDS = ATTEMPT_MISSING_GRACE_SECONDS + 300
 CONTROL_PLANE_LOG_APPS = (
     "gpu-fault-api-ha",
     "gpu-fault-control-worker",

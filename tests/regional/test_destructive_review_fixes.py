@@ -1109,3 +1109,17 @@ def test_restore_workflow_refuses_a_profile_without_an_executable_owner() -> Non
     )
     with pytest.raises(ValueError, match="no executable owner for deepDiagnostics"):
         restore.resolve_execution_owner(profile, WorkflowOperation.VALIDATE_GPU)
+
+
+def test_cleanup_budget_outlives_the_watcher_missing_pod_grace() -> None:
+    """After STOP_WORKLOADS the watcher republishes the vanished attempt as
+    RUNNING for its missing-pod grace before tombstoning it STOPPED; a cleanup
+    budget shorter than grace + quiet window + polling can never see the gate
+    hold (DESTR-012 group D, 2026-09-14)."""
+    slack = destr009.CLEANUP_QUIET_SECONDS + 2 * destr009.CLEANUP_POLL_SECONDS
+    assert destr009.ATTEMPT_MISSING_GRACE_SECONDS == 300, (
+        "mirror GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS's default"
+    )
+    assert destr009.CLEANUP_TIMEOUT_SECONDS >= (
+        destr009.ATTEMPT_MISSING_GRACE_SECONDS + slack + 60
+    ), destr009.CLEANUP_TIMEOUT_SECONDS
