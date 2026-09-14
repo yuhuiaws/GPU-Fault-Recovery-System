@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """HA-009 path-A verdicts: role status and the rotation-error contract.
 
 Split out of ``run_ha009_aurora_credential_rotation.py`` so neither file needs a
