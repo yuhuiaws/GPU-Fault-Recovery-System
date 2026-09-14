@@ -39,6 +39,8 @@ from scripts.perf.regional_capacity_registry import (  # noqa: E402
 TERMINAL_COMMAND_STATUSES = {"SUCCEEDED", "FAILED", "CANCELLED"}
 CASE_IDS = tuple(f"GF-REGIONAL-CAP-{number:03d}" for number in range(1, 5))
 PROBE_DIR = Path(__file__).with_name("probes")
+# Live worker volumes a probe Pod must inherit to reach Aurora at all.
+PROBE_CARRIED_VOLUMES = frozenset({"rds-ca-bundle"})
 CASE_LIMITATIONS = [
     "The load is generated against disposable control-plane "
     "Deployments and isolated databases in the selected CPU EKS; "
@@ -379,6 +381,22 @@ class CapProbeHarness(CapCoreHarness):
         }
         live_pod_spec = self.live_worker["spec"]["template"]["spec"]
         live_container = live_pod_spec["containers"][0]
+        # The Aurora DSN pins sslmode=verify-full to a CA bundle the release
+        # projects into every control-plane Pod (live 2026-09-14: the probe
+        # crash-looped on "root certificate file /etc/gpu-fault/rds/ca-bundle.pem
+        # does not exist"). Carry the worker's TLS material verbatim instead
+        # of naming the ConfigMap here, so the probe follows whatever the
+        # release mounts; a release that stops mounting it carries nothing.
+        carried_volumes = [
+            dict(volume)
+            for volume in live_pod_spec.get("volumes", [])
+            if volume.get("name") in PROBE_CARRIED_VOLUMES
+        ]
+        carried_mounts = [
+            dict(mount)
+            for mount in live_container.get("volumeMounts", [])
+            if mount.get("name") in PROBE_CARRIED_VOLUMES
+        ]
         self.apply(
             {
                 "apiVersion": "v1",
@@ -473,6 +491,7 @@ class CapProbeHarness(CapCoreHarness):
                                             "readOnly": True,
                                         },
                                         {"name": "work", "mountPath": "/work"},
+                                        *carried_mounts,
                                     ],
                                 }
                             ],
@@ -485,6 +504,7 @@ class CapProbeHarness(CapCoreHarness):
                                     },
                                 },
                                 {"name": "work", "emptyDir": {}},
+                                *carried_volumes,
                             ],
                         },
                     },

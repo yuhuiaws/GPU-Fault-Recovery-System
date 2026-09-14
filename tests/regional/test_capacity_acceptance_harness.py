@@ -416,3 +416,86 @@ def test_b_latency_factor_below_one_is_refused(tmp_path: Path) -> None:
             predecessor={"valid": True},
             b_latency_factor=0.5,
         )
+
+
+class _ManifestHarness(base.CapProbeHarness):
+    """A probe harness that records the manifests it would apply."""
+
+    def __init__(  # noqa: D107 - bypasses CapCoreHarness.__init__ on purpose
+        self, live_worker: dict[str, Any]
+    ) -> None:
+        self.live_worker = live_worker
+        self.namespace = "namespace"
+        self.run_id = "cap000000"
+        self.runtime_image = "image@sha256:0"
+        self.configmap_name = "gpu-fault-cap000000-scripts"
+        self.applied: list[dict[str, Any]] = []
+
+    def apply(self, value: Any) -> None:
+        self.applied.append(dict(value))
+
+
+def _live_worker(*volume_names: str) -> dict[str, Any]:
+    return {
+        "spec": {
+            "template": {
+                "spec": {
+                    "serviceAccountName": "gpu-fault-control-plane",
+                    "volumes": [
+                        {"name": name, "configMap": {"name": f"gpu-fault-{name}"}}
+                        for name in volume_names
+                    ],
+                    "containers": [
+                        {
+                            "image": "image@sha256:0",
+                            "volumeMounts": [
+                                {
+                                    "name": name,
+                                    "mountPath": f"/etc/gpu-fault/{name}",
+                                    "readOnly": True,
+                                }
+                                for name in volume_names
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
+    }
+
+
+def _probe_pod_spec(harness: _ManifestHarness) -> dict[str, Any]:
+    harness._apply_probe_resources(
+        suffix="cap001",
+        deployment="gpu-fault-cap000000-cap001",
+        service="gpu-fault-cap000000-cap001",
+        environment=[],
+    )
+    (deployment,) = [m for m in harness.applied if m["kind"] == "Deployment"]
+    return dict(deployment["spec"]["template"]["spec"])
+
+
+def test_probe_inherits_the_workers_rds_ca_bundle_verbatim() -> None:
+    # The Aurora DSN pins sslmode=verify-full to the projected CA bundle; a
+    # probe without the worker's mount cannot open a single connection.
+    pod = _probe_pod_spec(_ManifestHarness(_live_worker("artifact", "rds-ca-bundle")))
+    assert {
+        "name": "rds-ca-bundle",
+        "configMap": {"name": "gpu-fault-rds-ca-bundle"},
+    } in pod["volumes"]
+    assert {
+        "name": "rds-ca-bundle",
+        "mountPath": "/etc/gpu-fault/rds-ca-bundle",
+        "readOnly": True,
+    } in pod["containers"][0]["volumeMounts"]
+    # Only the TLS material is carried; the worker's artifact stays behind.
+    assert [v["name"] for v in pod["volumes"]] == ["scripts", "work", "rds-ca-bundle"]
+
+
+def test_probe_carries_nothing_when_the_release_mounts_no_ca_bundle() -> None:
+    pod = _probe_pod_spec(_ManifestHarness(_live_worker("artifact")))
+    assert [v["name"] for v in pod["volumes"]] == ["scripts", "work"]
+    assert [m["name"] for m in pod["containers"][0]["volumeMounts"]] == [
+        "scripts",
+        "work",
+    ]
