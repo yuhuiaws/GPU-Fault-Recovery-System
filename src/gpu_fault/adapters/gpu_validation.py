@@ -584,17 +584,26 @@ class GpuValidationAdapter:
             "clock_throttle_reasons",
             "composite:THERMAL_STRESS",
         }
-        memory_names = {
+        transient_names = {
+            # Correctable memory degradation self-clears as ECC scrubs and
+            # row-remap absorbs the affected cells.
             "ecc_sbe_volatile_total",
             "ecc_sbe_aggregate_total",
             "retired_pages_sbe_total",
             "row_remap_correctable_total",
             "composite:CORRECTABLE_MEMORY_DEGRADATION",
+            # Power-limit throttling is a benign WARNING that self-clears once
+            # the workload's power draw falls back under the enforced limit;
+            # its automatic action is only RUN_DIAGNOSTICS. Without a grace
+            # window here, a throttle still active at VALIDATE_GPU time fails
+            # validation and escalates the diagnostic workflow into a DRAIN.
+            "power_violation_total_us",
+            "composite:POWER_LIMIT_THROTTLING",
         }
         warning_grace = None
         if _warning_only(findings, thermal_names):
             warning_grace = self.temperature_warning_grace
-        elif _warning_only(findings, memory_names):
+        elif _warning_only(findings, transient_names):
             warning_grace = self.transient_warning_grace
         if (
             operation is WorkflowOperation.VALIDATE_GPU

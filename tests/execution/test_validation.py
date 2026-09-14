@@ -875,6 +875,92 @@ def test_correctable_memory_warning_validation_observes_grace() -> None:
     assert critical.status is WorkflowStepStatus.FAILED
 
 
+def test_power_limit_throttling_warning_validation_observes_grace() -> None:
+    now = datetime.now(timezone.utc)
+
+    class ValidationStore:
+        def list_collector_statuses(self, cluster_id, node_id):
+            return [
+                CollectorStatus(
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    collector=CollectorKind.GPU_METRICS,
+                    observed_at=now,
+                    ingested_at=now,
+                    last_success_at=now,
+                )
+            ]
+
+        def list_telemetry_metrics_latest(self, cluster_id, node_id):
+            return []
+
+    class ValidationMetrics:
+        store = ValidationStore()
+
+        def __init__(self, severity: str) -> None:
+            self.severity = severity
+
+        def latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    observed_at=now,
+                    sample=SimpleNamespace(
+                        canonical_name="gpu_temperature_c", gpu_uuid="GPU-a"
+                    ),
+                )
+            ]
+
+        def findings(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    finding_id="power-violation-growth",
+                    canonical_name="power_violation_total_us",
+                    severity=SimpleNamespace(value=self.severity),
+                    gpu_uuid="GPU-a",
+                ),
+                SimpleNamespace(
+                    finding_id="power-limit-throttling-composite",
+                    canonical_name=("composite:POWER_LIMIT_THROTTLING"),
+                    severity=SimpleNamespace(value=self.severity),
+                    gpu_uuid="GPU-a",
+                ),
+            ]
+
+    def validate(severity: str) -> WorkflowStepOutcome:
+        store = build_store()
+        incident, workflow = workflow_state(store, [WorkflowOperation.VALIDATE_GPU])
+        workflow = copy_model(workflow, created_at=now - timedelta(seconds=30))
+        step = copy_model(
+            workflow.official_steps[0],
+            execution_owner="gpu-fault-validation-adapter",
+            gpu_uuids=["GPU-a"],
+        )
+        return GpuValidationAdapter(
+            ValidationMetrics(severity),
+            store=ValidationMetrics.store,
+            transient_warning_grace=timedelta(minutes=2),
+        ).execute(
+            WorkflowStepContext(
+                workflow=workflow,
+                incident=incident,
+                step=step,
+                step_index=0,
+                request=WorkflowExecutionRequest(expected_fencing_token=3),
+                idempotency_key=("validation/power-limit-throttling-warning"),
+            )
+        )
+
+    warning = validate("WARNING")
+    critical = validate("CRITICAL")
+
+    assert warning.status is WorkflowStepStatus.WAITING
+    assert warning.details["pending_nodes"] == ["node-a"]
+    assert warning.details["node_pending"]["node-a"][
+        "transient_gpu_warning_cooldown"
+    ] == ["power-violation-growth", "power-limit-throttling-composite"]
+    assert critical.status is WorkflowStepStatus.FAILED
+
+
 def test_fabric_validation_ignores_findings_outside_reset_scope() -> None:
     now = datetime.now(timezone.utc)
 

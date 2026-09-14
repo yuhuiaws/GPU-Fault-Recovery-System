@@ -15,6 +15,17 @@ staging environment as of 2026-08-27:
   service-role/lifespan wiring that starts the production worker dispatcher
   has not been exercised end to end. Restart takeover while the provider is
   throttling is also unverified (`GF-REGIONAL-NOTIFY-006`).
+- `VALIDATE_GPU` grants a bounded grace window to WARNING-only findings that
+  belong to a single self-clearing class before it treats them as a validation
+  failure. Thermal stress, correctable-memory degradation, and power-limit
+  throttling (`composite:POWER_LIMIT_THROTTLING` with its `power_violation_total_us`
+  component) all recover on their own once temperature, ECC scrubbing, or the
+  workload's power draw settles. While one of these classes is the only active
+  finding and the workflow is still inside the grace window, the step returns
+  WAITING rather than failing, so a benign DCGM WARNING does not escalate a
+  `RUN_DIAGNOSTICS` workflow into a node-quarantining DRAIN. A finding that
+  persists past the window, a mix that is not all one transient class, or any
+  CRITICAL finding still fails validation and escalates as before.
 - PostgreSQL-specific test count is intentionally not pinned in this document.
   Any test skipped because `GPU_FAULT_TEST_POSTGRES_URL` is absent means the
   default local suite is not a production Aurora Store gate
