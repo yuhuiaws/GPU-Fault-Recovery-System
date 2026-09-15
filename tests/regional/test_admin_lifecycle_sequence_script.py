@@ -201,7 +201,8 @@ def test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy(
         for line in lines
     ), "remove-cluster names the GPU cluster and carries its confirmation token"
     assert any(
-        "--cpu-cluster keep --reset-database --confirm UNINSTALL_GPU_FAULT" in line
+        "--cpu-cluster keep --reset-database --aurora-final-snapshot retain "
+        "--confirm UNINSTALL_GPU_FAULT" in line
         for line in lines
     ), "uninstall keeps the CPU cluster and resets the database"
 
@@ -225,12 +226,16 @@ def test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy(
         }, (number, cold)
     for number in ("2", "3", "4"):
         assert record["stages"][number]["phase"] == "COMPLETED", (number, record)
+    assert record["stages"]["4"]["aurora_final_snapshot"] == "retain", record["stages"][
+        "4"
+    ]
     assert record["inputs"] == {
         "cpu_cluster_arn_sha256": _sha256(CPU_ARN),
         "gpu_cluster_arn_sha256": _sha256(GPU_ARN),
         "admin_email_sha256": _sha256(ADMIN_EMAIL),
         "state_dir_sha256": _sha256(str(tmp_path / "state")),
         "second_state_dir_sha256": _sha256(str(tmp_path / "state-second")),
+        "aurora_final_snapshot": "retain",
     }, "identifiers enter the record only as digests"
     serialized = json.dumps(record)
     for secret in (CPU_ARN, GPU_ARN, ADMIN_EMAIL, "cpu-fixture", str(tmp_path)):
@@ -340,18 +345,22 @@ def test_ecr_tags_are_deleted_only_when_the_site_repositories_exist(
     ), deletes
 
 
-def test_a_first_deploy_refuses_a_state_directory_that_already_bootstrapped(
+def test_a_first_deploy_refuses_a_state_directory_that_holds_an_installed_site(
     tmp_path: Path,
 ) -> None:
+    """site.yaml marks an installed site; bootstrap-state.json alone marks an
+    unfinished first deploy, which stage 1 resumes like stage 5 does."""
+
     env = _install_fakes(tmp_path)
     state = tmp_path / "state"
     state.mkdir()
     (state / "bootstrap-state.json").write_text("{}", encoding="utf-8")
+    (state / "site.yaml").write_text("spec: {}\n", encoding="utf-8")
 
     result = _run(tmp_path, env)
 
     assert result.returncode != 0, result.stdout
-    assert "already holds bootstrap-state.json" in result.stderr, result.stderr
+    assert "already holds site.yaml" in result.stderr, result.stderr
     assert _admin_verbs(_tool_log(env)) == [], "no admin command runs"
 
 
@@ -371,3 +380,66 @@ def test_usage_errors_exit_two_without_touching_any_tool(tmp_path: Path) -> None
     assert "usage:" in missing.stderr, missing.stderr
     assert bad_stage.returncode == 2, bad_stage.stderr
     assert _tool_log(env) == [], "argument errors never reach the tools"
+
+
+def test_the_final_snapshot_policy_reaches_the_uninstall_and_the_record(
+    tmp_path: Path,
+) -> None:
+    env = _install_fakes(tmp_path)
+
+    result = _run(tmp_path, env, "--aurora-final-snapshot", "skip")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any(
+        "--reset-database --aurora-final-snapshot skip --confirm UNINSTALL_GPU_FAULT"
+        in line
+        for line in _tool_log(env)
+    ), "the policy is passed through to the stage-4 uninstall"
+    record = _record(tmp_path)
+    assert record["inputs"]["aurora_final_snapshot"] == "skip", record["inputs"]
+    assert record["stages"]["4"]["aurora_final_snapshot"] == "skip", record["stages"]
+    refused = _run(tmp_path, env, "--aurora-final-snapshot", "bogus")
+    assert refused.returncode == 2 and "usage:" in refused.stderr, refused.stderr
+
+
+def test_stage_five_resumes_an_unfinished_first_deploy_but_refuses_an_installed_site(
+    tmp_path: Path,
+) -> None:
+    """A first deploy killed or failed before the site existed leaves
+    bootstrap-state.json with its AWS checkpoints; the product resumes it with the
+    same command, so the driver must too (live 2026-09-15: the stage-5 deploy died
+    with the session, then failed its gate; both left a resumable directory).
+    A directory that already holds site.yaml is an installed site and stays refused.
+    """
+
+    env = _install_fakes(tmp_path)
+    unfinished = tmp_path / "second-unfinished"
+    unfinished.mkdir()
+    (unfinished / "bootstrap-state.json").write_text(
+        json.dumps({"schema_version": 1, "phase": "aws-infrastructure-ready"}),
+        encoding="utf-8",
+    )
+
+    resumed = _run(tmp_path, env, "--stage", "5", "--second-state-dir", str(unfinished))
+
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert "resuming it" in resumed.stderr, resumed.stderr
+    assert any(
+        line.startswith("gpu-fault-admin deploy ")
+        and f"--state-dir {unfinished} " in line
+        for line in _tool_log(env)
+    ), "the same first-deploy command runs against the unfinished directory"
+    stage = _record(tmp_path)["stages"]["5"]
+    assert stage["status"] == "PASS", stage
+    assert stage["resumed_first_deploy"] is True, stage
+    assert stage["cold_build"]["dockerfile_steps"] == 6, stage
+
+    installed = tmp_path / "second-installed"
+    installed.mkdir()
+    (installed / "bootstrap-state.json").write_text("{}", encoding="utf-8")
+    (installed / "site.yaml").write_text("spec: {}\n", encoding="utf-8")
+
+    refused = _run(tmp_path, env, "--stage", "5", "--second-state-dir", str(installed))
+
+    assert refused.returncode != 0, refused.stdout
+    assert "already holds site.yaml" in refused.stdout + refused.stderr, refused.stderr

@@ -85,7 +85,16 @@ newest_state() {  # DIR -> newest DIR/*/state.json
 }
 
 require_fresh_state_dir() {
-  [[ -f "$1/bootstrap-state.json" ]] && fail "$(basename "$1") already holds bootstrap-state.json: a first deploy needs an empty state directory"
+  if [[ -f "$1/site.yaml" ]]; then
+    fail "$(basename "$1") already holds site.yaml: a first deploy needs an empty state directory"
+  elif [[ -f "$1/bootstrap-state.json" ]]; then
+    # A first deploy that stopped before the site existed (a killed process,
+    # a failed gate) is resumed the way the product resumes it: the same
+    # command in the same directory picks up the AWS checkpoints. The cache
+    # prune and the ECR tag sweep below still make the image build cold.
+    log "$(basename "$1") holds an unfinished first deploy (bootstrap-state.json, no site.yaml): resuming it"
+    printf '{"resumed_first_deploy": true}\n' >>"${STAGE_LOG}.extra.json"
+  fi
   install -d -m 0700 "$1"
 }
 
