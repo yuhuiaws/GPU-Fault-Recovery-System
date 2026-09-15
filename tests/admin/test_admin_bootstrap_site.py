@@ -805,6 +805,103 @@ def test_initial_deploy_target_accepts_monotonic_membership_subset(
         bind_initial_deploy_target(reloaded, site, cpu, [gpu_a])
 
 
+def _gpu_identity(cpu: ClusterIdentity, name: str) -> ClusterIdentity:
+    return replace(
+        cpu,
+        input_arn=f"arn:aws:eks:us-east-1:123456789012:cluster/{name}",
+        role="gpu",
+        eks_arn=f"arn:aws:eks:us-east-1:123456789012:cluster/{name}",
+        hyperpod_arn=f"arn:aws:sagemaker:us-east-1:123456789012:cluster/{name}",
+        hyperpod_name=name,
+    )
+
+
+def _site_with(cpu: ClusterIdentity, *gpu_clusters: ClusterIdentity) -> dict[str, Any]:
+    return {
+        "spec": {
+            "cpu": {"eksArn": cpu.eks_arn, "hyperpodClusterName": cpu.hyperpod_name},
+            "clusters": [
+                {
+                    "eksClusterArn": item.eks_arn,
+                    "hyperpodClusterName": item.hyperpod_name,
+                }
+                for item in gpu_clusters
+            ],
+        }
+    }
+
+
+def test_initial_deploy_target_settles_once_the_site_manages_it(tmp_path: Path) -> None:
+    """The first deploy's checkpoint stops binding once the site holds its target.
+
+    It used to stay PENDING until a later deploy requested exactly the birth
+    set, so ``deploy --gpu-cluster-arn A --gpu-cluster-arn NEW`` right after
+    the first deploy of A was refused against the checkpoint instead of joining
+    NEW. Before the site document exists the checkpoint still pins a resume.
+    """
+
+    cpu = _cluster()
+    gpu_a = _gpu_identity(cpu, "gpu-a")
+    gpu_b = _gpu_identity(cpu, "gpu-b")
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="test")
+
+    assert bind_initial_deploy_target(state, None, cpu, [gpu_a]) == [gpu_a]
+    assert state.value["resources"]["initial_deploy_target"]["status"] == "PENDING"
+    with pytest.raises(BootstrapError, match="persisted checkpoint"):
+        bind_initial_deploy_target(
+            BootstrapState(state.path, site_id="test"), None, cpu, [gpu_b]
+        )
+
+    # The site now manages gpu-a: adding gpu-b is the superset the deploy joins
+    # after the release, not a departure from the checkpoint.
+    grown = BootstrapState(state.path, site_id="test")
+    assert bind_initial_deploy_target(
+        grown, _site_with(cpu, gpu_a), cpu, [gpu_a, gpu_b]
+    ) == [gpu_a]
+    target = grown.value["resources"]["initial_deploy_target"]
+    assert target["status"] == "PENDING", target
+    assert [item["hyperpod_name"] for item in target["gpu_clusters"]] == [
+        "gpu-a",
+        "gpu-b",
+    ]
+
+    settled = BootstrapState(state.path, site_id="test")
+    assert bind_initial_deploy_target(
+        settled, _site_with(cpu, gpu_a, gpu_b), cpu, [gpu_a, gpu_b]
+    ) == [gpu_a, gpu_b]
+    assert settled.value["resources"]["initial_deploy_target"]["status"] == "COMPLETE"
+
+
+def test_a_cluster_detached_by_remove_cluster_releases_the_initial_target(
+    tmp_path: Path,
+) -> None:
+    """A CPU-only upgrade after remove-cluster is judged by the site document.
+
+    Live 2026-09-15 (BOOT-029 stage 3 rerun): the site had removed its only GPU
+    cluster, ``deploy --state-dir`` read ``clusters: []`` and was refused with
+    "initial deploy target differs from the persisted checkpoint" because the
+    PENDING checkpoint still named the removed cluster. remove-cluster records
+    the detachment under ``removed_clusters``; that record releases the
+    commitment, the checkpoint settles and the empty site deploys.
+    """
+
+    cpu = _cluster()
+    gpu_a = _gpu_identity(cpu, "gpu-a")
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="test")
+    bind_initial_deploy_target(state, None, cpu, [gpu_a])
+    document = json.loads(state.path.read_text(encoding="utf-8"))
+    document["removed_clusters"] = {
+        "gpu-a": {"removed_at": "2026-09-15T04:21:38+00:00", "vpc_id": "vpc-a"}
+    }
+    state.path.write_text(json.dumps(document), encoding="utf-8")
+
+    reloaded = BootstrapState(state.path, site_id="test")
+    assert bind_initial_deploy_target(reloaded, _site_with(cpu), cpu, []) == []
+    target = reloaded.value["resources"]["initial_deploy_target"]
+    assert target["status"] == "COMPLETE", target
+    assert target["gpu_clusters"] == []
+
+
 def test_a_site_without_gpu_clusters_still_discovers_its_control_plane(
     tmp_path: Path,
 ) -> None:

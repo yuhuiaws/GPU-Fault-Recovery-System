@@ -104,12 +104,59 @@ def _target_identity(
     }
 
 
+def _committed_gpu_keys(
+    stored: Mapping[str, Any], removed_clusters: Mapping[str, Any]
+) -> set[tuple[str, str]]:
+    """The GPU clusters an initial deploy is still committed to.
+
+    ``remove-cluster`` records what it detached under ``removed_clusters`` --
+    keyed by the site's cluster id, ``safe_name`` of the HyperPod name -- and
+    never rewrote this checkpoint, so a cluster the administrator explicitly
+    removed is dropped here rather than holding the commitment open.
+    """
+
+    keys: set[tuple[str, str]] = set()
+    for item in stored.get("gpu_clusters") or []:
+        if not isinstance(item, Mapping):
+            continue
+        hyperpod_name = str(item.get("hyperpod_name") or "")
+        if hyperpod_name and (
+            hyperpod_name in removed_clusters
+            or _site_cluster_id(hyperpod_name) in removed_clusters
+        ):
+            continue
+        keys.add((str(item.get("eks_arn") or ""), hyperpod_name))
+    return keys
+
+
+def _site_cluster_id(hyperpod_name: str) -> str:
+    try:
+        return safe_name(hyperpod_name)
+    except BootstrapError:
+        return hyperpod_name
+
+
 def bind_initial_deploy_target(
     state: BootstrapState,
     existing_site: Mapping[str, Any] | None,
     cpu: ClusterIdentity,
     gpu_clusters: Sequence[ClusterIdentity],
 ) -> list[ClusterIdentity]:
+    """Bind the deploy to its clusters; return the GPU clusters it manages.
+
+    A first deploy records the clusters it targets before any site document
+    exists, and a resume of that deploy must aim at the same ones: the
+    resources it created are bound to them. Once the site document exists and
+    holds the whole target -- or ``remove-cluster`` has since detached what it
+    did not reach -- the document, not the checkpoint, says which clusters the
+    site manages, and the checkpoint reads COMPLETE. It used to stay PENDING
+    until an upgrade happened to request exactly the birth set, so a CPU-only
+    upgrade right after remove-cluster (live 2026-09-15: "initial deploy target
+    differs from the persisted checkpoint" on ``clusters: []``) and a
+    ``deploy --gpu-cluster-arn NEW`` right after the first deploy were both
+    refused against a target the site had already met.
+    """
+
     requested = _target_identity(cpu, gpu_clusters)
     requested_keys = [_cluster_key(cluster) for cluster in gpu_clusters]
     if len(requested_keys) != len(set(requested_keys)):
@@ -118,17 +165,21 @@ def bind_initial_deploy_target(
     stored = (
         resources.get(INITIAL_DEPLOY_TARGET) if isinstance(resources, Mapping) else None
     )
-    status = str(stored.get("status") or "") if isinstance(stored, Mapping) else ""
-    if status == "COMPLETE":
-        validate_existing_cluster_identity(
-            existing_site,
-            cpu=cpu,
-            gpu_clusters=gpu_clusters,
+    if stored is not None and not isinstance(stored, Mapping):
+        raise BootstrapError("initial deploy target checkpoint is invalid")
+    status = str(stored.get("status") or "") if stored is not None else ""
+    existing_keys = set(_site_gpu_keys(existing_site)) if existing_site else set()
+    if stored is not None and status != "COMPLETE":
+        removed = state.value.get("removed_clusters")
+        committed = _committed_gpu_keys(
+            stored, removed if isinstance(removed, Mapping) else {}
         )
-    else:
-        if stored is not None:
-            if not isinstance(stored, Mapping):
-                raise BootstrapError("initial deploy target checkpoint is invalid")
+        if existing_site is not None and committed <= existing_keys:
+            status = "COMPLETE"
+        else:
+            # No site document yet, or the site still lacks part of the
+            # target: the first deploy is in flight and a resume must aim at
+            # the same clusters.
             stored_identity = {
                 key: stored.get(key)
                 for key in ("schema_version", "cpu", "gpu_clusters")
@@ -137,13 +188,12 @@ def bind_initial_deploy_target(
                 raise BootstrapError(
                     "initial deploy target differs from the persisted checkpoint"
                 )
-        validate_existing_cluster_identity(
-            existing_site,
-            cpu=cpu,
-            gpu_clusters=gpu_clusters,
-            allow_gpu_subset=True,
-        )
-    existing_keys = set(_site_gpu_keys(existing_site)) if existing_site else set()
+    validate_existing_cluster_identity(
+        existing_site,
+        cpu=cpu,
+        gpu_clusters=gpu_clusters,
+        allow_gpu_subset=status != "COMPLETE",
+    )
     complete = existing_site is not None and existing_keys == set(requested_keys)
     state.record(
         INITIAL_DEPLOY_TARGET,
