@@ -443,3 +443,33 @@ def test_stage_five_resumes_an_unfinished_first_deploy_but_refuses_an_installed_
 
     assert refused.returncode != 0, refused.stdout
     assert "already holds site.yaml" in refused.stdout + refused.stderr, refused.stderr
+
+
+def test_middle_stages_use_the_site_bound_cli_when_the_first_deploy_installed_it(
+    tmp_path: Path,
+) -> None:
+    """remove/join/uninstall run with <state-dir>/deployer-venv/bin/gpu-fault-admin
+    once a deploy has installed and bound it; the two cold deploys stay on the
+    PATH CLI, which prepares the release and re-execs into the bound one."""
+
+    env = _install_fakes(tmp_path)
+    bound_dir = tmp_path / "state" / "deployer-venv" / "bin"
+    bound_dir.mkdir(parents=True)
+    bound = bound_dir / "gpu-fault-admin"
+    bound.write_text(
+        FAKE_ADMIN.replace(
+            "printf 'gpu-fault-admin %s\\n' \"$*\"", "printf 'bound-admin %s\\n' \"$*\""
+        ),
+        encoding="utf-8",
+    )
+    bound.chmod(0o755)
+
+    result = _run(tmp_path, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = _tool_log(env)
+    bound_verbs = [line.split()[1] for line in lines if line.startswith("bound-admin ")]
+    assert bound_verbs == ["remove-cluster", "join-cluster", "uninstall"], lines
+    assert _admin_verbs(lines) == ["deploy", "deploy"], (
+        "both cold deploys use the PATH CLI"
+    )

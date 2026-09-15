@@ -147,7 +147,9 @@ def test_a_failure_announces_the_log_once_across_nested_invocations(
         return admin_cli.main()  # the re-entered CLI, inheriting the log
 
     monkeypatch.setattr(admin_cli, "parser", Parser)
-    monkeypatch.setattr(admin_cli, "enforce_deploy_host_state_dir", lambda _a: None)
+    monkeypatch.setattr(
+        admin_cli, "enforce_deploy_host_state_dir", lambda _a, **_k: None
+    )
     monkeypatch.setattr(admin_cli, "run", run)
 
     assert admin_cli.main() == 2
@@ -242,7 +244,9 @@ def test_a_failure_propagates_the_first_cause_through_the_admin_cli(
         return 0
 
     monkeypatch.setattr(admin_cli, "parser", Parser)
-    monkeypatch.setattr(admin_cli, "enforce_deploy_host_state_dir", lambda _a: None)
+    monkeypatch.setattr(
+        admin_cli, "enforce_deploy_host_state_dir", lambda _a, **_k: None
+    )
     monkeypatch.setattr(admin_cli, "run", run)
 
     assert admin_cli.main() == 4, "the child's exit status must pass through"

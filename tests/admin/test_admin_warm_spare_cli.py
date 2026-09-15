@@ -299,7 +299,9 @@ def test_a_mutating_spare_action_is_teed_into_the_admin_command_log(
     state_dir = _state_dir(tmp_path)
     monkeypatch.delenv(ADMIN_LOG_ENVIRONMENT, raising=False)
     monkeypatch.setattr(cli, "load_site", lambda *_args, **_kwargs: _site())
-    monkeypatch.setattr(cli, "enforce_deploy_host_state_dir", lambda _arguments: None)
+    monkeypatch.setattr(
+        cli, "enforce_deploy_host_state_dir", lambda _arguments, **_k: None
+    )
     monkeypatch.setattr(
         warm_spare,
         "run_config_spare_command",

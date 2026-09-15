@@ -146,9 +146,27 @@ record.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="ut
 PY
 }
 
+admin_binary() {  # VERB ARGS... -> the site's bound CLI for everything but deploy
+  # A first deploy installs <state-dir>/deployer-venv and binds it there; from
+  # then on the site is operated with that CLI (the checkout's gpu-fault-admin
+  # refuses mutating verbs against such a site). deploy itself stays on PATH:
+  # it prepares the release and re-execs into the bound CLI.
+  local verb="$1" dir="" previous=""
+  for argument in "$@"; do
+    [[ "$previous" == "--state-dir" ]] && dir="$argument"
+    previous="$argument"
+  done
+  if [[ "$verb" != deploy && -n "$dir" && -x "$dir/deployer-venv/bin/gpu-fault-admin" ]]; then
+    printf '%s' "$dir/deployer-venv/bin/gpu-fault-admin"
+  else
+    printf 'gpu-fault-admin'
+  fi
+}
+
 run_admin() {  # waits for the command to exit; never backgrounds a deploy
-  log "gpu-fault-admin $1 ... (waiting for the process to exit)"
-  gpu-fault-admin "$@" 2>&1 | tee -a "$STAGE_LOG"
+  local binary; binary="$(admin_binary "$@")"
+  log "$binary $1 ... (waiting for the process to exit)"
+  "$binary" "$@" 2>&1 | tee -a "$STAGE_LOG"
 }
 
 # --- cold build ------------------------------------------------------------

@@ -76,6 +76,10 @@ from gpu_fault.admin.collector_outbox import (
     run_collector_outbox_command,
 )
 from gpu_fault.admin.incident_close import run_incident_close
+from gpu_fault.admin.deploy_host_binding import (  # noqa: F401 - re-exported
+    DEPLOY_HOST_STATE_BINDING,
+    enforce_deploy_host_state_dir,
+)
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.release_child import (
     run_automatic_release as _run_automatic_release,
@@ -148,7 +152,6 @@ INTERNAL_READONLY_COMMANDS = ("preflight", "verify")
 # The managed commands that write nothing; their console logs rotate under
 # ``logs/readonly/`` so they cannot age out a failed deploy's log (I3).
 READONLY_COMMANDS = frozenset(PUBLIC_READONLY_COMMANDS + INTERNAL_READONLY_COMMANDS)
-DEPLOY_HOST_STATE_BINDING = "gpu-fault-managed-state-dir.json"
 
 
 RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
@@ -216,43 +219,6 @@ def quick_validation_evidence_environment(
     return {QUICK_VALIDATION_EVIDENCE_ENV: str(path)}
 
 
-def _bound_deploy_host_state_dir(prefix: Path | None = None) -> Path | None:
-    binding = (prefix or Path(sys.prefix)).resolve() / DEPLOY_HOST_STATE_BINDING
-    if not binding.is_file():
-        return None
-    try:
-        value = json.loads(binding.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SiteConfigError("deploy-host state-dir binding is invalid") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise SiteConfigError("deploy-host state-dir binding schema is invalid")
-    state_dir = value.get("state_dir")
-    if not isinstance(state_dir, str) or not state_dir.strip():
-        raise SiteConfigError("deploy-host state-dir binding has no state directory")
-    return Path(state_dir).expanduser().resolve()
-
-
-def enforce_deploy_host_state_dir(arguments: argparse.Namespace) -> None:
-    bound = _bound_deploy_host_state_dir()
-    if bound is None:
-        return
-    provided = cast(Path | None, getattr(arguments, "state_dir", None))
-    if provided is not None:
-        if provided.expanduser().resolve() == bound:
-            return
-        raise SiteConfigError(
-            f"installed deploy-host is bound to --state-dir {bound}; "
-            f"refusing {provided.expanduser().resolve()}"
-        )
-    explicit = cast(Path | None, getattr(arguments, "file", None))
-    if explicit is not None and explicit.expanduser().resolve() == bound / "site.yaml":
-        return
-    raise SiteConfigError(
-        f"installed deploy-host is bound to --state-dir {bound}; "
-        f"{arguments.command} requires that managed state"
-    )
-
-
 def _add_managed_site_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--state-dir",
@@ -282,7 +248,8 @@ def _add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
         help=(
             "roll the site back one step, to the release recorded as previous; "
             "refused while a transaction is in flight or when there is no "
-            "previous release; takes no other deploy option"
+            "previous release; takes no other deploy option except "
+            "--allow-inflight-installs"
         ),
     )
     deploy.add_argument(
@@ -1592,7 +1559,6 @@ def run(arguments: argparse.Namespace) -> int:
 
 def _run_reporting_failures(arguments: argparse.Namespace) -> int:
     try:
-        enforce_deploy_host_state_dir(arguments)
         return run(arguments)
     except (
         AdminConfigError,
@@ -1612,6 +1578,12 @@ def _run_reporting_failures(arguments: argparse.Namespace) -> int:
 def main() -> int:
     arguments = parser().parse_args()
     command = str(getattr(arguments, "command", "admin"))
+    try:
+        # Before the log opens under --state-dir: a refused call must not leave
+        # a log file in another site's directory.
+        enforce_deploy_host_state_dir(arguments, readonly_commands=READONLY_COMMANDS)
+    except SiteConfigError as exc:
+        return report_failure("gpu-fault-admin", exc)
     with command_log(
         getattr(arguments, "state_dir", None),
         command=command,

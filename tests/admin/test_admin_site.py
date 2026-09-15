@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault.admin import deploy_host_binding
 from gpu_fault.admin.bootstrap_common import BootstrapResult
 from gpu_fault.admin.site import (
     RegionalSite,
@@ -568,7 +569,7 @@ def test_deploy_host_binding_rejects_another_state_before_dispatch(
     canonical = tmp_path / "canonical"
     wrong = tmp_path / "wrong"
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     arguments = argparse.Namespace(
         command="status",
@@ -587,7 +588,7 @@ def test_deploy_host_binding_allows_canonical_state(
 ) -> None:
     canonical = tmp_path / "canonical"
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     arguments = argparse.Namespace(
         command="status",
@@ -613,7 +614,7 @@ def test_admin_main_enforces_binding_before_dispatch(
     arguments = argparse.Namespace(command="status", state_dir=wrong, file=None)
     monkeypatch.setattr(admin_cli, "parser", Parser)
     monkeypatch.setattr(
-        admin_cli, "_bound_deploy_host_state_dir", lambda: canonical.resolve()
+        deploy_host_binding, "bound_state_dir", lambda prefix=None: canonical.resolve()
     )
     monkeypatch.setattr(
         admin_cli,
