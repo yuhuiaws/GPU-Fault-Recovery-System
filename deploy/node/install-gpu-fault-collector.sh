@@ -99,7 +99,7 @@ MEMORY_FIELD_DIAGNOSTIC_COMMAND=""
 MEMORY_FIELD_DIAGNOSTIC_SHA256=""
 FIELD_DIAGNOSTIC_TIMEOUT_SECONDS="1800"
 ALLOW_DRIVER_REMEDIATION="false"
-ALLOW_EFA_DRIVER_REMEDIATION="true"
+ALLOW_EFA_DRIVER_REMEDIATION="true" # default-on; --disable-efa-driver-remediation turns it off; a default must not join the --enable-node-agent guard
 DRIVER_REMEDIATION_COMMAND=""
 DRIVER_REMEDIATION_SHA256=""
 TARGET_DRIVER_BRANCH=""
@@ -216,7 +216,8 @@ usage() {
         "  --field-diagnostic-sha256 HEX   Pinned executable SHA-256" \
         "  --field-diagnostic-timeout SEC  60-7200; default: 1800" \
         "  --allow-driver-remediation      Allow explicitly mapped SXID driver repair" \
-        "  --allow-efa-driver-remediation  Allow EFA PCI driver rebind after workload stop" \
+        "  --allow-efa-driver-remediation  Allow EFA PCI driver rebind after workload stop; default, explicit confirmation" \
+        "  --disable-efa-driver-remediation Do not allow EFA PCI driver rebind; drops REMEDIATE_EFA_DRIVER" \
         "  --driver-remediation-command CMD  Absolute, preinstalled command; {target} allowed" \
         "  --driver-remediation-sha256 HEX Pinned executable SHA-256" \
         "  --target-driver-branch INTEGER  Required driver branch after repair" \
@@ -241,7 +242,7 @@ usage() {
         "  --node-agent-tls-client-ca PATH Require a client certificate from this CA" \
         "  --node-heartbeat-interval SEC   Default: 30" \
         "  --node-inflight-wait-timeout SEC Duplicate command wait; default: 2100" \
-        "  --node-action-retention-seconds SEC Ledger retention; default: 604800" \
+        "  --node-action-retention-seconds SEC Ledger retention; default: 2592000" \
         "  --node-action-max-results N     Ledger row cap; default: 10000" \
         "  --node-instance-id ID           Stable VM or Kubernetes Node UID" \
         "  --no-start                      Install and enable without starting" \
@@ -571,6 +572,7 @@ while [[ $# -gt 0 ]]; do
         --field-diagnostic-timeout) require_value "$@"; FIELD_DIAGNOSTIC_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --allow-driver-remediation) ALLOW_DRIVER_REMEDIATION="true"; shift ;;
         --allow-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="true"; shift ;;
+        --disable-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="false"; shift ;;
         --driver-remediation-command) require_value "$@"; DRIVER_REMEDIATION_COMMAND="$2"; shift 2 ;;
         --driver-remediation-sha256) require_value "$@"; DRIVER_REMEDIATION_SHA256="$2"; shift 2 ;;
         --target-driver-branch) require_value "$@"; TARGET_DRIVER_BRANCH="$2"; shift 2 ;;
@@ -1663,8 +1665,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             "${FIELD_DIAGNOSTIC_TIMEOUT_SECONDS}"
         write_env GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION \
             "${ALLOW_DRIVER_REMEDIATION}"
-        write_env GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION \
-            "${ALLOW_EFA_DRIVER_REMEDIATION}"
+        write_env GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION "${ALLOW_EFA_DRIVER_REMEDIATION}"
         write_env GPU_FAULT_DRIVER_REMEDIATION_COMMAND \
             "${DRIVER_REMEDIATION_COMMAND}"
         write_env GPU_FAULT_DRIVER_REMEDIATION_SHA256 \
@@ -1743,8 +1744,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             "${NODE_HEARTBEAT_INTERVAL}"
         write_env GPU_FAULT_NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS \
             "${NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS}"
-        write_env GPU_FAULT_NODE_ACTION_RETENTION_SECONDS \
-            "${NODE_ACTION_RETENTION_SECONDS}"
+        write_env GPU_FAULT_NODE_ACTION_RETENTION_SECONDS "${NODE_ACTION_RETENTION_SECONDS}"
         write_env GPU_FAULT_NODE_ACTION_MAX_RESULTS \
             "${NODE_ACTION_MAX_RESULTS}"
         write_env GPU_FAULT_NODE_AGENT_HOST "${NODE_AGENT_HOST}"

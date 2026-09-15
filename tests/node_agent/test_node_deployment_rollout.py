@@ -12,7 +12,9 @@ quiesce configuration the production installer carries.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from pathlib import Path
 
 import yaml
 
@@ -60,6 +62,13 @@ def test_node_installer_help_does_not_require_root() -> None:
     assert "--quiesce-failsafe-seconds SEC" in result.stdout
     assert "--fabric-manager-log-paths GLOBS" in result.stdout
     assert "--allow-driver-remediation" in result.stdout
+    assert (
+        "--allow-efa-driver-remediation  Allow EFA PCI driver rebind after "
+        "workload stop; default"
+    ) in result.stdout
+    assert "--disable-efa-driver-remediation Do not allow EFA PCI driver rebind" in (
+        result.stdout
+    )
     assert "--firmware-verify-sha256 HEX" in result.stdout
     assert "--allow-field-diagnostic" in result.stdout
     assert "--field-diagnostic-sha256 HEX" in result.stdout
@@ -534,3 +543,136 @@ def test_install_and_uninstall_restore_pending_quiesce_state() -> None:
         assert "gpu-fault-restore-gpu-services" in script
     assert "upgrade aborted" in installer
     assert "uninstall aborted" in uninstaller
+
+
+def _shell_excerpt(script: str, pattern: str) -> str:
+    matches = re.findall(pattern, script, re.M | re.S)
+    assert len(matches) == 1, f"expected one match for {pattern!r}, got {len(matches)}"
+    return matches[0]
+
+
+def _installer_efa_switch(tmp_path: Path, *arguments: str) -> tuple[str, list[str]]:
+    """Run the installer's own flag parser and allowed-operations block.
+
+    Stitched from the script text rather than re-typed, so a renamed variable
+    or a rewritten case arm fails here instead of quietly testing a copy.
+    Returns the ALLOW_EFA_DRIVER_REMEDIATION value and NODE_ALLOWED_OPERATIONS.
+    """
+
+    installer = NODE_SCRIPTS[0].read_text(encoding="utf-8")
+    parser = _shell_excerpt(installer, r"^while \[\[ \$# -gt 0 \]\]; do\n.*?^done\n")
+    operations = _shell_excerpt(
+        installer,
+        r'^    NODE_ALLOWED_OPERATIONS="COLLECT_HUNG_TRIAGE.*?'
+        r'UPDATE_SOFTWARE_FIRMWARE"\n    fi\n',
+    )
+    defaults = "".join(
+        line + "\n"
+        for line in re.findall(
+            r"^(?:ALLOW_[A-Z_]+|MEMORY_FIELD_DIAGNOSTIC_COMMAND)=.*$", installer, re.M
+        )
+    )
+    probe = tmp_path / "efa-switch.sh"
+    probe.write_text(
+        "set -euo pipefail\n"
+        'die() { printf "die: %s\\n" "$*" >&2; exit 1; }\n'
+        'require_value() { [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"; }\n'
+        "usage() { :; }\n"
+        "print_config_digest_environment() { :; }\n"
+        + defaults
+        + parser
+        + operations
+        + 'printf "%s\\n%s\\n" "${ALLOW_EFA_DRIVER_REMEDIATION}" '
+        '"${NODE_ALLOWED_OPERATIONS}"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["bash", str(probe), *arguments], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    allowed, operations_value = result.stdout.splitlines()
+    return allowed, operations_value.split(",")
+
+
+def test_efa_driver_remediation_is_on_by_default_and_switchable_off(
+    tmp_path: Path,
+) -> None:
+    installer = NODE_SCRIPTS[0].read_text(encoding="utf-8")
+    assert 'ALLOW_EFA_DRIVER_REMEDIATION="true"' in installer
+    assert (
+        '--allow-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="true"; shift ;;'
+    ) in installer
+    assert (
+        '--disable-efa-driver-remediation) ALLOW_EFA_DRIVER_REMEDIATION="false"; '
+        "shift ;;"
+    ) in installer
+    guard = installer.split(
+        'die "node mutation options require --enable-node-agent"', 1
+    )[0].rsplit("elif [[", 1)[1]
+    assert "ALLOW_EFA_DRIVER_REMEDIATION" not in guard, (
+        "a default-on switch listed in the --enable-node-agent guard would make "
+        "every collector-only install die"
+    )
+
+    allowed, operations = _installer_efa_switch(tmp_path)
+    assert allowed == "true"
+    assert "REMEDIATE_EFA_DRIVER" in operations
+
+    allowed, operations = _installer_efa_switch(
+        tmp_path, "--disable-efa-driver-remediation"
+    )
+    assert allowed == "false"
+    assert "REMEDIATE_EFA_DRIVER" not in operations
+    assert "RESET_GPU" in operations, "the switch drops only its own operation"
+
+    allowed, operations = _installer_efa_switch(
+        tmp_path, "--allow-efa-driver-remediation"
+    )
+    assert allowed == "true"
+    assert "REMEDIATE_EFA_DRIVER" in operations
+
+
+def test_installer_job_forwards_the_efa_remediation_switch() -> None:
+    """A false GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION must reach the node.
+
+    The installer is default-on, so merely omitting --allow-efa-driver-remediation
+    changed nothing; the Job has to say --disable-efa-driver-remediation.
+    """
+
+    job = (ROOT / "deploy/node/run-hyperpod-installer-job.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        'ENABLE_EFA_DRIVER_REMEDIATION="${GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION:-true}"'
+    ) in job
+    assert "GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION must be true or false" in job
+    assert (
+        'ENABLE_EFA_DRIVER_REMEDIATION="\\${ENABLE_EFA_DRIVER_REMEDIATION}"' in job
+    ), (
+        "the Job env is not forwarded through `chroot /host /usr/bin/env` into "
+        "the installer shell"
+    )
+    block = _shell_excerpt(
+        job,
+        r'^\s*if \[\[ "\\\$\{ENABLE_EFA_DRIVER_REMEDIATION\}" == "true" \]\]; then\n'
+        r".*?^\s*fi\n",
+    )
+    for value, expected in (
+        ("true", "--allow-efa-driver-remediation"),
+        ("false", "--disable-efa-driver-remediation"),
+    ):
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "set -euo pipefail\nremediation_args=()\n"
+                + block.replace("\\$", "$")
+                + 'printf "%s\\n" "${remediation_args[@]}"\n',
+            ],
+            env={"PATH": "/usr/bin:/bin", "ENABLE_EFA_DRIVER_REMEDIATION": value},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == [expected], result.stdout

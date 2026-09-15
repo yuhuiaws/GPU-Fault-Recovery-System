@@ -449,6 +449,9 @@ categories:
         description: "逗号分隔的业务通知接收人列表，仅 channel=ses 使用。"
       - name: GPU_FAULT_EMAIL_SUBJECT_PREFIX
         description: "邮件环境/站点前缀，不替代正文中的 site、Region、account 和 cluster。"
+      - name: GPU_FAULT_SES_CONFIGURATION_SET
+        production: channel=ses 时由 site.yaml 的 spec.notifications.sesConfigurationSet 渲染，未声明为空
+        description: "SES v2 configuration set 名称，仅 channel=ses 使用；空值表示按 SES 账户默认发送。只能由 site.yaml 声明，不从执行 deploy 的 shell 环境继承。"
       - name: GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY
         description: "是否把投递放入持久化 outbox；区域生产为 true。"
       - name: GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED
@@ -470,7 +473,7 @@ categories:
       - name: GPU_FAULT_METRICS_WORKFLOW_SCAN_LIMIT
         description: "/metrics 明细扫描的行数硬上限，作用于非终态与窗内终态的并集；超出即置 gpu_fault_workflow_scan_truncated。调大只是把成本转给 Aurora 和每次抓取，先处理制造 workflow 的源头。"
       - name: GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS
-        description: "incident/workflow archive-first 保留天数；默认 0 = 关闭，永不归档删除。不直接设置：在 site.yaml 声明 spec.retention.controlRecordRetentionDays 后重跑 deploy --state-dir，只渲染进 control-worker。"
+        description: "incident/workflow archive-first 保留天数；进程裸默认 0 = 关闭，但 deploy 渲染的站点默认 30 天（spec.retention.controlRecordRetentionDays 缺省 30），显式写 0 才关闭。不直接设置：在 site.yaml 声明该键后重跑 deploy --state-dir，只渲染进 control-worker。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI
         description: "archive-first 目标 S3 URI（保留天数 >0 时必填）；先写归档并校验 SHA，再删 live rows。来自 site.yaml spec.retention.archiveS3Uri；deploy 同时给控制面角色加该前缀的 s3:PutObject。"
       - name: GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS

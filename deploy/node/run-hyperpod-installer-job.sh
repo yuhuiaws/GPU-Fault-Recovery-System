@@ -225,6 +225,10 @@ done
     printf 'ERROR: GPU_FAULT_ENABLE_NVIDIA_SMI_METRICS_COLLECTOR must be true or false\n' >&2
     exit 2
 }
+[[ "${ENABLE_EFA_DRIVER_REMEDIATION}" =~ ^(true|false)$ ]] || {
+    printf 'ERROR: GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION must be true or false\n' >&2
+    exit 2
+}
 [[ "${REQUIRE_ROLLBACK_SLOT}" =~ ^(true|false)$ ]] || {
     printf 'ERROR: GPU_FAULT_REQUIRE_ROLLBACK_SLOT must be true or false\n' >&2
     exit 2
@@ -779,6 +783,10 @@ ${CONTROL_PLANE_ENV}
                   if [[ "\${ENABLE_EFA_DRIVER_REMEDIATION}" == "true" ]]; then
                     remediation_args+=(
                       --allow-efa-driver-remediation
+                    )
+                  else
+                    remediation_args+=(
+                      --disable-efa-driver-remediation
                     )
                   fi
                   if [[ "\${ENABLE_FIRMWARE_UPDATE}" == "true" ]]; then

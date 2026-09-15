@@ -305,6 +305,9 @@ def build_rollback_environment(
         "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": str(
             rollback_config.notifications.acknowledge_external_alert_channel
         ).lower(),
+        "GPU_FAULT_SES_CONFIGURATION_SET": (
+            rollback_config.notifications.ses_configuration_set or ""
+        ),
         "GPU_FAULT_NOTIFICATION_CONFIG_SHA256": notification_digest(
             rollback_config.notifications
         ),

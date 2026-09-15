@@ -26,6 +26,8 @@ AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 OCI_IMAGE_PATTERN = re.compile(r"^[^\s#]+$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+# SES v2 configuration set names: letters, digits, hyphens and underscores.
+SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class SiteConfigError(ValueError):
@@ -90,6 +92,20 @@ def _subject_prefix(value: object, path: str) -> str:
     normalized = value.strip()
     if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
         raise SiteConfigError(f"{path} must be a single line of at most 64 characters")
+    return normalized
+
+
+def _ses_configuration_set(value: object, path: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SiteConfigError(f"{path} must be a string")
+    normalized = value.strip()
+    if not SES_CONFIGURATION_SET_PATTERN.fullmatch(normalized):
+        raise SiteConfigError(
+            f"{path} must be an SES configuration set name: 1-64 letters, "
+            "digits, hyphens or underscores"
+        )
     return normalized
 
 
@@ -739,6 +755,9 @@ class NotificationSiteConfig:
     ``channel: sns``). On ``sns`` only ``adminEmail`` is required, and naming
     one implies ``allowEmail``; a leftover ``emailSender``/``emailRecipients``
     is carried but not required, so flipping a live site edits one key.
+    ``sesConfigurationSet`` names the SES v2 configuration set the ``ses``
+    channel sends through (``GPU_FAULT_SES_CONFIGURATION_SET`` on every role);
+    like a leftover sender it is carried, unused, on ``sns``.
     """
 
     allow_email: bool = False
@@ -748,6 +767,7 @@ class NotificationSiteConfig:
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
     channel: str = NOTIFICATION_CHANNEL_SNS
+    ses_configuration_set: str | None = None
 
     @classmethod
     def from_value(cls, value: object) -> NotificationSiteConfig:
@@ -762,6 +782,7 @@ class NotificationSiteConfig:
                 "emailRecipients",
                 "emailSubjectPrefix",
                 "channel",
+                "sesConfigurationSet",
             },
         )
         channel = data.get("channel")
@@ -806,6 +827,10 @@ class NotificationSiteConfig:
             data.get("emailSubjectPrefix"),
             "spec.notifications.emailSubjectPrefix",
         )
+        ses_configuration_set = _ses_configuration_set(
+            data.get("sesConfigurationSet"),
+            "spec.notifications.sesConfigurationSet",
+        )
         if not allow_email and not acknowledge:
             raise SiteConfigError(
                 "notifications must enable email or acknowledge an external alert channel"
@@ -829,6 +854,7 @@ class NotificationSiteConfig:
             email_recipients=email_recipients,
             email_subject_prefix=email_subject_prefix,
             channel=channel,
+            ses_configuration_set=ses_configuration_set,
         )
 
 
@@ -1243,6 +1269,7 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             "email_recipients": list(site.spec.notifications.email_recipients),
             "email_subject_prefix": (site.spec.notifications.email_subject_prefix),
             "channel": site.spec.notifications.channel,
+            "ses_configuration_set": (site.spec.notifications.ses_configuration_set),
         },
         "admin_config": {
             "config": admin_config.as_dict(),

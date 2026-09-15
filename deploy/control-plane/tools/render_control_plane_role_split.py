@@ -782,11 +782,11 @@ def main() -> None:
     # process never creates. The worker tier sets all five below.
     for consumer_only in PROCESSOR_POOL_ENV:
         unset_env(ingress, consumer_only)
-    # The 40-connection process budget is split into three explicit
-    # admission lanes: 24 general API, eight striped cross-cluster spool
-    # batches and eight fault. The pool pre-opens sixteen connections,
-    # enough for every spool and fault lane, while general traffic grows
-    # into the remaining headroom on demand.
+    # At most 40 Aurora connections per ingress process; the store-I/O
+    # admission lanes are sized explicitly rather than derived from the
+    # pool: 28 general API, eight fault, four evidence and eight
+    # telemetry-spool workers (below). The pool pre-opens only two
+    # connections and grows on demand, so an idle replica pins none.
     set_env(ingress, "GPU_FAULT_POSTGRES_POOL_MIN_SIZE", "2")
     set_env(ingress, "GPU_FAULT_POSTGRES_POOL_MAX_SIZE", "40")
     set_env(ingress, "GPU_FAULT_STORE_IO_WORKERS", "28")

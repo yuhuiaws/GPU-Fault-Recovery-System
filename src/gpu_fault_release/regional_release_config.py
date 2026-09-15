@@ -20,6 +20,8 @@ DIGEST_IMAGE_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 AWS_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 RUNTIME_PROFILE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
+# SES v2 configuration set names: letters, digits, hyphens and underscores.
+SES_CONFIGURATION_SET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
     r"cluster/(?P<name>[^/]+)$"
@@ -86,6 +88,20 @@ def email_subject_prefix(value: object, field: str) -> str:
     normalized = str(value or "").strip()
     if len(normalized) > 64 or "\n" in normalized or "\r" in normalized:
         raise ReleaseError(f"{field} must be a single line of at most 64 characters")
+    return normalized
+
+
+def ses_configuration_set(value: object, field: str) -> str | None:
+    """The optional SES v2 configuration set name; ``None`` when not declared."""
+
+    if value is None:
+        return None
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not SES_CONFIGURATION_SET_PATTERN.fullmatch(normalized):
+        raise ReleaseError(
+            f"{field} must be an SES configuration set name: 1-64 letters, "
+            "digits, hyphens or underscores"
+        )
     return normalized
 
 
@@ -325,6 +341,8 @@ class RegionalNotificationConfig:
     the key existed carries an ``email_sender`` and stays on ``ses``, so a
     rollback onto such a record keeps the channel it shipped with; anything
     else is ``sns``. On ``sns`` only ``admin_email`` is required.
+    ``ses_configuration_set`` is ``None`` for a record written before the
+    field existed, so such a record's notification digest does not move.
     """
 
     allow_email: bool = False
@@ -334,6 +352,7 @@ class RegionalNotificationConfig:
     email_recipients: tuple[str, ...] = ()
     email_subject_prefix: str = ""
     channel: str = NOTIFICATION_CHANNEL_SNS
+    ses_configuration_set: str | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> RegionalNotificationConfig:
@@ -375,6 +394,10 @@ class RegionalNotificationConfig:
             value.get("email_subject_prefix"),
             "notifications.email_subject_prefix",
         )
+        configuration_set = ses_configuration_set(
+            value.get("ses_configuration_set"),
+            "notifications.ses_configuration_set",
+        )
         if not allow_email and not acknowledge:
             raise ReleaseError(
                 "notifications must allow email or acknowledge an external alert channel"
@@ -398,6 +421,7 @@ class RegionalNotificationConfig:
             email_recipients=email_recipients,
             email_subject_prefix=subject_prefix,
             channel=channel,
+            ses_configuration_set=configuration_set,
         )
 
 

@@ -524,6 +524,14 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert "REPLACE_WITH_AWS_REGION" in script
     assert "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION" in script
     assert "REPLACE_WITH_RUNTIME_PROFILE_VERSION" in script
+    assert (
+        "s/GPU_FAULT_SES_CONFIGURATION_SET: ''/"
+        "GPU_FAULT_SES_CONFIGURATION_SET: '${SES_CONFIGURATION_SET}'/g"
+    ) in script, (
+        "the apply sed and render_cpu_manifest_text must know the same "
+        "notification placeholders, or the plan digest and the live ConfigMap "
+        "disagree about the site's SES configuration set"
+    )
     assert "gpu-fault.io/artifact-sha256: ${WHEEL_SHA256}" in script, (
         "apply must not toggle the pod template back to the generated source digest"
     )

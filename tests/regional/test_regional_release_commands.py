@@ -194,7 +194,11 @@ def test_join_cluster_requires_an_idle_remote_command_queue() -> None:
 
 
 def rollback_environment(
-    monkeypatch: pytest.MonkeyPatch, *, metadata: dict[str, str], allow_email: bool
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    metadata: dict[str, str],
+    allow_email: bool,
+    ses_configuration_set: str | None = None,
 ) -> dict[str, str]:
     monkeypatch.setattr(
         ROLLBACK_CONTEXT_MODULE,
@@ -221,6 +225,7 @@ def rollback_environment(
             notifications=SimpleNamespace(
                 allow_email=allow_email,
                 acknowledge_external_alert_channel=not allow_email,
+                ses_configuration_set=ses_configuration_set,
             ),
             notification_environment=lambda: {
                 "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
@@ -284,6 +289,16 @@ def test_rollback_preserves_the_alerting_configuration(
         "be told which channel the snapshot shipped with"
     )
     assert enabled["GPU_FAULT_SNS_TOPIC_ARN"] == SNS_TOPIC_ARN
+    assert enabled["GPU_FAULT_SES_CONFIGURATION_SET"] == "", (
+        "an unset site re-renders the empty ConfigMap value, never a value "
+        "inherited from the operator's shell"
+    )
+
+    declared = rollback_environment(
+        monkeypatch, metadata={}, allow_email=True, ses_configuration_set="alerts-set"
+    )
+
+    assert declared["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
 
 
 def test_last_cluster_can_be_removed_from_the_cpu_registry(

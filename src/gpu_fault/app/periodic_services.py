@@ -276,13 +276,13 @@ class PeriodicServiceRunner:
     def run_all_due(self, now: float) -> None:
         """One tick: every job gets its turn even if another one raised.
 
-        The loop body used to call the six jobs bare; the one statement they
-        all share without a guard -- the task-lease write in ``_due`` -- ended
-        the thread on its first store error, and with it all six services for
-        the life of the process (F-F1).
+        The loop body used to call every job in ``_JOBS`` bare; the one
+        statement they all share without a guard -- the task-lease write in
+        ``_due`` -- ended the thread on its first store error, and with it
+        every periodic service for the life of the process (F-F1).
 
         ``now`` is refreshed after a job actually ran: a 20 s cleanup used to
-        leave the five jobs behind it judging their schedule by a clock taken
+        leave the jobs behind it judging their schedule by a clock taken
         before it started (F-F2).
         """
 

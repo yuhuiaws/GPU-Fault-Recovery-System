@@ -14,23 +14,28 @@ EMAIL_SECRET_NAME = "gpu-fault-email"
 
 
 def notification_digest(config: Any) -> str:
+    payload: dict[str, Any] = {
+        "schema_version": 4,
+        "channel": config.channel,
+        "allow_email": config.allow_email,
+        "acknowledge_external_alert_channel": (
+            config.acknowledge_external_alert_channel
+        ),
+        "admin_email": config.admin_email,
+        "email_sender": config.email_sender,
+        "email_recipients": list(config.email_recipients),
+        "email_subject_prefix": config.email_subject_prefix,
+    }
+    # Added after schema_version 4 shipped, so it enters the payload only when
+    # a site declares one: every existing site's digest -- compared against the
+    # live Deployment annotation by the admin check, and deciding whether a
+    # deploy is a NOOP -- stays what it was, and a record or double predating
+    # the field hashes identically.
+    configuration_set = getattr(config, "ses_configuration_set", None)
+    if configuration_set:
+        payload["ses_configuration_set"] = configuration_set
     return hashlib.sha256(
-        json.dumps(
-            {
-                "schema_version": 4,
-                "channel": config.channel,
-                "allow_email": config.allow_email,
-                "acknowledge_external_alert_channel": (
-                    config.acknowledge_external_alert_channel
-                ),
-                "admin_email": config.admin_email,
-                "email_sender": config.email_sender,
-                "email_recipients": list(config.email_recipients),
-                "email_subject_prefix": config.email_subject_prefix,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 

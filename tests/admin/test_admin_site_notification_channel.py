@@ -11,6 +11,7 @@ startup, so unlike retention the variables reach ingress, worker and spool.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -124,6 +125,65 @@ def test_declaring_sns_on_a_legacy_block_flips_the_channel_only(
     assert site.spec.notifications.email_sender == "sender@example.com"
 
 
+def test_the_ses_configuration_set_is_a_site_setting_on_the_ses_channel(
+    site_file: Path,
+) -> None:
+    """The SES notifier reads ``GPU_FAULT_SES_CONFIGURATION_SET``; the regional
+    deploy renders it from the site, never from the operator's shell."""
+
+    site = _parse(
+        site_file, {**LEGACY_BLOCK, "sesConfigurationSet": " gpu-fault_alerts-1 "}
+    )
+    assert site.spec.notifications.ses_configuration_set == "gpu-fault_alerts-1"
+
+    rendered = load_site(site_file)
+    assert rendered.release_config["notifications"]["ses_configuration_set"] == (
+        "gpu-fault_alerts-1"
+    )
+
+
+def test_the_ses_configuration_set_is_carried_on_sns_without_error(
+    site_file: Path,
+) -> None:
+    """Like a leftover ``emailSender``: flipping a live site to sns edits one
+    key, and the unused configuration set is carried rather than rejected."""
+
+    site = _parse(
+        site_file, {**LEGACY_BLOCK, "channel": "sns", "sesConfigurationSet": "alerts"}
+    )
+
+    assert site.spec.notifications.channel == "sns"
+    assert site.spec.notifications.ses_configuration_set == "alerts"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "my set", "alerts/prod", "a" * 65, "alerts'", "a\nb", 7, ["alerts"]],
+    ids=[
+        "empty",
+        "blank",
+        "space",
+        "slash",
+        "too-long",
+        "quote",
+        "newline",
+        "int",
+        "list",
+    ],
+)
+def test_the_ses_configuration_set_must_be_a_configuration_set_name(
+    site_file: Path, value: object
+) -> None:
+    """Only ``[A-Za-z0-9_-]{1,64}`` -- the SES name charset -- is accepted, which
+    is also what keeps the single-quoted ConfigMap scalar and the apply sed
+    intact."""
+
+    with pytest.raises(SiteConfigError, match="sesConfigurationSet"):
+        load_site(
+            _site_document(site_file, {**LEGACY_BLOCK, "sesConfigurationSet": value})
+        )
+
+
 @pytest.mark.parametrize(
     ("notifications", "message"),
     [
@@ -154,6 +214,7 @@ def test_the_channel_is_rendered_into_the_release_config(site_file: Path) -> Non
         "email_recipients": ["ops@example.com"],
         "email_subject_prefix": "",
         "channel": "sns",
+        "ses_configuration_set": None,
     }
 
 
@@ -230,6 +291,35 @@ def test_release_config_threads_the_channel_and_defaults_it_like_the_site(
         _release_config(tmp_path, {"allow_email": True, "channel": "sns"}, topic=None)
 
 
+SES_BLOCK = {
+    "allow_email": True,
+    "admin_email": "ops@example.com",
+    "email_sender": "sender@example.com",
+    "channel": "ses",
+}
+
+
+def test_release_config_threads_the_ses_configuration_set_and_defaults_it_absent(
+    tmp_path: Path,
+) -> None:
+    absent = _release_config(tmp_path, dict(SES_BLOCK), topic=None)
+    assert absent.notifications.ses_configuration_set is None, (
+        "a release config written before the field existed rolls back without one"
+    )
+
+    declared = _release_config(
+        tmp_path, {**SES_BLOCK, "ses_configuration_set": "alerts-set"}, topic=None
+    )
+    assert declared.notifications.ses_configuration_set == "alerts-set"
+
+    with pytest.raises(
+        release_config_module.ReleaseError, match="ses_configuration_set"
+    ):
+        _release_config(
+            tmp_path, {**SES_BLOCK, "ses_configuration_set": "not valid"}, topic=None
+        )
+
+
 def test_notification_environment_names_the_channel_and_the_topic_for_sns(
     tmp_path: Path,
 ) -> None:
@@ -263,17 +353,12 @@ def test_notification_environment_names_the_channel_and_the_topic_for_sns(
     }, "the runtime guard, not the renderer, reports a missing topic"
 
 
-def test_cpu_apply_environment_carries_the_channel_variables(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    for name in CHANNEL_ENV:
-        monkeypatch.delenv(name, raising=False)
-    release = SimpleNamespace(
-        config=_release_config(
-            tmp_path,
-            {"allow_email": True, "admin_email": "ops@example.com"},
-            topic=SNS_TOPIC_ARN,
-        ),
+def _apply_release(config: release_config_module.ReleaseConfig) -> SimpleNamespace:
+    """The release double ``build_cpu_apply_environment`` and the CPU manifest
+    renderer read: the site's config plus the pins the apply script stamps."""
+
+    return SimpleNamespace(
+        config=config,
         wheel_cm="wheel-cm",
         wheel_sha="a" * 64,
         runtime_image="registry.example/runtime@sha256:" + "b" * 64,
@@ -288,11 +373,64 @@ def test_cpu_apply_environment_carries_the_channel_variables(
         release_id="release-a",
     )
 
+
+def test_cpu_apply_environment_carries_the_channel_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in CHANNEL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    release = _apply_release(
+        _release_config(
+            tmp_path,
+            {"allow_email": True, "admin_email": "ops@example.com"},
+            topic=SNS_TOPIC_ARN,
+        )
+    )
+
     environment = rendering.build_cpu_apply_environment(release, finalize=False)
 
     assert environment["GPU_FAULT_NOTIFICATION_CHANNEL"] == "sns"
     assert environment["GPU_FAULT_SNS_TOPIC_ARN"] == SNS_TOPIC_ARN
     assert environment["GPU_FAULT_ALLOW_EMAIL"] == "true"
+
+
+NOTIFICATION_CONFIG_MAP = "gpu-fault-api-ha-config-notification.yaml"
+
+
+def test_the_ses_configuration_set_reaches_the_apply_environment_and_the_config_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The site's value -- or the template's ``''`` when unset -- is what both
+    the apply script's sed (through its environment) and the plan-digest render
+    substitute into the notification ConfigMap. The legacy HyperPod deploy read
+    the operator's shell for this; the regional deploy must not."""
+
+    template = (
+        ROOT / "deploy/control-plane/regional/generated" / NOTIFICATION_CONFIG_MAP
+    ).read_text(encoding="utf-8")
+    assert "GPU_FAULT_SES_CONFIGURATION_SET: ''" in template
+    monkeypatch.setenv("GPU_FAULT_SES_CONFIGURATION_SET", "from-the-operator-shell")
+
+    unset = _apply_release(_release_config(tmp_path, dict(SES_BLOCK), topic=None))
+    environment = rendering.build_cpu_apply_environment(unset, finalize=False)
+    rendered = rendering.render_cpu_manifest_text(
+        unset, NOTIFICATION_CONFIG_MAP, template
+    )
+    assert environment["GPU_FAULT_SES_CONFIGURATION_SET"] == ""
+    assert "GPU_FAULT_SES_CONFIGURATION_SET: ''" in rendered
+
+    declared = _apply_release(
+        _release_config(
+            tmp_path, {**SES_BLOCK, "ses_configuration_set": "alerts-set"}, topic=None
+        )
+    )
+    environment = rendering.build_cpu_apply_environment(declared, finalize=False)
+    rendered = rendering.render_cpu_manifest_text(
+        declared, NOTIFICATION_CONFIG_MAP, template
+    )
+    assert environment["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
+    assert "GPU_FAULT_SES_CONFIGURATION_SET: 'alerts-set'" in rendered
+    assert "GPU_FAULT_SES_CONFIGURATION_SET: ''" not in rendered
 
 
 # --------------------------------------------------------------------------
@@ -430,6 +568,49 @@ def test_notification_digest_changes_with_the_channel() -> None:
 
     assert ses != sns, "flipping the channel must render as a release change"
     assert ses == regional_notifications.notification_digest(_notifications())
+
+
+def test_notification_digest_is_unchanged_until_a_configuration_set_is_declared() -> (
+    None
+):
+    """The digest is compared against the live Deployment annotation by the
+    admin check and decides whether a deploy is a NOOP, so adding the field
+    must leave every existing site's digest exactly where it was."""
+
+    before = hashlib.sha256(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "channel": "ses",
+                "allow_email": True,
+                "acknowledge_external_alert_channel": False,
+                "admin_email": "ops@example.com",
+                "email_sender": "sender@example.com",
+                "email_recipients": ["ops@example.com"],
+                "email_subject_prefix": "[PROD]",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    old_shape = _notifications()
+    assert not hasattr(old_shape, "ses_configuration_set"), (
+        "this double must model a record written before the field existed"
+    )
+    assert regional_notifications.notification_digest(old_shape) == before
+    assert (
+        regional_notifications.notification_digest(
+            _notifications(ses_configuration_set=None)
+        )
+        == before
+    )
+    assert (
+        regional_notifications.notification_digest(
+            _notifications(ses_configuration_set="alerts-set")
+        )
+        != before
+    ), "declaring a configuration set must render as a release change"
 
 
 class _SecretRunner:

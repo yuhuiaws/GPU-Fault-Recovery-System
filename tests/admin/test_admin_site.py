@@ -249,6 +249,7 @@ def test_site_email_notification_contract(tmp_path: Path) -> None:
         "email_recipients": ["ops@example.com", "oncall@example.com"],
         "email_subject_prefix": "[PROD]",
         "channel": "ses",
+        "ses_configuration_set": None,
     }
 
 

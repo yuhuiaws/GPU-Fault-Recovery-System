@@ -38,6 +38,9 @@ ALLOW_EMAIL="${GPU_FAULT_ALLOW_EMAIL:-true}"
 ACKNOWLEDGE_NO_ALERT_CHANNEL="$(
     printf '%s' "${GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL:-false}"
 )"
+# The site's SES configuration set; the release engine always sets it ('' when
+# the site declares none), so an operator's shell never supplies it.
+SES_CONFIGURATION_SET="${GPU_FAULT_SES_CONFIGURATION_SET:-}"
 NOTIFICATION_CONFIG_SHA256="$(
     printf '%s' "${GPU_FAULT_NOTIFICATION_CONFIG_SHA256:-}"
 )"
@@ -89,6 +92,11 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "true" ||
     "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" == "false" ]] || {
     echo "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL must be true or false" >&2
+    exit 2
+}
+[[ -z "${SES_CONFIGURATION_SET}" ||
+    "${SES_CONFIGURATION_SET}" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || {
+    echo "GPU_FAULT_SES_CONFIGURATION_SET must be 1-64 letters, digits, hyphens or underscores" >&2
     exit 2
 }
 [[ "${NOTIFICATION_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
@@ -612,6 +620,7 @@ render_manifest() {
         -e "s#gpu-fault.io/artifact-sha256: .*#gpu-fault.io/artifact-sha256: ${WHEEL_SHA256}#g" \
         -e "s/GPU_FAULT_ALLOW_EMAIL: 'true'/GPU_FAULT_ALLOW_EMAIL: '${ALLOW_EMAIL}'/g" \
         -e "s/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: 'false'/GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL: '${ACKNOWLEDGE_NO_ALERT_CHANNEL}'/g" \
+        -e "s/GPU_FAULT_SES_CONFIGURATION_SET: ''/GPU_FAULT_SES_CONFIGURATION_SET: '${SES_CONFIGURATION_SET}'/g" \
         -e "s#${DEFAULT_RUNTIME_IMAGE}#${RUNTIME_IMAGE}#g" \
         "${GENERATED}/${manifest}.yaml"
 }

@@ -364,7 +364,9 @@ def _rollback_environment(
             aws_region="us-west-2",
             namespace=NAMESPACE,
             notifications=SimpleNamespace(
-                allow_email=True, acknowledge_external_alert_channel=False
+                allow_email=True,
+                acknowledge_external_alert_channel=False,
+                ses_configuration_set="alerts-set",
             ),
             notification_environment=lambda: {
                 "GPU_FAULT_NOTIFICATION_CHANNEL": "sns",
@@ -390,6 +392,17 @@ def test_build_rollback_environment_points_the_renderer_at_the_snapshot_file(
     )
     assert environment[VARIABLE] == "/tmp/inputs/previous.json"
     assert environment["GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS"] == "false"
+
+
+def test_build_rollback_environment_re_renders_the_ses_configuration_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback that renders from the template gives the notification
+    ConfigMap the configuration set the site declares, as the forward apply
+    does; the SES notifier reads it at startup."""
+
+    environment = _rollback_environment(monkeypatch)
+    assert environment["GPU_FAULT_SES_CONFIGURATION_SET"] == "alerts-set"
 
 
 def test_build_rollback_environment_never_inherits_the_variable_from_the_shell(
