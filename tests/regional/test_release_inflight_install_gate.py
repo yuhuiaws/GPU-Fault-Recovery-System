@@ -1395,7 +1395,9 @@ def test_the_rollback_mode_takes_an_automatic_marker(
     )
 
     seen: list[dict[str, Any]] = []
-    release = SimpleNamespace(rollback=lambda **kwargs: seen.append(kwargs))
+    release = SimpleNamespace(
+        rollback=lambda **kwargs: seen.append(kwargs), image_lock_conflicts={}
+    )
     monkeypatch.setattr(
         MODULE, "parser", lambda: SimpleNamespace(parse_args=lambda argv=None: parsed)
     )

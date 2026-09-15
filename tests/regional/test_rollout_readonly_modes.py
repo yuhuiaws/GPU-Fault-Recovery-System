@@ -56,6 +56,8 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     class Release:
         def __init__(self, config, runner):
             seen["config"] = config
+            # No image pin disagrees with the lock: the read-only modes run.
+            self.image_lock_conflicts: dict[str, tuple[str, str]] = {}
 
         def status(self, *, full=False):
             seen["status_full"] = full
