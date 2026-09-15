@@ -44,10 +44,15 @@ def _state_b() -> dict[str, Any]:
 
 
 def test_restart_budget_sections_pass_on_the_documented_readings() -> None:
+    # The budget-rejected RESTART_APP plan still runs STOP_WORKLOADS, which in
+    # the regional executor is a legitimate remote command; only a withheld
+    # RESTART_WORKLOAD command would be a defect (0a913df).
+    state_b = _state_b()
+    state_b["commands"] = [
+        {"command_id": "stop-1", "step": {"operation": "STOP_WORKLOADS"}}
+    ]
     assert (
-        collect016.restart_budget_section_errors(
-            _state_a(), _state_b(), job_id="c016-a-1"
-        )
+        collect016.restart_budget_section_errors(_state_a(), state_b, job_id="c016-a-1")
         == []
     )
 
@@ -77,7 +82,14 @@ def test_restart_budget_sections_pass_on_the_documented_readings() -> None:
             lambda b: b["workflow"].__setitem__("status", "SUCCEEDED"),
             "not budget",
         ),
-        (None, lambda b: b.__setitem__("commands", [{"command_id": "x"}]), "remote"),
+        (
+            None,
+            lambda b: b.__setitem__(
+                "commands",
+                [{"command_id": "x", "step": {"operation": "RESTART_WORKLOAD"}}],
+            ),
+            "dispatched a RESTART_WORKLOAD command",
+        ),
         (
             None,
             lambda b: b["workflow"]["step_executions"][0]["details"].__setitem__(
