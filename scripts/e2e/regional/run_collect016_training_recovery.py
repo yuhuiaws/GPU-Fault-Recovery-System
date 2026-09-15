@@ -515,7 +515,15 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
 
 
-A_WORKLOAD_DRAIN_TIMEOUT_SECONDS = 300
+# The completion controller republishes a missing attempt as RUNNING with a
+# fresh observed_at for the whole attempt-missing grace
+# (GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS, default 300s -- see
+# completion_observation.MissingAttemptTracker.observe_missing) before it
+# tombstones it to STOPPED. Both A attempts (a001 and the RESTART_APP
+# a001-r-<hash>) have to age out that grace, and the second flips a beat
+# after the first, so the wait budget has to clear 300s plus detection and
+# poll lag with room to spare; 600s is ~2x the observed ~300-340s.
+A_WORKLOAD_DRAIN_TIMEOUT_SECONDS = 600
 
 
 def wait_a_workload_drained(
