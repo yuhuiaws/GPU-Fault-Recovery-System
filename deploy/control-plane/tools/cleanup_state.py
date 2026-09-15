@@ -13,12 +13,28 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+# Schema 2 is this phase order. Schema 1 records (written while INGRESS_STOPPED
+# preceded QUEUES_DRAINED) stay readable -- the uninstall engine archives an
+# unfinished one before a rerun and the cleanup script reuses its fleet
+# snapshot -- but are never continued, so one history never mixes two orders.
+SCHEMA_VERSION = 2
+READABLE_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
 PHASES = (
     "PREFLIGHT",
+    # Every GPU cluster is published DRAINING in the regional registry: the API
+    # then refuses new collector events and executor claims while in-flight
+    # leases may still renew and complete. Nothing is stopped yet.
+    "CLUSTERS_DRAINING",
     "GPU_DATA_PLANE_SOURCES_STOPPED",
-    "INGRESS_STOPPED",
+    # Waited with CPU ingress and the consumers still running: leases can
+    # finish, the processor and the telemetry spool can drain.
     "QUEUES_DRAINED",
     "CONTROL_CONSUMERS_STOPPED",
+    # With the consumers gone nothing can turn a failed step into a successor
+    # workflow, so the work nothing may claim any more is failed from the
+    # ingress Pod, before ingress itself stops.
+    "UNCLAIMABLE_WORK_ABANDONED",
+    "INGRESS_STOPPED",
     "GPU_EXECUTORS_STOPPED",
     "CPU_AUXILIARIES_STOPPED",
     "APPLICATION_OBJECTS_DELETED",
@@ -53,7 +69,7 @@ def content_digest(document: dict[str, Any]) -> str:
 
 
 def verify_document(document: dict[str, Any]) -> None:
-    if document.get("schema_version") != 1:
+    if document.get("schema_version") not in READABLE_SCHEMA_VERSIONS:
         raise CleanupStateError("unsupported cleanup state schema")
     expected = document.get("content_sha256")
     actual = content_digest(document)
@@ -72,6 +88,16 @@ def read_state(path: Path) -> dict[str, Any]:
         raise CleanupStateError(f"cannot read cleanup state: {exc}") from exc
     verify_document(document)
     return document
+
+
+def require_current_schema(document: dict[str, Any]) -> None:
+    """Refuse to continue a record written under an earlier phase order."""
+
+    if document.get("schema_version") != SCHEMA_VERSION:
+        raise CleanupStateError(
+            "cleanup state was written under an earlier phase order and cannot "
+            "be continued; start a new run with a new state file"
+        )
 
 
 def atomic_write(
@@ -134,7 +160,7 @@ def initialize(
     inventory = json.loads(inventory_text)
     created_at = now()
     document = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "run_id": f"cleanup-{uuid4()}",
         "created_at": created_at,
         "updated_at": created_at,
@@ -239,6 +265,7 @@ def transition(
         raise CleanupStateError(f"unknown cleanup phase: {phase}")
     if status not in STATUSES:
         raise CleanupStateError(f"unknown cleanup status: {status}")
+    require_current_schema(document)
     current_phase = document["phase"]
     current_status = document["status"]
     if PHASE_INDEX[phase] < PHASE_INDEX[current_phase]:
@@ -332,6 +359,8 @@ def main() -> int:
         )
     else:
         document = read_state(args.path)
+        if args.command != "verify":
+            require_current_schema(document)
         if args.command == "record":
             record_resource(
                 document,

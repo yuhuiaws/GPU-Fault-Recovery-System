@@ -2510,9 +2510,10 @@ test_cases:
   level: staging
   risk: live-service-action
   problem: 整体卸载的首次真机执行暴露节点 Agent 在 drain 前被卸掉留下无人完成的 LEASED command、reset 的孤儿 lease 判失败 SQL 参数无类型、失败后重跑被状态文件拒绝、控制面已停后 reset 找不到 Pod、Aurora 逐实例等待五类缺口，单测各自覆盖，但没有区域验收用例用真实命令跑过。
-  injection: 在 BOOT-026 之后的隔离站点上执行 gpu-fault-admin uninstall --cpu-cluster keep --reset-database --confirm UNINSTALL_GPU_FAULT，在 CONTROL_CONSUMERS_STOPPED 之后注入一次 SIGINT 并原参数重跑；可选地先制造一条孤儿 LEASED command。
+  injection: 在 BOOT-026 之后的隔离站点上执行 gpu-fault-admin uninstall --cpu-cluster keep --reset-database --confirm UNINSTALL_GPU_FAULT，在 INGRESS_STOPPED 记为 COMPLETED 之后注入一次 SIGINT 并原参数重跑；可选地先制造一条孤儿 LEASED command。
   expected:
-  - kubernetes-cleanup.json 的 phase 按 PREFLIGHT、GPU_DATA_PLANE_SOURCES_STOPPED、INGRESS_STOPPED、QUEUES_DRAINED、CONTROL_CONSUMERS_STOPPED、GPU_EXECUTORS_STOPPED、CPU_AUXILIARIES_STOPPED、APPLICATION_OBJECTS_DELETED、NAMESPACES_DELETED、CLEANUP_COMPLETED 前进，节点组件在 GPU_EXECUTORS_STOPPED 内停止，QUEUES_DRAINED 不超时且没有新建 drain-after 工作流
+  - kubernetes-cleanup.json（schema_version=2）的 phase 按 PREFLIGHT、CLUSTERS_DRAINING、GPU_DATA_PLANE_SOURCES_STOPPED、QUEUES_DRAINED、CONTROL_CONSUMERS_STOPPED、UNCLAIMABLE_WORK_ABANDONED、INGRESS_STOPPED、GPU_EXECUTORS_STOPPED、CPU_AUXILIARIES_STOPPED、APPLICATION_OBJECTS_DELETED、NAMESPACES_DELETED、CLEANUP_COMPLETED 前进；每个 GPU 集群先在 registry 发布 DRAINING（一次发布命名全部集群），QUEUES_DRAINED 在 gpu-fault-api-ha 与 gpu-fault-control-worker 仍有副本时等待、不超时且没有新建 drain-after 工作流，节点组件在 GPU_EXECUTORS_STOPPED 内停止
+  - 无人可 claim 的遗留在 CONTROL_CONSUMERS_STOPPED 之后、INGRESS_STOPPED 之前被判失败：workflow status=FAILED 且 terminal_failure_reason 以 abandoned by clean-redeploy-drain 开头，command status=FAILED 且 status_source=clean-redeploy-drain，先 workflow 后 command；仍有活租约时 QUEUES_DRAINED 超时记 FAILED 退出且不缩任何 CPU Deployment
   - 孤儿 LEASED command 被判 FAILED 且 status_source=clean-redeploy-orphan，该步不因 psycopg 参数类型错误失败
   - 中断后的原参数重跑把旧 cleanup 状态归档为 kubernetes-cleanup.failed-<stamp>.json、复用上一轮 fleet 快照、在已停止的控制面上续跑到 COMPLETED
   - state.json 依次 STARTED、REGISTRY_EXPORTED、KUBERNETES_VERIFIED、NON_AURORA_DELETE_IN_PROGRESS、READY_TO_DELETE_AURORA、COMPLETED

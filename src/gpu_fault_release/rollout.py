@@ -141,7 +141,7 @@ from gpu_fault_release.regional_release_node_runtime_rollout import (
 )
 from gpu_fault_release.regional_release_online_registry import (
     activate_join_registry,
-    drain_registry_cluster,
+    drain_registry_clusters,
     fail_join_registry,
     prepare_join_registry,
     publish_restored_registry,
@@ -1307,6 +1307,22 @@ class RegionalRelease:
             )
 
 
+def _single_cluster_id(arguments: argparse.Namespace) -> str:
+    """The one ``--cluster-id`` a per-cluster mode acts on.
+
+    ``--cluster-id`` repeats only for ``drain-cluster``; every other cluster
+    mode changes one cluster's registry entry and refuses a second id rather
+    than acting on the first and ignoring the rest.
+    """
+
+    cluster_ids = list(arguments.cluster_ids or [])
+    if not cluster_ids:
+        raise ReleaseError("--cluster-id is required")
+    if len(cluster_ids) != 1:
+        raise ReleaseError(f"{arguments.mode} takes exactly one --cluster-id")
+    return str(cluster_ids[0])
+
+
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     value = parser()
     arguments = value.parse_args(argv)
@@ -1380,29 +1396,19 @@ def _dispatch_mode(release: RegionalRelease, arguments: argparse.Namespace) -> i
     elif arguments.mode == "stage-noop":
         stage_noop_release(release)
     elif arguments.mode == "join-cluster":
-        if not arguments.cluster_id:
-            raise ReleaseError("--cluster-id is required")
-        release.join_cluster(arguments.cluster_id)
+        release.join_cluster(_single_cluster_id(arguments))
     elif arguments.mode == "activate-cluster":
-        if not arguments.cluster_id:
-            raise ReleaseError("--cluster-id is required")
-        release.activate_cluster(arguments.cluster_id)
+        release.activate_cluster(_single_cluster_id(arguments))
     elif arguments.mode == "fail-cluster":
-        if not arguments.cluster_id:
-            raise ReleaseError("--cluster-id is required")
-        release.fail_cluster(arguments.cluster_id)
+        release.fail_cluster(_single_cluster_id(arguments))
     elif arguments.mode == "rollback-cluster":
-        if not arguments.cluster_id:
-            raise ReleaseError("--cluster-id is required")
-        release.rollback_cluster(arguments.cluster_id)
+        release.rollback_cluster(_single_cluster_id(arguments))
     elif arguments.mode == "drain-cluster":
-        if not arguments.cluster_id:
+        if not arguments.cluster_ids:
             raise ReleaseError("--cluster-id is required")
-        drain_registry_cluster(release, arguments.cluster_id)
+        drain_registry_clusters(release, arguments.cluster_ids)
     elif arguments.mode == "remove-cluster":
-        if not arguments.cluster_id:
-            raise ReleaseError("--cluster-id is required")
-        release.remove_cluster(arguments.cluster_id)
+        release.remove_cluster(_single_cluster_id(arguments))
     elif arguments.mode == "sync-state":
         sync_release_state(release)
     elif arguments.mode == "verify":

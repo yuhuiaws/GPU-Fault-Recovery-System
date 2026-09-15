@@ -8,6 +8,14 @@ CLEANUP_STATE_TOOL="$(
     printf '%s' \
         "${REPO_ROOT}/deploy/control-plane/tools/cleanup_state.py"
 )"
+CLEAN_REDEPLOY_STORE_TOOL="$(
+    printf '%s' \
+        "${REPO_ROOT}/deploy/control-plane/tools/clean_redeploy_store.py"
+)"
+CLEAN_REDEPLOY_CONFIG_TOOL="$(
+    printf '%s' \
+        "${REPO_ROOT}/deploy/control-plane/tools/clean_redeploy_config.py"
+)"
 MODE=stop
 SCOPE=all
 NODE_MODE=stop
@@ -17,6 +25,7 @@ CONFIRM_RESET=
 EXECUTE=false
 OFFLINE_PLAN=false
 TIMEOUT_SECONDS=600
+DRAIN_POLL_SECONDS=5
 NODE_CLEANUP_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-public.ecr.aws/amazonlinux/amazonlinux:2023}"
 SELECTED_CLUSTER_IDS=()
 
@@ -136,6 +145,10 @@ done
 [[ -f "${CONFIG}" ]] || die "config file does not exist: ${CONFIG}"
 [[ -f "${RESOURCE_INVENTORY}" ]] ||
     die "cleanup resource inventory does not exist: ${RESOURCE_INVENTORY}"
+[[ -f "${CLEAN_REDEPLOY_STORE_TOOL}" ]] ||
+    die "store helper does not exist: ${CLEAN_REDEPLOY_STORE_TOOL}"
+[[ -f "${CLEAN_REDEPLOY_CONFIG_TOOL}" ]] ||
+    die "config helper does not exist: ${CLEAN_REDEPLOY_CONFIG_TOOL}"
 [[ "${MODE}" == stop || "${MODE}" == clean || "${MODE}" == reset ]] ||
     die "--mode must be stop, clean, or reset"
 [[ "${SCOPE}" == all || "${SCOPE}" == gpu ]] ||
@@ -224,164 +237,8 @@ if [[ "${OFFLINE_PLAN}" != true ]]; then
 fi
 
 CONFIG_OUTPUT="$(
-    python3 - "${CONFIG}" "${EFFECTIVE_INVENTORY}" \
-        "${SELECTED_CLUSTER_IDS[@]}" <<'PY'
-import json
-import re
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-inventory_path = Path(sys.argv[2])
-selected = sys.argv[3:]
-try:
-    value = json.loads(path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"invalid regional release config: {exc}")
-try:
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"invalid cleanup resource inventory: {exc}")
-unregistered = inventory.get("unregistered_resources") or []
-if unregistered:
-    details = ", ".join(
-        f"{item['context']}:{item.get('namespace') or '_cluster'}:"
-        f"{item['kind']}/{item['name']}"
-        for item in unregistered
-    )
-    raise SystemExit(
-        "unregistered live gpu-fault resources require "
-        "classification before cleanup: " + details
-    )
-
-cpu_kubeconfig = value.get("cpu_kubeconfig")
-namespace = value.get("namespace", "gpu-fault-system")
-clusters = value.get("clusters")
-if not isinstance(cpu_kubeconfig, str) or not cpu_kubeconfig:
-    raise SystemExit("cpu_kubeconfig must be a non-empty string")
-if not isinstance(namespace, str) or not re.fullmatch(
-    r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace
-):
-    raise SystemExit("namespace is not a valid DNS label")
-if not isinstance(clusters, list) or not clusters:
-    raise SystemExit("clusters must be a non-empty list")
-
-by_id = {}
-for item in clusters:
-    if not isinstance(item, dict):
-        raise SystemExit("each clusters entry must be an object")
-    cluster_id = item.get("cluster_id")
-    context = item.get("context")
-    if not isinstance(cluster_id, str) or not cluster_id:
-        raise SystemExit("each cluster_id must be a non-empty string")
-    if not isinstance(context, str) or not context:
-        raise SystemExit(f"cluster {cluster_id!r} has no context")
-    if any(character in cluster_id + context for character in "\t\r\n"):
-        raise SystemExit("cluster_id and context may not contain tabs or newlines")
-    if cluster_id in by_id:
-        raise SystemExit(f"duplicate cluster_id: {cluster_id}")
-    by_id[cluster_id] = context
-
-if selected:
-    if len(selected) != len(set(selected)):
-        raise SystemExit("duplicate --cluster-id")
-    missing = sorted(set(selected) - set(by_id))
-    if missing:
-        raise SystemExit("unknown cluster_id: " + ", ".join(missing))
-    cluster_ids = selected
-else:
-    cluster_ids = list(by_id)
-
-print(f"META\t{namespace}\t{cpu_kubeconfig}")
-for cluster_id in cluster_ids:
-    print(f"CLUSTER\t{cluster_id}\t{by_id[cluster_id]}")
-
-if inventory.get("schema_version") != 1:
-    raise SystemExit("cleanup resource inventory schema_version must be 1")
-valid_scopes = {"namespaced", "cluster"}
-valid_clean = {"delete", "namespace", "reset"}
-valid_phases = {
-    "ingress",
-    "consumer",
-    "auxiliary",
-    "producer",
-    "executor",
-    "support",
-    "nlb",
-}
-for plane in ("cpu", "gpu"):
-    section = inventory.get(plane)
-    if not isinstance(section, dict):
-        raise SystemExit(f"cleanup resource inventory lacks {plane}")
-    resources = section.get("resources")
-    if not isinstance(resources, list) or not resources:
-        raise SystemExit(f"cleanup resource inventory {plane}.resources is empty")
-    seen = set()
-    for resource in resources:
-        if not isinstance(resource, dict):
-            raise SystemExit(f"{plane} resource entry must be an object")
-        kind = resource.get("kind")
-        name = resource.get("name")
-        scope = resource.get("scope")
-        phase = resource.get("phase")
-        clean = resource.get("clean")
-        fields = (kind, name, scope, phase, clean)
-        if not all(isinstance(field, str) and field for field in fields):
-            raise SystemExit(f"{plane} resource entry has an empty field")
-        if any(character in "".join(fields) for character in "\t\r\n"):
-            raise SystemExit(f"{plane} resource fields may not contain whitespace controls")
-        if not re.fullmatch(r"[a-z][a-z0-9]*", kind):
-            raise SystemExit(f"invalid kubectl resource kind: {kind}")
-        if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", name):
-            raise SystemExit(f"invalid resource name: {name}")
-        if scope not in valid_scopes:
-            raise SystemExit(f"invalid resource scope: {scope}")
-        if phase not in valid_phases:
-            raise SystemExit(f"invalid cleanup phase: {phase}")
-        if clean not in valid_clean:
-            raise SystemExit(f"invalid cleanup action: {clean}")
-        identity = (kind, name)
-        if identity in seen:
-            raise SystemExit(f"duplicate {plane} resource: {kind}/{name}")
-        seen.add(identity)
-        print(
-            "RESOURCE",
-            plane,
-            kind,
-            name,
-            scope,
-            phase,
-            clean,
-            sep="\t",
-        )
-    if plane == "cpu":
-        preferences = section.get("database_pod_preference")
-        if not isinstance(preferences, list) or not preferences:
-            raise SystemExit("cpu.database_pod_preference is empty")
-        for name in preferences:
-            if ("deployment", name) not in seen:
-                raise SystemExit(
-                    f"database pod preference is not a CPU deployment: {name}"
-                )
-            print("DBPREF", name, sep="\t")
-    else:
-        annotations = section.get("node_annotations")
-        if not isinstance(annotations, list) or not annotations:
-            raise SystemExit("gpu.node_annotations is empty")
-        for annotation in annotations:
-            if not isinstance(annotation, str) or not annotation.startswith(
-                "gpu-fault.io/"
-            ):
-                raise SystemExit(f"invalid node annotation: {annotation!r}")
-            print("ANNOTATION", annotation, sep="\t")
-        labels = section.get("node_labels")
-        if not isinstance(labels, list) or not labels:
-            raise SystemExit("gpu.node_labels is empty")
-        for label in labels:
-            if not isinstance(label, str) or not label.startswith("gpu-fault.io/"):
-                raise SystemExit(f"invalid node label: {label!r}")
-            print("LABEL", label, sep="\t")
-PY
+    PYTHONDONTWRITEBYTECODE=1 python3 "${CLEAN_REDEPLOY_CONFIG_TOOL}" \
+        "${CONFIG}" "${EFFECTIVE_INVENTORY}" "${SELECTED_CLUSTER_IDS[@]}"
 )" || exit $?
 
 NAMESPACE=
@@ -480,6 +337,18 @@ done <<<"${CONFIG_OUTPUT}"
 (( ${#CLUSTER_IDS[@]} > 0 )) ||
     die "regional release config did not select a GPU cluster"
 
+PLAN_STEP=0
+plan_step() {
+    # Numbered in one place so the scope-specific branches stay contiguous.
+    local line
+    PLAN_STEP=$((PLAN_STEP + 1))
+    printf '%3d. %s\n' "${PLAN_STEP}" "$1"
+    shift
+    for line in "$@"; do
+        printf '     %s\n' "${line}"
+    done
+}
+
 print_plan() {
     printf 'DRY RUN: no Kubernetes object or node service will be changed.\n'
     printf 'Config: %s\n' "${CONFIG}"
@@ -501,47 +370,46 @@ print_plan() {
     printf 'GPU executor deployments: %s\n' \
         "${GPU_EXECUTOR_DEPLOYMENTS[*]}"
     printf 'GPU daemonsets: %s\n' "${GPU_DAEMONSETS[*]}"
-    cat <<'EOF'
-Ordered plan:
-  1. Verify every Kubernetes context and capture the current replica/resource
-     state in a mode-0600 TSV file.
-  2. Fail closed if Aurora contains an active workflow or open remote command.
-  3. Stop every GPU producer Deployment and DaemonSet found in the live
-     installed-resource registries.
-  4. Restore any quiesced host services, then stop or uninstall all node
-     collectors, Node Agent, certificate timer, DCGM exporter, and GPU
-     persistence service.
-EOF
+    printf 'Ordered plan:\n'
+    plan_step 'Verify every Kubernetes context and capture the current replica/resource' \
+        'state in a mode-0600 JSON file.'
+    plan_step 'Fail closed if Aurora contains an active workflow or open remote command.'
     if [[ "${SCOPE}" == all ]]; then
-        cat <<'EOF'
-  5. Scale registered CPU ingress Deployments to zero, wait for processor and
-     telemetry spool rows to drain, then stop registered consumers.
-  6. Stop each registered GPU executor only after remote commands drain.
-  7. Stop ADOT, suspend Aurora credential refresh, and remove the control-plane
-     sysctl DaemonSet.
-EOF
+        plan_step 'Publish DRAINING for every GPU cluster in the regional registry: the API' \
+            'then refuses new collector events and executor claims while in-flight' \
+            'leases may still renew and complete.'
+        plan_step 'Stop every GPU producer Deployment and DaemonSet found in the live' \
+            'installed-resource registries.'
+        plan_step 'With CPU ingress and consumers still running, wait until no live lease,' \
+            'processor row or telemetry spool row remains on two consecutive polls;' \
+            'a lease still live at the deadline fails the run, other leftovers proceed.'
+        plan_step 'Stop registered CPU consumers, fail the workflows and remote commands' \
+            'nothing may claim any more (reset mode; other modes fail if any remain),' \
+            'then scale registered CPU ingress Deployments to zero.'
+        plan_step 'Stop each registered GPU executor, restore any quiesced host services,' \
+            'then stop or uninstall all node collectors, Node Agent, certificate timer,' \
+            'DCGM exporter, and GPU persistence service.'
+        plan_step 'Stop ADOT, suspend Aurora credential refresh, and remove the control-plane' \
+            'sysctl DaemonSet.'
     else
-        cat <<'EOF'
-  5. Keep the CPU control plane running while selected-cluster processor,
-     spool, workflow, and remote-command rows drain.
-  6. Stop the selected cluster's registered GPU executor.
-EOF
+        plan_step 'Stop the selected clusters'"'"' GPU producer Deployments and DaemonSets' \
+            'found in the live installed-resource registries.'
+        plan_step 'Keep the CPU control plane running while selected-cluster processor,' \
+            'spool, workflow, and remote-command rows drain.'
+        plan_step 'Stop the selected clusters'"'"' registered GPU executor, restore any' \
+            'quiesced host services, then stop or uninstall the node components.'
     fi
     if [[ "${MODE}" == clean || "${MODE}" == reset ]]; then
-        cat <<'EOF'
-  8. Delete application Deployments, DaemonSets, PDBs, service accounts and
-     RBAC in scope. Preserve Secrets, release ConfigMaps, Aurora, NLB, VPC,
-     IAM, and audit records unless reset mode is selected.
-EOF
+        plan_step 'Delete application Deployments, DaemonSets, PDBs, service accounts and' \
+            'RBAC in scope. Preserve Secrets, release ConfigMaps, Aurora, NLB, VPC,' \
+            'IAM, and audit records unless reset mode is selected.'
     fi
     if [[ "${MODE}" == reset ]]; then
-        cat <<'EOF'
-  9. Delete the Kubernetes NLB Service, then delete the solution namespace
-     in CPU EKS and every selected GPU EKS. Preserve all EKS clusters.
- 10. Delete the dedicated Aurora cluster and solution-owned NLB security
-     group, ACM certificate, private PKI Secret, Load Balancer Controller
-     and IAM resources with the explicit commands in manual section 0.3.
-EOF
+        plan_step 'Delete the Kubernetes NLB Service, then delete the solution namespace' \
+            'in CPU EKS and every selected GPU EKS. Preserve all EKS clusters.'
+        plan_step 'Delete the dedicated Aurora cluster and solution-owned NLB security' \
+            'group, ACM certificate, private PKI Secret, Load Balancer Controller' \
+            'and IAM resources with the explicit commands in manual section 0.3.'
     fi
     printf '\nTo execute, add --execute --state-file /secure/gpu-fault/<name>.json\n'
 }
@@ -574,6 +442,18 @@ gpu_kubectl() {
     local context=$1
     shift
     kubectl --context "${context}" "$@"
+}
+
+store_tool() {
+    # Every Aurora read or write runs inside a control-plane Pod: the helper's
+    # source goes in on stdin (``python -``), the subcommand and its arguments
+    # as argv, so the Pod needs nothing but its own psycopg and
+    # GPU_FAULT_STORE_URL. See deploy/control-plane/tools/clean_redeploy_store.py
+    # for the subcommands and their tab-separated output.
+    local pod=$1
+    shift
+    cpu_kubectl -n "${NAMESPACE}" exec -i "${pod}" -- python - "$@" \
+        <"${CLEAN_REDEPLOY_STORE_TOOL}"
 }
 
 record_state() {
@@ -730,35 +610,7 @@ capture_fleet_inventory() {
     local pod=$1
     local missing
     FLEET_INVENTORY_FILE="$(mktemp)"
-    cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- \
-        python -c '
-import json
-import os
-import sys
-
-import psycopg
-
-cluster_ids = set(sys.argv[1:])
-with psycopg.connect(
-    os.environ["GPU_FAULT_STORE_URL"],
-    connect_timeout=10,
-) as connection:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT payload
-            FROM gpu_fault_objects
-            WHERE kind='\''agent'\''
-            ORDER BY key
-            """
-        )
-        agents = [
-            row[0]
-            for row in cursor.fetchall()
-            if row[0].get("cluster_id") in cluster_ids
-        ]
-print(json.dumps(agents, sort_keys=True))
-' "${CLUSTER_IDS[@]}" >"${FLEET_INVENTORY_FILE}"
+    store_tool "${pod}" fleet-agents "${CLUSTER_IDS[@]}" >"${FLEET_INVENTORY_FILE}"
     PYTHONDONTWRITEBYTECODE=1 python3 \
         "${CLEANUP_STATE_TOOL}" attach-fleet \
         --path "${STATE_FILE}" \
@@ -787,90 +639,11 @@ PY
 }
 
 database_snapshot() {
+    # active_workflows open_commands processor_rows spool_rows leased_live
+    # leased_details, tab-separated; --scope gpu restricts to CLUSTER_IDS.
     local pod=$1
     local query_scope=$2
-    shift 2
-    cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- \
-        env GPU_FAULT_CLEAN_QUERY_SCOPE="${query_scope}" \
-        python -c '
-import os
-import sys
-
-import psycopg
-
-cluster_ids = sys.argv[1:]
-scoped = os.environ["GPU_FAULT_CLEAN_QUERY_SCOPE"] == "gpu"
-if scoped and not cluster_ids:
-    raise SystemExit("scoped cleanup requires cluster ids")
-
-def count(cursor, base, cluster_clause="", cluster_params=()):
-    statement = base
-    params = ()
-    if scoped:
-        statement += cluster_clause
-        params = cluster_params
-    try:
-        cursor.execute(statement, params)
-    except psycopg.errors.UndefinedTable:
-        return 0
-    return int(cursor.fetchone()[0])
-
-with psycopg.connect(
-    os.environ["GPU_FAULT_STORE_URL"],
-    connect_timeout=10,
-) as connection:
-    with connection.cursor() as cursor:
-        active_workflows = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_objects AS workflow
-            JOIN gpu_fault_objects AS incident
-              ON incident.kind = '\''incident'\''
-             AND incident.key = workflow.payload->>'\''incident_id'\''
-            WHERE workflow.kind = '\''workflow'\''
-              AND workflow.payload->>'\''status'\''
-                  IN ('\''PENDING'\'', '\''RUNNING'\'', '\''SAFETY_PENDING'\'')
-            """,
-            " AND incident.payload->>'\''cluster_id'\'' = ANY(%s)",
-            (cluster_ids,),
-        )
-        open_commands = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_objects
-            WHERE kind = '\''remote_command'\''
-              AND payload->>'\''status'\''
-                  IN ('\''PENDING'\'', '\''WAITING'\'', '\''LEASED'\'')
-            """,
-            " AND payload->>'\''cluster_id'\'' = ANY(%s)",
-            (cluster_ids,),
-        )
-        processor_rows = count(
-            cursor,
-            """
-            SELECT count(*)
-            FROM gpu_fault_processor_queue
-            WHERE status IN ('\''PENDING'\'', '\''LEASED'\'')
-            """,
-            " AND cluster_id = ANY(%s)",
-            (cluster_ids,),
-        )
-        spool_rows = count(
-            cursor,
-            "SELECT count(*) FROM gpu_fault_telemetry_spool WHERE true",
-            " AND cluster_id = ANY(%s)",
-            (cluster_ids,),
-        )
-print(
-    active_workflows,
-    open_commands,
-    processor_rows,
-    spool_rows,
-    sep="\t",
-)
-' "${CLUSTER_IDS[@]}"
+    store_tool "${pod}" snapshot --scope "${query_scope}" "${CLUSTER_IDS[@]}"
 }
 
 assert_no_active_work() {
@@ -880,19 +653,23 @@ assert_no_active_work() {
     local open_commands
     local processor_rows
     local spool_rows
+    local leased_live
+    local leased_details
     snapshot="$(database_snapshot "${pod}" "${SCOPE}")"
     IFS=$'\t' read -r active_workflows open_commands \
-        processor_rows spool_rows <<<"${snapshot}"
+        processor_rows spool_rows leased_live leased_details <<<"${snapshot}"
     [[ "${active_workflows}" =~ ^[0-9]+$ &&
         "${open_commands}" =~ ^[0-9]+$ ]] ||
         die "could not parse Aurora safety snapshot: ${snapshot}"
     if ((active_workflows != 0 || open_commands != 0)); then
         die "active workflows=${active_workflows}, open remote commands=${open_commands}; finish or block them before cleanup"
     fi
-    log "safety snapshot: workflows=${active_workflows} remote_commands=${open_commands} processor_rows=${processor_rows} spool_rows=${spool_rows}"
+    log "safety snapshot: workflows=${active_workflows} remote_commands=${open_commands} processor_rows=${processor_rows} spool_rows=${spool_rows} live_leases=${leased_live}"
 }
 
 wait_for_shared_queues() {
+    # --scope gpu: the CPU control plane keeps running, so every row of the
+    # selected clusters can still complete; all four counters must reach zero.
     local pod=$1
     local deadline=$((SECONDS + TIMEOUT_SECONDS))
     local snapshot
@@ -900,19 +677,66 @@ wait_for_shared_queues() {
     local open_commands
     local processor_rows
     local spool_rows
+    local leased_live
+    local leased_details
     while ((SECONDS < deadline)); do
         snapshot="$(database_snapshot "${pod}" "${SCOPE}")"
         IFS=$'\t' read -r active_workflows open_commands \
-            processor_rows spool_rows <<<"${snapshot}"
+            processor_rows spool_rows leased_live leased_details <<<"${snapshot}"
         if [[ "${active_workflows}" == 0 && "${open_commands}" == 0 &&
             "${processor_rows}" == 0 && "${spool_rows}" == 0 ]]; then
             log "Aurora queues are drained"
             return 0
         fi
-        log "waiting: workflows=${active_workflows} remote_commands=${open_commands} processor_rows=${processor_rows} spool_rows=${spool_rows}"
-        sleep 5
+        log "waiting: workflows=${active_workflows} remote_commands=${open_commands} processor_rows=${processor_rows} spool_rows=${spool_rows} live_leases=${leased_live}"
+        sleep "${DRAIN_POLL_SECONDS}"
     done
     die "Aurora queues did not drain within ${TIMEOUT_SECONDS}s"
+}
+
+wait_for_live_work_to_finish() {
+    # --scope all, with ingress and the consumers still running: a live lease
+    # can renew and finish, the processor and the spool can drain. Every
+    # cluster is DRAINING, so PENDING rows can never be claimed and are not
+    # waited for (abandon_unclaimable_work fails them once the consumers are
+    # gone). Converged: no live lease, processor row or spool row on two
+    # consecutive polls. A lease still live at the deadline is a node action
+    # in flight: fail with ingress and the consumers untouched so it can
+    # finish and a rerun starts coherent.
+    local pod=$1
+    local deadline=$((SECONDS + TIMEOUT_SECONDS))
+    local converged=0
+    local snapshot
+    local active_workflows
+    local open_commands
+    local processor_rows
+    local spool_rows
+    local leased_live
+    local leased_details
+    while :; do
+        snapshot="$(database_snapshot "${pod}" "${SCOPE}")"
+        IFS=$'\t' read -r active_workflows open_commands \
+            processor_rows spool_rows leased_live leased_details <<<"${snapshot}"
+        [[ "${leased_live}" =~ ^[0-9]+$ && "${processor_rows}" =~ ^[0-9]+$ &&
+            "${spool_rows}" =~ ^[0-9]+$ ]] ||
+            die "could not parse Aurora drain snapshot: ${snapshot}"
+        if ((leased_live == 0 && processor_rows == 0 && spool_rows == 0)); then
+            converged=$((converged + 1))
+            if ((converged >= 2)); then
+                log "Aurora drained: no live lease, processor row or spool row on two consecutive polls (workflows=${active_workflows} remote_commands=${open_commands} remain unclaimable under DRAINING)"
+                return 0
+            fi
+        else
+            converged=0
+        fi
+        ((SECONDS < deadline)) || break
+        log "waiting: live_leases=${leased_live} processor_rows=${processor_rows} spool_rows=${spool_rows} (workflows=${active_workflows} remote_commands=${open_commands})"
+        sleep "${DRAIN_POLL_SECONDS}"
+    done
+    if ((leased_live > 0)); then
+        die "${leased_live} remote command lease(s) still live after ${TIMEOUT_SECONDS}s: a node action is running; ingress and the consumers stay up so it can finish, rerun afterwards (key|operation|nodes): ${leased_details}"
+    fi
+    log "drain window of ${TIMEOUT_SECONDS}s elapsed with no live lease; ${open_commands} remote command(s) and ${active_workflows} workflow(s) cannot execute under DRAINING and will be abandoned; processor_rows=${processor_rows} spool_rows=${spool_rows} are left behind"
 }
 
 scale_cpu_deployment_zero() {
@@ -954,50 +778,59 @@ fail_orphaned_remote_commands() {
     # their workflow steps in the ordinary way.
     local pod=$1
     local failed
-    failed="$(
-        cpu_kubectl -n "${NAMESPACE}" exec "${pod}" -- python -c '
-import os
-import sys
-from datetime import datetime, timezone
-
-import psycopg
-
-cluster_ids = sys.argv[1:]
-now = datetime.now(timezone.utc)
-with psycopg.connect(os.environ["GPU_FAULT_STORE_URL"], connect_timeout=10) as connection:
-    with connection.cursor() as cursor:
-        statement = """
-            UPDATE gpu_fault_objects
-               SET payload = payload || jsonb_build_object(
-                       '\''status'\'', '\''FAILED'\'',
-                       '\''status_source'\'', '\''clean-redeploy-orphan'\'',
-                       '\''error'\'', %(reason)s::text,
-                       '\''updated_at'\'', %(now)s::text)
-             WHERE kind = '\''remote_command'\''
-               AND payload->>'\''status'\'' = '\''LEASED'\''
-               AND (payload->>'\''lease_expires_at'\'')::timestamptz < %(now)s::timestamptz
-        """
-        params = {
-            "reason": "orphaned by clean-redeploy: no executor remains to complete the lease",
-            "now": now.isoformat(),
-        }
-        if cluster_ids:
-            statement += " AND payload->>'\''cluster_id'\'' = ANY(%(clusters)s::text[])"
-            params["clusters"] = cluster_ids
-        try:
-            cursor.execute(statement, params)
-        except psycopg.errors.UndefinedTable:
-            print(0)
-            raise SystemExit(0)
-        print(cursor.rowcount)
-    connection.commit()
-' "${CLUSTER_IDS[@]}"
-    )"
+    failed="$(store_tool "${pod}" fail-orphaned-leases "${CLUSTER_IDS[@]}")"
     [[ "${failed}" =~ ^[0-9]+$ ]] ||
         die "could not fail orphaned remote commands: ${failed}"
     if ((failed > 0)); then
         log "failed ${failed} orphaned LEASED remote command(s) with no executor left to complete them"
     fi
+}
+
+drain_registry_clusters() {
+    # Under DRAINING the API refuses new collector events (no incident can be
+    # born) and executor claims (nothing PENDING can start) while heartbeats,
+    # lease renewals and results still pass, so a running command finishes.
+    # Same rollout entry point as remove-cluster, itself fail-closed on
+    # non-idle remote commands; re-publishing a DRAINING cluster is a new
+    # revision with the same content, so a rerun is harmless. One invocation
+    # for every cluster: a revision publishes the clusters it does not name as
+    # ACTIVE, so draining them one revision at a time would flip the earlier
+    # ones back and leave only the last one DRAINING.
+    local arguments=()
+    local cluster_id
+    for cluster_id in "${CLUSTER_IDS[@]}"; do
+        log "${cluster_id}: publishing DRAINING in the regional registry"
+        arguments+=(--cluster-id "${cluster_id}")
+    done
+    "${SCRIPT_DIR}/rollout-regional-release.sh" drain-cluster \
+        "${arguments[@]}" --config "${CONFIG}" ||
+        die "could not publish DRAINING for ${CLUSTER_IDS[*]} in the regional registry"
+}
+
+ABANDONED_SUMMARY=
+abandon_unclaimable_work() {
+    # Reset only, between CONTROL_CONSUMERS_STOPPED and INGRESS_STOPPED: no
+    # executor may claim what is left (DRAINING) and no consumer can turn a
+    # failed step into a successor workflow any more. Workflows first, then
+    # commands, one transaction (clean_redeploy_store.py abandon-unclaimable).
+    local pod=$1
+    local summary
+    local workflows
+    local commands
+    local workflow_keys
+    local command_keys
+    summary="$(store_tool "${pod}" abandon-unclaimable)"
+    IFS=$'\t' read -r workflows commands workflow_keys command_keys <<<"${summary}"
+    [[ "${workflows}" =~ ^[0-9]+$ && "${commands}" =~ ^[0-9]+$ ]] ||
+        die "could not abandon the unclaimable work: ${summary}"
+    ABANDONED_SUMMARY="abandoned ${workflows} workflow(s) and ${commands} remote command(s) nothing may claim under DRAINING (status FAILED, source clean-redeploy-drain)"
+    if ((workflows > 0)); then
+        ABANDONED_SUMMARY+="; workflows: ${workflow_keys}"
+    fi
+    if ((commands > 0)); then
+        ABANDONED_SUMMARY+="; commands: ${command_keys}"
+    fi
+    log "${ABANDONED_SUMMARY}"
 }
 
 run_node_cleanup() {
@@ -1143,12 +976,13 @@ stop_gpu_producers() {
         gpu_kubectl "${context}" -n "${NAMESPACE}" delete daemonset \
             "${name}" --ignore-not-found
     done
-    # Node components are stopped after the drain and after the executors
-    # (see GPU_EXECUTORS_STOPPED): uninstalling agents while the control
-    # plane could still turn their disappearance into incidents, and the
-    # executors could still claim the resulting commands, left commands
-    # LEASED with no claimant once ingress went down and the drain never
-    # finished (live uninstall, 2026-09-12).
+    # Node components stop later, inside GPU_EXECUTORS_STOPPED, after the
+    # drain and the executors: uninstalling agents while the control plane
+    # could still turn their disappearance into incidents left commands
+    # LEASED with no claimant once ingress went down (live uninstall,
+    # 2026-09-12). Every cluster is DRAINING by now, so the API refuses the
+    # events a stopping producer might still emit, and ingress stays up until
+    # the drain has settled and the leftovers are failed.
 }
 
 assert_no_quarantined_nodes() {
@@ -1308,18 +1142,27 @@ if [[ "${SCOPE}" == all ]]; then wait_for_cpu_rollouts; fi
 DATABASE_POD="$(find_database_pod || true)"
 # PRESENT: the Deployments exist (a previous run may have scaled them to
 # zero). RUNNING: at least one still has replicas, so a Pod can exist and
-# work can still be created.
+# work can still be created. INGRESS_RUNNING: the API itself has replicas --
+# the registry publish and the abandonment both need an ingress Pod, and an
+# earlier run may have stopped ingress while the consumers still ran.
 CPU_RUNTIME_PRESENT=false
 CPU_RUNTIME_RUNNING=false
-for deployment in \
-    "${CPU_INGRESS_DEPLOYMENTS[@]}" \
-    "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
+CPU_INGRESS_RUNNING=false
+for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}"; do
     replicas="$(deployment_replicas_cpu "${deployment}")"
-    if [[ -n "${replicas}" ]]; then
-        CPU_RUNTIME_PRESENT=true
-        if ((replicas > 0)); then
-            CPU_RUNTIME_RUNNING=true
-        fi
+    [[ -n "${replicas}" ]] || continue
+    CPU_RUNTIME_PRESENT=true
+    if ((replicas > 0)); then
+        CPU_RUNTIME_RUNNING=true
+        CPU_INGRESS_RUNNING=true
+    fi
+done
+for deployment in "${CPU_CONSUMER_DEPLOYMENTS[@]}"; do
+    replicas="$(deployment_replicas_cpu "${deployment}")"
+    [[ -n "${replicas}" ]] || continue
+    CPU_RUNTIME_PRESENT=true
+    if ((replicas > 0)); then
+        CPU_RUNTIME_RUNNING=true
     fi
 done
 if [[ -n "${DATABASE_POD}" ]]; then
@@ -1344,6 +1187,28 @@ transition_state \
     PREFLIGHT COMPLETED \
     "contexts, quarantine state, inventory, and active work verified"
 
+if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
+    # Before anything stops: from here on no incident can be born through
+    # the API and no claim can start, while in-flight leases still finish.
+    if [[ "${CPU_INGRESS_RUNNING}" == true ]]; then
+        transition_state \
+            CLUSTERS_DRAINING IN_PROGRESS \
+            "publishing DRAINING for every GPU cluster in the regional registry"
+        drain_registry_clusters
+        transition_state \
+            CLUSTERS_DRAINING COMPLETED \
+            "regional registry publishes DRAINING for ${CLUSTER_IDS[*]}: no new incident or claim may start, in-flight leases may still finish"
+    elif [[ "${CPU_RUNTIME_RUNNING}" == true ]]; then
+        transition_state \
+            CLUSTERS_DRAINING COMPLETED \
+            "CPU ingress already stopped by an earlier run; the API admits no event or claim, so no DRAINING publish is possible or needed"
+    else
+        transition_state \
+            CLUSTERS_DRAINING COMPLETED \
+            "control plane already stopped by an earlier run; nothing can enqueue work"
+    fi
+fi
+
 transition_state \
     GPU_DATA_PLANE_SOURCES_STOPPED IN_PROGRESS \
     "stopping GPU producers"
@@ -1356,31 +1221,24 @@ transition_state \
     "GPU producers stopped"
 
 if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
-    transition_state \
-        INGRESS_STOPPED IN_PROGRESS \
-        "stopping CPU ingress"
-    for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}"; do
-        scale_cpu_deployment_zero "${deployment}"
-    done
-    transition_state \
-        INGRESS_STOPPED COMPLETED \
-        "CPU ingress stopped"
     if [[ "${CPU_RUNTIME_RUNNING}" == true ]]; then
         DATABASE_POD="$(find_database_pod || true)"
         [[ -n "${DATABASE_POD}" ]] ||
-            die "no worker pod remains to verify the Aurora drain"
+            die "no control-plane pod remains to verify the Aurora drain"
         transition_state \
             QUEUES_DRAINED IN_PROGRESS \
-            "waiting for processor, spool, workflow, and remote command drain"
-        wait_for_shared_queues "${DATABASE_POD}"
+            "waiting, with ingress and consumers running, until no live lease, processor row or spool row remains"
+        wait_for_live_work_to_finish "${DATABASE_POD}"
         transition_state \
             QUEUES_DRAINED COMPLETED \
-            "processor, spool, workflow, and remote command state drained"
+            "no live lease, processor row or spool row remains; unclaimable leftovers are failed after the consumers stop"
     else
         transition_state \
             QUEUES_DRAINED COMPLETED \
             "control plane already stopped by an earlier run; nothing can enqueue work"
     fi
+    # The consumers go first: once they are gone nothing can turn a failed
+    # step into a successor workflow, so the leftovers can be failed safely.
     transition_state \
         CONTROL_CONSUMERS_STOPPED IN_PROGRESS \
         "stopping CPU consumers"
@@ -1390,6 +1248,43 @@ if [[ "${SCOPE}" == all && "${CPU_RUNTIME_PRESENT}" == true ]]; then
     transition_state \
         CONTROL_CONSUMERS_STOPPED COMPLETED \
         "CPU consumers stopped"
+    transition_state \
+        UNCLAIMABLE_WORK_ABANDONED IN_PROGRESS \
+        "failing the workflows and remote commands nothing may claim under DRAINING"
+    if [[ "${CPU_RUNTIME_RUNNING}" != true ]]; then
+        transition_state \
+            UNCLAIMABLE_WORK_ABANDONED COMPLETED \
+            "control plane already stopped by an earlier run; nothing can enqueue work"
+    else
+        # Re-picked: the worker is gone, so this is an ingress Pod now.
+        DATABASE_POD="$(find_database_pod || true)"
+        if [[ -z "${DATABASE_POD}" ]]; then
+            [[ "${CPU_INGRESS_RUNNING}" != true ]] ||
+                die "no CPU ingress pod remains to fail the unclaimable work"
+            transition_state \
+                UNCLAIMABLE_WORK_ABANDONED COMPLETED \
+                "CPU ingress already stopped by an earlier run and the consumers are gone; no Pod reaches Aurora and nothing can enqueue work"
+        elif [[ "${MODE}" == reset ]]; then
+            abandon_unclaimable_work "${DATABASE_POD}"
+            transition_state \
+                UNCLAIMABLE_WORK_ABANDONED COMPLETED \
+                "${ABANDONED_SUMMARY}"
+        else
+            assert_no_active_work "${DATABASE_POD}"
+            transition_state \
+                UNCLAIMABLE_WORK_ABANDONED COMPLETED \
+                "no workflow or remote command remained after the drain; mode ${MODE} abandons nothing"
+        fi
+    fi
+    transition_state \
+        INGRESS_STOPPED IN_PROGRESS \
+        "stopping CPU ingress"
+    for deployment in "${CPU_INGRESS_DEPLOYMENTS[@]}"; do
+        scale_cpu_deployment_zero "${deployment}"
+    done
+    transition_state \
+        INGRESS_STOPPED COMPLETED \
+        "CPU ingress stopped"
 elif [[ "${SCOPE}" == gpu ]]; then
     transition_state \
         QUEUES_DRAINED IN_PROGRESS \
@@ -1408,8 +1303,10 @@ for context in "${CLUSTER_CONTEXTS[@]}"; do
         scale_gpu_deployment_zero "${context}" "${deployment}"
     done
 done
-# No second orphan pass here: the consumers are already stopped, so no pod
-# can reach the store, and nothing dispatches new commands any more.
+# No orphan pass here: for --scope all the work nothing may claim was failed
+# in UNCLAIMABLE_WORK_ABANDONED, after the consumers stopped and before
+# ingress did, and no CPU Pod can reach the store any more; for --scope gpu
+# the drain above waited for every command of the selected clusters.
 if [[ "${NODE_MODE}" != skip ]]; then
     for index in "${!CLUSTER_IDS[@]}"; do
         run_node_cleanup "${CLUSTER_IDS[index]}" "${CLUSTER_CONTEXTS[index]}"

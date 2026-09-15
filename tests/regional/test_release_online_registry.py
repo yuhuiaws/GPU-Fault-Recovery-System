@@ -14,6 +14,7 @@ from gpu_fault.regional_registry_runtime import (
 )
 from gpu_fault_release import regional_release_online_registry as REGISTRY
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.rollout import parse_arguments
 from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -243,3 +244,61 @@ def test_convergence_has_no_per_cluster_scope_and_an_empty_set_is_immediate() ->
         revision, [], observed_at=now, stale_seconds=90
     ), "a revision no member has to ack converges at once"
     assert active_registry_member_ids([], observed_at=now, stale_seconds=90) == []
+
+
+def test_draining_several_clusters_publishes_one_revision_naming_all_of_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``current_registrations`` publishes every cluster it does not override as
+    ACTIVE, so one revision per cluster would flip the earlier ones back; the
+    uninstall drains all GPU clusters through a single publish, still refused
+    while any remote command is open."""
+
+    targeted: list[str] = []
+    published: list[dict] = []
+    monkeypatch.setattr(
+        REGISTRY,
+        "publish_current_registry",
+        lambda release, **kwargs: published.append(kwargs) or {},
+    )
+    release = SimpleNamespace(
+        _target=targeted.append, _remote_commands_are_idle=lambda: True
+    )
+
+    REGISTRY.drain_registry_clusters(release, ["gpu-b", "gpu-a", "gpu-b"])
+
+    assert targeted == ["gpu-b", "gpu-a"], "every named cluster is validated once"
+    assert published == [
+        {
+            "reason": "remove gpu-b, gpu-a draining",
+            "lifecycle_overrides": {"gpu-b": "DRAINING", "gpu-a": "DRAINING"},
+        }
+    ], published
+    busy = SimpleNamespace(
+        _target=lambda _: None, _remote_commands_are_idle=lambda: False
+    )
+    with pytest.raises(ReleaseError, match="PENDING/LEASED/WAITING"):
+        REGISTRY.drain_registry_clusters(busy, ["gpu-a"])
+    with pytest.raises(ReleaseError, match="--cluster-id is required"):
+        REGISTRY.drain_registry_clusters(release, [])
+    assert len(published) == 1, "a refused drain publishes nothing"
+
+
+def test_drain_cluster_takes_several_cluster_ids_and_the_other_modes_one() -> None:
+    drain = parse_arguments(
+        [
+            "drain-cluster",
+            "--config",
+            "r.json",
+            "--cluster-id",
+            "a",
+            "--cluster-id",
+            "b",
+        ]
+    )
+    assert drain.cluster_ids == ["a", "b"]
+    single = parse_arguments(
+        ["remove-cluster", "--config", "r.json", "--cluster-id", "a"]
+    )
+    assert single.cluster_ids == ["a"]
+    assert parse_arguments(["verify", "--config", "r.json"]).cluster_ids is None

@@ -119,3 +119,27 @@ def test_database_pod_is_empty_when_nothing_is_ready(tmp_path: Path) -> None:
     )
 
     assert chosen == "", "no Ready, non-terminating Pod exists"
+
+
+def test_database_pod_moves_to_the_ingress_once_the_worker_is_gone(
+    tmp_path: Path,
+) -> None:
+    """The abandonment step re-picks the Pod after CONTROL_CONSUMERS_STOPPED
+    scaled the worker to zero: with no worker Pod at all, the ingress Pod (still
+    running at that point of the sequence) carries the Aurora writes."""
+
+    chosen, calls = _find(
+        tmp_path, workers=[], ingress=[_pod("ingress-a", ready=True, terminating=False)]
+    )
+
+    assert chosen == "ingress-a", "no worker Pod exists; the ingress is next"
+    assert [call for call in calls if "get pod" in call] == [
+        (
+            "-n gpu-fault-system get pod -l app=gpu-fault-control-worker "
+            "--field-selector=status.phase=Running -o json"
+        ),
+        (
+            "-n gpu-fault-system get pod -l app=gpu-fault-api-ha "
+            "--field-selector=status.phase=Running -o json"
+        ),
+    ], calls

@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
@@ -314,15 +314,32 @@ def purge_failed_join(release: Any, target: Any) -> None:
     purge_registry_cluster(release, target.cluster_id)
 
 
-def drain_registry_cluster(release: Any, cluster_id: str) -> None:
-    release._target(cluster_id)
+def drain_registry_clusters(release: Any, cluster_ids: Sequence[str]) -> None:
+    """Publish DRAINING for every named cluster in one revision.
+
+    ``current_registrations`` publishes every cluster it does not override as
+    ACTIVE, so draining several clusters one revision at a time would flip each
+    earlier one back to ACTIVE and only the last would stay DRAINING; an
+    uninstall drains all of a site's GPU clusters through this one publish.
+    Fail-closed like remove-cluster: refused while any remote command is open.
+    """
+
+    ordered = list(dict.fromkeys(str(item) for item in cluster_ids))
+    if not ordered:
+        raise ReleaseError("--cluster-id is required")
+    for cluster_id in ordered:
+        release._target(cluster_id)
     if not release._remote_commands_are_idle():
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     publish_current_registry(
         release,
-        reason=f"remove {cluster_id} draining",
-        lifecycle_overrides={cluster_id: "DRAINING"},
+        reason=f"remove {', '.join(ordered)} draining",
+        lifecycle_overrides={cluster_id: "DRAINING" for cluster_id in ordered},
     )
+
+
+def drain_registry_cluster(release: Any, cluster_id: str) -> None:
+    drain_registry_clusters(release, [cluster_id])
 
 
 def revoke_registry_cluster(release: Any, cluster_id: str) -> None:
