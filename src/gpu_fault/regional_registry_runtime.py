@@ -445,6 +445,25 @@ def active_registry_member_ids(
     )
 
 
+def member_serves_revision(
+    member: RegionalRegistryMember,
+    revision: RegionalRegistryRevision,
+) -> bool:
+    """True when a member has re-read the revision and reports itself ready.
+
+    Staleness is judged separately (``last_seen_at`` against the window): this
+    asks only whether the member is at the revision's generation and digest, so
+    a caller can tell a member that has not caught up yet apart from one that
+    has left the fleet.
+    """
+
+    return (
+        member.ready
+        and member.generation == revision.generation
+        and member.content_sha256 == revision.content_sha256
+    )
+
+
 def registry_revision_converged(
     revision: RegionalRegistryRevision,
     members: list[RegionalRegistryMember],
@@ -454,11 +473,19 @@ def registry_revision_converged(
 ) -> bool:
     threshold = observed_at - timedelta(seconds=stale_seconds)
     by_id = {member.member_id: member for member in members}
-    return all(
-        (member := by_id.get(member_id)) is not None
-        and member.ready
-        and member.generation == revision.generation
-        and member.content_sha256 == revision.content_sha256
-        and member.last_seen_at >= threshold
-        for member_id in revision.required_member_ids
-    )
+    for member_id in revision.required_member_ids:
+        member = by_id.get(member_id)
+        if member is None or member.last_seen_at < threshold:
+            # The member has left the fleet: it is gone, or it stopped
+            # heartbeating past the stale window and by the registry's own
+            # liveness rule serves no traffic. required_member_ids is a
+            # publish-time snapshot of active_registry_member_ids, so a process
+            # that was draining at publish (an old Pod terminating under a
+            # rolling restart) can be captured in it and then terminate without
+            # ever acking the new generation; a departed member must not
+            # deadlock the publish. An empty required set still converges on the
+            # first poll.
+            continue
+        if not member_serves_revision(member, revision):
+            return False
+    return True

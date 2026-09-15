@@ -90,10 +90,14 @@ def describe_unconverged_publish(release: Any, *, timeout_seconds: float) -> Non
     member rows ``active_registry_member_ids`` counted at publish time (every
     process that heartbeated within ``GPU_FAULT_REGISTRY_STALE_SECONDS``) must
     each re-read the new head and heartbeat it before ``converged`` turns true
-    (``regional_registry_runtime.registry_revision_converged``). A GPU cluster
-    has no row -- its executor and agents are not registry members -- so a
-    cluster being joined, purged or rolled back never widens the set, and a
-    publish with no active member at all converges on the probe's first poll.
+    (``regional_registry_runtime.registry_revision_converged``), except a
+    member that has since left the fleet -- its row gone or stale past that
+    window -- which neither acks nor blocks (live 2026-09-15: a control-worker
+    terminating under the remove-cluster roll was captured at publish and held
+    the join's generation for its whole window). A GPU cluster has no row --
+    its executor and agents are not registry members -- so a cluster being
+    joined, purged or rolled back never widens the set, and a publish with no
+    active member at all converges on the probe's first poll.
 
     So when a publish still runs its whole window out, some control-plane
     process did not ack, and the probe's own exit line names only the

@@ -8,11 +8,13 @@ from gpu_fault.regional import (
     RegionalClusterLifecycle,
     RegionalClusterRegistration,
     RegionalRegistryHead,
+    RegionalRegistryMember,
     RegionalRegistryRevision,
 )
 from gpu_fault.regional_registry_runtime import (
     RegionalRegistryRuntime,
     active_registry_member_ids,
+    member_serves_revision,
     regional_cluster_request_allowed,
     registry_revision_converged,
 )
@@ -166,6 +168,66 @@ def test_revision_barrier_requires_every_named_member_at_same_digest() -> None:
     assert active_registry_member_ids(
         members, observed_at=clock[0], stale_seconds=5
     ) == ["pod-a/process-a", "pod-b/process-b"]
+
+
+def test_a_required_member_that_left_the_fleet_does_not_block_convergence() -> None:
+    """A publish-time straggler that terminates without acking must not deadlock.
+
+    required_member_ids is a snapshot of active_registry_member_ids at publish,
+    so a control-plane process still heartbeating while it drained under a
+    rolling restart can be captured in it and then terminate without ever
+    re-reading the new head. Once it goes stale it has left the fleet by the
+    registry's own liveness rule and serves no traffic, so convergence must
+    ignore it rather than run its whole window out -- while a member that is
+    still heartbeating and merely behind must still hold the barrier.
+    """
+
+    revision = RegionalRegistryRevision.build(
+        generation=5,
+        registrations=[registration("cluster-a")],
+        previous_generation=4,
+        required_member_ids=["live/process", "drained/process"],
+        reason="join cluster-a",
+        created_at=NOW + timedelta(seconds=1),
+    )
+    now = NOW + timedelta(seconds=120)
+
+    def member(
+        member_id: str, *, generation: int, last_seen: datetime
+    ) -> RegionalRegistryMember:
+        at_revision = generation == revision.generation
+        return RegionalRegistryMember(
+            member_id=member_id,
+            service_role="control-worker",
+            release_id="release-a",
+            generation=generation,
+            content_sha256=revision.content_sha256 if at_revision else "b" * 64,
+            ready=True,
+            started_at=NOW,
+            last_seen_at=last_seen,
+        )
+
+    live = member("live/process", generation=5, last_seen=now)
+    # Last heartbeat 100s back, past the 90s window: gone, never acked gen 5.
+    drained = member(
+        "drained/process", generation=4, last_seen=now - timedelta(seconds=100)
+    )
+
+    assert "drained/process" in revision.required_member_ids
+    assert active_registry_member_ids(
+        [live, drained], observed_at=now, stale_seconds=90
+    ) == ["live/process"]
+    assert member_serves_revision(live, revision), live
+    assert not member_serves_revision(drained, revision), drained
+    # Converges on the live member alone; the departed straggler is skipped.
+    assert registry_revision_converged(
+        revision, [live, drained], observed_at=now, stale_seconds=90
+    ), (live, drained)
+    # A member still heartbeating but merely behind keeps holding the barrier.
+    behind = member("live/process", generation=4, last_seen=now)
+    assert not registry_revision_converged(
+        revision, [behind, drained], observed_at=now, stale_seconds=90
+    ), (behind, drained)
 
 
 @pytest.mark.parametrize(

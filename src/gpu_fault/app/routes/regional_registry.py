@@ -23,6 +23,7 @@ from gpu_fault.regional import (
 )
 from gpu_fault.regional_registry_runtime import (
     active_registry_member_ids,
+    member_serves_revision,
     registry_revision_converged,
 )
 
@@ -161,18 +162,25 @@ def _status(
         stale_seconds=stale_seconds,
     )
     by_id = {member.member_id: member for member in members}
+    active = set(active_ids)
     acked = sorted(
         member_id
         for member_id in revision.required_member_ids
-        if (
-            (member := by_id.get(member_id)) is not None
-            and member.ready
-            and member.generation == revision.generation
-            and member.content_sha256 == revision.content_sha256
-            and member.member_id in active_ids
-        )
+        if (member := by_id.get(member_id)) is not None
+        and member.member_id in active
+        and member_serves_revision(member, revision)
     )
-    missing = sorted(set(revision.required_member_ids) - set(acked))
+    # A required member that has left the fleet (no row, or gone stale so it is
+    # not in active_ids) neither acks nor blocks convergence, so it is neither
+    # acked nor missing. missing is the members still heartbeating that have not
+    # yet re-read the new head -- the ones a stalled publish is truly waiting on.
+    missing = sorted(
+        member_id
+        for member_id in revision.required_member_ids
+        if (member := by_id.get(member_id)) is not None
+        and member.member_id in active
+        and not member_serves_revision(member, revision)
+    )
     return RegionalRegistryStatus(
         generation=revision.generation,
         content_sha256=revision.content_sha256,
