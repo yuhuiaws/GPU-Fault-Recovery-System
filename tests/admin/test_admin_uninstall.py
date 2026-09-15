@@ -1219,3 +1219,60 @@ def test_certificate_deletion_still_raises_on_any_other_failure(
 
     with pytest.raises(BootstrapError, match="AccessDeniedException"):
         cleaner.delete(_resource("aws/acm/certificate", "acm_certificate", "arn:acm/a"))
+
+
+def test_a_fresh_session_over_a_prior_cleanup_record_reruns_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    """A prior uninstall that ran to COMPLETED leaves its working files behind
+    (``RETIRED_AFTER_UNINSTALL`` retires the state-dir top level, not the
+    ``uninstall/`` subdir) yet consumes its own ``state.json``. The next
+    uninstall of a since-redeployed site therefore starts fresh, but used to
+    trust the stale ``kubernetes-cleanup.json`` (still CLEANUP_COMPLETED) and
+    skip the real cleanup, then fail verification against resources the redeploy
+    recreated (live 2026-09-15 ``installed resource still exists:
+    cpu:cpu:deployment/gpu-fault-api-ha``). A fresh session must archive the
+    prior working files and re-run the cleanup against the current site."""
+
+    aws = _InMemoryAws()
+    request = _orchestration(tmp_path, monkeypatch, aws)
+
+    uninstall_dir = request.site.source.parent / "uninstall"
+    uninstall_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cleanup_path = uninstall_dir / "kubernetes-cleanup.json"
+    cleanup_path.write_text(
+        json.dumps(
+            {"phase": "CLEANUP_COMPLETED", "status": "COMPLETED", "session": "PRIOR"}
+        ),
+        encoding="utf-8",
+    )
+    before_path = uninstall_dir / "installation-resources-before.json"
+    before_path.write_text("{}", encoding="utf-8")
+
+    calls: list[str] = []
+
+    def cleanup(request, runner, state_file):
+        del request, runner
+        calls.append("ran")
+        state_file.write_text(
+            json.dumps({"phase": "CLEANUP_COMPLETED", "status": "COMPLETED"}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(admin_uninstall, "_run_cleanup", cleanup)
+
+    _uninstall_locked(request)
+
+    assert calls == ["ran"], "the fresh session must re-run the Kubernetes cleanup"
+    current = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    assert current.get("session") is None, (
+        "the stale record must not survive as the live cleanup state"
+    )
+    superseded = sorted(path.name for path in uninstall_dir.glob("*.superseded-*"))
+    assert any(
+        name.startswith("kubernetes-cleanup.json.superseded-") for name in superseded
+    ), superseded
+    assert any(
+        name.startswith("installation-resources-before.json.superseded-")
+        for name in superseded
+    ), superseded

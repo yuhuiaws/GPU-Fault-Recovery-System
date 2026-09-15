@@ -390,7 +390,17 @@ def _terminal_resource(
 def _uninstall_state(
     request: UninstallRequest,
     path: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
+    """Load an in-progress uninstall or start a fresh session.
+
+    The second element is ``True`` when an existing ``state.json`` was
+    resumed and ``False`` when a brand-new session was created. A prior
+    session that ran to COMPLETED has its ``state.json`` renamed aside
+    (``state.consumed-*``), so a later uninstall of a redeployed site lands
+    here with no ``state.json`` and must be treated as fresh -- never a
+    resume that trusts the previous session's working artifacts.
+    """
+
     if path.is_file():
         value = cast(
             dict[str, Any],
@@ -407,7 +417,7 @@ def _uninstall_state(
             # a plain reinstall.
             if value.get(key, False if key == "reset_database" else None) != item:
                 raise BootstrapError(f"uninstall state {path} conflicts on {key}")
-        return value
+        return value, True
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     snapshot_identifier = safe_name(
         (f"{request.site.release_config['site_name']}-uninstall-{timestamp}"),
@@ -423,7 +433,43 @@ def _uninstall_state(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     write_json_atomic(path, value)
-    return value
+    return value, False
+
+
+def _archive_prior_session_artifacts(state_dir: Path) -> list[Path]:
+    """Move a previous uninstall session's working files aside on a fresh run.
+
+    ``_load_or_export_registry`` and the Kubernetes-cleanup gate both reuse a
+    file whenever it merely ``is_file()`` -- the resume path that lets a
+    crashed session pick up where it stopped. But once a session reaches
+    COMPLETED its ``state.json`` is consumed, so the next uninstall of a
+    site that was redeployed in between starts with no ``state.json`` yet
+    finds a stale ``installation-resources-before.json`` (a registry snapshot
+    of the retired install) and a ``kubernetes-cleanup.json`` still marked
+    CLEANUP_COMPLETED. Trusting them makes the run skip the real cleanup and
+    then fail verification against resources the redeploy recreated (live
+    2026-09-15: ``installed resource still exists: cpu:cpu:deployment/
+    gpu-fault-api-ha``). A fresh session must re-export and re-clean, so
+    rename the prior session's artifacts aside as evidence.
+    """
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archived: list[Path] = []
+    names = (
+        "installation-resources-before.json",
+        "installation-resources-delete-plan.json",
+        "installation-resources-pre-aurora-delete.json",
+        "installation-resources-final.json",
+        "kubernetes-cleanup.json",
+    )
+    for name in names:
+        base = state_dir / name
+        for candidate in (base, base.with_name(base.name + ".sha256")):
+            if candidate.is_file():
+                archive = candidate.with_name(f"{candidate.name}.superseded-{stamp}")
+                candidate.replace(archive)
+                archived.append(archive)
+    return archived
 
 
 def _transition(
@@ -862,7 +908,9 @@ def _uninstall_locked(
     state_dir = request.site.source.parent / "uninstall"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
-    state = _uninstall_state(request, state_path)
+    state, resumed = _uninstall_state(request, state_path)
+    if not resumed:
+        _archive_prior_session_artifacts(state_dir)
     snapshot = _load_or_export_registry(request, state_dir)
     cleaner = ResourceCleaner(request.site)
     cleaner.validate_supported(snapshot.resources)
