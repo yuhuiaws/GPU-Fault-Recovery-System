@@ -255,8 +255,25 @@ def restart_budget_section_errors(
     workflow_b = state_b.get("workflow") or {}
     if workflow_b.get("status") != "FAILED":
         errors.append("B: second RESTART_APP was not budget rejected")
-    if state_b.get("commands"):
-        errors.append("B: budget rejection created a remote command")
+    # 逻辑 4: an exhausted restart budget withholds *only* the RESTART_WORKLOAD
+    # step -- it is superseded before any adapter runs -- while the rest of the
+    # RESTART_APP plan still executes: FREEZE_EVIDENCE plus the STOP_WORKLOADS
+    # repair, so the faulty GPU is stopped and the job left for someone to
+    # resubmit (withhold_exhausted_restart in
+    # src/gpu_fault/execution/restart_budget_preflight.py, landed 9325347
+    # 2026-09-08; before that the whole workflow aborted and minted nothing,
+    # which is what the old "no command at all" check assumed). In the regional
+    # executor STOP_WORKLOADS is a remote command, so the budget-rejected
+    # workflow legitimately mints one. The invariant that survives is narrower:
+    # the withheld restart itself is never dispatched, i.e. no RESTART_WORKLOAD
+    # remote command may exist for it.
+    restart_commands = [
+        item
+        for item in (state_b.get("commands") or [])
+        if ((item.get("step") or {}).get("operation")) == "RESTART_WORKLOAD"
+    ]
+    if restart_commands:
+        errors.append("B: budget rejection dispatched a RESTART_WORKLOAD command")
     reasons = {
         str((item.get("details") or {}).get("reason") or "")
         for item in workflow_b.get("step_executions") or []
