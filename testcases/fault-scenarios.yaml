@@ -2557,7 +2557,13 @@ test_cases:
   - 阶段 5 与阶段 1 的 site_id、completed_tasks 集合、AWS 资源条数与 status --full PASS 计数一致，重跑 deploy --state-dir 严格 NOOP
   - 驱动的 admin-lifecycle-sequence.json 记录每阶段 PASS/FAIL、日志 sha256 与冷构建计数，ARN、邮箱与路径只以 sha256 出现
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 7a58ca8121467c92d674fd1ef764b40156d42c8425e6960b9b78a4f1e16fee98
+      components:
+        control_plane: 872969248a18f66a648d0e01da19eeb31b3a85a0724933792a653384fd6f64eb
+        executor: 3875b952e91c68439ed894f2d88f78ca6e824de960b133900f5f08b96808e50b
+        node_runtime: f2eff541a397849fa062f6d3bce5ec3ec27e8b58e6226963d67d71588aaf76db
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-029
   related_pytest: tests/regional/test_admin_lifecycle_sequence_script.py::test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy
