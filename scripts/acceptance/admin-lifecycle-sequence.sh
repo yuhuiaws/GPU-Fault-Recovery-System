@@ -6,7 +6,8 @@
 #      ECR image/buildcache tags are gone before the build)
 #   2  remove-cluster of the site's only GPU cluster
 #   3  join-cluster --gpu-cluster-arn re-attach
-#   4  uninstall --cpu-cluster keep --reset-database
+#   4  uninstall --cpu-cluster keep --reset-database (--aurora-final-snapshot
+#      retain|skip, default retain: skip only when the staging data is disposable)
 #   5  cold first deploy again, into a second empty state directory
 #
 # Every admin command runs in the foreground and the next stage starts only
@@ -21,13 +22,13 @@ usage() {
 usage: admin-lifecycle-sequence.sh --state-dir DIR --cpu-cluster-arn ARN
          --gpu-cluster-arn ARN --admin-email EMAIL --repo CHECKOUT
          [--stage N] [--second-state-dir DIR] [--email-wait-minutes M]
-         [--previous-site-id ID]
+         [--previous-site-id ID] [--aurora-final-snapshot retain|skip]
 USAGE
   exit 2
 }
 
 STATE_DIR="" CPU_ARN="" GPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1
-SECOND_STATE_DIR="" EMAIL_WAIT=0 PREVIOUS_SITE_ID=""
+SECOND_STATE_DIR="" EMAIL_WAIT=0 PREVIOUS_SITE_ID="" AURORA_FINAL_SNAPSHOT=retain
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
@@ -39,11 +40,13 @@ while [[ $# -gt 0 ]]; do
     --second-state-dir) SECOND_STATE_DIR="$2"; shift 2 ;;
     --email-wait-minutes) EMAIL_WAIT="$2"; shift 2 ;;
     --previous-site-id) PREVIOUS_SITE_ID="$2"; shift 2 ;;
+    --aurora-final-snapshot) AURORA_FINAL_SNAPSHOT="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 [[ -n "$STATE_DIR" && -n "$CPU_ARN" && -n "$GPU_ARN" && -n "$ADMIN_EMAIL" && -n "$REPO" ]] || usage
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
+[[ "$AURORA_FINAL_SNAPSHOT" =~ ^(retain|skip)$ ]] || usage
 [[ -d "$REPO/deploy/image" ]] || { echo "--repo is not a checkout: $REPO" >&2; exit 2; }
 
 STATE_DIR="$(realpath -m "$STATE_DIR")"
@@ -90,7 +93,7 @@ init_record() {
   install -d -m 0700 "$ACCEPT_DIR"
   python3 - "$RECORD" "$CASE_ID" "$(digest_of "$CPU_ARN")" "$(digest_of "$GPU_ARN")" \
     "$(digest_of "$ADMIN_EMAIL")" "$(digest_of "$STATE_DIR")" \
-    "$(digest_of "$SECOND_STATE_DIR")" "$START_STAGE" <<'PY'
+    "$(digest_of "$SECOND_STATE_DIR")" "$START_STAGE" "$AURORA_FINAL_SNAPSHOT" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 doc = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -103,6 +106,7 @@ doc.update(
         "admin_email_sha256": sys.argv[5],
         "state_dir_sha256": sys.argv[6],
         "second_state_dir_sha256": sys.argv[7],
+        "aurora_final_snapshot": sys.argv[9],
     },
     resumed_from_stage=int(sys.argv[8]),
 )
@@ -217,7 +221,8 @@ stage_3() {
 
 stage_4() {
   run_admin uninstall --state-dir "$STATE_DIR" --cpu-cluster keep --reset-database \
-    --confirm UNINSTALL_GPU_FAULT
+    --aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT" --confirm UNINSTALL_GPU_FAULT
+  printf '{"aurora_final_snapshot": "%s"}\n' "$AURORA_FINAL_SNAPSHOT" >>"${STAGE_LOG}.extra.json"
   assert_phase "$STATE_DIR/uninstall/state.json" COMPLETED
 }
 
