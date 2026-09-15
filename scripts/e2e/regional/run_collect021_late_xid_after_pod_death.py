@@ -421,6 +421,57 @@ def wait_death_observation(
     )
 
 
+def wait_node_clear_of_foreign_attempts(
+    regional: RegionalLiveFixture,
+    *,
+    node: str,
+    own_attempt_id: str,
+    timeout_seconds: int = 420,
+    poll_seconds: int = 10,
+) -> None:
+    """Wait until no attempt other than ``own_attempt_id`` resolves live on ``node``.
+
+    The missing-attempt grace (completion_controller.py:148,
+    ``attempt_missing_grace_seconds`` default 300) republishes a just-stopped
+    attempt as RUNNING with a fresh ``observed_at`` for the whole grace window
+    after its Pods vanish, only flipping to STOPPED/``containers: []`` once it
+    expires. So a predecessor case that stopped a workload on the shared GPU
+    fleet keeps a live-looking container on this node for minutes after its
+    teardown -- COLLECT-016's budget-exhausted D job (``gpu-fault-c016-d-*``,
+    left stopped-not-restarted by 逻辑 4) is exactly the one that bit us: it
+    finished 77s before this case injected, so the correlator still saw an
+    ACTIVE attempt on the target node, attributed the late XID to it
+    (``AMBIGUOUS_ACTIVE_ATTEMPTS``) and opened the RESTART_APP workflow this
+    case exists to prove does NOT happen on an idle node. The kill only makes
+    *our own* attempt read idle (``wait_death_observation``); it says nothing
+    about a foreign attempt still inside its grace. Wait the grace out so the
+    node reads genuinely idle to the correlator before injecting.
+
+    An observation with a live container on another node is ignored -- only a
+    live container on *this* node contaminates the correlation.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    lingering: list[str] = []
+    while True:
+        state = regional.store_snapshot(node=node, queue_attempts=1)
+        lingering = [
+            str(observation.get("attempt_id"))
+            for observation in state.get("observations") or []
+            if observation.get("attempt_id") != own_attempt_id
+            and not node_reads_idle(observation, node)
+        ]
+        if not lingering:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_seconds)
+    raise RegionalFixtureError(
+        f"target node {node} still shows live foreign attempt observations "
+        f"before XID injection (missing-attempt grace not cleared): {lingering}"
+    )
+
+
 def wait_for_decision(
     regional: RegionalLiveFixture,
     *,
@@ -534,6 +585,17 @@ def run_late_xid_section(
         job_id=job_id,
         attempt_id=attempt_id,
         pod_uid=target_uid,
+    )
+
+    # Our own attempt reads idle now, but the correlator resolves the node, not
+    # the job: a predecessor's stopped workload can still be inside its
+    # missing-attempt grace and read ACTIVE on this same node. Wait it out
+    # before injecting, or the late XID correlates to that stale attempt and
+    # escalates instead of staying MONITOR_ONLY.
+    wait_node_clear_of_foreign_attempts(
+        regional,
+        node=target_node,
+        own_attempt_id=attempt_id,
     )
 
     marker = f"c021-{int(time.time())}"
