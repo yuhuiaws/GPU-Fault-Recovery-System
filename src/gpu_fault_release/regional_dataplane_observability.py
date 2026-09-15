@@ -87,6 +87,7 @@ from gpu_fault_release.regional_observability_rollback import (
     wait_for_amp_definition_gone,
     wait_for_amp_definition_settled,
 )
+from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_rendering import (
     DATAPLANE_ADOT_DEPLOYMENT,
@@ -94,7 +95,10 @@ from gpu_fault_release.regional_release_rendering import (
     dataplane_adot_skip_reason,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
+# The checkout or source snapshot this engine copy runs from -- resolved like
+# every other engine module, so an installed (bound) deploy-host CLI finds the
+# installer and manifest under the site's snapshot, not under site-packages.
+ROOT = repository_root()
 AMP_MONITORING_INSTALLER = ROOT / "deploy/observability/install-amp-monitoring.sh"
 #: The rule-groups namespace the rendered per-cluster rules live in. Separate
 #: from ``health.amp_rule_namespace`` (the static file) on purpose: the static
