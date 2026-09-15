@@ -16,6 +16,7 @@ from gpu_fault.admin.cluster_join_evidence import (
 )
 from gpu_fault.admin.cluster_join_state import complete_step, step_done
 from gpu_fault.admin.resource_registry import LegacyInstallationRegistryMissing
+from gpu_fault.admin.resource_registry_dns import vpc_association_resource
 from gpu_fault.admin.site import RenderedSite, load_site
 from gpu_fault.installation_resources import (
     TERMINAL_INSTALLATION_RESOURCE_STATUSES,
@@ -162,24 +163,17 @@ def _joined_resources(
         )
     )
     if network["vpc_id"] not in set(network.get("existing_vpc_ids") or []):
+        # The row the registry derives from a bootstrap-created association
+        # for this VPC, so a later re-sync upserts this key instead of adding one.
         resources.append(
-            _resource(
+            vpc_association_resource(
                 site_id=site_id,
-                key=f"aws/route53/vpc-association/{cluster_id}",
-                resource_type="route53_vpc_association",
-                resource_id=(
-                    f"{network['hosted_zone_id']}:{region}:{network['vpc_id']}"
-                ),
+                owner=cluster_id,
+                hosted_zone_id=str(network["hosted_zone_id"]),
+                vpc_id=str(network["vpc_id"]),
+                vpc_region=region,
                 region=region,
                 account_id=account_id,
-                ownership=InstallationResourceOwnership.CREATED,
-                policy=InstallationResourceDeletePolicy.DETACH,
-                dependencies=["aws/route53/zone"],
-                attributes={
-                    "hosted_zone_id": str(network["hosted_zone_id"]),
-                    "vpc_id": str(network["vpc_id"]),
-                    "vpc_region": region,
-                },
             )
         )
     return resources

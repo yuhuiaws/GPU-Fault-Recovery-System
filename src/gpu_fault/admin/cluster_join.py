@@ -99,6 +99,7 @@ from gpu_fault.admin.resource_registry import (
     sync_installation_resource_snapshot,  # noqa: F401 - commit adapter seam
     write_installation_resource_snapshot,  # noqa: F401 - commit adapter seam
 )
+from gpu_fault.admin.resource_registry_dns import vpc_association_entry
 from gpu_fault.admin.site import (
     RenderedSite,
     effective_environment,
@@ -660,12 +661,14 @@ def _update_bootstrap_state(
         pki = resources.setdefault("pki", {})
         associations = list(pki.get("vpc_associations") or [])
         if not any(item.get("vpc_id") == network["vpc_id"] for item in associations):
+            # Named after the joining cluster, as bootstrap names its entries
+            # after the clusters in each VPC: the registry keys both by it.
             associations.append(
-                {
-                    "vpc_id": network["vpc_id"],
-                    "vpc_region": site.release_config["aws_region"],
-                    "ownership": "CREATED",
-                }
+                vpc_association_entry(
+                    vpc_id=str(network["vpc_id"]),
+                    vpc_region=str(site.release_config["aws_region"]),
+                    cluster_ids=[cluster_id],
+                )
             )
         pki["vpc_associations"] = associations
     completed = set(value.get("completed_tasks") or [])

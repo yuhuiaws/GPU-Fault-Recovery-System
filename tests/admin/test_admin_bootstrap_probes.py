@@ -12,7 +12,10 @@ from gpu_fault.admin import bootstrap_checkpoint as admin_bootstrap_checkpoint
 from gpu_fault.admin import bootstrap_load_balancer as admin_bootstrap_load_balancer
 from gpu_fault.admin import bootstrap_platform_probes as admin_bootstrap_platform_probes
 from gpu_fault.admin import bootstrap_services as admin_bootstrap_services
-from gpu_fault.admin.bootstrap_checkpoint import bind_bootstrap_inputs
+from gpu_fault.admin.bootstrap_checkpoint import (
+    bind_bootstrap_inputs,
+    bind_foundation_inputs,
+)
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     BootstrapMutationRequired,
@@ -1007,20 +1010,274 @@ def test_node_action_key_probe_requires_ensure_when_rotation_is_requested(
 def test_bootstrap_input_digest_invalidates_only_stale_task_checkpoints(
     tmp_path: Path,
 ) -> None:
-    state = BootstrapState(tmp_path / "state.json", site_id="test")
+    """Each simulated deploy reloads the state from disk.
+
+    A bind never drops a task the current process completed -- it ran against
+    the very inputs being bound -- so on one ``BootstrapState`` object the
+    ``aurora`` checkpoint below would survive whatever its digest did. The
+    stale-checkpoint rule this test pins is about checkpoints inherited from an
+    earlier process, and a reload is what an earlier process looks like.
+    """
+
+    path = tmp_path / "state.json"
+    state = BootstrapState(path, site_id="test")
     state.record("pki", {"certificate_arn": "arn:certificate"})
     state.complete("pki")
 
     task_digests = {"pki": "1" * 64, "aurora": "2" * 64}
+    state = BootstrapState(path, site_id="test")
     state.bind_inputs("a" * 64, task_digests)
+    assert state.value["completed_tasks"] == [], (
+        "a checkpoint with no recorded digest was trusted"
+    )
     state.complete("pki")
     state.complete("aurora")
+
+    state = BootstrapState(path, site_id="test")
     state.bind_inputs("a" * 64, task_digests)
     assert state.value["completed_tasks"] == ["aurora", "pki"]
 
+    state = BootstrapState(path, site_id="test")
     state.bind_inputs("b" * 64, {"pki": "1" * 64, "aurora": "3" * 64})
     assert state.value["completed_tasks"] == ["pki"]
     assert state.value["resources"]["pki"] == {"certificate_arn": "arn:certificate"}
+
+
+def test_a_task_completed_by_this_process_survives_every_bind(tmp_path: Path) -> None:
+    """The bind that follows the release build must not erase this run's work.
+
+    ``nlb_network`` and ``pki`` finish minutes before the image build does, and
+    the full bind that followed the build dropped every completed task whose
+    recorded digest differed from the new one -- on a first deploy, where
+    nothing is recorded yet, all of them -- so the next deploy re-ran them. A
+    task this process completed ran against the inputs being bound, and stays
+    whether its previous digest is absent or different.
+    """
+
+    state = BootstrapState(tmp_path / "state.json", site_id="test")
+    state.record("nlb_network", {"load_balancer_arn": "arn:nlb"})
+    state.complete("nlb_network")
+
+    state.bind_inputs("a" * 64, {"nlb_network": "1" * 64})
+    assert state.value["completed_tasks"] == ["nlb_network"], (
+        "the first bind dropped a task this process had completed"
+    )
+    state.bind_inputs("b" * 64, {"nlb_network": "2" * 64})
+    assert state.value["completed_tasks"] == ["nlb_network"], (
+        "a changed digest dropped a task this process had completed"
+    )
+
+
+def test_a_checkpoint_from_an_earlier_process_is_dropped_when_its_digest_changes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.json"
+    state = BootstrapState(path, site_id="test")
+    state.record("nlb_network", {"load_balancer_arn": "arn:nlb"})
+    state.complete("nlb_network")
+    state.bind_inputs("a" * 64, {"nlb_network": "1" * 64})
+
+    reloaded = BootstrapState(path, site_id="test")
+    reloaded.bind_inputs("a" * 64, {"nlb_network": "1" * 64})
+    assert reloaded.value["completed_tasks"] == ["nlb_network"], (
+        "an inherited checkpoint with an unchanged digest was dropped"
+    )
+    reloaded.bind_inputs("b" * 64, {"nlb_network": "2" * 64})
+    assert reloaded.value["completed_tasks"] == [], (
+        "an inherited checkpoint with a changed digest was trusted"
+    )
+
+
+def test_bind_inputs_judges_only_the_tasks_it_names_and_merges_their_digests(
+    tmp_path: Path,
+) -> None:
+    """A partial bind leaves the tasks it does not name, and their recorded
+    digests, alone -- that is what lets the release-independent tasks be bound
+    before the graph starts and the release-dependent ones after the build
+    without the second bind undoing the first. ``digest=None`` likewise leaves
+    the whole-input digest as it was."""
+
+    path = tmp_path / "state.json"
+    state = BootstrapState(path, site_id="test")
+    for name in ("nlb_network", "monitoring_install"):
+        state.record(name, {})
+        state.complete(name)
+    state.bind_inputs(
+        "a" * 64, {"nlb_network": "1" * 64, "monitoring_install": "2" * 64}
+    )
+
+    reloaded = BootstrapState(path, site_id="test")
+    reloaded.bind_inputs(None, {"nlb_network": "9" * 64})
+
+    assert reloaded.value["completed_tasks"] == ["monitoring_install"], (
+        "a task the bind did not name was judged by it"
+    )
+    assert reloaded.value["task_input_sha256"] == {
+        "monitoring_install": "2" * 64,
+        "nlb_network": "9" * 64,
+    }, "the recorded digest of a task the bind did not name was lost"
+    assert reloaded.value["input_sha256"] == "a" * 64, (
+        "a bind without a whole-input digest overwrote the recorded one"
+    )
+
+    fresh = BootstrapState(tmp_path / "fresh.json", site_id="test")
+    fresh.bind_inputs(None, {"nlb_network": "9" * 64})
+    assert "input_sha256" not in fresh.value, (
+        "a bind without a whole-input digest invented one"
+    )
+
+
+def test_the_legacy_whole_input_bind_keeps_this_process_completions(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.json"
+    state = BootstrapState(path, site_id="test")
+    state.record("pki", {})
+    state.complete("pki")
+    state.bind_inputs("a" * 64)
+
+    reloaded = BootstrapState(path, site_id="test")
+    reloaded.record("aurora", {})
+    reloaded.complete("aurora")
+    reloaded.bind_inputs("b" * 64)
+
+    assert reloaded.value["completed_tasks"] == ["aurora"], (
+        "the legacy bind kept an inherited checkpoint across a changed digest, "
+        "or dropped one this process completed"
+    )
+    assert reloaded.value["input_sha256"] == "b" * 64
+
+
+# What `bind_foundation_inputs` binds: every task whose digest is fixed before
+# the release is built. The three it leaves to the full bind need the manifest,
+# the images or the wheel bytes.
+FOUNDATION_BOUND_TASKS = (
+    "release_repositories",
+    "pod_identity_agent",
+    "nlb_network",
+    "pki",
+    "aurora",
+    "aurora_ready",
+    "load_balancer_controller",
+    "control_plane_role",
+    "email_notifications",
+    "monitoring_resources",
+    "node_keys:gpu-a",
+    "executor_role:gpu-a",
+    "adot_writer_role:gpu-a",
+)
+RELEASE_BOUND_TASKS = ("release", "monitoring_install", "aurora_refresh")
+
+
+def _foundation_request(tmp_path: Path) -> tuple[BootstrapRequest, dict[str, Any]]:
+    """A request over a mirrored repository root and a state directory that
+    already holds the admin config, plus the release the full bind digests."""
+
+    root = _mirror_repository_root(tmp_path, "repository")
+    state_dir = tmp_path / "state"
+    (state_dir / "admin-config").mkdir(parents=True)
+    (state_dir / "admin-config/desired.json").write_text(
+        json.dumps({"schema_version": 1, "config": {}}), encoding="utf-8"
+    )
+    wheel = tmp_path / "gpu_fault-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel-bytes")
+    manifest = state_dir / "release.json"
+    manifest.write_text(
+        json.dumps({"release_id": "0100-a", "wheel": str(wheel)}), encoding="utf-8"
+    )
+    request = BootstrapRequest(
+        cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
+        gpu_cluster_arns=("arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",),
+        repository_root=root,
+        state_dir=state_dir,
+        alert_email="ops@example.com",
+    )
+    release = {
+        "release_id": "0100-a",
+        "manifest": str(manifest),
+        "agent_config_digest": "c" * 64,
+        "images": {"runtime": "runtime@sha256:aaa", "adot": "adot@sha256:bbb"},
+    }
+    return request, release
+
+
+def test_the_foundation_bind_settles_the_release_independent_digests_first(
+    tmp_path: Path,
+) -> None:
+    """Before the build: every digest that does not need the release, computed
+    exactly as the full bind computes it; after the build: the full bind adds
+    the three release-dependent digests and keeps what the graph completed in
+    between."""
+
+    request, release = _foundation_request(tmp_path)
+    state = BootstrapState(request.state_dir / "bootstrap-state.json", site_id="site-a")
+
+    bind_foundation_inputs(
+        state, request=request, cpu=_cluster(), gpu_clusters=(_gpu_cluster(),)
+    )
+    foundation = dict(state.value["task_input_sha256"])
+
+    assert set(foundation) == set(FOUNDATION_BOUND_TASKS)
+    assert "input_sha256" not in state.value, (
+        "the foundation bind invented a whole-input digest"
+    )
+
+    state.record("nlb_network", {"load_balancer_arn": "arn:nlb"})
+    state.complete("nlb_network")
+    bind_bootstrap_inputs(
+        state,
+        request=request,
+        cpu=_cluster(),
+        gpu_clusters=(_gpu_cluster(),),
+        release=release,
+    )
+    full = dict(state.value["task_input_sha256"])
+
+    assert {name: full[name] for name in FOUNDATION_BOUND_TASKS} == foundation, (
+        "the two binds digest a release-independent task differently"
+    )
+    assert set(full) == set(FOUNDATION_BOUND_TASKS) | set(RELEASE_BOUND_TASKS)
+    assert state.value["completed_tasks"] == ["nlb_network"], (
+        "the full bind erased a task completed between the two binds"
+    )
+
+
+def test_a_stale_foundation_checkpoint_reruns_in_the_deploy_that_changed_its_inputs(
+    tmp_path: Path,
+) -> None:
+    """``run_parallel`` reads ``completed_tasks`` once, when the graph starts.
+    Bound only after the image build, a changed digest reached the state
+    minutes too late and the stale checkpoint was trusted for one more deploy;
+    bound before the graph, the task runs again now."""
+
+    request, _release = _foundation_request(tmp_path)
+    path = request.state_dir / "bootstrap-state.json"
+    previous = BootstrapState(path, site_id="site-a")
+    previous.record("nlb_network", {"load_balancer_arn": "arn:previous"})
+    previous.complete("nlb_network")
+    previous.bind_inputs("a" * 64, {"nlb_network": "0" * 64})
+    ran: list[str] = []
+
+    def ensure_nlb_network() -> dict[str, str]:
+        ran.append("nlb_network")
+        return {"load_balancer_arn": "arn:new"}
+
+    trusted = BootstrapState(path, site_id="site-a")
+    assert run_parallel({"nlb_network": ensure_nlb_network}, state=trusted) == {
+        "nlb_network": {"load_balancer_arn": "arn:previous"}
+    }
+    assert ran == [], "the unbound graph did not trust the checkpoint"
+
+    state = BootstrapState(path, site_id="site-a")
+    bind_foundation_inputs(
+        state, request=request, cpu=_cluster(), gpu_clusters=(_gpu_cluster(),)
+    )
+    assert run_parallel({"nlb_network": ensure_nlb_network}, state=state) == {
+        "nlb_network": {"load_balancer_arn": "arn:new"}
+    }
+    assert ran == ["nlb_network"], (
+        "a checkpoint whose inputs changed was trusted after the foundation bind"
+    )
 
 
 def _control_plane_identity_runner(calls: list[list[str]]):

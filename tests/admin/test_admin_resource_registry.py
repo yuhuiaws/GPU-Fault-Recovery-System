@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
 from gpu_fault.admin import resource_registry as admin_resource_registry
-from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_join_commit import registry_delta
 from gpu_fault.admin.resource_registry import (
     LegacyInstallationRegistryMissing,
@@ -17,6 +18,11 @@ from gpu_fault.admin.resource_registry import (
     load_installation_resource_snapshot,
     write_installation_resource_snapshot,
 )
+from gpu_fault.admin.resource_registry_dns import (
+    vpc_association_entry,
+    vpc_association_resource,
+    zone_vpc_associations,
+)
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -25,6 +31,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceSnapshot,
     InstallationResourceStatus,
 )
+from tests.admin._bootstrap_support import _cluster
 from tests.admin.test_admin_site import site_file
 
 
@@ -253,6 +260,286 @@ def test_registry_records_ownership_dependencies_and_delete_policy(tmp_path) -> 
         for resource in snapshot.resources
         for key in resource.attributes
     )
+
+
+CPU_ASSOCIATION = {
+    "vpc_id": "vpc-cpu",
+    "vpc_region": "us-east-1",
+    "ownership": "CREATED",
+}
+ASSOCIATION_KEY = "aws/route53/vpc-association/"
+TIMESTAMPS = {"created_at", "updated_at"}
+
+
+def _legacy_association(vpc_id: str, ownership: str = "CREATED") -> dict:
+    """A ``pki.vpc_associations`` item written before ``cluster_ids`` existed."""
+
+    return {"vpc_id": vpc_id, "vpc_region": "us-east-1", "ownership": ownership}
+
+
+def _zone_state(
+    *associations: dict, zone_ownership: str = "CREATED", joined: dict | None = None
+) -> dict:
+    """The fixture state with the private zone's recorded VPC associations; the
+    CPU VPC (the NLB network's VPC) is always the first, as bootstrap writes it."""
+
+    state = _bootstrap_state()
+    pki = state["resources"]["pki"]
+    pki["zone_ownership"] = zone_ownership
+    pki["vpc_associations"] = [dict(CPU_ASSOCIATION), *associations]
+    if joined is not None:
+        state["joined_clusters"] = joined
+    return state
+
+
+def _association_rows(site, state) -> dict[str, InstallationResource]:
+    return {
+        resource.resource_key: resource
+        for resource in build_installation_snapshot(site, state, {}).resources
+        if resource.resource_type == "route53_vpc_association"
+    }
+
+
+def test_a_bootstrap_created_gpu_vpc_association_is_registered_like_a_joined_one(
+    tmp_path,
+) -> None:
+    """Finding A (staging-1, 2026-09-15): the association bootstrap created for
+    the GPU VPC never reached the registry -- ``_pki_resources`` skipped every
+    association of a CREATED zone -- while the same association created by
+    join was registered as ``aws/route53/vpc-association/<cluster_id>``. Both
+    paths now yield one row of the join's shape, built by the same helper the
+    join commit uses, so a re-sync after a join cannot add a second key for
+    the VPC (the sync API only upserts; a stale row never disappears)."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        vpc_association_entry(
+            vpc_id="vpc-gpu-a", vpc_region="us-east-1", cluster_ids=["gpu-a"]
+        )
+    )
+
+    rows = _association_rows(site, state)
+
+    assert list(rows) == [ASSOCIATION_KEY + "gpu-a"]
+    row = rows[ASSOCIATION_KEY + "gpu-a"]
+    assert row.resource_type == "route53_vpc_association"
+    assert row.resource_id == "ZTEST123:us-east-1:vpc-gpu-a"
+    assert row.ownership is InstallationResourceOwnership.CREATED
+    assert row.delete_policy is InstallationResourceDeletePolicy.DETACH
+    assert row.dependencies == ["aws/route53/zone"]
+    assert row.attributes == {
+        "hosted_zone_id": "ZTEST123",
+        "vpc_id": "vpc-gpu-a",
+        "vpc_region": "us-east-1",
+    }
+    joined = vpc_association_resource(
+        site_id="test-site",
+        owner="gpu-a",
+        hosted_zone_id="ZTEST123",
+        vpc_id="vpc-gpu-a",
+        vpc_region="us-east-1",
+        region="us-east-1",
+        account_id="123456789012",
+    )
+    assert row.model_dump(exclude=TIMESTAMPS) == joined.model_dump(exclude=TIMESTAMPS)
+
+
+def test_the_cpu_vpc_association_is_never_registered(tmp_path) -> None:
+    """A private zone cannot lose its last VPC: the CPU VPC association goes
+    with the zone, so a row for it would hand uninstall a detach Route53
+    refuses. It is recognised as the NLB network's VPC or, for a state that
+    never recorded one, as the first association bootstrap wrote (the zone
+    is created with it) -- and skipped even when it lists the GPU clusters
+    that share the CPU VPC."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        vpc_association_entry(
+            vpc_id="vpc-gpu-a", vpc_region="us-east-1", cluster_ids=["gpu-a"]
+        )
+    )
+    state["resources"]["pki"]["vpc_associations"][0]["cluster_ids"] = ["gpu-shared"]
+
+    assert list(_association_rows(site, state)) == [ASSOCIATION_KEY + "gpu-a"]
+
+    del state["resources"]["nlb_network"]["vpc_id"]
+
+    assert list(_association_rows(site, state)) == [ASSOCIATION_KEY + "gpu-a"], (
+        "without the NLB network's VPC the first recorded association is the CPU's"
+    )
+
+
+def test_an_external_zone_registers_associations_under_the_same_keys(tmp_path) -> None:
+    """Zone ownership no longer decides whether associations are registered
+    (before: a CREATED zone registered none, an EXTERNAL zone registered
+    every one -- the CPU VPC included -- under its 1-based position). Each
+    row's policy follows the association's own recorded ownership: one the
+    site created is detached before the zone delete wave, one it found is
+    preserved."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        vpc_association_entry(
+            vpc_id="vpc-gpu-a", vpc_region="us-east-1", cluster_ids=["gpu-a"]
+        ),
+        vpc_association_entry(
+            vpc_id="vpc-gpu-b",
+            vpc_region="us-east-1",
+            cluster_ids=["gpu-b"],
+            ownership="EXTERNAL",
+        ),
+        zone_ownership="EXTERNAL",
+    )
+
+    rows = _association_rows(site, state)
+
+    assert sorted(rows) == [ASSOCIATION_KEY + "gpu-a", ASSOCIATION_KEY + "gpu-b"]
+    created = rows[ASSOCIATION_KEY + "gpu-a"]
+    assert created.ownership is InstallationResourceOwnership.CREATED
+    assert created.delete_policy is InstallationResourceDeletePolicy.DETACH
+    found = rows[ASSOCIATION_KEY + "gpu-b"]
+    assert found.ownership is InstallationResourceOwnership.EXTERNAL
+    assert found.delete_policy is InstallationResourceDeletePolicy.PRESERVE
+
+
+def test_a_legacy_association_is_keyed_from_the_cluster_that_joined_with_it(
+    tmp_path,
+) -> None:
+    """Live staging-1: join appended ``{vpc_id, vpc_region, ownership}`` with no
+    cluster ids and registered ``aws/route53/vpc-association/hp-cluster-…``;
+    a re-sync from that checkpoint must derive the same key from
+    ``joined_clusters`` or Aurora holds the VPC under two keys."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        _legacy_association("vpc-gpu-b"),
+        joined={
+            "gpu-b": {"joined_at": "2026-09-15T06:23:59+00:00", "vpc_id": "vpc-gpu-b"}
+        },
+    )
+
+    assert list(_association_rows(site, state)) == [ASSOCIATION_KEY + "gpu-b"]
+
+
+def test_a_legacy_association_of_the_only_unaccounted_cluster_is_that_clusters(
+    tmp_path,
+) -> None:
+    """A site bootstrapped with one GPU cluster before cluster ids were
+    recorded: bootstrap associated exactly the GPU clusters' VPCs, so the one
+    GPU association can only belong to the one cluster nothing else accounts
+    for (the site fixture's ``gpu-a``)."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(_legacy_association("vpc-gpu-a"))
+
+    assert list(_association_rows(site, state)) == [ASSOCIATION_KEY + "gpu-a"]
+
+
+def test_a_legacy_association_nobody_can_be_derived_for_keeps_its_index_key(
+    tmp_path,
+) -> None:
+    """Two legacy associations and one site cluster: the mapping is ambiguous,
+    so rather than guess a cluster the rows keep the pre-2026-09-15 key, the
+    1-based position in ``pki.vpc_associations`` with the CPU VPC counting
+    as position 1 (it is still not registered)."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        _legacy_association("vpc-gpu-x"), _legacy_association("vpc-gpu-y")
+    )
+
+    rows = _association_rows(site, state)
+
+    assert sorted(rows) == [ASSOCIATION_KEY + "2", ASSOCIATION_KEY + "3"]
+    assert rows[ASSOCIATION_KEY + "2"].attributes["vpc_id"] == "vpc-gpu-x"
+    assert rows[ASSOCIATION_KEY + "3"].attributes["vpc_id"] == "vpc-gpu-y"
+
+
+def test_a_vpc_shared_by_two_clusters_is_registered_once_under_the_first(
+    tmp_path,
+) -> None:
+    """Bootstrap associates a VPC once however many GPU clusters live in it and
+    join registers only the association it created, so the registry holds one
+    row per VPC keyed by the first cluster id; a duplicate checkpoint entry for
+    the same VPC adds no second row."""
+
+    site = load_site(site_file(tmp_path))
+    state = _zone_state(
+        vpc_association_entry(
+            vpc_id="vpc-shared", vpc_region="us-east-1", cluster_ids=["gpu-b", "gpu-a"]
+        ),
+        _legacy_association("vpc-shared"),
+    )
+
+    assert list(_association_rows(site, state)) == [ASSOCIATION_KEY + "gpu-a"]
+
+
+def _gpu(cluster_id: str, vpc_id: str) -> ClusterIdentity:
+    return replace(
+        _cluster(),
+        input_arn=f"arn:aws:eks:us-east-1:123456789012:cluster/{cluster_id}",
+        role="gpu",
+        hyperpod_arn=f"arn:aws:sagemaker:us-east-1:123456789012:cluster/{cluster_id}",
+        hyperpod_name=cluster_id,
+        eks_arn=f"arn:aws:eks:us-east-1:123456789012:cluster/{cluster_id}",
+        eks_name=cluster_id,
+        vpc_id=vpc_id,
+        context=cluster_id,
+    )
+
+
+def test_bootstrap_records_the_gpu_clusters_of_each_zone_vpc_association(
+    tmp_path,
+) -> None:
+    """What ``_ensure_private_zone`` records through ``zone_vpc_associations``:
+    the CPU VPC first as the zone's native association, then one CREATED entry
+    per distinct GPU VPC naming the
+    sorted ids of the clusters in it; a GPU cluster inside the CPU VPC is listed
+    on the CPU entry and gets no association of its own. Read back through the
+    registry, the entries yield exactly the keys join would have written for
+    the same clusters."""
+
+    cpu = _cluster()
+    associations = zone_vpc_associations(
+        cpu,
+        [
+            _gpu("gpu-b", "vpc-shared"),
+            _gpu("gpu-a", "vpc-shared"),
+            _gpu("gpu-c", "vpc-c"),
+            _gpu("gpu-d", cpu.vpc_id),
+        ],
+    )
+
+    assert associations == [
+        {
+            "vpc_id": "vpc-control",
+            "vpc_region": "us-east-1",
+            "ownership": "CREATED",
+            "cluster_ids": ["gpu-d"],
+        },
+        {
+            "vpc_id": "vpc-c",
+            "vpc_region": "us-east-1",
+            "ownership": "CREATED",
+            "cluster_ids": ["gpu-c"],
+        },
+        {
+            "vpc_id": "vpc-shared",
+            "vpc_region": "us-east-1",
+            "ownership": "CREATED",
+            "cluster_ids": ["gpu-a", "gpu-b"],
+        },
+    ]
+
+    site = load_site(site_file(tmp_path))
+    state = _bootstrap_state()
+    state["resources"]["nlb_network"]["vpc_id"] = cpu.vpc_id
+    state["resources"]["pki"]["vpc_associations"] = associations
+
+    assert sorted(_association_rows(site, state)) == [
+        ASSOCIATION_KEY + "gpu-a",
+        ASSOCIATION_KEY + "gpu-c",
+    ]
 
 
 LEGACY_QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/123456789012/test-alerts"

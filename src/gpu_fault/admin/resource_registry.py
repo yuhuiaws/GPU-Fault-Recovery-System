@@ -25,6 +25,7 @@ from gpu_fault.admin.resource_records import record as _record
 from gpu_fault.admin.resource_records import (
     release_repository_resources as _release_repository_resources,
 )
+from gpu_fault.admin.resource_registry_dns import vpc_association_resources
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -371,7 +372,13 @@ def _pki_resources(
     account_id: str,
     config: Mapping[str, Any],
     state: Mapping[str, Any],
+    joined_clusters: Mapping[str, Any] | None = None,
 ) -> list[InstallationResource]:
+    """The zone, its control-plane record, the GPU-VPC associations, ACM and PKI.
+
+    The associations follow ``resource_registry_dns.vpc_association_resources``:
+    one rule for bootstrap- and join-created ones (finding A, 2026-09-15).
+    """
     resources: list[InstallationResource] = []
     pki = state.get("pki") or {}
     dns = config.get("dns") or {}
@@ -417,37 +424,17 @@ def _pki_resources(
                 },
             )
         )
-    for index, association in enumerate(pki.get("vpc_associations") or (), 1):
-        ownership = _ownership(
-            association.get("ownership"),
-            default=InstallationResourceOwnership.CREATED,
+    resources.extend(
+        vpc_association_resources(
+            site_id=site_id,
+            region=region,
+            account_id=account_id,
+            hosted_zone_id=str(zone_id) if zone_id else None,
+            config=config,
+            state=state,
+            joined_clusters=joined_clusters or {},
         )
-        if zone_ownership is InstallationResourceOwnership.CREATED:
-            continue
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key=f"aws/route53/vpc-association/{index}",
-                resource_type="route53_vpc_association",
-                resource_id=(
-                    f"{zone_id}:{association.get('vpc_region')}:"
-                    f"{association.get('vpc_id')}"
-                ),
-                region=region,
-                account_id=account_id,
-                ownership=ownership,
-                delete_policy=_policy(
-                    ownership,
-                    created=InstallationResourceDeletePolicy.DETACH,
-                ),
-                dependencies=["aws/route53/zone"],
-                attributes={
-                    "hosted_zone_id": zone_id,
-                    "vpc_id": association.get("vpc_id"),
-                    "vpc_region": association.get("vpc_region"),
-                },
-            )
-        )
+    )
     certificate = pki.get("certificate_arn") or config["nlb"].get("certificate_arn")
     if certificate:
         ownership = _ownership(
@@ -998,6 +985,7 @@ def build_installation_snapshot(
             account_id=account_id,
             config=config,
             state=state,
+            joined_clusters=(bootstrap or {}).get("joined_clusters") or {},
         )
     )
     resources.extend(

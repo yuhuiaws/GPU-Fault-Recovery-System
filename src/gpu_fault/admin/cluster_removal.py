@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Collection, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -825,13 +825,36 @@ def _detach_network(
     }
 
 
-def _target_resource(resource: InstallationResource, cluster_id: str) -> bool:
+def _target_resource(
+    resource: InstallationResource,
+    cluster_id: str,
+    *,
+    exclusive_vpc_id: str | None = None,
+    shared_vpcs: Collection[str] = (),
+) -> bool:
     resource_key = str(resource.resource_key)
-    return (
+    if (
         resource_key.startswith(f"aws/iam/executor/{cluster_id}/")
         or resource_key.startswith(f"aws/iam/adot-writer/{cluster_id}/")
         or resource_key.startswith(f"cluster/{cluster_id}/")
-        or resource_key == f"aws/route53/vpc-association/{cluster_id}"
+    ):
+        return True
+    association_key = f"aws/route53/vpc-association/{cluster_id}"
+    if (
+        resource.resource_type != "route53_vpc_association"
+        and resource_key != association_key
+    ):
+        return False
+    # The registry holds one association row per VPC, keyed by the first
+    # cluster that used it. A VPC a remaining cluster still uses keeps its row
+    # ACTIVE (``_detach_network`` skips it too); the last user of a VPC takes
+    # the row whichever cluster id keys it, so no ACTIVE row outlives the
+    # association.
+    vpc_id = resource.attributes.get("vpc_id")
+    if vpc_id and vpc_id in shared_vpcs:
+        return False
+    return resource_key == association_key or bool(
+        exclusive_vpc_id and vpc_id == exclusive_vpc_id
     )
 
 
@@ -865,12 +888,30 @@ def _deletion_waves(
 def _remove_target_aws_resources(
     request: RemoveClusterRequest,
     snapshot: InstallationResourceSnapshot,
+    *,
+    target_vpc_id: str | None = None,
+    remaining_vpcs: Collection[str] = (),
+    cpu_vpc_id: str | None = None,
 ) -> tuple[InstallationResourceSnapshot, dict[str, Any]]:
     cleaner = ResourceCleaner(request.site)
+    # Mirrors ``_detach_network``: the target's VPC association is released
+    # only when no remaining cluster uses the VPC and it is not the CPU VPC.
+    exclusive_vpc_id = (
+        target_vpc_id
+        if target_vpc_id
+        and target_vpc_id not in remaining_vpcs
+        and target_vpc_id != cpu_vpc_id
+        else None
+    )
     selected = [
         resource
         for resource in snapshot.resources
-        if _target_resource(resource, request.cluster_id)
+        if _target_resource(
+            resource,
+            request.cluster_id,
+            exclusive_vpc_id=exclusive_vpc_id,
+            shared_vpcs=remaining_vpcs,
+        )
     ]
     # Exactly one executor role; the data-plane ADOT writer role is optional (a
     # site without an AMP workspace has none) and is the only other role the
@@ -1276,7 +1317,13 @@ def _remove_cluster_locked(
             remaining_networks=remaining_networks,
             cpu_vpc_id=cpu_vpc_id,
         )
-        updated, resources = _remove_target_aws_resources(request, snapshot)
+        updated, resources = _remove_target_aws_resources(
+            request,
+            snapshot,
+            target_vpc_id=str(target_network["vpc_id"]),
+            remaining_vpcs={str(item["vpc_id"]) for item in remaining_networks},
+            cpu_vpc_id=cpu_vpc_id,
+        )
         write_installation_resource_snapshot(
             request.site,
             updated,

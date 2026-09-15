@@ -291,6 +291,10 @@ class BootstrapState:
     def __init__(self, path: Path, *, site_id: str) -> None:
         self.path = path
         self._lock = threading.Lock()
+        # The tasks this process completed. A bind never drops one of these:
+        # it ran against the very inputs being bound, so its checkpoint is
+        # current by construction. A state loaded from disk starts empty here.
+        self._completed_this_run: set[str] = set()
         if path.is_file():
             self.value = json.loads(path.read_text(encoding="utf-8"))
             if self.value.get("site_id") != site_id:
@@ -321,28 +325,51 @@ class BootstrapState:
             completed = set(self.value["completed_tasks"])
             completed.add(task)
             self.value["completed_tasks"] = sorted(completed)
+            self._completed_this_run.add(task)
             self._write()
 
     def bind_inputs(
         self,
-        digest: str,
+        digest: str | None,
         task_digests: Mapping[str, str] | None = None,
     ) -> None:
+        """Drop the checkpoints whose inputs changed and record the new inputs.
+
+        With ``task_digests``, only the tasks it names are judged: a named task
+        stays completed if this process completed it or its recorded digest
+        equals the new one, and is dropped otherwise; a task it does not name is
+        left as it is, recorded digest included. The new digests are merged over
+        the recorded ones. That is what lets the release-independent tasks be
+        bound before the graph starts and the release-dependent ones after the
+        build, without the later bind judging tasks it carries no digest for.
+
+        ``digest`` is the whole-input digest; ``None`` leaves the recorded one
+        untouched. Without ``task_digests`` (the pre-v3 shape) a changed
+        whole-input digest clears every checkpoint but this process's own.
+        """
+
         with self._lock:
+            completed = list(self.value["completed_tasks"])
             if task_digests is None:
-                if self.value.get("input_sha256") != digest:
-                    self.value["completed_tasks"] = []
+                if digest is not None and self.value.get("input_sha256") != digest:
+                    completed = [
+                        task for task in completed if task in self._completed_this_run
+                    ]
             else:
                 previous = self.value.get("task_input_sha256")
-                previous = previous if isinstance(previous, dict) else {}
-                completed = {
+                recorded = dict(previous) if isinstance(previous, dict) else {}
+                completed = [
                     task
-                    for task in self.value["completed_tasks"]
-                    if previous.get(task) == task_digests.get(task)
-                }
-                self.value["completed_tasks"] = sorted(completed)
-                self.value["task_input_sha256"] = dict(sorted(task_digests.items()))
-            self.value["input_sha256"] = digest
+                    for task in completed
+                    if task not in task_digests
+                    or task in self._completed_this_run
+                    or recorded.get(task) == task_digests[task]
+                ]
+                recorded.update(task_digests)
+                self.value["task_input_sha256"] = dict(sorted(recorded.items()))
+            self.value["completed_tasks"] = sorted(set(completed))
+            if digest is not None:
+                self.value["input_sha256"] = digest
             self._write()
 
     def phase(self, value: str) -> None:

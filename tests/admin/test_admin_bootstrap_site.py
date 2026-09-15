@@ -269,10 +269,12 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     )
     scopes: dict[str, tuple[str, ...]] = {}
     namespaced: list[str | None] = []
+    order: list[str] = []
 
     def record(name: str, result=None):
         def step(*_arguments, gpu_clusters=(), **_kwargs):
             scopes[name] = tuple(cluster.hyperpod_name for cluster in gpu_clusters)
+            order.append(name)
             return result
 
         return step
@@ -288,6 +290,12 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     monkeypatch.setattr(admin_bootstrap, "_require_same_scope", lambda *_a, **_k: None)
     monkeypatch.setattr(
         admin_bootstrap, "bootstrap_gpu_scope", lambda *_arguments: [gpu_a]
+    )
+    # The release-independent task digests are bound to the baseline scope
+    # before the release build is started and before any graph reads its
+    # checkpoint (see ``bind_foundation_inputs``).
+    monkeypatch.setattr(
+        admin_bootstrap, "bind_foundation_inputs", record("foundation_bind")
     )
     monkeypatch.setattr(
         admin_bootstrap,
@@ -341,18 +349,19 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     # answers for both former phases.
     monkeypatch.setattr(admin_bootstrap, "foundation_task_graph", record("foundation"))
     monkeypatch.setattr(admin_bootstrap, "platform_task_graph", record("platform"))
-    monkeypatch.setattr(
-        admin_bootstrap,
-        "run_bootstrap_tasks",
-        lambda **_keywords: {
+
+    def run_tasks(**_keywords):
+        order.append("graph")
+        return {
             "executor_role:gpu-a": {"role_arn": "arn:aws:iam::1:role/gpu-a"},
             "aurora": {"cluster_id": "c"},
             "aurora_ready": {"master_secret_arn": "arn:new"},
             "monitoring_resources": {},
             "nlb_network": {},
             "pki": {},
-        },
-    )
+        }
+
+    monkeypatch.setattr(admin_bootstrap, "run_bootstrap_tasks", run_tasks)
     documents: dict[str, object] = {}
 
     def site_document(*_arguments, gpu_clusters=(), aurora=None, **_kwargs):
@@ -387,6 +396,7 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
     assert documents["aurora"] == {"cluster_id": "c", "master_secret_arn": "arn:new"}
     baseline = (gpu_a.hyperpod_name,)
     assert scopes == {
+        "foundation_bind": baseline,
         "release": baseline,
         "kubeconfigs": baseline,
         "secure_files": baseline,
@@ -395,6 +405,14 @@ def test_bootstrap_uses_the_baseline_scope_for_all_gpu_mutations(
         "site_document": baseline,
         "finalize": (gpu_a.hyperpod_name, gpu_b.hyperpod_name),
     }
+    # The release build is submitted only after the bind returned, so the order
+    # below is decided by the call sequence, not by thread timing.
+    assert order.index("foundation_bind") < order.index("release"), (
+        "the release build started before the foundation digests were bound"
+    )
+    assert order.index("foundation_bind") < order.index("graph"), (
+        "the graph read its checkpoint before the foundation digests were bound"
+    )
     # The CPU and GPU namespace chains run on their own threads, so only the
     # set is deterministic.
     assert sorted(namespaced, key=str) == sorted([None, gpu_a.context], key=str), (

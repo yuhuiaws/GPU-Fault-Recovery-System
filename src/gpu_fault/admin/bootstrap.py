@@ -33,7 +33,11 @@ from gpu_fault.admin.bootstrap_aurora import (
     reconcile_cluster_diagnostics,
     reconcile_existing_capacity,
 )
-from gpu_fault.admin.bootstrap_checkpoint import HYPERPOD_HINTS, load_hyperpod_hints
+from gpu_fault.admin.bootstrap_checkpoint import (
+    HYPERPOD_HINTS,
+    bind_foundation_inputs,
+    load_hyperpod_hints,
+)
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
     Arn,
@@ -47,27 +51,15 @@ from gpu_fault.admin.bootstrap_common import (
     describe_or_absent,
     tag_map,
 )
-from gpu_fault.admin.bootstrap_common import (
-    ensure_namespace as _ensure_namespace,
-)
-from gpu_fault.admin.bootstrap_common import (
-    kubectl_apply as _kubectl_apply,
-)
+from gpu_fault.admin.bootstrap_common import ensure_namespace as _ensure_namespace
+from gpu_fault.admin.bootstrap_common import kubectl_apply as _kubectl_apply
 from gpu_fault.admin.bootstrap_common import safe_name as _safe_name
-from gpu_fault.admin.bootstrap_common import (
-    write_secret as _write_secret,
-)
-from gpu_fault.admin.bootstrap_common import (
-    write_yaml as _write_yaml,
-)
+from gpu_fault.admin.bootstrap_common import write_secret as _write_secret
+from gpu_fault.admin.bootstrap_common import write_yaml as _write_yaml
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
 from gpu_fault.admin.bootstrap_network import RouteTableIndex
-from gpu_fault.admin.bootstrap_network import (
-    describe_subnets as _describe_subnets,
-)
-from gpu_fault.admin.bootstrap_network import (
-    private_subnets as _private_subnets,
-)
+from gpu_fault.admin.bootstrap_network import describe_subnets as _describe_subnets
+from gpu_fault.admin.bootstrap_network import private_subnets as _private_subnets
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
 )
@@ -78,11 +70,8 @@ from gpu_fault.admin.bootstrap_site import (
     discover_subnet_cidrs,
     finalize_bootstrap_site,
     hyperpod_inventory,
-    unique_gpu_vpcs,
 )
-from gpu_fault.admin.bootstrap_site import (
-    site_identifier as _site_identifier,
-)
+from gpu_fault.admin.bootstrap_site import site_identifier as _site_identifier
 from gpu_fault.admin.bootstrap_tasks import (
     foundation_task_graph,
     platform_task_graph,
@@ -100,6 +89,7 @@ from gpu_fault.admin.release_repositories import (
     SignedReleaseBuild,
     prepare_signed_release,
 )
+from gpu_fault.admin.resource_registry_dns import zone_vpc_associations
 from gpu_fault.admin.site import bootstrap_archive_s3_uri
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
@@ -1022,53 +1012,39 @@ def _ensure_private_zone(
             (str(item.get("VPCRegion") or ""), str(item.get("VPCId") or ""))
             for item in details.get("VPCs", [])
         }
-    associations = [
-        {
-            "vpc_id": cpu.vpc_id,
-            "vpc_region": cpu.region,
-            "ownership": "CREATED",
-        }
-    ]
+    # The CPU VPC first (the zone's native association), then each distinct
+    # GPU VPC naming the clusters in it: the registry keys the association by
+    # the first of them, exactly as join keys the one it creates by the
+    # joining cluster (finding A, 2026-09-15).
+    planned = zone_vpc_associations(cpu, gpu_clusters)
+    associations = [planned[0]]
     associated_vpcs.add((cpu.region, cpu.vpc_id))
-    for region, vpc_id in unique_gpu_vpcs(cpu, gpu_clusters):
-        association = (region, vpc_id)
-        if association in associated_vpcs:
-            associations.append(
-                {
-                    "vpc_id": vpc_id,
-                    "vpc_region": region,
-                    "ownership": "CREATED",
-                }
+    for association in planned[1:]:
+        vpc_region = str(association["vpc_region"])
+        vpc_id = str(association["vpc_id"])
+        if (vpc_region, vpc_id) not in associated_vpcs:
+            result = subprocess.run(
+                [
+                    "aws",
+                    "route53",
+                    "associate-vpc-with-hosted-zone",
+                    "--hosted-zone-id",
+                    zone_id,
+                    "--vpc",
+                    f"VPCRegion={vpc_region},VPCId={vpc_id}",
+                    "--comment",
+                    "GPU fault managed data plane",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
             )
-            continue
-        result = subprocess.run(
-            [
-                "aws",
-                "route53",
-                "associate-vpc-with-hosted-zone",
-                "--hosted-zone-id",
-                zone_id,
-                "--vpc",
-                f"VPCRegion={region},VPCId={vpc_id}",
-                "--comment",
-                "GPU fault managed data plane",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode and not any(
-            value in result.stderr for value in ("PriorRequestNotComplete",)
-        ):
-            raise BootstrapError(result.stderr.strip())
-        associations.append(
-            {
-                "vpc_id": vpc_id,
-                "vpc_region": region,
-                "ownership": "CREATED",
-            }
-        )
-        associated_vpcs.add(association)
+            if result.returncode and not any(
+                value in result.stderr for value in ("PriorRequestNotComplete",)
+            ):
+                raise BootstrapError(result.stderr.strip())
+            associated_vpcs.add((vpc_region, vpc_id))
+        associations.append(association)
     return {
         "zone_name": zone_name.rstrip("."),
         "hosted_zone_id": zone_id,
@@ -1879,6 +1855,16 @@ def bootstrap_from_arns(
     managed_gpu_clusters = bootstrap_gpu_scope(state, existing_site, cpu, gpu_clusters)
     _remember_hyperpod_hints(state, cpu, gpu_clusters)
     state.phase("discovered")
+    # Reading the admin config can migrate a legacy record in place; do it before
+    # the task digests read that file, so both binds digest the same bytes.
+    aurora_capacity = bootstrap_aurora_capacity(request.state_dir)
+    # Bound before the release build starts and before any graph reads
+    # ``completed_tasks``, so a checkpoint whose inputs changed re-runs in this
+    # deploy rather than the next, and nothing this run completes before the
+    # build finishes is erased by the full bind (``bind_foundation_inputs``).
+    bind_foundation_inputs(
+        state, request=request, cpu=cpu, gpu_clusters=tuple(managed_gpu_clusters)
+    )
     release_build = SignedReleaseBuild(
         prepare_signed_release,
         existing_site=existing_site,
@@ -1929,7 +1915,7 @@ def bootstrap_from_arns(
             state_dir=request.state_dir,
             admin_email=admin_email,
             routing=routing,
-            aurora_capacity=bootstrap_aurora_capacity(request.state_dir),
+            aurora_capacity=aurora_capacity,
             ensure_nlb_network=_ensure_nlb_network,
             ensure_pki=_ensure_pki,
             ensure_aurora=_ensure_aurora,

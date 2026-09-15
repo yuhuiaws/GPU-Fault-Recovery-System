@@ -18,6 +18,7 @@ from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_batch_join import join_clusters
 from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution, join_cluster
 from gpu_fault.admin.cluster_join_evidence import JoinVerificationExpired
+from gpu_fault.admin.resource_registry_dns import vpc_association_resource
 from gpu_fault.admin.site import load_site
 from gpu_fault.installation_resources import (
     InstallationResource,
@@ -163,6 +164,69 @@ def _joined_prerequisites() -> dict:
     }
 
 
+def _seed_bootstrap_state(site_path: Path) -> Path:
+    """A checkpoint beside site.yaml holding the zone and its CPU VPC association, so
+    the join's real ``_update_bootstrap_state`` has something to append to."""
+
+    path = site_path.parent / "bootstrap-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "site_id": "test-site",
+                "resources": {
+                    "pki": {
+                        "hosted_zone_id": "Z123",
+                        "vpc_associations": [
+                            {
+                                "vpc_id": "vpc-cpu",
+                                "vpc_region": "us-east-1",
+                                "ownership": "CREATED",
+                            }
+                        ],
+                    }
+                },
+                "completed_tasks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _assert_association_committed(
+    snapshot: InstallationResourceSnapshot, bootstrap_state: Path
+) -> None:
+    """The join's Route53 association row is the shared registry shape and its
+    checkpoint entry names the cluster the registry keys it by (finding A)."""
+
+    association = next(
+        item
+        for item in snapshot.resources
+        if item.resource_key == "aws/route53/vpc-association/hp-gpu-b"
+    )
+    expected = vpc_association_resource(
+        site_id="test-site",
+        owner="hp-gpu-b",
+        hosted_zone_id="Z123",
+        vpc_id="vpc-gpu-b",
+        vpc_region="us-east-1",
+        region="us-east-1",
+        account_id="123456789012",
+    )
+    timestamps = {"created_at", "updated_at"}
+    assert association.model_dump(exclude=timestamps) == expected.model_dump(
+        exclude=timestamps
+    ), "the join registers its association in a shape of its own"
+    recorded = json.loads(bootstrap_state.read_text(encoding="utf-8"))
+    assert recorded["resources"]["pki"]["vpc_associations"][-1] == {
+        "vpc_id": "vpc-gpu-b",
+        "vpc_region": "us-east-1",
+        "ownership": "CREATED",
+        "cluster_ids": ["hp-gpu-b"],
+    }, "the checkpoint entry does not name the cluster the registry keys it by"
+    assert recorded["joined_clusters"]["hp-gpu-b"]["vpc_id"] == "vpc-gpu-b"
+
+
 def _assert_adot_writer_committed(snapshot: InstallationResourceSnapshot, site) -> None:
     """The created ADOT writer role is registered for cleanup and named in the site."""
 
@@ -270,9 +334,7 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
         "_parallel_prerequisites",
         lambda *_args, **_kwargs: _joined_prerequisites(),
     )
-    monkeypatch.setattr(
-        admin_cluster_join, "_update_bootstrap_state", lambda *_args, **_kwargs: None
-    )
+    bootstrap_state = _seed_bootstrap_state(path)
     monkeypatch.setattr(
         admin_cluster_join,
         "sync_cluster_release_state",
@@ -375,6 +437,7 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     )
     assert len(synced) == 1, "a resumed COMPLETED join re-sent the registry delta"
     _assert_adot_writer_committed(synced[-1], updated)
+    _assert_association_committed(synced[-1], bootstrap_state)
     assert rollout_calls == [
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),

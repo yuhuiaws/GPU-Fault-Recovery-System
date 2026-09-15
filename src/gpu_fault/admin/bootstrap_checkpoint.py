@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -105,18 +106,17 @@ def _manifest_wheel_sha256(root: Path, manifest: Path) -> str | None:
     return _file_sha256(wheel)
 
 
-def _platform_task_digests(
+def _release_task_digests(
     task_digest: Callable[[str, object], str],
     *,
     assets: Mapping[str, str | None],
     images: Mapping[str, Any],
     alert_email: str | None,
     control_plane_wheel_sha256: str | None,
-    gpu_identity: Sequence[Mapping[str, Any]],
     dashboards: Mapping[str, str],
     grafana: Mapping[str, Any],
 ) -> dict[str, str]:
-    """Digest the probe-before-ensure tasks against their real inputs.
+    """Digest the two probe-before-ensure tasks that ship a release image.
 
     These tasks install live resources whose desired state is decided by the
     assets they apply and by the images and wheel bytes they reference, not by
@@ -124,9 +124,14 @@ def _platform_task_digests(
     re-run them even when nothing they touch changed; drift that no static input
     can describe (node membership, out-of-band edits) is caught by the read-only
     probes instead.
+
+    Besides `release` itself they are the only tasks whose digest needs the
+    built release, so they are bound after the build (`bind_bootstrap_inputs`)
+    while every other task is bound before the graph starts
+    (`bind_foundation_inputs`).
     """
 
-    digests = {
+    return {
         "monitoring_install": task_digest(
             "monitoring_install",
             {
@@ -159,29 +164,37 @@ def _platform_task_digests(
             },
         ),
     }
-    for cluster_identity in gpu_identity:
-        cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        name = f"node_keys:{cluster_id}"
-        digests[name] = task_digest(
-            name,
-            {
-                "asset": assets["deploy/node/provision-node-action-keys.sh"],
-                "cluster": cluster_identity,
-            },
-        )
-    return digests
 
 
-def bind_bootstrap_inputs(
+@dataclass(frozen=True)
+class _FoundationInputs:
+    """What the task digests read that is known before the release is built,
+    and the digests of the tasks that read nothing else.
+
+    Both binds are computed from one of these, so the digest a task gets before
+    the graph starts is byte-identical to the one the full bind records for it
+    after the build.
+    """
+
+    root: Path
+    sources: Mapping[str, str | None]
+    assets: Mapping[str, str | None]
+    cpu_identity: Mapping[str, Any]
+    gpu_identity: Sequence[Mapping[str, Any]]
+    notification_identity: Mapping[str, str | None]
+    admin_config_sha256: str | None
+    task_digest: Callable[[str, object], str]
+    task_digests: Mapping[str, str]
+
+
+def _foundation_inputs(
     state: BootstrapState,
     *,
     request: BootstrapRequest,
     cpu: ClusterIdentity,
     gpu_clusters: tuple[ClusterIdentity, ...],
-    release: Mapping[str, Any],
-) -> str:
+) -> _FoundationInputs:
     root = request.repository_root.resolve()
-    manifest = Path(str(release["manifest"])).expanduser().resolve()
     sources = {
         relative: _file_sha256(root / relative)
         for relative in BOOTSTRAP_RECONCILE_SOURCES
@@ -207,32 +220,14 @@ def bind_bootstrap_inputs(
         }
         for item in gpu_clusters
     ]
-    release_identity = {
-        "release_id": release.get("release_id"),
-        "manifest_sha256": _file_sha256(manifest),
-        "agent_config_digest": release.get("agent_config_digest"),
-        "images": release.get("images"),
-    }
-    images = release.get("images")
-    images = images if isinstance(images, Mapping) else {}
-    control_plane_wheel_sha256 = _manifest_wheel_sha256(root, manifest)
     # Sender and recipient are the administrator address (see
     # ``resolve_notification_routing``), so the address is the whole identity.
     notification_identity = {"admin_email": request.alert_email}
-    payload = {
-        "schema_version": 1,
-        "cpu": cpu_identity,
-        "gpu_clusters": gpu_identity,
-        "release": release_identity,
-        "notifications": notification_identity,
-        "admin_config_sha256": _file_sha256(
-            request.state_dir.resolve() / "admin-config/desired.json"
-        ),
-        "reconcile_source_sha256": sources,
-    }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    # Written by ``initialize_desired_admin_config`` before deploy enters
+    # bootstrap, so both binds digest the same bytes.
+    admin_config_sha256 = _file_sha256(
+        request.state_dir.resolve() / "admin-config/desired.json"
+    )
     common = {
         "cpu": cpu_identity,
         "site_id": state.value["site_id"],
@@ -282,7 +277,6 @@ def bind_bootstrap_inputs(
             "release_repositories",
             {"region": cpu.region, "account_id": cpu.account_id},
         ),
-        "release": task_digest("release", {"release": release_identity}),
         "pod_identity_agent": task_digest(
             "pod_identity_agent", {"eks_arn": cpu.eks_arn}
         ),
@@ -305,7 +299,7 @@ def bind_bootstrap_inputs(
         ),
         "aurora": task_digest(
             "aurora",
-            {"admin_config_sha256": payload["admin_config_sha256"]},
+            {"admin_config_sha256": admin_config_sha256},
         ),
         # Instances available and the control-plane Secret present: nothing
         # static decides it, so the probe is its only trigger (like the add-on).
@@ -322,26 +316,124 @@ def bind_bootstrap_inputs(
         "monitoring_resources": task_digest(
             "monitoring_resources", {"admin_email": request.alert_email}
         ),
-        **_platform_task_digests(
-            task_digest,
-            assets=assets,
+    }
+    for cluster_identity in gpu_identity:
+        cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
+        # Node keys are decided by the provisioning script and the cluster, not
+        # by the release; the per-cluster roles are re-proved by a read-only
+        # probe, so their digest only has to change when the cluster itself does.
+        name = f"node_keys:{cluster_id}"
+        task_digests[name] = task_digest(
+            name,
+            {
+                "asset": assets["deploy/node/provision-node-action-keys.sh"],
+                "cluster": cluster_identity,
+            },
+        )
+        for prefix in ("executor_role:", "adot_writer_role:"):
+            name = f"{prefix}{cluster_id}"
+            task_digests[name] = task_digest(name, {"cluster": cluster_identity})
+    return _FoundationInputs(
+        root=root,
+        sources=sources,
+        assets=assets,
+        cpu_identity=cpu_identity,
+        gpu_identity=gpu_identity,
+        notification_identity=notification_identity,
+        admin_config_sha256=admin_config_sha256,
+        task_digest=task_digest,
+        task_digests=task_digests,
+    )
+
+
+def bind_foundation_inputs(
+    state: BootstrapState,
+    *,
+    request: BootstrapRequest,
+    cpu: ClusterIdentity,
+    gpu_clusters: tuple[ClusterIdentity, ...],
+) -> None:
+    """Bind the digests that do not need the built release, before the graph
+    reads its checkpoint.
+
+    Bootstrap builds the signed release on a thread beside the task graph, and
+    `bind_bootstrap_inputs` can only run once that build has a manifest to
+    digest -- minutes after `run_parallel` has read `completed_tasks`. Bound
+    that late, a checkpoint whose inputs changed since the last deploy is
+    trusted for one more deploy; and before `BootstrapState` protected its own
+    run's completions, every task that had finished before the build was erased
+    by the late bind and re-run on the next deploy (`nlb_network` and `pki`,
+    which finish first, went missing from a live site's state this way).
+
+    Everything but `release`, `monitoring_install` and `aurora_refresh` depends
+    only on the request, the clusters, the admin config and the source
+    snapshot, all fixed before the graph starts, so those digests are bound
+    here through the same helper the full bind uses. The whole-input digest
+    needs the release and is left to the full bind.
+    """
+
+    inputs = _foundation_inputs(
+        state, request=request, cpu=cpu, gpu_clusters=gpu_clusters
+    )
+    state.bind_inputs(None, inputs.task_digests)
+
+
+def bind_bootstrap_inputs(
+    state: BootstrapState,
+    *,
+    request: BootstrapRequest,
+    cpu: ClusterIdentity,
+    gpu_clusters: tuple[ClusterIdentity, ...],
+    release: Mapping[str, Any],
+) -> str:
+    """Bind every task digest and the whole-input digest once the release is
+    built.
+
+    In a deploy this follows `bind_foundation_inputs`: the release-independent
+    digests it carries are byte-identical to that bind's, so it re-affirms
+    those and adds `release`, `monitoring_install` and `aurora_refresh`.
+    """
+
+    inputs = _foundation_inputs(
+        state, request=request, cpu=cpu, gpu_clusters=gpu_clusters
+    )
+    manifest = Path(str(release["manifest"])).expanduser().resolve()
+    release_identity = {
+        "release_id": release.get("release_id"),
+        "manifest_sha256": _file_sha256(manifest),
+        "agent_config_digest": release.get("agent_config_digest"),
+        "images": release.get("images"),
+    }
+    images = release.get("images")
+    images = images if isinstance(images, Mapping) else {}
+    control_plane_wheel_sha256 = _manifest_wheel_sha256(inputs.root, manifest)
+    payload = {
+        "schema_version": 1,
+        "cpu": inputs.cpu_identity,
+        "gpu_clusters": inputs.gpu_identity,
+        "release": release_identity,
+        "notifications": inputs.notification_identity,
+        "admin_config_sha256": inputs.admin_config_sha256,
+        "reconcile_source_sha256": inputs.sources,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    task_digests = {
+        **inputs.task_digests,
+        "release": inputs.task_digest("release", {"release": release_identity}),
+        **_release_task_digests(
+            inputs.task_digest,
+            assets=inputs.assets,
             images=images,
             alert_email=request.alert_email,
             control_plane_wheel_sha256=control_plane_wheel_sha256,
-            gpu_identity=gpu_identity,
-            dashboards=dashboard_asset_digests(root),
+            dashboards=dashboard_asset_digests(inputs.root),
             grafana={
                 "workspace_id": request.grafana_workspace_id,
                 "viewer": request.grafana_viewer,
             },
         ),
     }
-    for cluster_identity in gpu_identity:
-        cluster_id = safe_name(str(cluster_identity["hyperpod_name"]))
-        # Both per-cluster roles are re-proved by a read-only probe; the digest
-        # only has to change when the cluster itself does.
-        for prefix in ("executor_role:", "adot_writer_role:"):
-            name = f"{prefix}{cluster_id}"
-            task_digests[name] = task_digest(name, {"cluster": cluster_identity})
     state.bind_inputs(digest, task_digests)
     return digest
