@@ -11,7 +11,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
-from gpu_fault_release import repository_root
+from gpu_fault_release import containing_repository_root, repository_root
 
 ROOT = repository_root()
 DEFAULT_NAMESPACE = "gpu-fault-system"
@@ -600,7 +600,12 @@ def load_release_artifacts(
                 Path(str(node_component.get("wheel") or manifest["wheel"])),
                 Path(str(manifest["bundle"])),
             ),
-            base=ROOT,
+            # Relative to the root that built the manifest -- the site's source
+            # snapshot -- not to this engine's own checkout: join-cluster runs
+            # the engine in-process from the operator's tree, and its verify
+            # step could not find dist/<release-id>/ there (live 2026-09-15:
+            # the join rolled back after a successful release).
+            base=containing_repository_root(manifest_path) or ROOT,
         )
         _require_artifact_files((wheel, executor_wheel, node_wheel, bundle))
         release_id = required_text(

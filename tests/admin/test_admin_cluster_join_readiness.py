@@ -383,6 +383,26 @@ def test_join_verify_fails_on_a_failing_check(monkeypatch: pytest.MonkeyPatch) -
         engine.verify_joined_clusters(object(), readiness={"gpu-b": {}})
 
 
+def test_join_verify_reports_an_unloadable_candidate_release_as_a_bootstrap_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate whose release config cannot be loaded is a join failure the
+    CLI can report, not a traceback after the rollback (live 2026-09-15: the
+    manifest's wheels resolved against the wrong root)."""
+
+    def unloadable(_site):
+        raise ReleaseError("release component wheels and bundle must exist")
+
+    monkeypatch.setattr(engine, "build_release", unloadable)
+    monkeypatch.setattr(engine, "site_process_environment", lambda _site: nullcontext())
+
+    with pytest.raises(
+        BootstrapError,
+        match="could not load the candidate release: release component wheels",
+    ):
+        engine.verify_joined_clusters(object(), readiness={"gpu-b": {}})
+
+
 def _release_for_capture(
     *,
     cpu_image: str = "img@sha256:aa",

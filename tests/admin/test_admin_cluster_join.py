@@ -13,6 +13,7 @@ import yaml
 from gpu_fault.admin import cluster_batch_join as admin_cluster_batch_join
 from gpu_fault.admin import cluster_join as admin_cluster_join
 from gpu_fault.admin import cluster_join_commit as admin_cluster_join_commit
+from gpu_fault.admin import cluster_join_state as admin_cluster_join_state
 from gpu_fault.admin.bootstrap_common import BootstrapError, ClusterIdentity
 from gpu_fault.admin.cluster_batch_join import join_clusters
 from gpu_fault.admin.cluster_join import JoinClusterRequest, JoinExecution, join_cluster
@@ -1277,3 +1278,29 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     state = json.loads((state_dir / "state.json").read_text())
     assert "FINAL_VERIFIED" in state["completed_steps"]
     assert state["evidence"]["FINAL_VERIFIED"]["registry_lifecycle"] == "ACTIVE"
+
+
+def test_a_noted_join_failure_names_its_cause_and_the_last_completed_step() -> None:
+    """The state file the operator is told to fix and resume from carries the
+    cause; before, it read ROLLED_BACK and the reason lived only in the log."""
+
+    state = {
+        "attempt": 2,
+        "completed_steps": ["PRECHECKED", "DISCOVERED", "JOINED"],
+        "step_completed_at": {
+            "PRECHECKED": "2026-09-15T05:47:47+00:00",
+            "DISCOVERED": "2026-09-15T05:47:54+00:00",
+            "JOINED": "2026-09-15T05:54:10+00:00",
+        },
+        "evidence": {},
+    }
+
+    admin_cluster_join_state.note_join_failure(
+        state, RuntimeError("release component wheels and bundle must exist")
+    )
+
+    assert state["failure"]["error"] == (
+        "RuntimeError: release component wheels and bundle must exist"
+    )
+    assert state["failure"]["after_step"] == "JOINED"
+    assert state["failure"]["recorded_at"]

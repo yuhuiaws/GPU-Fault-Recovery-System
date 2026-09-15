@@ -36,6 +36,22 @@ def _is_repository(path: Path) -> bool:
     return all((path / anchor).is_dir() for anchor in _ANCHORS)
 
 
+def containing_repository_root(path: Path) -> Path | None:
+    """The checkout or source snapshot ``path`` lies in, or None.
+
+    A release manifest names its wheels and bundle relative to the root that
+    built them (``dist/<release-id>/...`` under the snapshot the site was
+    deployed from). A reader running from another checkout -- the admin CLI
+    joining a cluster in-process from the operator's tree -- must resolve them
+    against the manifest's root, not its own.
+    """
+
+    for candidate in (path, *path.parents):
+        if _is_repository(candidate):
+            return candidate.resolve()
+    return None
+
+
 def _bound_repository_root(prefix: Path) -> Path | None:
     """The bound site's ``spec.repositoryRoot`` for an installed copy.
 

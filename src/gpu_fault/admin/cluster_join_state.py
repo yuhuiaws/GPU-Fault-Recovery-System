@@ -116,6 +116,25 @@ def completed_state_is_current(
     )
 
 
+def note_join_failure(state: dict[str, Any], error: BaseException) -> None:
+    """Record why an attempt failed and after which step, in the state file.
+
+    The cause used to live only in the command log; the state file the
+    operator is told to fix and resume from said ROLLED_BACK and nothing else.
+    Rollback keeps the key; ``reset_completed_state`` starts the next attempt
+    clean.
+    """
+
+    completed_at = dict(state.get("step_completed_at") or {})
+    state["failure"] = {
+        "error": f"{type(error).__name__}: {error}",
+        "after_step": (
+            max(completed_at, key=completed_at.__getitem__) if completed_at else None
+        ),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def reset_completed_state(
     request: JoinStateRequest,
     *,

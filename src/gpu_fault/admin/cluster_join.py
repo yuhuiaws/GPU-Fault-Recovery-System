@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
@@ -63,6 +64,7 @@ from gpu_fault.admin.cluster_join_rollback import (
 )
 from gpu_fault.admin.cluster_join_state import (
     complete_step as _complete,
+    note_join_failure,
 )
 from gpu_fault.admin.cluster_join_state import (
     completed_state_is_current as _completed_state_is_current,
@@ -1300,6 +1302,9 @@ def _record_join_failure(
     attempt.state["phase"] = (
         "FAILED_AFTER_ACTIVATION" if activation_started else "FAILED"
     )
+    error = sys.exception()
+    if error is not None:
+        note_join_failure(attempt.state, error)
     attempt.state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(attempt.state_path, attempt.state)
     if not activation_started and attempt.request.site.release_config.get(

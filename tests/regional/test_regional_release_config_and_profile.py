@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -390,3 +391,53 @@ def test_release_config_loads_health_targets(tmp_path: Path) -> None:
     assert config.health.amp_workspace_id == "ws-test"
     assert config.health.certificate_min_validity_days == 45
     assert config.health.remote_command_max_unclaimed_seconds == 240
+
+
+def test_manifest_artifacts_resolve_against_the_manifests_own_repository_root(
+    tmp_path: Path,
+) -> None:
+    """Relative wheel/bundle paths belong to the root that built the manifest.
+
+    A site's manifest lives in the source snapshot it was deployed from, and
+    join-cluster runs the engine in-process from the operator's checkout. The
+    loader used to resolve ``dist/<release-id>/...`` against that checkout, so
+    the join's verify step could not find artifacts that sat next to the
+    manifest and the join rolled back after a successful release.
+    """
+
+    snapshot = tmp_path / "snapshot"
+    for anchor in ("deploy/control-plane/regional", "scripts", "dist/abc123def456"):
+        (snapshot / anchor).mkdir(parents=True)
+    wheel_name = "dist/abc123def456/gpu_fault_control_plane-0.10.0-py3-none-any.whl"
+    bundle_name = "dist/abc123def456/gpu-fault-node-installer-0.10.0.tar.gz"
+    (snapshot / wheel_name).write_bytes(b"wheel")
+    (snapshot / bundle_name).write_bytes(b"bundle")
+    manifest = snapshot / "dist/current-release.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "release_id": "abc123def456",
+                "wheel": wheel_name,
+                "wheel_sha256": hashlib.sha256(b"wheel").hexdigest(),
+                "bundle": bundle_name,
+                "bundle_sha256": hashlib.sha256(b"bundle").hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    value = json.loads(config_file(tmp_path).read_text(encoding="utf-8"))
+    value["release"] = {"manifest": str(manifest), "agent_config_digest": "a" * 64}
+    # The CLI materializes the site's release config in a temporary directory,
+    # nowhere near the snapshot or the checkout.
+    elsewhere = tmp_path / "materialized"
+    elsewhere.mkdir()
+    path = elsewhere / "regional-release.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    config = MODULE.ReleaseConfig.load(path)
+
+    assert config.release_id == "abc123def456"
+    assert config.wheel == snapshot / wheel_name
+    assert config.executor_wheel == snapshot / wheel_name
+    assert config.node_wheel == snapshot / wheel_name
+    assert config.bundle == snapshot / bundle_name

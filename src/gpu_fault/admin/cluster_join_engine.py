@@ -246,7 +246,15 @@ def verify_joined_clusters(
     """
 
     with site_process_environment(candidate):
-        release = build_release(candidate)
+        try:
+            release = build_release(candidate)
+        except ReleaseError as exc:
+            # The engine's own error type is not one the CLI reports, so a
+            # candidate whose release config cannot even be loaded surfaced as
+            # a traceback after the rollback (live 2026-09-15).
+            raise BootstrapError(
+                f"join verification could not load the candidate release: {exc}"
+            ) from exc
         release._apply_health_baseline(release._load_state())
         specifications, runner = join_verify_specifications(release, readiness)
         with release._read_snapshot():
