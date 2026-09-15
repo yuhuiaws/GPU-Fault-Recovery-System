@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -80,6 +79,8 @@ from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseConfig,
     ReleaseError,
+    require_image_lock,
+    resolve_release_image,
 )
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
@@ -604,28 +605,39 @@ class RegionalRelease:
             "gpu-fault-executor-wheel-0100-" + self.executor_wheel_sha[:12]
         )
         self.bundle_cm = "gpu-fault-node-installer-0100-" + self.bundle_sha[:12]
-        self.runtime_image = self._release_image(
+        # Filled by resolve_release_image, enforced by _dispatch_mode before a
+        # mode that reads an image starts (require_image_lock), never here.
+        self.image_lock_conflicts: dict[str, tuple[str, str]] = {}
+        self.runtime_image = resolve_release_image(
+            config,
             "runtime",
             "GPU_FAULT_RUNTIME_IMAGE",
             DEFAULT_RUNTIME_IMAGE,
+            self.image_lock_conflicts,
         )
-        self.node_installer_image = self._release_image(
+        self.node_installer_image = resolve_release_image(
+            config,
             "node_installer",
             "GPU_FAULT_NODE_INSTALLER_IMAGE",
             "public.ecr.aws/amazonlinux/amazonlinux:2023",
+            self.image_lock_conflicts,
         )
-        self.dcgm_exporter_image = self._release_image(
+        self.dcgm_exporter_image = resolve_release_image(
+            config,
             "dcgm_exporter",
             "GPU_FAULT_DCGM_EXPORTER_IMAGE",
             DEFAULT_DCGM_EXPORTER_IMAGE,
+            self.image_lock_conflicts,
         )
-        self.adot_image = self._release_image(
+        self.adot_image = resolve_release_image(
+            config,
             "adot",
             "GPU_FAULT_ADOT_IMAGE",
             (
                 "public.ecr.aws/aws-observability/aws-otel-collector@"
                 "sha256:bb72328152c72fb9662056759b275f7cc85e115db12bbb114fbea9f68dc4816c"
             ),
+            self.image_lock_conflicts,
         )
         for variable, image in (
             ("GPU_FAULT_RUNTIME_IMAGE", self.runtime_image),
@@ -712,33 +724,6 @@ class RegionalRelease:
             ).encode()
         ).hexdigest()
         self.rendered_manifest_digest = rendered_release_manifest_sha256(self)
-
-    def _release_image(
-        self,
-        name: str,
-        environment_name: str,
-        legacy_default: str,
-    ) -> str:
-        configured = os.getenv(environment_name, "").strip()
-        if self.config.release_manifest_schema_version < 3:
-            return configured or legacy_default
-        locked = self.config.locked_images[name]
-        source = str(
-            (
-                self.config.release_delivery_identity.get("images", {})
-                .get(name, {})
-                .get("source")
-                or ""
-            )
-        )
-        if not configured or configured in {source, locked}:
-            return locked
-        locked_digest = locked.rsplit("@sha256:", 1)[-1]
-        if configured.endswith(f"@sha256:{locked_digest}"):
-            return configured
-        raise ReleaseError(
-            f"{environment_name} does not match the schema v3 image lock"
-        )
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -1348,7 +1333,14 @@ def _run_mode(arguments: argparse.Namespace) -> int:
         return _dispatch_mode(release, arguments)
 
 
+# Publishes a registry revision and reads no release image; every other mode
+# enforces the schema v3 image lock before it starts (require_image_lock).
+IMAGE_LOCK_EXEMPT_MODES = frozenset({"drain-cluster"})
+
+
 def _dispatch_mode(release: RegionalRelease, arguments: argparse.Namespace) -> int:
+    if arguments.mode not in IMAGE_LOCK_EXEMPT_MODES:
+        require_image_lock(release.image_lock_conflicts, arguments.mode)
     exit_code = 0
     if arguments.mode == "plan":
         print(

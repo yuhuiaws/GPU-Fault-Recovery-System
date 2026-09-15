@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1100,3 +1101,53 @@ def render_nlb_manifest(config: ReleaseConfig, text: str) -> str:
     if "REPLACE_WITH" in text:
         raise ReleaseError("NLB manifest still contains a placeholder")
     return text
+
+
+def resolve_release_image(
+    config: ReleaseConfig,
+    name: str,
+    environment_name: str,
+    legacy_default: str,
+    conflicts: dict[str, tuple[str, str]],
+) -> str:
+    """The image a release applies for ``name``; a lock conflict is recorded.
+
+    Schema v3 manifests lock every image by digest. An environment override
+    with the same digest under another reference is kept; one with another
+    digest goes into ``conflicts`` (variable -> (configured, locked)) and the
+    lock is returned. require_image_lock refuses the conflict before a mode
+    that reads an image starts, never at construction: drain-cluster publishes
+    one registry revision and reads none. Live 2026-09-15: an uninstall run
+    from a checkout ahead of the deployed release (GPU_FAULT_ADMIN_ALLOW_UNBOUND,
+    the sanctioned path for a fix that must run before it can be deployed)
+    died at CLUSTERS_DRAINING on this comparison.
+    """
+
+    configured = os.getenv(environment_name, "").strip()
+    if config.release_manifest_schema_version < 3:
+        return configured or legacy_default
+    locked = config.locked_images[name]
+    source = str(
+        config.release_delivery_identity.get("images", {}).get(name, {}).get("source")
+        or ""
+    )
+    if not configured or configured in {source, locked}:
+        return locked
+    locked_digest = locked.rsplit("@sha256:", 1)[-1]
+    if configured.endswith(f"@sha256:{locked_digest}"):
+        return configured
+    conflicts[environment_name] = (configured, locked)
+    return locked
+
+
+def require_image_lock(conflicts: dict[str, tuple[str, str]], mode: str) -> None:
+    """Refuse ``mode`` while the environment names an image the lock does not."""
+
+    if not conflicts:
+        return
+    variable, (configured, locked) = min(conflicts.items())
+    raise ReleaseError(
+        f"{variable} does not match the schema v3 image lock: {mode} reads "
+        f"this image (configured {configured}, locked {locked}); run the "
+        "site's bound CLI, or deploy this release first"
+    )
