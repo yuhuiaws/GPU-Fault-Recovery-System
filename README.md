@@ -132,6 +132,7 @@ gpu-fault-admin deploy \
 
 多个GPU集群重复传`--gpu-cluster-arn`。命令自动判断首次或后续部署，内部管理release、
 签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
+之后的`status`/`join-cluster`/`remove-cluster`/`uninstall`/`config`/`rotate-token`用首次`deploy`装在`<state-dir>/deployer-venv/bin/`下、与站点绑定的那份`gpu-fault-admin`执行（开发checkout的`.venv`不绑定站点，对已有绑定CLI的站点只放行`deploy`与只读动词），见[管理员日常运维](docs/管理员日常运维.md) §1.1。
 
 ### 开发者：修改代码或Profile后发布
 
