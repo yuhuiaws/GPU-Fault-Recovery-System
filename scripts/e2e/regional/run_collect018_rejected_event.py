@@ -90,6 +90,45 @@ def _first_bdf(snapshot: dict[str, Any]) -> str:
     return str(inventory[0]["pci_bus_id"])
 
 
+def _wait_silence_metrics(
+    fixture: CollectorWindowFixture,
+    *,
+    metrics_before: list[str],
+    cluster_id: str,
+    node: str,
+    case_dir: Path,
+) -> list[str]:
+    """Poll ``/metrics`` until the erroring-nodes snapshot reflects the rejection.
+
+    The rejected-event status is in the store the instant the runner sees it,
+    but gpu_fault_collector_erroring_nodes is served from a leased ~30s snapshot
+    (collector_metrics.py), so a single read catches only the pre-rejection
+    snapshot. Poll until ``silence_errors`` clears -- still well before the next
+    300s kernel heartbeat moves last_success_at past the error -- and fall back
+    to one final read on timeout so a genuine silence defect still surfaces.
+    """
+
+    settled = fixture.wait_until(
+        lambda: (
+            {"metrics": metrics}
+            if not verdicts.silence_errors(
+                metrics_before,
+                metrics := fixture.control_plane_metrics(),
+                cluster_id=cluster_id,
+                node=node,
+            )
+            else None
+        ),
+        timeout_seconds=verdicts.SILENCE_SNAPSHOT_TIMEOUT_SECONDS,
+        poll_seconds=5,
+        case_dir=case_dir,
+        name="erroring-gauge",
+    )
+    if settled is not None:
+        return list(settled["metrics"])
+    return fixture.control_plane_metrics()
+
+
 def execute(
     settings: WindowSettings,
     fixture: CollectorWindowFixture,
@@ -179,9 +218,18 @@ def execute(
         metrics_before, metrics_after
     )
     stages["rejection_log"] = verdicts.rejection_log_errors(logs, record_id)
+    # The synchronous G1 counters above were already correct in metrics_after;
+    # the erroring-nodes gauge lags on its ~30s snapshot, so poll it separately.
+    metrics_silence = _wait_silence_metrics(
+        fixture,
+        metrics_before=metrics_before,
+        cluster_id=settings.regional.cluster_id,
+        node=settings.node,
+        case_dir=case_dir,
+    )
     stages["not_silent"] = verdicts.silence_errors(
         metrics_before,
-        metrics_after,
+        metrics_silence,
         cluster_id=settings.regional.cluster_id,
         node=settings.node,
     )

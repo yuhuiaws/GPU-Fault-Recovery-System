@@ -88,6 +88,16 @@ def heartbeat_is_imminent(age_seconds: float | None) -> bool:
 
 FINDING_TIMEOUT_SECONDS = 300
 RECOVERY_TIMEOUT_SECONDS = 420
+# gpu_fault_collector_erroring_nodes is published from a leased ~30s periodic
+# snapshot (app/collector_metrics.py CollectorMetricsSnapshot,
+# GPU_FAULT_METRICS_COLLECTOR_SNAPSHOT_SECONDS default 30), not from live store
+# state, so the gauge trails the rejection's last_error_at by up to one
+# interval. The G1 rejection counters are updated synchronously and are current
+# the instant the rejected-event status appears, but the erroring gauge is not:
+# poll it for a few snapshot intervals. Bounded well below the next 300s kernel
+# heartbeat (which moves last_success_at past the error and clears the state),
+# so the poll always lands inside the erroring window.
+SILENCE_SNAPSHOT_TIMEOUT_SECONDS = 120
 
 
 def _stamp(value: Any) -> datetime | None:
