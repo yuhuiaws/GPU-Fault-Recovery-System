@@ -72,6 +72,7 @@ def test_public_release_scan_uses_git_without_python_pathspec(tmp_path: Path) ->
             "arn:aws:eks:us-west-2:999999999999:cluster/example\n",
             "customer AWS account",
         ),
+        ('assert "999999999999" not in source\n', "bare AWS account number"),
         ("node i-0123456789abcdef0\n", "concrete EC2 instance ID"),
         ("network vpc-0123456789abcdef0\n", "concrete AWS resource ID"),
         ("endpoint 10.91.0.1\n", "site private address"),

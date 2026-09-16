@@ -21,6 +21,7 @@ from scripts.e2e.regional import destr021_verdicts as verdicts
 from scripts.e2e.regional import run_destr021_adversarial_node_metadata as destr021
 from scripts.e2e.regional.probes import destr021_annotation_writer as writer_module
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 NODE = "node-a"
@@ -804,12 +805,7 @@ def test_the_runner_and_probe_are_executable_and_carry_no_site_topology() -> Non
     for name in (*executables, "destr021_verdicts.py"):
         path = ROOT / "scripts/e2e/regional" / name
         source = path.read_text(encoding="utf-8")
-        for token in (
-            "/secure/gpu-fault-bootstrap",
-            "514385905925",
-            "gpu-fault-gpu-1-",
-        ):
-            assert token not in source, (name, token)
+        assert not site_topology_leaks(source), (name, site_topology_leaks(source))
         if name not in executables:
             continue
         mode = path.stat().st_mode & 0o777

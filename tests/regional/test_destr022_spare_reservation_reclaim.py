@@ -21,6 +21,7 @@ from scripts.e2e.regional import destr022_verdicts as verdicts
 from scripts.e2e.regional import run_destr022_spare_reservation_reclaim as destr022
 from scripts.e2e.regional.probes import destr022_executor_probe as probe
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 SPARE = "spare-a"
@@ -28,7 +29,6 @@ INCIDENT = verdicts.synthetic_incident_id("abc123-a1")
 T0 = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
 RECLAIMED_AT = T0 + timedelta(minutes=4)
 RESERVED_AT = verdicts.stale_reserved_at(T0)
-TOPOLOGY_STRINGS = ("/secure/gpu-fault-bootstrap", "514385905925", "gpu-fault-gpu-1-")
 
 
 def _text(errors: list[str]) -> str:
@@ -607,8 +607,7 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         ROOT / "scripts/e2e/regional/destr022_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for value in TOPOLOGY_STRINGS:
-            assert value not in source, (path.name, value)
+        assert not site_topology_leaks(source), (path.name, site_topology_leaks(source))
         if path.name.startswith("destr022_verdicts"):
             continue
         mode = path.stat().st_mode & 0o777

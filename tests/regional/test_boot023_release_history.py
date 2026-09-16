@@ -21,6 +21,7 @@ from gpu_fault_release import regional_release_config as CONFIG
 from scripts.e2e.regional import boot023_verdicts as verdicts
 from scripts.e2e.regional import run_boot023_release_history as boot023
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_ID = "rel-42"
@@ -128,12 +129,8 @@ def test_the_scripts_carry_no_site_topology() -> None:
         ROOT / "scripts/e2e/regional/boot023_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for needle in (
-            "/secure/gpu-fault-bootstrap",
-            "514385905925",
-            "gpu-fault-gpu-1-",
-        ):
-            assert needle not in source, f"{path.name} embeds {needle}"
+        leaks = site_topology_leaks(source)
+        assert not leaks, f"{path.name} embeds {leaks}"
 
 
 # --------------------------------------------------------------------------- #

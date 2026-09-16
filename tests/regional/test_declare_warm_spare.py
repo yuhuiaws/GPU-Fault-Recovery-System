@@ -19,6 +19,7 @@ import pytest
 from gpu_fault.admin import warm_spare
 from scripts.e2e.regional import declare_warm_spare as helper
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+from tests.regional._site_topology import site_topology_leaks
 
 
 def test_the_wrapper_binds_the_admin_module_not_a_copy() -> None:
@@ -56,8 +57,7 @@ def test_the_spare_is_never_named_by_the_shared_node_flag() -> None:
 def test_helper_carries_no_site_topology() -> None:
     source = Path(helper.__file__).read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
     assert "hyperpod-i-" not in source
 
 

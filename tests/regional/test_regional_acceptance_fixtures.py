@@ -32,6 +32,7 @@ from scripts.e2e.regional.run_ha007_control_worker_shutdown import (
 from scripts.e2e.regional.run_ha008_processor_exit_acceptance import (
     run_acceptance as run_ha008_acceptance,
 )
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -334,9 +335,7 @@ def test_net004_dependency_audit_is_environment_driven() -> None:
     path = ROOT / "scripts/e2e/regional/audit_net004_dependency_boundary.py"
     source = path.read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "gpu-fault-gpu-1-" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
 
     help_result = subprocess.run(
         [sys.executable, str(path), "--help"],
@@ -371,9 +370,7 @@ def test_promoted_manual_live_driver_has_safety_entrypoint(
     path = ROOT / "scripts/e2e/regional" / script_name
     source = path.read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "gpu-fault-gpu-1-" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
     assert "2026, 8, 31" not in source
 
     help_result = subprocess.run(

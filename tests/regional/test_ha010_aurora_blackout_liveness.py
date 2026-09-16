@@ -22,6 +22,7 @@ from scripts.e2e.regional import ha010_verdicts as verdicts
 from scripts.e2e.regional import run_ha010_aurora_blackout_liveness as ha010
 from scripts.e2e.regional.probes import ha010_probe as probe
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 T0 = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
@@ -682,12 +683,7 @@ def test_the_runner_and_probe_are_executable_with_a_shebang_and_no_topology() ->
         ROOT / "scripts/e2e/regional/ha010_verdicts.py",
     ):
         source = path.read_text(encoding="utf-8")
-        for topology in (
-            "/secure/gpu-fault-bootstrap",
-            "514385905925",
-            "gpu-fault-gpu-1-",
-        ):
-            assert topology not in source, (path.name, topology)
+        assert not site_topology_leaks(source), (path.name, site_topology_leaks(source))
         if path.name.endswith("_verdicts.py"):
             continue
         mode = path.stat().st_mode & 0o777

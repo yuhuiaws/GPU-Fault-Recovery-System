@@ -77,6 +77,12 @@ ARN_ACCOUNT = re.compile(
     r"(?P<account>\d{12}):"
 )
 ECR_ACCOUNT = re.compile(r"\b(?P<account>\d{12})\.dkr\.ecr\.")
+# An account number quoted on its own -- a test needle, a comment, a YAML
+# value -- carries the site just as an ARN does. Digits inside a hex digest,
+# a version, an address or a longer number are not account numbers.
+BARE_ACCOUNT = re.compile(
+    r"(?<![0-9A-Za-z_./:-])(?P<account>\d{12})(?![0-9A-Za-z_./:-])"
+)
 AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
 INSTANCE_ID = re.compile(r"\bi-[0-9a-f]{16,17}\b", re.IGNORECASE)
@@ -148,6 +154,12 @@ CHECKS = (
     Check(
         "customer ECR account",
         ECR_ACCOUNT,
+        group="account",
+        allowed=frozenset(PUBLIC_AWS_ACCOUNTS),
+    ),
+    Check(
+        "bare AWS account number",
+        BARE_ACCOUNT,
         group="account",
         allowed=frozenset(PUBLIC_AWS_ACCOUNTS),
     ),

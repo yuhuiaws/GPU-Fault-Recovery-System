@@ -52,6 +52,7 @@ from tests.regional._destructive_acceptance_builders import (
     _restart_state,
     _runtime_identity,
 )
+from tests.regional._site_topology import site_topology_leaks
 
 yaml = importlib.import_module("yaml")
 
@@ -96,8 +97,7 @@ def test_destructive_live_drivers_are_promoted_and_plan_only() -> None:
         path = REGIONAL / name
         assert path.is_file(), f"missing destructive live driver: {name}"
         source = path.read_text(encoding="utf-8")
-        assert "/secure/gpu-fault-bootstrap" not in source, name
-        assert "514385905925" not in source, name
+        assert not site_topology_leaks(source), name
         module = {
             "run_destr001_gpu_reset.py": destr001,
             "run_destr002_hyperpod_reboot.py": destr002,

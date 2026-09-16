@@ -22,6 +22,7 @@ from scripts.e2e.regional.multi_cluster_fixture import (
 )
 from scripts.e2e.regional.probes import cluster_network_probe, collector_node_probe
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+from tests.regional._site_topology import site_topology_leaks
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -368,9 +369,7 @@ def test_collector_promoted_scripts_contain_no_site_specific_topology() -> None:
 
     for path in paths:
         source = path.read_text(encoding="utf-8")
-        assert "/secure/gpu-fault-bootstrap" not in source, path
-        assert "514385905925" not in source, path
-        assert "gpu-fault-gpu-1-" not in source, path
+        assert not site_topology_leaks(source), path
 
 
 def test_collector_probe_canonicalises_every_bdf_spelling_the_node_emits() -> None:

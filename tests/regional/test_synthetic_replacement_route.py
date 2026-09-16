@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import synthetic_replacement_route as helper
+from tests.regional._site_topology import site_topology_leaks
 
 
 class _Regional:
@@ -289,8 +290,7 @@ def test_the_managed_variable_cannot_be_chosen_on_the_command_line() -> None:
 def test_helper_carries_no_site_topology() -> None:
     source = Path(helper.__file__).read_text(encoding="utf-8")
 
-    assert "/secure/gpu-fault-bootstrap" not in source
-    assert "514385905925" not in source
+    assert not site_topology_leaks(source), site_topology_leaks(source)
     assert "hyperpod-i-" not in source
 
 
