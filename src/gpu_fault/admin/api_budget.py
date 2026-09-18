@@ -1006,15 +1006,33 @@ def main() -> int:
                 raise
 
 
-if __name__ == "__main__":
+def run_shim() -> int:
+    """The shim's process entry: ``main`` plus the exit-status contract.
+
+    The generic line is what callers grep for; the class and text of the
+    underlying error follow it, because a release that fails on this shim has
+    nothing else to diagnose from (live 2026-09-18: two identity-check kubectl
+    calls failed with the bare line and the cause was unrecoverable).
+    """
+
     try:
-        raise SystemExit(main())
+        return main()
     except ApiBudgetProtocolError as error:
         print(str(error), file=sys.stderr)
-        raise SystemExit(1) from None
-    except (ApiBudgetError, OSError, sqlite3.Error, subprocess.SubprocessError):
+        return 1
+    except (
+        ApiBudgetError,
+        OSError,
+        sqlite3.Error,
+        subprocess.SubprocessError,
+    ) as error:
         print(
-            "deployment API command failed or exceeded its bounded capacity/deadline",
+            "deployment API command failed or exceeded its bounded capacity/deadline: "
+            f"{type(error).__name__}: {error}",
             file=sys.stderr,
         )
-        raise SystemExit(1) from None
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_shim())

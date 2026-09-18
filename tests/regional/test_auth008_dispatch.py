@@ -145,6 +145,8 @@ def test_auth008_default_cli_builds_a_bound_plan_without_seeding(
     assert plans[0]["details"]["secondary"] == {
         "cluster_id": "b",
         "context": "context-b",
+        # A site cluster; ISO-003/004 may also name an unregistered id as B.
+        "registered": True,
     }
     assert "FREEZE_EVIDENCE" in plans[0]["details"]["mutation"]
 

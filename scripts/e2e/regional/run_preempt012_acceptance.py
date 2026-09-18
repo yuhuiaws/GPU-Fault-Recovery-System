@@ -45,10 +45,28 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 CASE_ID = "GF-REGIONAL-PREEMPT-012"
 CONFIRMATION = "PREEMPT012_REAL_QUIESCE_BOUNDARIES"
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "preempt012_node_probe.py"
-# How long the runner waits for the host cycle to report QUIESCED before the
-# control audit starts, and for it to finish afterwards. The cycle is armed
-# with a 5s delay and a 45s hold; the fail-safe restore is at 180s.
+# How long the runner waits for the quiesce to begin before the control audit
+# starts, and for the cycle to finish afterwards. The cycle is armed with a 5s
+# delay and ``HOST_HOLD_SECONDS`` of hold; the fail-safe restore is at
+# ``HOST_FAILSAFE_SECONDS``. The runner reads the host cycle through a kubectl
+# exec into the probe Pod, and the quiesce's first act stops kubelet -- so on
+# a real node the runner never reads QUIESCED: every read fails until the
+# restore. A2 on 2026-09-18 quiesced in 5 s, held 120 s and timed this wait
+# out on failed reads. The loss of the transport is therefore accepted as the
+# start signal (``TRANSPORT_LOSS_READS`` consecutive failed reads after the
+# arm); it is only a signal -- the overlap is proven afterwards from the
+# cycle's quiesced_at/restored_at against the audit's own timestamps.
 QUIESCE_WAIT_SECONDS = 120
+TRANSPORT_LOSS_READS = 2
+QUIESCE_START_SIGNALS = frozenset({"QUIESCED", "TRANSPORT_LOST"})
+# How long the host stays quiesced after the delay. The control audit starts
+# only once the host reports QUIESCED and then pays a kubectl exec into an API
+# Pod plus the control-plane imports before its first timestamp: 65 s on the
+# live site (2026-09-18, quiesced 06:53:51 -> audit 06:54:56), so a 45 s hold
+# had already restored the host and the audit no longer overlapped the real
+# quiesce. 120 s keeps a 60 s margin under the 180 s fail-safe restore.
+HOST_HOLD_SECONDS = 120
+HOST_FAILSAFE_SECONDS = 180
 CYCLE_WAIT_SECONDS = 600
 CYCLE_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "INTERRUPTED"})
 TIMER_LIVE_STATES = frozenset({"active", "activating", "waiting", "reloading"})
@@ -594,6 +612,44 @@ def wait_for_cycle(
     return cycle
 
 
+def wait_for_quiesce(
+    host: HostProbeFixture,
+    run_id: str,
+    *,
+    timeout: float,
+    poll_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Wait for the quiesce to begin: QUIESCED (or a terminal status) read from
+    the host, or the probe transport failing ``TRANSPORT_LOSS_READS`` times in
+    a row -- which on a real node is the quiesce stopping kubelet. A single
+    failed read is tolerated as noise and resets on the next success."""
+
+    deadline = time.monotonic() + timeout
+    cycle: dict[str, Any] = {}
+    failed_reads = 0
+    while time.monotonic() < deadline:
+        try:
+            cycle = host.execute("read", "--run-id", run_id)
+        except Exception as exc:
+            failed_reads += 1
+            if failed_reads >= TRANSPORT_LOSS_READS:
+                return {
+                    "run_id": run_id,
+                    "status": "TRANSPORT_LOST",
+                    "failed_reads": failed_reads,
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                    "observed_at": utc_now(),
+                }
+            time.sleep(poll_seconds)
+            continue
+        failed_reads = 0
+        status = str(cycle.get("status") or "")
+        if status == "QUIESCED" or status in CYCLE_TERMINAL_STATUSES:
+            return cycle
+        time.sleep(poll_seconds)
+    return cycle
+
+
 def evaluate_checks(
     *,
     control: dict[str, Any],
@@ -756,23 +812,19 @@ def execute_case(
             "--delay-seconds",
             "5",
             "--hold-seconds",
-            "45",
+            str(HOST_HOLD_SECONDS),
             "--failsafe-seconds",
-            "180",
+            str(HOST_FAILSAFE_SECONDS),
         )
         if not armed["timer_active"]:
             raise PreemptAcceptanceError("host cycle timer is not active")
         # The control audit has to run *inside* the real quiesce window: wait
         # for the host to report QUIESCED rather than guessing with a sleep.
-        cycle = wait_for_cycle(
-            host,
-            run_id,
-            until=frozenset({"QUIESCED"}),
-            timeout=QUIESCE_WAIT_SECONDS,
-        )
-        if cycle.get("status") != "QUIESCED":
+        signal = wait_for_quiesce(host, run_id, timeout=QUIESCE_WAIT_SECONDS)
+        result["quiesce_signal"] = signal
+        if signal.get("status") not in QUIESCE_START_SIGNALS:
             raise PreemptAcceptanceError(
-                f"host cycle did not reach QUIESCED before the audit: {cycle}"
+                f"host cycle did not reach QUIESCED before the audit: {signal}"
             )
         # One attempt only: the script writes and executes synthetic workflows,
         # and a retry after a partial run would execute them twice.
@@ -940,7 +992,7 @@ def main() -> int:
                 "quiesce state, timer, workflow object or probe resource remains",
             ],
             "rollback": {
-                "node_quiesce_has_independent_failsafe_seconds": 180,
+                "node_quiesce_has_independent_failsafe_seconds": HOST_FAILSAFE_SECONDS,
                 "cycle_restores_services_after_45_seconds": True,
                 "cycle_restores_on_sigterm": True,
                 "runner_finally_stops_timer_then_restores_and_deletes_probe": True,

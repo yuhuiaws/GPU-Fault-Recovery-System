@@ -144,18 +144,19 @@ def test_window_expiry_during_observation_stops_the_next_real_action(
 
         monkeypatch.setattr(harness.host, "execute", host_execute)
     elif phase == "failover":
-        binding = harness.binding
+        run = harness.api.run
 
-        def read(expected: dict | None = None) -> dict:
+        def describe(argv: list[str], **kwargs: Any) -> Any:
             nonlocal expired
-            value = binding(expected)
-            if harness.binding_reads == 3:
+            value = run(argv, **kwargs)
+            # The barrier before the failover request no longer re-reads the
+            # binding; its one describe call after the injection is where the
+            # window closes here.
+            if argv[2] == "describe-db-clusters" and "write-xid46" in harness.events:
                 expired = True
             return value
 
-        monkeypatch.setattr(
-            module, "regional_binding", lambda *a: SimpleNamespace(read=read)
-        )
+        monkeypatch.setattr(harness.api, "run", describe)
     else:
         snapshot = harness.api.store_snapshot
 

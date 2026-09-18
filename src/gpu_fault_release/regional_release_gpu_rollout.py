@@ -664,8 +664,21 @@ def require_executor_pin(
     *,
     artifact_sha: str,
     compatibility_digest: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
-    metadata = release._config_map_data("gpu-fault-release-metadata")
+    """Refuse a GPU rollout whose executor falls outside the pin window.
+
+    The window is the live ``gpu-fault-release-metadata`` unless the caller
+    hands over another one: a rollback restores the previous release's
+    executor after the finalize already promoted the live window to the
+    candidate, so it must be judged against the previous release's own window
+    (live 2026-09-18: the automatic rollback was refused with "regional executor
+    artifact mismatch" against the candidate's window and the transaction
+    stayed in ``rollback-failed``).
+    """
+
+    if metadata is None:
+        metadata = release._config_map_data("gpu-fault-release-metadata")
     try:
         reason = executor_pin_rejection(
             metadata,
@@ -691,6 +704,7 @@ def _gpu_deployment_manifests(
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
     require_live_pin: bool,
+    pin_metadata: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
@@ -703,6 +717,7 @@ def _gpu_deployment_manifests(
             release,
             artifact_sha=artifact_sha,
             compatibility_digest=compatibility_digest,
+            metadata=pin_metadata,
         )
     manifests = dict(
         render_gpu_rollout_manifests(
@@ -773,6 +788,7 @@ def apply_gpu_deployments(
     executor_wheel_filename: str | None = None,
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
+    pin_metadata: dict[str, Any] | None = None,
 ) -> None:
     preflight_allowed_namespace_coverage(release, target)
     manifests = _gpu_deployment_manifests(
@@ -786,6 +802,7 @@ def apply_gpu_deployments(
         executor_artifact_sha=executor_artifact_sha,
         executor_compatibility_digest=executor_compatibility_digest,
         require_live_pin=True,
+        pin_metadata=pin_metadata,
     )
     # One wave. The three Deployments each talk to the control plane and none
     # of them to another, and the endpoint gate they all depend on has already

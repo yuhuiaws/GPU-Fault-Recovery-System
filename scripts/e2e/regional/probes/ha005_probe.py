@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -324,6 +325,23 @@ def run_probe(evidence: ProbeEvidence) -> None:
     value["replay_stopped"] = replay_stopped
     value["stopped"] = True
     atomic_json(STATS, value)
+    hold_after_stop()
+
+
+def hold_after_stop(sleep: Callable[[float], None] | None = None) -> None:
+    """Keep the container alive after the final stats are written.
+
+    The runner reads ``/state/stats.json`` with ``kubectl exec``; a process
+    that exits right after writing it leaves a Succeeded Pod whose container
+    nothing can exec into, and the read that lands after the exit fails with
+    "container not found" (HA-005 attempt 2). The runner deletes the Pod once
+    it has the stats; the bound (``HOLD_AFTER_STOP_SECONDS``, default 600)
+    only ends a Pod whose runner never came back.
+    """
+
+    sleep = time.sleep if sleep is None else sleep
+    for _ in range(int(os.environ.get("HOLD_AFTER_STOP_SECONDS", "600"))):
+        sleep(1)
 
 
 if __name__ == "__main__":

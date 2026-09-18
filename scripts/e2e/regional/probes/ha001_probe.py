@@ -63,6 +63,29 @@ class SimulatedAdapter:
         )
 
 
+class SimulatedStopOwnership:
+    """The executor's STOP-ownership validator, simulated like the adapter.
+
+    ``ClusterActionExecutor`` dispatch guards every node-mutating step -- the
+    closure's RESTART_WORKLOAD included -- through the validator the executor
+    carries, and refuses with STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE when there
+    is none (a1 on 2026-09-18). This probe stops and restarts nothing real, so
+    its validator lets the simulated closure through and says so.
+    """
+
+    def check(self, context) -> WorkflowStepOutcome | None:
+        return None
+
+    def check_idle(self, context) -> WorkflowStepOutcome | None:
+        return None
+
+    def capture(self, context, prepared):
+        return None
+
+    def finish(self, context, receipt, outcome: WorkflowStepOutcome):
+        return outcome
+
+
 def failure_key(exc: Exception) -> str:
     if isinstance(exc, ClusterExecutorError) and exc.status_code is not None:
         return f"http-{exc.status_code}"
@@ -94,6 +117,8 @@ def main() -> None:
         claim_backoff_max_seconds=4,
         claim_state_path="/state/claim-state.json",
     )
+    # Mirrors cluster_executor.bootstrap: dispatch reads this attribute.
+    setattr(executor, "stop_ownership_validator", SimulatedStopOwnership())
     atomic_json(
         READY,
         {

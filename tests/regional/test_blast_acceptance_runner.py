@@ -387,14 +387,18 @@ def test_blast001_reads_the_window_and_the_workflow_steps_e2e001_hands_over(
     assert evidence["verdict"] == "PASS", evidence
     assert analysis["e2e_window_start"] == "2026-09-07T10:00:00+00:00"
     assert analysis["e2e_window_end"] == "2026-09-07T11:00:00+00:00"
-    assert "MARK_UNSCHEDULABLE" not in analysis["workload_operations"]
-    assert analysis["containment_source"]["case_id"] == base.CONTAINMENT_CASE_ID
-    assert analysis["workflow_operations"] == [
-        "FREEZE_EVIDENCE",
-        "MARK_UNSCHEDULABLE",
-        "RESTART_WORKLOAD",
-        "STOP_WORKLOADS",
-    ]
+    assert analysis["workload_operations"] == ["RESTART_WORKLOAD", "STOP_WORKLOADS"], (
+        "the workload side is read from SUCCEEDED step executions only"
+    )
+    assert analysis["isolation_producers"] == [base.CONTAINMENT_CASE_ID], (
+        "DESTR-001's SUCCEEDED MARK_UNSCHEDULABLE makes it the isolation producer"
+    )
+    assert analysis["workload_producers"] == [base.E2E001_CASE_ID], (
+        "E2E-001's SUCCEEDED STOP/RESTART make it the workload producer"
+    )
+    assert {"MARK_UNSCHEDULABLE", "RESTART_WORKLOAD", "STOP_WORKLOADS"} <= set(
+        analysis["workflow_operations"]
+    ), analysis["workflow_operations"]
     assert evidence["checks"]["required_e2e_operations_present"] is True
 
 
@@ -412,3 +416,193 @@ def test_blast001_limitation_names_the_before_snapshot_it_compares_against(
     assert not any(
         "did not preserve an immediate CPU node" in item for item in limitations
     ), "the old claim that no before-snapshot exists is gone"
+
+
+def _pass_case(
+    run_dir: Path,
+    case_id: str,
+    *,
+    release: str,
+    operations: list[str],
+    started_at: str,
+    sidecar: str | None = None,
+) -> None:
+    """A PASS verdict whose SUCCEEDED workflow proves ``operations``.
+
+    ``sidecar`` puts the workflow into a second JSON file, as COLLECT-021 does
+    with passive-completion.json, so discovery must read the whole case dir.
+    """
+
+    case_dir = run_dir / "cases" / case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+    workflow = {
+        "request_id": f"{case_id.lower()}-workflow",
+        "status": "SUCCEEDED",
+        "official_steps": [{"operation": item} for item in operations],
+        "step_executions": [
+            {"operation": item, "status": "SUCCEEDED"} for item in operations
+        ],
+    }
+    verdict: dict[str, Any] = {
+        "case_id": case_id,
+        "verdict": "PASS",
+        "release_id": release,
+        "cluster_id": "cluster-a",
+        "errors": [],
+        "started_at": started_at,
+    }
+    if sidecar:
+        base.write_json(case_dir / sidecar, {"recovery_workflow": workflow})
+    else:
+        verdict["workflow"] = workflow
+    base.write_json(case_dir / f"{case_id}.json", verdict)
+
+
+def test_blast001_binds_producers_by_release_not_by_case_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The baseline snapshot comes from an E2E-001 card of an OLDER release; the
+    # producers are whichever PASS cases of the run prove the operations on the
+    # live release -- here a passive restart (sidecar file) and a reboot case.
+    runner = _runner(tmp_path, case_id="GF-REGIONAL-BLAST-001", cls=BlastCasesOne)
+    nodes = {"items": [_node("cpu-1", [])]}
+    _e2e001_handoff(runner.e2e_dir, nodes)
+    card_path = runner.e2e_dir / base.E2E001_EXECUTION_CARD
+    card = json.loads(card_path.read_text())
+    card["release_id"] = "release-0"
+    base.write_json(card_path, card)
+    _pass_case(
+        runner.root_run_dir,
+        "GF-REGIONAL-COLLECT-021",
+        release="release-1",
+        operations=["FREEZE_EVIDENCE", "STOP_WORKLOADS", "RESTART_WORKLOAD"],
+        started_at="2026-09-08T10:00:00+00:00",
+        sidecar="passive-completion.json",
+    )
+    _pass_case(
+        runner.root_run_dir,
+        "GF-REGIONAL-COLLECT-015",
+        release="release-1",
+        operations=["MARK_UNSCHEDULABLE", "RESTART_NODE"],
+        started_at="2026-09-08T11:00:00+00:00",
+    )
+    _pass_case(
+        runner.root_run_dir,
+        "GF-REGIONAL-DESTR-009",
+        release="release-0",
+        operations=["STOP_WORKLOADS", "RESTART_WORKLOAD"],
+        started_at="2026-09-08T09:00:00+00:00",
+    )
+    listings = {
+        ("get", "nodes", "-o", "json"): nodes,
+        ("get", "jobs", "-A", "-o", "json"): {"items": []},
+        ("get", "events", "-A", "-o", "json"): {"items": []},
+    }
+    runner.cpu_json = lambda *args: listings[args]
+
+    runner.blast_001()
+
+    analysis = json.loads(
+        (runner.run_dir / "BLAST-001-analysis.json").read_text(encoding="utf-8")
+    )
+    assert sorted(analysis["producers"]) == [
+        "GF-REGIONAL-COLLECT-015",
+        "GF-REGIONAL-COLLECT-021",
+    ], "only PASS cases bound to the live release count; release-0 evidence does not"
+    assert analysis["workload_producers"] == ["GF-REGIONAL-COLLECT-021"], (
+        "the sidecar file's SUCCEEDED workflow proves the workload side"
+    )
+    assert analysis["isolation_producers"] == ["GF-REGIONAL-COLLECT-015"], (
+        "a reboot case's SUCCEEDED MARK_UNSCHEDULABLE proves the isolation side"
+    )
+    assert analysis["required_operations_present"] is True, analysis
+
+
+def test_blast001_refuses_when_no_live_release_case_proves_an_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, case_id="GF-REGIONAL-BLAST-001", cls=BlastCasesOne)
+    nodes = {"items": [_node("cpu-1", [])]}
+    _e2e001_handoff(runner.e2e_dir, nodes)
+    card_path = runner.e2e_dir / base.E2E001_EXECUTION_CARD
+    card = json.loads(card_path.read_text())
+    card["release_id"] = "release-0"
+    base.write_json(card_path, card)
+    _pass_case(
+        runner.root_run_dir,
+        "GF-REGIONAL-COLLECT-015",
+        release="release-1",
+        operations=["MARK_UNSCHEDULABLE"],
+        started_at="2026-09-08T11:00:00+00:00",
+    )
+    runner.cpu_json = lambda *args: nodes if "nodes" in args else {"items": []}
+    with pytest.raises(base.CheckError, match="RESTART_WORKLOAD, STOP_WORKLOADS"):
+        runner.blast_001()
+
+
+def test_blast001_does_not_count_a_producer_that_started_before_the_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, case_id="GF-REGIONAL-BLAST-001", cls=BlastCasesOne)
+    nodes = {"items": [_node("cpu-1", [])]}
+    _e2e001_handoff(runner.e2e_dir, nodes)
+    # The card's window starts 2026-09-07T10:00; a producer that started earlier
+    # cannot be judged against a baseline taken after it ran, so it is listed
+    # and excluded -- and with it the only MARK_UNSCHEDULABLE proof is gone.
+    _pass_case(
+        runner.root_run_dir,
+        "GF-REGIONAL-COLLECT-015",
+        release="release-1",
+        operations=["MARK_UNSCHEDULABLE"],
+        started_at="2026-09-07T09:00:00+00:00",
+    )
+    runner.cpu_json = lambda *args: nodes if "nodes" in args else {"items": []}
+    with pytest.raises(
+        base.CheckError,
+        match=(
+            "inside the audited window proves MARK_UNSCHEDULABLE.*"
+            "producers before the baseline: GF-REGIONAL-COLLECT-015"
+        ),
+    ):
+        runner.blast_001()
+
+
+def test_succeeded_operations_read_only_succeeded_records() -> None:
+    document = {
+        "workflows": [
+            {
+                "request_id": "wf-ok",
+                "status": "SUCCEEDED",
+                "official_steps": [{"operation": "RESET_GPU"}],
+                "step_executions": [
+                    {"operation": "MARK_UNSCHEDULABLE", "status": "SUCCEEDED"},
+                    {"operation": "RESET_GPU", "status": "FAILED"},
+                ],
+            },
+            {
+                "request_id": "wf-open",
+                "status": "RUNNING",
+                "step_executions": [
+                    {"operation": "STOP_WORKLOADS", "status": "SUCCEEDED"}
+                ],
+            },
+        ],
+        "commands": [
+            {
+                "command_id": "cmd-1",
+                "workflow_request_id": "wf-ok",
+                "status": "SUCCEEDED",
+                "step": {"operation": "WorkflowOperation.RESTART_WORKLOAD"},
+            },
+            {
+                "command_id": "cmd-2",
+                "workflow_request_id": "wf-ok",
+                "status": "FAILED",
+                "step": {"operation": "REPLACE_NODE"},
+            },
+        ],
+    }
+    found = base.succeeded_operations(document)
+    assert found == {"MARK_UNSCHEDULABLE": {"wf-ok"}, "RESTART_WORKLOAD": {"wf-ok"}}, (
+        "declared steps, FAILED executions and non-terminal workflows prove nothing"
+    )

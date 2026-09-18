@@ -405,11 +405,25 @@ class CollectorWindowFixture:
     def control_plane_metrics(self) -> list[str]:
         """Raw ``/metrics`` of every ready control-worker and ingress replica."""
 
+        return self._metrics_texts(
+            ((CONTROL_WORKER_APP, WORKER_METRICS_PORT), (API_APP, API_METRICS_PORT))
+        )
+
+    def census_metrics(self) -> list[str]:
+        """Raw ``/metrics`` of every ready replica that publishes the collector census.
+
+        ``CollectorMetricsSnapshot`` is created with ``enabled=service_role in
+        {"all", "ingress"}`` (``gpu_fault.app.factory``): only the ingress
+        Deployment renders ``gpu_fault_collector_{silent,erroring}_nodes``, a
+        ``worker`` replica never does. A verdict that demands the census from
+        every replica must therefore read the ingress replicas only.
+        """
+
+        return self._metrics_texts(((API_APP, API_METRICS_PORT),))
+
+    def _metrics_texts(self, targets: tuple[tuple[str, int], ...]) -> list[str]:
         texts: list[str] = []
-        for app, port in (
-            (CONTROL_WORKER_APP, WORKER_METRICS_PORT),
-            (API_APP, API_METRICS_PORT),
-        ):
+        for app, port in targets:
             for pod in self.regional.ready_pods("cpu", app):
                 output = self.regional.kubectl(
                     "cpu",

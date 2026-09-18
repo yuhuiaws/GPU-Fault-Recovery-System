@@ -143,9 +143,13 @@ class WindowHost:
                     else [],
                 }
             ]
-        self.errors_seen += 1
         errors = []
         if self.window:
+            # The first erroring round after the hang names the timeout, the
+            # rounds after it the open breaker. Count rounds inside the window
+            # only: the runner also reads the statuses before it opens the
+            # window (host-success freshness gate), and those reads are clean.
+            self.errors_seen += 1
             errors = [
                 "nvidia-smi timed out"
                 if self.errors_seen == 1
@@ -186,6 +190,13 @@ class WindowHost:
             f'{v.ERRORING_METRIC}{{cluster_id="cluster-a",channel="HOST_TELEMETRY"}} {int(self.window)}\n'
             f'{v.SILENT_METRIC}{{cluster_id="cluster-a",channel="HOST_TELEMETRY"}} {int(self.problem == "silence" and self.window)}'
         ]
+
+    def census_metrics(self) -> list[str]:
+        # The census gauges are rendered by the ingress role only (the real
+        # fixture scrapes the api replicas alone); COLLECT-018 keeps reading
+        # every replica through control_plane_metrics.
+        assert self.module is c019, "only COLLECT-019 reads the ingress census"
+        return self.control_plane_metrics()
 
     def control_plane_logs(self, since: int) -> str:
         assert since >= 60

@@ -41,6 +41,11 @@ E2E001_EXECUTION_CARD = "execution-card.json"
 E2E001_CONTROL_PLANE_STATE = "control-plane-current.json"
 E2E001_CPU_NODES_BEFORE = "cpu-nodes-before.json"
 CONTAINMENT_CASE_ID = "GF-REGIONAL-DESTR-001"
+# BLAST-001 binds its producers by release, not by case id: any PASS case of
+# the run whose SUCCEEDED records prove these operations on the live release.
+REQUIRED_WORKLOAD_OPERATIONS = ("STOP_WORKLOADS", "RESTART_WORKLOAD")
+REQUIRED_ISOLATION_OPERATIONS = ("MARK_UNSCHEDULABLE",)
+PRODUCER_EVIDENCE_LIMIT_BYTES = 32 * 1024 * 1024
 # The four BLAST cases share one preflight (site/account/EKS/HyperPod
 # bindings); a result this young is reused rather than paid for four times.
 PREFLIGHT_REUSE_SECONDS = 30 * 60
@@ -1023,3 +1028,168 @@ class BlastRunnerBase:
 
     def blast_004(self) -> None:
         raise NotImplementedError
+
+
+def _operation_name(value: Any) -> str:
+    return str(value).rsplit(".", 1)[-1]
+
+
+def _read_json_document(path: Path) -> Any | None:
+    try:
+        if path.stat().st_size > PRODUCER_EVIDENCE_LIMIT_BYTES:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def parse_optional_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = parse_time(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def succeeded_operations(document: Any) -> dict[str, set[str]]:
+    """Operations proven by SUCCEEDED records anywhere in ``document``.
+
+    Two shapes count, both as the runners write them: a workflow record whose
+    ``status`` is SUCCEEDED, read through its SUCCEEDED ``step_executions``; and
+    a remote command whose ``status`` is SUCCEEDED, read through
+    ``step.operation``. Declared steps, ``completed_operations`` lists, WAITING
+    or FAILED executions and non-terminal workflows prove nothing here -- the
+    spec forbids taking a step name or an arbitrary terminal status as success.
+    Returns ``{operation: {workflow ids}}``.
+    """
+
+    found: dict[str, set[str]] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if str(value.get("status") or "").endswith("SUCCEEDED"):
+                identity = str(
+                    value.get("request_id") or value.get("workflow_request_id") or ""
+                )
+                steps = value.get("step_executions")
+                if isinstance(steps, list):
+                    for step in steps:
+                        if (
+                            isinstance(step, dict)
+                            and str(step.get("status") or "").endswith("SUCCEEDED")
+                            and step.get("operation")
+                        ):
+                            found.setdefault(
+                                _operation_name(step["operation"]), set()
+                            ).add(identity)
+                step = value.get("step")
+                if (
+                    isinstance(step, dict)
+                    and step.get("operation")
+                    and value.get("command_id")
+                ):
+                    found.setdefault(_operation_name(step["operation"]), set()).add(
+                        identity
+                    )
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(document)
+    return found
+
+
+def release_bound_producers(
+    root_run_dir: Path, *, release_id: str, cluster_ids: set[str]
+) -> dict[str, dict[str, Any]]:
+    """PASS cases of this run bound to ``release_id`` with the operations they prove.
+
+    A case counts when its verdict file says PASS for ``release_id`` and one of
+    ``cluster_ids`` with no recorded errors; every JSON file in its directory is
+    then read for SUCCEEDED records (``succeeded_operations``). The window a
+    producer contributes runs from its ``started_at`` (or the earliest JSON it
+    wrote) to its latest recorded end (or the verdict file's write time).
+    """
+
+    producers: dict[str, dict[str, Any]] = {}
+    for case_dir in sorted((root_run_dir / "cases").glob("GF-REGIONAL-*")):
+        if not case_dir.is_dir():
+            continue
+        # The case's own verdict file, or -- for E2E-001, whose in-process
+        # producer writes only its execution card -- the card, which carries
+        # the same case_id/verdict/release_id/cluster_id binding.
+        verdict_path = case_dir / f"{case_dir.name}.json"
+        if not verdict_path.is_file():
+            verdict_path = case_dir / E2E001_EXECUTION_CARD
+        verdict = _read_json_document(verdict_path)
+        if (
+            not isinstance(verdict, dict)
+            or verdict.get("case_id") not in (None, case_dir.name)
+            or verdict.get("verdict") != "PASS"
+            or verdict.get("release_id") != release_id
+            or verdict.get("cluster_id") not in cluster_ids
+            or verdict.get("errors")
+            or verdict.get("error")
+        ):
+            continue
+        operations: dict[str, set[str]] = {}
+        files: list[str] = []
+        documents = sorted(case_dir.glob("*.json"))
+        for path in documents:
+            document = _read_json_document(path)
+            if document is None:
+                continue
+            for operation, identities in succeeded_operations(document).items():
+                operations.setdefault(operation, set()).update(identities)
+            files.append(path.name)
+        if not operations:
+            continue
+        # A run's own start stamp, else the window its card opened (E2E-001's
+        # card carries no started_at), else the earliest JSON it wrote.
+        window = verdict.get("maintenance_window")
+        started = (
+            parse_optional_time(verdict.get("started_at"))
+            or parse_optional_time(
+                window.get("start") if isinstance(window, dict) else None
+            )
+            or datetime.fromtimestamp(
+                min(path.stat().st_mtime for path in documents), tz=timezone.utc
+            )
+        )
+        ends = [
+            parse_optional_time(verdict.get(key))
+            for key in ("ended_at", "executed_at", "completed_at")
+        ]
+        ended = max(
+            [item for item in ends if item is not None]
+            or [datetime.fromtimestamp(verdict_path.stat().st_mtime, tz=timezone.utc)]
+        )
+        producers[case_dir.name] = {
+            "started_at": started.isoformat(),
+            "ended_at": ended.isoformat(),
+            "operations": {
+                operation: sorted(identities)
+                for operation, identities in sorted(operations.items())
+            },
+            "files": files,
+        }
+    return producers
+
+
+def producer_operations(producers: dict[str, dict[str, Any]]) -> set[str]:
+    return {
+        operation
+        for producer in producers.values()
+        for operation in producer["operations"]
+    }
+
+
+def missing_required_operations(producers: dict[str, dict[str, Any]]) -> list[str]:
+    present = producer_operations(producers)
+    return sorted(
+        set(REQUIRED_WORKLOAD_OPERATIONS + REQUIRED_ISOLATION_OPERATIONS) - present
+    )

@@ -248,7 +248,7 @@ def test_the_recovery_contract_passes_when_the_waited_step_succeeded() -> None:
 def test_another_success_cannot_stand_in_for_the_waited_command(mismatch: str) -> None:
     bundle = _bundle()
     step = bundle["workflow"]["step_executions"][1]
-    step.update(step_index=1, operation_id="remote/cmd-1")
+    step.update(step_index=1, adapter_operation_id="remote/cmd-1")
     bundle["remote_commands"] = [
         {
             "command_id": "cmd-1",
@@ -396,6 +396,16 @@ def test_the_preflight_passes_on_an_idle_node_and_a_classifying_executor() -> No
         ),
         ({"workloads": [{"name": "job"}]}, "non-system workload"),
         (
+            {
+                "product_view": {
+                    "workload_state": "ACTIVE",
+                    "attempt_ids": ["train-a1-r-c6e14c8e"],
+                    "workload_ids": ["ns/pytorchjob/trainer"],
+                }
+            },
+            "still binds",
+        ),
+        (
             {"state": {"queue": {"depth": 2, "fault_backlog_depth": 1}}},
             "processor queue",
         ),
@@ -495,3 +505,35 @@ def test_the_classifier_probe_reads_the_dispatch_module_and_the_node_labels_come
         "role": "gpu",
     }
     assert calls[-1][:4] == ("gpu", "get", "node", "hp-node-1")
+
+
+def test_the_recovery_contract_reads_the_step_field_the_workflow_model_writes() -> None:
+    """The waited step is matched on ``adapter_operation_id`` (the field
+    ``WorkflowStepExecution`` serialises), not a fake-only ``operation_id``:
+    the live 2026-09-18 run recovered the same command and still failed."""
+    from gpu_fault.models import WorkflowStepExecution
+
+    assert "adapter_operation_id" in WorkflowStepExecution.model_fields
+    assert "operation_id" not in WorkflowStepExecution.model_fields
+    bundle = _bundle()
+    bundle["workflow"]["step_executions"][1] = WorkflowStepExecution(
+        step_index=1,
+        operation="MARK_UNSCHEDULABLE",
+        status="SUCCEEDED",
+        adapter_operation_id="remote/cmd-1",
+    ).model_dump(mode="json")
+    bundle["remote_commands"] = [
+        {
+            "command_id": "cmd-1",
+            "step_index": 1,
+            "status": "SUCCEEDED",
+            "operation": "MARK_UNSCHEDULABLE",
+        }
+    ]
+    proof = verdicts.outage_evidence([_sample()])
+    assert (
+        verdicts.recovery_errors(
+            bundle, waited_operation="MARK_UNSCHEDULABLE", waited_evidence=proof
+        )
+        == []
+    )

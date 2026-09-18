@@ -1323,6 +1323,15 @@ def main() -> int:
         description="Run the HA-009 managed Aurora credential rotation case."
     )
     add_live_arguments(parser, confirmation=CONFIRMATION)
+    # The regional flags the site profile fills (bind_site_profile only binds
+    # flags the parser accepts); without them chain_preflight resolved an empty
+    # cluster ID and the plan died on 2026-09-18.
+    parser.add_argument("--cpu-kubeconfig", default="")
+    parser.add_argument("--gpu-kubeconfig", default="")
+    parser.add_argument("--gpu-context", default="")
+    parser.add_argument("--cluster-id", default="")
+    parser.add_argument("--namespace", default="gpu-fault-system")
+    parser.add_argument("--region", default="")
     parser.add_argument(
         "--rds-cluster-id",
         default="",

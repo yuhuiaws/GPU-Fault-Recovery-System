@@ -30,6 +30,7 @@ from tests.regional.test_net007_outage_lifecycle import Regional, fixture
         "label",
         "existing",
         "focused",
+        "bound",
     ],
 )
 def test_read_only_preflight_rejects_each_unsafe_observation(
@@ -57,6 +58,18 @@ def test_read_only_preflight_rejects_each_unsafe_observation(
 
         def business_workloads(self, node: str) -> list[Any]:
             return []
+
+        def node_workload_view(self, node: str) -> dict[str, Any]:
+            # The control plane's own view: inside the watcher's missing-Pod
+            # grace a node with no Pods is still bound to the attempt that
+            # left it, and the preflight must refuse it (NET-007 attempt 2).
+            if problem == "bound":
+                return {
+                    "workload_state": "ACTIVE",
+                    "attempt_ids": ["train-a1-r-c6e14c8e"],
+                    "workload_ids": ["ns/pytorchjob/trainer"],
+                }
+            return {"workload_state": "IDLE", "attempt_ids": [], "workload_ids": []}
 
         def store_snapshot(self, **kwargs: Any) -> dict[str, Any]:
             return {

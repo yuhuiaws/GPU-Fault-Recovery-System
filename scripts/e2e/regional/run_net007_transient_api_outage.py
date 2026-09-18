@@ -252,10 +252,24 @@ def preflight_errors(
     existing_webhook: str,
     permissions: dict[str, bool],
     tests_passed: bool,
+    product_view: dict[str, Any] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     if node.get("ready") != "True" or node.get("unschedulable"):
         errors.append("target node is not Ready and schedulable")
+    if product_view is not None and (
+        str(product_view.get("workload_state") or "").upper() == "ACTIVE"
+        or product_view.get("attempt_ids")
+    ):
+        # Idle is the control plane's word, not kubectl's: inside the watcher's
+        # missing-Pod grace a node with no Pods is still bound to the attempt
+        # that left it, and the EFA workflow would then STOP a 404 workload.
+        errors.append(
+            "control plane still binds attempt(s) "
+            f"{product_view.get('attempt_ids')} to the target node "
+            f"(workload_state={product_view.get('workload_state')}); wait for "
+            "the completion watcher's tombstone before injecting"
+        )
     if node.get("ownership_annotations"):
         errors.append("target node has pre-existing workflow ownership")
     if (node.get("labels") or {}).get("kubernetes.io/hostname") != settings.node:
@@ -330,6 +344,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "labels": node_labels(regional, settings.node),
     }
     workloads = regional.business_workloads(settings.node)
+    product_view = regional.node_workload_view(settings.node)
     state = regional.store_snapshot(
         node=settings.node,
         observed_after=datetime.now(timezone.utc),
@@ -372,6 +387,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         existing_webhook=existing,
         permissions=permissions,
         tests_passed=tests["passed"],
+        product_view=product_view,
     )
     result = {
         **binding["identity"],
@@ -379,6 +395,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "predecessor": binding["predecessor"],
         "node": node,
         "business_workloads": workloads,
+        "product_workload_view": product_view,
         "store": state,
         "executor": executor,
         "server_minor": minor,

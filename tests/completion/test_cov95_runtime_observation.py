@@ -51,7 +51,10 @@ def test_restored_attempt_with_partial_workload_evidence_remains_stopped(unknown
     terminals = [payload for path, payload in sink.posts if path.endswith("/terminal")]
     assert [item["terminal_status"] for item in terminals] == ["STOPPED"]
     assert stopper.calls == []
-    assert [name for name, _, _ in batch.reads] == ["succeeded", "unknown"]
+    # Two bounded reads per attempt: the first missing pass reads the owners
+    # once to tell a deleted workload (404) from a transient absence, and the
+    # tombstone at the end of the grace reads them again for the outcome.
+    assert [name for name, _, _ in batch.reads] == ["succeeded", "unknown"] * 2
     assert all(
         kwargs["_request_timeout"] == WORKLOAD_READ_TIMEOUT
         for _, _, kwargs in batch.reads

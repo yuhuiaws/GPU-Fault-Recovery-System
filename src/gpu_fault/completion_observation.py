@@ -24,6 +24,10 @@ TERMINAL_ORIGIN_MISSING_TOMBSTONE = "missing-tombstone"
 # The kubernetes client leaves the read timeout unset by default, and a parked
 # API-server endpoint would then hold the whole reconcile forever (F3).
 WORKLOAD_READ_TIMEOUT = (5.0, 10.0)
+# The API server's two answers for an object that is definitely gone. Anything
+# else -- RBAC, a timeout, an unparsable ID -- is "unknown" and keeps the
+# missing-Pod path on its fail-closed grace.
+_ABSENT_STATUSES = frozenset({404, 410})
 _FAILURE_CONDITION_TYPES = frozenset({"failed"})
 # What a FAILED verdict recovered from a workload object can say about the
 # attempt: the Pods are gone, so there is no failed rank, no node and no exit
@@ -51,12 +55,29 @@ def read_workload_objects(
     that our own stop produced turns a stop into an unattributed failure.
     """
 
+    objects, _absent = read_workload_objects_or_absence(controller, workload_ids)
+    return objects
+
+
+def read_workload_objects_or_absence(
+    controller: Any, workload_ids: list[str]
+) -> tuple[list[dict[str, Any]], bool]:
+    """``read_workload_objects`` plus whether every object is definitely gone.
+
+    Absence is a property of the whole attempt: it holds only when the attempt
+    names at least one workload and the API server answered 404/410 for each
+    of them. One readable object -- or one read that failed for any other
+    reason -- and the attempt may still get its Pods back, so it is not absent.
+    """
+
     objects: list[dict[str, Any]] = []
+    absent = bool(workload_ids)
     for workload_id in workload_ids:
-        data = read_workload_object(controller, workload_id)
+        data, gone = read_workload_object_state(controller, workload_id)
         if data is not None:
             objects.append(data)
-    return objects
+        absent = absent and gone
+    return objects, absent
 
 
 def workload_objects_initiator(objects: list[dict[str, Any]]) -> str | None:
@@ -84,7 +105,22 @@ def read_workload_object(controller: Any, workload_id: str) -> dict[str, Any] | 
     read of a wedged API-server endpoint would park the whole watcher. Any
     failure -- absent object, RBAC, timeout, unparsable ID -- is "unknown",
     never an exception on the observation path, and every caller has to fail
-    closed on ``None``.
+    closed on ``None``. ``read_workload_object_state`` is the same read for a
+    caller that must tell a deleted object apart from an unreadable one.
+    """
+
+    data, _gone = read_workload_object_state(controller, workload_id)
+    return data
+
+
+def read_workload_object_state(
+    controller: Any, workload_id: str
+) -> tuple[dict[str, Any] | None, bool]:
+    """The object (or ``None``) and whether the API server said it is gone.
+
+    The second value is ``True`` only for a 404/410 from the read itself: a
+    missing client, an RBAC refusal, a timeout or a bad ID all read as
+    ``(None, False)`` -- unknown, never gone.
     """
 
     stopper = controller.workload_stopper
@@ -94,14 +130,14 @@ def read_workload_object(controller: Any, workload_id: str) -> dict[str, Any] | 
         if kind == "job":
             batch = getattr(stopper, "batch", None)
             if batch is None:
-                return None
+                return None, False
             raw = batch.read_namespaced_job(
                 name, namespace, _request_timeout=WORKLOAD_READ_TIMEOUT
             )
         else:
             custom = getattr(stopper, "custom", None)
             if custom is None or kind not in _CUSTOM_WORKLOADS:
-                return None
+                return None, False
             group, version, plural = _CUSTOM_WORKLOADS[kind]
             raw = custom.get_namespaced_custom_object(
                 group,
@@ -113,14 +149,14 @@ def read_workload_object(controller: Any, workload_id: str) -> dict[str, Any] | 
             )
     except Exception as exc:  # noqa: BLE001 - observation must not fail
         LOGGER.debug("could not read workload %s: %s", workload_id, exc)
-        return None
+        return None, getattr(exc, "status", None) in _ABSENT_STATUSES
     if isinstance(raw, dict):
-        return raw
+        return raw, False
     try:
-        return dict(controller.serializer(raw))
+        return dict(controller.serializer(raw)), False
     except Exception as exc:  # noqa: BLE001 - observation must not fail
         LOGGER.debug("could not deserialize workload %s: %s", workload_id, exc)
-        return None
+        return None, False
 
 
 def pod_container_has_started(pod: dict[str, Any], container_name: str) -> bool:
@@ -339,6 +375,32 @@ class MissingAttemptTracker:
             # faulted GPU resolved IDLE -- the flip C1 exists to prevent.
             return observation.model_copy(update={"observed_at": observed_at})
         self.tombstoned.add(attempt_id)
+        return self._tombstone(observation, observed_at)
+
+    def tombstone_now(
+        self,
+        attempt_id: str,
+        observation: AttemptObservation,
+        observed_at: datetime,
+    ) -> AttemptObservation:
+        """The tombstone without the grace: nothing will recreate these Pods.
+
+        The grace exists for the gap while a controller recreates a Pod; a
+        workload object the API server reports gone (404/410) recreates
+        nothing, and the RUNNING re-post would only keep a dead attempt bound
+        to its node -- long enough for a host fault raised in that window to
+        plan STOP_WORKLOADS against a workload that no longer exists, which
+        the ownership guard refuses and escalates (NET-007, live).
+        """
+
+        self.since.setdefault(attempt_id, observed_at)
+        self.tombstoned.add(attempt_id)
+        return self._tombstone(observation, observed_at)
+
+    @staticmethod
+    def _tombstone(
+        observation: AttemptObservation, observed_at: datetime
+    ) -> AttemptObservation:
         return cast(
             AttemptObservation,
             observation.model_copy(
@@ -480,18 +542,50 @@ def reconcile_attempt_observation(
             AttemptObservation,
             previous.model_copy(update={"observed_at": observed_at}),
         )
-    result = cast(
-        AttemptObservation,
-        controller._missing_attempts.observe_missing(
+    # The first pass that finds the Pods gone reads the workload objects once
+    # (bounded): owners the API server reports gone (404/410) end the grace on
+    # this very pass -- see ``tombstone_now``. Later passes inside the grace do
+    # not read again; the tombstone resolution at the end of the grace takes its
+    # own fresh read, so its two questions still come from one snapshot (C1).
+    objects: list[dict[str, Any]] | None = None
+    absent = False
+    if attempt_id not in controller._missing_attempts.since:
+        objects, absent = read_workload_objects_or_absence(
+            controller, previous.workload_ids
+        )
+        controller.note_progress()
+    if absent:
+        LOGGER.info(
+            "attempt %s has no Pods left and its workload object(s) %s are "
+            "gone; recording the stop now instead of after the missing grace",
             attempt_id,
-            previous,
-            observed_at,
-        ),
-    )
+            previous.workload_ids,
+        )
+        result = cast(
+            AttemptObservation,
+            controller._missing_attempts.tombstone_now(
+                attempt_id, previous, observed_at
+            ),
+        )
+    else:
+        result = cast(
+            AttemptObservation,
+            controller._missing_attempts.observe_missing(
+                attempt_id,
+                previous,
+                observed_at,
+            ),
+        )
     if result.workload_phase is not WorkloadPhase.STOPPED:
         return result
     return resolve_missing_attempt_tombstone(
-        controller, attempt_id, previous, result, observed_at
+        controller,
+        attempt_id,
+        previous,
+        result,
+        observed_at,
+        # Only the read of this pass may be reused; a grace-old one may not.
+        objects=objects if absent else None,
     )
 
 
@@ -501,16 +595,20 @@ def resolve_missing_attempt_tombstone(
     previous: AttemptObservation,
     tombstone: AttemptObservation,
     observed_at: datetime,
+    *,
+    objects: list[dict[str, Any]] | None = None,
 ) -> AttemptObservation:
     """Let the workload objects qualify a tombstone the Pods cannot explain.
 
     Read once, and ask the questions in the order that keeps the path
     fail-closed (C1): who stopped this first, an outcome only afterwards.
+    ``objects`` is that one read when the caller already holds it.
     """
 
     if tombstone.termination_initiator_incident_id is not None:
         return tombstone
-    objects = read_workload_objects(controller, previous.workload_ids)
+    if objects is None:
+        objects = read_workload_objects(controller, previous.workload_ids)
     # STOP_WORKLOADS annotates the attempt Pods with the initiator incident
     # and then suspends the workload; a Pod that exits within one poll of the
     # patch is never observed annotated, so the tombstone would read as a user

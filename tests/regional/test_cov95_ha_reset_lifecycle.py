@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -46,10 +47,32 @@ def test_full_reset_window_lifecycle_keeps_identity_and_cleans(
     if harness.module is ha003:
         assert report["failover_overlap_observed"] is True
         assert report["rds_after"]["writer"] != report["rds_before"]["writer"]
-        assert harness.binding_reads == 3
-        assert harness.events.index("write-xid46") < harness.events.index(
-            "failover-request"
+        # Two full binding reads remain: the execute-phase preflight and the
+        # one immediately before the reset is injected. The barrier before the
+        # failover request no longer re-reads the binding (~40 s live, most of
+        # the ~65 s a batched reset stays WAITING); it is one describe call.
+        assert harness.binding_reads == 2
+        injected = harness.events.index("write-xid46")
+        requested = harness.events.index("failover-request")
+        assert injected < requested
+        assert harness.events[injected:requested].count("rds-describe") == 1, (
+            "the barrier between the injection and the failover request is one "
+            "describe-db-clusters call"
         )
+        timing = json.loads((harness.directory / "failover-timing.json").read_text())
+        stamps = [
+            "claim_observed_at",
+            "recheck_started_at",
+            "aurora_checked_at",
+            "store_snapshot_at",
+            "requested_at",
+        ]
+        assert sorted(timing) == sorted(stamps), (
+            "the failover request must record where the reset window went"
+        )
+        assert [timing[key] for key in stamps] == sorted(
+            timing[key] for key in stamps
+        ), "the stamps must follow the barrier's order: claim, describe, store, request"
         assert report["provider_events_provisional"] is True
     else:
         assert report["remote_command_ids"] == ["command-4"]
@@ -177,23 +200,41 @@ def test_source_valid_focused_result_is_reused_without_nested_pytest(
     assert "focused-tests" not in harness.events
 
 
-@pytest.mark.parametrize("boundary", [1, 2, 3])
+@pytest.mark.parametrize(
+    "boundary",
+    [1, 2, "writer", "status"],
+    ids=["preflight", "injection", "failover-writer", "failover-status"],
+)
 def test_aurora_binding_drift_stops_before_the_next_action(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, boundary: int
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, boundary: int | str
 ) -> None:
+    """Drift at the preflight and injection boundaries is the full binding
+    read refusing. The barrier before the failover request no longer re-reads
+    the binding: drift there is its one describe call answering a moved
+    writer or a cluster that is not available, and it must stop before the
+    store re-read and the provider request."""
     harness = ResetHarness(monkeypatch, tmp_path, ha003)
-    harness.binding_failure_at = boundary
+    if isinstance(boundary, int):
+        harness.binding_failure_at = boundary
+        error = "Aurora binding drift"
+    else:
+        harness.api.rds_drift_before_failover = boundary
+        error = "Aurora moved before the failover request"
     if boundary == 1:
-        with pytest.raises(RegionalFixtureError, match="Aurora binding drift"):
+        with pytest.raises(RegionalFixtureError, match=error):
             harness.execute()
         assert "host-create" not in harness.events
     else:
         code, report = harness.execute()
         assert code == 1
-        assert "Aurora binding drift" in report["error"]
+        assert error in report["error"]
         assert "host-cleanup" in harness.events
     assert "failover-request" not in harness.events
-    assert ("write-xid46" in harness.events) is (boundary == 3)
+    assert ("write-xid46" in harness.events) is (boundary not in (1, 2))
+    if boundary not in (1, 2):
+        # The reset capture took two store reads (PENDING, then WAITING);
+        # a moved writer must refuse before the barrier's third one.
+        assert harness.api.state_reads == 2, harness.events
 
 
 def test_failover_after_reset_is_inconclusive_not_a_false_pass(

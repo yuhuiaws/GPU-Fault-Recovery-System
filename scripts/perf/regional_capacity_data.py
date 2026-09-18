@@ -208,7 +208,16 @@ def inspect_or_cleanup(
                 raise RuntimeError(
                     "capacity data has no current run-owned registration"
                 )
-            if counts["gpu_fault_processor_queue"]:
+            # Drained means no open work. COMPLETED rows are replay records the
+            # processor keeps for its idempotency window and this cleanup deletes
+            # below; counting them refused every teardown that ran right after
+            # the probe stopped (HA-005 attempt 2: 26 COMPLETED rows, 3 refusals).
+            cursor.execute(
+                "SELECT count(*) FROM gpu_fault_processor_queue "
+                "WHERE cluster_id=ANY(%s) AND status <> 'COMPLETED'",
+                (cluster_ids,),
+            )
+            if int(cursor.fetchone()[0]):
                 raise RuntimeError("capacity processor queue has not drained")
             for (kind, _), payload in records.items():
                 terminal = (

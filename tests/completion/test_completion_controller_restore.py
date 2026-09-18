@@ -534,3 +534,113 @@ def test_restored_attempt_with_a_retrying_job_is_not_tombstoned_yet() -> None:
     assert terminal["terminal_status"] == "FAILED", (
         f"the failure was not reported once the job went quiet: {terminal}"
     )
+
+
+class _GoneCustom:
+    """The API server's answer for a PyTorchJob that was deleted: 404."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def get_namespaced_custom_object(self, *args, **kwargs):
+        self.reads += 1
+        error = RuntimeError('pytorchjobs.kubeflow.org "trainer" not found')
+        error.status = 404
+        raise error
+
+
+class _UnreadableCustom:
+    def get_namespaced_custom_object(self, *args, **kwargs):
+        error = RuntimeError("gateway timeout")
+        error.status = 504
+        raise error
+
+
+def _watch_disappearing_attempt(stopper, *, workload_ids, grace=300):
+    clock = Clock()
+    core = FakeCoreApi([pod(0, workload_ids=workload_ids)])
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        cleanup_timeout_seconds=30,
+        attempt_missing_grace_seconds=grace,
+        now=clock,
+        workload_stopper=stopper,
+        publish_observations=True,
+    )
+    subject.run_once()
+    core.pods = []
+    # One watcher pass later: inside the grace by a wide margin.
+    clock.value += timedelta(seconds=30)
+    subject.run_once()
+    observations = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ]
+    terminals = [
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    ]
+    return observations, terminals
+
+
+def test_disappeared_attempt_whose_workload_object_is_gone_is_stopped_at_once() -> None:
+    """The missing-Pod grace covers the gap while a controller recreates a Pod.
+
+    A workload object that is gone (404) recreates nothing, so keeping its
+    attempt bound to the node for the grace only lets a host fault raised in
+    that window plan STOP_WORKLOADS against a workload that no longer exists,
+    which the ownership guard refuses as STOP_OWNERSHIP_IDENTITY_UNKNOWN and
+    turns into a quarantine (NET-007 a2, live).
+    """
+
+    stopper = FakeStopper()
+    stopper.custom = _GoneCustom()
+    stopper.batch = None
+
+    observations, terminals = _watch_disappearing_attempt(
+        stopper, workload_ids=["default/pytorchjob/trainer"]
+    )
+
+    assert observations[-1]["workload_phase"] == "STOPPED", observations[-1]
+    assert observations[-1]["containers"] == []
+    assert [item["terminal_status"] for item in terminals] == ["STOPPED"]
+    assert terminals[0].get("termination_initiator_incident_id") is None
+
+
+def test_disappeared_attempt_with_an_unreadable_workload_object_keeps_the_grace() -> (
+    None
+):
+    """Only a definite 404/410 is absence; any other failure is unknown and the
+    fail-closed default -- the RUNNING re-post for the whole grace -- stands."""
+
+    stopper = FakeStopper()
+    stopper.custom = _UnreadableCustom()
+    stopper.batch = None
+
+    observations, terminals = _watch_disappearing_attempt(
+        stopper, workload_ids=["default/pytorchjob/trainer"]
+    )
+
+    assert observations[-1]["workload_phase"] == "RUNNING", observations[-1]
+    assert terminals == []
+
+
+def test_disappeared_attempt_with_one_owner_still_present_keeps_the_grace() -> None:
+    """Absence is a property of the whole attempt: while any of its workload
+    objects can still be read, its Pods may come back."""
+
+    class ActiveJobApi:
+        def read_namespaced_job(self, name, namespace, **kwargs):
+            return {"metadata": {"name": name}, "status": {"active": 1}}
+
+    stopper = FakeStopper()
+    stopper.custom = _GoneCustom()
+    stopper.batch = ActiveJobApi()
+
+    observations, terminals = _watch_disappearing_attempt(
+        stopper, workload_ids=["default/pytorchjob/trainer", "default/job/side"]
+    )
+
+    assert observations[-1]["workload_phase"] == "RUNNING", observations[-1]
+    assert terminals == []

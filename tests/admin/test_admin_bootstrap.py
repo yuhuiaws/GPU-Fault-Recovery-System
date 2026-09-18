@@ -300,11 +300,14 @@ def test_public_subnet_allocator_avoids_existing_ranges() -> None:
     assert selected == ["10.0.0.32/28", "10.0.0.48/28"]
 
 
+PARALLEL_TASK_SECONDS = 0.3
+
+
 def test_independent_bootstrap_tasks_run_in_parallel(tmp_path) -> None:
     state = BootstrapState(tmp_path / "state.json", site_id="test")
 
     def task(value: str) -> str:
-        time.sleep(0.1)
+        time.sleep(PARALLEL_TASK_SECONDS)
         return value
 
     started = time.monotonic()
@@ -315,7 +318,10 @@ def test_independent_bootstrap_tasks_run_in_parallel(tmp_path) -> None:
     elapsed = time.monotonic() - started
 
     assert result == {"a": "a", "b": "b", "c": "c"}
-    assert elapsed < 0.25
+    # Three tasks in parallel take about one task's time; the bound is 75 % of
+    # the serial sum, wide enough for thread start-up jitter on a loaded box
+    # (16 xdist workers stretched three 0.1 s tasks to 0.43 s).
+    assert elapsed < 3 * PARALLEL_TASK_SECONDS * 0.75, f"{elapsed:.2f}s elapsed"
 
 
 def test_bootstrap_aurora_formats_admin_config_capacity() -> None:

@@ -479,3 +479,36 @@ def test_ha010_standalone_invalid_arguments_do_not_contact_any_endpoint(
     monkeypatch.setattr(sys, "argv", ["probe", "0", "1", "1"])
     with pytest.raises(SystemExit, match="positive"):
         runpy.run_path(ha010_probe.__file__, run_name="__main__")
+
+
+def test_ha001_probe_validator_lets_the_simulated_closure_through_the_guard() -> None:
+    """Dispatch guards RESTART_WORKLOAD through ``executor.stop_ownership_validator``
+    and refuses without one -- a1 on 2026-09-18 ended FAILED with
+    STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE, so the closure never closed."""
+    from gpu_fault.adapters.kubernetes import stop_ownership
+
+    steps = [
+        WorkflowStepSpec(operation=operation, execution_owner=ha001_probe.OWNER)
+        for operation in (
+            WorkflowOperation.FREEZE_EVIDENCE,
+            WorkflowOperation.STOP_WORKLOADS,
+            WorkflowOperation.RESTART_WORKLOAD,
+        )
+    ]
+    workflow = SimpleNamespace(
+        executes_safety_steps=False, official_steps=steps, safety_steps=[]
+    )
+    context = SimpleNamespace(
+        workflow=workflow, step=steps[2], step_index=2, idempotency_key="unit-key"
+    )
+    with stop_ownership.stop_ownership_scope(None):
+        refused = stop_ownership.node_submission_ownership_guard(context)
+    assert refused is not None, "no validator must still refuse, as the product does"
+    assert refused.details["reason"] == "STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE"
+    with stop_ownership.stop_ownership_scope(ha001_probe.SimulatedStopOwnership()):
+        assert stop_ownership.node_submission_ownership_guard(context) is None
+    source = Path(ha001_probe.__file__).read_text(encoding="utf-8")
+    assert (
+        'setattr(executor, "stop_ownership_validator", SimulatedStopOwnership())'
+        in source
+    ), "main() must wire the validator the way cluster_executor.bootstrap does"

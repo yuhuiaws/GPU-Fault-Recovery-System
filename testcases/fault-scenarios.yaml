@@ -2873,7 +2873,13 @@ test_cases:
   - revoke_agent 抛 cannot transition an agent in another cluster
   - B 的 agent 状态未变化
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8d0448fdc2cdddbe887f8406f179f48bb160e3ec4c22fb9b8fd6775b41b8d008
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-003
   related_pytest: tests/regional/test_regional_auth_boundary_acceptance.py::test_iso003_the_fleet_proxy_refuses_cross_cluster_reads_and_transitions
@@ -2889,7 +2895,13 @@ test_cases:
   - 一致时返回 200
   - 对不存在的节点返回 ready=false 且 reasons 含 expected one matching agent, found 0
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d7b284cbdca969d250cdadc68ae3ec99277792a7a639de13ff113ab471f0ed5c
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-iso-004
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_spare_health_uses_fleet_registry
@@ -3395,7 +3407,13 @@ test_cases:
   - 隔离命令在替代副本就位后完成，私有执行记录按命令身份保持幂等
   - 本用例不声明真实XID11或物理执行；真实恢复链由对应已批准的恢复用例独立证明
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: abe8f1e0362979c58f340356224a208cc9928b95fe6a4291e2d9de19a8333cc0
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-001
 - id: GF-REGIONAL-HA-002
@@ -3413,7 +3431,13 @@ test_cases:
   - uncordon后各角色恢复声明副本数与拓扑分布
   - 报告给出容量建议，例如增加第四个CPU节点或明确评估后调整topology spread
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: d71787c549098695acb1df9a755e54f9583a174fe66f2d3fcc2355c9a1da1592
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-002
 - id: GF-REGIONAL-HA-003
@@ -3433,7 +3457,13 @@ test_cases:
   - 若 failover 落在 reset command 已终态之后，结果记为 INCONCLUSIVE 而不是 PASS
   - reset及failover前重新证明CPU投影凭据和SQL writer绑定指定Aurora incarnation及已提交release；绑定重验后reset窗口仍须开放
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f549089ca028420ab4f8d7c8300980c9bbfb5a26d4fc7ea0e81f0dd7bf224e11
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha003_waits_for_reset_claim_before_failover
@@ -3455,9 +3485,9 @@ test_cases:
     verified:
       case_digest: 10b5f1094e2cb09efe62611e6af438afd4ad397aad0012022ec58bda6d7a9b4d
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-004
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha004_reclaim_timeline_keeps_one_command_id
@@ -3475,7 +3505,13 @@ test_cases:
   - routine spool路径允许latest-state合并，必须证明最后同节点健康批次被接收及spool排空，不要求每个202都有独立queue行
   - 全部目标滚动完成，合成registry、工作流、命令与探针资源清理通过
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: e674fd26e96b03b41d5186d54142a815e8611ad3296d9585ce86f142db99e999
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-005
 - id: GF-REGIONAL-HA-006
@@ -3516,7 +3552,13 @@ test_cases:
   - 重复的重连不产生第 4 条
   - DCGM 与 host outbox 在恢复后清零，并记录有界容量与 CompletionWatcher 残余限制
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 67cc655e3f4700c02cf268f8ac2dfacdf30f2efddccffb67706344bf56ec33e1
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-001
 - id: GF-REGIONAL-NET-002
@@ -3680,7 +3722,13 @@ test_cases:
   - 全程不出现 ESCALATE_SUPPORT、QUARANTINE、RESTART_NODE、REPLACE_NODE；CloudTrail provider 变更动词集合为空
   - webhook 与 deadman Job/ServiceAccount/ClusterRole/ClusterRoleBinding 零残留；EFA function 由控制面而非宿主 fail-safe 重绑
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ba353869dfb9dc235d71ac6a9b5d77fc3ab893e87be6566f0f3cc26ee0d172a0
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-007
   related_pytest: tests/execution/test_retryable_adapter_errors.py::test_transient_adapter_error_becomes_a_waiting_step_not_a_failure
@@ -3706,7 +3754,13 @@ test_cases:
   - 中断前后 kernel 采集器 PID、InvocationID 与 /dev/kmsg fd 集合不变，fdinfo pos 不回退；中断期间写入的行在解封后恰到达一次
   - 清理：窗口、防火墙规则、种子记录、Pod/ConfigMap 均为零残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 04296f03bc797366dfb8cb118b1b537cae39925835967bda4481aabc57a43138
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-net-008
   related_pytest: tests/regional/test_net008_outbox_dead_letter.py::test_the_transient_outbox_contract_passes_on_replayable_403_records
@@ -3819,7 +3873,13 @@ test_cases:
   - 控制面 EKS 无新增带 gpu-fault.io 标签的 Job
   - 控制面 EKS 无 Evicted 或 TaintManagerEviction 事件
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 515d1b8f8ef9a765a63a435b9a2a1799ab90856a92f4199676062a0b68e5bb9d
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-001
 - id: GF-REGIONAL-BLAST-002
@@ -4607,7 +4667,13 @@ test_cases:
   - 人工/带外确认订阅端真的收到通知（SNS→email 订阅即确认收件箱收到邮件）
   - 对同一RESET_GPU completion首次处理后再重复三次，provider_message_id与通知条数不变；发送计数零增量窗口须从首次完成之后开始，首次合法发送单独计数
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6b0293fd73df64e2e7349a24e54c8bebc876d99005998bee1d952ac0b7d9a3f9
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-notify-001
   related_pytest: tests/regional/test_regional_control_plane.py::test_regional_api_sends_executor_workload_restart_notification
@@ -4714,9 +4780,9 @@ test_cases:
     verified:
       case_digest: 0bb9ebcd573682e3abfd8463c8212e27e609abe2668fa938a14b5a453fa20a2f
       components:
-        control_plane: edfe63817c015a48f33f47d7b4d73a2c7e55ed4cbe716c4bd4671cdb533df8be
-        executor: 2eb6cd33b75c93fc483d0a1b04a66ecf36e629c9c2c4d0c501f496b1aee79d2d
-        node_runtime: ef5713ef2e4ed964e662e376017a4eeb85d28edbd431cdb45730e6da3c730d58
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-e2e-001
 - id: GF-REGIONAL-E2E-002
@@ -4997,7 +5063,13 @@ test_cases:
   - 轮换前与动作边界绑定CPU release、Secret/投影DSN、Aurora incarnation/master Secret及刷新器SA/RBAC/IAM；未知或漂移在mutation前停止
   - 刷新Job来自已验证CronJob；原始日志不进入证据，仅保留摘要和布尔结果；未开始轮换的中止解除本次watchdog，提交未知时保留受控前向恢复
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 2cd0ec80660ec374b6b355d22debd8c592da5107bb82e4b99d57251a230ad331
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-009
   related_pytest: tests/regional/test_aurora_credential_refresh.py::test_rotation_updates_the_secret_and_leaves_every_deployment_alone
@@ -5026,7 +5098,13 @@ test_cases:
   - 全程无任何 remote command 在飞、processor 队列为空；三个 Deployment 回到期望副本数，runtime identity 与 preflight 相同
   - failover之前再次校验CPU Secret/投影DSN/SQL writer与指定Aurora incarnation及release的绑定，不能故障转移另一套数据库
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 381f265549b2cbab40412b04551a9eb72708c9128446a67e91b5638233d3e0f7
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-010
   related_pytest: tests/regional/test_ha010_aurora_blackout_liveness.py::test_a_healthz_500_is_a_crash_not_a_refusal
@@ -5454,9 +5532,9 @@ test_cases:
     verified:
       case_digest: 169fba084a2e127231f5aa45c79b36492b4e645d9945e04cfdd2fa656496b981
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-012真机验收
 - id: GF-REGIONAL-PREEMPT-013
@@ -6170,7 +6248,13 @@ test_cases:
   - 规则读 gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds、severity=critical、runbook 锚点存在于运维手册
   - 关窗后 Deployment env 与副本值精确回到基线（原本缺省则回到缺省），阈值秒内表达式变为 false
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 71d5f661cb5d662877fb34062e5602ad803eb98202e3d13881df970163f815d5
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-037调度循环判活
   related_pytest: tests/regional/test_preempt037_dispatcher_liveness.py::test_the_stall_timeline_contract_passes_when_the_expression_holds_for_the_rule_for
@@ -6192,7 +6276,13 @@ test_cases:
   - "control-worker 日志含 cleanup raw_evidence deleted N rows; keys[:20]=... 且分别点名两条被删的键；没有 0 行的清理日志"
   - finally 后以 audit- 为前缀的本次行数为 0
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 79d12477dd4931ca2d1842ac3b661c05918d0e06a91046f2f03dccbb489ebd79
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-038证据钉在-incident-生命周期
   related_pytest: tests/regional/test_preempt038_evidence_pins.py::test_the_audit_contract_passes_when_only_the_pinned_row_survives
@@ -6683,7 +6773,13 @@ test_cases:
   - 训练子场景的每个原 Pod 在 plugin 缺失期间和恢复后均有递增的有效 NCCL heartbeat；UID、节点和 attempt 不变
   - finding 的 incident、已观测的计划 workflow 与同一 cluster/job/attempt 和目标节点绑定
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0e21058a7c0cac74732846e737acfee1b5142aa0399c2cd3f7a6bfbca5c77fd9
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-017
   related_pytest: tests/collectors/test_host.py::test_efa_inventory_distinguishes_unbound_driver_from_missing_pci
@@ -6737,7 +6833,13 @@ test_cases:
   - 每个被观测副本均有显式、有限非负的匹配 census 样本；缺失或负数不能当作零
   - 关窗后一个 summary 周期内 last_success_at > last_error_at；drop-in 与窗口目录被删除
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: b6a701f9d9aee01c4dddf8904ad3a0320c5bbbfd900637269d5268fc06706c7c
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-019
   related_pytest: tests/regional/test_collect019_nvidia_smi_hang.py::test_the_erroring_status_contract_passes_on_timeout_then_breaker
@@ -6762,7 +6864,13 @@ test_cases:
   - 按 finding metric、incident event_id 和 marker_id 检查无 gpu_expected_count_unknown、无 gpu_inventory_mismatch，不只搜索 reason 文本；boot_id 不变
   - restore 后 RECOVERED incident 的每个 marker 带 retired_at 与 retired_reason；节点无 ownership、无 taint、可调度
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4d1e31b308cd161accdf084a322d5eae8a6473da131f5f8c1e5bc7e927f9341e
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
   related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow
@@ -6815,7 +6923,13 @@ test_cases:
   - 绝不调用 BatchReplaceClusterNodes，ALLOW_HYPERPOD_REPLACE 为 false
   - HyperPod 任务 auto-resume 已关
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 49c1d2bf09ab54e44bcafff188823623a7d938c8a8c17599989bb76feb55af12
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: 31a6b0c6c3c629c2a58e455aad8c029a8794c980be98e3f84c32e4a5233b1b3d
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-015
   related_pytest: tests/policy/test_policy.py::test_always_fatal_sxid_uses_host_restart_branch

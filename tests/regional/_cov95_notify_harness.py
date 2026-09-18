@@ -177,7 +177,7 @@ class NotificationSite:
         monkeypatch.setattr(
             notification_drill, "time", SimpleNamespace(sleep=clock.sleep)
         )
-        monkeypatch.setattr(runner, "source_digest", lambda: "unit-source")
+        monkeypatch.setattr(runner, "drill_source_digest", lambda: "unit-source")
         monkeypatch.setattr(
             ApplicationContext,
             "from_environment",

@@ -33,7 +33,6 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     install_site_profile,
     record_focused_tests,
     reusable_focused_tests,
-    source_digest,
 )
 from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     TRAINING_IMAGE,
@@ -57,7 +56,11 @@ from scripts.e2e.regional.notify005_checks import (  # noqa: E402
     node_errors,
     phase_checks,
 )
-from scripts.e2e.regional.notification_probe_cache import cached_drill  # noqa: E402
+from scripts.e2e.regional.notification_probe_cache import (  # noqa: E402
+    cached_drill,
+    drill_plan_binding,
+    drill_source_digest,
+)
 from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
     case_evidence_path,
     predecessor_path,
@@ -272,13 +275,9 @@ def run_notify001(
     release_id: str | None = None,
 ) -> dict[str, Any]:
     pod = control_worker_pod(site, target)
-    digest = source_digest() if release_id is not None else None
+    digest = drill_source_digest() if release_id is not None else None
     plan_path = run_dir / "cases" / "GF-REGIONAL-NOTIFY-001" / "plan.json"
-    plan_digest = (
-        hashlib.sha256(plan_path.read_bytes()).hexdigest()
-        if plan_path.is_file()
-        else None
-    )
+    plan_digest = drill_plan_binding(plan_path)
 
     def observed_drill(kind: str, stage: str, *, delay: int = 0) -> dict[str, Any]:
         def capture() -> dict[str, Any]:
@@ -300,9 +299,9 @@ def run_notify001(
             / "GF-REGIONAL-NOTIFY-001"
             / f"drill-{attempt}-{stage}.json",
             {
-                "source_digest": digest,
+                "drill_source_sha256": digest,
                 "release_id": release_id,
-                "plan_sha256": plan_digest,
+                "plan_details_sha256": plan_digest,
                 "cluster_id": target.cluster_id,
                 "attempt": attempt,
                 "stage": stage,
@@ -404,8 +403,9 @@ def run_notify001(
         "RESET_GPU or RESTART_WORKLOAD; the deduplication drill always sends "
         "one final labeled mail, waits 65 seconds and replays the same remote result "
         "three more times. Fallback delivery drills may send two earlier emails.",
-        "Completed drill observations are reused within the same source/release/attempt "
-        "when external receipts arrive later; an unconfirmed drill is never resent.",
+        "Completed drill observations are re-judged, not re-sent, when receipts "
+        "arrive later (same release/cluster/attempt/plan details/notification-runner "
+        "source; operator evidence may change). An unconfirmed drill is never resent.",
         "GF-REGIONAL-NOTIFY-002 is superseded by this case: "
         "four_submissions_return_one_provider_id and the SES window evidence "
         "cover the actual result handler using an isolated Store. HTTP authorization "

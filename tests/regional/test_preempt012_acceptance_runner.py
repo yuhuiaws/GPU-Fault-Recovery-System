@@ -364,3 +364,53 @@ def test_cycle_records_a_restore_error_of_any_type(
 def test_plan_parser_stays_plan_only_by_default() -> None:
     parsed = runner.parser().parse_args(["--run-dir", "/tmp/run"])
     assert parsed.execute is False
+
+
+def test_the_quiesce_hold_outlasts_the_audit_start_latency_under_the_failsafe() -> None:
+    # Live 2026-09-18: the host reported QUIESCED at 06:53:51 and the control
+    # audit's first timestamp was 06:54:56 (kubectl exec into an API Pod plus
+    # the control-plane imports), so a 45 s hold restored the host before the
+    # audit ran and the overlap check failed for a reason that was not the
+    # product's. The hold must cover that latency with margin and still end
+    # well before the independent fail-safe restore.
+    observed_audit_start_latency = 65
+    assert runner.HOST_HOLD_SECONDS >= observed_audit_start_latency + 30, (
+        "the hold must outlast the audit start latency with a 30 s margin"
+    )
+    assert runner.HOST_HOLD_SECONDS <= runner.HOST_FAILSAFE_SECONDS - 60, (
+        "the fail-safe restore must stay a full minute behind the planned restore"
+    )
+
+
+def test_wait_for_quiesce_takes_transport_loss_as_the_start_signal() -> None:
+    """The quiesce stops kubelet first, so the probe's exec reads fail until the
+    restore; two consecutive failures after the arm start the audit (a2 on
+    2026-09-18 timed out waiting to *read* QUIESCED). One failure is noise."""
+
+    class Host:
+        def __init__(self, replies: list[object]) -> None:
+            self.replies = iter(replies)
+            self.reads = 0
+
+        def execute(self, *arguments: str) -> dict[str, Any]:
+            self.reads += 1
+            reply = next(self.replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return {"status": reply}
+
+    lost = Host(["PENDING", "RUNNING", RuntimeError("dial"), RuntimeError("dial")])
+    signal = runner.wait_for_quiesce(lost, "r", timeout=5, poll_seconds=0)
+    assert signal["status"] == "TRANSPORT_LOST" and signal["failed_reads"] == 2
+    assert signal["status"] in runner.QUIESCE_START_SIGNALS and lost.reads == 4
+
+    noisy = Host(["RUNNING", RuntimeError("blip"), "RUNNING", "QUIESCED"])
+    signal = runner.wait_for_quiesce(noisy, "r", timeout=5, poll_seconds=0)
+    assert signal["status"] == "QUIESCED" and noisy.reads == 4
+
+    failed = Host(["RUNNING", "FAILED"])
+    signal = runner.wait_for_quiesce(failed, "r", timeout=5, poll_seconds=0)
+    assert signal["status"] == "FAILED"
+    assert signal["status"] not in runner.QUIESCE_START_SIGNALS
+
+    assert runner.TRANSPORT_LOSS_READS == 2

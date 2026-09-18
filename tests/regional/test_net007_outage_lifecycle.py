@@ -253,7 +253,7 @@ def test_outage_hold_requires_its_full_duration_and_continuous_owned_webhook(
                     "operation": operation,
                     "step_index": index,
                     "status": "SUCCEEDED",
-                    "operation_id": "remote/cmd-1",
+                    "adapter_operation_id": "remote/cmd-1",
                 }
                 for index, operation in enumerate(operations)
             ],

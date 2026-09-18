@@ -167,3 +167,53 @@ def test_reconciler_rollback_selects_previous_image_for_unchanged_bundle(
     )
     assert environments[0]["GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"] == content_pin
     assert environments[0]["GPU_FAULT_INSTALLER_TEMPLATE_SHA256"] == "f" * 64
+
+
+def test_rollback_hands_the_previous_pin_window_to_the_executor_rollout() -> None:
+    """``rollback_target`` restores the previous executor under the previous
+    release's pin window; without a window in the snapshot the live check runs
+    as before."""
+
+    applied: list[dict[str, Any]] = []
+    release: Any = SimpleNamespace(
+        config=SimpleNamespace(
+            namespace="gpu-fault-system", executor_wheel=Path("executor.whl")
+        ),
+        _gpu=lambda _target, *arguments: list(arguments),
+        _apply_gpu_deployments=lambda target, wheel, **kwargs: applied.append(
+            {"target": target.cluster_id, "wheel": wheel, **kwargs}
+        ),
+    )
+    target: Any = SimpleNamespace(cluster_id="gpu-a", context="gpu-a-context")
+    window = {
+        "required-regional-executor-artifact-sha256": "3" * 64,
+        "required-regional-executor-compatibility-digest": "4" * 64,
+        "required-regional-executor-protocol-version": "4",
+    }
+    for metadata in (window, None):
+        previous: dict[str, Any] = {
+            "clusters": {"gpu-a": {"wheel": "previous-wheel", "wheel_key": "e.whl"}}
+        }
+        if metadata is not None:
+            previous["metadata"] = metadata
+        rollback_target(
+            release,
+            target,
+            previous=previous,
+            artifact="1" * 64,
+            config_digest="2" * 64,
+            runtime_profile_version="previous-profile",
+            executor_artifact="3" * 64,
+            executor_compatibility="4" * 64,
+            node_compatibility="5" * 64,
+            runtime_image="registry.example/executor@sha256:" + "6" * 64,
+            node_installer_image="registry.example/installer@sha256:" + "7" * 64,
+            components=frozenset({ReleaseComponent.EXECUTOR}),
+        )
+    assert [item["pin_metadata"] for item in applied] == [window, None]
+    assert all(item["executor_artifact_sha"] == "3" * 64 for item in applied), (
+        "the rollback must restore the previous executor artifact"
+    )
+    assert all(item["wheel"] == "previous-wheel" for item in applied), (
+        "the rollback must restore the previous executor wheel"
+    )

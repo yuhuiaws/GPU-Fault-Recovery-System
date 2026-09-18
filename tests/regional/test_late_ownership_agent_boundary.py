@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -73,6 +74,21 @@ def transport_bridge(client):
     return send
 
 
+def settled(step, done, *, budget_seconds=30.0):
+    """Poll the Agent like the live transport does: at intervals, bounded by
+    wall clock. The Agent answers from a background thread whose tail after
+    the physical action is I/O-bound (ledger write, result publish); a fixed
+    spin of 100 immediate polls was ~140 ms of wall clock and ran out under
+    the release gate's parallel load while a healthy run needs ~50 ms of it.
+    """
+    deadline = time.monotonic() + budget_seconds
+    while True:
+        value = step()
+        if done(value) or time.monotonic() >= deadline:
+            return value
+        time.sleep(0.01)
+
+
 @pytest.mark.parametrize("drift", ["none", "owner", "late-sibling"])
 def test_product_checks_again_after_agent_queue_before_physical_reset(
     tmp_path, monkeypatch, drift
@@ -116,11 +132,11 @@ def test_product_checks_again_after_agent_queue_before_physical_reset(
     with TestClient(create_node_agent_app(agent)) as client:
         monkeypatch.setattr(transport, "urlopen", transport_bridge(client))
         with stop_ownership_scope(validator):
-            for _ in range(100):
-                outcome = adapter.execute(context)
-                if outcome.status is not WorkflowStepStatus.WAITING:
-                    break
-            else:
+            outcome = settled(
+                lambda: adapter.execute(context),
+                lambda value: value.status is not WorkflowStepStatus.WAITING,
+            )
+            if outcome.status is WorkflowStepStatus.WAITING:
                 pytest.fail(
                     "the owned Agent did not finish its one-shot boundary: "
                     f"state={outcome.details}; probes={len(hardware.commands)}; "
@@ -128,15 +144,16 @@ def test_product_checks_again_after_agent_queue_before_physical_reset(
                 )
         assert len(observed) == 1
         command_id = observed[0].command_id
-        for _ in range(100):
+
+        def read_result():
             response = client.get(
                 "/v1/node-actions/result", params=result_params(command_id)
             )
             assert response.status_code == 200
-            result = response.json()
-            if result["state"] != "PENDING":
-                break
-        else:
+            return response.json()
+
+        result = settled(read_result, lambda value: value["state"] != "PENDING")
+        if result["state"] == "PENDING":
             pytest.fail(
                 "the denied/authorized Agent callback did not drain: "
                 f"outcome={outcome.status}; details={outcome.details}; "

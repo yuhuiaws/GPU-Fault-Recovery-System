@@ -164,6 +164,33 @@ def test_executor_pin_refuses_malformed_or_incompatible_live_metadata(
     assert release.reads == [("cpu", "configmap", "gpu-fault-release-metadata")]
 
 
+def test_executor_pin_judges_a_rollback_against_the_previous_window() -> None:
+    """The finalize promotes the live window to the candidate before a late
+    failure can start the rollback, so the previous executor is judged against
+    the previous release's own window, not the live ConfigMap (live 2026-09-18:
+    the automatic rollback was refused as an artifact mismatch)."""
+
+    release = ResourceRelease()
+    previous_window = dict(release.metadata)
+    release.metadata["required-regional-executor-artifact-sha256"] = "f" * 64
+    release.metadata["required-regional-executor-compatibility-digest"] = "e" * 64
+    with pytest.raises(ReleaseError, match="pin preflight rejected"):
+        gpu.require_executor_pin(
+            release,
+            artifact_sha=release.executor_wheel_sha,
+            compatibility_digest=release.config.component_digests["executor"],
+        )
+    release.reads.clear()
+    gpu.require_executor_pin(
+        release,
+        artifact_sha=release.executor_wheel_sha,
+        compatibility_digest=release.config.component_digests["executor"],
+        metadata=previous_window,
+    )
+    assert release.reads == [], "a supplied window must not read the live metadata"
+    assert release.runner.calls == []
+
+
 @pytest.mark.parametrize("record_progress", [False, True])
 def test_failed_selected_component_reports_failure_without_advancing(
     record_progress: bool,

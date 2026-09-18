@@ -90,7 +90,10 @@ def test_cluster_access_runs_its_three_chains_concurrently_and_in_order(
     chain still runs in its own order and the add-on still lands in the
     checkpoint the way `revalidate_pod_identity_agent` always recorded it."""
 
-    runner = _ClusterAccess()
+    # 100 ms per command: the overlap has to stand out against scheduling
+    # jitter on a loaded box (16 xdist workers pushed a 50 ms pause past the
+    # 0.75 bound), and the test still finishes in well under a second.
+    runner = _ClusterAccess(pause=0.1)
     state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
     ensured: list[str] = []
 
@@ -114,7 +117,7 @@ def test_cluster_access_runs_its_three_chains_concurrently_and_in_order(
     access.graph.run(state=state)
     elapsed = time.monotonic() - started
 
-    # Ten commands at 50 ms each would be 0.5 s in series; three chains overlap.
+    # Ten commands at 100 ms each would be 1.0 s in series; three chains overlap.
     serial = len(runner.calls) * runner.pause
     assert elapsed < serial * 0.75, f"{elapsed:.2f}s for {len(runner.calls)} commands"
     threads = {

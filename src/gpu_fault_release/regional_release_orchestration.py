@@ -1310,7 +1310,10 @@ def _stage_rollback_controller(
     artifact: str,
     config_digest: str,
     runtime_profile_version: str,
+    stage_agents: bool = True,
 ) -> None:
+    """Stage the CPU for the previous pins; ``stage_agents`` adds Agent identities."""
+
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
     cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
     if cpu_secret.get("backup"):
@@ -1321,23 +1324,24 @@ def _stage_rollback_controller(
         )
     if self._restore_registry_backup():
         self._publish_restored_registry()
-    controller_config = rollback_controller_config(
-        previous.get("agent_identities") or {}
-    )
-    patch = json.dumps({"data": controller_config}, sort_keys=True)
-    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
-        self.runner.run(
-            self._cpu(
-                "-n",
-                self.config.namespace,
-                "patch",
-                "configmap",
-                f"{deployment}-config-core",
-                "--type=merge",
-                "-p",
-                patch,
-            )
+    if stage_agents:
+        controller_config = rollback_controller_config(
+            previous.get("agent_identities") or {}
         )
+        patch = json.dumps({"data": controller_config}, sort_keys=True)
+        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+            self.runner.run(
+                self._cpu(
+                    "-n",
+                    self.config.namespace,
+                    "patch",
+                    "configmap",
+                    f"{deployment}-config-core",
+                    "--type=merge",
+                    "-p",
+                    patch,
+                )
+            )
     cpu_sha = self._config_map_sha(
         self._cpu(),
         cpu_wheel,
@@ -1791,6 +1795,7 @@ def _rollback_release(
                 artifact=artifact,
                 config_digest=config_digest,
                 runtime_profile_version=profile,
+                stage_agents=compensation.needs_agent_controller,
             ),
         )
     _restore_regional_singletons(

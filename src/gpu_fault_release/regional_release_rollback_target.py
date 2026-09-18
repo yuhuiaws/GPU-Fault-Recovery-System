@@ -138,6 +138,11 @@ def rollback_target(
             wheel,
             old.get("wheel_key") or self.config.executor_wheel.name,
         )
+        # The previous release's own pin window judges its executor: the
+        # finalize may already have promoted the live window to the candidate.
+        # A snapshot without one keeps the live-window check, which then fails
+        # closed exactly as before.
+        previous_metadata = previous.get("metadata")
         self._apply_gpu_deployments(
             target,
             wheel,
@@ -147,6 +152,9 @@ def rollback_target(
             executor_artifact_sha=rollback_artifact,
             executor_compatibility_digest=executor_compatibility or rollback_artifact,
             runtime_image=runtime_image,
+            pin_metadata=(
+                dict(previous_metadata) if isinstance(previous_metadata, dict) else None
+            ),
         )
     if ReleaseComponent.AGENT in components:
         missing = [name for name in ("reconciler_wheel", "bundle") if not old.get(name)]

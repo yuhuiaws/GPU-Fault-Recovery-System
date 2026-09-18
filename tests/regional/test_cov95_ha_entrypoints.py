@@ -68,3 +68,27 @@ def test_cli_help_contract_under_fake_profile_and_transport_boundaries(
         runpy.run_path(str(ROOT / filename), run_name="__main__")
     assert stopped.value.code == 0
     assert "usage:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "runner_name",
+    ["run_ha005_rollout_continuity.py", "run_ha009_aurora_credential_rotation.py"],
+)
+def test_legacy_ha_runners_accept_the_regional_flags_the_site_profile_fills(
+    runner_name: str,
+) -> None:
+    """``bind_site_profile`` only fills flags a parser accepts; HA-005 and HA-009
+    lacked them and their ``chain_preflight`` died with ``cluster ID is required``
+    on 2026-09-18 while HA-001/HA-002, which define them, planned fine."""
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts/e2e/regional" / runner_name
+    ).read_text(encoding="utf-8")
+    for flag in (
+        "--cpu-kubeconfig",
+        "--gpu-kubeconfig",
+        "--gpu-context",
+        "--cluster-id",
+        "--namespace",
+        "--region",
+    ):
+        assert f'parser.add_argument("{flag}"' in source, f"{runner_name} lacks {flag}"

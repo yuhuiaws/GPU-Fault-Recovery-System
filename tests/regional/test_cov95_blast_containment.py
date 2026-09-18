@@ -102,7 +102,9 @@ def test_blast001_counts_only_window_changes_and_performs_no_extra_action(
     result = evidence(runner)
     assert result["verdict"] == ("PASS" if defect == "none" else "FAIL")
     analysis = json.loads((runner.run_dir / "BLAST-001-analysis.json").read_text())
-    assert analysis["containment_source"]["operations"] == ["MARK_UNSCHEDULABLE"]
+    assert analysis["isolation_producers"] == [base.CONTAINMENT_CASE_ID], (
+        "the real DESTR-001 producer proves MARK_UNSCHEDULABLE"
+    )
     assert analysis["workload_operations"] == ["RESTART_WORKLOAD", "STOP_WORKLOADS"]
     assert result["checks"]["gpu_fault_jobs_created_in_window"] == (
         0 if defect == "none" else 1
@@ -114,7 +116,7 @@ def test_blast001_counts_only_window_changes_and_performs_no_extra_action(
 
 
 @pytest.mark.parametrize(
-    "defect", ["directory", "baseline", "verdict", "window", "digest", "order"]
+    "defect", ["directory", "baseline", "verdict", "window", "digest"]
 )
 def test_blast001_refuses_unbound_handoffs_before_any_further_action(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
@@ -130,21 +132,49 @@ def test_blast001_refuses_unbound_handoffs_before_any_further_action(
         card["verdict"] = "FAIL"
     elif defect == "window":
         card["maintenance_window"]["start"] = card["maintenance_window"]["end"]
-    elif defect == "digest":
-        card["state_sha256"] = "0" * 64
     else:
-        monkeypatch.setattr(
-            "scripts.e2e.regional.blast_acceptance_cases_1.containment_source",
-            lambda *args, **kwargs: {
-                "window_start": "2000-01-01T00:00:00Z",
-                "window_end": "2000-01-01T00:01:00Z",
-            },
-        )
+        card["state_sha256"] = "0" * 64
     base.write_json(card_path, card)
     before_events = list(events)
     assert runner.run() == 1
     assert evidence(runner)["verdict"] == "FAIL"
     assert events == before_events
+
+
+def test_blast001_lists_a_producer_that_started_before_the_baseline_without_counting_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A PASS producer that started before the baseline snapshot cannot be
+    judged against it: it is reported as producers_before_baseline and left
+    out of the coverage -- the in-window E2E-001 and DESTR-001 still prove
+    the required operations, so the audit passes on them alone."""
+    runner, _docs, _events, _reads = containment_runner(monkeypatch, tmp_path)
+    early = runner.root_run_dir / "cases" / "GF-REGIONAL-COLLECT-015"
+    early.mkdir(parents=True)
+    base.write_json(
+        early / "GF-REGIONAL-COLLECT-015.json",
+        {
+            "case_id": "GF-REGIONAL-COLLECT-015",
+            "verdict": "PASS",
+            "release_id": "release-test",
+            "cluster_id": "a",
+            "errors": [],
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "workflow": {
+                "request_id": "early-workflow",
+                "status": "SUCCEEDED",
+                "step_executions": [
+                    {"operation": "MARK_UNSCHEDULABLE", "status": "SUCCEEDED"}
+                ],
+            },
+        },
+    )
+    assert runner.run() == 0
+    assert evidence(runner)["verdict"] == "PASS"
+    analysis = json.loads((runner.run_dir / "BLAST-001-analysis.json").read_text())
+    assert analysis["producers_before_baseline"] == ["GF-REGIONAL-COLLECT-015"]
+    assert "GF-REGIONAL-COLLECT-015" not in analysis["producers"]
+    assert analysis["isolation_producers"] == [base.CONTAINMENT_CASE_ID]
 
 
 @pytest.mark.parametrize("defect", ["not-object", "escaped-file", "node-uid"])

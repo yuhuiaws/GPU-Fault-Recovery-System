@@ -446,6 +446,47 @@ def test_capacity_cleanup_refuses_missing_or_foreign_registry_before_deleting_ol
     assert store.get_incident_by_event("capacity-event-old") is not None
 
 
+def test_capacity_cleanup_treats_completed_queue_rows_as_drained_but_not_open_ones(
+    database: tuple[str, PostgresStore],
+) -> None:
+    """HA-005 attempt 2: the probe's 26 requests were all COMPLETED, yet the
+    teardown refused three times with "has not drained". Drained means no
+    PENDING/LEASED work; a COMPLETED row is data the cleanup itself deletes."""
+
+    import psycopg
+
+    url, store = database
+    publish_capacity_registry(store, [capacity_registration("perf-cap-000", "run-a")])
+
+    def queue_row(connection: Any, request_id: str, status: str) -> None:
+        connection.execute(
+            "INSERT INTO gpu_fault_processor_queue("
+            "request_id,status,cluster_id,ordering_key,priority,"
+            "created_at,updated_at,payload) VALUES "
+            "(%s,%s,'perf-cap-000','perf-cap-000:node:probe:host-summary',0,"
+            "now(),now(),'{}'::jsonb)",
+            (request_id, status),
+        )
+
+    with psycopg.connect(url, autocommit=True) as connection:
+        queue_row(connection, "capacity-done", "COMPLETED")
+        queue_row(connection, "capacity-open", "PENDING")
+        with pytest.raises(RuntimeError, match="has not drained"):
+            capacity_data.inspect_or_cleanup(
+                connection, run_id="run-a", cluster_ids=["perf-cap-000"], cleanup=True
+            )
+        connection.execute(
+            "DELETE FROM gpu_fault_processor_queue WHERE request_id='capacity-open'"
+        )
+        result = capacity_data.inspect_or_cleanup(
+            connection, run_id="run-a", cluster_ids=["perf-cap-000"], cleanup=True
+        )
+        assert result["total"] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_queue WHERE cluster_id='perf-cap-000'"
+        ).fetchone() == (0,), "the cleanup deletes the completed rows itself"
+
+
 def test_capacity_cleanup_refuses_inflight_work_without_removing_its_links(
     database: tuple[str, PostgresStore],
 ) -> None:

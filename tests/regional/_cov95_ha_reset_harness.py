@@ -234,6 +234,10 @@ class RegionalAPI(WindowApi):
         self.rds_reads = 0
         self.rds_members = 2
         self.rds_status = "available"
+        # "writer" or "status": the describe answered at the barrier before the
+        # failover request (reset injected, failover not yet requested) reports
+        # a moved writer or a cluster that is not available.
+        self.rds_drift_before_failover: str | None = None
         self.focused_returncode = 0
         self.removed = False
         self.replace_on_delete = False
@@ -315,14 +319,23 @@ class RegionalAPI(WindowApi):
                 argv, 0, json.dumps({"accepted": True}), ""
             )
         assert argv[2] == "describe-db-clusters"
+        self.events.append("rds-describe")
         if self.failover:
             self.rds_reads += 1
+        drift = (
+            self.rds_drift_before_failover
+            if "write-xid46" in self.events and not self.failover
+            else None
+        )
         cluster = {
-            "Status": "failing-over" if self.rds_reads == 1 else self.rds_status,
+            "Status": "failing-over"
+            if self.rds_reads == 1 or drift == "status"
+            else self.rds_status,
             "DBClusterMembers": [
                 {
                     "DBInstanceIdentifier": name,
-                    "IsClusterWriter": (index == 0) != (self.rds_reads >= 2),
+                    "IsClusterWriter": (index == 0)
+                    != (self.rds_reads >= 2 or drift == "writer"),
                 }
                 for index, name in enumerate(
                     ["old-writer", "new-writer"][: self.rds_members]

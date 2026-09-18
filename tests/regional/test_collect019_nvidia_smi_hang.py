@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import pytest
 
 from scripts.e2e.regional import collect019_verdicts as verdicts
 from scripts.e2e.regional import run_collect019_nvidia_smi_hang as collect019
 from scripts.e2e.regional.collector_window_fixture import open_window_or_rollback
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CLUSTER = "cluster-a"
 
@@ -219,3 +223,106 @@ def test_a_failed_open_closes_the_half_open_window_and_reports_the_open_error() 
         )
     else:
         raise AssertionError("a failed open must raise even when the close fails")
+
+
+def test_the_gauge_source_is_the_ingress_role_that_publishes_the_census() -> None:
+    # ``CollectorMetricsSnapshot`` is created with ``enabled=service_role in
+    # {"all", "ingress"}`` (factory.py): a ``worker`` replica never renders the
+    # census families. Reading them from control-workers and demanding a sample
+    # from every replica failed the live case with "missing or invalid
+    # host-channel samples" although the census was healthy on every ingress
+    # replica, so the gauge verdict reads the publishing role only.
+    from scripts.e2e.regional import collector_window_fixture as window
+
+    calls: list[tuple[str, str]] = []
+
+    class Regional:
+        def ready_pods(self, plane: str, app: str) -> list[dict[str, str]]:
+            calls.append((plane, app))
+            return [{"name": f"{app}-0"}]
+
+        def kubectl(self, plane: str, *arguments: str, **kwargs: object) -> str:
+            return '{"metrics": "gpu_fault_collector_silent_nodes{a=\\"b\\"} 0\\n"}'
+
+    fixture = window.CollectorWindowFixture.__new__(window.CollectorWindowFixture)
+    fixture.regional = Regional()
+    texts = fixture.census_metrics()
+    assert calls == [("cpu", window.API_APP)], (
+        "the census is read from the ingress replicas only, never from workers"
+    )
+    assert texts and "gpu_fault_collector_silent_nodes" in texts[0], (
+        "the ingress replica's metrics text is returned"
+    )
+
+    class Spy:
+        def census_metrics(self) -> list[str]:
+            return ["census text"]
+
+        def control_plane_metrics(self) -> list[str]:
+            raise AssertionError("the gauge verdict must not read worker replicas")
+
+    assert collect019.census_texts(Spy()) == ["census text"], (
+        "the runner's gauge texts come from the census-publishing role"
+    )
+
+
+NOW = datetime(2026, 9, 18, 6, 30, tzinfo=timezone.utc)
+
+
+def _host_row(age_seconds: float | None) -> list[dict[str, Any]]:
+    row: dict[str, Any] = {"collector": verdicts.HOST_CHANNEL, "errors": []}
+    if age_seconds is not None:
+        row["last_success_at"] = (NOW - timedelta(seconds=age_seconds)).isoformat()
+    return [{"collector": "GPU_METRICS", "last_success_at": NOW.isoformat()}, row]
+
+
+def test_the_freshness_contract_measures_silence_from_the_last_success() -> None:
+    # Silence is judged from the host channel's last success, not from the
+    # window open: COLLECT-015 had rebooted the target 15 min earlier and the
+    # channel was 232 s behind, so the 420 s budget ran out mid-window and a
+    # healthy erroring node was reported as silence.
+    assert verdicts.freshness_errors(_host_row(100), now=NOW) == [], (
+        "a success within the freshness limit lets the window open"
+    )
+    stale = verdicts.freshness_errors(_host_row(232), now=NOW)
+    assert stale and "232s old" in stale[0] and "silence budget" in stale[0], stale
+    assert verdicts.host_success_age_seconds(_host_row(232), now=NOW) == 232.0, (
+        "the age is measured in seconds from the recorded success"
+    )
+    assert "no usable last_success_at" in _text(
+        verdicts.freshness_errors(_host_row(None), now=NOW)
+    )
+    assert verdicts.HOST_SUCCESS_FRESHNESS_SECONDS <= (
+        verdicts.HOST_SILENT_AFTER_SECONDS - 300
+    ), "the limit leaves at least 300 s of silence budget for the erroring window"
+
+
+def test_the_window_waits_for_a_fresh_host_success_and_then_gives_up() -> None:
+    readings = iter([_host_row(300), _host_row(200), _host_row(40)])
+    slept: list[float] = []
+
+    class Fixture:
+        def collector_statuses(self) -> list[dict[str, Any]]:
+            return next(readings)
+
+    fresh = collect019.wait_for_fresh_host_success(
+        Fixture(), interval_seconds=15, now=lambda: NOW, sleep=slept.append
+    )
+    assert slept == [15, 15], "the runner polls once per collection interval"
+    assert fresh["host_success_age_seconds"] == 40.0, (
+        "the evidence records how fresh the channel was at the open"
+    )
+    assert fresh["records"] == _host_row(40), "the accepted statuses are returned"
+
+    class Stale:
+        def collector_statuses(self) -> list[dict[str, Any]]:
+            return _host_row(500)
+
+    with pytest.raises(RegionalFixtureError, match="precondition: .*500s old"):
+        collect019.wait_for_fresh_host_success(
+            Stale(),
+            interval_seconds=15,
+            wait_seconds=0.001,
+            now=lambda: NOW,
+            sleep=slept.append,
+        )

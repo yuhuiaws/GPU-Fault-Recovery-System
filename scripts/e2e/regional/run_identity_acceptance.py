@@ -40,6 +40,7 @@ from scripts.e2e.regional.identity_acceptance_common import (  # noqa: E402
     IdentityAcceptanceError,
     IdentityCaseFailure,
     IdentitySite,
+    unregistered_secondary,
     utc_now,
 )
 from scripts.e2e.regional.identity_acceptance_iso import (  # noqa: E402
@@ -129,6 +130,7 @@ def case_plan(
             {
                 "cluster_id": secondary.cluster_id,
                 "context": secondary.context,
+                "registered": getattr(secondary, "registered", True),
             }
             if secondary is not None
             else None
@@ -172,6 +174,9 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+UNREGISTERED_SECONDARY_CASES = frozenset({"GF-REGIONAL-ISO-003", "GF-REGIONAL-ISO-004"})
+
+
 def validate_case_arguments(
     arguments: argparse.Namespace,
     site: IdentitySite,
@@ -189,7 +194,17 @@ def validate_case_arguments(
             raise IdentityAcceptanceError(
                 f"{arguments.case} requires --secondary-cluster-id"
             )
-        secondary = site.target(arguments.secondary_cluster_id)
+        try:
+            secondary = site.target(arguments.secondary_cluster_id)
+        except IdentityAcceptanceError:
+            # ISO-003/004 judge a cluster-id binding: the executor's Fleet
+            # proxy and the control plane's payload binding compare ids and
+            # never consult the registry, so a single-cluster site may name
+            # any other id as B (the AUTH matrix does the same). AUTH-007/008
+            # disable and claim as B and keep needing a registered cluster.
+            if arguments.case not in UNREGISTERED_SECONDARY_CASES:
+                raise
+            secondary = unregistered_secondary(primary, arguments.secondary_cluster_id)
         if secondary.cluster_id == primary.cluster_id:
             raise IdentityAcceptanceError("primary and secondary clusters must differ")
     nodes = tuple(arguments.node)

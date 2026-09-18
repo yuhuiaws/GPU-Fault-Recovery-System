@@ -152,3 +152,39 @@ def test_duplicate_window_waits_a_full_metric_period_but_never_past_deadline(
             deadline=now[0] + timedelta(seconds=30),
         )
     assert notifier.sent == []
+
+
+def test_drill_identity_survives_operator_evidence_and_unrelated_source(
+    tmp_path,
+) -> None:
+    """A completed drill is re-judged with later receipts: its identity binds the
+    plan details and the notification-runner modules, not the plan's argument
+    digest (which the evidence flags change) nor the whole tree."""
+    import json
+
+    from scripts.e2e.regional import notification_probe_cache as cache
+    from scripts.e2e.regional import run_notification_acceptance as runner
+
+    plan = tmp_path / "plan.json"
+    base = {
+        "details_sha256": "d" * 64,
+        "arguments_sha256": "a" * 64,
+        "source_digest": "s" * 64,
+    }
+    plan.write_text(json.dumps(base), encoding="utf-8")
+    first = runner.drill_plan_binding(plan)
+    plan.write_text(
+        json.dumps({**base, "arguments_sha256": "b" * 64, "source_digest": "t" * 64}),
+        encoding="utf-8",
+    )
+    assert runner.drill_plan_binding(plan) == first == "d" * 64
+    plan.write_text(json.dumps({**base, "details_sha256": "e" * 64}), encoding="utf-8")
+    assert runner.drill_plan_binding(plan) != first
+    assert runner.drill_plan_binding(tmp_path / "missing.json") is None
+    assert cache.DRILL_SOURCE_MODULES == (
+        "run_notification_acceptance.py",
+        "notification_probe_cache.py",
+        "notification_evidence.py",
+    )
+    assert len(runner.drill_source_digest()) == 64
+    assert runner.drill_source_digest() == runner.drill_source_digest()

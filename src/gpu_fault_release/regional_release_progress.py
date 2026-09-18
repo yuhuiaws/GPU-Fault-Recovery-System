@@ -241,6 +241,28 @@ class RollbackCompensationPlan:
 
     @property
     def needs_controller(self) -> bool:
+        """Whether the control plane must be staged for the previous pins first.
+
+        The control plane admits agents and executors by the pin window its
+        Pods were started with (``gpu-fault-release-metadata`` through env), so
+        a previous agent *or* a previous executor rolled back onto a control
+        plane still pinned to the candidate is refused until the controller is
+        re-staged with the previous window. Live 2026-09-18: an executor-only
+        rollback skipped the staging and its Pod stayed unready on
+        ``regional executor artifact mismatch`` (503) until the rollout timed
+        out.
+        """
+
+        return any(
+            components & {ReleaseComponent.AGENT, ReleaseComponent.EXECUTOR}
+            for components in self.cluster_components.values()
+        )
+
+    @property
+    def needs_agent_controller(self) -> bool:
+        """Whether the staged controller must also carry the previous Agent
+        identities (the ``-config-core`` pins); only an Agent rollback does."""
+
         return any(
             ReleaseComponent.AGENT in components
             for components in self.cluster_components.values()

@@ -114,9 +114,15 @@ def test_continuity_probe_executes_one_bounded_claim_and_event_cycle(
 
     monkeypatch.setattr(ha005_probe, "ObservedSink", Sink)
     monkeypatch.setattr(ha005_probe.time, "sleep", lambda _: ha005_probe.STOP.touch())
+    held: list[bool] = []
+    monkeypatch.setattr(ha005_probe, "hold_after_stop", lambda: held.append(True))
     ha005_probe.main()
     result = json.loads(ha005_probe.STATS.read_text())
     assert result["stopped"] is True
+    # The runner reads the final stats with ``kubectl exec``; a process that
+    # exits right after writing them leaves a Succeeded Pod nothing can exec
+    # into (HA-005 attempt 2), so the probe holds its container after the write.
+    assert held == [True], "the probe must hold its container after the final stats"
     assert result["counters"]["claim_success"] == 1
     assert result["counters"]["event_attempts"] == 1
     assert len(posts) == 1
@@ -166,3 +172,15 @@ def test_cpu_failover_probe_records_failed_claims_without_faking_success(
     assert result["counters"]["health_success"] == 1
     assert result["counters"].get("claim_success", 0) == int(not failure)
     assert result["counters"].get("claim_failure", 0) == int(failure)
+
+
+def test_continuity_probe_hold_is_bounded_by_the_configured_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One sleep per second up to the budget: the runner deletes the Pod long
+    before, and an abandoned Pod still ends by itself."""
+
+    monkeypatch.setenv("HOLD_AFTER_STOP_SECONDS", "3")
+    slept: list[float] = []
+    ha005_probe.hold_after_stop(sleep=slept.append)
+    assert slept == [1, 1, 1]

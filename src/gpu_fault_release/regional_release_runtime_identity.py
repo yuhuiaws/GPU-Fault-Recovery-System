@@ -416,6 +416,28 @@ def _pod_digest(
     return str(digest)
 
 
+def _read_once_more(first: Any, again: Any) -> Any:
+    """A read-only check gets one retry before it fails the release.
+
+    Every listing and probe here is a read; the release is already rolled out
+    when they run. One transient failure -- live 2026-09-18, two of twenty
+    concurrent kubectl calls were refused by the deployment API budget shim --
+    must not turn a converged candidate into a failed transaction and a
+    rollback. A second failure is reported with both errors.
+    """
+
+    try:
+        return first()
+    except Exception as first_error:
+        try:
+            return again()
+        except Exception as second_error:
+            raise ReleaseError(
+                f"{type(second_error).__name__}: {second_error} "
+                f"(retry after {type(first_error).__name__}: {first_error})"
+            ) from second_error
+
+
 def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
     control_digest = str(release.config.component_digests.get("control_plane") or "")
     executor_digest = str(release.config.component_digests.get("executor") or "")
@@ -452,22 +474,23 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
         (scope, deployment): {} for scope, deployment, *_rest in targets
     }
     errors: dict[str, str] = {}
+
     # Listings and Pod execs share one pool; nested per-Deployment pools would
     # multiply the bound as clusters and replicas grow.
+    def expected_image(scope: str) -> str | None:
+        if release.config.release_manifest_schema_version < 4:
+            return None
+        image = (
+            release.runtime_image
+            if scope == "control-plane"
+            else release.executor_image
+        )
+        return None if image is None else str(image)
+
     with ThreadPoolExecutor(max_workers=MAX_RUNTIME_IDENTITY_WORKERS) as executor:
         listings = {
             executor.submit(
-                _running_pods,
-                release,
-                kubectl,
-                deployment,
-                (
-                    release.runtime_image
-                    if scope == "control-plane"
-                    else release.executor_image
-                )
-                if release.config.release_manifest_schema_version >= 4
-                else None,
+                _running_pods, release, kubectl, deployment, expected_image(scope)
             ): (
                 scope,
                 deployment,
@@ -482,7 +505,12 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
         for listing in as_completed(listings):
             scope, deployment, kubectl, python, path, expected = listings[listing]
             try:
-                pods = listing.result()
+                pods = _read_once_more(
+                    listing.result,
+                    lambda: _running_pods(
+                        release, kubectl, deployment, expected_image(scope)
+                    ),
+                )
             except Exception as exc:
                 errors[f"{scope}/{deployment}"] = f"{type(exc).__name__}: {exc}"
                 continue
@@ -498,11 +526,22 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
                         path=path,
                         expected=expected,
                     )
-                ] = (scope, deployment, pod)
+                ] = (scope, deployment, pod, kubectl, python, path, expected)
         for probe in as_completed(probes):
-            scope, deployment, pod = probes[probe]
+            scope, deployment, pod, kubectl, python, path, expected = probes[probe]
             try:
-                results[scope, deployment][pod] = probe.result()
+                results[scope, deployment][pod] = _read_once_more(
+                    probe.result,
+                    lambda: _pod_digest(
+                        release,
+                        kubectl,
+                        deployment,
+                        pod,
+                        python=python,
+                        path=path,
+                        expected=expected,
+                    ),
+                )
             except Exception as exc:
                 errors[f"{scope}/{deployment}/{pod}"] = f"{type(exc).__name__}: {exc}"
     if errors:

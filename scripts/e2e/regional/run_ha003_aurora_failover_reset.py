@@ -808,16 +808,32 @@ def request_bound_failover(
     observed_after: datetime,
     maintenance_window_end: datetime,
     observe_state: Callable[[dict[str, Any]], None],
+    timing: dict[str, Any] | None = None,
 ) -> tuple[datetime, dict[str, Any]]:
-    regional_binding(regional, settings.rds_cluster_id).read(
-        preflight["aurora_binding"]
-    )
+    # The final barrier before the provider call. The full Aurora binding
+    # (identity, writer, credential: ~10 kubectl/aws subprocesses, ~40 s live)
+    # was read at injection seconds ago; re-reading it here spent most of the
+    # ~65 s the batched reset stays WAITING -- a1 on 2026-09-18 requested the
+    # failover 59 s after the claim, 11 s before the reset closed, and the case
+    # ended INCONCLUSIVE. One describe call now proves the writer has not moved
+    # and the cluster is available; the store re-read stays as the spec asks.
+    stamps = timing if timing is not None else {}
+    stamps["recheck_started_at"] = datetime.now(timezone.utc).isoformat()
+    aurora = rds_snapshot(settings)
+    if aurora.get("status") != "available" or aurora.get("writer") != str(
+        preflight["rds"]["writer"]
+    ):
+        raise RegionalFixtureError(
+            f"Aurora moved before the failover request: {aurora}"
+        )
+    stamps["aurora_checked_at"] = datetime.now(timezone.utc).isoformat()
     latest = regional.store_snapshot(
         node=settings.node,
         marker=marker,
         observed_after=observed_after,
         queue_attempts=1,
     )
+    stamps["store_snapshot_at"] = datetime.now(timezone.utc).isoformat()
     observe_state(latest)
     evidence.observe(latest)
     current = [
@@ -836,11 +852,29 @@ def request_bound_failover(
     if datetime.now(timezone.utc) >= maintenance_window_end:
         raise RegionalFixtureError("maintenance window ended before failover")
     requested_at = datetime.now(timezone.utc)
+    stamps["requested_at"] = requested_at.isoformat()
     return requested_at, aws_rds(
         settings,
         "failover-db-cluster",
         "--db-cluster-identifier",
         settings.rds_cluster_id,
+    )
+
+
+def host_fixture(settings: Settings, case_dir: Path, run_id: str) -> HostProbeFixture:
+    return HostProbeFixture(
+        HostProbeSettings(
+            kubeconfig=settings.regional.gpu_kubeconfig,
+            context=settings.regional.gpu_context,
+            namespace=settings.regional.namespace,
+            node=settings.node,
+            image=settings.host_probe_image,
+            case_id=CASE_ID,
+            run_id=run_id,
+            state_directory=case_dir / "host-probes",
+            probe_script=reset_case.PROBE_SCRIPT,
+            active_deadline_seconds=3600,
+        )
     )
 
 
@@ -856,20 +890,7 @@ def execute_case(
     regional = RegionalLiveFixture(settings.regional)
     run_id = f"ha003-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"ha003-{int(time.time())}-a{attempt}"
-    host = HostProbeFixture(
-        HostProbeSettings(
-            kubeconfig=settings.regional.gpu_kubeconfig,
-            context=settings.regional.gpu_context,
-            namespace=settings.regional.namespace,
-            node=settings.node,
-            image=settings.host_probe_image,
-            case_id=CASE_ID,
-            run_id=run_id,
-            state_directory=case_dir / "host-probes",
-            probe_script=reset_case.PROBE_SCRIPT,
-            active_deadline_seconds=3600,
-        )
-    )
+    host = host_fixture(settings, case_dir, run_id)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -934,6 +955,9 @@ def execute_case(
         if not incident_id:
             raise RegionalFixtureError("claimed reset has no cleanup incident identity")
         write_json_atomic(case_dir / "reset-claimed.json", claimed_state)
+        failover_timing: dict[str, Any] = {
+            "claim_observed_at": datetime.now(timezone.utc).isoformat()
+        }
         failover_requested_at, failover = request_bound_failover(
             settings,
             regional,
@@ -944,8 +968,10 @@ def execute_case(
             observed_after=injected_at,
             maintenance_window_end=maintenance_window_end,
             observe_state=remember_incident,
+            timing=failover_timing,
         )
         write_json_atomic(case_dir / "failover-request.json", failover)
+        write_json_atomic(case_dir / "failover-timing.json", failover_timing)
 
         def observe() -> dict[str, Any]:
             sample = regional.store_snapshot(

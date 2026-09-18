@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from collections.abc import Callable, Mapping
@@ -57,3 +58,36 @@ def cached_drill(
         return result
     finally:
         os.close(fd)
+
+
+# The code a completed drill is bound to. A drill is an observed fact about
+# the release (mails sent, provider ids); it is re-judged -- never re-sent --
+# while the code that ran and interprets it is unchanged. Binding the whole
+# tree instead (the focused-test rule) made a later receipt impossible: the
+# evidence record, unrelated runner fixes and the very plan the receipt flags
+# alter all changed the identity (2026-09-18).
+DRILL_SOURCE_MODULES = (
+    "run_notification_acceptance.py",
+    "notification_probe_cache.py",
+    "notification_evidence.py",
+)
+
+
+def drill_source_digest() -> str:
+    digest = hashlib.sha256()
+    here = Path(__file__).resolve().parent
+    for name in DRILL_SOURCE_MODULES:
+        digest.update(b"\0" + name.encode() + b"\0")
+        digest.update((here / name).read_bytes())
+    return digest.hexdigest()
+
+
+def drill_plan_binding(plan_path: Path) -> str | None:
+    """The plan's ``details_sha256`` -- the drill inputs -- not the whole
+    plan, whose ``arguments_sha256`` changes when ``--receipt-evidence`` and
+    ``--ses-window-evidence`` are added for the re-judgement."""
+    if not plan_path.is_file():
+        return None
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    value = plan.get("details_sha256") if isinstance(plan, dict) else None
+    return str(value) if value else None

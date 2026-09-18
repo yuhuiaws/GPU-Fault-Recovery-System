@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from scripts.e2e.regional.blast_acceptance_base import (
     FORBIDDEN_CONTROL_PLANE_ACTIONS,
@@ -15,12 +15,16 @@ from scripts.e2e.regional.blast_acceptance_base import (
     arn_parts,
     as_list,
     command,
-    containment_source,
     default_e2e_dir,
+    missing_required_operations,
     notification_channel,
     observed_in_windows,
     parse_time,
     policy_statement_summary,
+    producer_operations,
+    release_bound_producers,
+    REQUIRED_ISOLATION_OPERATIONS,
+    REQUIRED_WORKLOAD_OPERATIONS,
     resources_for,
     sha256_bytes,
     statement_actions,
@@ -41,6 +45,73 @@ AUTHORIZATION_RESOURCE_GROUPS = {
     "configmaps": "",
     "jobs": "batch",
 }
+
+
+def gpu_fault_jobs_in(
+    cpu_json: Callable[..., dict[str, Any]],
+    windows: tuple[tuple[datetime, datetime], ...],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """CPU-plane Jobs carrying gpu-fault labels: all, and those created
+    inside ``windows`` (or without a creation stamp)."""
+    jobs = cpu_json("get", "jobs", "-A", "-o", "json")
+    gpu_fault_jobs: list[dict[str, Any]] = []
+    gpu_fault_jobs_in_window: list[dict[str, Any]] = []
+    for job in jobs.get("items", []):
+        metadata = job.get("metadata", {})
+        labels = metadata.get("labels") or {}
+        item = {
+            "namespace": metadata.get("namespace"),
+            "name": metadata.get("name"),
+            "creation_timestamp": metadata.get("creationTimestamp"),
+            "gpu_fault_labels": {
+                key: value
+                for key, value in labels.items()
+                if key.startswith(GPU_FAULT_PREFIX)
+            },
+        }
+        if item["gpu_fault_labels"]:
+            gpu_fault_jobs.append(item)
+            created = metadata.get("creationTimestamp")
+            if not created or observed_in_windows(str(created), windows):
+                gpu_fault_jobs_in_window.append(item)
+    return gpu_fault_jobs, gpu_fault_jobs_in_window
+
+
+def evictions_in(
+    cpu_json: Callable[..., dict[str, Any]],
+    windows: tuple[tuple[datetime, datetime], ...],
+) -> list[dict[str, Any]]:
+    """Eviction events on the CPU plane inside ``windows`` (an event
+    without any timestamp is kept)."""
+    events = cpu_json("get", "events", "-A", "-o", "json")
+    eviction_events: list[dict[str, Any]] = []
+    for event in events.get("items", []):
+        reason = str(event.get("reason", ""))
+        message = str(event.get("message", ""))
+        if reason not in {"Evicted", "TaintManagerEviction"} and not any(
+            term in message for term in ("Evicted", "TaintManagerEviction")
+        ):
+            continue
+        metadata = event.get("metadata", {})
+        event_time = (
+            event.get("eventTime")
+            or event.get("lastTimestamp")
+            or event.get("firstTimestamp")
+            or metadata.get("creationTimestamp")
+        )
+        if event_time and not observed_in_windows(str(event_time), windows):
+            continue
+        eviction_events.append(
+            {
+                "namespace": metadata.get("namespace"),
+                "name": metadata.get("name"),
+                "reason": reason,
+                "event_time": event_time,
+                "involved_kind": event.get("involvedObject", {}).get("kind"),
+                "involved_name": event.get("involvedObject", {}).get("name"),
+            }
+        )
+    return eviction_events
 
 
 class BlastCasesOne(BlastRunnerBase):
@@ -179,17 +250,19 @@ class BlastCasesOne(BlastRunnerBase):
         window = execution_card.get("maintenance_window") or {}
         start_text = str(window.get("start", ""))
         end_text = str(window.get("end", ""))
+        cluster_ids = {target.cluster_id for target in self.targets}
+        # E2E-001 hands over the trusted CPU baseline (pinned by its card). It
+        # need not be from the live release: the baseline is a snapshot taken
+        # before the producers ran, and the producers are bound to the release
+        # separately below.
         if (
             execution_card.get("case_id") != "GF-REGIONAL-E2E-001"
             or execution_card.get("verdict") != "PASS"
             or execution_card.get("cleanup_complete") is not True
-            or execution_card.get("release_id")
-            != self.evidence_identity()["release_id"]
-            or execution_card.get("cluster_id")
-            not in {target.cluster_id for target in self.targets}
+            or execution_card.get("cluster_id") not in cluster_ids
         ):
             raise CheckError(
-                "E2E-001 handoff is not a successful, cleaned, deployment-bound run"
+                "E2E-001 handoff is not a successful, cleaned baseline snapshot"
             )
         start, end = parse_time(start_text), parse_time(end_text)
         if (
@@ -215,19 +288,37 @@ class BlastCasesOne(BlastRunnerBase):
         )
         baseline_snapshot = self.node_security_snapshot(baseline_nodes)
         baseline_identical = baseline_snapshot == current_snapshot
-        containment = containment_source(
-            self.root_run_dir,
-            predecessor=self.predecessor,
-            release_id=str(execution_card["release_id"]),
-            cluster_id=str(execution_card["cluster_id"]),
-            cpu_snapshot=baseline_snapshot,
+        # Producers: every PASS case of this run bound to the live release whose
+        # SUCCEEDED records prove the workload (STOP/RESTART) and isolation
+        # (MARK_UNSCHEDULABLE) operations -- not a fixed pair of case ids.
+        release_id = str(self.evidence_identity()["release_id"])
+        producers = release_bound_producers(
+            self.root_run_dir, release_id=release_id, cluster_ids=cluster_ids
         )
-        containment_start = parse_time(containment["window_start"])
-        containment_end = parse_time(containment["window_end"])
-        if end > containment_start:
-            raise CheckError("DESTR-001 must follow E2E-001 in the same run")
-
-        windows = ((start, end), (containment_start, containment_end))
+        # A producer that started before the baseline snapshot cannot be judged
+        # against it (its CPU writes may predate the snapshot): it is outside
+        # the audited window -- listed, not counted. The required operations
+        # must be proven by producers inside the window.
+        before_baseline = sorted(
+            case_id
+            for case_id, item in producers.items()
+            if parse_time(item["started_at"]) < start
+        )
+        producers = {
+            case_id: item
+            for case_id, item in producers.items()
+            if case_id not in before_baseline
+        }
+        missing = missing_required_operations(producers)
+        if missing:
+            raise CheckError(
+                f"no PASS case of this run inside the audited window proves "
+                f"{', '.join(missing)} on release {release_id}; run a case that "
+                "executes them on this release after the baseline first "
+                f"(producers before the baseline: {', '.join(before_baseline) or 'none'})"
+            )
+        producer_end = max(parse_time(item["ended_at"]) for item in producers.values())
+        windows = ((start, max(end, producer_end)),)
 
         managed_field_hits = self.managed_field_writes(
             current_nodes,
@@ -240,73 +331,25 @@ class BlastCasesOne(BlastRunnerBase):
             if not hit.get("time") or observed_in_windows(str(hit["time"]), windows)
         ]
 
-        jobs = self.cpu_json("get", "jobs", "-A", "-o", "json")
-        gpu_fault_jobs = []
-        gpu_fault_jobs_in_window = []
-        for job in jobs.get("items", []):
-            metadata = job.get("metadata", {})
-            labels = metadata.get("labels") or {}
-            item = {
-                "namespace": metadata.get("namespace"),
-                "name": metadata.get("name"),
-                "creation_timestamp": metadata.get("creationTimestamp"),
-                "gpu_fault_labels": {
-                    key: value
-                    for key, value in labels.items()
-                    if key.startswith(GPU_FAULT_PREFIX)
-                },
-            }
-            if item["gpu_fault_labels"]:
-                gpu_fault_jobs.append(item)
-                created = metadata.get("creationTimestamp")
-                if not created or observed_in_windows(str(created), windows):
-                    gpu_fault_jobs_in_window.append(item)
-
-        events = self.cpu_json("get", "events", "-A", "-o", "json")
-        eviction_events = []
-        for event in events.get("items", []):
-            reason = str(event.get("reason", ""))
-            message = str(event.get("message", ""))
-            if reason not in {"Evicted", "TaintManagerEviction"} and not any(
-                term in message for term in ("Evicted", "TaintManagerEviction")
-            ):
-                continue
-            metadata = event.get("metadata", {})
-            event_time = (
-                event.get("eventTime")
-                or event.get("lastTimestamp")
-                or event.get("firstTimestamp")
-                or metadata.get("creationTimestamp")
-            )
-            if event_time and not observed_in_windows(str(event_time), windows):
-                continue
-            eviction_events.append(
-                {
-                    "namespace": metadata.get("namespace"),
-                    "name": metadata.get("name"),
-                    "reason": reason,
-                    "event_time": event_time,
-                    "involved_kind": event.get("involvedObject", {}).get("kind"),
-                    "involved_name": event.get("involvedObject", {}).get("name"),
-                }
-            )
-
-        e2e_state = json.loads(state_path.read_text(encoding="utf-8"))
-        workload_operations = sorted(
-            {
-                str(step.get("operation"))
-                for workflow in e2e_state.get("workflows", [])
-                if workflow.get("status") == "SUCCEEDED"
-                for step in workflow.get("step_executions") or []
-                if step.get("operation") and step.get("status") == "SUCCEEDED"
-            }
+        gpu_fault_jobs, gpu_fault_jobs_in_window = gpu_fault_jobs_in(
+            self.cpu_json, windows
         )
-        workflow_operations = sorted(
-            set(workload_operations) | set(containment["operations"])
+        eviction_events = evictions_in(self.cpu_json, windows)
+
+        proven = producer_operations(producers)
+        workflow_operations = sorted(proven)
+        workload_operations = sorted(proven & set(REQUIRED_WORKLOAD_OPERATIONS))
+        isolation_producers = sorted(
+            case_id
+            for case_id, item in producers.items()
+            if set(REQUIRED_ISOLATION_OPERATIONS) & set(item["operations"])
         )
-        required_operations_present = {"STOP_WORKLOADS", "RESTART_WORKLOAD"} <= set(
-            workload_operations
-        ) and containment["operations"] == ["MARK_UNSCHEDULABLE"]
+        workload_producers = sorted(
+            case_id
+            for case_id, item in producers.items()
+            if set(REQUIRED_WORKLOAD_OPERATIONS) & set(item["operations"])
+        )
+        required_operations_present = not missing
 
         checks = {
             "e2e_evidence_dir": str(self.e2e_dir),
@@ -314,7 +357,11 @@ class BlastCasesOne(BlastRunnerBase):
             "e2e_window_end": end_text,
             "workflow_operations": workflow_operations,
             "workload_operations": workload_operations,
-            "containment_source": containment,
+            "release_id": release_id,
+            "producers": producers,
+            "producers_before_baseline": before_baseline,
+            "workload_producers": workload_producers,
+            "isolation_producers": isolation_producers,
             "required_operations_present": required_operations_present,
             "trusted_baseline": str(self.trusted_cpu_baseline),
             "trusted_baseline_identical": baseline_identical,
@@ -338,11 +385,13 @@ class BlastCasesOne(BlastRunnerBase):
         limitations = [
             "The CPU node baseline is the snapshot E2E-001 wrote immediately "
             "before its injection (cpu-nodes-before.json); managedFields writes are "
-            "counted only when they are new relative to that baseline and "
-            "inside either producer's window.",
-            "E2E-001 proves workload operations; DESTR-001 supplies the successful "
-            "MARK_UNSCHEDULABLE command and CPU before/after evidence. This audit "
-            "does not trigger a reset or workload restart.",
+            "counted only when they are new relative to that baseline and inside "
+            "the window from that snapshot to the last producer's end.",
+            "Producers are the PASS cases of this run bound to the live release "
+            "whose SUCCEEDED records prove STOP_WORKLOADS/RESTART_WORKLOAD and "
+            "MARK_UNSCHEDULABLE and that started after the baseline snapshot; "
+            "producers that started earlier are listed as producers_before_baseline "
+            "and not counted. This audit does not trigger a reset or workload restart.",
             "Current managedFields and retained Jobs/events cannot prove the "
             "absence of transient changes already removed from API history.",
         ]
@@ -355,7 +404,8 @@ class BlastCasesOne(BlastRunnerBase):
                 "gpu_fault_jobs_created_in_window": len(gpu_fault_jobs_in_window),
                 "eviction_events_in_window": len(eviction_events),
                 "required_e2e_operations_present": required_operations_present,
-                "successful_containment_source": containment["case_id"],
+                "workload_producers": workload_producers,
+                "isolation_producers": isolation_producers,
             },
             limitations=limitations,
         )

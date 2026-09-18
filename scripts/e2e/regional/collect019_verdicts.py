@@ -38,6 +38,12 @@ ERRORING_METRIC = "gpu_fault_collector_erroring_nodes"
 # erroring window must end well inside it or the case would page for silence.
 HOST_SILENT_AFTER_SECONDS = 420
 WINDOW_RESTORE_SECONDS = 600
+# The silence clock starts at the host channel's LAST SUCCESS, not at the
+# window open: a node whose host collector had gone 232 s without a success
+# (COLLECT-015 had just rebooted it) was judged silent 3 min into the window
+# although every batch was an erroring one. Opening only when the last success
+# is at most this old leaves >= 300 s of the 420 s budget for the window.
+HOST_SUCCESS_FRESHNESS_SECONDS = 120
 
 
 def timing_errors(
@@ -87,6 +93,39 @@ def host_status(statuses: list[dict[str, Any]]) -> dict[str, Any] | None:
         if record.get("collector") == HOST_CHANNEL:
             return record
     return None
+
+
+def host_success_age_seconds(
+    statuses: list[dict[str, Any]], *, now: datetime
+) -> float | None:
+    """Seconds since the host channel's last successful batch; ``None`` if unknown."""
+
+    status = host_status(statuses)
+    value = status.get("last_success_at") if status else None
+    if not value:
+        return None
+    try:
+        last = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if last.tzinfo is None:
+        return None
+    return (now - last).total_seconds()
+
+
+def freshness_errors(statuses: list[dict[str, Any]], *, now: datetime) -> list[str]:
+    """The window may open only while the host channel's last success is fresh."""
+
+    age = host_success_age_seconds(statuses, now=now)
+    if age is None:
+        return ["the host channel has no usable last_success_at before the window"]
+    if age > HOST_SUCCESS_FRESHNESS_SECONDS:
+        return [
+            f"the host channel's last success is {age:.0f}s old before the window "
+            f"(limit {HOST_SUCCESS_FRESHNESS_SECONDS}s): the {HOST_SILENT_AFTER_SECONDS}s "
+            "silence budget would be spent by the erroring window"
+        ]
+    return []
 
 
 def erroring_status_errors(

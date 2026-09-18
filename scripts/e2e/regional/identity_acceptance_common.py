@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -205,6 +205,32 @@ class ClusterTarget:
     executor_role_arn: str
     control_plane_url: str
     ca_file: Path
+    # False for a cluster id the site does not list: ISO-003/004 judge a
+    # cluster-id binding and may name any other id as "cluster B" on a
+    # single-cluster site; the evidence must say so.
+    registered: bool = True
+
+
+def unregistered_secondary(primary: ClusterTarget, cluster_id: str) -> ClusterTarget:
+    """Cluster B for a single-cluster site: an id with no registration.
+
+    The probes still run through the primary's connection (context, control
+    plane URL, CA file); nothing else about B exists, so its own identifiers
+    stay empty and ``registered`` is False.
+    """
+
+    if not cluster_id:
+        raise IdentityAcceptanceError("an unregistered secondary needs a cluster id")
+    if cluster_id == primary.cluster_id:
+        raise IdentityAcceptanceError("primary and secondary clusters must differ")
+    return replace(
+        primary,
+        cluster_id=cluster_id,
+        hyperpod_cluster_name="",
+        eks_cluster_arn="",
+        executor_role_arn="",
+        registered=False,
+    )
 
 
 class IdentitySite:

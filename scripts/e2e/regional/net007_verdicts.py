@@ -305,7 +305,7 @@ def recovery_errors(
             or len(matching_steps) != 1
             or matching_steps[0].get("operation") != waited_operation
             or matching_steps[0].get("status") != "SUCCEEDED"
-            or matching_steps[0].get("operation_id")
+            or matching_steps[0].get("adapter_operation_id")
             != f"remote/{waited_evidence.get('command_id')}"
         ):
             errors.append(

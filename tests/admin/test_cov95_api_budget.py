@@ -333,3 +333,29 @@ def test_csm_discards_malformed_messages_and_counts_only_valid_events():
                 stats["sdk_attempt_records"],
                 stats["sdk_retries"],
             ) == (1, 3, 1, 2)
+
+
+def test_shim_failure_line_names_the_underlying_error(monkeypatch, capsys):
+    """Two identity-check kubectl calls failed a live release with only the
+    generic line (2026-09-18); the cause must travel with it."""
+
+    def failing_main():
+        raise budget.ApiBudgetError("deployment API admission deadline expired")
+
+    monkeypatch.setattr(budget, "main", failing_main)
+    assert budget.run_shim() == 1
+    stderr = capsys.readouterr().err
+    assert (
+        "deployment API command failed or exceeded its bounded capacity/deadline"
+        in stderr
+    )
+    assert "ApiBudgetError: deployment API admission deadline expired" in stderr
+
+
+def test_shim_protocol_error_keeps_its_own_line(monkeypatch, capsys):
+    def failing_main():
+        raise budget.ApiBudgetProtocolError("incompatible inherited protocol")
+
+    monkeypatch.setattr(budget, "main", failing_main)
+    assert budget.run_shim() == 1
+    assert capsys.readouterr().err.strip() == "incompatible inherited protocol"

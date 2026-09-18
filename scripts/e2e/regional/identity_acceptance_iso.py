@@ -113,15 +113,24 @@ def run_iso003(
         "no_http_requests": result.get("request_count") == 0,
         "secondary_agent_state_unchanged": before == after,
     }
+    registered = bool(getattr(secondary, "registered", True))
+    limitations = [
+        "The probe invokes the deployed executor client but performs no "
+        "Fleet state transition."
+    ]
+    if not registered:
+        limitations.append(
+            "The secondary cluster id is not registered on this site: the refusal "
+            "rests on the executor's own cluster binding alone, and the agent-state "
+            "comparison is over an empty list."
+        )
     return {
         "verdict": verdict(checks),
         "checks": checks,
+        "secondary_registered": registered,
         "secondary_agents_before_after_equal": before == after,
         "results": result,
-        "limitations": [
-            "The probe invokes the deployed executor client but performs no "
-            "Fleet state transition."
-        ],
+        "limitations": limitations,
     }
 
 
@@ -202,15 +211,23 @@ def run_iso004(
             MISSING_AGENT_REASON in reason for reason in reasons
         ),
     }
+    registered = bool(getattr(secondary, "registered", True))
+    limitations = [
+        "The consistent-cluster branch queries a deliberately nonexistent "
+        "node and performs no spare allocation."
+    ]
+    if not registered:
+        limitations.append(
+            "The secondary cluster id is not registered on this site: the 403 "
+            "rests on the token-to-payload cluster binding alone."
+        )
     return {
         "verdict": verdict(checks),
         "checks": checks,
+        "secondary_registered": registered,
         "cross_cluster": cross,
         "local": local,
-        "limitations": [
-            "The consistent-cluster branch queries a deliberately nonexistent "
-            "node and performs no spare allocation."
-        ],
+        "limitations": limitations,
     }
 
 

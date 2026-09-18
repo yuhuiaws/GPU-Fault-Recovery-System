@@ -85,11 +85,15 @@ def test_precise_executor_progress_rolls_back_only_started_cluster() -> None:
 
     assert plan.for_cluster("gpu-a") == frozenset()
     assert plan.for_cluster("gpu-b") == frozenset({DIFF.ReleaseComponent.EXECUTOR})
-    assert plan.needs_controller is False
+    # The previous executor is admitted only by a control plane whose Pods were
+    # started with the previous pin window, so an executor rollback stages the
+    # controller first (live 2026-09-18: without it the rolled-back executor
+    # Pod stayed unready on a 503 artifact mismatch until the rollout timed out).
+    assert plan.needs_controller is True
     assert plan.conservative is False
 
 
-def test_agent_not_started_does_not_stage_rollback_controller() -> None:
+def test_agent_not_started_still_stages_the_controller_for_the_executor() -> None:
     state = _state(
         DIFF.ReleaseComponent.EXECUTOR,
         DIFF.ReleaseComponent.AGENT,
@@ -107,7 +111,37 @@ def test_agent_not_started_does_not_stage_rollback_controller() -> None:
     plan = PROGRESS.build_rollback_compensation_plan(state, ["gpu-a"])
 
     assert plan.for_cluster("gpu-a") == frozenset({DIFF.ReleaseComponent.EXECUTOR})
-    assert plan.needs_controller is False
+    # The agent never started, so it is not rolled back; the executor that did
+    # start still needs the controller staged with the previous window, but
+    # without Agent identities to restore.
+    assert plan.needs_controller is True
+    assert plan.needs_agent_controller is False
+
+
+def test_collector_or_watcher_only_rollback_does_not_stage_the_controller() -> None:
+    state = _state(
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.COLLECTOR,
+        DIFF.ReleaseComponent.VERIFY,
+        completed_phases=("uploaded", "schema-ready"),
+    )
+    for component in (DIFF.ReleaseComponent.WATCHER, DIFF.ReleaseComponent.COLLECTOR):
+        state["component_progress"] = PROGRESS.update_component_progress(
+            state,
+            component,
+            PROGRESS.PROGRESS_COMPLETED,
+            cluster_id="gpu-a",
+            observed_at_epoch=20.0,
+        )
+
+    plan = PROGRESS.build_rollback_compensation_plan(state, ["gpu-a"])
+
+    assert plan.for_cluster("gpu-a") == frozenset(
+        {DIFF.ReleaseComponent.WATCHER, DIFF.ReleaseComponent.COLLECTOR}
+    )
+    assert plan.needs_controller is False, (
+        "watcher and collector are admitted by token, not by the executor window"
+    )
 
 
 def test_legacy_gpu_failure_falls_back_to_full_planned_cluster_scope() -> None:
@@ -126,6 +160,7 @@ def test_legacy_gpu_failure_falls_back_to_full_planned_cluster_scope() -> None:
     assert plan.for_cluster("gpu-a") == expected
     assert plan.for_cluster("gpu-b") == expected
     assert plan.needs_controller is True
+    assert plan.needs_agent_controller is True
     assert plan.conservative is True
 
 

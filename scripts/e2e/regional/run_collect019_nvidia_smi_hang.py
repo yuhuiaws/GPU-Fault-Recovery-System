@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 )
 from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
     bounded_window_case,
+    finite_seconds,
     require_action_time,
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
@@ -88,6 +90,56 @@ def plan_details(settings: WindowSettings, preflight: dict[str, Any]) -> dict[st
     }
 
 
+FRESH_SUCCESS_WAIT_SECONDS = 300
+
+
+def wait_for_fresh_host_success(
+    fixture: Any,
+    *,
+    interval_seconds: int,
+    wait_seconds: float = FRESH_SUCCESS_WAIT_SECONDS,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Open the window only on a host channel whose last success is fresh.
+
+    Silence is judged from the last success, so a target that has just been
+    rebooted (COLLECT-015 leaves its node like that) or is otherwise behind
+    would burn the 420 s budget before the erroring window even starts. Poll
+    the collector statuses for at most ``wait_seconds``; a stale channel is a
+    precondition failure, never a verdict on the product.
+    """
+
+    deadline = time.monotonic() + finite_seconds(wait_seconds)
+    while True:
+        records = list(fixture.collector_statuses())
+        checked_at = now()
+        errors = verdicts.freshness_errors(records, now=checked_at)
+        if not errors:
+            return {
+                "checked_at": checked_at.isoformat(),
+                "host_success_age_seconds": verdicts.host_success_age_seconds(
+                    records, now=checked_at
+                ),
+                "records": records,
+            }
+        if time.monotonic() >= deadline:
+            raise RegionalFixtureError("precondition: " + "; ".join(errors))
+        sleep(max(1, interval_seconds))
+
+
+def census_texts(fixture: Any) -> list[str]:
+    """The census gauges as the publishing role renders them.
+
+    ``CollectorMetricsSnapshot`` runs with ``enabled=service_role in {"all",
+    "ingress"}``, so control-workers never render the census families; reading
+    them from every control-plane replica reported healthy census as "missing"
+    on the worker texts (live, 2026-09-18). The ingress replicas are the source.
+    """
+
+    return list(fixture.census_metrics())
+
+
 @bounded_window_case
 def execute(
     settings: WindowSettings,
@@ -107,7 +159,10 @@ def execute(
     if timing:
         raise RegionalFixtureError("timing: " + "; ".join(timing))
     stages: dict[str, list[str]] = {"timing": timing}
-    metrics_before = fixture.control_plane_metrics()
+    fresh = wait_for_fresh_host_success(fixture, interval_seconds=interval)
+    write_json_atomic(case_dir / "host-freshness.json", fresh)
+    stages["freshness"] = []
+    metrics_before = census_texts(fixture)
     opened: dict[str, Any] = {}
     statuses: list[dict[str, Any]] = []
     window_open = False
@@ -152,7 +207,7 @@ def execute(
             else fixture.collector_statuses()
         )
         during = fixture.snapshot()
-        metrics_during = fixture.control_plane_metrics()
+        metrics_during = census_texts(fixture)
         stages["erroring_status"] = verdicts.erroring_status_errors(
             statuses, seen=errors_seen
         )

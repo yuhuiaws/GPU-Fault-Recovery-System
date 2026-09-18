@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -63,7 +64,7 @@ def failover(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "commands": [copy.deepcopy(_BATCHED)],
             "workflow": {"step_executions": [waiting]},
         },
-        binding_changed=False,
+        aurora_moved=False,
         deadline=datetime.now(timezone.utc) + timedelta(minutes=10),
         observed_after=datetime.now(timezone.utc),
         evidence=ha003.WaitingEvidence(),
@@ -72,14 +73,13 @@ def failover(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         observations=[],
     )
 
-    def read(expected: dict[str, Any]) -> dict[str, Any]:
-        fixture.events.append("binding")
-        assert expected == fixture.proof, (
-            "failover must revalidate the preflight's exact Aurora binding"
+    def aurora(settings: Any) -> dict[str, Any]:
+        fixture.events.append("aurora")
+        assert settings is fixture.settings, (
+            "the pre-failover Aurora check must describe the bound database"
         )
-        if fixture.binding_changed:
-            raise ha003.RegionalFixtureError("unit Aurora binding changed")
-        return fixture.proof
+        writer = "unit-writer-moved" if fixture.aurora_moved else "unit-writer"
+        return {"status": "available", "writer": writer}
 
     def snapshot(**kwargs: Any) -> dict[str, Any]:
         fixture.events.append("snapshot")
@@ -93,12 +93,6 @@ def failover(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     fixture.regional = SimpleNamespace(store_snapshot=snapshot)
 
-    def binding(regional: Any, cluster: str) -> SimpleNamespace:
-        assert regional is fixture.regional and cluster == "unit-aurora", (
-            "the failover binding must use the selected fixture and database"
-        )
-        return SimpleNamespace(read=read)
-
     def observe(state: dict[str, Any]) -> None:
         fixture.events.append("observe")
         fixture.observations.append(state)
@@ -109,14 +103,14 @@ def failover(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         fixture.requests.append(args)
         return {"status": "mock-requested"}
 
-    monkeypatch.setattr(ha003, "regional_binding", binding)
+    monkeypatch.setattr(ha003, "rds_snapshot", aurora)
     monkeypatch.setattr(ha003, "aws_rds", provider)
 
     def request() -> tuple[datetime, dict[str, Any]]:
         return ha003.request_bound_failover(
             fixture.settings,
             fixture.regional,
-            {"aurora_binding": fixture.proof},
+            {"aurora_binding": fixture.proof, "rds": {"writer": "unit-writer"}},
             {"command_id": _BATCHED["command_id"]},
             fixture.evidence,
             marker="unit-marker",
@@ -148,8 +142,9 @@ def test_failover_rechecks_the_same_in_flight_reset(
     assert requested_at < failover.deadline, (
         "failover must be requested within the maintenance window"
     )
-    assert failover.events == ["binding", "snapshot", "observe", "provider"], (
-        "fresh binding and reset evidence must precede the single provider request"
+    assert failover.events == ["aurora", "snapshot", "observe", "provider"], (
+        "the Aurora writer check and fresh reset evidence must precede the single "
+        "provider request"
     )
     assert failover.requests == [
         ("failover-db-cluster", "--db-cluster-identifier", "unit-aurora")
@@ -191,29 +186,65 @@ def test_failover_refuses_unproved_reset_identity_or_state(
     with pytest.raises(ha003.RegionalFixtureError, match="uniquely in flight"):
         failover.request()
     assert failover.requests == [], "unproved reset state must not trigger failover"
-    assert failover.events == ["binding", "snapshot", "observe"], (
-        "a refused dispatch must retain its fresh binding and cleanup observation"
+    assert failover.events == ["aurora", "snapshot", "observe"], (
+        "a refused dispatch must retain its Aurora check and cleanup observation"
     )
 
 
-@pytest.mark.parametrize("failure", ["binding", "deadline"])
-def test_batched_reset_does_not_bypass_binding_or_window(
+@pytest.mark.parametrize("failure", ["aurora", "deadline"])
+def test_batched_reset_does_not_bypass_aurora_or_window(
     failover: SimpleNamespace, failure: str
 ) -> None:
-    failover.binding_changed = failure == "binding"
+    failover.aurora_moved = failure == "aurora"
     if failure == "deadline":
         failover.deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
     with pytest.raises(
-        ha003.RegionalFixtureError, match="binding changed|maintenance window ended"
+        ha003.RegionalFixtureError, match="Aurora moved|maintenance window ended"
     ):
         failover.request()
     assert failover.requests == [], (
-        "binding/window refusal must precede provider mutation"
+        "Aurora/window refusal must precede provider mutation"
     )
     assert failover.events == (
-        ["binding"] if failure == "binding" else ["binding", "snapshot", "observe"]
+        ["aurora"] if failure == "aurora" else ["aurora", "snapshot", "observe"]
     ), (
-        "binding drift must stop before store sampling; expiry must still retain observations"
+        "a moved writer must stop before store sampling; expiry must still retain "
+        "observations"
+    )
+
+
+def test_failover_request_is_one_describe_call_and_stamps_its_timing(
+    failover: SimpleNamespace,
+) -> None:
+    """The final barrier costs one RDS describe plus the store re-read; the
+    full binding re-read (~40 s live) is what made a1 on 2026-09-18
+    INCONCLUSIVE. The stamps let a live run show where the window went."""
+    timing: dict[str, Any] = {}
+    requested_at, _ = ha003.request_bound_failover(
+        failover.settings,
+        failover.regional,
+        {"aurora_binding": failover.proof, "rds": {"writer": "unit-writer"}},
+        {"command_id": _BATCHED["command_id"]},
+        failover.evidence,
+        marker="unit-marker",
+        observed_after=failover.observed_after,
+        maintenance_window_end=failover.deadline,
+        observe_state=lambda state: None,
+        timing=timing,
+    )
+    assert list(timing) == [
+        "recheck_started_at",
+        "aurora_checked_at",
+        "store_snapshot_at",
+        "requested_at",
+    ]
+    assert timing["requested_at"] == requested_at.isoformat()
+    assert failover.events.count("aurora") == 1
+    source = Path(ha003.__file__).read_text(encoding="utf-8")
+    assert "def request_bound_failover" in source
+    body = source.split("def request_bound_failover", 1)[1].split("\ndef ", 1)[0]
+    assert "regional_binding(" not in body, (
+        "the pre-failover barrier must not re-read the full Aurora binding"
     )
 
 

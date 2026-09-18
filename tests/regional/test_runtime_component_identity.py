@@ -344,3 +344,59 @@ def test_runtime_component_identity_aggregates_every_failed_pod() -> None:
     message = str(error.value)
     for index in range(3):
         assert f"gpu-fault-cluster-executor-pod-{index}" in message
+
+
+class FlakyListingRelease(Release):
+    """The first Pod listing of one Deployment fails; the retry succeeds."""
+
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self.failures = failures
+        self.listing_calls = 0
+
+    def _get_json(self, arguments):
+        if "deployment" not in arguments and "app=gpu-fault-api-ha" in arguments:
+            self.listing_calls += 1
+            if self.listing_calls <= self.failures:
+                raise MODULE.ReleaseError("deployment API command failed")
+        return super()._get_json(arguments)
+
+
+class FlakyProbeRunner(Runner):
+    """One module-digest exec fails once, the way a refused shim call does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    def run(self, arguments, **kwargs):
+        if f"PATH={MODULE.EXECUTOR_PATH}" in arguments and not self.failed:
+            self.failed = True
+            raise MODULE.ReleaseError("deployment API command failed")
+        return super().run(arguments, **kwargs)
+
+
+def test_a_listing_refused_once_is_read_again_before_it_fails_the_release() -> None:
+    """Live 2026-09-18: two of twenty concurrent read-only kubectl calls were
+    refused by the deployment API budget shim and a fully converged candidate
+    went FAILED then rollback-failed."""
+
+    release = FlakyListingRelease(failures=1)
+    result = MODULE.validate_runtime_component_identity(release)
+    assert release.listing_calls == 2
+    assert result["control_plane"]["expected"] == "c" * 64
+
+
+def test_a_probe_refused_once_is_run_again_before_it_fails_the_release() -> None:
+    runner = FlakyProbeRunner()
+    result = MODULE.validate_runtime_component_identity(Release(runner=runner))
+    assert runner.failed is True, "the probe fixture must have refused once"
+    assert result["executor"]["expected"] == "e" * 64
+
+
+def test_a_listing_refused_twice_fails_the_release_naming_both_errors() -> None:
+    release = FlakyListingRelease(failures=2)
+    with pytest.raises(MODULE.ReleaseError, match="retry after ReleaseError") as raised:
+        MODULE.validate_runtime_component_identity(release)
+    assert "control-plane/gpu-fault-api-ha" in str(raised.value)
+    assert release.listing_calls == 2, "exactly one retry, never a loop"

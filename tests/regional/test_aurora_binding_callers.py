@@ -169,25 +169,49 @@ def test_ha010_revalidates_its_own_boundary_before_failover_or_pod_deletion(
 def test_ha003_checks_before_real_reset_and_again_before_failover(
     refusal: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """The full binding is read once, right before the physical reset. The
+    barrier before the failover request is one ``describe-db-clusters`` (the
+    writer has not moved, the cluster is available) plus a fresh store
+    re-read: re-reading the full binding there (~40 s live) spent the ~65 s a
+    batched reset stays WAITING, and a1 on 2026-09-18 ended INCONCLUSIVE."""
     environment = FakeAurora()
     expected = environment.guard.read()
+    members = environment.cluster["DBClusterMembers"]
+    writer = next(
+        item["DBInstanceIdentifier"] for item in members if item["IsClusterWriter"]
+    )
     events = []
-    checks = 0
     claims = 0
 
     def read(value):
-        nonlocal checks
-        checks += 1
         events.append("binding")
-        if (refusal == "reset" and checks == 1) or (
-            refusal == "failover" and checks == 2
-        ):
+        if refusal == "reset":
             environment.cluster["DbClusterResourceId"] += "-changed"
         return environment.guard.read(value)
+
+    def rds(settings, *arguments):
+        assert settings.rds_cluster_id == CLUSTER
+        if arguments[0] == "describe-db-clusters":
+            assert arguments == (
+                "describe-db-clusters",
+                "--db-cluster-identifier",
+                CLUSTER,
+            ), "the barrier must describe the bound cluster"
+            events.append("describe")
+            if refusal == "failover":
+                # The writer moves after the injection-time binding read; the
+                # barrier's one describe call is what has to catch it.
+                for item in members:
+                    item["IsClusterWriter"] = not item["IsClusterWriter"]
+            return {"DBClusters": [environment.cluster]}
+        assert arguments == ("failover-db-cluster", "--db-cluster-identifier", CLUSTER)
+        events.append("failover")
+        raise RuntimeError("unit stop after observing dispatch")
 
     monkeypatch.setattr(
         ha003, "regional_binding", lambda *a: SimpleNamespace(read=read)
     )
+    monkeypatch.setattr(ha003, "aws_rds", rds)
     monkeypatch.setattr(
         ha003,
         "read_only_preflight",
@@ -196,6 +220,7 @@ def test_ha003_checks_before_real_reset_and_again_before_failover(
             "release_id": "unit-release",
             "store": {},
             "aurora_binding": expected,
+            "rds": {"writer": writer},
         },
     )
     monkeypatch.setattr(ha003, "verify_plan_identity", lambda *a: None)
@@ -252,13 +277,7 @@ def test_ha003_checks_before_real_reset_and_again_before_failover(
             store_snapshot=snapshot,
         ),
     )
-
-    def failover(*args):
-        events.append("failover")
-        raise RuntimeError("unit stop after observing dispatch")
-
     monkeypatch.setattr(ha003, "wait_reset_claim", claimed)
-    monkeypatch.setattr(ha003, "aws_rds", failover)
     settings = SimpleNamespace(
         rds_cluster_id=CLUSTER,
         node="unit-node",
@@ -274,13 +293,31 @@ def test_ha003_checks_before_real_reset_and_again_before_failover(
     assert ha003.execute_case(settings, tmp_path, 1, DEADLINE) == 1, (
         "mock boundary run must not claim live PASS"
     )
+    report = json.loads(
+        (tmp_path / "cases" / ha003.CASE_ID / f"{ha003.CASE_ID}.json").read_text()
+    )
+    assert events.count("binding") == 1, (
+        "the full binding is read once, before the physical reset; the barrier "
+        "before the failover request must not re-read it"
+    )
     assert ("write-xid46" in events) is (refusal != "reset"), events
+    assert ("describe" in events) is (refusal != "reset"), events
     assert ("failover" in events) is (refusal == "none"), events
+    # The first claim is the reset capture; the second is the barrier's store
+    # re-read, which a moved writer must never reach.
+    assert (
+        events.count("claim")
+        == {"reset": 0, "failover": 1, "terminal": 2, "none": 2}[refusal]
+    ), events
     if refusal == "none":
         assert events[events.index("failover") - 2 : events.index("failover")] == [
-            "binding",
+            "describe",
             "claim",
-        ], "fresh identity and open reset are required at dispatch"
+        ], "an unmoved Aurora writer and an open reset are required at dispatch"
+    if refusal == "failover":
+        assert "Aurora moved before the failover request" in report["error"], report
+    if refusal == "terminal":
+        assert "no longer uniquely in flight before failover" in report["error"], report
     if refusal != "reset":
         assert "restore-quiesce" in events, (
             "binding refusal must retain the already-created incident for cleanup"

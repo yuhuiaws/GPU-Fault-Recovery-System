@@ -623,6 +623,28 @@ print(json.dumps({
 """
 
 
+NODE_WORKLOAD_VIEW_SCRIPT = r"""
+import json
+import sys
+from datetime import datetime, timezone
+
+from gpu_fault.app import ApplicationContext
+
+context = ApplicationContext.from_environment()
+resolved = context.topology.resolve(sys.argv[1], sys.argv[2], datetime.now(timezone.utc))
+state = getattr(resolved.workload_state, "value", resolved.workload_state)
+print(
+    json.dumps(
+        {
+            "workload_state": str(state),
+            "attempt_ids": list(resolved.attempt_ids),
+            "workload_ids": list(resolved.workload_ids),
+        }
+    )
+)
+"""
+
+
 class RegionalLiveFixture:
     def __init__(self, settings: RegionalLiveSettings) -> None:
         self.settings = settings
@@ -1071,6 +1093,20 @@ class RegionalLiveFixture:
                 and not key.startswith("gpu-fault.io/installer-")
             },
         }
+
+    def node_workload_view(self, node: str) -> dict[str, Any]:
+        """The control plane's own resolution of what runs on ``node`` now.
+
+        ``kubectl get pods`` is not the product's view: the completion watcher
+        re-posts a vanished attempt's last RUNNING observation for its
+        missing-Pod grace, so a node can be empty and still bound to a dead
+        attempt. A host-fault case that starts inside that window plans a
+        STOP_WORKLOADS against a workload that no longer exists (NET-007).
+        """
+
+        return self.cpu_python(
+            NODE_WORKLOAD_VIEW_SCRIPT, self.settings.cluster_id, node
+        )
 
     def gpu_nodes(self) -> list[dict[str, Any]]:
         value = json.loads(self.kubectl("gpu", "get", "node", "-o", "json"))

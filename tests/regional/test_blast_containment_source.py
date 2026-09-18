@@ -41,7 +41,12 @@ def test_blast001_consumes_both_real_producer_paths(
     runner.blast_001()
     analysis = json.loads((runner.run_dir / "BLAST-001-analysis.json").read_text())
     assert analysis["workload_operations"] == ["RESTART_WORKLOAD", "STOP_WORKLOADS"]
-    assert analysis["containment_source"]["operations"] == ["MARK_UNSCHEDULABLE"]
+    assert analysis["isolation_producers"] == [base.CONTAINMENT_CASE_ID], (
+        "the real DESTR-001 producer is discovered through its SUCCEEDED records"
+    )
+    assert base.E2E001_CASE_ID in analysis["workload_producers"], (
+        "the real E2E-001 producer is discovered through its SUCCEEDED records"
+    )
     assert analysis["required_operations_present"] is True
 
 

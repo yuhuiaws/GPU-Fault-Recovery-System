@@ -381,6 +381,17 @@ def test_rollback_stops_after_first_target_failure_and_keeps_failed_timing(
     with pytest.raises(ReleaseError, match="gpu-b rollback failed"):
         release.rollback(state=release.previous)
     assert calls == ["gpu-b"]
+    # An executor rollback re-stages the control plane for the previous pin
+    # window before any cluster is restored, and needs no Agent identities to
+    # do so (the previous snapshot here records none).
+    previous_artifact = release.previous["metadata"][
+        "required-regional-executor-artifact-sha256"
+    ]
+    assert release.environments, "the controller was not staged before the restore"
+    assert all(
+        env["GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256"] == previous_artifact
+        for env in release.environments
+    ), "every staged control-plane render must carry the previous executor pin"
     assert release.state["rollback_timing"]["clusters"]["gpu-b"]["status"] == "FAILED"
     assert release.state["rollback_completed_cluster_ids"] == []
     assert "rollback-data-restored" not in release.state["rollback_completed_phases"]

@@ -200,7 +200,13 @@ def test_one_stopped_thread_does_not_authorize_an_api_loan(monkeypatch):
             context.setattr(budget, "os", model.os)
             context.setattr(budget, "signal", model.signal)
             context.setattr(budget, "Path", model.path)
-            with deadline_scope("thread stop proof", 0.05):
+            # The proof waits min(2 s, remaining deadline) for every thread to
+            # acknowledge STOP, so the deadline is what keeps this test short.
+            # 50 ms was too short to be deterministic: under release-gate load
+            # (16 workers + Postgres shards) the deadline expired before the
+            # slot's first remaining-time check and the case failed with
+            # "deadline expired" instead of "did not stop" (deploy #6).
+            with deadline_scope("thread stop proof", 1.0):
                 with pytest.raises(budget.ApiBudgetError, match="did not stop"):
                     with budget.api_slot("aws", parent_id=PARENT):
                         pytest.fail("leader-only STOP proof authorized an API helper")
