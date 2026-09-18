@@ -13,9 +13,11 @@ from scripts.e2e.regional.regional_live_fixture import (
 )
 from tests.regional._cov95_destr_fence import FenceHarness, data
 
+CONDITIONAL_KIND = "conditional-barrier-pre-authorization"
+
 
 @pytest.mark.parametrize("recovered", [False, True])
-def test_reboot_fence_keeps_original_request_and_authorizes_only_waiting_generation(
+def test_reboot_fence_pre_authorizes_before_injection_and_never_execs_after_barrier(
     recovered: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = FenceHarness(tmp_path, monkeypatch)
@@ -29,21 +31,27 @@ def test_reboot_fence_keeps_original_request_and_authorizes_only_waiting_generat
     assert report["workflow_request_id"] == data.REQUEST, report
     assert report["reconcile_application"] == "NOT_APPLIED", report
     proof = report["reboot"]["authorization"]
+    assert proof["kind"] == CONDITIONAL_KIND and proof["conditional"] is True, proof
     assert proof["run_id"] == h.run_id and proof["drill_id"] == h.run_id, proof
-    assert (
-        proof["boot_id"] == data.BOOT_BEFORE
-        and proof["agent_generation"] == data.GENERATION
-    ), proof
-    assert proof["command_ids"] == {
+    assert proof["boot_id"] == data.BOOT_BEFORE and proof["node_id"] == data.NODE, proof
+    assert proof["not_before_seconds"] == {"reboot": 60}, proof
+    assert "command_ids" not in proof, (
+        "a pre-authorization cannot name barrier rows that do not exist yet"
+    )
+    barrier = report["reboot"]["barrier"]
+    assert barrier["waiting"] is True and barrier["fencing_token"] == 5, barrier
+    assert barrier["workflow_request_id"] == data.REQUEST, barrier
+    assert barrier["agent_generation"] == data.GENERATION, barrier
+    assert barrier["command_ids"] == {
         op: f"key-{op}/{data.NODE}/agent-{data.GENERATION}"
         for op in ("QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS")
-    }, proof
-    names = [name for name, _ in h.calls]
+    }, barrier
+    names = h.names()
     order = [
         "fence.arm-holder",
+        "fence.pre-authorize-reboot",
         "host.write-xid",
         "waiting.read",
-        "fence.arm-reboot",
         "node.ready",
         "aftermath",
         "reconcile.plan",
@@ -55,6 +63,9 @@ def test_reboot_fence_keeps_original_request_and_authorizes_only_waiting_generat
     assert [names.index(name) for name in order] == sorted(
         names.index(name) for name in order
     ), names
+    # kubelet is down from the quiesce until the node is back: nothing may be
+    # exec'd into the node between the barrier observation and its return.
+    assert h.host_execs_between("waiting.read", "node.ready") == [], names
     assert [args for name, args in h.calls if name == "aftermath"] == [
         (data.REQUEST,)
     ], h.calls
@@ -67,11 +78,9 @@ def test_reboot_fence_keeps_original_request_and_authorizes_only_waiting_generat
         ("verify", "never reached WAITING"),
         ("workflow", "workflow changed"),
         ("drill", "exact drill/workflow"),
-        ("index", "device index"),
-        ("window", "window"),
     ],
 )
-def test_reboot_is_not_armed_without_the_exact_live_barrier(
+def test_barrier_defects_fail_closed_without_an_exec_after_the_barrier(
     defect: str, message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = FenceHarness(tmp_path, monkeypatch)
@@ -82,15 +91,38 @@ def test_reboot_is_not_armed_without_the_exact_live_barrier(
         h.verify_missing = True
     elif defect == "workflow":
         h.authorization_drift = True
-    elif defect == "drill":
+    else:
         h.bad_drill = True
-    elif defect == "index":
+    code, report = h.execute(tmp_path)
+    assert code == 1 and message in report["error"], report
+    assert h.reboot_armed is True, "the reboot is pre-authorized before the injection"
+    assert h.host_execs_between("waiting.read", "node.ready") == [], h.names()
+    names = h.names()
+    assert (
+        names.index("node.ready")
+        < names.index("fence.cancel-reboot")
+        < names.index("fence.disarm-holder")
+    ), names
+    assert any(name == "host.cleanup" for name, _ in h.calls), h.calls
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"), [("index", "device index"), ("window", "window")]
+)
+def test_premise_defects_refuse_before_the_reboot_is_pre_authorized(
+    defect: str, message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = FenceHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    if defect == "index":
         h.baseline["gpu_inventory"][0].pop("index")
     else:
         h.bounds["agent_maintenance_window_seconds"] = 30
     code, report = h.execute(tmp_path)
     assert code == 1 and message in report["error"], report
     assert h.reboot_armed is False, h.calls
+    assert "fence.pre-authorize-reboot" not in h.names(), h.names()
+    assert h.injected is False, h.calls
     assert any(name == "host.cleanup" for name, _ in h.calls), h.calls
 
 
@@ -113,8 +145,8 @@ def test_fence_waits_through_transient_missing_pin_and_old_generation(
     "phase",
     [
         "fence.arm-holder",
+        "fence.pre-authorize-reboot",
         "host.write-xid",
-        "fence.arm-reboot",
         "node.ready",
         "aftermath",
         "escalations",
@@ -143,6 +175,14 @@ def test_fence_failure_is_retained_and_remaining_cleanup_is_attempted(
     assert "host.cleanup" in names and "fence.cleanup" in names, names
     if phase in {"fence.cancel-reboot", "fence.disarm-holder"}:
         assert "fence.clear-state" not in names, names
+    if phase == "node.ready":
+        # A node that never answers again gets no exec at all; the holder
+        # cannot be assumed gone while its boot id is unchanged.
+        assert "fence.cancel-reboot" not in names, names
+        assert "fence.disarm-holder" not in names, names
+        assert any(
+            "never answered again" in error for error in report["cleanup"]["errors"]
+        ), report
 
 
 def test_fence_generation_timeout_cancels_timers_without_fabricating_new_agent(
@@ -174,12 +214,12 @@ def test_fence_rechecks_maintenance_window_before_arming_or_injection(
     assert h.injected is False, h.calls
 
 
-def test_fence_abort_after_timer_ack_still_cancels_owned_timers(
+def test_fence_abort_after_pre_authorization_ack_still_cancels_owned_timers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = FenceHarness(tmp_path, monkeypatch)
     h.plan(tmp_path)
-    h.failures["fence.arm-reboot"] = RegionalFixtureAbort(2)
+    h.failures["fence.pre-authorize-reboot"] = RegionalFixtureAbort(2)
     with pytest.raises(RegionalFixtureAbort):
         h.execute(tmp_path)
     names = [name for name, _ in h.calls]
@@ -256,18 +296,98 @@ def test_fence_bad_aftermath_cannot_become_pass(
     assert code == 1 and (report["errors"] or report["cleanup"]["errors"]), report
 
 
-def test_fence_authorization_is_persisted_with_no_raw_credentials(
+def test_fence_evidence_persists_the_pre_authorization_and_the_store_barrier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = FenceHarness(tmp_path, monkeypatch)
     h.plan(tmp_path)
     code, report = h.execute(tmp_path)
     assert code == 0, report
-    path = tmp_path / "cases" / case.CASE_ID / "reboot-armed.json"
-    proof = json.loads(path.read_text())["authorization"]
-    assert proof["waiting"] is True and proof["fencing_token"] == 5, proof
-    assert proof["workflow_request_id"] == data.REQUEST, proof
-    assert set(proof["command_ids"]) == {
+    case_dir = tmp_path / "cases" / case.CASE_ID
+    armed = json.loads((case_dir / "reboot-armed.json").read_text())
+    assert armed["authorization"]["kind"] == CONDITIONAL_KIND, armed
+    assert armed["authorization"] == h.pre_authorization, armed
+    assert "lease_token" not in json.dumps(armed), armed
+    waiting = json.loads((case_dir / "waiting-verify.json").read_text())
+    barrier = waiting["barrier"]
+    assert barrier["waiting"] is True and barrier["fencing_token"] == 5, barrier
+    assert barrier["workflow_request_id"] == data.REQUEST, barrier
+    assert set(barrier["command_ids"]) == {
         "QUIESCE_GPU_SERVICES",
         "VERIFY_NO_GPU_CLIENTS",
-    }, proof
+    }, barrier
+    window = json.loads((case_dir / "reboot-window.json").read_text())
+    assert window["barrier"] == barrier and window["window_remaining_seconds"] > 60, (
+        window
+    )
+
+
+def test_fence_ordering_check_fails_when_the_host_fired_before_the_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = FenceHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.host_fired_early = True
+    code, report = h.execute(tmp_path)
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert any(
+        "not after the runner observed the barrier" in error
+        for error in report["errors"]
+    ), report["errors"]
+
+
+def test_fence_ordering_check_fails_when_the_host_matched_another_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = FenceHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.host_condition_workflow = "workflow-someone-else"
+    code, report = h.execute(tmp_path)
+    assert code == 1, report
+    assert any(
+        "matched workflow_request_id 'workflow-someone-else'" in error
+        for error in report["errors"]
+    ), report["errors"]
+
+
+def test_fence_cleanup_never_execs_into_a_node_that_does_not_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = FenceHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.node_unreachable = True
+    code, report = h.execute(tmp_path)
+    assert code == 1 and "did not return Ready" in report["error"], report
+    names = h.names()
+    for forbidden in (
+        "fence.cancel-reboot",
+        "fence.disarm-holder",
+        "fence.clear-state",
+        "host.restore-quiesce",
+    ):
+        assert forbidden not in names, names
+    assert h.host_execs_between("waiting.read", "fence.cleanup") == [], names
+    errors = report["cleanup"]["errors"]
+    assert any("cancel_reboot: the node never answered" in e for e in errors), errors
+    assert any("host_final: the node never answered" in e for e in errors), errors
+
+
+def test_fence_cleanup_assumes_the_timer_gone_when_the_node_rebooted_but_hid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = FenceHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.node_unreachable = True
+    h.unreachable_boot_id = data.BOOT_AFTER
+    code, report = h.execute(tmp_path)
+    assert code == 1, report
+    cleanup = report["cleanup"]
+    assert cleanup["node_ready"]["assume_disarmed"] is True, cleanup
+    assert "boot id changed" in cleanup["cancel_reboot"]["skipped"], cleanup
+    assert "boot id changed" in cleanup["disarm_holder"]["skipped"], cleanup
+    names = h.names()
+    assert "fence.cancel-reboot" not in names and "fence.disarm-holder" not in names, (
+        names
+    )
+    # Quiescence still has to be proven on the host; it cannot be assumed.
+    assert any("host_final" in error for error in cleanup["errors"]), cleanup

@@ -363,6 +363,25 @@ def host_after() -> dict[str, Any]:
     }
 
 
+def fire_record(phase: str, minute: int) -> dict[str, Any]:
+    """What the holder wrote on the node when it fired ``phase``."""
+
+    return {
+        "fire_requested_at": _at(minute),
+        "fired_at": _at(minute, 2),
+        "condition": {
+            "workflow_request_id": RESET_ID,
+            "incident_id": INCIDENT,
+            "boot_id": "host-boot-before",
+            "agent_generation": 4,
+            "quiesce_command_id": f"{RESET_ID}/2/QUIESCE/commit",
+            "verify_command_id": BARRIER_COMMAND,
+            "verify_attempt": 2,
+            "observed_at": _at(minute),
+        },
+    }
+
+
 def holder_status() -> dict[str, Any]:
     return {
         "run_id": "destr016-run-a1",
@@ -373,7 +392,41 @@ def holder_status() -> dict[str, Any]:
         "hold_started_at": _at(1, 55),
         "arm_race_lost": False,
         "holder_error": None,
+        "pre_authorized_at": _at(0, 30),
+        "pre_authorization_expires_at": _at(20, 30),
+        "not_before_seconds": {"absorb": 90, "escalate": 240},
+        "injections_fired": {
+            "absorb": fire_record("absorb", 4),
+            "escalate": fire_record("escalate", 6),
+        },
+        "injection_refusals": {},
+        "disarmed_at": None,
+        "disarm_reason": None,
         "boot_id": "host-boot-after",
+    }
+
+
+def barrier_observation(minute: int) -> dict[str, Any]:
+    """The runner's store-side ``barrier_authorization`` taken at ``minute``."""
+
+    return {
+        "run_id": "destr016-run-a1",
+        "node_id": NODE,
+        "boot_id": "host-boot-before",
+        "device": "/dev/nvidia0",
+        "drill_id": "destr016-run-a1-r",
+        "incident_id": INCIDENT,
+        "workflow_request_id": RESET_ID,
+        "fencing_token": 7,
+        "agent_generation": 4,
+        "command_ids": {
+            "QUIESCE_GPU_SERVICES": f"{RESET_ID}/2/QUIESCE/commit",
+            "VERIFY_NO_GPU_CLIENTS": BARRIER_COMMAND,
+        },
+        "observed_at": _at(minute),
+        "window_expires_at": _at(8),
+        "maintenance_window_end": _at(59),
+        "waiting": True,
     }
 
 

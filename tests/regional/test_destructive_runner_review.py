@@ -266,6 +266,23 @@ def test_lost_holder_race_never_schedules_escalation(
 
     assert scheduled == []
     assert holder_probe.read_state(path)["arm_race_lost"] is True
+    # A pre-authorized timer that fires afterwards refuses for the same reason
+    # and records it, instead of writing the escalation onto a committed reset.
+    holder_probe.update_state(
+        path,
+        {
+            "run_id": "review",
+            "pre_authorization": {"kind": "conditional-barrier-pre-authorization"},
+        },
+    )
+    monkeypatch.setattr(holder_probe, "holder_active", lambda _run: True)
+    with pytest.raises(holder_probe.ProbeError, match="before the holder started"):
+        holder_probe.fire_injection(
+            argparse.Namespace(run_id="review", phase="escalate")
+        )
+    assert scheduled == []
+    refusal = holder_probe.read_state(path)["injection_refusals"]["escalate"]
+    assert "before the holder started" in refusal["reason"], refusal
 
 
 def test_holder_is_bound_to_the_explicit_faulted_gpu() -> None:

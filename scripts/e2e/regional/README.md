@@ -380,7 +380,12 @@ Current classification:
   including an ambient `GPU_FAULT_STORE_URL`: a fixture whose job is to
   manufacture wedged workflows must not be able to aim at a real database.
 - NOTIFY-001..005 share `run_notification_acceptance.py`. Reset/restart email
-  cases use labeled drills rather than repeating physical actions.
+  cases use labeled drills rather than repeating physical actions; the GPU-reset
+  drill replays the compound reset carrier (QUIESCE head, RESET_GPU batched) and
+  requires the one mail to be keyed by the batched step's own idempotency key.
+  DESTR-001/HA-003/HA-004 require that record from the real reset they drive:
+  SKIPPED by the drill policy for their drill-injected incidents, SENT with a
+  provider id for a real incident (only that branch waits for the dispatcher).
 - CAP-001..004 share `run_capacity_acceptance.py`, promoted from the isolated
   disposable-control-plane harness. NET-001 uses
   `run_net001_collector_replay.py` and arms a host rollback timer before any

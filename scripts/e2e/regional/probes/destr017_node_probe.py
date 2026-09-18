@@ -23,11 +23,27 @@ must outlive the ``kubectl exec`` channel that starts them (see memory
   ``reboot-status`` can prove after the fact that exactly one boot happened and
   which boot id preceded it.
 
+``QUIESCE_GPU_SERVICES`` stops kubelet, so from the quiesce until the restore
+no exec can reach this node -- including the moment the fence is WAITING. The
+runner therefore authorizes the reboot *before* the fault is injected, as a
+**conditional pre-authorization** (``pre-authorize-reboot``) bound to the run,
+node, boot id, device, drill, delay and maintenance window; the timer is placed
+then, and ``fire-reboot`` evaluates the barrier itself, against the ledger on
+this node, every few seconds until a deadline: this run's workflow has a
+succeeded ``QUIESCE_GPU_SERVICES`` row, an executed ``VERIFY_NO_GPU_CLIENTS``
+row whose refusal names active clients (the holder's doing), no
+``RESET_GPU``/``RESET_ALL_GPUS_NVSWITCHES``/``RESTORE_GPU_SERVICES`` row, an
+unchanged boot id, the holder still alive, and a clock inside both the pinned
+maintenance window and the pre-authorization's expiry. The reboot delay is the
+*earliest* moment after the holder opened, never the authorization. A condition
+that cannot clear, or a deadline that passes, records why, cancels the reboot
+and disarms the holder.
+
 The reboot is deliberately *not* a control-plane action: no workflow step, no
 provider call, no Node Agent command.  That is the fault this case injects.
 
 Every shell command is on an allow-list, the only units this probe may touch
-are the two it names after its own run id, and the only reboot form it can
+are the three it names after its own run id, and the only reboot form it can
 issue is a plain ``systemctl reboot``.  Nothing here executes a GPU reset,
 stops a service, or touches the Node Agent.
 """
@@ -44,6 +60,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -67,12 +85,26 @@ ARM_LEDGER_OPERATIONS = {"QUIESCE_GPU_SERVICES", "VERIFY_NO_GPU_CLIENTS"}
 ALLOWED_SYSTEMCTL_VERBS = {"stop", "reset-failed", "show"}
 MIN_HOLD_SECONDS = 60
 MAX_HOLD_SECONDS = 3600
-# The reboot must be far enough out that the arming exec returns first, and
-# near enough that it lands inside the pinned quiesce maintenance window.
+# The reboot may fire no earlier than this long after the holder opened (the
+# quiesce landed), and the delay must be short enough to land inside the
+# pinned maintenance window.
 MIN_REBOOT_DELAY_SECONDS = 30
 MAX_REBOOT_DELAY_SECONDS = 600
-SAFE_GUARD_SCRIPT = re.compile(r"^/run/gpu-fault-host-probe-[0-9a-f]{6,32}\.py$")
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+# The conditional pre-authorization the runner delivers before the injection.
+CONDITIONAL_KIND = "conditional-barrier-pre-authorization"
+REBOOT_PHASE = "reboot"
+LEDGER_SHAPE: dict[str, Any] = {
+    "quiesce": "QUIESCE_GPU_SERVICES",
+    "verify": "VERIFY_NO_GPU_CLIENTS",
+    "verify_refusal": "clients are still active",
+    "forbidden": ["RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTORE_GPU_SERVICES"],
+}
+IN_PROGRESS_STATE = "IN_PROGRESS"
+MIN_MAINTENANCE_WINDOW_SECONDS = 30
+MAX_MAINTENANCE_WINDOW_SECONDS = 3600
+POLL_SECONDS = 5
+FIRE_RUNTIME_SLACK_SECONDS = 120
 
 # The holder body, kept a host process (Pods cannot start once GPU services are
 # quiesced). It names itself, opens the device read-only, and exits on SIGTERM
@@ -243,13 +275,29 @@ def update_state(path: Path, value: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+@contextmanager
+def locked(path: Path) -> Iterator[None]:
+    """Serialize the read-modify-write cycles of the units sharing one state file."""
+
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def locked_update(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+    with locked(path):
+        return update_state(path, value)
+
+
 def ledger_rows(ledger: Path = LEDGER) -> list[dict[str, Any]]:
     if not ledger.is_file():
         return []
     connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
     try:
         rows = connection.execute(
-            "SELECT command_id, completed_at, attempt, state, operation, started_at "
+            "SELECT command_id, completed_at, attempt, state, operation, started_at, "
+            "workflow_request_id, incident_id, agent_generation, payload "
             "FROM results WHERE operation IN "
             f"({', '.join('?' for _ in LEDGER_OPERATIONS)}) "
             "ORDER BY completed_at, command_id",
@@ -257,17 +305,27 @@ def ledger_rows(ledger: Path = LEDGER) -> list[dict[str, Any]]:
         ).fetchall()
     finally:
         connection.close()
-    return [
-        {
-            "command_id": row[0],
-            "completed_at": row[1],
-            "attempt": row[2],
-            "state": row[3],
-            "operation": row[4],
-            "started_at": row[5],
-        }
-        for row in rows
-    ]
+    result = []
+    for row in rows:
+        try:
+            error = (json.loads(row[9]) or {}).get("error") if row[9] else None
+        except (TypeError, ValueError, AttributeError):
+            error = None
+        result.append(
+            {
+                "command_id": row[0],
+                "completed_at": row[1],
+                "attempt": row[2],
+                "state": row[3],
+                "operation": row[4],
+                "started_at": row[5],
+                "workflow_request_id": row[6],
+                "incident_id": row[7],
+                "agent_generation": row[8],
+                "error": error,
+            }
+        )
+    return result
 
 
 def match_ledger_row(
@@ -332,6 +390,12 @@ def _holder_unit_state(run_id: str) -> dict[str, str]:
     )
 
 
+def holder_active(run_id: str) -> bool:
+    """Whether the GPU device holder unit is alive right now."""
+
+    return _holder_unit_state(run_id).get("ActiveState") == "active"
+
+
 def _reboot_unit_state(run_id: str) -> dict[str, dict[str, str]]:
     return {
         "timer": _unit_state(
@@ -361,6 +425,18 @@ def _clear_unit(unit_with_suffix: str, run_id: str) -> None:
         checked_command(["systemctl", "reset-failed", unit_with_suffix], run_id),
         check=False,
     )
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def record_boot_observation(
@@ -411,7 +487,7 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
         if matched is None:
             time.sleep(1)
     if matched is None:
-        update_state(path, {"holder_error": "arm ledger row never appeared"})
+        locked_update(path, {"holder_error": "arm ledger row never appeared"})
         return
     if state.get("reboot_delay_seconds") is not None:
         require_maintenance_window(str(state.get("maintenance_window_end") or ""))
@@ -433,7 +509,7 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             str(max_hold),
         ]
     )
-    update_state(
+    locked_update(
         path,
         {
             "matched_row": matched,
@@ -441,8 +517,8 @@ def watch_ledger(arguments: argparse.Namespace) -> None:
             "holder_unit": unit + ".service",
         },
     )
-    # Quiesce alone does not prove the controller's WAITING barrier. The runner
-    # must deliver its exact authorization before any reboot timer is placed.
+    # The reboot timer was placed by ``pre-authorize-reboot`` and decides for
+    # itself, from the ledger, whether and when the barrier holds.
 
 
 def arm_holder(arguments: argparse.Namespace) -> None:
@@ -465,6 +541,7 @@ def arm_holder(arguments: argparse.Namespace) -> None:
         require_maintenance_window(getattr(arguments, "maintenance_window_end", ""))
     path = state_path(run_id)
     armed_at = datetime.now(timezone.utc).isoformat()
+    current = boot_id()
     state = update_state(
         path,
         {
@@ -475,11 +552,12 @@ def arm_holder(arguments: argparse.Namespace) -> None:
             "after_ledger_op": arguments.after_ledger_op,
             "baseline_command_ids": baseline_ids,
             "armed_at": armed_at,
+            "boot_id": current,
             "reboot_delay_seconds": reboot_delay,
             "maintenance_window_end": getattr(arguments, "maintenance_window_end", ""),
         },
     )
-    write_state(path, record_boot_observation(state, boot_id(), observed_at=armed_at))
+    write_state(path, record_boot_observation(state, current, observed_at=armed_at))
     unit = arm_unit(run_id)
     _clear_unit(unit + ".service", run_id)
     run(
@@ -514,7 +592,12 @@ def disarm_holder(arguments: argparse.Namespace) -> None:
     _clear_unit(holder_unit(run_id) + ".service", run_id)
     path = state_path(run_id)
     if path.is_file():
-        update_state(path, {"disarmed_at": datetime.now(timezone.utc).isoformat()})
+        now = datetime.now(timezone.utc).isoformat()
+        with locked(path):
+            state = read_state(path)
+            state["disarmed_at"] = state.get("disarmed_at") or now
+            state["disarm_reason"] = state.get("disarm_reason") or "disarm-holder"
+            write_state(path, state)
     emit(
         {
             "run_id": run_id,
@@ -537,6 +620,9 @@ def holder_status(arguments: argparse.Namespace) -> None:
             "hold_started_at": state.get("hold_started_at"),
             "holder_error": state.get("holder_error"),
             "after_ledger_op": state.get("after_ledger_op"),
+            "pre_authorized_at": state.get("pre_authorized_at"),
+            "disarmed_at": state.get("disarmed_at"),
+            "disarm_reason": state.get("disarm_reason"),
         }
     )
 
@@ -551,56 +637,86 @@ def require_maintenance_window(value: str) -> datetime:
     return deadline
 
 
-def check_barrier(state: dict[str, Any]) -> None:
-    proof = state.get("barrier_authorization")
-    script = str(state.get("barrier_script") or "")
-    if not isinstance(proof, dict) or SAFE_GUARD_SCRIPT.fullmatch(script) is None:
-        raise ProbeError("reboot has no exact WAITING barrier authorization")
-    if hashlib.sha256(Path(script).read_bytes()).hexdigest() != state.get(
-        "barrier_script_sha256"
+# --------------------------------------------------------------------------- #
+# Conditional pre-authorization and the host-side barrier condition
+# --------------------------------------------------------------------------- #
+def check_pre_authorization(
+    state: dict[str, Any],
+    proof: Any,
+    *,
+    run_id: str,
+    boot_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Refuse a proof that does not bind this armed holder, now, on this boot."""
+
+    if state.get("run_id") != run_id:
+        raise ProbeError("no armed holder is recorded for this run")
+    if state.get("disarmed_at"):
+        raise ProbeError("the holder was already disarmed")
+    if state.get("pre_authorization") or state.get("reboot_armed_at"):
+        raise ProbeError("the reboot is already pre-authorized")
+    if state.get("reboot_cancelled_at"):
+        raise ProbeError("the reboot was cancelled")
+    if (
+        not isinstance(proof, dict)
+        or proof.get("kind") != CONDITIONAL_KIND
+        or proof.get("conditional") is not True
     ):
-        raise ProbeError("barrier guard script changed")
-    run(
-        [
-            sys.executable,
-            script,
-            "check-barrier",
-            "--barrier-authorization",
-            json.dumps(proof, sort_keys=True),
-        ]
-    )
+        raise ProbeError("authorization is not a conditional barrier pre-authorization")
+    if (
+        proof.get("run_id") != run_id
+        or proof.get("device") != state.get("device")
+        or proof.get("drill_id") != state.get("drill_id")
+    ):
+        raise ProbeError("pre-authorization does not bind this holder")
+    if (
+        not boot_id
+        or proof.get("boot_id") != boot_id
+        or state.get("boot_id") != boot_id
+    ):
+        raise ProbeError("pre-authorization belongs to another boot")
+    if SAFE_ID.fullmatch(str(proof.get("node_id") or "")) is None:
+        raise ProbeError("pre-authorization names no node")
+    if proof.get("ledger") != LEDGER_SHAPE:
+        raise ProbeError("pre-authorization ledger shape is not this probe's")
+    expires = _parse_time(proof.get("expires_at"))
+    window_end = _parse_time(proof.get("maintenance_window_end"))
+    authorized = _parse_time(proof.get("authorized_at"))
+    if expires is None or window_end is None or authorized is None:
+        raise ProbeError("pre-authorization has no valid deadline")
+    if now >= expires or now >= window_end or authorized > now + timedelta(seconds=90):
+        raise ProbeError("pre-authorization is expired or future-dated")
+    max_hold = int(state.get("max_hold_seconds") or 0)
+    if expires > now + timedelta(seconds=max_hold):
+        raise ProbeError("pre-authorization outlives the holder's bounded lifetime")
+    window_seconds = proof.get("maintenance_window_seconds")
+    if (
+        type(window_seconds) is not int
+        or not MIN_MAINTENANCE_WINDOW_SECONDS
+        <= window_seconds
+        <= MAX_MAINTENANCE_WINDOW_SECONDS
+    ):
+        raise ProbeError("pre-authorization agent maintenance window is out of bounds")
+    delays = proof.get("not_before_seconds")
+    if (
+        not isinstance(delays, dict)
+        or set(delays) != {REBOOT_PHASE}
+        or type(delays[REBOOT_PHASE]) is not int
+    ):
+        raise ProbeError("pre-authorization must name exactly the reboot delay")
+    return proof
 
 
-def fire_reboot(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id, "run ID")
-    path = state_path(run_id)
-    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        state = read_state(path)
-        require_maintenance_window(str(state.get("maintenance_window_end") or ""))
-        if (
-            state.get("run_id") != run_id
-            or state.get("reboot_cancelled_at")
-            or state.get("fire_requested_at")
-            or state.get("boot_id_before_reboot") != boot_id()
-        ):
-            raise ProbeError(
-                "reboot authorization was consumed, cancelled or changed boot"
-            )
-        check_barrier(state)
-        update_state(
-            path, {"fire_requested_at": datetime.now(timezone.utc).isoformat()}
-        )
-        run(reboot_command())
-
-
-def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
+def arm_reboot(run_id: str, delay: int, path: Path) -> dict[str, Any]:
     """Write the durable boot-id marker, then arm the transient reboot timer.
 
-    Shared by ``arm-reboot`` (runner-driven, before this drill's quiesce stops
-    kubelet) and ``watch-ledger`` (on-node, the moment quiesce lands). The
-    marker file is written *before* the timer exists, so a reboot can never fire
-    without a durable record of the boot id it replaced.
+    Called by ``pre-authorize-reboot`` before this drill's quiesce stops
+    kubelet. The marker file is written *before* the timer exists, so a reboot
+    can never fire without a durable record of the boot id it replaced. The
+    timer elapses after ``delay`` seconds; ``fire-reboot`` then keeps waiting
+    for the barrier condition, so ``delay`` is an earliest time, never the
+    authorization.
     """
 
     delay = checked_reboot_delay(delay)
@@ -611,27 +727,31 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
     )
     if armed_at + timedelta(seconds=delay) >= deadline:
         raise ProbeError("scheduled reboot would outlive the maintenance window")
-    proof = recorded.get("barrier_authorization")
+    proof = recorded.get("pre_authorization")
     if (
         not isinstance(proof, dict)
         or proof.get("run_id") != run_id
         or recorded.get("reboot_armed_at")
         or recorded.get("reboot_cancelled_at")
     ):
-        raise ProbeError("reboot requires a new exact barrier authorization")
-    pinned = require_maintenance_window(str(proof.get("window_expires_at") or ""))
-    if armed_at + timedelta(seconds=delay) >= pinned or delay > 60:
-        raise ProbeError("reboot would outlive the barrier authorization")
+        raise ProbeError("reboot requires a conditional pre-authorization")
+    expires = _parse_time(proof.get("expires_at"))
+    if expires is None or armed_at + timedelta(seconds=delay) >= expires:
+        raise ProbeError("reboot would outlive the pre-authorization")
+    if (proof.get("not_before_seconds") or {}).get(REBOOT_PHASE) != delay:
+        raise ProbeError("reboot delay differs from the pre-authorized delay")
     current = boot_id()
     unit = reboot_unit(run_id)
+    poll_starts_at = armed_at + timedelta(seconds=delay)
     state = update_state(
         path,
         {
             "run_id": run_id,
             "reboot_armed_at": armed_at.isoformat(),
             "reboot_delay_seconds": delay,
+            "reboot_not_before_seconds": delay,
             "boot_id_before_reboot": current,
-            "reboot_fire_at": (armed_at + timedelta(seconds=delay)).isoformat(),
+            "reboot_poll_starts_at": poll_starts_at.isoformat(),
             "reboot_unit": unit + ".timer",
             "reboot_command": reboot_command(),
             "reboot_cancelled_at": None,
@@ -643,6 +763,7 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
     )
     _clear_unit(unit + ".timer", run_id)
     _clear_unit(unit + ".service", run_id)
+    runtime = int((expires - armed_at).total_seconds()) + FIRE_RUNTIME_SLACK_SECONDS
     run(
         [
             "systemd-run",
@@ -650,6 +771,7 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
             f"--on-active={delay}s",
             "--timer-property=AccuracySec=1s",
             "--property=Type=oneshot",
+            f"--property=RuntimeMaxSec={runtime}",
             sys.executable,
             str(Path(__file__).resolve()),
             "fire-reboot",
@@ -661,50 +783,302 @@ def place_reboot_timer(run_id: str, delay: int, path: Path) -> dict[str, Any]:
         "run_id": run_id,
         "reboot_unit": unit + ".timer",
         "reboot_armed_at": armed_at.isoformat(),
-        "reboot_fire_at": (armed_at + timedelta(seconds=delay)).isoformat(),
+        "reboot_poll_starts_at": poll_starts_at.isoformat(),
         "reboot_delay_seconds": delay,
         "boot_id_before_reboot": current,
         "units": _reboot_unit_state(run_id),
     }
 
 
-def arm_reboot(arguments: argparse.Namespace) -> None:
-    """Arm a bounded transient timer that runs ``systemctl reboot``.
+def pre_authorize_reboot(arguments: argparse.Namespace) -> None:
+    """Record the conditional authorization and arm the reboot timer.
 
-    Kept for direct/off-drill use; on this drill the reboot is armed on-node by
-    ``watch-ledger`` because quiesce stops kubelet before the runner could exec
-    an ``arm-reboot`` (the exec channel is gone by the time verify is WAITING).
+    Exec'd by the runner right after ``arm-holder`` and *before* the fault is
+    injected: the quiesce that follows the injection takes kubelet down, so
+    this is the last moment the runner can reach the node until the restore.
     """
 
     run_id = safe_id(arguments.run_id, "run ID")
     path = state_path(run_id)
     proof = json.loads(arguments.authorization)
-    script = arguments.barrier_script
-    if SAFE_GUARD_SCRIPT.fullmatch(script) is None:
-        raise ProbeError("barrier script is not an installed host probe")
-    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    delay = checked_reboot_delay(arguments.delay_seconds)
+    with locked(path):
         state = read_state(path)
-        if (
-            state.get("run_id") != run_id
-            or state.get("disarmed_at")
-            or proof.get("run_id") != run_id
-            or proof.get("device") != state.get("device")
-            or proof.get("drill_id") != state.get("drill_id")
-            or proof.get("boot_id") != boot_id()
-            or state.get("reboot_cancelled_at")
-            or state.get("reboot_armed_at")
-        ):
-            raise ProbeError("reboot authorization does not bind this holder")
-        state["barrier_authorization"] = proof
-        state["barrier_script"] = script
-        state["barrier_script_sha256"] = hashlib.sha256(
-            Path(script).read_bytes()
-        ).hexdigest()
-        check_barrier(state)
+        now = datetime.now(timezone.utc)
+        check_pre_authorization(state, proof, run_id=run_id, boot_id=boot_id(), now=now)
+        if proof["not_before_seconds"][REBOOT_PHASE] != delay:
+            raise ProbeError("pre-authorization delay does not match the reboot delay")
+        baseline = sorted(
+            {
+                str(row["workflow_request_id"])
+                for row in ledger_rows()
+                if row.get("workflow_request_id")
+            }
+        )
+        state.update(
+            {
+                "pre_authorization": proof,
+                "pre_authorized_at": now.isoformat(),
+                "ledger_baseline_workflow_ids": baseline,
+            }
+        )
         write_state(path, state)
-        record = place_reboot_timer(run_id, arguments.delay_seconds, path)
-    emit(record)
+        record = arm_reboot(run_id, delay, path)
+    emit(
+        {
+            **record,
+            "pre_authorized_at": now.isoformat(),
+            "expires_at": proof["expires_at"],
+            "ledger_baseline_workflow_ids": baseline,
+        }
+    )
+
+
+def new_workflow_ids(
+    rows: list[dict[str, Any]], *, baseline: set[str], not_before: str
+) -> set[str]:
+    """Workflow ids with a row written since the pre-authorization."""
+
+    result: set[str] = set()
+    for row in rows:
+        workflow_id = str(row.get("workflow_request_id") or "")
+        if not workflow_id or workflow_id in baseline:
+            continue
+        stamp = str(row.get("completed_at") or row.get("started_at") or "")
+        if stamp and stamp >= not_before:
+            result.add(workflow_id)
+    return result
+
+
+def _verdict(
+    reason: str,
+    *,
+    holds: bool = False,
+    final: bool = False,
+    condition: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "holds": holds,
+        "final": final,
+        "reason": reason,
+        "condition": dict(condition or {}),
+    }
+
+
+def _holder_gate(
+    state: dict[str, Any], *, now: datetime, boot_id: str, holder_active: bool
+) -> dict[str, Any] | None:
+    """The non-ledger half of the condition: binding, deadlines, the holder."""
+
+    proof = state.get("pre_authorization")
+    if not isinstance(proof, dict) or proof.get("kind") != CONDITIONAL_KIND:
+        return _verdict("no conditional pre-authorization is recorded", final=True)
+    if state.get("disarmed_at") or state.get("reboot_cancelled_at"):
+        return _verdict("the reboot was cancelled or the holder disarmed", final=True)
+    if (
+        not boot_id
+        or boot_id != proof.get("boot_id")
+        or boot_id != state.get("boot_id")
+        or boot_id != state.get("boot_id_before_reboot")
+    ):
+        return _verdict("the boot id changed since the pre-authorization", final=True)
+    if proof.get("ledger") != LEDGER_SHAPE:
+        return _verdict(
+            "the pre-authorization ledger shape is not this probe's", final=True
+        )
+    expires = _parse_time(proof.get("expires_at"))
+    window_end = _parse_time(proof.get("maintenance_window_end"))
+    if expires is None or window_end is None:
+        return _verdict("the pre-authorization has no valid deadline", final=True)
+    if now >= min(expires, window_end):
+        return _verdict(
+            "the pre-authorization expired before the barrier condition held",
+            final=True,
+        )
+    delay = (proof.get("not_before_seconds") or {}).get(REBOOT_PHASE)
+    if type(delay) is not int:
+        return _verdict("the pre-authorization names no reboot delay", final=True)
+    hold_started = _parse_time(state.get("hold_started_at"))
+    if hold_started is None:
+        return _verdict("the holder has not started")
+    if not holder_active:
+        return _verdict("the holder is no longer active", final=True)
+    if now < hold_started + timedelta(seconds=delay):
+        return _verdict(
+            f"the reboot is not due until {delay}s after the holder started"
+        )
+    return None
+
+
+def barrier_condition(
+    state: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime,
+    boot_id: str,
+    holder_active: bool,
+) -> dict[str, Any]:
+    """Whether the reboot may fire now, judged from this node alone.
+
+    ``holds`` means reboot; ``final`` means stop polling because the reason can
+    never clear (the caller records it, cancels and disarms). Anything else is
+    a wait. The barrier is proven by the ledger: this run's workflow -- the one
+    new workflow written since the pre-authorization -- has a succeeded
+    quiesce, an executed client verification that refused on active clients
+    (the holder's doing), and nothing beyond it.
+    """
+
+    gate = _holder_gate(state, now=now, boot_id=boot_id, holder_active=holder_active)
+    if gate is not None:
+        return gate
+    proof = state["pre_authorization"]
+    node = str(proof.get("node_id") or "")
+    candidates = new_workflow_ids(
+        rows,
+        baseline=set(state.get("ledger_baseline_workflow_ids") or []),
+        not_before=str(state.get("pre_authorized_at") or proof.get("authorized_at")),
+    )
+    if not candidates:
+        return _verdict("no workflow of this run has reached the ledger")
+    if len(candidates) > 1:
+        return _verdict(
+            f"more than one new workflow reached the ledger: {sorted(candidates)}",
+            final=True,
+        )
+    workflow_id = candidates.pop()
+    mine = [row for row in rows if row.get("workflow_request_id") == workflow_id]
+    forbidden = sorted(
+        {
+            str(row.get("operation"))
+            for row in mine
+            if row.get("operation") in LEDGER_SHAPE["forbidden"]
+        }
+    )
+    if forbidden:
+        return _verdict(
+            f"the workflow advanced beyond the barrier: {forbidden}", final=True
+        )
+    quiesce = [row for row in mine if row.get("operation") == LEDGER_SHAPE["quiesce"]]
+    succeeded = [row for row in quiesce if row.get("state") == "SUCCEEDED"]
+    if not succeeded:
+        if any(row.get("state") != IN_PROGRESS_STATE for row in quiesce):
+            return _verdict("the quiesce did not succeed", final=True)
+        return _verdict("the quiesce has not succeeded")
+    quiesce_row = succeeded[-1]
+    if f"/{node}/" not in str(quiesce_row.get("command_id") or ""):
+        return _verdict("the quiesce row does not name this node", final=True)
+    # The control plane pins the window from the quiesce step's start; the
+    # earlier of the row's two timestamps is the conservative local estimate.
+    stamps = [
+        stamp
+        for stamp in (
+            _parse_time(quiesce_row.get("started_at")),
+            _parse_time(quiesce_row.get("completed_at")),
+        )
+        if stamp is not None
+    ]
+    pinned = min(stamps) if stamps else None
+    if pinned is None:
+        return _verdict("the pinned maintenance window cannot be derived", final=True)
+    pinned_end = pinned + timedelta(seconds=int(proof["maintenance_window_seconds"]))
+    if now >= pinned_end:
+        return _verdict("the pinned maintenance window has expired", final=True)
+    verify = [row for row in mine if row.get("operation") == LEDGER_SHAPE["verify"]]
+    if any(row.get("state") == "SUCCEEDED" for row in verify):
+        return _verdict(
+            "the client verification succeeded; the holder did not hold", final=True
+        )
+    executed = [
+        row
+        for row in verify
+        if row.get("state") != IN_PROGRESS_STATE and row.get("completed_at")
+    ]
+    if not executed:
+        return _verdict("the client verification has not executed")
+    latest = max(executed, key=lambda row: int(row.get("attempt") or 0))
+    if LEDGER_SHAPE["verify_refusal"] not in str(latest.get("error") or ""):
+        return _verdict("the latest client verification did not refuse on clients")
+    return _verdict(
+        "the barrier holds",
+        holds=True,
+        condition={
+            "workflow_request_id": workflow_id,
+            "incident_id": quiesce_row.get("incident_id"),
+            "boot_id": boot_id,
+            "agent_generation": quiesce_row.get("agent_generation"),
+            "quiesce_command_id": quiesce_row.get("command_id"),
+            "verify_command_id": latest.get("command_id"),
+            "verify_attempt": latest.get("attempt"),
+            "verify_completed_at": latest.get("completed_at"),
+            "pinned_window_expires_at": pinned_end.isoformat(),
+            "observed_at": now.isoformat(),
+        },
+    )
+
+
+def refuse_reboot(run_id: str, path: Path, state: dict[str, Any], reason: str) -> None:
+    """Record why the reboot will never fire, cancel it and disarm the holder."""
+
+    now = datetime.now(timezone.utc).isoformat()
+    state["reboot_refusal"] = {"refused_at": now, "reason": reason}
+    state["reboot_cancelled_at"] = state.get("reboot_cancelled_at") or now
+    state["disarmed_at"] = state.get("disarmed_at") or now
+    state["disarm_reason"] = state.get("disarm_reason") or reason
+    write_state(path, state)
+    _clear_unit(arm_unit(run_id) + ".service", run_id)
+    _clear_unit(holder_unit(run_id) + ".service", run_id)
+
+
+def _reboot_intent(path: Path, run_id: str) -> dict[str, Any]:
+    """Wait for the barrier condition; record the fire intent under the lock."""
+
+    while True:
+        with locked(path):
+            state = read_state(path)
+            if state.get("run_id") != run_id:
+                raise ProbeError("reboot was not authorized for this run")
+            if state.get("fire_requested_at"):
+                raise ProbeError("reboot authorization was consumed")
+            if state.get("reboot_cancelled_at"):
+                raise ProbeError("reboot was cancelled")
+            try:
+                require_maintenance_window(
+                    str(state.get("maintenance_window_end") or "")
+                )
+            except ProbeError as exc:
+                refuse_reboot(run_id, path, state, str(exc))
+                raise
+            verdict = barrier_condition(
+                state,
+                ledger_rows(),
+                now=datetime.now(timezone.utc),
+                boot_id=boot_id(),
+                holder_active=holder_active(run_id),
+            )
+            if verdict["holds"]:
+                state["fire_requested_at"] = verdict["condition"]["observed_at"]
+                state["fire_condition"] = verdict["condition"]
+                write_state(path, state)
+                return verdict["condition"]
+            if verdict["final"]:
+                refuse_reboot(run_id, path, state, verdict["reason"])
+                raise ProbeError(f"reboot refused: {verdict['reason']}")
+        time.sleep(POLL_SECONDS)
+
+
+def fire_reboot(arguments: argparse.Namespace) -> None:
+    """Run by the transient timer: reboot once the barrier holds.
+
+    The fire intent is durable before ``systemctl reboot``, so the marker file
+    the node comes back with says the reboot was requested, on which boot and
+    against which ledger rows.
+    """
+
+    run_id = safe_id(arguments.run_id, "run ID")
+    path = state_path(run_id)
+    condition = _reboot_intent(path, run_id)
+    run(reboot_command())
+    emit({"run_id": run_id, "fire_requested_at": condition["observed_at"]})
 
 
 def reboot_status(arguments: argparse.Namespace) -> None:
@@ -717,15 +1091,21 @@ def reboot_status(arguments: argparse.Namespace) -> None:
         state = record_boot_observation(state, current, observed_at=observed_at)
         write_state(path, state)
     before = str(state.get("boot_id_before_reboot") or "")
+    proof = state.get("pre_authorization") or {}
     emit(
         {
             "run_id": run_id,
             "observed_at": observed_at,
             "armed": bool(state.get("reboot_armed_at")),
             "reboot_armed_at": state.get("reboot_armed_at"),
-            "reboot_fire_at": state.get("reboot_fire_at"),
+            "reboot_poll_starts_at": state.get("reboot_poll_starts_at"),
             "reboot_delay_seconds": state.get("reboot_delay_seconds"),
             "reboot_cancelled_at": state.get("reboot_cancelled_at"),
+            "pre_authorized_at": state.get("pre_authorized_at"),
+            "pre_authorization_expires_at": proof.get("expires_at"),
+            "fire_requested_at": state.get("fire_requested_at"),
+            "condition": state.get("fire_condition"),
+            "refusal": state.get("reboot_refusal"),
             "boot_id_before_reboot": before or None,
             "boot_id_now": current,
             "fired": bool(state.get("fire_requested_at"))
@@ -746,12 +1126,13 @@ def cancel_reboot(arguments: argparse.Namespace) -> None:
     path = state_path(run_id)
     current = boot_id()
     cancelled_at = datetime.now(timezone.utc).isoformat()
-    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    with locked(path):
         state = read_state(path)
         if state:
             state = record_boot_observation(state, current, observed_at=cancelled_at)
-            state["reboot_cancelled_at"] = cancelled_at
+            state["reboot_cancelled_at"] = state.get("reboot_cancelled_at") or (
+                cancelled_at
+            )
             write_state(path, state)
     before = _reboot_unit_state(run_id)
     _clear_unit(unit + ".timer", run_id)
@@ -783,8 +1164,7 @@ def clear_state(arguments: argparse.Namespace) -> None:
             "failed",
         }:
             raise ProbeError("cannot clear state while a probe unit may still run")
-    with path.with_suffix(".lock").open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    with locked(path):
         state = read_state(path)
         if state and (
             state.get("run_id") != run_id
@@ -832,9 +1212,9 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "if set, the on-node watcher arms the out-of-band reboot this many "
-            "seconds after quiesce lands, once the fence is holding; the reboot "
-            f"delay must be within {MIN_REBOOT_DELAY_SECONDS}.."
+            "if set, records the out-of-band reboot's earliest offset after the "
+            "holder opens; the reboot itself is placed by pre-authorize-reboot and "
+            f"the delay must be within {MIN_REBOOT_DELAY_SECONDS}.."
             f"{MAX_REBOOT_DELAY_SECONDS} seconds"
         ),
     )
@@ -852,20 +1232,19 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--run-id", required=True)
     status.set_defaults(handler=holder_status)
 
-    reboot = commands.add_parser("arm-reboot")
-    reboot.add_argument("--run-id", required=True)
-    reboot.add_argument("--authorization", required=True)
-    reboot.add_argument("--barrier-script", required=True)
-    reboot.add_argument(
+    authorize = commands.add_parser("pre-authorize-reboot")
+    authorize.add_argument("--run-id", required=True)
+    authorize.add_argument("--authorization", required=True)
+    authorize.add_argument(
         "--delay-seconds",
         type=int,
         default=MIN_REBOOT_DELAY_SECONDS,
         help=(
-            "seconds until the transient timer runs systemctl reboot; "
-            f"{MIN_REBOOT_DELAY_SECONDS}..{MAX_REBOOT_DELAY_SECONDS}"
+            "earliest seconds after the holder opens before the barrier condition "
+            f"may reboot; {MIN_REBOOT_DELAY_SECONDS}..{MAX_REBOOT_DELAY_SECONDS}"
         ),
     )
-    reboot.set_defaults(handler=arm_reboot)
+    authorize.set_defaults(handler=pre_authorize_reboot)
 
     fire = commands.add_parser("fire-reboot")
     fire.add_argument("--run-id", required=True)

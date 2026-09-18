@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
@@ -44,6 +45,7 @@ from gpu_fault.policy import (
     XidEvent,
 )
 from gpu_fault.ports import NotificationPort
+from gpu_fault.remote_command_models import BATCHED_RESULTS_KEY, RemoteCommandStatus
 from gpu_fault.store import (
     NotFoundError,
     WorkflowLeaseError,
@@ -324,6 +326,121 @@ def _reports_dcgm_verdict(command: Any) -> bool:
         and command.step.operation is WorkflowOperation.RUN_DCGM_DIAGNOSTIC
         and bool(_dcgm_node_results(command))
     )
+
+
+@dataclass(frozen=True)
+class _BatchedStepView:
+    """One batched step of a compound command, read as the standalone command
+    it would have been.
+
+    ``_dispatch_remote_node_action_completion`` needs a command's cluster,
+    incident, workflow, step spec, idempotency key, status and result details.
+    A batched step shares the first three with its carrier and owns the rest:
+    its spec and key ride in ``command.batched_steps``, its verdict and
+    ``node_results`` sit under ``result_details["batched_results"]``.
+    """
+
+    cluster_id: str
+    incident: Any
+    workflow: Any
+    step: Any
+    idempotency_key: str
+    status: RemoteCommandStatus
+    result_details: dict[str, Any]
+
+
+def _batched_step_views(command: Any) -> list[_BatchedStepView]:
+    """The batched steps whose terminal verdict the carrier holds.
+
+    Nothing while the carrier itself is still open: a WAITING report may
+    already carry a SUCCEEDED RESET_GPU entry, but the mail lands when the
+    carrier finishes, not when a progress or WAITING report mentions the step.
+    A WAITING entry, or no entry at all (the executor stopped before the
+    step), is not a completion. The head step is not in ``batched_steps`` and
+    keeps its own path, so a compound command that heads with RESET_GPU is
+    still mailed exactly once.
+    """
+
+    terminal = {RemoteCommandStatus.SUCCEEDED.value, RemoteCommandStatus.FAILED.value}
+    results = command.result_details.get(BATCHED_RESULTS_KEY)
+    if command.status.value not in terminal or not isinstance(results, dict):
+        return []
+    views: list[_BatchedStepView] = []
+    for item in command.batched_steps:
+        entry = results.get(str(item.step_index))
+        if not isinstance(entry, dict) or entry.get("status") not in terminal:
+            continue
+        details = entry.get("details")
+        views.append(
+            _BatchedStepView(
+                cluster_id=command.cluster_id,
+                incident=command.incident,
+                workflow=command.workflow,
+                step=item.step,
+                idempotency_key=item.idempotency_key,
+                status=RemoteCommandStatus(entry["status"]),
+                result_details=dict(details) if isinstance(details, dict) else {},
+            )
+        )
+    return views
+
+
+def _mails_completion(command: Any) -> bool:
+    """A SUCCEEDED action, or a failed DCGM diagnostic that carries its verdict."""
+
+    return bool(
+        command.status is RemoteCommandStatus.SUCCEEDED
+        or _reports_dcgm_verdict(command)
+    )
+
+
+def _reports_batched_verdict(command: Any) -> bool:
+    """Whether a terminal carrier holds at least one batched completion to mail."""
+
+    return any(_mails_completion(view) for view in _batched_step_views(command))
+
+
+def _dispatch_remote_node_action_completions(
+    service: AdvisoryNotificationService,
+    command: Any,
+    existing_id: str | None,
+) -> list[NotificationResult]:
+    """Mail the head step, then every batched step the carrier completed.
+
+    Since the compound node command (性能 C) RESET_GPU -- and any other step
+    that rides along -- no longer arrives as a remote command of its own: it
+    is a passenger of a carrier headed by QUIESCE_GPU_SERVICES, and keying
+    the mail on the head alone never produced GPU_RESET_COMPLETED for a real
+    reset. Each batched step with a SUCCEEDED verdict (or a failed DCGM
+    diagnostic carrying its node results, the rule a standalone command
+    already follows) is mailed exactly as the standalone command would have
+    been: same kind, ``operation_id`` = the step's own idempotency key
+    (``<workflow>/<index>/<OPERATION>``, identical to the standalone
+    deduplication key, so a non-batched executor and this path can never both
+    mail), ``node_results`` from the step's own entry, targets and parameters
+    from the step's own spec.
+
+    Batched steps are judged whenever the carrier is terminal, SUCCEEDED or
+    FAILED: a RESTORE_GPU_SERVICES failure after a completed reset does not
+    undo the reset, and the executor may have posted the reset verdict only
+    in the terminal report. WAITING and FAILED entries never mail; the head
+    QUIESCE_GPU_SERVICES/RESTORE_GPU_SERVICES has no notification kind and
+    never mails; the progress route records ``batched_results`` mid-run
+    without mailing -- the mail lands when the carrier finishes.
+    ``existing_id`` (the single-cluster adapter's own notification for the
+    head) suppresses the head only. ``save_notification_if_absent``
+    deduplicates, so dispatching the same command twice sends nothing new.
+    """
+
+    results: list[NotificationResult] = []
+    if _mails_completion(command):
+        results.extend(
+            _dispatch_remote_node_action_completion(service, command, existing_id)
+        )
+    for view in _batched_step_views(command):
+        if _mails_completion(view):
+            results.extend(_dispatch_remote_node_action_completion(service, view, None))
+    return results
 
 
 class AdvisoryNotificationService:
@@ -661,7 +778,7 @@ class AdvisoryNotificationService:
         from gpu_fault.regional import RemoteCommandStatus
 
         if command.status is not RemoteCommandStatus.SUCCEEDED and not (
-            _reports_dcgm_verdict(command)
+            _reports_dcgm_verdict(command) or _reports_batched_verdict(command)
         ):
             return []
         results = []
@@ -704,7 +821,7 @@ class AdvisoryNotificationService:
                 if notification.notification_id != existing_id:
                     results.append(self.send(notification.notification_id))
         results.extend(
-            _dispatch_remote_node_action_completion(self, command, existing_id)
+            _dispatch_remote_node_action_completions(self, command, existing_id)
         )
         return results
 

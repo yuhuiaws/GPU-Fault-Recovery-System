@@ -393,7 +393,6 @@ RECORDED_SCRIPT_SIZE_EXCEPTIONS = {
         "scripts/e2e/regional/run_destr010_fabric_manager_restart.py:execute_case",
         "scripts/e2e/regional/run_destr023_idle_cluster_reset.py:execute_case",
         "scripts/e2e/regional/run_destr024_watcher_down_fail_closed.py:execute_case",
-        "scripts/e2e/regional/run_identity_acceptance.py:main",
         "scripts/e2e/regional/run_notification_acceptance.py:run_notify005",
         "scripts/e2e/regional/run_workload_acceptance.py:run_e2e001",
         "scripts/e2e/regional/run_workload_acceptance.py:run_iso001",

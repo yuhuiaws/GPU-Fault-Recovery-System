@@ -81,10 +81,14 @@ CLEANUP_POLL_SECONDS = 5
 ATTEMPT_MISSING_GRACE_SECONDS = 300
 CLEANUP_TIMEOUT_SECONDS = ATTEMPT_MISSING_GRACE_SECONDS + 300
 SILENCE_HISTORY_BYTES = 4096
+# The control-plane roles of the role split. A role the site does not run
+# (no Deployment, or scaled to zero -- the telemetry spool worker on a site
+# without spooling) is recorded ``absent``; a role whose Deployment exists but
+# has no Ready Pod stays INCONCLUSIVE, because its logs cannot be read.
 CONTROL_PLANE_LOG_APPS = (
     "gpu-fault-api-ha",
     "gpu-fault-control-worker",
-    "gpu-fault-processor",
+    "gpu-fault-telemetry-spool-worker",
 )
 # A Kubernetes write against the workload, in the plain-text form the control
 # plane logs (`LOG_FORMAT` in gpu_fault.logging_setup is `%(asctime)s
@@ -537,10 +541,14 @@ def log_write_snapshot(
     suspicious: list[dict[str, Any]] = []
     inconclusive: list[str] = []
     silent: list[str] = []
+    absent: list[str] = []
     for app in apps:
         pods = regional.ready_pods(plane, app)
         if not pods:
-            inconclusive.append(f"{app}/*")
+            if role_replicas(regional, plane=plane, app=app) == 0:
+                absent.append(f"{app}/*")
+            else:
+                inconclusive.append(f"{app}/*")
         for pod in pods:
             name = str(pod["name"])
             path_key = f"{app}/{pod['name']}"
@@ -597,8 +605,29 @@ def log_write_snapshot(
         "suspicious": suspicious,
         "inconclusive": inconclusive,
         "silent": silent,
+        "absent": absent,
         "verdict": verdict,
     }
+
+
+def role_replicas(regional: RegionalLiveFixture, *, plane: str, app: str) -> int:
+    """Desired replicas of a control-plane role; 0 when the site has no such Deployment.
+
+    Read with ``--ignore-not-found`` so a role the site never deployed reads as
+    zero instead of failing the scan; a refused read still raises and stays
+    INCONCLUSIVE with the caller.
+    """
+
+    output = regional.kubectl(
+        plane,
+        "get",
+        "deployment",
+        app,
+        "--ignore-not-found",
+        "-o",
+        "jsonpath={.spec.replicas}",
+    ).strip()
+    return int(output) if output else 0
 
 
 def log_write_errors(logs: dict[str, Any], label: str) -> list[str]:

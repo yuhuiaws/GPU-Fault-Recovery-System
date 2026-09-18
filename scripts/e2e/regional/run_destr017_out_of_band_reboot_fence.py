@@ -11,8 +11,14 @@ window on a node that has not been reset yet.
 While it waits, the node is rebooted from outside the control plane: the probe
 arms a bounded ``systemd-run --on-active`` timer that runs ``systemctl reboot``
 and returns, because a reboot issued synchronously would kill the ``kubectl
-exec`` channel the probe answers over. Nothing about that reboot is a workflow
-step, a Node Agent command or a provider call.
+exec`` channel the probe answers over. ``QUIESCE_GPU_SERVICES`` stops kubelet,
+so no exec can reach the node between the quiesce and the restore -- including
+the moment the fence is WAITING. The reboot is therefore pre-authorized on the
+node *before* the fault is injected, conditionally: the timer fires only once
+the node's own Node Agent ledger shows this run's workflow parked at the
+barrier, and the runner grades that fire record against its own store-side
+observation afterwards. Nothing about that reboot is a workflow step, a Node
+Agent command or a provider call.
 
 The node comes back with a new boot id and its Node Agent re-registers with a
 new generation. The generation the workflow pinned at quiesce time no longer
@@ -47,30 +53,42 @@ if str(ROOT) not in sys.path:
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
+from scripts.e2e.regional.destr017_store_probes import (  # noqa: E402
+    AFTERMATH_PROBE,
+    ESCALATION_PROBE,
+    reconcile_plan_script,
+)
 from scripts.e2e.regional.destr017_verdicts import (  # noqa: E402
     EXPECTED_XID,
     FENCE_STEP_OPERATION,
     agent_errors,
     boot_errors,
+    boot_reconcile_errors,
     cloudtrail_errors,
     command_errors,
     estimated_duration_seconds,
     fence_evidence,
     holder_errors,
     host_final_errors,
-    boot_reconcile_errors,
     ledger_errors,
     lifetime_errors,
     preflight_errors,
     reboot_window_errors,
     recent_unresolved_xid_events,
-    recovery_errors,
     reconcile_plan_errors,
+    recovery_errors,
     reset_journal_errors,
     schedulability_errors,
     step_transitions,
     successor_errors,
     workflow_errors,
+)
+from scripts.e2e.regional.destr_barrier_authorization import (  # noqa: E402
+    barrier_authorization,
+    conditional_pre_authorization,
+    executor_bounds,
+    fired_after_barrier_errors,
+    host_reachability,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -117,96 +135,11 @@ WAITING_BUDGET_SECONDS = 600
 NODE_RETURN_BUDGET_SECONDS = 900
 AGENT_RETURN_BUDGET_SECONDS = 600
 OBSERVATION_BUDGET_SECONDS = 2400
-
-
-# --------------------------------------------------------------------------- #
-# Control-plane probes (read-only, except the reconcile plan, which is a read)
-# --------------------------------------------------------------------------- #
-ESCALATION_PROBE = r"""
-import json
-import sys
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.store import NotFoundError
-
-request_id = sys.argv[1]
-store = ApplicationContext.from_environment().store
-
-
-def pair(event_id):
-    incident = store.get_incident_by_event(event_id)
-    if incident is None:
-        return None
-    workflow = None
-    if incident.workflow_request_id:
-        try:
-            workflow = store.get_workflow(incident.workflow_request_id)
-        except NotFoundError:
-            workflow = None
-    return {
-        "incident": incident.model_dump(mode="json"),
-        "workflow": (
-            workflow.model_dump(mode="json") if workflow is not None else None
-        ),
-    }
-
-
-# The escalation ladder names its follow-on records deterministically:
-# ``<rung>-after-<predecessor request id>``. Reading all four says both which
-# rung was taken and that none of the hardware rungs was.
-print(json.dumps({
-    name: pair("%s-after-%s" % (name, request_id))
-    for name in ("support", "reboot", "replace", "drain")
-}, sort_keys=True, default=str))
-"""
-
-EXECUTOR_BOUNDS_PROBE = r"""
-import json
-import os
-
-from gpu_fault.execution.config import ProductionExecutorConfig
-from gpu_fault.models import WorkflowOperation
-
-config = ProductionExecutorConfig.from_environment()
-print(json.dumps({
-    "node_workflow_lifetime_seconds": config.node_workflow_lifetime_seconds,
-    "step_waiting_timeout_seconds": config.step_waiting_timeout_seconds,
-    "verify_waiting_limit_seconds": config.step_waiting_limit(
-        WorkflowOperation.VERIFY_NO_GPU_CLIENTS
-    ),
-    "restore_waiting_limit_seconds": config.step_waiting_limit(
-        WorkflowOperation.RESTORE_GPU_SERVICES
-    ),
-    "agent_maintenance_window_seconds": int(
-        os.getenv("GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS", "420")
-    ),
-    "gpu_client_verify_max_attempts": int(
-        os.getenv("GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS", "60")
-    ),
-}, sort_keys=True))
-"""
-
-
-def reconcile_plan_script() -> str:
-    """The shipped retired-generation planner, plan mode only.
-
-    ``gpu_fault.admin.workflow_reconcile`` ships the module's own source plus a
-    stdin driver so an operator can plan against a runtime that predates it; this
-    runner reuses the same source and calls the same entry point, but only ever
-    the ``plan`` half. Applying a revocation is an operator decision and this
-    case records NOT_APPLIED.
-    """
-
-    from gpu_fault import retired_generation
-
-    source = Path(retired_generation.__file__).read_text(encoding="utf-8")
-    return source + (
-        "\n\nimport json as _json\n"
-        "from gpu_fault.app import ApplicationContext as _Context\n"
-        "_store = _Context.from_environment().store\n"
-        "print(_json.dumps(build_retired_generation_plan(_store), "
-        "sort_keys=True, default=str))\n"
-    )
+# QUIESCE_GPU_SERVICES stops kubelet, so the reboot is pre-authorized on the
+# node before the injection and must stay valid until the barrier is reached
+# and the reboot delay has passed; it has to fit inside the device hold, which
+# ``configure`` enforces.
+PRE_AUTHORIZATION_VALID_SECONDS = 900
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +284,11 @@ def configure(arguments: argparse.Namespace) -> Settings:
         raise RegionalFixtureError("reboot delay is outside 30..600 seconds")
     if not 60 <= arguments.max_hold_seconds <= 3600:
         raise RegionalFixtureError("device hold is outside 60..3600 seconds")
+    if arguments.max_hold_seconds < PRE_AUTHORIZATION_VALID_SECONDS:
+        raise RegionalFixtureError(
+            f"device hold must cover the {PRE_AUTHORIZATION_VALID_SECONDS}s "
+            "pre-authorization"
+        )
     return Settings(
         regional=settings_from_arguments(arguments),
         node=required(
@@ -382,9 +320,11 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "workflow cordon and quiesce the node; hold a GPU device open so "
             "VERIFY_NO_GPU_CLIENTS stays WAITING; while it waits, reboot the "
             "node from outside the control plane with a bounded systemd timer "
-            "running systemctl reboot. One real OS reboot of one node. No "
-            "provider call, no reset, no replacement; the reset is what the "
-            "generation fence must refuse on the new boot."
+            "running systemctl reboot, pre-authorized on the node before the "
+            "injection (the quiesce stops kubelet) and fired only when the "
+            "node's own ledger shows the barrier. One real OS reboot of one "
+            "node. No provider call, no reset, no replacement; the reset is "
+            "what the generation fence must refuse on the new boot."
         ),
         "preflight_identity": identity,
         "preflight_identity_digest": identity_digest(identity),
@@ -398,6 +338,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "VERIFY_NO_GPU_CLIENTS never reaches WAITING, so there is nothing "
             "in flight for the reboot to interrupt",
             "the reboot would fire after the pinned window or the per-step cap",
+            "the host-side barrier condition never holds before the "
+            "pre-authorization expires, so the reboot cancels itself",
+            "the host rebooted before the runner observed the barrier in the store",
             "the node or its Node Agent does not come back",
             "the Agent generation does not advance by exactly one, or the boot "
             "id changes more than once",
@@ -456,16 +399,14 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     only reading that cannot drift from what will judge the case.
     """
 
-    bounds = regional.executor_python(EXECUTOR_BOUNDS_PROBE)
+    bounds = executor_bounds(regional)
     return {
-        "node_lifetime_seconds": int(bounds["node_workflow_lifetime_seconds"]),
-        "step_waiting_timeout_seconds": int(bounds["step_waiting_timeout_seconds"]),
-        "verify_waiting_limit_seconds": int(bounds["verify_waiting_limit_seconds"]),
-        "restore_waiting_limit_seconds": int(bounds["restore_waiting_limit_seconds"]),
-        "agent_maintenance_window_seconds": int(
-            bounds["agent_maintenance_window_seconds"]
-        ),
-        "gpu_client_verify_max_attempts": int(bounds["gpu_client_verify_max_attempts"]),
+        "node_lifetime_seconds": bounds["node_workflow_lifetime_seconds"],
+        "step_waiting_timeout_seconds": bounds["step_waiting_timeout_seconds"],
+        "verify_waiting_limit_seconds": bounds["verify_waiting_limit_seconds"],
+        "restore_waiting_limit_seconds": bounds["restore_waiting_limit_seconds"],
+        "agent_maintenance_window_seconds": bounds["agent_maintenance_window_seconds"],
+        "gpu_client_verify_max_attempts": bounds["gpu_client_verify_max_attempts"],
     }
 
 
@@ -669,11 +610,18 @@ class _LiveRun:
     baseline_agent: dict[str, Any] = field(default_factory=dict)
     pin: dict[str, Any] = field(default_factory=dict)
     holder_armed: bool = False
+    holder_armed_at: datetime | None = None
     reboot_armed: bool = False
     reboot_fired: bool = False
     incident_id: str = ""
     successor_incident_id: str = ""
     workflow_request_id: str = ""
+    # The conditional authorization handed to the fence probe before the
+    # injection, its on-node report, and the runner's own store-side barrier
+    # observation the host's fire record is graded against afterwards.
+    pre_authorization: dict[str, Any] = field(default_factory=dict)
+    reboot_record: dict[str, Any] = field(default_factory=dict)
+    barrier_proof: dict[str, Any] = field(default_factory=dict)
     # The RESET_GPU workflow whose VERIFY_NO_GPU_CLIENTS the reboot interrupts.
     # Captured the moment that step is WAITING, so the verdict grades the fenced
     # workflow itself and not whatever successor the incident pointer moves to
@@ -738,13 +686,13 @@ def _start_probes(run: _LiveRun) -> None:
     write_json_atomic(run.case_dir / "host-before.json", run.baseline)
     run.baseline_boot_id = str(run.baseline.get("boot_id") or "")
     run.baseline_agent = dict(run.preflight["store"].get("agent") or {})
-    # Pre-validate and hand the reboot to the on-node watcher. quiesce stops
-    # kubelet, so the runner can never exec ``arm-reboot`` after the fence is
-    # WAITING (live: arm-reboot "dial tcp :10250 connect: connection refused",
-    # and the node was left quarantined). The watcher arms the reboot on-node
-    # the moment quiesce lands, which is the window start; validate the delay
-    # against the full pinned window (its length is a control-plane constant)
-    # here, before injection, while the exec channel is still up.
+    # quiesce stops kubelet, so the runner can never exec into the node after
+    # the fence is WAITING (live: "dial tcp :10250 connect: connection
+    # refused", and the node was left quarantined). The reboot is therefore
+    # pre-authorized right after the holder is armed, before the injection,
+    # while the exec channel is still up; the delay is validated here against
+    # the full pinned window (its length is a control-plane constant), and the
+    # holder on the node decides from its ledger when the barrier holds.
     control_env = run.preflight["control_env"]
     window_errors = reboot_window_errors(
         delay_seconds=settings.reboot_delay_seconds,
@@ -778,8 +726,58 @@ def _start_probes(run: _LiveRun) -> None:
         run.fence.host_script,
         timeout=180,
     )
-    # The holder may start, but reboot still needs a controller-observed barrier.
+    run.holder_armed_at = datetime.now(timezone.utc)
     write_json_atomic(run.case_dir / "holder-armed.json", armed)
+    run.marker = f"{run.run_id}-{int(time.time())}"
+    _pre_authorize_reboot(run)
+
+
+def _pre_authorize_reboot(run: _LiveRun) -> None:
+    """Hand the fence probe its conditional reboot authorization now.
+
+    This is the last exec the runner can make before the quiesce takes kubelet
+    down. The proof binds the reboot to this run, node, boot, device, drill,
+    marker, delay and window; the probe writes the durable boot-id marker and
+    arms the timer, and ``fire-reboot`` reboots only once the node's ledger
+    shows this run's workflow parked at the barrier. The delay is the earliest
+    moment after the holder opens, never the authorization.
+    """
+
+    settings = run.settings
+    control_env = run.preflight["control_env"]
+    run.pre_authorization = conditional_pre_authorization(
+        run_id=run.run_id,
+        node=settings.node,
+        boot_id=run.baseline_boot_id,
+        device=_holder_device(run),
+        drill_id=run.run_id,
+        marker=run.marker,
+        maintenance_window_end=run.maintenance_window_end,
+        maintenance_window_seconds=int(control_env["agent_maintenance_window_seconds"]),
+        valid_for_seconds=PRE_AUTHORIZATION_VALID_SECONDS,
+        not_before_seconds={"reboot": settings.reboot_delay_seconds},
+    )
+    run.reboot_armed = True
+    armed = run.fence.execute(
+        "pre-authorize-reboot",
+        "--run-id",
+        run.run_id,
+        "--delay-seconds",
+        str(settings.reboot_delay_seconds),
+        "--authorization",
+        json.dumps(run.pre_authorization, sort_keys=True),
+        timeout=180,
+    )
+    run.reboot_record = {
+        "armed_on_node_by": (
+            "pre-authorize-reboot before the injection; the host fires only when "
+            "its own ledger shows this run's barrier"
+        ),
+        "authorization": run.pre_authorization,
+        "armed": armed,
+        "reboot_delay_seconds": settings.reboot_delay_seconds,
+    }
+    write_json_atomic(run.case_dir / "reboot-armed.json", run.reboot_record)
 
 
 def _holder_device(run: _LiveRun) -> str:
@@ -804,7 +802,8 @@ def _holder_device(run: _LiveRun) -> str:
 def _inject(run: _LiveRun) -> dict[str, Any]:
     if datetime.now(timezone.utc) >= run.maintenance_window_end:
         raise RegionalFixtureError("maintenance window ended before injection")
-    run.marker = f"{run.run_id}-{int(time.time())}"
+    if not run.marker:
+        raise RegionalFixtureError("the reboot was not pre-authorized before injection")
     written = run.host.execute(
         "write-xid",
         "--xid",
@@ -873,9 +872,25 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
         ]
         if waiting:
             run.fenced_request_id = str(workflow.get("request_id") or "")
+            # The store-side identity of the barrier and when the runner saw
+            # it. Never delivered to the node (kubelet is down by now): the
+            # host's fire record is graded against it once the node is back.
+            run.barrier_proof = barrier_authorization(
+                state,
+                run_id=run.run_id,
+                node=run.settings.node,
+                boot_id=run.baseline_boot_id,
+                device=_holder_device(run),
+                drill_id=run.run_id,
+                maintenance_window_end=run.maintenance_window_end,
+            )
             write_json_atomic(
                 run.case_dir / "waiting-verify.json",
-                {"executions": waiting, "fenced_request_id": run.fenced_request_id},
+                {
+                    "executions": waiting,
+                    "fenced_request_id": run.fenced_request_id,
+                    "barrier": run.barrier_proof,
+                },
             )
             return state
         if workflow.get("status") in {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}:
@@ -887,10 +902,13 @@ def _wait_for_waiting_verify(run: _LiveRun) -> dict[str, Any]:
     )
 
 
-def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
-    """Authorize only the observed barrier; an unavailable transport refuses."""
+def _confirm_reboot_window(run: _LiveRun) -> dict[str, Any]:
+    """Store-side confirmation that the pre-armed reboot still fits the window.
 
-    from scripts.e2e.regional.destr_barrier_authorization import barrier_authorization
+    No exec: kubelet is down. The host applies the same bounds itself before it
+    fires; this reading records them from the control plane and fails the case
+    early when the delay can no longer land inside the pinned window.
+    """
 
     now = datetime.now(timezone.utc)
     remaining = window_remaining_seconds(run.pin, now=now)
@@ -901,44 +919,21 @@ def _arm_out_of_band_reboot(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
             run.preflight["control_env"]["verify_waiting_limit_seconds"]
         ),
     )
-    if errors:
-        raise RegionalFixtureError("; ".join(errors))
     state = _store_state(run)
     if (state.get("workflow") or {}).get("request_id") != run.fenced_request_id:
         raise RegionalFixtureError(
-            "fenced workflow changed before reboot authorization"
+            "fenced workflow changed before the reboot window was confirmed"
         )
-    proof = barrier_authorization(
-        state,
-        run_id=run.run_id,
-        node=run.settings.node,
-        boot_id=run.baseline_boot_id,
-        device=_holder_device(run),
-        drill_id=run.run_id,
-        maintenance_window_end=run.maintenance_window_end,
-    )
-    run.reboot_armed = True
-    armed = run.fence.execute(
-        "arm-reboot",
-        "--run-id",
-        run.run_id,
-        "--delay-seconds",
-        str(run.settings.reboot_delay_seconds),
-        "--authorization",
-        json.dumps(proof, sort_keys=True),
-        "--barrier-script",
-        run.host.host_script,
-    )
     record = {
-        "armed_on_node_by": "arm-reboot after controller WAITING authorization",
-        "authorization": proof,
-        "armed": armed,
-        "reboot_delay_seconds": run.settings.reboot_delay_seconds,
+        **run.reboot_record,
         "window_remaining_seconds": remaining,
+        "barrier": run.barrier_proof,
         "expected_fence": expected_fence_text(run.pin, node=run.settings.node),
     }
-    write_json_atomic(run.case_dir / "reboot-armed.json", record)
-    return [], record
+    write_json_atomic(run.case_dir / "reboot-window.json", record)
+    if errors:
+        raise RegionalFixtureError("; ".join(errors))
+    return record
 
 
 def _wait_for_new_generation(run: _LiveRun) -> dict[str, Any]:
@@ -1010,59 +1005,14 @@ def _observe_until_terminal(run: _LiveRun) -> dict[str, Any]:
 # still in flight.
 SETTLED_INCIDENT_STATES = frozenset({"QUARANTINED", "RECOVERED", "ESCALATED"})
 
-# Fetch the fenced RESET_GPU workflow, its origin incident, that incident's
-# recovery successors (workflows that descend from the fenced one and are not
-# the operator support escalation), and the fenced workflow's own remote
-# commands -- all keyed off the request id captured at WAITING, so the verdict
-# never has to follow the incident pointer to a self-heal successor.
-AFTERMATH_PROBE = r"""
-import json
-import sys
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.store import NotFoundError
-
-fenced_id = sys.argv[1]
-store = ApplicationContext.from_environment().store
-
-fenced = None
-try:
-    fenced = store.get_workflow(fenced_id)
-except NotFoundError:
-    fenced = None
-
-incident = None
-if fenced is not None and getattr(fenced, "incident_id", None):
-    try:
-        incident = store.get_incident(fenced.incident_id)
-    except NotFoundError:
-        incident = None
-
-successors = []
-for workflow in store.list_workflows(None, limit=500, newest_first=True):
-    if (
-        getattr(workflow, "predecessor_workflow_id", None) == fenced_id
-        and not str(workflow.request_id).startswith("workflow-support-after-")
-    ):
-        successors.append(workflow.model_dump(mode="json"))
-
-commands = [
-    item.model_dump(mode="json", exclude={"lease_token"})
-    for item in store.list_remote_commands()
-    if item.workflow_request_id == fenced_id
-]
-
-print(json.dumps({
-    "fenced": fenced.model_dump(mode="json") if fenced is not None else None,
-    "incident": incident.model_dump(mode="json") if incident is not None else None,
-    "recovery_successors": successors,
-    "commands": commands,
-}, sort_keys=True, default=str))
-"""
-
 
 def _aftermath(run: _LiveRun) -> dict[str, Any]:
-    """Read the fenced workflow and its settled aftermath by request id."""
+    """Read the fenced workflow and its settled aftermath by request id.
+
+    ``AFTERMATH_PROBE`` keys everything off the request id captured at
+    WAITING, so the verdict never follows the incident pointer to a self-heal
+    successor.
+    """
 
     result = run.regional.cpu_python(AFTERMATH_PROBE, run.fenced_request_id)
     write_json_atomic(run.case_dir / "aftermath.json", result)
@@ -1111,6 +1061,14 @@ def _data_plane_errors(run: _LiveRun) -> tuple[list[str], dict[str, Any]]:
     errors.extend(boot_reconcile_errors(after, node=run.settings.node))
     errors.extend(reset_journal_errors(after, node=run.settings.node))
     errors.extend(holder_errors(holder, node=run.settings.node))
+    # The host's durable record of when it rebooted, graded against the
+    # runner's store-side barrier observation: the reboot must come after the
+    # runner saw the barrier, on the same workflow, incident and boot.
+    errors.extend(
+        fired_after_barrier_errors(
+            reboot_state, store_proof=run.barrier_proof, label="out-of-band reboot"
+        )
+    )
     node_after = run.regional.node_snapshot(run.settings.node)
     errors.extend(
         boot_errors(
@@ -1157,7 +1115,7 @@ def execute_case(
         _inject(run)
         _wait_for_maintenance_pin(run)
         _wait_for_waiting_verify(run)
-        _, reboot_record = _arm_out_of_band_reboot(run)
+        reboot_record = _confirm_reboot_window(run)
         agent_after = _wait_for_new_generation(run)
         state = _observe_until_terminal(run)
         # Grade the fenced RESET_GPU workflow captured at WAITING, not whatever
@@ -1260,14 +1218,38 @@ def execute_case(
     return 0 if result["verdict"] == "PASS" else 1
 
 
+def _host_reachability(run: _LiveRun) -> dict[str, Any]:
+    """Wait for kubelet to answer again before cleanup execs into the node."""
+
+    return host_reachability(
+        run.regional,
+        node=run.settings.node,
+        baseline_boot_id=(run.preflight.get("node") or {}).get("boot_id"),
+        holder_armed_at=run.holder_armed_at,
+        max_hold_seconds=run.settings.max_hold_seconds,
+        budget_seconds=NODE_RETURN_BUDGET_SECONDS,
+    )
+
+
+def _fence_exec(run: _LiveRun, action: str) -> dict[str, Any]:
+    """Recreate the fence Pod (a reboot took it) and run one owned command."""
+
+    run.fence.create()
+    return run.fence.execute(action, "--run-id", run.run_id, timeout=120)
+
+
 def _cleanup(run: _LiveRun) -> dict[str, Any]:
     """Undo the case in the order the node can survive.
 
-    Anything armed comes down first (an unfired reboot timer is the one residue
-    that could fire into cleanup), then the node is waited back, then isolation
-    is released through the validated-restore workflow -- never by deleting a
-    taint -- and finally the quiesce state file the reboot orphaned is cleared
-    by the product's own restore path.
+    Nothing is exec'd into the node until kubelet answers again: the quiesce
+    stops it and only the restore or the reboot brings it back. Once the node
+    is Ready, anything armed comes down first (an unfired reboot timer is the
+    one residue that could fire into cleanup), then isolation is released
+    through the validated-restore workflow -- never by deleting a taint -- and
+    finally the quiesce state file the reboot orphaned is cleared by the
+    product's own restore path. A node that never answers fails the cleanup
+    unless the boot id changed or the holder's lifetime passed, which is when
+    the holder and its timer are known to be gone.
     """
 
     result: dict[str, Any] = {"errors": []}
@@ -1278,26 +1260,29 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
+    guard("node_ready", lambda: _host_reachability(run))
+    reach = result.get("node_ready") or {}
+    host_ok = reach.get("exec_allowed") is True
+
+    def on_host(label: str, action: Any, *, skippable: bool) -> None:
+        if host_ok:
+            guard(label, action)
+        elif skippable and reach.get("assume_disarmed"):
+            result[label] = {"skipped": reach.get("reason")}
+        else:
+            result["errors"].append(
+                f"{label}: the node never answered again "
+                f"({reach.get('reason') or 'no reachability decision'})"
+            )
+
     if run.reboot_armed or run.holder_armed:
-        guard(
-            "cancel_reboot",
-            lambda: run.fence.execute(
-                "cancel-reboot", "--run-id", run.run_id, timeout=120
-            ),
+        on_host(
+            "cancel_reboot", lambda: _fence_exec(run, "cancel-reboot"), skippable=True
         )
     if run.holder_armed:
-        guard(
-            "disarm_holder",
-            lambda: run.fence.execute(
-                "disarm-holder", "--run-id", run.run_id, timeout=120
-            ),
+        on_host(
+            "disarm_holder", lambda: _fence_exec(run, "disarm-holder"), skippable=True
         )
-    guard(
-        "node_ready",
-        lambda: run.regional.wait_node_ready(
-            run.settings.node, timeout_seconds=NODE_RETURN_BUDGET_SECONDS
-        ),
-    )
     guard(
         "agent_active",
         lambda: run.warm.wait_agent_active(
@@ -1305,16 +1290,17 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         ),
     )
     guard("restore_isolation", lambda: _restore_isolation(run))
-    guard(
+    on_host(
         "quiesce_residue",
         lambda: run.host.execute(
             "restore-quiesce", "--incident-id", run.incident_id, timeout=180
         )
         if run.incident_id
         else {"skipped": "no incident"},
+        skippable=False,
     )
-    guard("host_final", lambda: _host_final(run))
-    if "cancel_reboot" in result and "disarm_holder" in result:
+    on_host("host_final", lambda: _host_final(run), skippable=False)
+    if host_ok and "cancel_reboot" in result and "disarm_holder" in result:
         guard(
             "clear_probe_state",
             lambda: run.fence.execute("clear-state", "--run-id", run.run_id),

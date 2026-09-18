@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import destr016_verdicts as verdicts
+from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr016_preempting_reboot as destr016
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
 from tests.regional._destr016_builders import (
@@ -34,10 +35,12 @@ from tests.regional._destr016_builders import (
     _step,
     absorbed_snapshot,
     barrier_commands,
+    barrier_observation,
     barrier_snapshot,
     cancelled_commands,
     compound_hold,
     escalated_incident,
+    fire_record,
     holder_status,
     host_after,
     host_baseline,
@@ -861,6 +864,7 @@ def happy_preflight_arguments() -> dict[str, Any]:
         "control_env": {
             "step_timeout_seconds": 600,
             "node_lifetime_seconds": 3600,
+            "agent_maintenance_window_seconds": 420,
             "preemption_enabled": True,
         },
         "identity_errors": [],
@@ -915,6 +919,25 @@ def test_a_healthy_idle_node_passes_the_preflight() -> None:
                 }
             },
             "preemption is disabled",
+        ),
+        (
+            {
+                "control_env": {
+                    "step_timeout_seconds": 600,
+                    "node_lifetime_seconds": 3600,
+                    "agent_maintenance_window_seconds": 250,
+                }
+            },
+            "leaves no room for an escalation",
+        ),
+        (
+            {
+                "control_env": {
+                    "step_timeout_seconds": 600,
+                    "node_lifetime_seconds": 3600,
+                }
+            },
+            "agent maintenance window is unknown",
         ),
         ({"identity_errors": ["release rollback is active"]}, "rollback is active"),
     ],
@@ -1201,3 +1224,88 @@ def test_a_leased_compound_command_keeps_the_barrier_standing() -> None:
     assert any("remote command is not WAITING: SUCCEEDED" in item for item in errors), (
         errors
     )
+
+
+# --------------------------------------------------------------------------- #
+# Conditional pre-authorization: bounds and the post-hoc ordering verdict
+# --------------------------------------------------------------------------- #
+def test_the_pre_authorization_covers_the_barrier_wait_and_the_escalation() -> None:
+    """The holder is authorized before the injection and must still be valid
+    when the escalation is due; the device hold has to outlive it."""
+
+    assert (
+        destr016.PRE_AUTHORIZATION_VALID_SECONDS
+        > destr016.BARRIER_WAIT_BUDGET_SECONDS + destr016.ESCALATE_DELAY_SECONDS
+    )
+    assert destr016.ABSORB_DELAY_SECONDS < destr016.ESCALATE_DELAY_SECONDS
+    default_hold = destr016.parser().parse_args(["--run-dir", "/tmp/run"])
+    assert (
+        default_hold.max_hold_seconds
+        >= destr016.PRE_AUTHORIZATION_VALID_SECONDS + destr016.MIN_HOLD_MARGIN_SECONDS
+    )
+
+
+def test_configure_refuses_a_hold_that_cannot_cover_the_pre_authorization() -> None:
+    arguments = destr016.parser().parse_args(
+        ["--run-dir", "/tmp/run", "--node", NODE, "--max-hold-seconds", "900"]
+    )
+    with pytest.raises(destr016.RegionalFixtureError, match="pre-authorization"):
+        destr016.configure(arguments)
+
+
+def test_the_escalation_must_fit_the_agent_maintenance_window() -> None:
+    assert (
+        verdicts.window_fit_errors(
+            maintenance_window_seconds=420,
+            latest_delay_seconds=destr016.ESCALATE_DELAY_SECONDS,
+        )
+        == []
+    )
+    errors = verdicts.window_fit_errors(
+        maintenance_window_seconds=290,
+        latest_delay_seconds=destr016.ESCALATE_DELAY_SECONDS,
+    )
+    assert any("leaves no room for an escalation" in item for item in errors), errors
+    assert verdicts.window_fit_errors(
+        maintenance_window_seconds=None, latest_delay_seconds=240
+    ) == ["the deployed agent maintenance window is unknown"]
+
+
+def test_the_host_must_fire_after_the_runner_observed_the_barrier() -> None:
+    status = holder_status()
+    assert (
+        authorization.fired_after_barrier_errors(
+            status["injections_fired"]["absorb"],
+            store_proof=barrier_observation(3),
+            label="absorb injection",
+        )
+        == []
+    )
+    assert (
+        authorization.fired_after_barrier_errors(
+            status["injections_fired"]["escalate"],
+            store_proof=barrier_observation(5),
+            label="escalation injection",
+        )
+        == []
+    )
+    late_observation = barrier_observation(4)
+    errors = authorization.fired_after_barrier_errors(
+        status["injections_fired"]["absorb"],
+        store_proof=late_observation,
+        label="absorb injection",
+    )
+    assert any(
+        "not after the runner observed the barrier" in item for item in errors
+    ), errors
+    foreign = fire_record("absorb", 5)
+    foreign["condition"]["workflow_request_id"] = "wf-other"
+    errors = authorization.fired_after_barrier_errors(
+        foreign, store_proof=barrier_observation(3), label="absorb injection"
+    )
+    assert any("matched workflow_request_id 'wf-other'" in item for item in errors), (
+        errors
+    )
+    assert authorization.fired_after_barrier_errors(
+        None, store_proof=barrier_observation(3), label="escalation injection"
+    ) == ["escalation injection: the host recorded no fire"]

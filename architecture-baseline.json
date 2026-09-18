@@ -61,7 +61,6 @@
     "scripts/e2e/regional/run_destr010_fabric_manager_restart.py:execute_case": 232,
     "scripts/e2e/regional/run_destr023_idle_cluster_reset.py:execute_case": 219,
     "scripts/e2e/regional/run_destr024_watcher_down_fail_closed.py:execute_case": 244,
-    "scripts/e2e/regional/run_identity_acceptance.py:main": 205,
     "scripts/e2e/regional/run_notification_acceptance.py:run_notify005": 205,
     "scripts/e2e/regional/run_workload_acceptance.py:run_e2e001": 238,
     "scripts/e2e/regional/run_workload_acceptance.py:run_iso001": 280,

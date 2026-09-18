@@ -54,6 +54,9 @@ class LogRegional:
         self.describe_error = False
         self.calls: list[tuple[str, ...]] = []
         self.described = self.histories = 0
+        # Desired replicas per control-plane role; a role missing here has no
+        # Deployment on the site (the read answers empty, like --ignore-not-found).
+        self.deployments: dict[str, int] = {APP: 3}
 
     def ready_pods(self, _plane: str, app: str) -> list[dict[str, Any]]:
         return [{"name": "pod-a", "uid": "uid-a"}] if app == APP else []
@@ -62,6 +65,12 @@ class LogRegional:
         assert plane == "cpu"
         assert kwargs.get("check", True) is True, "failed reads must not be swallowed"
         self.calls.append(arguments)
+        if arguments[:2] == ("get", "deployment"):
+            assert "--ignore-not-found" in arguments, (
+                "an undeployed role must read as absent"
+            )
+            replicas = self.deployments.get(arguments[2])
+            return "" if replicas is None else str(replicas)
         if arguments[0] == "get":
             if self.describe_error:
                 raise RegionalFixtureError("describe refused")
@@ -217,12 +226,37 @@ def test_kubernetes_errors_do_not_become_clean_log_evidence(failure: str) -> Non
     assert logs["silent"] == []
 
 
-def test_one_checked_app_does_not_cover_an_absent_app() -> None:
+def test_one_checked_app_does_not_cover_a_role_whose_pods_are_missing() -> None:
+    """A role the site runs (Deployment with replicas) but whose Pods cannot be
+    read is not proven by its neighbours: the scan stays INCONCLUSIVE."""
+
     regional = LogRegional()
     regional.window = "ordinary log line\n"
-    logs = snapshot(regional, apps=(APP, "gpu-fault-processor"))
+    regional.deployments["gpu-fault-control-worker"] = 6
+    logs = snapshot(regional, apps=(APP, "gpu-fault-control-worker"))
     assert logs["verdict"] == "INCONCLUSIVE"
-    assert "gpu-fault-processor/*" in logs["inconclusive"]
+    assert "gpu-fault-control-worker/*" in logs["inconclusive"]
+    assert logs["absent"] == []
+
+
+def test_a_role_the_site_does_not_deploy_is_recorded_absent_not_inconclusive() -> None:
+    """DESTR-009 live: the scan still listed the pre-role-split
+    ``gpu-fault-processor`` and a role with no Deployment (or the spool worker
+    at zero replicas) failed the case as INCONCLUSIVE although every deployed
+    role was checked."""
+
+    regional = LogRegional()
+    regional.window = "ordinary log line\n"
+    regional.deployments["gpu-fault-telemetry-spool-worker"] = 0
+    logs = snapshot(
+        regional, apps=(APP, "gpu-fault-telemetry-spool-worker", "gpu-fault-processor")
+    )
+    assert logs["verdict"] == "CLEAN", logs
+    assert sorted(logs["absent"]) == [
+        "gpu-fault-processor/*",
+        "gpu-fault-telemetry-spool-worker/*",
+    ]
+    assert logs["inconclusive"] == []
 
 
 def test_suspicious_writes_override_silent_or_checked_entries() -> None:

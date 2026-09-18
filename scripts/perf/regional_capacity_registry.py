@@ -752,38 +752,67 @@ def publish_registry_revision(
     raise RuntimeError(f"regional registry generation {generation} did not converge")
 
 
+# The EKS account every synthetic registration names. No real cluster lives
+# there, so a synthetic entry can never be mistaken for -- or collide with --
+# a physical cluster's ARN, whichever id it carries.
+SYNTHETIC_ACCOUNT = "000000000000"
+
+
+def synthetic_cluster_entry(
+    cluster_id: str,
+    *,
+    run_id: str,
+    expires_at: datetime,
+    region: str | None = None,
+    allowed_namespaces: list[str] | None = None,
+    token: str | None = None,
+) -> dict:
+    """One synthetic registration as the registry takes it (plaintext token).
+
+    The shape every synthetic registration shares: ``synthetic`` plus the run
+    id and expiry that let the perf sweep and the registry's own load-time
+    hygiene reap it, a fresh random token, a placeholder-account EKS ARN and a
+    loopback-only agent CIDR so no Node Agent can ever bind to it. The perf
+    suite mints ``perf-cap-NNN`` ids through it; the AUTH-007/008 runner mints
+    its ``auth-logical-`` second logical cluster through the same builder so
+    the two never drift apart in what "synthetic" means.
+    """
+
+    selected_region = region or AWS_REGION
+    return {
+        "cluster_id": cluster_id,
+        "region": selected_region,
+        "hyperpod_cluster_name": cluster_id,
+        "eks_cluster_arn": (
+            f"arn:aws:eks:{selected_region}:{SYNTHETIC_ACCOUNT}:cluster/{cluster_id}"
+        ),
+        "token": token or secrets.token_urlsafe(48),
+        "synthetic": True,
+        "synthetic_run_id": run_id,
+        "synthetic_expires_at": expires_at.isoformat(),
+        "allowed_namespaces": (
+            list(allowed_namespaces)
+            if allowed_namespaces is not None
+            else ["default", NAMESPACE, "kubeflow", "training"]
+        ),
+        "agent_endpoint_allowed_cidrs": ["127.0.0.1/32"],
+    }
+
+
 def perf_cluster_entries(
     count: int,
     *,
     run_id: str,
     expires_at: datetime,
 ) -> list[dict]:
-    account = "000000000000"
-    entries = []
-    for index in range(count):
-        cluster_id = f"{PERF_CLUSTER_PREFIX}{index:03d}"
-        entries.append(
-            {
-                "cluster_id": cluster_id,
-                "region": AWS_REGION,
-                "hyperpod_cluster_name": cluster_id,
-                "eks_cluster_arn": (
-                    f"arn:aws:eks:{AWS_REGION}:{account}:cluster/{cluster_id}"
-                ),
-                "token": secrets.token_urlsafe(48),
-                "synthetic": True,
-                "synthetic_run_id": run_id,
-                "synthetic_expires_at": expires_at.isoformat(),
-                "allowed_namespaces": [
-                    "default",
-                    NAMESPACE,
-                    "kubeflow",
-                    "training",
-                ],
-                "agent_endpoint_allowed_cidrs": ["127.0.0.1/32"],
-            }
+    return [
+        synthetic_cluster_entry(
+            f"{PERF_CLUSTER_PREFIX}{index:03d}",
+            run_id=run_id,
+            expires_at=expires_at,
         )
-    return entries
+        for index in range(count)
+    ]
 
 
 def redacted_registry_entries(entries: list[dict]) -> list[dict]:

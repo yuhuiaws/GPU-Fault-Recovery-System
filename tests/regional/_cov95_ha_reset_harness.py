@@ -27,6 +27,7 @@ from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
 from tests.regional._cov95_ha001_harness import DEADLINE, Clock
 from tests.regional._cov95_ha002_harness import Watchdog
+from tests.regional._reset_notification_support import reset_notification_entry
 from tests.regional.test_ha_resource_guards import WindowApi
 
 
@@ -93,6 +94,15 @@ def workflow_state() -> dict[str, Any]:
         "workflow": workflow.model_dump(mode="json"),
         "commands": commands,
         "agent": {"generation": 1},
+        # The completion mail the reset owes, keyed by the RESET_GPU command's
+        # own idempotency key and already SENT when the workflow turns terminal.
+        "notifications": [
+            reset_notification_entry(
+                cluster_id=incident.cluster_id,
+                incident_id=incident.incident_id,
+                operation_id=commands[4]["idempotency_key"],
+            )
+        ],
     }
 
 

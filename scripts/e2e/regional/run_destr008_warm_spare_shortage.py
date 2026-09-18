@@ -314,8 +314,11 @@ def read_only_preflight(
         if set(settings.scenarios) & {*SERVICE_UNIT, "active-gpu-pod"}:
             require_admission_api(regional)
     except Exception as exc:
+        # Keep the failing command's own words: a swallowed RegionalCommandFailed
+        # left the 2026-09-18 refusal undiagnosable.
         errors.append(
-            f"independent shortage safeguards unavailable: {type(exc).__name__}"
+            "independent shortage safeguards unavailable: "
+            f"{type(exc).__name__}: {str(exc)[:300]}"
         )
     errors.extend(
         scenario_admission_errors(settings.scenarios, capabilities=capabilities)

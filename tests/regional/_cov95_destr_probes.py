@@ -15,6 +15,9 @@ from tests.regional._cov95_destr_warm import NOW, Clock
 
 RUN_ID = "unit-destr-run"
 GUARD = "/run/gpu-fault-host-probe-abcdef123456.py"
+NODE = "node-a"
+WORKFLOW = "workflow-owned"
+INCIDENT = "incident-owned"
 
 
 class ProbeHarness:
@@ -225,4 +228,111 @@ class ProbeHarness:
             "waiting": True,
             "window_expires_at": (NOW + timedelta(minutes=5)).isoformat(),
             "maintenance_window_end": (NOW + timedelta(minutes=10)).isoformat(),
+        }
+
+    def pre_authorization(
+        self,
+        not_before_seconds: dict[str, int],
+        *,
+        valid_for_seconds: int = 60,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        """The conditional proof a runner delivers before the injection.
+
+        Bounded to the 60 s device hold ``arm_arguments`` asks for: the probe
+        refuses a validity that outlives the holder.
+        """
+
+        proof = {
+            "kind": "conditional-barrier-pre-authorization",
+            "conditional": True,
+            "run_id": RUN_ID,
+            "node_id": NODE,
+            "boot_id": "boot-before",
+            "device": "/dev/nvidia0",
+            "drill_id": "drill-owned",
+            "marker": "marker-owned",
+            "maintenance_window_end": (NOW + timedelta(minutes=10)).isoformat(),
+            "maintenance_window_seconds": 600,
+            "authorized_at": self.clock.now().isoformat(),
+            "expires_at": (
+                self.clock.now() + timedelta(seconds=valid_for_seconds)
+            ).isoformat(),
+            "not_before_seconds": dict(not_before_seconds),
+            "ledger": {
+                "quiesce": "QUIESCE_GPU_SERVICES",
+                "verify": "VERIFY_NO_GPU_CLIENTS",
+                "verify_refusal": "clients are still active",
+                "forbidden": [
+                    "RESET_GPU",
+                    "RESET_ALL_GPUS_NVSWITCHES",
+                    "RESTORE_GPU_SERVICES",
+                ],
+            },
+        }
+        proof.update(overrides)
+        return proof
+
+    def barrier_rows(
+        self,
+        *,
+        workflow: str = WORKFLOW,
+        verify_state: str = "FAILED",
+        verify_error: str | None = "GPU device clients are still active: GPU-a:4242",
+        extra_operations: tuple[str, ...] = (),
+        offset_seconds: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Ledger rows of one workflow parked at the client-verification barrier."""
+
+        stamp = (NOW + timedelta(seconds=offset_seconds)).isoformat()
+        rows = [
+            {
+                "command_id": f"{workflow}/2/QUIESCE_GPU_SERVICES/{NODE}/agent-4",
+                "operation": "QUIESCE_GPU_SERVICES",
+                "state": "SUCCEEDED",
+                "attempt": 1,
+                "started_at": stamp,
+                "completed_at": stamp,
+                "workflow_request_id": workflow,
+                "incident_id": INCIDENT,
+                "agent_generation": 4,
+                "error": None,
+            },
+            {
+                "command_id": f"{workflow}/3/VERIFY_NO_GPU_CLIENTS/{NODE}/agent-4",
+                "operation": "VERIFY_NO_GPU_CLIENTS",
+                "state": verify_state,
+                "attempt": 1,
+                "started_at": stamp,
+                "completed_at": stamp,
+                "workflow_request_id": workflow,
+                "incident_id": INCIDENT,
+                "agent_generation": 4,
+                "error": verify_error,
+            },
+        ]
+        for index, operation in enumerate(extra_operations, start=4):
+            rows.append(
+                {
+                    "command_id": f"{workflow}/{index}/{operation}/{NODE}/agent-4",
+                    "operation": operation,
+                    "state": "SUCCEEDED",
+                    "attempt": 1,
+                    "started_at": stamp,
+                    "completed_at": stamp,
+                    "workflow_request_id": workflow,
+                    "incident_id": INCIDENT,
+                    "agent_generation": 4,
+                    "error": None,
+                }
+            )
+        return rows
+
+    def holder_alive(self, alive: bool = True) -> None:
+        """Make the device holder unit report active (or not) to systemctl."""
+
+        self.units[self.module.holder_unit(RUN_ID) + ".service"] = {
+            "LoadState": "loaded",
+            "ActiveState": "active" if alive else "inactive",
+            "MainPID": "222" if alive else "0",
         }

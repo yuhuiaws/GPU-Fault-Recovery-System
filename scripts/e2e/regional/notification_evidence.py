@@ -136,9 +136,34 @@ def completion_checks(
             and dedup_drill.get("injection_path")
             == "gpu_fault.app.routes.regional.complete_remote_command"
         ),
+        "gpu_reset_mail_keyed_by_the_batched_step": drill_mails_the_batched_reset(
+            dedup_drill
+        ),
         "receipt_confirmed_outside_the_solution": receipt["valid"],
         "ses_send_count_did_not_increase_for_duplicates": duplicate_window["valid"],
     }
+
+
+def drill_mails_the_batched_reset(drill: dict[str, Any]) -> bool:
+    """The gpu-reset drill replayed a compound carrier and the one mail it
+    produced is the batched RESET_GPU step's, keyed by that step's own
+    idempotency key; the head QUIESCE_GPU_SERVICES produced none.
+
+    This is the shape production issues on the current protocol (the idle-node
+    reset chain of DESTR-001/HA-003/HA-004); a standalone RESET_GPU drill
+    proves the head path only and would have passed while every real batched
+    reset went unmailed.
+    """
+
+    expected = drill.get("expected_operation_id")
+    return (
+        drill.get("command_shape") == "compound"
+        and drill.get("head_operation") == "QUIESCE_GPU_SERVICES"
+        and "RESET_GPU" in (drill.get("batched_operations") or [])
+        and isinstance(expected, str)
+        and expected.endswith("/RESET_GPU")
+        and drill.get("notification_operation_ids") == [expected]
+    )
 
 
 def select_live_record(

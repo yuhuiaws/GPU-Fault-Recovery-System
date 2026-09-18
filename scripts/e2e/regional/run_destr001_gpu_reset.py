@@ -29,6 +29,9 @@ from scripts.e2e.regional.remote_command_shapes import (  # noqa: E402
 from scripts.e2e.regional.reset_dependency_chain import (  # noqa: E402
     reset_chain_errors,
 )
+from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
+    reset_notification_evidence,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -661,6 +664,40 @@ def quiesce_recovery_report(
     }
 
 
+def node_restored_errors(
+    regional: RegionalLiveFixture, node: str, case_dir: Path
+) -> list[str]:
+    """The node after the reset: Ready, schedulable and no longer owned."""
+
+    node_after = regional.node_snapshot(node)
+    write_json_atomic(case_dir / "node-after.json", node_after)
+    errors = []
+    if node_after["ready"] != "True":
+        errors.append("target node is not Ready after reset")
+    if node_after["unschedulable"] or node_after["ownership_annotations"]:
+        errors.append("target node scheduling ownership was not restored")
+    return errors
+
+
+def provider_evidence(
+    regional: RegionalLiveFixture, case_dir: Path, injection_started: datetime
+) -> tuple[list[dict[str, Any]], bool]:
+    """CloudTrail's view of the injection window, recorded with its caveat.
+
+    An empty CloudTrail read inside the delivery window is not proof that no
+    provider mutation happened; it is recorded as provisional.
+    """
+
+    window_end = datetime.now(timezone.utc)
+    provider = regional.provider_events(injection_started, window_end)
+    provisional = not provider and regional.provider_events_provisional(window_end)
+    write_json_atomic(
+        case_dir / "provider-events.json",
+        {"events": provider, "provider_events_provisional": provisional},
+    )
+    return provider, provisional
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -799,22 +836,9 @@ def execute_case(
                 ),
             )
         )
-        node_after = regional.node_snapshot(settings.node)
-        write_json_atomic(case_dir / "node-after.json", node_after)
-        if node_after["ready"] != "True":
-            errors.append("target node is not Ready after reset")
-        if node_after["unschedulable"] or node_after["ownership_annotations"]:
-            errors.append("target node scheduling ownership was not restored")
-        provider_window_end = datetime.now(timezone.utc)
-        provider = regional.provider_events(injection_started, provider_window_end)
-        # An empty CloudTrail read inside the delivery window is not proof
-        # that no provider mutation happened; it is recorded as provisional.
-        provider_provisional = not provider and regional.provider_events_provisional(
-            provider_window_end
-        )
-        write_json_atomic(
-            case_dir / "provider-events.json",
-            {"events": provider, "provider_events_provisional": provider_provisional},
+        errors.extend(node_restored_errors(regional, settings.node, case_dir))
+        provider, provider_provisional = provider_evidence(
+            regional, case_dir, injection_started
         )
         if provider:
             errors.append("provider mutation appeared during GPU reset")
@@ -822,6 +846,18 @@ def execute_case(
         write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
         if cpu_after != preflight["cpu_blast"]:
             errors.append("control-plane EKS state differs from baseline")
+        reset_mail, mail_errors = reset_notification_evidence(
+            regional,
+            state,
+            node=settings.node,
+            marker=marker,
+            observed_after=injection_started,
+            wait=not errors,
+            sleep=time.sleep,
+            monotonic=time.monotonic,
+        )
+        write_json_atomic(case_dir / "reset-notification.json", reset_mail)
+        errors.extend(mail_errors)
         result.update(
             {
                 "verdict": "PASS" if not errors else "FAIL",
@@ -833,6 +869,7 @@ def execute_case(
                 "incident_id": incident_id,
                 "provider_events": provider,
                 "provider_events_provisional": provider_provisional,
+                "reset_notification": reset_mail,
                 "sampler": after.get("sampler"),
             }
         )

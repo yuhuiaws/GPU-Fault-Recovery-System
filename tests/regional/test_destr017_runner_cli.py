@@ -126,6 +126,30 @@ def test_configure_bounds_the_reboot_delay_and_the_device_hold() -> None:
             destr017.configure(arguments)
 
 
+def test_configure_requires_the_hold_to_cover_the_pre_authorization() -> None:
+    """The reboot is pre-authorized before the injection and the holder must
+    outlive that authorization, or the timer could poll a holder that is gone."""
+
+    arguments = destr017.parser().parse_args(
+        [
+            "--run-dir",
+            "/tmp/run",
+            "--node",
+            NODE,
+            "--host-probe-image",
+            "img",
+            "--max-hold-seconds",
+            "600",
+        ]
+    )
+    with pytest.raises(RegionalFixtureError, match="pre-authorization"):
+        destr017.configure(arguments)
+    assert destr017.DEFAULT_MAX_HOLD_SECONDS >= destr017.PRE_AUTHORIZATION_VALID_SECONDS
+    assert (
+        destr017.PRE_AUTHORIZATION_VALID_SECONDS > destr017.DEFAULT_REBOOT_DELAY_SECONDS
+    )
+
+
 def test_the_holder_is_armed_with_the_host_path_of_the_probe_script() -> None:
     """The arm unit runs on the node; /host is the Pod's mount, not the host's.
     Live, the unit died with "can't open file '/host/run/...'" and nothing held."""

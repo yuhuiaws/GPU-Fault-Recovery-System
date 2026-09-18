@@ -38,6 +38,9 @@ from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeSettings,
 )
 from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
+from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
+    reset_notification_evidence,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
     add_live_arguments,
@@ -652,6 +655,31 @@ def owner_pod(
     return cast(dict[str, Any], matches[0])
 
 
+def delete_owner(
+    regional: RegionalLiveFixture,
+    settings: Settings,
+    owner: str,
+    maintenance_window_end: datetime,
+) -> dict[str, Any]:
+    """Force-delete the executor Pod that owns the in-flight reset command.
+
+    Refused once the maintenance window has ended. The Pod is resolved by its
+    exact name and deleted with a UID precondition (``ha_kubernetes.delete_pod``)
+    so a replacement that reused the name is never the one removed.
+    """
+
+    if datetime.now(timezone.utc) >= maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before owner deletion")
+    pod = owner_pod(regional, owner)
+    delete_pod(
+        lambda args, body: regional.kubectl("gpu", *args, input_text=body, timeout=180),
+        settings.regional.namespace,
+        pod,
+        force=True,
+    )
+    return pod
+
+
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     state = preflight["store"]
     details: dict[str, Any] = {
@@ -761,12 +789,14 @@ def lease_reissue_observed(
 def evaluate_reclaim(
     *,
     settings: Settings,
+    regional: RegionalLiveFixture,
     host: HostProbeFixture,
     state: dict[str, Any],
     timeline: list[dict[str, Any]],
     baseline_host: dict[str, Any],
     target_bdf: str,
     run_id: str,
+    marker: str,
     injected_at: datetime,
     case_dir: Path,
 ) -> tuple[list[str], dict[str, Any]]:
@@ -837,6 +867,22 @@ def evaluate_reclaim(
         ]
         if len(added) != 1:
             errors.append("deterministic node command ledger entry is not unique")
+    # The reset's completion record: the reclaimed carrier finished once, so its
+    # batched RESET_GPU step is recorded once, keyed by the step's own
+    # idempotency key -- the same key whichever replica reported the terminal
+    # result -- and SKIPPED by the drill policy for this drill incident.
+    reset_mail, mail_errors = reset_notification_evidence(
+        regional,
+        state,
+        node=settings.node,
+        marker=marker,
+        observed_after=injected_at,
+        wait=not errors,
+        sleep=time.sleep,
+        monotonic=time.monotonic,
+    )
+    write_json_atomic(case_dir / "reset-notification.json", reset_mail)
+    errors.extend(mail_errors)
     return errors, {
         "command": command,
         "command_ids": sorted(command_ids),
@@ -844,6 +890,7 @@ def evaluate_reclaim(
         "token_count": len(tokens),
         "expected_node_command": expected_node_command,
         "host_after": after,
+        "reset_notification": reset_mail,
     }
 
 
@@ -1009,19 +1056,7 @@ def execute_case(
 
         def kill(owner: str) -> None:
             nonlocal killed_pod
-            if datetime.now(timezone.utc) >= maintenance_window_end:
-                raise RegionalFixtureError(
-                    "maintenance window ended before owner deletion"
-                )
-            killed_pod = owner_pod(regional, owner)
-            delete_pod(
-                lambda args, body: regional.kubectl(
-                    "gpu", *args, input_text=body, timeout=180
-                ),
-                settings.regional.namespace,
-                killed_pod,
-                force=True,
-            )
+            killed_pod = delete_owner(regional, settings, owner, maintenance_window_end)
 
         # The command timeline samples the store through the whole reset, so
         # it also has to keep the WAITING records of the steps that finish
@@ -1061,12 +1096,14 @@ def execute_case(
         remember_incident(state)
         errors, evidence = evaluate_reclaim(
             settings=settings,
+            regional=regional,
             host=host,
             state=state,
             timeline=timeline,
             baseline_host=baseline_host,
             target_bdf=target_bdf,
             run_id=run_id,
+            marker=marker,
             injected_at=injected_at,
             case_dir=case_dir,
         )
@@ -1093,6 +1130,7 @@ def execute_case(
                 },
                 "phase_budgets_seconds": PHASE_BUDGETS,
                 "watchdog_seconds": WATCHDOG_SECONDS,
+                "reset_notification": evidence["reset_notification"],
             }
         )
     except ProcessSupervisionLost:

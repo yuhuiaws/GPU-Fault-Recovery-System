@@ -1007,3 +1007,31 @@ def step_timeout_errors(*, step_timeout_seconds: int | None) -> list[str]:
             "enough for both escalation injections"
         ]
     return []
+
+
+# The latest scheduled write has to land this much before the agent maintenance
+# window the quiesce pins would expire: past it the barrier fails the step and
+# the restore compensation runs, so the host-side condition refuses anyway and
+# the case would only ever record a refusal.
+WINDOW_FIT_MARGIN_SECONDS = 60
+
+
+def window_fit_errors(
+    *,
+    maintenance_window_seconds: int | None,
+    latest_delay_seconds: int,
+) -> list[str]:
+    """The pre-authorized writes must fit the maintenance window the quiesce pins.
+
+    ``latest_delay_seconds`` is the escalation's earliest offset after the
+    holder opened (the quiesce landed), which is also when the window starts.
+    """
+
+    if maintenance_window_seconds is None:
+        return ["the deployed agent maintenance window is unknown"]
+    if latest_delay_seconds + WINDOW_FIT_MARGIN_SECONDS >= maintenance_window_seconds:
+        return [
+            f"the {maintenance_window_seconds}s agent maintenance window leaves no "
+            f"room for an escalation {latest_delay_seconds}s after the quiesce"
+        ]
+    return []

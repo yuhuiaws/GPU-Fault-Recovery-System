@@ -399,10 +399,10 @@ def run_notify001(
     checks = completion_checks(evidence, dedup_drill, receipt, ses_window)
     sources = {kind: value["source"] for kind, value in evidence.items()}
     limitations = [
-        "Drill emails are explicitly labeled and are built without executing "
-        "RESET_GPU or RESTART_WORKLOAD; the deduplication drill always sends "
-        "one final labeled mail, waits 65 seconds and replays the same remote result "
-        "three more times. Fallback delivery drills may send two earlier emails.",
+        "Drill emails are explicitly labeled and built without executing RESET_GPU "
+        "or RESTART_WORKLOAD; gpu-reset drills replay the compound reset carrier "
+        "(QUIESCE head, RESET_GPU batched). The deduplication drill sends one final "
+        "labeled mail, waits 65 s, replays it three times; fallbacks send two more.",
         "Completed drill observations are re-judged, not re-sent, when receipts "
         "arrive later (same release/cluster/attempt/plan details/notification-runner "
         "source; operator evidence may change). An unconfirmed drill is never resent.",
@@ -1396,9 +1396,9 @@ def case_plan(
     mutations = {
         "GF-REGIONAL-NOTIFY-001": (
             "reuse this run's real ACTION_COMPLETED notifications where the store "
-            "still holds them SENT; otherwise send one GPU-reset drill and one "
-            "workload-restart drill through SES; always repeat one GPU-reset "
-            "notification four times for the deduplication proof"
+            "still holds them SENT; otherwise send one compound-carrier GPU-reset "
+            "drill and one workload-restart drill; always replay one compound "
+            "GPU-reset completion four times for the deduplication proof"
         ),
         "GF-REGIONAL-NOTIFY-002": (
             f"superseded by {NOTIFY002_SUPERSEDED_BY}: send one GPU-reset drill "

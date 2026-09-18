@@ -21,6 +21,7 @@ import pytest
 from scripts.e2e.regional import destr023_verdicts as verdicts
 from scripts.e2e.regional import run_destr023_idle_cluster_reset as destr023
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
+from tests.regional._reset_notification_support import reset_notification_entry
 
 NODE = "node-a"
 NOW = datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc)
@@ -74,12 +75,21 @@ def _step(operation: str) -> dict[str, Any]:
     return {"operation": operation, "node_ids": [NODE]}
 
 
-def _command(operation: str, status: str = "SUCCEEDED") -> dict[str, Any]:
-    return {"status": status, "step": {"operation": operation}}
+def _command(
+    operation: str, status: str = "SUCCEEDED", *, index: int | None = None
+) -> dict[str, Any]:
+    command: dict[str, Any] = {"status": status, "step": {"operation": operation}}
+    if index is not None:
+        command["idempotency_key"] = f"wf-destr023/{index}/{operation}"
+    return command
+
+
+RESET_OPERATION_ID = "wf-destr023/4/RESET_GPU"
 
 
 def reset_state(*, status: str = "SUCCEEDED") -> dict[str, Any]:
-    """A store snapshot that satisfies DESTR-001's ``workflow_errors``."""
+    """A store snapshot that satisfies DESTR-001's ``workflow_errors`` and
+    carries the SENT completion mail the RESET_GPU step owes."""
 
     steps = list(verdicts.RESET_OPERATIONS)
     executions = [
@@ -106,7 +116,7 @@ def reset_state(*, status: str = "SUCCEEDED") -> dict[str, Any]:
         },
         "observed_waiting_step_executions": [],
         "commands": [
-            _command(item)
+            _command(item, index=steps.index(item))
             for item in (
                 "MARK_UNSCHEDULABLE",
                 "QUIESCE_GPU_SERVICES",
@@ -114,6 +124,13 @@ def reset_state(*, status: str = "SUCCEEDED") -> dict[str, Any]:
                 "RESET_GPU",
                 "RESTORE_GPU_SERVICES",
                 "RESTORE_SCHEDULING",
+            )
+        ],
+        "notifications": [
+            reset_notification_entry(
+                cluster_id="cluster-a",
+                incident_id="inc-destr023",
+                operation_id=RESET_OPERATION_ID,
             )
         ],
     }

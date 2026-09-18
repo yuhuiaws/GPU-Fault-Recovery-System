@@ -10,6 +10,7 @@ import pytest
 
 from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr016_preempting_reboot as case
+from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional import test_destr016_preempting_reboot as data
 from tests.regional._cov95_destr_branches import ready_runtime
 from tests.regional._cov95_destr_warm import NOW, Clock, regional_settings
@@ -35,12 +36,29 @@ class PreemptionHarness:
         self.advance_at: dict[str, float] = {}
         self.preflight = data.happy_preflight_arguments()
         self.preflight["agent"].update(generation=4, artifact_sha256="artifact-sha")
+        self.bounds = {
+            "node_workflow_lifetime_seconds": 3600,
+            "step_waiting_timeout_seconds": 600,
+            "verify_waiting_limit_seconds": 600,
+            "restore_waiting_limit_seconds": 600,
+            "agent_maintenance_window_seconds": 420,
+            "gpu_client_verify_max_attempts": 60,
+        }
         self.node = {**data.node_baseline(), "boot_id": "boot-before"}
         self.baseline = {**data.host_baseline(), "boot_id": "boot-before"}
         self.after = {**data.host_after(), "boot_id": "boot-after"}
         self.injected = False
         self.rebooted = False
-        self.authorized: list[str] = []
+        # The conditional pre-authorization the holder probe received, and the
+        # host's fire records (one per phase) that holder-status reads back
+        # after the reboot. ``host_fired_early`` makes the host claim a fire
+        # before the runner's barrier observation; ``node_unreachable`` keeps
+        # kubelet from ever answering again during cleanup.
+        self.pre_authorization: dict[str, Any] | None = None
+        self.fired: dict[str, str] = {}
+        self.host_fired_early = False
+        self.node_unreachable = False
+        self.unreachable_boot_id: str | None = None
         self.barrier_delays = 0
         self.absorb_delays = 0
         self.successor_delays = 0
@@ -93,10 +111,57 @@ class PreemptionHarness:
         if name in self.failures:
             raise self.failures[name]
 
+    def names(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+    def host_execs_between(self, start: str, end: str) -> list[str]:
+        """Probe execs recorded after the first ``start`` and before the first
+        ``end`` call: kubelet is down there, so this must stay empty."""
+
+        names = self.names()
+        first = names.index(start)
+        last = names.index(end) if end in names else len(names)
+        return [
+            name
+            for name in names[first:last]
+            if name.startswith(("holder.", "injector."))
+            and not name.endswith(".create")
+        ]
+
     def probe(self, settings: Any) -> Any:
         return PreemptionProbe(
             self, "injector" if settings.case_id.endswith("-inject") else "holder"
         )
+
+    def fire(self, phase: str) -> None:
+        """The host fires ``phase`` now: one clock tick after the store read
+        that let the runner see the barrier, or before it when asked to."""
+
+        if phase in self.fired:
+            return
+        self.clock.sleep(1)
+        fired = self.clock.now()
+        if self.host_fired_early:
+            fired -= timedelta(minutes=5)
+        self.fired[phase] = fired.isoformat()
+
+    def fire_records(self) -> dict[str, Any]:
+        return {
+            phase: {
+                "fire_requested_at": fired_at,
+                "fired_at": fired_at,
+                "condition": {
+                    "workflow_request_id": data.RESET_ID,
+                    "incident_id": data.INCIDENT,
+                    "boot_id": "boot-before",
+                    "agent_generation": 4,
+                    "quiesce_command_id": f"quiesce-owned/{data.NODE}/agent-4",
+                    "verify_command_id": f"verify-owned/{data.NODE}/agent-4",
+                    "observed_at": fired_at,
+                },
+            }
+            for phase, fired_at in self.fired.items()
+        }
 
     def barrier(self, absorbed: bool = False) -> dict[str, Any]:
         state = data.absorbed_snapshot() if absorbed else data.barrier_snapshot()
@@ -123,7 +188,7 @@ class PreemptionHarness:
             workflow["step_executions"][-1]["status"] = "SUCCEEDED"
         if self.bad_absorb and absorbed:
             workflow["request_id"] = "wrong-workflow"
-        if self.changed_predecessor and self.authorized:
+        if self.changed_predecessor and self.fired:
             workflow["request_id"] = "changed-predecessor"
         return state
 
@@ -150,6 +215,10 @@ class PreemptionRegional:
         self.h = harness
         self.settings = harness.settings.regional
 
+    def executor_python(self, script: str) -> dict[str, Any]:
+        self.h.call("bounds")
+        return deepcopy(self.h.bounds)
+
     def store_snapshot(self, **kwargs: Any) -> dict[str, Any]:
         self.h.call("store", kwargs)
         marker = str(kwargs.get("marker") or "")
@@ -172,12 +241,14 @@ class PreemptionRegional:
             if self.h.absorb_delays:
                 self.h.absorb_delays -= 1
                 return self.h.barrier()
+            self.h.fire("absorb")
             return self.h.barrier(absorbed=True)
         if marker.endswith("-e"):
             self.h.call("successor.read")
             if self.h.successor_delays:
                 self.h.successor_delays -= 1
                 return {}
+            self.h.fire("escalate")
             if self.h.rebooted:
                 state = deepcopy(self.h.terminal)
                 if self.h.terminal_delays:
@@ -227,8 +298,15 @@ class PreemptionRegional:
 
     def wait_node_ready(self, node: str, **kwargs: Any) -> dict[str, Any]:
         self.h.call("node.ready", kwargs)
-        self.h.rebooted = True
-        self.h.node["boot_id"] = "boot-after"
+        if self.h.node_unreachable:
+            if self.h.unreachable_boot_id:
+                self.h.node["boot_id"] = self.h.unreachable_boot_id
+            raise RegionalFixtureError("node did not return Ready: fake outage")
+        if kwargs.get("expected_boot_id"):
+            # Only a wait for a *new* boot models the provider reboot; the
+            # plain Ready wait cleanup takes reboots nothing.
+            self.h.rebooted = True
+            self.h.node["boot_id"] = "boot-after"
         return deepcopy(self.h.node)
 
     def provider_events(self, *args: Any) -> list[dict[str, Any]]:
@@ -256,13 +334,15 @@ class PreemptionProbe:
             return deepcopy(self.h.after if self.h.rebooted else self.h.baseline)
         if action == "write-xid46":
             self.h.injected = True
-        if action == "authorize-injection":
-            phase = args[args.index("--phase") + 1]
+        if action == "pre-authorize":
             proof = json.loads(args[args.index("--authorization") + 1])
-            self.h.call("authorization", {"phase": phase, "proof": proof})
-            self.h.authorized.append(phase)
+            self.h.pre_authorization = proof
+            self.h.call("pre-authorization", proof)
         if action == "holder-status":
-            return deepcopy(self.h.holder_status)
+            return {
+                **deepcopy(self.h.holder_status),
+                "injections_fired": (self.h.fire_records()),
+            }
         return {"action": action, "ok": True}
 
     def cleanup(self) -> dict[str, bool]:

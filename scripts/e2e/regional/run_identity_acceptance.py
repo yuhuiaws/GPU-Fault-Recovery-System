@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, cast
 
@@ -22,6 +22,7 @@ from scripts.e2e.regional.auth015_custody_inputs import (  # noqa: E402
     verify_custody_inputs,
 )
 from scripts.e2e.regional.auth015_release import (  # noqa: E402
+    Auth015ReleaseInputs,
     load_release_inputs,
     verify_release_inputs,
 )
@@ -47,6 +48,15 @@ from scripts.e2e.regional.identity_acceptance_iso import (  # noqa: E402
     run_iso003,
     run_iso004,
     run_iso005,
+)
+from scripts.e2e.regional.identity_synthetic_secondary import (  # noqa: E402
+    SECONDARY_REGISTRATION_MODES,
+    SITE_SECONDARY,
+    SYNTHETIC_SECONDARY_KIND,
+    SyntheticSecondary,
+    run_with_synthetic_secondary,
+    synthetic_secondary_from_arguments,
+    synthetic_secondary_lifecycle,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
@@ -118,6 +128,17 @@ def case_plan(
             "an allowed-namespace positive control; no live allowlist change"
         ),
     }
+    secondary_plan: dict[str, Any] | None = None
+    if secondary is not None:
+        secondary_plan = {
+            "cluster_id": secondary.cluster_id,
+            "context": secondary.context,
+            "registered": getattr(secondary, "registered", True),
+        }
+        if getattr(secondary, "kind", SITE_SECONDARY) == SYNTHETIC_SECONDARY_KIND:
+            # Only a synthetic B adds keys: a site B's plan is what it always was.
+            secondary_plan["kind"] = SYNTHETIC_SECONDARY_KIND
+            secondary_plan["executor_namespace"] = secondary.executor_namespace
     return {
         "risk": "case-defined",
         "predecessor": predecessor,
@@ -126,15 +147,7 @@ def case_plan(
             "cluster_id": primary.cluster_id,
             "context": primary.context,
         },
-        "secondary": (
-            {
-                "cluster_id": secondary.cluster_id,
-                "context": secondary.context,
-                "registered": getattr(secondary, "registered", True),
-            }
-            if secondary is not None
-            else None
-        ),
+        "secondary": secondary_plan,
         "nodes": list(nodes),
         "mutation": mutations[case_id],
         "stop_conditions": [
@@ -163,6 +176,23 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--site", type=Path, required=True)
     value.add_argument("--cluster-id", default="")
     value.add_argument("--secondary-cluster-id", default="")
+    value.add_argument(
+        "--secondary-registration",
+        choices=SECONDARY_REGISTRATION_MODES,
+        default=SITE_SECONDARY,
+        help=(
+            "site: cluster B is a registered site cluster (default); synthetic: "
+            "AUTH-007/008 register B themselves as a synthetic logical cluster on "
+            "the primary's EKS with its own token, namespace and executor Pod, and "
+            "remove it afterwards (requires --allow-synthetic-secondary and an id "
+            "starting with auth-logical-)"
+        ),
+    )
+    value.add_argument(
+        "--allow-synthetic-secondary",
+        action="store_true",
+        help="explicitly permit --secondary-registration synthetic to register B",
+    )
     value.add_argument("--node", action="append", default=[])
     value.add_argument("--fleet-master-file", type=Path)
     value.add_argument("--auth015-release-proof", type=Path)
@@ -188,23 +218,32 @@ def validate_case_arguments(
         "GF-REGIONAL-ISO-003",
         "GF-REGIONAL-ISO-004",
     }
+    # None in site mode (the default); refuses the synthetic mode outside
+    # AUTH-007/008, without its allow switch or with an unsafe/colliding id.
+    synthetic = synthetic_secondary_from_arguments(arguments, site, primary)
     secondary = None
     if arguments.case in secondary_cases:
         if not arguments.secondary_cluster_id:
             raise IdentityAcceptanceError(
                 f"{arguments.case} requires --secondary-cluster-id"
             )
-        try:
-            secondary = site.target(arguments.secondary_cluster_id)
-        except IdentityAcceptanceError:
-            # ISO-003/004 judge a cluster-id binding: the executor's Fleet
-            # proxy and the control plane's payload binding compare ids and
-            # never consult the registry, so a single-cluster site may name
-            # any other id as B (the AUTH matrix does the same). AUTH-007/008
-            # disable and claim as B and keep needing a registered cluster.
-            if arguments.case not in UNREGISTERED_SECONDARY_CASES:
-                raise
-            secondary = unregistered_secondary(primary, arguments.secondary_cluster_id)
+        if synthetic is not None:
+            secondary = synthetic
+        else:
+            try:
+                secondary = site.target(arguments.secondary_cluster_id)
+            except IdentityAcceptanceError:
+                # ISO-003/004 judge a cluster-id binding: the executor's Fleet
+                # proxy and the control plane's payload binding compare ids and
+                # never consult the registry, so a single-cluster site may name
+                # any other id as B (the AUTH matrix does the same). AUTH-007/008
+                # disable and claim as B and keep needing a registered cluster --
+                # a site cluster, or the synthetic logical one they register.
+                if arguments.case not in UNREGISTERED_SECONDARY_CASES:
+                    raise
+                secondary = unregistered_secondary(
+                    primary, arguments.secondary_cluster_id
+                )
         if secondary.cluster_id == primary.cluster_id:
             raise IdentityAcceptanceError("primary and secondary clusters must differ")
     nodes = tuple(arguments.node)
@@ -265,28 +304,34 @@ def validate_case_arguments(
     return primary, secondary, nodes
 
 
-def main() -> int:
-    install_site_profile()
-    arguments = parser().parse_args()
-    os.umask(0o077)
-    site = IdentitySite(arguments.site)
-    primary, secondary, nodes = validate_case_arguments(arguments, site)
-    # The release and cluster this run's evidence is bound to; the predecessor
-    # must have been earned against the same pair, and the successor will ask
-    # the same of this case's evidence.
-    identity = site.regional(primary).evidence_identity()
-    if not identity["release_id"].strip():
-        raise IdentityAcceptanceError("the deployed release identity is missing")
-    release_inputs = None
-    release_binding = None
-    custody_inputs = None
-    custody_binding = None
+@dataclass(frozen=True)
+class Auth015Bindings:
+    """The verified AUTH-015 proof inputs and the digests the plan binds."""
+
+    release_inputs: Auth015ReleaseInputs | None = None
+    release_binding: dict[str, Any] | None = None
+    custody_inputs: Auth015CustodyInputs | None = None
+    custody_binding: dict[str, Any] | None = None
+
+
+def auth015_bindings(
+    arguments: argparse.Namespace,
+    *,
+    identity: dict[str, str],
+    primary: ClusterTarget,
+    nodes: tuple[str, ...],
+) -> Auth015Bindings:
+    bindings = Auth015Bindings()
     if arguments.auth015_release_proof is not None:
         release_inputs = load_release_inputs(
             arguments.auth015_release_proof, expected_release_id=identity["release_id"]
         )
         release_binding = verify_release_inputs(release_inputs).input_identity
-        release_inputs = replace(release_inputs, expected_identity=release_binding)
+        bindings = replace(
+            bindings,
+            release_inputs=replace(release_inputs, expected_identity=release_binding),
+            release_binding=release_binding,
+        )
     if arguments.auth015_custody_proof is not None:
         custody_inputs = Auth015CustodyInputs(
             arguments.auth015_custody_proof,
@@ -303,20 +348,25 @@ def main() -> int:
                 "AUTH015 custody inputs name a different target"
             )
         custody_binding = custody_input_identity(custody_inputs)
-        custody_inputs = replace(custody_inputs, expected_identity=custody_binding)
-    predecessor_id, path = predecessor_path(
-        arguments.run_dir,
-        arguments.case,
-        arguments.predecessor_evidence,
-    )
-    predecessor = (
-        predecessor_evidence(path, predecessor_id, **identity)
-        if predecessor_id is not None and path is not None
-        else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
-    )
-    confirmation = (
-        arguments.case.removeprefix("GF-REGIONAL-").replace("-", "") + "_EXECUTE"
-    )
+        bindings = replace(
+            bindings,
+            custody_inputs=replace(custody_inputs, expected_identity=custody_binding),
+            custody_binding=custody_binding,
+        )
+    return bindings
+
+
+def case_environment(
+    arguments: argparse.Namespace,
+    site: IdentitySite,
+    *,
+    identity: dict[str, str],
+    primary: ClusterTarget,
+    secondary: ClusterTarget | None,
+    nodes: tuple[str, ...],
+    auth015: Auth015Bindings,
+    synthetic: SyntheticSecondary | None,
+) -> dict[str, str]:
     environment = {
         "GPU_FAULT_IDENTITY_CASE": arguments.case,
         "GPU_FAULT_SITE_FILE": str(arguments.site.resolve()),
@@ -330,40 +380,223 @@ def main() -> int:
         ),
         "GPU_FAULT_TARGET_NODES": ",".join(nodes),
     }
-    if release_binding is not None:
-        environment["AUTH015_RELEASE_INPUTS_SHA256"] = details_sha256(release_binding)
-    if custody_binding is not None:
-        environment["AUTH015_CUSTODY_INPUTS_SHA256"] = details_sha256(custody_binding)
+    if auth015.release_binding is not None:
+        environment["AUTH015_RELEASE_INPUTS_SHA256"] = details_sha256(
+            auth015.release_binding
+        )
+    if auth015.custody_binding is not None:
+        environment["AUTH015_CUSTODY_INPUTS_SHA256"] = details_sha256(
+            auth015.custody_binding
+        )
+    if synthetic is not None:
+        # Only a synthetic B adds keys: a site-mode plan is what it always was.
+        environment["GPU_FAULT_SECONDARY_REGISTRATION"] = "synthetic"
+        environment["GPU_FAULT_SYNTHETIC_SECONDARY_NAMESPACE"] = (
+            synthetic.journal.namespace
+        )
+        environment["GPU_FAULT_SYNTHETIC_SECONDARY_RUN_ID"] = synthetic.journal.run_id
+    return environment
+
+
+def case_handlers(
+    arguments: argparse.Namespace,
+    site: IdentitySite,
+    *,
+    primary: ClusterTarget,
+    secondary: ClusterTarget | None,
+    nodes: tuple[str, ...],
+    case_dir: Path,
+    auth015: Auth015Bindings,
+    synthetic: SyntheticSecondary | None,
+) -> dict[str, Callable[[], dict[str, Any]]]:
+    def with_secondary(
+        handler: Callable[[IdentitySite, ClusterTarget, ClusterTarget], dict[str, Any]],
+    ) -> Callable[[], dict[str, Any]]:
+        def body() -> dict[str, Any]:
+            return handler(site, primary, cast(ClusterTarget, secondary))
+
+        if synthetic is None:
+            return body
+
+        def with_synthetic_secondary() -> dict[str, Any]:
+            # B exists only for the length of the body: registered and served
+            # by its own Pod before it runs, removed and proven absent after.
+            return run_with_synthetic_secondary(synthetic, body)
+
+        return with_synthetic_secondary
+
+    return {
+        "GF-REGIONAL-AUTH-007": with_secondary(
+            lambda site, a, b: run_auth007(site, a, b, case_dir=case_dir)
+        ),
+        "GF-REGIONAL-AUTH-008": with_secondary(
+            lambda site, a, b: run_auth008(site, a, b, case_dir=case_dir)
+        ),
+        "GF-REGIONAL-AUTH-010": lambda: run_auth010(site, primary),
+        "GF-REGIONAL-AUTH-013": lambda: run_auth013(
+            site,
+            primary,
+            node=nodes[0] if nodes else "",
+            host_probe_image=arguments.host_probe_image,
+            case_dir=case_dir,
+        ),
+        "GF-REGIONAL-AUTH-014": lambda: run_auth014(
+            site,
+            primary,
+            outside_probe_path=arguments.outside_probe_evidence,
+        ),
+        "GF-REGIONAL-AUTH-015": lambda: run_auth015(
+            site,
+            primary,
+            nodes=cast(tuple[str, str], nodes),
+            fleet_master_file=arguments.fleet_master_file,
+            host_probe_image=arguments.host_probe_image,
+            case_dir=case_dir,
+            focused_tests=reusable_focused_tests(case_dir / "plan.json"),
+            release_inputs=auth015.release_inputs,
+            custody_inputs=auth015.custody_inputs,
+        ),
+        "GF-REGIONAL-AUTH-016": lambda: run_auth016(site, primary, case_dir=case_dir),
+        "GF-REGIONAL-ISO-003": with_secondary(run_iso003),
+        "GF-REGIONAL-ISO-004": with_secondary(run_iso004),
+        "GF-REGIONAL-ISO-005": lambda: run_iso005(
+            site,
+            primary,
+            case_dir=case_dir,
+        ),
+    }
+
+
+def failure_outcome(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, IdentityCaseFailure):
+        # The handler restored what it could and kept its partial checks;
+        # they are evidence of how far the case got, not a PASS.
+        return {
+            "verdict": "FAIL",
+            "error": f"{type(exc.__cause__ or exc).__name__}: {exc}",
+            "partial": exc.details,
+            "cleanup_errors": list(exc.details.get("cleanup_errors") or []),
+            "limitations": [
+                "The case stopped at the first failed step; the checks under "
+                "'partial' were gathered before it and the restore state after."
+            ],
+        }
+    return {
+        "verdict": "FAIL",
+        "error": f"{type(exc).__name__}: {exc}",
+        "limitations": [
+            "The case stopped at the first failed assertion; later checks "
+            "were not treated as executed."
+        ],
+    }
+
+
+def plan_case(
+    arguments: argparse.Namespace,
+    *,
+    primary: ClusterTarget,
+    secondary: ClusterTarget | None,
+    nodes: tuple[str, ...],
+    predecessor: dict[str, Any],
+    identity: dict[str, str],
+    auth015: Auth015Bindings,
+    synthetic: SyntheticSecondary | None,
+    confirmation: str,
+    environment: dict[str, str],
+) -> int:
+    details = case_plan(
+        arguments.case,
+        primary=primary,
+        secondary=secondary,
+        nodes=nodes,
+        predecessor=predecessor,
+        evidence_identity=identity,
+    )
+    if arguments.case == "GF-REGIONAL-AUTH-015":
+        details["deployed_protocol_release_inputs"] = auth015.release_binding
+        details["custody_inputs"] = auth015.custody_binding
+        # Run the focused pytest here so --execute can reuse the result
+        # against an unchanged tree instead of paying for it twice.
+        record_focused_tests(details, auth015_focused_tests())
+    synthetic_ok = True
+    if synthetic is not None:
+        # Read-only: what B will be, and whether the site can take it now.
+        details["synthetic_secondary"] = synthetic.plan_details()
+        synthetic_ok = not details["synthetic_secondary"]["preflight"]["errors"]
+    focused_ok = details.get("focused_tests", {"passed": True}).get("passed")
+    preflight_passed = (
+        predecessor.get("valid") is True and focused_ok is True and synthetic_ok
+    )
+    plan = build_plan(
+        arguments=arguments,
+        preflight_passed=preflight_passed,
+        run_dir=arguments.run_dir,
+        case_id=arguments.case,
+        attempt=arguments.attempt,
+        confirmation=confirmation,
+        environment=environment,
+        details=details,
+    )
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0 if preflight_passed else 1
+
+
+def main() -> int:
+    install_site_profile()
+    arguments = parser().parse_args()
+    os.umask(0o077)
+    site = IdentitySite(arguments.site)
+    primary, secondary, nodes = validate_case_arguments(arguments, site)
+    # The release and cluster this run's evidence is bound to; the predecessor
+    # must have been earned against the same pair, and the successor will ask
+    # the same of this case's evidence.
+    identity = site.regional(primary).evidence_identity()
+    if not identity["release_id"].strip():
+        raise IdentityAcceptanceError("the deployed release identity is missing")
+    auth015 = auth015_bindings(
+        arguments, identity=identity, primary=primary, nodes=nodes
+    )
+    predecessor_id, path = predecessor_path(
+        arguments.run_dir,
+        arguments.case,
+        arguments.predecessor_evidence,
+    )
+    predecessor = (
+        predecessor_evidence(path, predecessor_id, **identity)
+        if predecessor_id is not None and path is not None
+        else {"valid": True, "case_id": None, "verdict": "NOT_REQUIRED"}
+    )
+    confirmation = (
+        arguments.case.removeprefix("GF-REGIONAL-").replace("-", "") + "_EXECUTE"
+    )
     case_dir = arguments.run_dir / "cases" / arguments.case
     case_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    synthetic = synthetic_secondary_lifecycle(
+        arguments, site, primary, secondary, case_dir=case_dir
+    )
+    environment = case_environment(
+        arguments,
+        site,
+        identity=identity,
+        primary=primary,
+        secondary=secondary,
+        nodes=nodes,
+        auth015=auth015,
+        synthetic=synthetic,
+    )
     if not arguments.execute:
-        details = case_plan(
-            arguments.case,
+        return plan_case(
+            arguments,
             primary=primary,
             secondary=secondary,
             nodes=nodes,
             predecessor=predecessor,
-            evidence_identity=identity,
-        )
-        if arguments.case == "GF-REGIONAL-AUTH-015":
-            details["deployed_protocol_release_inputs"] = release_binding
-            details["custody_inputs"] = custody_binding
-            # Run the focused pytest here so --execute can reuse the result
-            # against an unchanged tree instead of paying for it twice.
-            record_focused_tests(details, auth015_focused_tests())
-        focused_ok = details.get("focused_tests", {"passed": True}).get("passed")
-        plan = build_plan(
-            arguments=arguments,
-            preflight_passed=(predecessor.get("valid") is True and focused_ok is True),
-            run_dir=arguments.run_dir,
-            case_id=arguments.case,
-            attempt=arguments.attempt,
+            identity=identity,
+            auth015=auth015,
+            synthetic=synthetic,
             confirmation=confirmation,
             environment=environment,
-            details=details,
         )
-        print(json.dumps(plan, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid") is True and focused_ok is True else 1
     if arguments.confirm != confirmation:
         raise IdentityAcceptanceError(f"confirmation must be exactly {confirmation}")
     evidence_path = case_evidence_path(arguments.run_dir, arguments.case)
@@ -386,76 +619,23 @@ def main() -> int:
     )
     if not predecessor.get("valid", False):
         raise IdentityAcceptanceError("formal predecessor evidence is not PASS")
+    handlers = case_handlers(
+        arguments,
+        site,
+        primary=primary,
+        secondary=secondary,
+        nodes=nodes,
+        case_dir=case_dir,
+        auth015=auth015,
+        synthetic=synthetic,
+    )
     try:
-        handlers: dict[str, Callable[[], dict[str, Any]]] = {
-            "GF-REGIONAL-AUTH-007": lambda: run_auth007(
-                site, primary, cast(ClusterTarget, secondary), case_dir=case_dir
-            ),
-            "GF-REGIONAL-AUTH-008": lambda: run_auth008(
-                site, primary, cast(ClusterTarget, secondary), case_dir=case_dir
-            ),
-            "GF-REGIONAL-AUTH-010": lambda: run_auth010(site, primary),
-            "GF-REGIONAL-AUTH-013": lambda: run_auth013(
-                site,
-                primary,
-                node=nodes[0] if nodes else "",
-                host_probe_image=arguments.host_probe_image,
-                case_dir=case_dir,
-            ),
-            "GF-REGIONAL-AUTH-014": lambda: run_auth014(
-                site,
-                primary,
-                outside_probe_path=arguments.outside_probe_evidence,
-            ),
-            "GF-REGIONAL-AUTH-015": lambda: run_auth015(
-                site,
-                primary,
-                nodes=cast(tuple[str, str], nodes),
-                fleet_master_file=arguments.fleet_master_file,
-                host_probe_image=arguments.host_probe_image,
-                case_dir=case_dir,
-                focused_tests=reusable_focused_tests(case_dir / "plan.json"),
-                release_inputs=release_inputs,
-                custody_inputs=custody_inputs,
-            ),
-            "GF-REGIONAL-AUTH-016": lambda: run_auth016(
-                site, primary, case_dir=case_dir
-            ),
-            "GF-REGIONAL-ISO-003": lambda: run_iso003(
-                site, primary, cast(ClusterTarget, secondary)
-            ),
-            "GF-REGIONAL-ISO-004": lambda: run_iso004(
-                site, primary, cast(ClusterTarget, secondary)
-            ),
-            "GF-REGIONAL-ISO-005": lambda: run_iso005(
-                site,
-                primary,
-                case_dir=case_dir,
-            ),
-        }
         outcome = handlers[arguments.case]()
     except IdentityCaseFailure as exc:
-        # The handler restored what it could and kept its partial checks;
-        # they are evidence of how far the case got, not a PASS.
-        outcome = {
-            "verdict": "FAIL",
-            "error": f"{type(exc.__cause__ or exc).__name__}: {exc}",
-            "partial": exc.details,
-            "cleanup_errors": list(exc.details.get("cleanup_errors") or []),
-            "limitations": [
-                "The case stopped at the first failed step; the checks under "
-                "'partial' were gathered before it and the restore state after."
-            ],
-        }
+        # Partial checks and restore state travel with the failure.
+        outcome = failure_outcome(exc)
     except Exception as exc:
-        outcome = {
-            "verdict": "FAIL",
-            "error": f"{type(exc).__name__}: {exc}",
-            "limitations": [
-                "The case stopped at the first failed assertion; later checks "
-                "were not treated as executed."
-            ],
-        }
+        outcome = failure_outcome(exc)
     result = {
         **result,
         "verdict": outcome.get("verdict", "FAIL"),

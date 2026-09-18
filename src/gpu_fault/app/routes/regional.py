@@ -383,6 +383,8 @@ async def report_remote_command_progress(
     the executor's heartbeat thread at its own cadence, while progress is
     posted by the executing thread the moment a step settles, and the terminal
     ``/result`` stays exactly what it was. Lease-fenced like the renewal.
+    No notification is dispatched here: a batched step's completion mail lands
+    with the terminal report (``dispatch_remote_completion``), never mid-run.
     """
 
     ctx = dependencies.context

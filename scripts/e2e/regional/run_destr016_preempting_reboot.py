@@ -81,6 +81,14 @@ from scripts.e2e.regional.destr016_verdicts import (  # noqa: E402
     superseded_predecessor_errors,
     terminal_errors,
     waiting_boundary_errors,
+    window_fit_errors,
+)
+from scripts.e2e.regional.destr_barrier_authorization import (  # noqa: E402
+    barrier_authorization,
+    conditional_pre_authorization,
+    executor_bounds,
+    fired_after_barrier_errors,
+    host_reachability,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
@@ -142,6 +150,17 @@ REBOOT_BUDGET_SECONDS = 1800
 OBSERVATION_BUDGET_SECONDS = 2400
 # The maintenance window must have at least this much left at injection time.
 MIN_WINDOW_REMAINING_SECONDS = 3600
+# QUIESCE_GPU_SERVICES stops kubelet, so nothing can be authorized on the node
+# between the quiesce and the restore. The holder probe is therefore given a
+# conditional pre-authorization before the first injection; it must stay valid
+# until the escalation may fire (the barrier wait, the escalation's earliest
+# offset and polling slack) and fit inside the holder's bounded lifetime.
+PRE_AUTHORIZATION_VALID_SECONDS = 1200
+MIN_HOLD_MARGIN_SECONDS = 300
+MAX_HOLD_SECONDS = 3600
+# How long cleanup waits for kubelet to answer again before it may exec into
+# the node; only the restore or a reboot brings kubelet back.
+HOST_RETURN_BUDGET_SECONDS = 900
 
 COMMANDS_BY_WORKFLOW = r"""
 import json
@@ -243,6 +262,14 @@ def preflight_errors(
             lifetime_seconds=control_env.get("node_lifetime_seconds"),
         )
     )
+    errors.extend(
+        window_fit_errors(
+            maintenance_window_seconds=control_env.get(
+                "agent_maintenance_window_seconds"
+            ),
+            latest_delay_seconds=ESCALATE_DELAY_SECONDS,
+        )
+    )
     return errors
 
 
@@ -277,14 +304,19 @@ def case_digest(components: dict[str, str]) -> str:
     return _digest(components)
 
 
-def control_env_record(observations: dict[str, str | None]) -> dict[str, Any]:
+def control_env_record(
+    observations: dict[str, str | None],
+    *,
+    agent_maintenance_window_seconds: int | None = None,
+) -> dict[str, Any]:
     """Fold the values every ready control-worker replica agrees on into the
     two bounds the case does arithmetic against.
 
     A value no replica agrees on (mid-rollout) is reported as the shipped
     default rather than averaged: the preflight then measures against what the
     code would use if the override were absent, and a rollout in progress is
-    caught by the runtime-identity check instead.
+    caught by the runtime-identity check instead. The agent maintenance window
+    is the executor's, read separately, and stays ``None`` when it was not.
     """
 
     def number(name: str, default: int) -> int:
@@ -302,6 +334,7 @@ def control_env_record(observations: dict[str, str | None]) -> dict[str, Any]:
         "node_lifetime_seconds": number(
             NODE_LIFETIME_VARIABLE, DEFAULT_NODE_LIFETIME_SECONDS
         ),
+        "agent_maintenance_window_seconds": agent_maintenance_window_seconds,
         "preemption_enabled": True,
     }
 
@@ -428,6 +461,13 @@ def configure(arguments: argparse.Namespace) -> Settings:
             / f"{PREDECESSOR_CASE_ID}.json"
         ).resolve()
     )
+    minimum_hold = PRE_AUTHORIZATION_VALID_SECONDS + MIN_HOLD_MARGIN_SECONDS
+    if not minimum_hold <= int(arguments.max_hold_seconds) <= MAX_HOLD_SECONDS:
+        raise RegionalFixtureError(
+            f"the device hold must cover the {PRE_AUTHORIZATION_VALID_SECONDS}s "
+            f"pre-authorization plus {MIN_HOLD_MARGIN_SECONDS}s and stay within "
+            f"{MAX_HOLD_SECONDS}s: {arguments.max_hold_seconds}"
+        )
     return Settings(
         regional=settings_from_arguments(arguments),
         node=required(
@@ -465,11 +505,15 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "write one XID 46 to /dev/kmsg on one idle GPU node and hold a GPU "
             "device open so the reset workflow parks at VERIFY_NO_GPU_CLIENTS "
             "with GPU services quiesced; write a second XID 46 that must merge "
-            "into the same workflow; write one XID 79 that must preempt it. The "
-            "successor workflow reboots the node through HyperPod for real "
-            "(BatchRebootClusterNodes, once), restores GPU services after the "
-            "reboot, validates GPU/host/fabric and restores scheduling. No GPU "
-            "reset is allowed to commit; no replacement or deletion is authorized."
+            "into the same workflow; write one XID 79 that must preempt it. Both "
+            "later writes are pre-authorized on the node before the first "
+            "injection (the quiesce stops kubelet, so nothing can be authorized "
+            "afterwards) and fire only when the node's own ledger shows the "
+            "barrier. The successor workflow reboots the node through HyperPod "
+            "for real (BatchRebootClusterNodes, once), restores GPU services "
+            "after the reboot, validates GPU/host/fabric and restores scheduling. "
+            "No GPU reset is allowed to commit; no replacement or deletion is "
+            "authorized."
         ),
         "preflight_identity": identity,
         "preflight_identity_digest": identity_digest(identity),
@@ -479,12 +523,18 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "gpuReset is not OWN by the Node Agent, or nodeReboot not OWN by the "
             "HyperPod adapter",
             "the deployed step timeout leaves no room for both escalation "
-            "injections inside the barrier's WAITING window",
+            "injections inside the barrier's WAITING window, or the agent "
+            "maintenance window leaves no room for the escalation",
             "the estimated duration does not fit the node workflow lifetime the "
             "successor inherits from the reset workflow",
             "the maintenance window has under an hour left at injection time",
             "the GPU holder loses the arming race, so the client verification "
             "succeeds and the reset commits before the escalation arrives",
+            "the host-side barrier condition never holds before the "
+            "pre-authorization expires, so the holder disarms itself and no "
+            "later fault is written",
+            "the host writes a scheduled fault before the runner observed the "
+            "barrier in the store",
             "the second XID 46 opens a second workflow or adds a step",
             "the XID 79 does not supersede the reset workflow, or the successor "
             "carries no quiesce handoff",
@@ -543,10 +593,16 @@ def control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
         deployment=CONTROL_DEPLOYMENT,
         names=CONTROL_VARIABLES,
     )
+    # The maintenance window the quiesce pins is the executor's own setting;
+    # the pre-authorized writes have to land inside it, so it is read from the
+    # running executor exactly as DESTR-017 does.
+    bounds = executor_bounds(regional)
     record = control_env_record(
-        {name: observed_value(replicas, name) for name in CONTROL_VARIABLES}
+        {name: observed_value(replicas, name) for name in CONTROL_VARIABLES},
+        agent_maintenance_window_seconds=bounds["agent_maintenance_window_seconds"],
     )
     record["replicas"] = replicas
+    record["executor_bounds"] = bounds
     return record
 
 
@@ -685,7 +741,14 @@ class _LiveRun:
     predecessor_id: str = ""
     successor_id: str = ""
     holder_armed: bool = False
+    holder_armed_at: datetime | None = None
     rebooted: bool = False
+    # The conditional authorization handed to the holder before the injection,
+    # and the runner's own store-side observations of the barrier that the
+    # host's fire records are graded against afterwards.
+    pre_authorization: dict[str, Any] = field(default_factory=dict)
+    barrier_proof: dict[str, Any] = field(default_factory=dict)
+    escalation_proof: dict[str, Any] = field(default_factory=dict)
 
 
 def _prepare_live_run(
@@ -816,6 +879,8 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
         str(ESCALATE_DELAY_SECONDS),
     )
     write_json_atomic(case_dir / "holder-armed.json", armed)
+    run.holder_armed_at = datetime.now(timezone.utc)
+    _pre_authorize(run)
     run.started_at = datetime.now(timezone.utc)
     injection = run.inject_probe.execute(
         "write-xid46",
@@ -828,7 +893,65 @@ def _arm_and_park(run: _LiveRun) -> dict[str, Any]:
     )
     run.injected_at["reset"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(case_dir / "injection-reset.json", injection)
-    return _wait_for_barrier(run)
+    barrier = _wait_for_barrier(run)
+    # The store-side identity of the barrier, and when the runner saw it. It is
+    # never delivered to the node (kubelet is down by now); the host's fire
+    # records are graded against it once the node is back.
+    run.barrier_proof = _store_proof(run, barrier)
+    write_json_atomic(case_dir / "barrier-authorization.json", run.barrier_proof)
+    return barrier
+
+
+def _pre_authorize(run: _LiveRun) -> None:
+    """Hand the holder its conditional authorization while kubelet still answers.
+
+    The quiesce that follows the first injection takes kubelet down, and with
+    it every exec into the node, until the restore. The two later writes are
+    therefore authorized now, bound to this run, node, boot, device, drill and
+    window, and the holder itself decides from the Node Agent ledger when the
+    barrier holds. The relative delays stay the earliest times, never the
+    authorization.
+    """
+
+    control_env = run.preflight["control_env"]
+    run.pre_authorization = conditional_pre_authorization(
+        run_id=run.run_id,
+        node=run.settings.node,
+        boot_id=str(run.baseline.get("boot_id") or ""),
+        device=run.device,
+        drill_id=f"{run.run_id}-r",
+        marker=run.marker["reset"],
+        maintenance_window_end=run.maintenance_window_end,
+        maintenance_window_seconds=int(control_env["agent_maintenance_window_seconds"]),
+        valid_for_seconds=PRE_AUTHORIZATION_VALID_SECONDS,
+        not_before_seconds={
+            "absorb": ABSORB_DELAY_SECONDS,
+            "escalate": ESCALATE_DELAY_SECONDS,
+        },
+    )
+    report = run.holder_probe.execute(
+        "pre-authorize",
+        "--run-id",
+        run.run_id,
+        "--authorization",
+        json.dumps(run.pre_authorization, sort_keys=True),
+    )
+    write_json_atomic(
+        run.case_dir / "pre-authorization.json",
+        {"authorization": run.pre_authorization, "report": report},
+    )
+
+
+def _store_proof(run: _LiveRun, state: dict[str, Any]) -> dict[str, Any]:
+    return barrier_authorization(
+        state,
+        run_id=run.run_id,
+        node=run.settings.node,
+        boot_id=str(run.baseline.get("boot_id") or ""),
+        device=run.device,
+        drill_id=f"{run.run_id}-r",
+        maintenance_window_end=run.maintenance_window_end,
+    )
 
 
 def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
@@ -864,22 +987,22 @@ def _wait_for_barrier(run: _LiveRun) -> dict[str, Any]:
                 break
         time.sleep(5)
     write_json_atomic(run.case_dir / "barrier-state.json", last)
-    try:
-        holder = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
-    except Exception as exc:  # noqa: BLE001 - a quiesced node cannot answer
-        holder = {"error": f"{type(exc).__name__}: {exc}"}
-    write_json_atomic(run.case_dir / "holder-status-barrier.json", holder)
+    # No holder read here: the quiesce has stopped kubelet by now, so the exec
+    # could only fail. Cleanup reads ``holder-status`` once the node answers.
     raise RegionalFixtureError(
         "the reset workflow never parked at the client-verification barrier: "
         + "; ".join(errors)
-        + f"; holder={json.dumps(holder, sort_keys=True)}"
     )
 
 
 def _absorb(run: _LiveRun, barrier: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
-    """Phase A: a second same-rank XID 46 must merge into the parked workflow."""
+    """Phase A: a second same-rank XID 46 must merge into the parked workflow.
 
-    _authorize_injection(run, barrier, "absorb")
+    No exec: the write was pre-authorized before the quiesce and the holder
+    fires it from the node once its ledger shows the barrier. The runner only
+    watches it land through the store.
+    """
+
     deadline = time.monotonic() + ABSORB_BUDGET_SECONDS
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -915,9 +1038,15 @@ def _escalate(
     current = _wait_for_barrier(run)
     if (current.get("workflow") or {}).get("request_id") != run.predecessor_id:
         raise RegionalFixtureError(
-            "reset workflow changed before escalation authorization"
+            "reset workflow changed before the escalation was due"
         )
-    _authorize_injection(run, current, "escalate")
+    # Still no exec: the escalation fires from the node on its own condition.
+    # This second store-side observation is what its fire record is graded
+    # against.
+    run.escalation_proof = _store_proof(run, current)
+    write_json_atomic(
+        case_dir / "barrier-authorization-escalate.json", run.escalation_proof
+    )
     successor: dict[str, Any] = {}
     deadline = time.monotonic() + PREEMPTION_BUDGET_SECONDS
     while time.monotonic() < deadline:
@@ -967,32 +1096,6 @@ def _escalate(
         )
     )
     return errors, adopted
-
-
-def _authorize_injection(run: _LiveRun, state: dict[str, Any], phase: str) -> None:
-    from scripts.e2e.regional.destr_barrier_authorization import barrier_authorization
-
-    proof = barrier_authorization(
-        state,
-        run_id=run.run_id,
-        node=run.settings.node,
-        boot_id=str(run.baseline.get("boot_id") or ""),
-        device=run.device,
-        drill_id=f"{run.run_id}-r",
-        maintenance_window_end=run.maintenance_window_end,
-    )
-    # If quiesce makes this transport unavailable, fail closed. A relative
-    # timer armed before the barrier is not a substitute for authorization.
-    report = run.holder_probe.execute(
-        "authorize-injection",
-        "--run-id",
-        run.run_id,
-        "--phase",
-        phase,
-        "--authorization",
-        json.dumps(proof, sort_keys=True),
-    )
-    write_json_atomic(run.case_dir / f"authorization-{phase}.json", report)
 
 
 def _wait_for(
@@ -1050,6 +1153,22 @@ def _data_plane_errors(
     holder = run.holder_probe.execute("holder-status", "--run-id", run_id)
     write_json_atomic(case_dir / "holder-status.json", holder)
     errors.extend(holder_errors(holder))
+    # The host's own record of when it fired, graded against the runner's
+    # store-side barrier observations: each write must come after the runner
+    # saw the barrier, on the same workflow, incident and boot.
+    fired = holder.get("injections_fired") or {}
+    errors.extend(
+        fired_after_barrier_errors(
+            fired.get("absorb"), store_proof=run.barrier_proof, label="absorb injection"
+        )
+    )
+    errors.extend(
+        fired_after_barrier_errors(
+            fired.get("escalate"),
+            store_proof=run.escalation_proof or run.barrier_proof,
+            label="escalation injection",
+        )
+    )
     after = run.inject_probe.execute(
         "snapshot",
         "--since-epoch",
@@ -1105,6 +1224,9 @@ def _data_plane_errors(
         "ledger_rows_added": len(after.get("ledger") or [])
         - len(run.baseline.get("ledger") or []),
         "holder_hold_started_at": holder.get("hold_started_at"),
+        "injections_fired": fired,
+        "barrier_observed_at": run.barrier_proof.get("observed_at"),
+        "escalation_barrier_observed_at": run.escalation_proof.get("observed_at"),
     }
 
 
@@ -1188,6 +1310,8 @@ def execute_case(
                 "predecessor_workflow_id": run.predecessor_id,
                 "successor_workflow_id": run.successor_id,
                 "submission": state.get("submission"),
+                "pre_authorization": run.pre_authorization,
+                "barrier_observed_at": run.barrier_proof.get("observed_at"),
                 "case_digest": case_digest(components),
                 "components": components,
             }
@@ -1251,15 +1375,50 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
     return result
 
 
+def _host_reachability(run: _LiveRun) -> dict[str, Any]:
+    """Wait for kubelet to answer again before cleanup execs into the node."""
+
+    return host_reachability(
+        run.regional,
+        node=run.settings.node,
+        baseline_boot_id=(run.preflight.get("node") or {}).get("boot_id"),
+        holder_armed_at=run.holder_armed_at,
+        max_hold_seconds=run.settings.max_hold_seconds,
+        budget_seconds=HOST_RETURN_BUDGET_SECONDS,
+    )
+
+
 def _disarm_holder(run: _LiveRun) -> dict[str, Any]:
     """Idempotent: a holder the reboot already took with it is not an error.
 
-    The probe Pod does not survive the reboot, so it is recreated first; a node
-    that cannot answer here is a cleanup failure, which is the point.
+    Nothing is exec'd while kubelet is down: the node has to be Ready again
+    first, and the probe Pod (which does not survive a reboot) is recreated
+    before the disarm. A node that never answers is a cleanup failure unless
+    the boot id changed or the holder's own lifetime has passed, in which case
+    the holder is known to be gone.
     """
 
+    reach = _host_reachability(run)
+    if not reach["exec_allowed"]:
+        if reach["assume_disarmed"]:
+            return {"disarmed": "assumed", **reach}
+        raise RegionalFixtureError(
+            "the node never answered again, so the holder could not be "
+            f"disarmed: {reach['reason']} ({reach['wait_error']})"
+        )
     run.holder_probe.create()
-    return run.holder_probe.execute("disarm-holder", "--run-id", run.run_id)
+    # The holder's own account first (what it matched, fired or refused, and
+    # why), then the disarm; the failure path of the barrier wait could not
+    # read it while kubelet was down.
+    status = run.holder_probe.execute("holder-status", "--run-id", run.run_id)
+    write_json_atomic(run.case_dir / "holder-status-cleanup.json", status)
+    report = run.holder_probe.execute("disarm-holder", "--run-id", run.run_id)
+    return {
+        "disarmed": "by-probe",
+        "reachability": reach,
+        "status": status,
+        "report": report,
+    }
 
 
 def _refuse_residual(residuals: dict[str, bool]) -> dict[str, bool]:

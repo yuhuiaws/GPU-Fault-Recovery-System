@@ -5,14 +5,17 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import run_destr016_preempting_reboot as case
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureAbort,
     RegionalFixtureError,
 )
 from tests.regional._cov95_destr_preemption import PreemptionHarness, data
 
+CONDITIONAL_KIND = "conditional-barrier-pre-authorization"
 
-def test_preemption_authorizes_absorb_and_escalation_from_same_running_barrier(
+
+def test_preemption_pre_authorizes_both_writes_and_never_execs_after_the_barrier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = PreemptionHarness(tmp_path, monkeypatch)
@@ -24,16 +27,31 @@ def test_preemption_authorizes_absorb_and_escalation_from_same_running_barrier(
     assert code == 0 and report["errors"] == report["cleanup"]["errors"] == [], report
     assert report["predecessor_workflow_id"] == data.RESET_ID, report
     assert report["successor_workflow_id"] == data.REBOOT_ID, report
-    assert h.authorized == ["absorb", "escalate"], h.calls
-    proofs = [detail["proof"] for name, detail in h.calls if name == "authorization"]
-    assert all(
-        proof["workflow_request_id"] == data.RESET_ID and proof["agent_generation"] == 4
-        for proof in proofs
-    ), proofs
-    names = [name for name, _ in h.calls]
-    assert names.index("holder.arm-holder") < names.index("injector.write-xid46"), names
+    proof = h.pre_authorization
+    assert proof is not None and proof["kind"] == CONDITIONAL_KIND, h.calls
+    assert proof["not_before_seconds"] == {
+        "absorb": case.ABSORB_DELAY_SECONDS,
+        "escalate": case.ESCALATE_DELAY_SECONDS,
+    }, proof
+    assert proof["drill_id"] == f"{h.run_id}-r" and proof["boot_id"] == "boot-before", (
+        proof
+    )
+    assert proof["maintenance_window_seconds"] == 420, proof
+    assert report["pre_authorization"] == proof, report
+    names = h.names()
+    assert (
+        names.index("holder.arm-holder")
+        < names.index("holder.pre-authorize")
+        < names.index("injector.write-xid46")
+    ), names
+    # kubelet is down from the quiesce until the reboot brings the node back:
+    # nothing may be exec'd into the node between the first barrier read and
+    # the node's return.
+    assert h.host_execs_between("barrier.read", "node.ready") == [], names
     assert names.index("holder.disarm-holder") < names.index("incident.idle"), names
-    assert h.rebooted, h.calls
+    assert h.rebooted is True, h.calls
+    assert sorted(h.fired) == ["absorb", "escalate"], h.fired
+    assert report["barrier_observed_at"] is not None, report
 
 
 @pytest.mark.parametrize(
@@ -58,16 +76,22 @@ def test_preemption_refuses_bad_premise_before_escalation(
         h.bad_absorb = True
     code, report = h.execute(tmp_path)
     assert code == 1 and report["error"], report
-    assert "escalate" not in h.authorized, h.calls
-    assert not h.rebooted, h.calls
+    assert h.rebooted is False, h.calls
+    if defect in {"clients", "kmsg", "quiesce", "inventory"}:
+        assert h.pre_authorization is None, (
+            "the holder is not pre-authorized before the premise holds"
+        )
+        assert h.injected is False, h.calls
+    else:
+        assert h.host_execs_between("barrier.read", "node.ready") == [], h.names()
 
 
 @pytest.mark.parametrize(
     "phase",
     [
         "holder.arm-holder",
+        "holder.pre-authorize",
         "injector.write-xid46",
-        "holder.authorize-injection",
         "predecessor.read",
         "handoff.read",
         "commands.read",
@@ -90,7 +114,14 @@ def test_preemption_phase_failure_retains_failure_and_attempts_cleanup(
     assert code == 1 and phase in str(report), report
     names = [name for name, _ in h.calls]
     assert "holder.cleanup" in names and "injector.cleanup" in names, names
-    if "holder.arm-holder" in names:
+    if phase == "node.ready":
+        # The node never answered again and its boot id did not change: the
+        # holder cannot be disarmed through the probe nor assumed gone.
+        assert "holder.disarm-holder" not in names, names
+        assert any(
+            "never answered again" in error for error in report["cleanup"]["errors"]
+        ), report
+    elif "holder.arm-holder" in names:
         assert "holder.disarm-holder" in names, names
 
 
@@ -137,6 +168,7 @@ def test_preemption_cannot_start_without_a_full_reboot_window(
     code, report = h.execute(tmp_path, seconds=60)
     assert code == 1 and "needs at least" in report["error"], report
     assert not h.injected, h.calls
+    assert h.pre_authorization is None, h.calls
 
 
 def test_preemption_abort_propagates_after_disarming_and_probe_cleanup(
@@ -144,11 +176,12 @@ def test_preemption_abort_propagates_after_disarming_and_probe_cleanup(
 ) -> None:
     h = PreemptionHarness(tmp_path, monkeypatch)
     h.plan(tmp_path)
-    h.failures["holder.authorize-injection"] = RegionalFixtureAbort(2)
+    h.failures["holder.pre-authorize"] = RegionalFixtureAbort(2)
     with pytest.raises(RegionalFixtureAbort):
         h.execute(tmp_path)
     names = [name for name, _ in h.calls]
     assert "holder.disarm-holder" in names and "injector.cleanup" in names, names
+    assert "injector.write-xid46" not in names, names
 
 
 def test_preemption_plan_identity_drift_never_arms_a_holder(
@@ -160,3 +193,53 @@ def test_preemption_plan_identity_drift_never_arms_a_holder(
     with pytest.raises(RegionalFixtureError, match="plan identity drifted"):
         h.execute(tmp_path)
     assert not h.injected, h.calls
+
+
+def test_preemption_ordering_check_fails_when_the_host_fired_before_the_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = PreemptionHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.host_fired_early = True
+    code, report = h.execute(tmp_path)
+    assert code == 1 and report["verdict"] == "FAIL", report
+    early = [
+        error
+        for error in report["errors"]
+        if "not after the runner observed the barrier" in error
+    ]
+    assert len(early) == 2, report["errors"]
+    assert any(error.startswith("absorb injection") for error in early), early
+    assert any(error.startswith("escalation injection") for error in early), early
+
+
+def test_preemption_cleanup_never_execs_into_a_node_that_does_not_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = PreemptionHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.node_unreachable = True
+    code, report = h.execute(tmp_path)
+    assert code == 1 and "did not return Ready" in report["error"], report
+    names = h.names()
+    assert "holder.disarm-holder" not in names, names
+    assert h.host_execs_between("barrier.read", "holder.cleanup") == [], names
+    assert any(
+        "never answered again" in error for error in report["cleanup"]["errors"]
+    ), report["cleanup"]
+
+
+def test_preemption_cleanup_assumes_the_holder_gone_after_a_boot_it_could_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = PreemptionHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.node_unreachable = True
+    h.unreachable_boot_id = "boot-after"
+    code, report = h.execute(tmp_path)
+    assert code == 1, report
+    disarm = report["cleanup"]["holder_disarm"]
+    assert disarm["disarmed"] == "assumed" and "boot id changed" in disarm["reason"], (
+        disarm
+    )
+    assert "holder.disarm-holder" not in h.names(), h.names()

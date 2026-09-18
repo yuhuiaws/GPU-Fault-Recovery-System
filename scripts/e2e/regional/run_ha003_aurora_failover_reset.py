@@ -53,6 +53,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     settings_from_arguments,
 )
 from scripts.e2e.regional.remote_command_shapes import command_operations  # noqa: E402
+from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
+    reset_notification_evidence,
+)
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     WarmSpareLiveFixture,
 )
@@ -484,7 +487,7 @@ def control_logs(
     for app in (
         "gpu-fault-api-ha",
         "gpu-fault-control-worker",
-        "gpu-fault-processor",
+        "gpu-fault-telemetry-spool-worker",
     ):
         for pod in regional.ready_pods("cpu", app):
             output = regional.kubectl(
@@ -598,6 +601,7 @@ def evaluate_reset(
     baseline_host: dict[str, Any],
     target_bdf: str,
     run_id: str,
+    marker: str,
     injected_at: datetime,
     failover_requested_at: datetime,
     case_dir: Path,
@@ -673,6 +677,22 @@ def evaluate_reset(
         errors.append("provider node mutation appeared during HA-003")
     if regional.cpu_blast_snapshot() != preflight["cpu_blast"]:
         errors.append("control-plane EKS state differs from baseline")
+    # The reset's completion record: one GPU_RESET_COMPLETED keyed by the batched
+    # RESET_GPU step's own idempotency key once the carrier finished (SKIPPED by
+    # the drill policy for this drill incident) -- the failover must not have
+    # lost it or produced a second one.
+    reset_mail, mail_errors = reset_notification_evidence(
+        regional,
+        state,
+        node=settings.node,
+        marker=marker,
+        observed_after=injected_at,
+        wait=not errors,
+        sleep=time.sleep,
+        monotonic=time.monotonic,
+    )
+    write_json_atomic(case_dir / "reset-notification.json", reset_mail)
+    errors.extend(mail_errors)
     return errors, {
         "workflow": workflow,
         "provider_events": provider,
@@ -681,6 +701,7 @@ def evaluate_reset(
         "executor_logs": executor,
         "host_after": after,
         "final_node": final_node,
+        "reset_notification": reset_mail,
     }
 
 
@@ -1019,6 +1040,7 @@ def execute_case(
             baseline_host=baseline_host,
             target_bdf=target_bdf,
             run_id=run_id,
+            marker=marker,
             injected_at=injected_at,
             failover_requested_at=failover_requested_at,
             case_dir=case_dir,
@@ -1040,6 +1062,7 @@ def execute_case(
                 "executor_result_codes": evidence["executor_logs"][
                     "rejected_result_codes"
                 ],
+                "reset_notification": evidence["reset_notification"],
             }
         )
         if not overlap:

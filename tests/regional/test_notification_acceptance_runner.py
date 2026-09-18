@@ -342,9 +342,27 @@ def test_select_live_record_wants_a_sent_non_drill_record_for_the_cluster() -> N
 
 
 def _fake_drill(kind: str, drill_id: str, **_: Any) -> dict[str, Any]:
+    # The shape the real probe reports: the gpu-reset drill replays the compound
+    # reset carrier and mails only its batched RESET_GPU step; the restart
+    # drill is the standalone command it always was.
+    compound = kind == "gpu-reset"
+    operation_id = (
+        f"workflow-{drill_id}/2/RESET_GPU"
+        if compound
+        else f"workflow-{drill_id}/0/RESTART_WORKLOAD"
+    )
     return {
         "kind": kind,
         "drill_id": drill_id,
+        "command_shape": "compound" if compound else "standalone",
+        "head_operation": "QUIESCE_GPU_SERVICES" if compound else "RESTART_WORKLOAD",
+        "batched_operations": (
+            ["VERIFY_NO_GPU_CLIENTS", "RESET_GPU", "RESTORE_GPU_SERVICES"]
+            if compound
+            else []
+        ),
+        "expected_operation_id": operation_id,
+        "notification_operation_ids": [operation_id],
         "executed_at": "2026-09-07T12:00:00+00:00",
         "completed_at": "2026-09-07T12:00:01+00:00",
         "initial_completed_at": "2026-09-07T12:00:00+00:00",

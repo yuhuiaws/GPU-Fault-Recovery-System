@@ -12,6 +12,7 @@ import pytest
 from scripts.e2e.regional import blast_acceptance_base as base
 from scripts.e2e.regional import run_destr001_gpu_reset as producer
 from scripts.e2e.regional.blast_acceptance_cases_1 import BlastCasesOne
+from tests.regional._reset_notification_support import reset_notification_entry
 
 
 def produce_containment(
@@ -66,6 +67,7 @@ def produce_containment(
             "workflow_request_id": "containment-workflow",
             "incident_id": "containment-incident",
             "step_index": index,
+            "idempotency_key": f"containment-workflow/{index}/{operation}",
             "step": {"operation": operation, "node_ids": ["gpu-1"]},
             "fencing_token": 1,
             "status": "SUCCEEDED",
@@ -109,6 +111,13 @@ def produce_containment(
             ],
         },
         "commands": commands,
+        "notifications": [
+            reset_notification_entry(
+                cluster_id=cluster,
+                incident_id="containment-incident",
+                operation_id="containment-workflow/4/RESET_GPU",
+            )
+        ],
     }
 
     class Regional:

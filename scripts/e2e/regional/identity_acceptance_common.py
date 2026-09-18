@@ -209,6 +209,13 @@ class ClusterTarget:
     # cluster-id binding and may name any other id as "cluster B" on a
     # single-cluster site; the evidence must say so.
     registered: bool = True
+    # "site" for a cluster site.yaml lists; "synthetic-logical" for the second
+    # logical cluster AUTH-007/008 register themselves on a one-cluster site.
+    kind: str = "site"
+    # The GPU-plane namespace holding this cluster's executor Pod when that is
+    # not the site namespace: a synthetic logical secondary shares the
+    # primary's EKS and lives in a namespace of its own. "" = site namespace.
+    executor_namespace: str = ""
 
 
 def unregistered_secondary(primary: ClusterTarget, cluster_id: str) -> ClusterTarget:
@@ -231,6 +238,48 @@ def unregistered_secondary(primary: ClusterTarget, cluster_id: str) -> ClusterTa
         executor_role_arn="",
         registered=False,
     )
+
+
+class SecondaryNamespaceFixture(RegionalLiveFixture):
+    """A live fixture whose GPU-plane default namespace is not the site's.
+
+    The control plane (``cpu``) keeps the site namespace: the release-state
+    ConfigMap, the API Pods and the registry live there for every logical
+    cluster. Only ``gpu`` reads and execs default to the executor namespace, so
+    ``executor_python``, ``ready_pods`` and ``pod_json`` find the secondary's
+    own executor Pod and nothing of the primary's. An explicit ``namespace`` or
+    ``all_namespaces`` still wins, exactly as on the base fixture.
+    """
+
+    def __init__(
+        self, settings: RegionalLiveSettings, *, executor_namespace: str
+    ) -> None:
+        super().__init__(settings)
+        if not executor_namespace:
+            raise ValueError("executor namespace must not be empty")
+        self.executor_namespace = executor_namespace
+
+    def kubectl(
+        self,
+        plane: str,
+        *arguments: str,
+        input_text: str | None = None,
+        check: bool = True,
+        timeout: int = 300,
+        all_namespaces: bool = False,
+        namespace: str | None = None,
+    ) -> str:
+        if plane == "gpu" and namespace is None and not all_namespaces:
+            namespace = self.executor_namespace
+        return super().kubectl(
+            plane,
+            *arguments,
+            input_text=input_text,
+            check=check,
+            timeout=timeout,
+            all_namespaces=all_namespaces,
+            namespace=namespace,
+        )
 
 
 class IdentitySite:
@@ -288,16 +337,22 @@ class IdentitySite:
             ) from exc
 
     def regional(self, target: ClusterTarget) -> RegionalLiveFixture:
-        return RegionalLiveFixture(
-            RegionalLiveSettings(
-                cpu_kubeconfig=self.cpu_kubeconfig,
-                gpu_kubeconfig=self.gpu_kubeconfig,
-                gpu_context=target.context,
-                namespace=self.namespace,
-                cluster_id=target.cluster_id,
-                region=self.region,
-            )
+        settings = RegionalLiveSettings(
+            cpu_kubeconfig=self.cpu_kubeconfig,
+            gpu_kubeconfig=self.gpu_kubeconfig,
+            gpu_context=target.context,
+            namespace=self.namespace,
+            cluster_id=target.cluster_id,
+            region=self.region,
         )
+        executor_namespace = str(getattr(target, "executor_namespace", "") or "")
+        if executor_namespace:
+            # A synthetic logical secondary: same EKS, own namespace; the
+            # control plane stays the site's.
+            return SecondaryNamespaceFixture(
+                settings, executor_namespace=executor_namespace
+            )
+        return RegionalLiveFixture(settings)
 
     def cpu(self, *arguments: str, **kwargs: Any) -> str:
         target = next(iter(self.targets.values()))

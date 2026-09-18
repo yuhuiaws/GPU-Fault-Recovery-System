@@ -3970,7 +3970,13 @@ test_cases:
   - reset 后的 VALIDATE_GPU 必须为 step.gpu_uuids 中每一张 GPU 拿到晚于 readiness_after 的新鲜样本才 SUCCEEDED；任一 GPU 缺样本时 WAITING details 含 missing_recent_metrics_by_gpu[<uuid>]，不允许兄弟 GPU 的样本代答
   - MARK_UNSCHEDULABLE 与 RESTORE_SCHEDULING 的 remote command result_details 含 node_baselines[node].before/after（unschedulable、taint_keys、resource_version），隔离后 after 带 gpu-fault.io/quarantined、恢复后 after 不带且 unschedulable 回到 previous-unschedulable；executor 每个副本的 GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS 为正数或未设（默认 30 s），每个 Kubernetes 调用都带该上限
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 64810a8685612b1dff602e3db4740e1098e51303518777c49e94122461aa49d7
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-001
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr001_requires_the_exact_reset_contract
@@ -3997,7 +4003,13 @@ test_cases:
   - RESTART_NODE 提交前 executor 必须现场重读目标节点（node_id、kubernetes.io/hostname、hyperpod-<instance_id> 三个候选名）并观察到 spec.unschedulable=true、本 incident 的 gpu-fault.io/quarantined taint 与 gpu-fault.io/incident-id 注解；WAITING details 的 observed_isolation[node] 含 kubernetes_node、incident、fencing_token、resource_version，isolation_verified_nodes 只来自这次观测而不是 completed_operations 的记忆
   - 任一候选名都读不到、或节点已被 uncordon/taint 被删/注解归属他人时 RESTART_NODE 立即 FAILED 且 details 含 safety_rejection=true 与 isolation_problems，不提交任何 provider 调用
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: abe129b08e1dd3c89789c996ed80b26a029dd390bbfdcbc7a14a563649e48dae
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-002
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr002_preflight_and_reboot_contract
@@ -4021,7 +4033,13 @@ test_cases:
   - HyperPod 集群节点总数与基线一致
   - 控制面 EKS 比对结果为 IDENTICAL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 236e13dc556a3744a39d5761372a3f72c15d348c196605ef546c141c636c0e8d
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-003
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr003_requires_local_warm_spare_rebinding_and_notification
@@ -4059,7 +4077,13 @@ test_cases:
   - finally 中全体 GPU 节点的 UID、Ready、GPU allocatable、taints、unschedulable 与 ownership annotation 逐字段等于基线
   - 用例不创建 workload、临时 Profile、持久 workflow 或 Kubernetes mutation
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: ea946894758c7fcb26df2352441f821a44b109e6876d8b81e208a8c0620f4792
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-005
   command:
@@ -4084,7 +4108,13 @@ test_cases:
   - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   - 负向集群必须不在当前durable registry中；录制的目标、时间、摘要、分页和逐节点身份完整
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 907e18777d24010fcef8842ca6f7cd71d08282560da05a72b7a2910f449a9298
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-006
   command:
@@ -4108,7 +4138,13 @@ test_cases:
   - 生产Executor按Deployment期望值核对全部Ready副本，SPARE_FAILOVER=true、REMOTE_STATE=true、ALLOW_HYPERPOD_REPLACE=false及Pod UID全程未变化
   - finally 中全体 GPU 节点调度状态与 ownership 逐字段等于基线
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f83e988057df1c3bedf23d0b8fb7d230edcf39320ea5c89b5019103548735e76
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-007
   command:
@@ -4163,7 +4199,13 @@ test_cases:
   - 未执行 GPU reset、reboot 或 replacement，CloudTrail 为空且节点无 quarantine taint
   - 控制面 EKS 比对结果为 IDENTICAL
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: be158abe7d58d89bb7897ba493be3ea858040f7174bbede839e5aad0f8c37044
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-009
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr009_workflow_contract_scales_to_expected_gpu_count
@@ -4183,7 +4225,13 @@ test_cases:
   - 终态workflow重放返回缓存的 SUCCEEDED，Node Agent ledger、MainPID 与 Started 计数不再变化
   - 同一incident恰有一条ACTION_COMPLETED Fabric Manager通知，重放不新增notification；drill可为SKIPPED，真实邮件启用时为SENT
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: cc2d97bc8c9d5c631079543f9538da024a9102c9bc23aecdf384c470eec8d5b6
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-010
 
@@ -4229,7 +4277,13 @@ test_cases:
   - C 组 owner 必须在 GPU_FAULT_MANAGED_RECOVERY_OWNERS 内且不在 GPU_FAULT_REMOTE_EXECUTION_OWNERS 内，否则 step 会被 RegionalRemoteWorkflowAdapter 抢走真去动 K8s
   - C组结束后删除隔离测试数据库；当前site profile内容与指纹必须始终未变
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 595802c32a90cad23ecbb678970cc7187bab1b9c77550bd1acfd91df7855d78a
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-012
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr012_group_d_requires_prewrite_failure_details
@@ -4401,7 +4455,13 @@ test_cases:
   - 清理后：持有者单元已解除、隔离只经 validated-restore 工作流解除、环境窗口回到记录的基线、
     探针零残留、control-worker 模板摘要回到开窗前的值（只允许 generation 前进两次写入）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f72375e49f507092bc4a5035200679229855826ba6be87a0eb75ee7141ed5761
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-018
   related_pytest: tests/regional/test_destr018_lifetime_deadline.py::test_the_lifetime_contract_passes_on_the_intended_terminal_state
@@ -4433,7 +4493,13 @@ test_cases:
   - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
   - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: b0516b489d7e56256d2c1b4de14d46b66ca66d0df69bb3bcef124810bb93464f
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-019
   related_pytest: tests/regional/test_destr019_node_probe.py::test_the_migration_drill_report_satisfies_the_case_verdict
@@ -4462,7 +4528,13 @@ test_cases:
   - 全部真实 GPU 节点的 unschedulable/taint/gpu-fault 注解与基线逐项相同，别名未成为节点；CloudTrail provider 变更动词集合为空
   - 遗留的 FAILED incident 与 support 记录以 leftover_records 记入证据（无节点需恢复）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: f6052b29ed81ea3e4dfb250d15af06009555f0f14e27bf9016d7dbfdad6f236a
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-020
   related_pytest: tests/regional/test_destr020_identity_mismatch_isolation.py::test_the_old_memory_based_isolation_is_a_failure
@@ -4489,7 +4561,13 @@ test_cases:
   - 结束后节点 Ready、可调度、无 gpu-fault.io 注解/taint、无 tick 注解、EFA allocatable 与基线一致、uid/boot_id 不变
   - CloudTrail provider 变更动词集合为空；探针 Pod/ConfigMap 零残留；runtime identity 与 preflight 相同
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 0c1d12930d9843379aed954e6eda93ceebc29d63cccc46f9abf2c6f10b7c779d
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-021
   related_pytest: tests/regional/test_destr021_adversarial_node_metadata.py::test_the_stale_foreign_annotation_is_taken_over_and_cleared
@@ -4515,7 +4593,13 @@ test_cases:
   - 清理后热备节点的三项注解与 cordon 状态逐项等于声明基线，spare 标签与 taint 不变；其他 GPU 节点调度状态与基线相同；CloudTrail provider 变更动词集合为空
   - 预置门禁：executor 必须 GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true 且 breadcrumb 含该计数器，否则拒绝执行（这是部署事实，不是用例缺陷）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3a83007748ea571fdd9497f3ac2d8a33ce6cbaab7f166abc6cd1efbd99764e2f
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
   related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
@@ -4545,7 +4629,13 @@ test_cases:
   - 其余全部等于 DESTR-001 的 reset 契约：八步 official_steps、SUCCEEDED、远端 WAITING 明细 mutation_submitted_by_control_plane=false、Node Agent ledger 恰一条 RESET_GPU、宿主采样器看到目标 GPU 离开并回来、服务与 timer 回到基线、无 provider 变更、控制面 EKS 状态不变
   - 清理后节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解；探针 Pod/ConfigMap 无残留
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 4d2cda8b8fb26d2abb590e32b006ef6d545ee255cc6e9527b7229db6cb8e2ede
+      components:
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-023
   related_pytest: tests/regional/test_destr023_idle_cluster_reset.py::test_fresh_coverage_refuses_idle_that_a_leftover_job_could_explain
@@ -4579,9 +4669,9 @@ test_cases:
     verified:
       case_digest: 8a7f52a3b89a044974110a14ee342aebdc2908d6662723252c2af79394219e15
       components:
-        control_plane: 42f5ad3d55153a684f0ff1190eeee894a31d5fa7a14c2186fd533a913ff92160
-        executor: 367bef5a23e01947bebf146efa4ad0e151b763dcfd06c9d034903b8df32a84a3
-        node_runtime: e2597494d6c43265c6a66d8f35334493f56a389132743ea8864a0fd407d9fa94
+        control_plane: e9bd6e92d7cf6e0bd42a67ac5dd60c0b7c1524aa6e707ef258dab073bf2a83fe
+        executor: d24eb45cba4f3035b741bccb3dc96ad5f174994c79e0414aa46bcb8a1ac7bd48
+        node_runtime: a089e2d857590b8b0a86a774ec08ab37cb7fc086f273a436dc692b388003930c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-024
   related_pytest: tests/regional/test_destr024_watcher_down_fail_closed.py::test_a_workflow_that_ran_is_the_failure_the_case_exists_to_catch

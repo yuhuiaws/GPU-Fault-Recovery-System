@@ -793,6 +793,10 @@ def delete_owned_resource(
         "pod": ("api/v1", "pods"),
         "configmap": ("api/v1", "configmaps"),
         "secret": ("api/v1", "secrets"),
+        # The AUTH-007/008 synthetic secondary owns a whole namespace; deleting
+        # it is the last step of that teardown and follows the same
+        # uid/resourceVersion preconditions as every other owned resource.
+        "namespace": ("api/v1", "namespaces"),
         "job": ("apis/batch/v1", "jobs"),
         "serviceaccount": ("api/v1", "serviceaccounts"),
         "role": ("apis/rbac.authorization.k8s.io/v1", "roles"),
@@ -841,6 +845,7 @@ def delete_owned_resource(
         ""
         if kind
         in {
+            "namespace",
             "clusterrole",
             "clusterrolebinding",
             "validatingwebhookconfiguration",

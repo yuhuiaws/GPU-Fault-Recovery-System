@@ -12,6 +12,7 @@ from gpu_fault.models import WorkflowStatus
 from scripts.e2e.regional import destr017_verdicts as verdicts
 from scripts.e2e.regional import destr_barrier_authorization as authorization
 from scripts.e2e.regional import run_destr017_out_of_band_reboot_fence as case
+from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional import test_destr017_out_of_band_reboot_fence as data
 from tests.regional._cov95_destr_branches import ready_runtime
 from tests.regional._cov95_destr_warm import NOW, Clock, regional_settings
@@ -62,7 +63,19 @@ class FenceHarness:
         self.residuals = {"pod": False}
         self.injected = False
         self.reboot_armed = False
+        self.pre_authorization: dict[str, Any] | None = None
         self.rebooted = False
+        # What the on-node fire record says once the node is back: when the
+        # host fired and which ledger rows it matched. ``host_fired_early``
+        # makes the host claim a fire before the runner's barrier observation.
+        self.fired_at: str | None = None
+        self.host_fired_early = False
+        self.host_condition_workflow = data.REQUEST
+        # ``node_unreachable`` keeps the node from ever returning Ready, i.e.
+        # kubelet never answers again during cleanup; ``unreachable_boot_id``
+        # is what a later node read then shows (a reboot cleanup could not see).
+        self.node_unreachable = False
+        self.unreachable_boot_id: str | None = None
         self.recovered = False
         self.waiting_reads = 0
         self.pin_missing = False
@@ -137,6 +150,40 @@ class FenceHarness:
         )
         path = run_dir / "cases" / case.CASE_ID / f"{case.CASE_ID}.json"
         return code, json.loads(path.read_text(encoding="utf-8"))
+
+    def names(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+    def host_execs_between(self, start: str, end: str) -> list[str]:
+        """Probe execs recorded after the first ``start`` and before the first
+        ``end`` call: kubelet is down there, so this must stay empty."""
+
+        names = self.names()
+        first = names.index(start)
+        last = names.index(end) if end in names else len(names)
+        return [
+            name
+            for name in names[first:last]
+            if name.startswith(("fence.", "host.")) and not name.endswith(".create")
+        ]
+
+    def fire_record(self) -> dict[str, Any]:
+        """The host's durable record of the reboot it fired, read back later."""
+
+        if self.fired_at is None:
+            return {}
+        return {
+            "fire_requested_at": self.fired_at,
+            "condition": {
+                "workflow_request_id": self.host_condition_workflow,
+                "incident_id": data.INCIDENT,
+                "boot_id": data.BOOT_BEFORE,
+                "agent_generation": data.GENERATION,
+                "quiesce_command_id": f"key-QUIESCE_GPU_SERVICES/{data.NODE}/agent-7",
+                "verify_command_id": f"key-VERIFY_NO_GPU_CLIENTS/{data.NODE}/agent-7",
+                "observed_at": self.fired_at,
+            },
+        }
 
     def waiting_state(self) -> dict[str, Any]:
         self.waiting_reads += 1
@@ -251,7 +298,18 @@ class FenceRegional:
 
     def wait_node_ready(self, node: str, **kwargs: Any) -> dict[str, Any]:
         self.h.call("node.ready", {"node": node, **kwargs})
-        if kwargs.get("expected_boot_id"):
+        if self.h.node_unreachable:
+            if self.h.unreachable_boot_id:
+                self.h.node["boot_id"] = self.h.unreachable_boot_id
+            raise RegionalFixtureError("node did not return Ready: fake outage")
+        if kwargs.get("expected_boot_id") and not self.h.rebooted:
+            # The host reboots on its own once its ledger shows the barrier,
+            # no earlier than the reboot delay after the holder opened.
+            self.h.clock.sleep(self.h.settings.reboot_delay_seconds)
+            fired = self.h.clock.now()
+            if self.h.host_fired_early:
+                fired -= timedelta(seconds=self.h.settings.reboot_delay_seconds + 1)
+            self.h.fired_at = fired.isoformat()
             self.h.rebooted = True
             self.h.node["boot_id"] = data.BOOT_AFTER
         return deepcopy(self.h.node)
@@ -304,15 +362,16 @@ class FenceProbe:
         if action == "snapshot":
             return deepcopy(self.h.after if self.h.rebooted else self.h.baseline)
         if action == "reboot-status":
-            return (
-                data.reboot_status()
-                if self.h.rebooted
-                else deepcopy(self.h.preflight_reboot)
-            )
+            if not self.h.rebooted:
+                return deepcopy(self.h.preflight_reboot)
+            return {**data.reboot_status(), **self.h.fire_record()}
         if action == "write-xid":
             self.h.injected = True
-        if action == "arm-reboot":
+        if action == "pre-authorize-reboot":
             self.h.reboot_armed = True
+            self.h.pre_authorization = json.loads(
+                args[args.index("--authorization") + 1]
+            )
         if action == "holder-status":
             return {
                 "matched_row": {"command_id": "owned-quiesce"},

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -338,9 +339,10 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """quiesce stops kubelet, so the reboot cannot be exec'd from the runner
-    after the fence is WAITING. ``place_reboot_timer`` is the shared path the
-    on-node watcher takes: it must write the pre-reboot boot id durably *before*
-    the systemd timer that will run ``systemctl reboot`` exists."""
+    after the fence is WAITING. ``arm_reboot`` is the path
+    ``pre-authorize-reboot`` takes before the injection: it must write the
+    pre-reboot boot id durably *before* the systemd timer that will run the
+    conditional ``fire-reboot`` exists."""
 
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -353,25 +355,71 @@ def test_the_reboot_is_armed_on_node_and_records_its_boot_id_first(
         path,
         {
             "maintenance_window_end": "2099-01-01T00:00:00+00:00",
-            "barrier_authorization": {
+            "pre_authorization": {
                 "run_id": RUN_ID,
-                "window_expires_at": "2099-01-01T00:00:00+00:00",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "not_before_seconds": {"reboot": 45},
             },
         },
     )
 
-    record = probe.place_reboot_timer(RUN_ID, 45, path)
+    record = probe.arm_reboot(RUN_ID, 45, path)
 
     assert record["reboot_delay_seconds"] == 45
     assert record["boot_id_before_reboot"] == BOOT_A
     state = json.loads(path.read_text())
     assert state["boot_id_before_reboot"] == BOOT_A, "durable marker before timer"
     assert state["reboot_delay_seconds"] == 45
+    assert state["reboot_not_before_seconds"] == 45
     timer = probe.reboot_unit(RUN_ID)
     armed = [c for c in calls if "systemd-run" in c and "--on-active=45s" in c]
     assert len(armed) == 1, calls
     assert f"--unit={timer}" in armed[0]
     assert armed[0][-3:] == ["fire-reboot", "--run-id", RUN_ID]
+    assert "reboot" not in " ".join(armed[0][:-3]).replace(timer, ""), (
+        "the timer runs the conditional fire, never systemctl reboot itself"
+    )
+
+
+def test_the_reboot_timer_needs_a_pre_authorization_that_covers_the_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        probe, "run", lambda command, **kwargs: calls.append(list(command))
+    )
+    monkeypatch.setattr(probe, "boot_id", lambda: BOOT_A)
+    path = tmp_path / "state.json"
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=40)).isoformat()
+    for state, message in (
+        ({"maintenance_window_end": "2099-01-01T00:00:00+00:00"}, "pre-authorization"),
+        (
+            {
+                "maintenance_window_end": "2099-01-01T00:00:00+00:00",
+                "pre_authorization": {
+                    "run_id": RUN_ID,
+                    "expires_at": soon,
+                    "not_before_seconds": {"reboot": 45},
+                },
+            },
+            "outlive the pre-authorization",
+        ),
+        (
+            {
+                "maintenance_window_end": "2099-01-01T00:00:00+00:00",
+                "pre_authorization": {
+                    "run_id": RUN_ID,
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "not_before_seconds": {"reboot": 30},
+                },
+            },
+            "differs from the pre-authorized delay",
+        ),
+    ):
+        probe.write_state(path, state)
+        with pytest.raises(probe.ProbeError, match=message):
+            probe.arm_reboot(RUN_ID, 45, path)
+    assert calls == [], calls
 
 
 # --------------------------------------------------------------------------- #
@@ -480,28 +528,18 @@ def test_parser_accepts_every_documented_subcommand() -> None:
     assert armed_reboot.reboot_delay_seconds == 30
     reboot = parser.parse_args(
         [
-            "arm-reboot",
+            "pre-authorize-reboot",
             "--run-id",
             RUN_ID,
             "--delay-seconds",
             "45",
             "--authorization",
             "{}",
-            "--barrier-script",
-            "/run/gpu-fault-host-probe-ab894dd753.py",
         ]
     )
     assert reboot.delay_seconds == 45
     default_reboot = parser.parse_args(
-        [
-            "arm-reboot",
-            "--run-id",
-            RUN_ID,
-            "--authorization",
-            "{}",
-            "--barrier-script",
-            "/run/gpu-fault-host-probe-ab894dd753.py",
-        ]
+        ["pre-authorize-reboot", "--run-id", RUN_ID, "--authorization", "{}"]
     )
     assert default_reboot.delay_seconds == probe.MIN_REBOOT_DELAY_SECONDS
     for command in (
@@ -509,12 +547,17 @@ def test_parser_accepts_every_documented_subcommand() -> None:
         ["holder-status", "--run-id", RUN_ID],
         ["reboot-status", "--run-id", RUN_ID],
         ["cancel-reboot", "--run-id", RUN_ID],
+        ["fire-reboot", "--run-id", RUN_ID],
         ["watch-ledger", "--run-id", RUN_ID],
         ["snapshot"],
         ["snapshot", "--run-id", RUN_ID],
     ):
         parsed = parser.parse_args(command)
         assert parsed.command == command[0]
+    # No exec-time arming remains: quiesce stops kubelet, so an ``arm-reboot``
+    # after the barrier could never be delivered.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["arm-reboot", "--run-id", RUN_ID, "--authorization", "{}"])
 
 
 def test_the_parser_refuses_a_ledger_operation_the_drill_may_not_arm_on() -> None:
@@ -545,3 +588,274 @@ def test_the_parser_has_no_subcommand_that_stops_a_service() -> None:
     for command in (["stop-agent", "--run-id", RUN_ID], ["reboot", "--run-id", RUN_ID]):
         with pytest.raises(SystemExit):
             parser.parse_args(command)
+
+
+# --------------------------------------------------------------------------- #
+# The host-side barrier condition, against a real Node Agent ledger
+# --------------------------------------------------------------------------- #
+NODE = "node-b"
+NEW_WORKFLOW = "workflow-destr017-new"
+
+
+def _proof(**overrides: Any) -> dict[str, Any]:
+    proof: dict[str, Any] = {
+        "kind": probe.CONDITIONAL_KIND,
+        "conditional": True,
+        "run_id": RUN_ID,
+        "node_id": NODE,
+        "boot_id": BOOT_A,
+        "device": "/dev/nvidia0",
+        "drill_id": RUN_ID,
+        "marker": f"{RUN_ID}-m",
+        "maintenance_window_end": (T0 + timedelta(hours=1)).isoformat(),
+        "maintenance_window_seconds": 420,
+        "authorized_at": T0.isoformat(),
+        "expires_at": (T0 + timedelta(seconds=600)).isoformat(),
+        "not_before_seconds": {"reboot": 30},
+        "ledger": dict(probe.LEDGER_SHAPE),
+    }
+    proof.update(overrides)
+    return proof
+
+
+def _parked_state(**overrides: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "run_id": RUN_ID,
+        "boot_id": BOOT_A,
+        "boot_id_before_reboot": BOOT_A,
+        "hold_started_at": (T0 + timedelta(seconds=20)).isoformat(),
+        "pre_authorization": _proof(),
+        "pre_authorized_at": T0.isoformat(),
+        "ledger_baseline_workflow_ids": ["wf-old"],
+    }
+    state.update(overrides)
+    return state
+
+
+def _command(
+    command_id: str, operation: WorkflowOperation, workflow: str, node: str = NODE
+) -> NodeActionCommand:
+    return NodeActionCommand(
+        command_id=command_id,
+        workflow_request_id=workflow,
+        incident_id="inc-1",
+        fencing_token=3,
+        operation=operation,
+        node_id=node,
+        issued_at=T0,
+        expires_at=T0 + timedelta(minutes=5),
+    )
+
+
+def _record(
+    ledger: NodeActionLedger,
+    command: NodeActionCommand,
+    status: NodeActionStatus | None,
+    offset_seconds: int,
+    *,
+    error: str | None = None,
+) -> None:
+    ledger.mark_in_progress(command, 1, agent_generation=4)
+    if status is None:
+        return
+    ledger.save(
+        NodeActionResult(
+            command_id=command.command_id,
+            operation=command.operation,
+            status=status,
+            error=error,
+            retryable=False,
+            attempt=1,
+            completed_at=T0 + timedelta(seconds=offset_seconds),
+        )
+    )
+
+
+def _barrier_ledger(
+    tmp_path: Path,
+    *,
+    verify: NodeActionStatus | None | bool = NodeActionStatus.FAILED,
+    verify_error: str | None = "GPU device clients are still active: GPU-a:4242",
+    extra: tuple[WorkflowOperation, ...] = (),
+    node: str = NODE,
+) -> list[dict[str, Any]]:
+    """A real ledger: an old drill's quiesce, then this run's barrier rows."""
+
+    path, ledger = _ledger(tmp_path)
+    _record(
+        ledger,
+        _command(
+            f"wf-old/2/{QUIESCE}/{NODE}/agent-3",
+            WorkflowOperation.QUIESCE_GPU_SERVICES,
+            "wf-old",
+        ),
+        NodeActionStatus.SUCCEEDED,
+        -600,
+    )
+    _record(
+        ledger,
+        _command(
+            f"{NEW_WORKFLOW}/2/{QUIESCE}/{node}/agent-4",
+            WorkflowOperation.QUIESCE_GPU_SERVICES,
+            NEW_WORKFLOW,
+            node,
+        ),
+        NodeActionStatus.SUCCEEDED,
+        20,
+    )
+    if verify is not False:
+        _record(
+            ledger,
+            _command(
+                f"{NEW_WORKFLOW}/3/{VERIFY}/{node}/agent-4",
+                WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+                NEW_WORKFLOW,
+                node,
+            ),
+            None if verify is None else verify,
+            40,
+            error=verify_error,
+        )
+    for index, operation in enumerate(extra, start=4):
+        _record(
+            ledger,
+            _command(
+                f"{NEW_WORKFLOW}/{index}/{operation.value}/{node}/agent-4",
+                operation,
+                NEW_WORKFLOW,
+                node,
+            ),
+            NodeActionStatus.SUCCEEDED,
+            60,
+        )
+    return probe.ledger_rows(path)
+
+
+def test_ledger_rows_expose_workflow_incident_generation_and_refusal(
+    tmp_path: Path,
+) -> None:
+    rows = _barrier_ledger(tmp_path)
+    verify = [row for row in rows if row["operation"] == VERIFY][-1]
+    assert verify["workflow_request_id"] == NEW_WORKFLOW, verify
+    assert verify["incident_id"] == "inc-1" and verify["agent_generation"] == 4, verify
+    assert "clients are still active" in verify["error"], verify
+    assert verify["started_at"] and verify["completed_at"], verify
+
+
+def test_barrier_condition_holds_on_a_real_ledger_parked_at_the_verification(
+    tmp_path: Path,
+) -> None:
+    verdict = probe.barrier_condition(
+        _parked_state(),
+        _barrier_ledger(tmp_path),
+        now=T0 + timedelta(seconds=60),
+        boot_id=BOOT_A,
+        holder_active=True,
+    )
+    assert verdict["holds"] is True and verdict["final"] is False, verdict
+    condition = verdict["condition"]
+    assert condition["workflow_request_id"] == NEW_WORKFLOW, condition
+    assert condition["incident_id"] == "inc-1" and condition["boot_id"] == BOOT_A, (
+        condition
+    )
+    assert condition["agent_generation"] == 4, condition
+    assert condition["verify_command_id"].endswith(f"/{NODE}/agent-4"), condition
+    assert condition["observed_at"] == (T0 + timedelta(seconds=60)).isoformat(), (
+        condition
+    )
+    # Pinned from the quiesce row's earlier timestamp plus the agent window.
+    assert (
+        condition["pinned_window_expires_at"]
+        == (T0 + timedelta(seconds=20 + 420)).isoformat()
+    ), condition
+
+
+@pytest.mark.parametrize(
+    ("change", "final", "reason"),
+    [
+        ("no-verify", False, "has not executed"),
+        ("verify-in-progress", False, "has not executed"),
+        ("verify-succeeded", True, "did not hold"),
+        ("reset-row", True, "advanced beyond the barrier"),
+        ("restore-row", True, "advanced beyond the barrier"),
+        ("boot", True, "boot id changed"),
+        ("expired", True, "expired before the barrier condition held"),
+        ("window", True, "pinned maintenance window has expired"),
+        ("not-due", False, "not due"),
+        ("holder-dead", True, "no longer active"),
+        ("no-holder", False, "has not started"),
+        ("baseline-only", False, "no workflow of this run"),
+        ("other-node", True, "does not name this node"),
+        ("wrong-refusal", False, "did not refuse on clients"),
+        ("no-preauth", True, "no conditional pre-authorization"),
+        ("cancelled", True, "cancelled"),
+    ],
+)
+def test_barrier_condition_waits_or_refuses_for_every_defect(
+    change: str, final: bool, reason: str, tmp_path: Path
+) -> None:
+    state = _parked_state()
+    now = T0 + timedelta(seconds=60)
+    boot = BOOT_A
+    holder = True
+    if change == "no-verify":
+        rows = _barrier_ledger(tmp_path, verify=False)
+    elif change == "verify-in-progress":
+        rows = _barrier_ledger(tmp_path, verify=None)
+    elif change == "verify-succeeded":
+        rows = _barrier_ledger(
+            tmp_path, verify=NodeActionStatus.SUCCEEDED, verify_error=None
+        )
+    elif change == "reset-row":
+        rows = _barrier_ledger(tmp_path, extra=(WorkflowOperation.RESET_GPU,))
+    elif change == "restore-row":
+        rows = _barrier_ledger(
+            tmp_path, extra=(WorkflowOperation.RESTORE_GPU_SERVICES,)
+        )
+    elif change == "other-node":
+        rows = _barrier_ledger(tmp_path, node="node-c")
+    elif change == "wrong-refusal":
+        rows = _barrier_ledger(tmp_path, verify_error="connection reset by peer")
+    else:
+        rows = _barrier_ledger(tmp_path)
+    if change == "boot":
+        boot = BOOT_B
+    elif change == "expired":
+        now = T0 + timedelta(seconds=601)
+    elif change == "window":
+        now = T0 + timedelta(seconds=20 + 420)
+    elif change == "not-due":
+        now = T0 + timedelta(seconds=40)
+    elif change == "holder-dead":
+        holder = False
+    elif change == "no-holder":
+        state = _parked_state(hold_started_at=None)
+    elif change == "baseline-only":
+        state = _parked_state(ledger_baseline_workflow_ids=["wf-old", NEW_WORKFLOW])
+    elif change == "no-preauth":
+        state = _parked_state(pre_authorization=None)
+    elif change == "cancelled":
+        state = _parked_state(reboot_cancelled_at=T0.isoformat())
+    verdict = probe.barrier_condition(
+        state, rows, now=now, boot_id=boot, holder_active=holder
+    )
+    assert verdict["holds"] is False, verdict
+    assert verdict["final"] is final and reason in verdict["reason"], verdict
+
+
+def test_new_workflow_ids_ignore_the_baseline_and_rows_before_the_authorization(
+    tmp_path: Path,
+) -> None:
+    rows = _barrier_ledger(tmp_path)
+    assert probe.new_workflow_ids(
+        rows, baseline={"wf-old"}, not_before=T0.isoformat()
+    ) == {NEW_WORKFLOW}
+    assert probe.new_workflow_ids(rows, baseline=set(), not_before=T0.isoformat()) == {
+        NEW_WORKFLOW
+    }, "the old drill's row completed before the authorization"
+    assert (
+        probe.new_workflow_ids(
+            rows, baseline=set(), not_before=(T0 + timedelta(minutes=5)).isoformat()
+        )
+        == set()
+    )
